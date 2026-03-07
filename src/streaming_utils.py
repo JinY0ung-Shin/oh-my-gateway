@@ -139,6 +139,57 @@ def make_response_sse(
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a structured task event dict from a system chunk, or None."""
+    subtype = chunk.get("subtype")
+    if subtype == "task_started":
+        return {
+            "type": "task_started",
+            "task_id": chunk.get("task_id", ""),
+            "description": chunk.get("description", ""),
+            "session_id": chunk.get("session_id", ""),
+        }
+    if subtype == "task_progress":
+        return {
+            "type": "task_progress",
+            "task_id": chunk.get("task_id", ""),
+            "description": chunk.get("description", ""),
+            "last_tool_name": chunk.get("last_tool_name"),
+            "usage": chunk.get("usage"),
+        }
+    if subtype == "task_notification":
+        return {
+            "type": "task_notification",
+            "task_id": chunk.get("task_id", ""),
+            "status": chunk.get("status", ""),
+            "summary": chunk.get("summary", ""),
+            "usage": chunk.get("usage"),
+        }
+    return None
+
+
+def make_task_sse(request_id: str, model: str, task_event: Dict[str, Any]) -> str:
+    """Build an SSE line for Chat Completions with a system_event field (empty delta)."""
+    import time
+
+    data = {
+        "id": request_id,
+        "object": "chat.completion.chunk",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
+        "system_event": task_event,
+    }
+    return f"data: {json.dumps(data)}\n\n"
+
+
+def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int = 0) -> str:
+    """Build an SSE line for Responses API with a custom task event type."""
+    event_type = f"response.{task_event['type']}"
+    data = {**task_event, "type": event_type, "sequence_number": sequence_number}
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
 def is_assistant_content_chunk(chunk: Dict[str, Any]) -> bool:
     """Return True for assistant chunks, including the SDK's untyped content-list shape."""
     chunk_type = chunk.get("type")
@@ -184,29 +235,11 @@ async def stream_chunks(
             content_sent = True
             continue
 
-        # Handle task system messages (subagent progress — out-of-band, not "content")
+        # Handle task system messages (subagent progress — structured JSON, not content)
         if chunk.get("type") == "system":
-            subtype = chunk.get("subtype")
-            if subtype == "task_started":
-                desc = chunk.get("description", "")
-                for sse in _emit_sse(f"\n\n> **Task started**: {desc}\n"):
-                    yield sse
-            elif subtype == "task_progress":
-                desc = chunk.get("description", "")
-                last_tool = chunk.get("last_tool_name", "")
-                usage = chunk.get("usage", {})
-                tool_uses = usage.get("tool_uses", 0)
-                progress_text = f"\n> **Task progress**: {desc}"
-                if last_tool:
-                    progress_text += f" (tool: {last_tool}, uses: {tool_uses})"
-                progress_text += "\n"
-                for sse in _emit_sse(progress_text):
-                    yield sse
-            elif subtype == "task_notification":
-                status = chunk.get("status", "")
-                summary = chunk.get("summary", "")
-                for sse in _emit_sse(f"\n> **Task {status}**: {summary}\n\n"):
-                    yield sse
+            task_event = _build_task_event(chunk)
+            if task_event:
+                yield make_task_sse(request_id, request.model, task_event)
             continue
 
         text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
@@ -434,26 +467,11 @@ async def stream_response_chunks(
                 yield _make_failed_event(error_type, f"Claude error: {error_type}")
                 return
 
-            # Handle task system messages (subagent progress)
+            # Handle task system messages (subagent progress — structured JSON, not content)
             if chunk.get("type") == "system":
-                subtype = chunk.get("subtype")
-                if subtype == "task_started":
-                    desc = chunk.get("description", "")
-                    yield _emit_delta(f"\n\n> **Task started**: {desc}\n")
-                elif subtype == "task_progress":
-                    desc = chunk.get("description", "")
-                    last_tool = chunk.get("last_tool_name", "")
-                    usage = chunk.get("usage", {})
-                    tool_uses = usage.get("tool_uses", 0)
-                    delta_text = f"\n> **Task progress**: {desc}"
-                    if last_tool:
-                        delta_text += f" (tool: {last_tool}, uses: {tool_uses})"
-                    delta_text += "\n"
-                    yield _emit_delta(delta_text)
-                elif subtype == "task_notification":
-                    status = chunk.get("status", "")
-                    summary = chunk.get("summary", "")
-                    yield _emit_delta(f"\n> **Task {status}**: {summary}\n\n")
+                task_event = _build_task_event(chunk)
+                if task_event:
+                    yield make_task_response_sse(task_event, sequence_number=_next_seq())
                 continue
 
             was_thinking = in_thinking

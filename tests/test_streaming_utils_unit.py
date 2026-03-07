@@ -544,13 +544,13 @@ async def test_stream_chunks_emits_assistant_error():
 
 
 @pytest.mark.asyncio
-async def test_stream_chunks_task_messages_dont_count_as_content():
-    """Task system messages are rendered but don't set content_sent."""
+async def test_stream_chunks_task_messages_as_structured_json():
+    """Task system messages are emitted as structured JSON system_event, not content."""
 
     async def task_only_source():
-        yield {"type": "system", "subtype": "task_started", "description": "Analyzing code"}
-        yield {"type": "system", "subtype": "task_progress", "description": "Reading files", "last_tool_name": "Read", "usage": {"tool_uses": 3}}
-        yield {"type": "system", "subtype": "task_notification", "status": "completed", "summary": "Done"}
+        yield {"type": "system", "subtype": "task_started", "task_id": "t1", "description": "Analyzing code", "session_id": "s1"}
+        yield {"type": "system", "subtype": "task_progress", "task_id": "t1", "description": "Reading files", "last_tool_name": "Read", "usage": {"tool_uses": 3}}
+        yield {"type": "system", "subtype": "task_notification", "task_id": "t1", "status": "completed", "summary": "Done", "usage": {"tool_uses": 5}}
 
     request = ChatCompletionRequest(
         model="claude-test",
@@ -564,11 +564,25 @@ async def test_stream_chunks_task_messages_dont_count_as_content():
         )
     ]
 
-    all_content = "".join(lines)
-    assert "Task started" in all_content
-    assert "Task progress" in all_content
-    assert "Task completed" in all_content
+    # Parse task event SSE lines (system_event field, empty delta)
+    task_events = []
+    for line in lines:
+        if line.startswith("data: ") and "system_event" in line:
+            parsed = json.loads(line[len("data: "):])
+            task_events.append(parsed["system_event"])
+
+    assert len(task_events) == 3
+    assert task_events[0]["type"] == "task_started"
+    assert task_events[0]["description"] == "Analyzing code"
+    assert task_events[0]["task_id"] == "t1"
+    assert task_events[1]["type"] == "task_progress"
+    assert task_events[1]["last_tool_name"] == "Read"
+    assert task_events[2]["type"] == "task_notification"
+    assert task_events[2]["status"] == "completed"
+    assert task_events[2]["summary"] == "Done"
+
     # Since no real content, fallback "unable to provide" should appear
+    all_content = "".join(lines)
     assert "unable to provide a response" in all_content
 
 
@@ -602,12 +616,12 @@ async def test_stream_response_chunks_assistant_error_emits_failed():
 
 
 @pytest.mark.asyncio
-async def test_stream_response_chunks_task_only_emits_failed():
-    """Task-only stream (no real assistant content) should still fail with empty_response."""
+async def test_stream_response_chunks_task_events_as_custom_sse():
+    """Task events are emitted as custom SSE event types, not content."""
 
     async def task_only_source():
-        yield {"type": "system", "subtype": "task_started", "description": "Working"}
-        yield {"type": "system", "subtype": "task_notification", "status": "completed", "summary": "Done"}
+        yield {"type": "system", "subtype": "task_started", "task_id": "t1", "description": "Working", "session_id": "s1"}
+        yield {"type": "system", "subtype": "task_notification", "task_id": "t1", "status": "completed", "summary": "Done"}
 
     stream_result = {}
     lines = [
@@ -623,7 +637,23 @@ async def test_stream_response_chunks_task_only_emits_failed():
         )
     ]
     parsed = [_parse_response_sse(line) for line in lines]
-    # Task-only stream should NOT complete successfully
+    event_types = [et for et, _ in parsed]
+
+    # Task events should be custom SSE event types
+    assert "response.task_started" in event_types
+    assert "response.task_notification" in event_types
+
+    # Verify task event payload — both SSE event name AND JSON type field must match
+    task_started = next(p for et, p in parsed if et == "response.task_started")
+    assert task_started["type"] == "response.task_started"
+    assert task_started["task_id"] == "t1"
+    assert task_started["description"] == "Working"
+
+    task_done = next(p for et, p in parsed if et == "response.task_notification")
+    assert task_done["type"] == "response.task_notification"
+    assert task_done["status"] == "completed"
+
+    # Task-only stream should still fail (no real content)
     assert parsed[-1][0] == "response.failed"
     assert parsed[-1][1]["response"]["error"]["code"] == "empty_response"
     assert stream_result["success"] is False
