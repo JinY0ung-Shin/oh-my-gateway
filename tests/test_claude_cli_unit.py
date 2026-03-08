@@ -868,3 +868,132 @@ class TestConvertMessageEdgeCases:
         original = {"type": "assistant", "content": "hi"}
         result = cli._convert_message(original)
         assert result is original
+
+
+class TestSdkEnvContextManager:
+    """Test ClaudeCodeCLI._sdk_env() environment variable management."""
+
+    def test_sdk_env_sets_and_restores(self, cli_instance):
+        """_sdk_env sets auth env vars and restores originals."""
+        original = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+
+        with cli_instance._sdk_env():
+            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
+
+        if original is None:
+            assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+        else:
+            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original
+
+    def test_sdk_env_restores_on_exception(self, cli_instance):
+        """_sdk_env restores env vars even when an exception occurs."""
+        original = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+
+        with pytest.raises(RuntimeError):
+            with cli_instance._sdk_env():
+                assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
+                raise RuntimeError("boom")
+
+        if original is None:
+            assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
+        else:
+            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original
+
+    def test_sdk_env_noop_when_no_vars(self):
+        """_sdk_env is a no-op when no auth env vars configured."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch("src.auth.validate_claude_code_auth") as mock_validate:
+                with patch("src.auth.auth_manager") as mock_auth:
+                    mock_validate.return_value = (True, {"method": "anthropic"})
+                    mock_auth.get_claude_code_env_vars.return_value = {}
+
+                    from src.claude_cli import ClaudeCodeCLI
+
+                    cli = ClaudeCodeCLI(cwd=temp_dir)
+
+        env_before = dict(os.environ)
+        with cli._sdk_env():
+            env_during = dict(os.environ)
+        env_after = dict(os.environ)
+
+        assert env_before == env_during
+        assert env_before == env_after
+
+
+class TestConfigureHelpers:
+    """Test the extracted _configure_* helper methods."""
+
+    def test_configure_thinking_adaptive(self, cli_instance):
+        """_configure_thinking sets adaptive mode."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.claude_cli.THINKING_MODE", "adaptive"):
+            cli_instance._configure_thinking(opts)
+        assert opts.thinking == {"type": "adaptive"}
+
+    def test_configure_thinking_enabled(self, cli_instance):
+        """_configure_thinking sets enabled mode with budget."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.claude_cli.THINKING_MODE", "enabled"):
+            with patch("src.claude_cli.THINKING_BUDGET_TOKENS", 8000):
+                cli_instance._configure_thinking(opts)
+        assert opts.thinking == {"type": "enabled", "budget_tokens": 8000}
+
+    def test_configure_thinking_disabled_noop(self, cli_instance):
+        """_configure_thinking does nothing for disabled mode."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.claude_cli.THINKING_MODE", "disabled"):
+            cli_instance._configure_thinking(opts)
+        assert not hasattr(opts, "thinking") or opts.thinking is None
+
+    def test_configure_tools_allowed_and_disallowed(self, cli_instance):
+        """_configure_tools sets both allowed and disallowed lists."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        cli_instance._configure_tools(opts, ["Bash", "Read"], ["Write"])
+        assert opts.allowed_tools == ["Bash", "Read"]
+        assert "Write" in opts.disallowed_tools
+
+    def test_configure_tools_none_inputs(self, cli_instance):
+        """_configure_tools with None inputs still applies base disallowed."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.claude_cli.DISALLOWED_SUBAGENT_TYPES", ["Agent(statusline-setup)"]):
+            cli_instance._configure_tools(opts, None, None)
+        # allowed_tools should be unchanged (SDK default, not set by _configure_tools)
+        assert opts.allowed_tools == [] or opts.allowed_tools is None
+        assert "Agent(statusline-setup)" in opts.disallowed_tools
+
+    def test_configure_session_resume(self, cli_instance):
+        """_configure_session sets resume when provided."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        cli_instance._configure_session(opts, session_id="sess-1", resume="resume-1")
+        assert opts.resume == "resume-1"
+        assert opts.extra_args.get("session-id") is None
+
+    def test_configure_session_id_only(self, cli_instance):
+        """_configure_session sets session-id when no resume."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        cli_instance._configure_session(opts, session_id="sess-1", resume=None)
+        assert opts.extra_args.get("session-id") == "sess-1"
+        assert not getattr(opts, "resume", None)
+
+    def test_configure_session_neither(self, cli_instance):
+        """_configure_session does nothing when both are None."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        cli_instance._configure_session(opts, session_id=None, resume=None)
+        assert not getattr(opts, "resume", None)
+        assert opts.extra_args.get("session-id") is None

@@ -2,6 +2,7 @@ import os
 import tempfile
 import atexit
 import shutil
+import contextlib
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 import logging
@@ -27,6 +28,16 @@ logger = logging.getLogger(__name__)
 
 
 class ClaudeCodeCLI:
+    """Gateway for Claude Agent SDK queries.
+
+    Each call to ``run_completion`` / ``verify_cli`` invokes the SDK's
+    ``query()`` function which is **single-use**: the underlying anyio
+    channel closes after the first response completes.  Never cache or
+    reuse the async generator returned by ``query()``; always create a
+    fresh call.  For multi-turn conversations use the ``resume``
+    parameter instead of attempting to reuse a previous query.
+    """
+
     def __init__(self, timeout: int = None, cwd: Optional[str] = None):
         if timeout is None:
             timeout = DEFAULT_TIMEOUT_MS
@@ -37,7 +48,6 @@ class ClaudeCodeCLI:
         # Otherwise create an isolated temp directory
         if cwd:
             self.cwd = Path(cwd)
-            # Check if the directory exists
             if not self.cwd.exists():
                 logger.error(f"ERROR: Specified working directory does not exist: {self.cwd}")
                 logger.error(
@@ -47,26 +57,66 @@ class ClaudeCodeCLI:
             else:
                 logger.info(f"Using CLAUDE_CWD: {self.cwd}")
         else:
-            # Create isolated temp directory (cross-platform)
             self.temp_dir = tempfile.mkdtemp(prefix="claude_code_workspace_")
             self.cwd = Path(self.temp_dir)
             logger.info(f"Using temporary isolated workspace: {self.cwd}")
-
-            # Register cleanup function to remove temp dir on exit
             atexit.register(self._cleanup_temp_dir)
 
-        # Import auth manager
         from src.auth import auth_manager, validate_claude_code_auth
 
-        # Validate authentication
         is_valid, auth_info = validate_claude_code_auth()
         if not is_valid:
             logger.warning(f"Claude Code authentication issues detected: {auth_info['errors']}")
         else:
             logger.info(f"Claude Code authentication method: {auth_info.get('method', 'unknown')}")
 
-        # Store auth environment variables for SDK
+        # Auth env vars for SDK – constant per instance, set before each query.
         self.claude_env_vars = auth_manager.get_claude_code_env_vars()
+
+    # ------------------------------------------------------------------
+    # SDK option helpers
+    # ------------------------------------------------------------------
+
+    def _configure_thinking(self, options: ClaudeAgentOptions) -> None:
+        """Apply thinking-mode configuration to *options*."""
+        if THINKING_MODE == "adaptive":
+            options.thinking = {"type": "adaptive"}
+        elif THINKING_MODE == "enabled":
+            options.thinking = {"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS}
+        elif THINKING_MODE != "disabled":
+            logger.warning(f"Unrecognized THINKING_MODE={THINKING_MODE!r}, thinking not configured")
+
+    def _configure_tools(
+        self,
+        options: ClaudeAgentOptions,
+        allowed_tools: Optional[List[str]],
+        disallowed_tools: Optional[List[str]],
+    ) -> None:
+        """Apply tool allow/disallow lists to *options*."""
+        if allowed_tools:
+            options.allowed_tools = allowed_tools
+        base_disallowed = list(DISALLOWED_SUBAGENT_TYPES)
+        if disallowed_tools:
+            base_disallowed.extend(disallowed_tools)
+        if base_disallowed:
+            options.disallowed_tools = base_disallowed
+
+    def _configure_session(
+        self,
+        options: ClaudeAgentOptions,
+        session_id: Optional[str],
+        resume: Optional[str],
+    ) -> None:
+        """Apply session / resume configuration to *options*.
+
+        ``resume`` takes priority: when set, the SDK picks up the existing
+        conversation by its session ID.  ``session_id`` is only used for
+        brand-new sessions (passed as ``--session-id`` via extra_args).
+        """
+        if resume:
+            options.resume = resume
+        elif session_id:
+            options.extra_args["session-id"] = session_id
 
     def _build_sdk_options(
         self,
@@ -84,13 +134,8 @@ class ClaudeCodeCLI:
         """Build ClaudeAgentOptions with common parameters."""
         options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd, setting_sources=["project"])
 
-        # Configure thinking mode
-        if THINKING_MODE == "adaptive":
-            options.thinking = {"type": "adaptive"}
-        elif THINKING_MODE == "enabled":
-            options.thinking = {"type": "enabled", "budget_tokens": THINKING_BUDGET_TOKENS}
-        elif THINKING_MODE != "disabled":
-            logger.warning(f"Unrecognized THINKING_MODE={THINKING_MODE!r}, thinking not configured")
+        self._configure_thinking(options)
+        self._configure_tools(options, allowed_tools, disallowed_tools)
 
         if model:
             options.model = model
@@ -98,13 +143,6 @@ class ClaudeCodeCLI:
             options.system_prompt = {"type": "text", "text": system_prompt}
         else:
             options.system_prompt = {"type": "preset", "preset": "claude_code"}
-        if allowed_tools:
-            options.allowed_tools = allowed_tools
-        base_disallowed = list(DISALLOWED_SUBAGENT_TYPES)
-        if disallowed_tools:
-            base_disallowed.extend(disallowed_tools)
-        if base_disallowed:
-            options.disallowed_tools = base_disallowed
         if permission_mode:
             options.permission_mode = permission_mode
         if output_format:
@@ -114,13 +152,13 @@ class ClaudeCodeCLI:
         if TOKEN_STREAMING:
             options.include_partial_messages = True
 
-        # Session management: new session uses --session-id, follow-up uses --resume
-        if resume:
-            options.resume = resume
-        elif session_id:
-            options.extra_args["session-id"] = session_id
+        self._configure_session(options, session_id, resume)
 
         return options
+
+    # ------------------------------------------------------------------
+    # SDK message conversion (SDK types -> plain dicts)
+    # ------------------------------------------------------------------
 
     # Order matters: subclasses before base classes for isinstance checks
     _TYPE_CHECKS = [
@@ -147,10 +185,43 @@ class ClaudeCodeCLI:
             return result
         return message
 
+    # ------------------------------------------------------------------
+    # Environment management
+    # ------------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def _sdk_env(self):
+        """Temporarily inject auth env vars for an SDK call.
+
+        The SDK reads authentication from ``os.environ``.  Because these
+        values are constant per instance the worst-case concurrent-write
+        scenario is benign (same values), but we still restore the originals
+        to keep tests hermetic.
+        """
+        if not self.claude_env_vars:
+            yield
+            return
+
+        original = {}
+        try:
+            for key, value in self.claude_env_vars.items():
+                original[key] = os.environ.get(key)
+                os.environ[key] = value
+            yield
+        finally:
+            for key, original_value in original.items():
+                if original_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = original_value
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     async def verify_cli(self) -> bool:
         """Verify Claude Agent SDK is working and authenticated."""
         try:
-            # Test SDK with a simple query
             logger.info("Testing Claude Agent SDK...")
 
             messages = []
@@ -163,23 +234,17 @@ class ClaudeCodeCLI:
                 ),
             ):
                 messages.append(message)
-                # Break early on first response to speed up verification
-                # Handle both dict and object types
-                msg_type = (
-                    getattr(message, "type", None)
-                    if hasattr(message, "type")
-                    else message.get("type")
-                    if isinstance(message, dict)
-                    else None
+                msg_type = getattr(message, "type", None) or (
+                    message.get("type") if isinstance(message, dict) else None
                 )
                 if msg_type == "assistant":
                     break
 
             if messages:
-                logger.info("✅ Claude Agent SDK verified successfully")
+                logger.info("Claude Agent SDK verified successfully")
                 return True
             else:
-                logger.warning("⚠️ Claude Agent SDK test returned no messages")
+                logger.warning("Claude Agent SDK test returned no messages")
                 return False
 
         except Exception as e:
@@ -195,7 +260,7 @@ class ClaudeCodeCLI:
         prompt: str,
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
-        stream: bool = True,
+        stream: bool = True,  # Accepted for caller compatibility; always yields chunks.
         max_turns: int = 10,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
@@ -205,22 +270,17 @@ class ClaudeCodeCLI:
         output_format: Optional[Dict[str, Any]] = None,
         mcp_servers: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Run Claude Agent using the Python SDK and yield response chunks.
+        """Run a single-use SDK query and yield converted message dicts.
 
         For multi-turn conversations:
-        - First turn: pass session_id (uses --session-id CLI flag)
-        - Follow-up turns: pass resume=session_id (uses --resume CLI flag)
+        - First turn: pass ``session_id`` (uses ``--session-id`` CLI flag)
+        - Follow-up turns: pass ``resume=<session_id>`` (uses ``--resume``)
+
+        The SDK ``query()`` function is always invoked fresh per call — see
+        the class docstring for why reuse is unsafe.
         """
-
         try:
-            # Set authentication environment variables (if any)
-            original_env = {}
-            if self.claude_env_vars:  # Only set env vars if we have any
-                for key, value in self.claude_env_vars.items():
-                    original_env[key] = os.environ.get(key)
-                    os.environ[key] = value
-
-            try:
+            with self._sdk_env():
                 options = self._build_sdk_options(
                     model=model,
                     system_prompt=system_prompt,
@@ -234,9 +294,7 @@ class ClaudeCodeCLI:
                     resume=resume,
                 )
 
-                # Run the query and yield messages
                 async for message in query(prompt=prompt, options=options):
-                    # Debug logging
                     logger.debug(f"Raw SDK message type: {type(message)}")
                     logger.debug(f"Raw SDK message: {message}")
 
@@ -244,24 +302,18 @@ class ClaudeCodeCLI:
                     logger.debug(f"Converted message: {converted}")
                     yield converted
 
-            finally:
-                # Restore original environment (if we changed anything)
-                if original_env:
-                    for key, original_value in original_env.items():
-                        if original_value is None:
-                            os.environ.pop(key, None)
-                        else:
-                            os.environ[key] = original_value
-
         except Exception as e:
             logger.error(f"Claude Agent SDK error: {e}")
-            # Yield error message in the expected format
             yield {
                 "type": "result",
                 "subtype": "error_during_execution",
                 "is_error": True,
                 "error_message": str(e),
             }
+
+    # ------------------------------------------------------------------
+    # Response parsing helpers
+    # ------------------------------------------------------------------
 
     def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Extract the assistant message from Claude Agent SDK messages.
@@ -279,7 +331,6 @@ class ClaudeCodeCLI:
                 if result and result.strip():
                     result_text = result
 
-        # If ResultMessage found, use it directly (avoids duplication)
         if result_text is not None:
             return result_text
 
@@ -309,13 +360,7 @@ class ClaudeCodeCLI:
     def estimate_token_usage(
         self, prompt: str, completion: str, model: Optional[str] = None
     ) -> Dict[str, int]:
-        """
-        Estimate token usage based on character count.
-
-        Uses rough approximation: ~4 characters per token for English text.
-        This is approximate and may not match actual tokenization.
-        """
-        # Rough approximation: 1 token ≈ 4 characters
+        """Estimate token usage (~4 characters per token)."""
         prompt_tokens = max(1, len(prompt) // 4)
         completion_tokens = max(1, len(completion) // 4)
 

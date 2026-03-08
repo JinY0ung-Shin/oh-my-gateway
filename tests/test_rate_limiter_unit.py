@@ -134,6 +134,72 @@ class TestRateLimitExceededHandler:
         assert "Retry-After" in response.headers
         assert response.headers["Retry-After"] == "60"
 
+    def test_extracts_retry_after_from_detail_minute(self):
+        """Extracts window time (not request count) from 'N per M minute'."""
+        from src.rate_limiter import rate_limit_exceeded_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_exc = MagicMock()
+        mock_exc.detail = "Rate limit exceeded: 30 per 1 minute"
+
+        response = rate_limit_exceeded_handler(mock_request, mock_exc)
+        assert response.headers["Retry-After"] == "60"
+
+    def test_extracts_retry_after_multi_minute(self):
+        """Parses 'N per M minute' where M > 1."""
+        from src.rate_limiter import rate_limit_exceeded_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_exc = MagicMock()
+        mock_exc.detail = "Rate limit exceeded: 2 per 5 minute"
+
+        response = rate_limit_exceeded_handler(mock_request, mock_exc)
+        assert response.headers["Retry-After"] == "300"
+
+    def test_extracts_retry_after_seconds(self):
+        """Parses 'N per M second'."""
+        from src.rate_limiter import rate_limit_exceeded_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_exc = MagicMock()
+        mock_exc.detail = "Rate limit exceeded: 100 per 60 second"
+
+        response = rate_limit_exceeded_handler(mock_request, mock_exc)
+        assert response.headers["Retry-After"] == "60"
+
+    def test_extracts_retry_after_hour(self):
+        """Parses 'N per M hour'."""
+        from src.rate_limiter import rate_limit_exceeded_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_exc = MagicMock()
+        mock_exc.detail = "Rate limit exceeded: 1000 per 1 hour"
+
+        response = rate_limit_exceeded_handler(mock_request, mock_exc)
+        assert response.headers["Retry-After"] == "3600"
+
+    def test_defaults_retry_after_when_no_detail(self):
+        """Defaults to 60 when exception has no detail."""
+        from src.rate_limiter import rate_limit_exceeded_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_exc = MagicMock()
+        mock_exc.detail = None
+
+        response = rate_limit_exceeded_handler(mock_request, mock_exc)
+        assert response.headers["Retry-After"] == "60"
+
+    def test_defaults_retry_after_when_unparseable(self):
+        """Defaults to 60 when detail doesn't match expected format."""
+        from src.rate_limiter import rate_limit_exceeded_handler
+
+        mock_request = MagicMock(spec=Request)
+        mock_exc = MagicMock()
+        mock_exc.detail = "Some unexpected error format"
+
+        response = rate_limit_exceeded_handler(mock_request, mock_exc)
+        assert response.headers["Retry-After"] == "60"
+
 
 class TestGetRateLimitForEndpoint:
     """Test get_rate_limit_for_endpoint()"""

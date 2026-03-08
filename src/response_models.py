@@ -1,7 +1,7 @@
 """Pydantic models for OpenAI Responses API compatibility."""
 
 import time
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
 
@@ -36,18 +36,18 @@ class ResponseCreateRequest(BaseModel):
 class ContentPart(BaseModel):
     """A content part within an output item."""
 
-    type: str = "output_text"
+    type: Literal["output_text"] = "output_text"
     text: str = ""
-    annotations: list = Field(default_factory=list)
+    annotations: List[Any] = Field(default_factory=list)
 
 
 class OutputItem(BaseModel):
     """An output item (message) in the response."""
 
     id: str
-    type: str = "message"
-    role: str = "assistant"
-    status: str = "completed"
+    type: Literal["message"] = "message"
+    role: Literal["assistant"] = "assistant"
+    status: Literal["completed", "in_progress", "failed"] = "completed"
     content: List[ContentPart] = Field(default_factory=list)
 
 
@@ -58,22 +58,22 @@ class ResponseUsage(BaseModel):
     output_tokens: int = 0
 
 
-class ResponseObject(BaseModel):
-    """The response object returned by POST /v1/responses."""
-
-    id: str
-    object: str = "response"
-    created_at: int = Field(default_factory=lambda: int(time.time()))
-    status: str = "completed"
-    model: str = ""
-    output: List[OutputItem] = Field(default_factory=list)
-    usage: ResponseUsage = Field(default_factory=ResponseUsage)
-    metadata: Dict[str, str] = Field(default_factory=dict)
-    error: Optional["ResponseErrorDetail"] = None
-
-
 class ResponseErrorDetail(BaseModel):
     """Error detail when status is 'failed'."""
 
     code: str
     message: str
+
+
+class ResponseObject(BaseModel):
+    """The response object returned by POST /v1/responses."""
+
+    id: str
+    object: Literal["response"] = "response"
+    created_at: int = Field(default_factory=lambda: int(time.time()))
+    status: Literal["completed", "in_progress", "failed"] = "completed"
+    model: str = ""
+    output: List[OutputItem] = Field(default_factory=list)
+    usage: ResponseUsage = Field(default_factory=ResponseUsage)
+    metadata: Dict[str, str] = Field(default_factory=dict)
+    error: Optional[ResponseErrorDetail] = None

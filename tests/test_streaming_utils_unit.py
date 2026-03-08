@@ -10,7 +10,17 @@ import pytest
 
 from src.models import ChatCompletionRequest, Message
 from src.response_models import OutputItem, ResponseObject
-from src.streaming_utils import extract_sdk_usage, make_response_sse, stream_chunks, stream_response_chunks
+from src.streaming_utils import (
+    ToolUseAccumulator,
+    extract_sdk_usage,
+    extract_user_tool_results,
+    format_chunk_content,
+    make_response_sse,
+    make_sse,
+    map_stop_reason,
+    stream_chunks,
+    stream_response_chunks,
+)
 
 
 def _parse_chat_sse(line: str) -> dict:
@@ -23,6 +33,24 @@ def _parse_response_sse(line: str) -> tuple[str, dict]:
     assert event_line.startswith("event: ")
     assert data_line.startswith("data: ")
     return event_line[len("event: ") :], json.loads(data_line[len("data: ") :])
+
+
+class TestMakeSSEFinishReason:
+    def test_tool_calls_finish_reason_serializes(self):
+        """make_sse with finish_reason='tool_calls' must not raise ValidationError."""
+        line = make_sse("req-1", "claude-test", {}, finish_reason="tool_calls")
+        parsed = _parse_chat_sse(line)
+        assert parsed["choices"][0]["finish_reason"] == "tool_calls"
+
+    def test_stop_finish_reason_serializes(self):
+        line = make_sse("req-2", "claude-test", {"content": ""}, finish_reason="stop")
+        parsed = _parse_chat_sse(line)
+        assert parsed["choices"][0]["finish_reason"] == "stop"
+
+    def test_length_finish_reason_serializes(self):
+        line = make_sse("req-3", "claude-test", {}, finish_reason="length")
+        parsed = _parse_chat_sse(line)
+        assert parsed["choices"][0]["finish_reason"] == "length"
 
 
 class TestMakeResponseSSE:
@@ -673,3 +701,176 @@ async def test_stream_response_chunks_task_events_as_custom_sse():
     assert parsed[-1][0] == "response.failed"
     assert parsed[-1][1]["response"]["error"]["code"] == "empty_response"
     assert stream_result["success"] is False
+
+
+# ==================== Tests for refactored helpers ====================
+
+
+class TestMapStopReason:
+    def test_max_tokens_returns_length(self):
+        assert map_stop_reason("max_tokens") == "length"
+
+    def test_tool_use_returns_tool_calls(self):
+        assert map_stop_reason("tool_use") == "tool_calls"
+
+    def test_end_turn_returns_stop(self):
+        assert map_stop_reason("end_turn") == "stop"
+
+    def test_none_returns_stop(self):
+        assert map_stop_reason(None) == "stop"
+
+    def test_unknown_returns_stop(self):
+        assert map_stop_reason("some_unknown_reason") == "stop"
+
+
+class TestToolUseAccumulator:
+    def test_non_stream_event_returns_not_handled(self):
+        acc = ToolUseAccumulator()
+        handled, result = acc.process_stream_event({"type": "assistant"})
+        assert handled is False
+        assert result is None
+
+    def test_accumulates_and_completes_tool_use(self):
+        acc = ToolUseAccumulator()
+
+        # content_block_start
+        handled, result = acc.process_stream_event({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "tool-1", "name": "Read"},
+            },
+        })
+        assert handled is True
+        assert result is None
+
+        # content_block_delta (input_json_delta)
+        handled, result = acc.process_stream_event({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": '{"path":"/tmp/a.txt"}'},
+            },
+        })
+        assert handled is True
+        assert result is None
+
+        # content_block_stop
+        handled, result = acc.process_stream_event({
+            "type": "stream_event",
+            "event": {"type": "content_block_stop", "index": 0},
+        })
+        assert handled is True
+        assert result is not None
+        assert result["name"] == "Read"
+        assert result["input"] == {"path": "/tmp/a.txt"}
+        assert "parent_tool_use_id" not in result
+
+    def test_tracks_incomplete_blocks(self):
+        acc = ToolUseAccumulator()
+        acc.process_stream_event({
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "tool-1", "name": "Write"},
+            },
+        })
+        assert acc.has_incomplete is True
+        assert len(acc.incomplete_keys) == 1
+
+    def test_subagent_text_delta_is_skipped(self):
+        acc = ToolUseAccumulator()
+        handled, result = acc.process_stream_event({
+            "type": "stream_event",
+            "parent_tool_use_id": "parent-1",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "sub-agent output"},
+            },
+        })
+        assert handled is True
+        assert result is None
+
+    def test_includes_parent_tool_use_id_when_present(self):
+        acc = ToolUseAccumulator()
+        acc.process_stream_event({
+            "type": "stream_event",
+            "parent_tool_use_id": "parent-1",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "tool-1", "name": "Read"},
+            },
+        })
+        _, result = acc.process_stream_event({
+            "type": "stream_event",
+            "parent_tool_use_id": "parent-1",
+            "event": {"type": "content_block_stop", "index": 0},
+        })
+        assert result["parent_tool_use_id"] == "parent-1"
+
+
+class TestExtractUserToolResults:
+    def test_extracts_tool_results_from_content(self):
+        chunk = {
+            "type": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tool-1", "content": "done"},
+                {"type": "text", "text": "ignored"},
+            ],
+        }
+        results, parent_id = extract_user_tool_results(chunk)
+        assert len(results) == 1
+        assert results[0]["tool_use_id"] == "tool-1"
+        assert parent_id is None
+
+    def test_extracts_from_message_content_fallback(self):
+        chunk = {
+            "type": "user",
+            "content": "ignored-string",
+            "message": {
+                "content": [{"type": "tool_result", "tool_use_id": "tool-2", "content": "ok"}]
+            },
+        }
+        results, parent_id = extract_user_tool_results(chunk)
+        assert len(results) == 1
+        assert results[0]["tool_use_id"] == "tool-2"
+
+    def test_returns_empty_when_no_tool_results(self):
+        chunk = {"type": "user", "content": [{"type": "text", "text": "hi"}]}
+        results, _ = extract_user_tool_results(chunk)
+        assert results == []
+
+    def test_returns_parent_id(self):
+        chunk = {
+            "type": "user",
+            "parent_tool_use_id": "parent-1",
+            "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "x"}],
+        }
+        results, parent_id = extract_user_tool_results(chunk)
+        assert parent_id == "parent-1"
+
+
+class TestFormatChunkContent:
+    def test_formats_text_blocks(self):
+        chunk = {"content": [{"type": "text", "text": "Hello world"}]}
+        assert format_chunk_content(chunk, content_sent=False) == "Hello world"
+
+    def test_returns_result_string(self):
+        chunk = {"subtype": "success", "result": "Done"}
+        assert format_chunk_content(chunk, content_sent=False) == "Done"
+
+    def test_returns_none_for_result_when_content_already_sent(self):
+        chunk = {"subtype": "success", "result": "Done"}
+        assert format_chunk_content(chunk, content_sent=True) is None
+
+    def test_returns_none_for_whitespace_only(self):
+        chunk = {"content": [{"type": "text", "text": "   "}]}
+        assert format_chunk_content(chunk, content_sent=False) is None
+
+    def test_returns_none_for_empty_chunk(self):
+        chunk = {"type": "metadata"}
+        assert format_chunk_content(chunk, content_sent=False) is None

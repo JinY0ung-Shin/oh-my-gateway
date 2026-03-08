@@ -40,7 +40,6 @@ class TestSession:
         session = Session(session_id="test-123")
         original_accessed = session.last_accessed
 
-        # Small delay to ensure time difference
         import time
 
         time.sleep(0.01)
@@ -84,7 +83,7 @@ class TestSession:
 
         assert session.last_accessed >= original_accessed
 
-    def test_get_all_messages_returns_copy(self):
+    def test_get_all_messages_returns_all(self):
         """get_all_messages() returns all messages."""
         session = Session(session_id="test-123")
         msg1 = Message(role="user", content="Hello")
@@ -96,6 +95,16 @@ class TestSession:
         assert len(messages) == 2
         assert messages[0].content == "Hello"
         assert messages[1].content == "Hi"
+
+    def test_get_all_messages_returns_copy(self):
+        """get_all_messages() returns a shallow copy — mutating it doesn't affect the session."""
+        session = Session(session_id="test-123")
+        session.add_messages([Message(role="user", content="Hello")])
+
+        returned = session.get_all_messages()
+        returned.append(Message(role="user", content="Ghost"))
+
+        assert len(session.messages) == 1, "Internal list should not be modified"
 
     def test_is_expired_false_for_new_session(self):
         """Newly created session is not expired."""
@@ -295,17 +304,17 @@ class TestSessionManager:
 
         assert len(manager.sessions) == 0
 
-    @pytest.mark.asyncio
     async def test_cleanup_expired_sessions(self, manager):
         """cleanup_expired_sessions() removes only expired sessions."""
         manager.get_or_create_session("active")
         expired = manager.get_or_create_session("expired")
         expired.expires_at = utc_now() - timedelta(hours=1)
 
-        await manager.cleanup_expired_sessions()
+        removed = await manager.cleanup_expired_sessions()
 
         assert "active" in manager.sessions
         assert "expired" not in manager.sessions
+        assert removed == 1
 
 
 class TestSessionManagerAsync:
@@ -316,7 +325,6 @@ class TestSessionManagerAsync:
         """Create a fresh SessionManager for each test."""
         return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
 
-    @pytest.mark.asyncio
     async def test_start_cleanup_task_creates_task(self, manager):
         """start_cleanup_task() creates an async task when loop is running."""
         # Start the cleanup task
@@ -328,7 +336,6 @@ class TestSessionManagerAsync:
         # Clean up
         manager.shutdown()
 
-    @pytest.mark.asyncio
     async def test_start_cleanup_task_idempotent(self, manager):
         """start_cleanup_task() only creates one task."""
         manager.start_cleanup_task()
@@ -395,6 +402,11 @@ class TestSessionTurnCounterAndLock:
         session = Session(session_id="test-123")
         assert hasattr(session, "lock")
         assert isinstance(session.lock, asyncio.Lock)
+
+    def test_session_lock_excluded_from_repr(self):
+        """Per-session lock should not appear in repr."""
+        session = Session(session_id="test-123")
+        assert "lock=" not in repr(session)
 
 
 class TestEnsureUtc:
@@ -474,7 +486,6 @@ class TestAsyncShutdown:
     def manager(self):
         return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
 
-    @pytest.mark.asyncio
     async def test_async_shutdown_cancels_cleanup_task(self, manager):
         """async_shutdown() cancels the cleanup task if one exists."""
         manager.start_cleanup_task()
@@ -489,7 +500,6 @@ class TestAsyncShutdown:
         assert task.cancelled()
         assert len(manager.sessions) == 0
 
-    @pytest.mark.asyncio
     async def test_async_shutdown_clears_all_sessions(self, manager):
         """async_shutdown() clears all sessions."""
         manager.get_or_create_session("s1")
@@ -501,7 +511,6 @@ class TestAsyncShutdown:
 
         assert len(manager.sessions) == 0
 
-    @pytest.mark.asyncio
     async def test_async_shutdown_works_without_cleanup_task(self, manager):
         """async_shutdown() works even when _cleanup_task is None."""
         assert manager._cleanup_task is None
@@ -586,7 +595,6 @@ class TestGetStatsAllExpired:
 class TestCleanupExpiredSessionsMixed:
     """Test cleanup_expired_sessions() with a mix of expired and active."""
 
-    @pytest.mark.asyncio
     async def test_cleanup_removes_only_expired_keeps_active(self):
         """cleanup_expired_sessions() removes expired, keeps active sessions intact."""
         manager = SessionManager(default_ttl_minutes=60)
@@ -604,8 +612,9 @@ class TestCleanupExpiredSessionsMixed:
 
         assert len(manager.sessions) == 5
 
-        await manager.cleanup_expired_sessions()
+        removed = await manager.cleanup_expired_sessions()
 
+        assert removed == 2
         assert len(manager.sessions) == 3
         assert "active-1" in manager.sessions
         assert "active-2" in manager.sessions
@@ -615,3 +624,38 @@ class TestCleanupExpiredSessionsMixed:
 
         # Verify active session data is preserved
         assert len(manager.sessions["active-2"].messages) == 1
+
+    async def test_cleanup_returns_zero_when_nothing_expired(self):
+        """cleanup_expired_sessions() returns 0 when no sessions are expired."""
+        manager = SessionManager(default_ttl_minutes=60)
+        manager.get_or_create_session("active-1")
+        manager.get_or_create_session("active-2")
+
+        removed = await manager.cleanup_expired_sessions()
+
+        assert removed == 0
+        assert len(manager.sessions) == 2
+
+
+class TestPerSessionLock:
+    """Test that per-session asyncio.Lock can be used for concurrent safety."""
+
+    async def test_per_session_lock_serializes_access(self):
+        """Concurrent coroutines using session.lock don't interleave."""
+        session = Session(session_id="lock-test")
+        order = []
+
+        async def writer(label: str):
+            async with session.lock:
+                order.append(f"{label}-start")
+                await asyncio.sleep(0.01)
+                session.add_messages([Message(role="user", content=label)])
+                order.append(f"{label}-end")
+
+        await asyncio.gather(writer("A"), writer("B"))
+
+        # One writer should fully complete before the other starts
+        assert order[0].endswith("-start")
+        assert order[1].endswith("-end")
+        assert order[0][0] == order[1][0]  # Same label for start/end pair
+        assert len(session.messages) == 2

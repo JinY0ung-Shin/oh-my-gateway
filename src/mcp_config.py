@@ -51,6 +51,13 @@ def load_mcp_config() -> McpServersDict:
 
     servers = raw.get("mcpServers", raw)
 
+    # Required fields per server type
+    _REQUIRED_FIELDS = {
+        "stdio": ("command",),
+        "sse": ("url",),
+        "http": ("url",),
+    }
+
     validated: McpServersDict = {}
     for name, config in servers.items():
         if not isinstance(config, dict):
@@ -59,6 +66,13 @@ def load_mcp_config() -> McpServersDict:
         server_type = config.get("type", "stdio")
         if server_type not in ALLOWED_TYPES:
             logger.warning(f"Skipping MCP server '{name}': unsupported type '{server_type}'")
+            continue
+        required = _REQUIRED_FIELDS.get(server_type, ())
+        missing = [f for f in required if not config.get(f)]
+        if missing:
+            logger.warning(
+                f"Skipping MCP server '{name}': missing required field(s) {missing} for type '{server_type}'"
+            )
             continue
         validated[name] = config
 

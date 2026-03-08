@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Optional
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -37,7 +38,19 @@ def create_rate_limiter() -> Optional[Limiter]:
 
 def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
     """Custom rate limit exceeded handler that returns JSON error response."""
+    # Try to extract actual retry_after from the exception detail
     retry_after = 60
+    detail = getattr(exc, "detail", "") or ""
+    if isinstance(detail, str):
+        # slowapi detail format: "Rate limit exceeded: N per M unit"
+        # N is the request count, M+unit is the window. Parse the window as retry_after.
+        unit_seconds = {"second": 1, "minute": 60, "hour": 3600, "day": 86400}
+        match = re.search(r"(\d+)\s+per\s+(\d+)\s+(second|minute|hour|day)", detail)
+        if match:
+            period = int(match.group(2))
+            unit = match.group(3)
+            retry_after = period * unit_seconds.get(unit, 60)
+
     response = JSONResponse(
         status_code=429,
         content={

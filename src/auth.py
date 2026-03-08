@@ -1,3 +1,4 @@
+import hmac
 import os
 import logging
 from typing import Optional, Dict, Any, Tuple
@@ -173,8 +174,8 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verify the API key
-    if credentials.credentials != active_api_key:
+    # Verify the API key (timing-safe comparison to prevent timing attacks)
+    if not hmac.compare_digest(credentials.credentials, active_api_key):
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",

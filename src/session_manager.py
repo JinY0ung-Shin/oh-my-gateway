@@ -1,3 +1,21 @@
+"""
+Session management for chat-session history.
+
+This module manages in-memory conversation sessions with TTL-based expiry
+and automatic cleanup.  It handles **chat-session message history** only;
+the ``previous_response_id`` chaining used by ``/v1/responses`` is managed
+at the endpoint layer in ``src/main.py``.
+
+Concurrency model
+-----------------
+* ``SessionManager.lock`` (threading.Lock) guards the ``sessions`` dict for
+  thread-safe CRUD.  Dict operations are O(1) so holding the lock briefly
+  from async handlers is acceptable under CPython's GIL.
+* ``Session.lock`` (asyncio.Lock) is a **per-session** lock that callers
+  may acquire for multi-step atomic operations on a single session (e.g.
+  read-modify-write across concurrent requests to the same session_id).
+"""
+
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
@@ -25,7 +43,12 @@ def _ensure_utc(dt: datetime) -> datetime:
 
 @dataclass
 class Session:
-    """Represents a conversation session with message history."""
+    """Represents a conversation session with message history.
+
+    Each session tracks its own TTL, message history, and turn count.
+    The ``lock`` field is an ``asyncio.Lock`` that callers can acquire
+    for safe multi-step operations on the session under concurrency.
+    """
 
     session_id: str
     ttl_minutes: int = 60
@@ -34,9 +57,9 @@ class Session:
     last_accessed: datetime = field(default_factory=_utcnow)
     expires_at: Optional[datetime] = field(default=None)
     turn_counter: int = 0
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         self.created_at = _ensure_utc(self.created_at)
         self.last_accessed = _ensure_utc(self.last_accessed)
         if self.expires_at is None:
@@ -44,27 +67,27 @@ class Session:
         else:
             self.expires_at = _ensure_utc(self.expires_at)
 
-    def touch(self):
+    def touch(self) -> None:
         """Update last accessed time and extend expiration."""
         now = _utcnow()
         self.last_accessed = now
         self.expires_at = now + timedelta(minutes=self.ttl_minutes)
 
-    def add_messages(self, messages: List[Message]):
-        """Add new messages to the session."""
+    def add_messages(self, messages: List[Message]) -> None:
+        """Add new messages to the session and refresh TTL."""
         self.messages.extend(messages)
         self.touch()
 
     def get_all_messages(self) -> List[Message]:
-        """Get all messages in the session."""
-        return self.messages
+        """Return a shallow copy of the session's message list."""
+        return list(self.messages)
 
     def is_expired(self) -> bool:
         """Check if the session has expired."""
         return _utcnow() > self.expires_at
 
     def to_session_info(self) -> SessionInfo:
-        """Convert to SessionInfo model."""
+        """Convert to SessionInfo model for API responses."""
         return SessionInfo(
             session_id=self.session_id,
             created_at=self.created_at,
@@ -75,21 +98,54 @@ class Session:
 
 
 class SessionManager:
-    """Manages conversation sessions with automatic cleanup."""
+    """Manages conversation sessions with automatic cleanup.
 
-    def __init__(self, default_ttl_minutes: int = 60, cleanup_interval_minutes: int = 5):
+    This class handles chat-session lifecycle (create, access, expire, delete)
+    and a periodic background cleanup task.  It does **not** manage the
+    ``previous_response_id`` chain used by the Responses API surface.
+    """
+
+    def __init__(self, default_ttl_minutes: int = 60, cleanup_interval_minutes: int = 5) -> None:
         self.sessions: Dict[str, Session] = {}
-        self.lock = Lock()
-        self.default_ttl_minutes = default_ttl_minutes
-        self.cleanup_interval_minutes = cleanup_interval_minutes
-        self._cleanup_task = None
+        self.lock: Lock = Lock()
+        self.default_ttl_minutes: int = default_ttl_minutes
+        self.cleanup_interval_minutes: int = cleanup_interval_minutes
+        self._cleanup_task: Optional[asyncio.Task[None]] = None
 
-    def start_cleanup_task(self):
-        """Start the automatic cleanup task - call this after the event loop is running."""
+    # ------------------------------------------------------------------
+    # Internal helpers (caller must hold self.lock)
+    # ------------------------------------------------------------------
+
+    def _remove_if_expired(self, session_id: str) -> bool:
+        """Remove *session_id* if present and expired.
+
+        Returns ``True`` when the session was expired and removed.
+        """
+        session = self.sessions.get(session_id)
+        if session is not None and session.is_expired():
+            del self.sessions[session_id]
+            logger.info(f"Removed expired session: {session_id}")
+            return True
+        return False
+
+    def _purge_all_expired(self) -> int:
+        """Remove every expired session.  Returns the count removed."""
+        expired = [sid for sid, s in self.sessions.items() if s.is_expired()]
+        for sid in expired:
+            del self.sessions[sid]
+            logger.info(f"Cleaned up expired session: {sid}")
+        return len(expired)
+
+    # ------------------------------------------------------------------
+    # Cleanup task
+    # ------------------------------------------------------------------
+
+    def start_cleanup_task(self) -> None:
+        """Start the automatic cleanup task — call after the event loop is running."""
         if self._cleanup_task is not None:
             return  # Already started
 
-        async def cleanup_loop():
+        async def cleanup_loop() -> None:
             try:
                 while True:
                     await asyncio.sleep(self.cleanup_interval_minutes * 60)
@@ -107,16 +163,17 @@ class SessionManager:
         except RuntimeError:
             logger.warning("No running event loop, automatic session cleanup disabled")
 
-    async def cleanup_expired_sessions(self):
-        """Remove expired sessions."""
+    async def cleanup_expired_sessions(self) -> int:
+        """Remove expired sessions.  Returns the count of sessions removed."""
         with self.lock:
-            expired = [sid for sid, s in self.sessions.items() if s.is_expired()]
-            for sid in expired:
-                del self.sessions[sid]
-                logger.info(f"Cleaned up expired session: {sid}")
+            return self._purge_all_expired()
 
-    async def async_shutdown(self):
-        """Async shutdown: clear all sessions."""
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def async_shutdown(self) -> None:
+        """Async shutdown: cancel cleanup task and clear all sessions."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
 
@@ -124,89 +181,95 @@ class SessionManager:
             self.sessions.clear()
             logger.info("Session manager async shutdown complete")
 
+    def shutdown(self) -> None:
+        """Synchronous shutdown: cancel cleanup task and clear all sessions."""
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+
+        with self.lock:
+            self.sessions.clear()
+            logger.info("Session manager shutdown complete")
+
+    # ------------------------------------------------------------------
+    # Session CRUD
+    # ------------------------------------------------------------------
+
     def get_or_create_session(self, session_id: str) -> Session:
-        """Get existing session or create a new one."""
+        """Get existing session or create a new one.
+
+        If the session exists but is expired it is replaced with a fresh one.
+        """
         with self.lock:
             if session_id in self.sessions:
-                session = self.sessions[session_id]
-                if session.is_expired():
+                if self._remove_if_expired(session_id):
                     logger.info(f"Session {session_id} expired, creating new session")
-                    del self.sessions[session_id]
-                    session = Session(session_id=session_id, ttl_minutes=self.default_ttl_minutes)
-                    self.sessions[session_id] = session
                 else:
-                    session.touch()
-            else:
-                session = Session(session_id=session_id, ttl_minutes=self.default_ttl_minutes)
-                self.sessions[session_id] = session
-                logger.info(f"Created new session: {session_id}")
+                    self.sessions[session_id].touch()
+                    return self.sessions[session_id]
 
-        return session
+            session = Session(session_id=session_id, ttl_minutes=self.default_ttl_minutes)
+            self.sessions[session_id] = session
+            logger.info(f"Created new session: {session_id}")
+            return session
 
     def get_session(self, session_id: str) -> Optional[Session]:
-        """Get existing session without creating new one."""
-        with self.lock:
-            session = self.sessions.get(session_id)
-            if session and not session.is_expired():
-                session.touch()
-                return session
-            elif session and session.is_expired():
-                del self.sessions[session_id]
-                logger.info(f"Removed expired session: {session_id}")
+        """Get existing session without creating a new one.
 
-        return None
+        Returns ``None`` when the session does not exist or is expired.
+        """
+        with self.lock:
+            self._remove_if_expired(session_id)
+            session = self.sessions.get(session_id)
+            if session is not None:
+                session.touch()
+            return session
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session."""
+        """Delete a session.  Returns ``True`` if it was found and removed."""
         with self.lock:
-            if session_id in self.sessions:
-                del self.sessions[session_id]
-                logger.info(f"Deleted session: {session_id}")
-            else:
+            if session_id not in self.sessions:
                 return False
-
-        return True
+            del self.sessions[session_id]
+            logger.info(f"Deleted session: {session_id}")
+            return True
 
     def list_sessions(self) -> List[SessionInfo]:
-        """List all active sessions."""
+        """List all active (non-expired) sessions."""
         with self.lock:
-            expired_sessions = [
-                session_id for session_id, session in self.sessions.items() if session.is_expired()
-            ]
-            for session_id in expired_sessions:
-                del self.sessions[session_id]
-
+            self._purge_all_expired()
             return [session.to_session_info() for session in self.sessions.values()]
+
+    # ------------------------------------------------------------------
+    # Message handling
+    # ------------------------------------------------------------------
 
     def process_messages(
         self, messages: List[Message], session_id: Optional[str] = None
     ) -> Tuple[List[Message], Optional[str]]:
-        """
-        Process messages for a request, handling both stateless and session modes.
+        """Process messages for a request.
 
-        Returns:
-            Tuple of (all_messages_for_claude, actual_session_id_used)
+        In stateless mode (*session_id* is ``None``) the messages are returned
+        as-is.  In session mode the messages are appended to the session's
+        history and the full history is returned.
+
+        Returns ``(all_messages, actual_session_id)``.
         """
         if session_id is None:
-            # Stateless mode - just return the messages as-is
             return messages, None
 
-        # Session mode - get or create session and merge messages
         session = self.get_or_create_session(session_id)
-
-        # Add new messages to session
         session.add_messages(messages)
-
-        # Return all messages in the session for Claude
         all_messages = session.get_all_messages()
 
         logger.info(
-            f"Session {session_id}: processing {len(messages)} new messages, {len(all_messages)} total"
+            f"Session {session_id}: processing {len(messages)} new messages, "
+            f"{len(all_messages)} total"
         )
-
         return all_messages, session_id
 
-    def add_assistant_response(self, session_id: Optional[str], assistant_message: Message):
+    def add_assistant_response(
+        self, session_id: Optional[str], assistant_message: Message
+    ) -> None:
         """Add assistant response to session if session mode is active."""
         if session_id is None:
             return
@@ -216,27 +279,28 @@ class SessionManager:
             session.add_messages([assistant_message])
             logger.info(f"Added assistant response to session {session_id}")
 
+    # ------------------------------------------------------------------
+    # Stats
+    # ------------------------------------------------------------------
+
     def get_stats(self) -> Dict[str, int]:
         """Get session manager statistics."""
         with self.lock:
-            active_sessions = sum(1 for s in self.sessions.values() if not s.is_expired())
-            expired_sessions = sum(1 for s in self.sessions.values() if s.is_expired())
-            total_messages = sum(len(s.messages) for s in self.sessions.values())
+            active = 0
+            expired = 0
+            total_messages = 0
+            for s in self.sessions.values():
+                if s.is_expired():
+                    expired += 1
+                else:
+                    active += 1
+                total_messages += len(s.messages)
 
             return {
-                "active_sessions": active_sessions,
-                "expired_sessions": expired_sessions,
+                "active_sessions": active,
+                "expired_sessions": expired,
                 "total_messages": total_messages,
             }
-
-    def shutdown(self):
-        """Shutdown the session manager and cleanup tasks."""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-
-        with self.lock:
-            self.sessions.clear()
-            logger.info("Session manager shutdown complete")
 
 
 # Global session manager instance

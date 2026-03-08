@@ -365,6 +365,72 @@ class TestGetApiKey:
                 assert result in ["env-key", "runtime-key"]
 
 
+class TestCleanStaleEnvVars:
+    """Test clean_stale_env_vars()"""
+
+    def test_removes_stale_bedrock_vars(self):
+        """Removes stale Bedrock/Vertex env vars from os.environ."""
+        stale_vars = {
+            "CLAUDE_CODE_USE_BEDROCK": "1",
+            "CLAUDE_CODE_USE_VERTEX": "1",
+            "ANTHROPIC_VERTEX_PROJECT_ID": "test-project",
+            "CLOUD_ML_REGION": "us-central1",
+        }
+        with patch.dict(os.environ, stale_vars, clear=False):
+            import src.auth
+
+            importlib.reload(src.auth)
+            # Verify vars exist before cleanup
+            for var in stale_vars:
+                assert var in os.environ
+            src.auth.auth_manager.clean_stale_env_vars()
+            # Verify all removed
+            for var in stale_vars:
+                assert var not in os.environ
+
+    def test_no_error_when_stale_vars_absent(self):
+        """Does not error when stale vars are not present."""
+        env_copy = {
+            k: v
+            for k, v in os.environ.items()
+            if k not in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
+                         "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION"]
+        }
+        with patch.dict(os.environ, env_copy, clear=True):
+            import src.auth
+
+            importlib.reload(src.auth)
+            # Should not raise
+            src.auth.auth_manager.clean_stale_env_vars()
+
+
+class TestTimingSafeComparison:
+    """Verify API key comparison uses timing-safe method."""
+
+    @pytest.mark.asyncio
+    async def test_uses_hmac_compare_digest(self):
+        """verify_api_key uses hmac.compare_digest for comparison."""
+        with patch.dict(os.environ, {"API_KEY": "test-key"}):
+            import src.auth
+
+            importlib.reload(src.auth)
+
+            from fastapi.security import HTTPAuthorizationCredentials
+
+            mock_request = MagicMock()
+            credentials = HTTPAuthorizationCredentials(
+                scheme="Bearer", credentials="wrong-key"
+            )
+
+            with patch.object(src.auth.auth_manager, "get_api_key", return_value="test-key"):
+                with patch("src.auth.hmac") as mock_hmac:
+                    mock_hmac.compare_digest.return_value = False
+                    with pytest.raises(HTTPException) as exc_info:
+                        await src.auth.verify_api_key(mock_request, credentials)
+                    assert exc_info.value.status_code == 401
+                    mock_hmac.compare_digest.assert_called_once_with("wrong-key", "test-key")
+
+
 # Reset module state after tests
 @pytest.fixture(autouse=True)
 def reset_auth_module():
