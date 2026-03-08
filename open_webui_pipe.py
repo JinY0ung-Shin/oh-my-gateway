@@ -29,7 +29,7 @@ class ChainResetError(Exception):
 class Pipe:
     class Valves(BaseModel):
         BASE_URL: str = Field(
-            default="http://192.168.0.103:8000",
+            default="http://localhost:8000",
             description="Claude Code OpenAI Wrapper server URL",
         )
         API_KEY: str = Field(
@@ -274,6 +274,8 @@ class Pipe:
 
                 completed = False
                 line_count = 0
+                # Track tool_use_id -> name for result display
+                tool_names: dict[str, str] = {}
                 async for line in resp.aiter_lines():
                     line_count += 1
                     if line_count <= 5 or line.startswith("data: ") and "completed" in line:
@@ -297,23 +299,48 @@ class Pipe:
                     elif event_type == "response.task_started":
                         desc = event.get("description", "")
                         if desc:
-                            yield f"\n\n> **Task started**: {desc}\n"
+                            yield f"\n\n> ⏳ **Task**: {desc}\n"
 
                     elif event_type == "response.task_progress":
                         desc = event.get("description", "")
                         tool = event.get("last_tool_name", "")
                         usage = event.get("usage") or {}
                         uses = usage.get("tool_uses", 0)
-                        text = f"\n> **Task progress**: {desc}"
+                        text = f"\n> 🔄 **Progress**: {desc}"
                         if tool:
-                            text += f" (tool: {tool}, uses: {uses})"
+                            text += f" ({tool}, {uses}회)"
                         yield text + "\n"
 
                     elif event_type == "response.task_notification":
                         status = event.get("status", "")
                         summary = event.get("summary", "")
                         if summary:
-                            yield f"\n> **Task {status}**: {summary}\n\n"
+                            yield f"\n> ✅ **Task {status}**: {summary}\n\n"
+
+                    elif event_type == "response.tool_use":
+                        tool_id = event.get("tool_use_id", "")
+                        name = event.get("name", "")
+                        if tool_id:
+                            tool_names[tool_id] = name
+                        parent = event.get("parent_tool_use_id")
+                        indent = "> > " if parent else "> "
+                        event_json = json.dumps(event, indent=2, ensure_ascii=False)
+                        quoted_json = ("\n" + indent).join(event_json.split("\n"))
+                        yield f"\n\n{indent}🔧 **{name}**\n{indent}```json\n{indent}{quoted_json}\n{indent}```\n"
+
+                    elif event_type == "response.tool_result":
+                        tool_id = event.get("tool_use_id", "")
+                        is_error = event.get("is_error", False)
+                        parent = event.get("parent_tool_use_id")
+                        tool_name = tool_names.get(tool_id, "")
+                        prefix = "❌" if is_error else "📎"
+                        label = f"{prefix} **Result**"
+                        if tool_name:
+                            label += f" ({tool_name})"
+                        indent = "> > " if parent else "> "
+                        event_json = json.dumps(event, indent=2, ensure_ascii=False)
+                        quoted_json = ("\n" + indent).join(event_json.split("\n"))
+                        yield f"\n{indent}{label}\n{indent}```json\n{indent}{quoted_json}\n{indent}```\n"
 
                     elif event_type == "response.completed":
                         completed = True

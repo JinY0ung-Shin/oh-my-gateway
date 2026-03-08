@@ -590,10 +590,17 @@ async def test_stream_chunks_token_mode_emits_tool_use_from_stream_events():
     ]
 
     assert content_deltas[0] == "Let me check"
-    assert "tool_use" in content_deltas[1]
-    assert "Read" in content_deltas[1]
-    assert "/tmp/test.txt" in content_deltas[1]
-    assert "```json" in content_deltas[1]
+
+    # tool_use is now emitted as a system_event, not as content
+    system_events = [
+        payload["system_event"]
+        for payload in payloads
+        if "system_event" in payload
+    ]
+    tool_use_events = [e for e in system_events if e.get("type") == "tool_use"]
+    assert len(tool_use_events) == 1
+    assert tool_use_events[0]["name"] == "Read"
+    assert tool_use_events[0]["input"] == {"file_path": "/tmp/test.txt"}
 
 
 @pytest.mark.asyncio
@@ -712,9 +719,17 @@ async def test_stream_chunks_thinking_and_tool_use_reassembly_complex():
     assert "</think>" in content_deltas
     assert "I will read the file." in content_deltas
 
-    tool_json = next(content for content in content_deltas if '"id": "tool-1"' in content)
-    assert '"name": "Read"' in tool_json
-    assert '"path": "/tmp/test.txt"' in tool_json
+    # tool_use is now emitted as a system_event
+    system_events = [
+        payload["system_event"]
+        for payload in payloads
+        if "system_event" in payload
+    ]
+    tool_use_events = [e for e in system_events if e.get("type") == "tool_use"]
+    assert len(tool_use_events) == 1
+    assert tool_use_events[0]["id"] == "tool-1"
+    assert tool_use_events[0]["name"] == "Read"
+    assert tool_use_events[0]["input"] == {"path": "/tmp/test.txt"}
     assert all("sub-agent-output" not in content for content in content_deltas)
 
 

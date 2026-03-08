@@ -75,9 +75,14 @@ async def test_stream_chunks_formats_tool_results_from_legacy_user_messages():
         async for line in stream_chunks(tool_result_source(), request, "req-tool-result", chunks_buffer, logger)
     ]
 
-    assert len(lines) == 2
-    assert _parse_chat_sse(lines[0])["choices"][0]["delta"]["role"] == "assistant"
-    assert "tool_result" in lines[1]
+    # tool_result is emitted as a system_event; since no real text content was sent,
+    # the fallback message is also emitted
+    assert len(lines) == 3
+    parsed = _parse_chat_sse(lines[0])
+    assert "system_event" in parsed
+    assert parsed["system_event"]["type"] == "tool_result"
+    assert parsed["system_event"]["tool_use_id"] == "tool-1"
+    # lines[1] is the fallback role+content chunk (no real assistant text)
     assert chunks_buffer[0]["type"] == "user"
 
 
@@ -160,12 +165,14 @@ async def test_stream_chunks_reassembles_tool_use_with_invalid_json_as_raw_text(
         )
     ]
 
+    # tool_use is now emitted as a system_event, not inline content
     assert len(lines) == 3
     assert "Hi" in lines[1]
     payload = _parse_chat_sse(lines[2])
-    content = payload["choices"][0]["delta"]["content"]
-    assert '"type": "tool_use"' in content
-    assert '"input": "{bad json"' in content
+    assert "system_event" in payload
+    assert payload["system_event"]["type"] == "tool_use"
+    assert payload["system_event"]["name"] == "Read"
+    assert payload["system_event"]["input"] == "{bad json"
 
 
 @pytest.mark.asyncio
@@ -306,11 +313,20 @@ async def test_stream_response_chunks_success_suppresses_thinking_and_formats_to
 
     deltas = [payload["delta"] for event_type, payload in parsed if event_type == "response.output_text.delta"]
     assert deltas[0] == "Hello"
-    assert any("tool_use" in delta for delta in deltas[1:])
-    assert any("tool_result" in delta for delta in deltas[1:])
     assert all("hidden" not in delta for delta in deltas)
     assert all("<think>" not in delta for delta in deltas)
     assert all("duplicate assistant payload" not in delta for delta in deltas)
+
+    # tool_use and tool_result are now separate structured SSE events
+    assert "response.tool_use" in event_types
+    tool_use_events = [payload for et, payload in parsed if et == "response.tool_use"]
+    assert tool_use_events[0]["name"] == "Read"
+    assert tool_use_events[0]["input"] == {"path": "/tmp/demo.txt"}
+
+    assert "response.tool_result" in event_types
+    tool_result_events = [payload for et, payload in parsed if et == "response.tool_result"]
+    assert tool_result_events[0]["tool_use_id"] == "tool-1"
+    assert tool_result_events[0]["content"] == "done"
 
     completed_payload = parsed[-1][1]
     assert completed_payload["response"]["status"] == "completed"

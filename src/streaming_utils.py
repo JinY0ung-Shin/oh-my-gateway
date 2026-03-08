@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Any, AsyncGenerator, Dict, Optional
 
-from claude_agent_sdk.types import ToolResultBlock
+from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
 from src.message_adapter import MessageAdapter
 from src.models import ChatCompletionRequest, ChatCompletionStreamResponse, StreamChoice
@@ -52,15 +52,38 @@ def extract_stop_reason(messages: list) -> Optional[str]:
     return None
 
 
+
+def _filter_tool_blocks(content):
+    """Filter out tool_use and tool_result blocks from a content list.
+
+    Only filters by block type (dict or SDK object). Text blocks are never
+    filtered to avoid suppressing legitimate user-visible content.
+    """
+    if not isinstance(content, list):
+        return content
+    filtered = []
+    for b in content:
+        # Filter SDK Pydantic objects directly
+        if isinstance(b, (ToolUseBlock, ToolResultBlock)):
+            continue
+        # Filter dict blocks by type
+        if isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result"):
+            continue
+        if hasattr(b, "type") and getattr(b, "type", None) in ("tool_use", "tool_result"):
+            continue
+        filtered.append(b)
+    return filtered or None
+
+
 def process_chunk_content(chunk: Dict[str, Any], content_sent: bool = False):
     """Extract content from a chunk message. Returns content list, result string, or None."""
     if chunk.get("type") == "assistant" and "message" in chunk:
         message = chunk["message"]
         if isinstance(message, dict) and "content" in message:
-            return message["content"]
+            return _filter_tool_blocks(message["content"])
 
     if "content" in chunk and isinstance(chunk["content"], list):
-        return chunk["content"]
+        return _filter_tool_blocks(chunk["content"])
 
     if chunk.get("subtype") == "success" and "result" in chunk and not content_sent:
         return chunk["result"]
@@ -190,6 +213,68 @@ def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int =
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
+def make_tool_use_response_sse(
+    tool_block: Dict[str, Any],
+    *,
+    sequence_number: int = 0,
+    parent_tool_use_id: Optional[str] = None,
+) -> str:
+    """Build an SSE line for a tool_use block as a structured event."""
+    event_type = "response.tool_use"
+    data = {
+        "type": event_type,
+        "tool_use_id": tool_block.get("id", ""),
+        "name": tool_block.get("name", ""),
+        "input": tool_block.get("input", {}),
+        "sequence_number": sequence_number,
+    }
+    if parent_tool_use_id:
+        data["parent_tool_use_id"] = parent_tool_use_id
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+def _normalize_tool_result(result_block) -> Dict[str, Any]:
+    """Normalize a ToolResultBlock or dict into a plain tool_result dict."""
+    if isinstance(result_block, ToolResultBlock):
+        return {
+            "type": "tool_result",
+            "tool_use_id": result_block.tool_use_id or "",
+            "content": result_block.content or "",
+            "is_error": bool(result_block.is_error),
+        }
+    if hasattr(result_block, "tool_use_id"):
+        return {
+            "type": "tool_result",
+            "tool_use_id": getattr(result_block, "tool_use_id", "") or "",
+            "content": getattr(result_block, "content", "") or "",
+            "is_error": bool(getattr(result_block, "is_error", False)),
+        }
+    if isinstance(result_block, dict):
+        return {
+            "type": "tool_result",
+            "tool_use_id": result_block.get("tool_use_id", ""),
+            "content": result_block.get("content", ""),
+            "is_error": bool(result_block.get("is_error", False)),
+        }
+    return {"type": "tool_result", "tool_use_id": "", "content": str(result_block), "is_error": False}
+
+
+def make_tool_result_response_sse(
+    result_block,
+    *,
+    sequence_number: int = 0,
+    parent_tool_use_id: Optional[str] = None,
+) -> str:
+    """Build an SSE line for a tool_result block as a structured event."""
+    event_type = "response.tool_result"
+    data = _normalize_tool_result(result_block)
+    data["type"] = event_type
+    data["sequence_number"] = sequence_number
+    if parent_tool_use_id:
+        data["parent_tool_use_id"] = parent_tool_use_id
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
 def is_assistant_content_chunk(chunk: Dict[str, Any]) -> bool:
     """Return True for assistant chunks, including the SDK's untyped content-list shape."""
     chunk_type = chunk.get("type")
@@ -209,7 +294,8 @@ async def stream_chunks(
 ) -> AsyncGenerator[str, None]:
     """Shared SSE streaming logic for both stateless and session modes."""
     role_sent = False
-    content_sent = False
+    content_sent = False  # True only when real assistant text has been emitted
+    tool_event_sent = False  # True when structured tool/task events have been emitted
     token_streaming = False
     in_thinking = False
     tool_use_acc = {}
@@ -254,52 +340,65 @@ async def stream_chunks(
                 role_sent = True
             continue
 
+        # Accumulate tool_use blocks (including sub-agent tool calls)
+        if chunk.get("type") == "stream_event":
+            parent_id = chunk.get("parent_tool_use_id")
+            event = chunk.get("event", {})
+            event_type = event.get("type")
+            if event_type == "content_block_start":
+                block = event.get("content_block", {})
+                if block.get("type") == "tool_use":
+                    idx = (parent_id or "", event.get("index", 0))
+                    tool_use_acc[idx] = {
+                        "id": block.get("id", ""),
+                        "name": block.get("name", ""),
+                        "input_parts": [],
+                        "parent_tool_use_id": parent_id,
+                    }
+                    continue
+            if event_type == "content_block_delta":
+                delta = event.get("delta", {})
+                if delta.get("type") == "input_json_delta":
+                    idx = (parent_id or "", event.get("index", 0))
+                    if idx in tool_use_acc:
+                        tool_use_acc[idx]["input_parts"].append(delta.get("partial_json", ""))
+                    continue
+                # Skip sub-agent text deltas (noise)
+                if parent_id is not None:
+                    continue
+            if event_type == "content_block_stop":
+                idx = (parent_id or "", event.get("index", 0))
+                if idx in tool_use_acc:
+                    acc = tool_use_acc.pop(idx)
+                    input_str = "".join(acc["input_parts"])
+                    try:
+                        input_parsed = json.loads(input_str) if input_str else {}
+                    except json.JSONDecodeError:
+                        input_parsed = input_str
+                    tool_block = {
+                        "type": "tool_use",
+                        "id": acc["id"],
+                        "name": acc["name"],
+                        "input": input_parsed,
+                    }
+                    event_data = {"type": "tool_use", **tool_block}
+                    if acc["parent_tool_use_id"]:
+                        event_data["parent_tool_use_id"] = acc["parent_tool_use_id"]
+                    yield make_task_sse(request_id, request.model, event_data)
+                    tool_event_sent = True  # noqa: F841
+                    continue
+                # Skip sub-agent non-tool stream events
+                if parent_id is not None:
+                    continue
+
         if token_streaming:
             if chunk.get("type") == "stream_event":
-                if chunk.get("parent_tool_use_id") is not None:
-                    continue
-                event = chunk.get("event", {})
-                event_type = event.get("type")
-                if event_type == "content_block_start":
-                    block = event.get("content_block", {})
-                    if block.get("type") == "tool_use":
-                        idx = event.get("index", 0)
-                        tool_use_acc[idx] = {
-                            "id": block.get("id", ""),
-                            "name": block.get("name", ""),
-                            "input_parts": [],
-                        }
-                elif event_type == "content_block_delta":
-                    delta = event.get("delta", {})
-                    if delta.get("type") == "input_json_delta":
-                        idx = event.get("index", 0)
-                        if idx in tool_use_acc:
-                            tool_use_acc[idx]["input_parts"].append(delta.get("partial_json", ""))
-                elif event_type == "content_block_stop":
-                    idx = event.get("index", 0)
-                    if idx in tool_use_acc:
-                        acc = tool_use_acc.pop(idx)
-                        input_str = "".join(acc["input_parts"])
-                        try:
-                            input_parsed = json.loads(input_str) if input_str else {}
-                        except json.JSONDecodeError:
-                            input_parsed = input_str
-                        tool_block = {
-                            "type": "tool_use",
-                            "id": acc["id"],
-                            "name": acc["name"],
-                            "input": input_parsed,
-                        }
-                        formatted = MessageAdapter.format_block(tool_block)
-                        if formatted:
-                            for sse in _emit_sse(formatted):
-                                yield sse
-                            content_sent = True
                 continue
             if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
                 continue
 
-        if chunk.get("type") == "user" and chunk.get("parent_tool_use_id") is None:
+        if chunk.get("type") == "user":
+            parent_id = chunk.get("parent_tool_use_id")
             content_blocks = chunk.get("content", [])
             if not isinstance(content_blocks, list):
                 msg = chunk.get("message", {})
@@ -311,12 +410,12 @@ async def stream_chunks(
                     if (b.get("type") if isinstance(b, dict) else None) == "tool_result"
                     or isinstance(b, ToolResultBlock)
                 ]
-                if tool_result_blocks:
-                    formatted = MessageAdapter.format_blocks(tool_result_blocks)
-                    if formatted and not formatted.isspace():
-                        for sse in _emit_sse(formatted):
-                            yield sse
-                        content_sent = True
+                for tr_block in tool_result_blocks:
+                    result_data = _normalize_tool_result(tr_block)
+                    if parent_id:
+                        result_data["parent_tool_use_id"] = parent_id
+                    yield make_task_sse(request_id, request.model, result_data)
+                    tool_event_sent = True  # noqa: F841
             chunks_buffer.append(chunk)
             continue
 
@@ -376,7 +475,8 @@ async def stream_response_chunks(
     On SDK error or failure: emits response.failed instead of response.completed.
     Sets stream_result["success"] to indicate outcome to caller.
     """
-    content_sent = False
+    content_sent = False  # True only when real assistant text has been emitted
+    tool_event_sent = False  # True when structured tool/task events have been emitted
     token_streaming = False
     in_thinking = False
     tool_use_acc = {}
@@ -487,54 +587,68 @@ async def stream_response_chunks(
                     content_sent = True
                 continue
 
+            # Accumulate tool_use blocks (including sub-agent tool calls)
+            if chunk.get("type") == "stream_event":
+                parent_id = chunk.get("parent_tool_use_id")
+                event = chunk.get("event", {})
+                event_type = event.get("type")
+                if event_type == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        idx = (parent_id or "", event.get("index", 0))
+                        tool_use_acc[idx] = {
+                            "id": block.get("id", ""),
+                            "name": block.get("name", ""),
+                            "input_parts": [],
+                            "parent_tool_use_id": parent_id,
+                        }
+                        continue
+                if event_type == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "input_json_delta":
+                        idx = (parent_id or "", event.get("index", 0))
+                        if idx in tool_use_acc:
+                            tool_use_acc[idx]["input_parts"].append(
+                                delta.get("partial_json", "")
+                            )
+                        continue
+                    # Skip sub-agent text deltas (they produce noise)
+                    if parent_id is not None:
+                        continue
+                if event_type == "content_block_stop":
+                    idx = (parent_id or "", event.get("index", 0))
+                    if idx in tool_use_acc:
+                        acc = tool_use_acc.pop(idx)
+                        input_str = "".join(acc["input_parts"])
+                        try:
+                            input_parsed = json.loads(input_str) if input_str else {}
+                        except json.JSONDecodeError:
+                            input_parsed = input_str
+                        tool_block = {
+                            "type": "tool_use",
+                            "id": acc["id"],
+                            "name": acc["name"],
+                            "input": input_parsed,
+                        }
+                        yield make_tool_use_response_sse(
+                            tool_block,
+                            sequence_number=_next_seq(),
+                            parent_tool_use_id=acc["parent_tool_use_id"],
+                        )
+                        tool_event_sent = True  # noqa: F841
+                        continue
+                    # Skip sub-agent non-tool stream events
+                    if parent_id is not None:
+                        continue
+
             if token_streaming:
                 if chunk.get("type") == "stream_event":
-                    if chunk.get("parent_tool_use_id") is not None:
-                        continue
-                    event = chunk.get("event", {})
-                    event_type = event.get("type")
-                    if event_type == "content_block_start":
-                        block = event.get("content_block", {})
-                        if block.get("type") == "tool_use":
-                            idx = event.get("index", 0)
-                            tool_use_acc[idx] = {
-                                "id": block.get("id", ""),
-                                "name": block.get("name", ""),
-                                "input_parts": [],
-                            }
-                    elif event_type == "content_block_delta":
-                        delta = event.get("delta", {})
-                        if delta.get("type") == "input_json_delta":
-                            idx = event.get("index", 0)
-                            if idx in tool_use_acc:
-                                tool_use_acc[idx]["input_parts"].append(
-                                    delta.get("partial_json", "")
-                                )
-                    elif event_type == "content_block_stop":
-                        idx = event.get("index", 0)
-                        if idx in tool_use_acc:
-                            acc = tool_use_acc.pop(idx)
-                            input_str = "".join(acc["input_parts"])
-                            try:
-                                input_parsed = json.loads(input_str) if input_str else {}
-                            except json.JSONDecodeError:
-                                input_parsed = input_str
-                            tool_block = {
-                                "type": "tool_use",
-                                "id": acc["id"],
-                                "name": acc["name"],
-                                "input": input_parsed,
-                            }
-                            formatted = MessageAdapter.format_block(tool_block)
-                            if formatted:
-                                yield _emit_delta(formatted)
-                                full_text.append(formatted)
-                                content_sent = True
                     continue
                 if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
                     continue
 
-            if chunk.get("type") == "user" and chunk.get("parent_tool_use_id") is None:
+            if chunk.get("type") == "user":
+                parent_id = chunk.get("parent_tool_use_id")
                 content_blocks = chunk.get("content", [])
                 if not isinstance(content_blocks, list):
                     msg = chunk.get("message", {})
@@ -546,12 +660,13 @@ async def stream_response_chunks(
                         if (b.get("type") if isinstance(b, dict) else None) == "tool_result"
                         or isinstance(b, ToolResultBlock)
                     ]
-                    if tool_result_blocks:
-                        formatted = MessageAdapter.format_blocks(tool_result_blocks)
-                        if formatted and not formatted.isspace():
-                            yield _emit_delta(formatted)
-                            full_text.append(formatted)
-                            content_sent = True
+                    for tr_block in tool_result_blocks:
+                        yield make_tool_result_response_sse(
+                            tr_block,
+                            sequence_number=_next_seq(),
+                            parent_tool_use_id=parent_id,
+                        )
+                        tool_event_sent = True  # noqa: F841
                 chunks_buffer.append(chunk)
                 continue
 
