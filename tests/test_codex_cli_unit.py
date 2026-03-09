@@ -982,3 +982,181 @@ class TestNormalizeCollabToolCallEvent:
         result = normalize_codex_event(event)
         # close_agent produces no blocks → None
         assert result is None
+
+    def test_cross_event_spawn_wait_correlation_via_shared_dict(self):
+        """spawn_agent and wait in separate normalize_codex_event calls
+        share the same agent_tool_ids dict, so tool_use_id correlates."""
+        shared_ids: dict = {}
+
+        spawn_event = {
+            "type": "collab_tool_call",
+            "tool": "spawn_agent",
+            "prompt": "Do something",
+            "receiver_thread_ids": ["thread-A"],
+            "agents_states": {},
+        }
+        r1 = normalize_codex_event(spawn_event, agent_tool_ids=shared_ids)
+        assert r1 is not None
+        spawn_block = next(b for b in r1["content"] if b["type"] == "tool_use")
+        spawn_tool_id = spawn_block["id"]
+        assert "thread-A" in shared_ids
+        assert shared_ids["thread-A"] == spawn_tool_id
+
+        wait_event = {
+            "type": "collab_tool_call",
+            "tool": "wait",
+            "agents_states": {
+                "thread-A": {"status": "completed", "message": "Result here"},
+            },
+        }
+        r2 = normalize_codex_event(wait_event, agent_tool_ids=shared_ids)
+        assert r2 is not None
+        result_block = next(b for b in r2["content"] if b["type"] == "tool_result")
+        assert result_block["tool_use_id"] == spawn_tool_id
+
+    def test_embedded_collab_in_separate_items_correlation(self):
+        """spawn_agent and wait embedded in separate agent_message items
+        correlate through the shared agent_tool_ids dict."""
+        shared_ids: dict = {}
+
+        spawn_json = json.dumps(
+            {
+                "collab_tool_call": {
+                    "tool": "spawn_agent",
+                    "prompt": "Research task",
+                    "receiver_thread_ids": ["t-99"],
+                    "agents_states": {},
+                }
+            }
+        )
+        item1_event = {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": f"Starting\n{spawn_json}"},
+        }
+        r1 = normalize_codex_event(item1_event, agent_tool_ids=shared_ids)
+        assert r1 is not None
+        spawn_block = next(b for b in r1["content"] if b["type"] == "tool_use")
+        spawn_tool_id = spawn_block["id"]
+        assert shared_ids.get("t-99") == spawn_tool_id
+
+        wait_json = json.dumps(
+            {
+                "collab_tool_call": {
+                    "tool": "wait",
+                    "agents_states": {
+                        "t-99": {"status": "completed", "message": "Done"},
+                    },
+                }
+            }
+        )
+        item2_event = {
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": f"Finished\n{wait_json}"},
+        }
+        r2 = normalize_codex_event(item2_event, agent_tool_ids=shared_ids)
+        assert r2 is not None
+        result_block = next(b for b in r2["content"] if b["type"] == "tool_result")
+        assert result_block["tool_use_id"] == spawn_tool_id
+
+
+class TestConcurrentRunCompletionIsolation:
+    """Verify that concurrent run_completion calls on the same CodexCLI
+    instance do not cross-wire collab agent_tool_ids (Round 3 regression)."""
+
+    async def test_concurrent_completions_isolated(self, codex_cli):
+        """Two concurrent run_completion() calls each track their own
+        collab spawn→wait correlation without interference."""
+        spawn_a = json.dumps(
+            {
+                "type": "collab_tool_call",
+                "tool": "spawn_agent",
+                "prompt": "Task A",
+                "receiver_thread_ids": ["a-thread"],
+                "agents_states": {},
+            }
+        )
+        wait_a = json.dumps(
+            {
+                "type": "collab_tool_call",
+                "tool": "wait",
+                "agents_states": {
+                    "a-thread": {"status": "completed", "message": "Result A"},
+                },
+            }
+        )
+        lines_a = [
+            json.dumps({"type": "thread.started", "thread_id": "t-a"}),
+            spawn_a,
+            wait_a,
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+
+        spawn_b = json.dumps(
+            {
+                "type": "collab_tool_call",
+                "tool": "spawn_agent",
+                "prompt": "Task B",
+                "receiver_thread_ids": ["b-thread"],
+                "agents_states": {},
+            }
+        )
+        wait_b = json.dumps(
+            {
+                "type": "collab_tool_call",
+                "tool": "wait",
+                "agents_states": {
+                    "b-thread": {"status": "completed", "message": "Result B"},
+                },
+            }
+        )
+        lines_b = [
+            json.dumps({"type": "thread.started", "thread_id": "t-b"}),
+            spawn_b,
+            wait_b,
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+
+        async def collect(jsonl_lines):
+            return await _run_with_mock(codex_cli, jsonl_lines)
+
+        # Run both completions concurrently on the SAME instance
+        import asyncio
+
+        chunks_a, chunks_b = await asyncio.gather(
+            collect(lines_a),
+            collect(lines_b),
+        )
+
+        # Extract tool_use and tool_result blocks from each stream
+        def extract_blocks(chunks):
+            tool_uses = []
+            tool_results = []
+            for c in chunks:
+                if c.get("type") == "assistant":
+                    for b in c.get("content", []):
+                        if b.get("type") == "tool_use":
+                            tool_uses.append(b)
+                        elif b.get("type") == "tool_result":
+                            tool_results.append(b)
+            return tool_uses, tool_results
+
+        uses_a, results_a = extract_blocks(chunks_a)
+        uses_b, results_b = extract_blocks(chunks_b)
+
+        # Each stream should have its own tool_use
+        assert len(uses_a) >= 1
+        assert len(uses_b) >= 1
+        assert len(results_a) >= 1
+        assert len(results_b) >= 1
+
+        # Correlation: A's tool_result references A's tool_use, not B's
+        a_use_ids = {u["id"] for u in uses_a}
+        b_use_ids = {u["id"] for u in uses_b}
+        a_result_refs = {r["tool_use_id"] for r in results_a}
+        b_result_refs = {r["tool_use_id"] for r in results_b}
+
+        # No overlap between A and B tool_use_ids
+        assert a_use_ids.isdisjoint(b_use_ids), "Concurrent streams share tool_use ids!"
+        # Each result references its own stream's tool_use
+        assert a_result_refs.issubset(a_use_ids), f"A results reference wrong ids: {a_result_refs - a_use_ids}"
+        assert b_result_refs.issubset(b_use_ids), f"B results reference wrong ids: {b_result_refs - b_use_ids}"
