@@ -420,6 +420,10 @@ class CodexCLI:
         # OPENAI_API_KEY from os.environ.
         self._api_key: Optional[str] = os.getenv("OPENAI_API_KEY") or None
 
+        # Persistent collab agent ID mapping for spawn_agent → wait correlation
+        # across separate JSONL events within a single run_completion() call.
+        self._collab_agent_ids: Dict[str, str] = {}
+
     # ------------------------------------------------------------------
     # Binary discovery
     # ------------------------------------------------------------------
@@ -613,6 +617,9 @@ class CodexCLI:
         """
         thread_id_for_resume = resume  # Codex thread_id if resuming
         captured_thread_id: Optional[str] = None
+        # Reset per-turn collab agent ID tracking so spawn→wait correlation
+        # is scoped to this completion but persists across JSONL events.
+        self._collab_agent_ids = {}
 
         try:
             async with self._spawn_codex(
@@ -648,14 +655,35 @@ class CodexCLI:
                             }
                         continue  # Don't yield to downstream as normal content
 
+                    # Handle collab_tool_call events inline with the
+                    # instance-level agent ID dict so spawn→wait correlation
+                    # persists across separate JSONL events.
+                    if event.get("type") == "collab_tool_call":
+                        blocks = _collab_to_tool_blocks(
+                            [event], agent_tool_ids=self._collab_agent_ids
+                        )
+                        if blocks:
+                            yield {"type": "assistant", "content": blocks}
+                        continue
+
                     normalized = normalize_codex_event(event)
                     if normalized is not None:
                         yield normalized
 
-                # _parse_jsonl breaks on readline timeout; check if process
-                # is still alive to infer a stall rather than clean EOF.
+                # Detect timeout: _parse_jsonl breaks on readline timeout
+                # while the process is still running.  Mark *before* wait()
+                # so clean EOF (process already exited) is not confused.
                 if proc.returncode is None:
-                    timed_out = True
+                    # Process still alive after JSONL loop ended — either a
+                    # readline timeout or the process hasn't set returncode yet.
+                    # Wait briefly for natural exit to distinguish EOF from timeout.
+                    with contextlib.suppress(asyncio.TimeoutError):
+                        await asyncio.wait_for(proc.wait(), timeout=2.0)
+                    if proc.returncode is None:
+                        timed_out = True
+                else:
+                    # Process already exited — clean EOF, not a timeout.
+                    pass
 
                 if timed_out:
                     logger.error("Codex timed out after %.1f seconds", self.timeout)
@@ -674,9 +702,6 @@ class CodexCLI:
                     stderr_text = stderr_data.decode("utf-8", errors="replace").strip()
                     if stderr_text:
                         logger.debug("Codex stderr: %s", stderr_text[:500])
-
-                # Wait for process exit
-                await proc.wait()
                 if proc.returncode and proc.returncode != 0:
                     logger.warning("Codex exited with code %d", proc.returncode)
 

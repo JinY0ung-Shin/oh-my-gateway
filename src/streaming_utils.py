@@ -161,7 +161,6 @@ class CollabJsonStreamFilter:
     """
 
     _COLLAB_MARKERS = ('"collab_tool_call"', '"collab_tool"')
-    _MARKER_CHECK_LEN = 50  # enough to see {"collab_tool_call": with whitespace/reordering
     _MAX_BUFFER = 8192
 
     def __init__(self):
@@ -208,13 +207,8 @@ class CollabJsonStreamFilter:
                             output.append(self._buf)
                             self._reset()
                             continue
-                # Not-collab early bail after enough chars
-                if len(self._buf) > self._MARKER_CHECK_LEN and not any(
-                    m in self._buf for m in self._COLLAB_MARKERS
-                ):
-                    output.append(self._buf)
-                    self._reset()
-                elif len(self._buf) > self._MAX_BUFFER:
+                # Safety limit: flush if buffer grows unreasonably large
+                if len(self._buf) > self._MAX_BUFFER:
                     output.append(self._buf)
                     self._reset()
             else:

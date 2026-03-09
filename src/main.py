@@ -530,10 +530,12 @@ def _build_backend_options(
         # Non-Claude backends: basic permission mode
         options["permission_mode"] = PERMISSION_MODE_BYPASS
         if not request.enable_tools:
-            logger.warning(
-                "enable_tools=false requested for %s backend, but Codex always runs "
-                "in --full-auto mode. Tool restrictions cannot be enforced.",
-                resolved.backend,
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Codex backend does not support disabling tools. "
+                    "Remove enable_tools=false or use the Claude backend."
+                ),
             )
 
     return options
@@ -752,6 +754,7 @@ async def generate_streaming_response(
     """
     session = None
     lock_acquired = False
+    chunks_buffer: list = []
     try:
         resolved, backend = _resolve_and_get_backend(request.model)
 
@@ -871,6 +874,10 @@ async def generate_streaming_response(
         raise  # Let FastAPI handle these
     except Exception as e:
         logger.error(f"Streaming error: {e}")
+        # Capture provider_session_id from partial chunks on mid-stream failure
+        # so the Codex thread_id is not lost for future resume attempts.
+        if session is not None and chunks_buffer:
+            _capture_provider_session_id(chunks_buffer, session)
         error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
     finally:
