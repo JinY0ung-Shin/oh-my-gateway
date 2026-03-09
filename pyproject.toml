@@ -43,6 +43,17 @@ packages = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "integration: Integration tests (real subprocess with mock binary)",
+    "codex_binary: Requires real Codex CLI (opt-in: RUN_CODEX_BINARY_TESTS=1)",
+    "slow: Tests taking more than 5 seconds",
+]
+
+[tool.coverage.run]
+source = ["src"]
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if __name__"]
 
 [tool.ruff]
 line-length = 100
