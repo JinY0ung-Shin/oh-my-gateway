@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import src.main as main
@@ -15,22 +16,22 @@ from src.constants import DEFAULT_MODEL
 from src.models import SessionInfo
 
 
-
 @contextmanager
 def client_context():
     """Create a TestClient with startup/shutdown side effects patched out."""
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
+    mock_cli.verify = AsyncMock(return_value=True)
 
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
-    with patch.object(main, "claude_cli", mock_cli), patch.object(
-        main, "verify_api_key", new=AsyncMock(return_value=True)
-    ), patch.object(
-        main, "validate_claude_code_auth", return_value=(True, {"method": "test"})
-    ), patch.object(main.session_manager, "start_cleanup_task"), patch.object(
-        main.session_manager, "async_shutdown", new=AsyncMock()
+    with (
+        patch.object(main, "claude_cli", mock_cli),
+        patch.object(main, "verify_api_key", new=AsyncMock(return_value=True)),
+        patch.object(main, "validate_claude_code_auth", return_value=(True, {"method": "test"})),
+        patch.object(main.session_manager, "start_cleanup_task"),
+        patch.object(main.session_manager, "async_shutdown", new=AsyncMock()),
     ):
         with TestClient(main.app) as client:
             yield client, mock_cli
@@ -85,11 +86,14 @@ def test_chat_completions_non_streaming_success():
         yield {"content": [{"type": "text", "text": "Hello"}]}
         yield {"subtype": "success", "result": "Hello", "stop_reason": "max_tokens"}
 
-    with client_context() as (client, mock_cli), patch.object(
-        main, "get_mcp_servers", return_value={"demo": {"type": "stdio", "command": "demo"}}
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(
+            main, "get_mcp_servers", return_value={"demo": {"type": "stdio", "command": "demo"}}
+        ),
     ):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = "Hello"
+        mock_cli.parse_message.return_value = "Hello"
 
         response = client.post(
             "/v1/chat/completions",
@@ -123,7 +127,7 @@ def test_chat_completions_streaming_response_with_usage():
 
     with client_context() as (client, mock_cli):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = "Hello"
+        mock_cli.parse_message.return_value = "Hello"
         mock_cli.estimate_token_usage.return_value = {
             "prompt_tokens": 1,
             "completion_tokens": 2,
@@ -150,10 +154,20 @@ def test_chat_completions_streaming_response_with_usage():
 
 @pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
 def test_returns_503_when_auth_is_invalid(endpoint):
-    with client_context() as (client, _mock_cli), patch.object(
-        main,
-        "validate_claude_code_auth",
-        return_value=(False, {"errors": ["missing auth"], "method": "none"}),
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            main,
+            "_validate_backend_auth",
+            side_effect=HTTPException(
+                status_code=503,
+                detail={
+                    "message": "claude backend authentication failed",
+                    "errors": ["missing auth"],
+                    "help": "Check /v1/auth/status for detailed authentication information",
+                },
+            ),
+        ),
     ):
         response = client.post(
             endpoint,
@@ -168,7 +182,7 @@ def test_returns_503_when_auth_is_invalid(endpoint):
     assert response.status_code == 503
     assert body["error"]["type"] == "api_error"
     assert body["error"]["code"] == "503"
-    assert body["error"]["message"]["message"] == "Claude Code authentication failed"
+    assert "authentication failed" in body["error"]["message"]["message"]
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
@@ -179,7 +193,7 @@ def test_returns_500_when_claude_returns_no_message(endpoint):
 
     with client_context() as (client, mock_cli):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = None
+        mock_cli.parse_message.return_value = None
 
         response = client.post(
             endpoint,
@@ -191,7 +205,7 @@ def test_returns_500_when_claude_returns_no_message(endpoint):
         )
 
     assert response.status_code == 500
-    assert response.json()["error"]["message"] == "No response from Claude Code"
+    assert "No response from" in response.json()["error"]["message"]
 
 
 def test_anthropic_messages_success():
@@ -201,11 +215,12 @@ def test_anthropic_messages_success():
         run_calls.append(kwargs)
         yield {"subtype": "success", "result": "Anthropic answer", "stop_reason": "end_turn"}
 
-    with client_context() as (client, mock_cli), patch.object(
-        main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
     ):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = "Anthropic answer"
+        mock_cli.parse_message.return_value = "Anthropic answer"
 
         response = client.post(
             "/v1/messages",
@@ -231,10 +246,13 @@ def test_anthropic_messages_success():
 
 
 def test_models_compatibility_version_and_root_endpoints():
-    with client_context() as (client, _mock_cli), patch.object(
-        main,
-        "get_claude_code_auth_info",
-        return_value={"method": "claude_cli", "status": {"valid": True}},
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            main,
+            "get_claude_code_auth_info",
+            return_value={"method": "claude_cli", "status": {"valid": True}},
+        ),
     ):
         models_response = client.get("/v1/models")
         compatibility_response = client.post(
@@ -251,7 +269,10 @@ def test_models_compatibility_version_and_root_endpoints():
     assert models_response.status_code == 200
     assert models_response.json()["object"] == "list"
     assert compatibility_response.status_code == 200
-    assert "temperature" in compatibility_response.json()["compatibility_report"]["unsupported_parameters"]
+    assert (
+        "temperature"
+        in compatibility_response.json()["compatibility_report"]["unsupported_parameters"]
+    )
     assert version_response.status_code == 200
     assert version_response.json()["api_version"] == "v1"
     assert root_response.status_code == 200
@@ -260,22 +281,25 @@ def test_models_compatibility_version_and_root_endpoints():
 
 
 def test_list_mcp_servers_filters_safe_fields():
-    with client_context() as (client, _mock_cli), patch.object(
-        main,
-        "get_mcp_servers",
-        return_value={
-            "stdio-server": {
-                "type": "stdio",
-                "command": "demo",
-                "args": ["--flag"],
-                "secret": "ignored",
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            main,
+            "get_mcp_servers",
+            return_value={
+                "stdio-server": {
+                    "type": "stdio",
+                    "command": "demo",
+                    "args": ["--flag"],
+                    "secret": "ignored",
+                },
+                "remote-server": {
+                    "type": "sse",
+                    "url": "https://example.com/mcp",
+                    "token": "ignored",
+                },
             },
-            "remote-server": {
-                "type": "sse",
-                "url": "https://example.com/mcp",
-                "token": "ignored",
-            },
-        },
+        ),
     ):
         response = client.get("/v1/mcp/servers")
 
@@ -311,12 +335,15 @@ def test_debug_request_endpoint_reports_parse_and_validation_results():
 def test_auth_status_endpoint_uses_runtime_key_source():
     main.runtime_api_key = "runtime-key"
 
-    with client_context() as (client, _mock_cli), patch.object(
-        main,
-        "get_claude_code_auth_info",
-        return_value={"method": "claude_cli", "status": {"valid": True}},
-    ), patch("src.auth.auth_manager.get_api_key", return_value="runtime-key"), patch.dict(
-        "os.environ", {}, clear=True
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            main,
+            "get_claude_code_auth_info",
+            return_value={"method": "claude_cli", "status": {"valid": True}},
+        ),
+        patch("src.auth.auth_manager.get_api_key", return_value="runtime-key"),
+        patch.dict("os.environ", {}, clear=True),
     ):
         response = client.get("/v1/auth/status")
 
@@ -345,16 +372,16 @@ def test_session_endpoints_and_http_exception_handler():
     def fake_delete_session(session_id):
         return session_id == "demo-session"
 
-    with client_context() as (client, _mock_cli), patch.object(
-        main.session_manager,
-        "get_stats",
-        return_value={"active_sessions": 1, "expired_sessions": 0, "total_messages": 2},
-    ), patch.object(
-        main.session_manager, "list_sessions", return_value=[session_info]
-    ), patch.object(
-        main.session_manager, "get_session", side_effect=fake_get_session
-    ), patch.object(
-        main.session_manager, "delete_session", side_effect=fake_delete_session
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            main.session_manager,
+            "get_stats",
+            return_value={"active_sessions": 1, "expired_sessions": 0, "total_messages": 2},
+        ),
+        patch.object(main.session_manager, "list_sessions", return_value=[session_info]),
+        patch.object(main.session_manager, "get_session", side_effect=fake_get_session),
+        patch.object(main.session_manager, "delete_session", side_effect=fake_delete_session),
     ):
         stats_response = client.get("/v1/sessions/stats")
         list_response = client.get("/v1/sessions")
@@ -388,11 +415,12 @@ def test_create_response_non_streaming_success_uses_array_system_prompt(isolated
         run_calls.append(kwargs)
         yield {"subtype": "success", "result": "Responses answer"}
 
-    with client_context() as (client, mock_cli), patch.object(
-        main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
     ):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = "Responses answer"
+        mock_cli.parse_message.return_value = "Responses answer"
 
         response = client.post(
             "/v1/responses",
@@ -472,7 +500,10 @@ def test_create_response_rejects_instructions_with_previous_response_id():
         )
 
     assert response.status_code == 400
-    assert "instructions cannot be used with previous_response_id" in response.json()["error"]["message"]
+    assert (
+        "instructions cannot be used with previous_response_id"
+        in response.json()["error"]["message"]
+    )
 
 
 def test_create_response_returns_404_when_previous_response_session_is_missing():
@@ -491,10 +522,13 @@ def test_create_response_returns_404_when_previous_response_session_is_missing()
 
 
 def test_create_response_returns_503_when_auth_is_invalid():
-    with client_context() as (client, _mock_cli), patch.object(
-        main,
-        "validate_claude_code_auth",
-        return_value=(False, {"errors": ["missing auth"], "method": "none"}),
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            main,
+            "validate_claude_code_auth",
+            return_value=(False, {"errors": ["missing auth"], "method": "none"}),
+        ),
     ):
         response = client.post(
             "/v1/responses",
@@ -512,9 +546,12 @@ def test_create_response_uses_string_system_prompt_from_array_input(isolated_ses
         run_calls.append(kwargs)
         yield {"subtype": "success", "result": "String system prompt answer"}
 
-    with client_context() as (client, mock_cli), patch.object(main, "get_mcp_servers", return_value={}):
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+    ):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = "String system prompt answer"
+        mock_cli.parse_message.return_value = "String system prompt answer"
 
         response = client.post(
             "/v1/responses",
@@ -550,15 +587,21 @@ def test_create_response_streaming_success_commits_session_state(isolated_sessio
         return empty_source()
 
     async def fake_stream_response_chunks(**kwargs):
-        kwargs["chunks_buffer"].append({"content": [{"type": "text", "text": "streamed assistant"}]})
+        kwargs["chunks_buffer"].append(
+            {"content": [{"type": "text", "text": "streamed assistant"}]}
+        )
         kwargs["stream_result"]["success"] = True
         yield 'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
 
-    with client_context() as (client, mock_cli), patch.object(
-        main, "get_mcp_servers", return_value={}
-    ), patch.object(main.streaming_utils, "stream_response_chunks", new=fake_stream_response_chunks):
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(
+            main.streaming_utils, "stream_response_chunks", new=fake_stream_response_chunks
+        ),
+    ):
         mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_claude_message.return_value = "streamed assistant"
+        mock_cli.parse_message.return_value = "streamed assistant"
 
         with client.stream(
             "POST",
@@ -575,7 +618,10 @@ def test_create_response_streaming_success_commits_session_state(isolated_sessio
     assert run_calls[0]["session_id"] == session.session_id
     assert run_calls[0]["resume"] is None
     assert session.turn_counter == 1
-    assert [message.content for message in session.messages] == ["Stream this", "streamed assistant"]
+    assert [message.content for message in session.messages] == [
+        "Stream this",
+        "streamed assistant",
+    ]
 
 
 def test_create_response_streaming_setup_error_returns_error_event_without_commit(
@@ -596,10 +642,12 @@ def test_create_response_streaming_setup_error_returns_error_event_without_commi
         raise RuntimeError("boom")
         yield  # pragma: no cover
 
-    with client_context() as (client, mock_cli), patch.object(
-        main, "get_mcp_servers", return_value={}
-    ), patch.object(
-        main.streaming_utils, "stream_response_chunks", new=exploding_stream_response_chunks
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(
+            main.streaming_utils, "stream_response_chunks", new=exploding_stream_response_chunks
+        ),
     ):
         mock_cli.run_completion = fake_run_completion
 
@@ -624,7 +672,10 @@ def test_create_response_returns_502_when_claude_sdk_raises():
         raise RuntimeError("boom")
         yield  # pragma: no cover
 
-    with client_context() as (client, mock_cli), patch.object(main, "get_mcp_servers", return_value={}):
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+    ):
         mock_cli.run_completion = raising_run_completion
 
         response = client.post(
@@ -640,7 +691,10 @@ def test_create_response_returns_502_when_sdk_emits_error_chunk():
     async def error_chunk_run_completion(**kwargs):
         yield {"is_error": True, "error_message": "sdk failed"}
 
-    with client_context() as (client, mock_cli), patch.object(main, "get_mcp_servers", return_value={}):
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+    ):
         mock_cli.run_completion = error_chunk_run_completion
 
         response = client.post(
@@ -657,9 +711,12 @@ def test_create_response_returns_502_when_sdk_returns_no_message():
         if False:
             yield None
 
-    with client_context() as (client, mock_cli), patch.object(main, "get_mcp_servers", return_value={}):
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+    ):
         mock_cli.run_completion = empty_run_completion
-        mock_cli.parse_claude_message.return_value = None
+        mock_cli.parse_message.return_value = None
 
         response = client.post(
             "/v1/responses",

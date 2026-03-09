@@ -85,11 +85,7 @@ class TestClaudeCodeAuthManagerDetectMethod:
     def test_auto_detect_anthropic_key(self):
         """ANTHROPIC_AUTH_TOKEN auto-detects to anthropic."""
         env = {"ANTHROPIC_AUTH_TOKEN": "test-key-12345678901234567890"}
-        env_copy = {
-            k: v
-            for k, v in os.environ.items()
-            if k not in ["CLAUDE_AUTH_METHOD"]
-        }
+        env_copy = {k: v for k, v in os.environ.items() if k not in ["CLAUDE_AUTH_METHOD"]}
         env_copy.update(env)
         with patch.dict(os.environ, env_copy, clear=True):
             import src.auth
@@ -336,10 +332,10 @@ class TestGetApiKey:
         with patch.dict(os.environ, {"API_KEY": "env-key"}):
             import src.auth
             import src.main as main
-            
+
             # Manually set runtime_api_key
             main.runtime_api_key = "runtime-secret"
-            
+
             try:
                 # Reload to ensure it tries to import from main
                 importlib.reload(src.auth)
@@ -393,8 +389,13 @@ class TestCleanStaleEnvVars:
         env_copy = {
             k: v
             for k, v in os.environ.items()
-            if k not in ["CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX",
-                         "ANTHROPIC_VERTEX_PROJECT_ID", "CLOUD_ML_REGION"]
+            if k
+            not in [
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "ANTHROPIC_VERTEX_PROJECT_ID",
+                "CLOUD_ML_REGION",
+            ]
         }
         with patch.dict(os.environ, env_copy, clear=True):
             import src.auth
@@ -418,9 +419,7 @@ class TestTimingSafeComparison:
             from fastapi.security import HTTPAuthorizationCredentials
 
             mock_request = MagicMock()
-            credentials = HTTPAuthorizationCredentials(
-                scheme="Bearer", credentials="wrong-key"
-            )
+            credentials = HTTPAuthorizationCredentials(scheme="Bearer", credentials="wrong-key")
 
             with patch.object(src.auth.auth_manager, "get_api_key", return_value="test-key"):
                 with patch("src.auth.hmac") as mock_hmac:
@@ -429,6 +428,236 @@ class TestTimingSafeComparison:
                         await src.auth.verify_api_key(mock_request, credentials)
                     assert exc_info.value.status_code == 401
                     mock_hmac.compare_digest.assert_called_once_with("wrong-key", "test-key")
+
+
+class TestBackendAuthProviders:
+    """Test BackendAuthProvider ABC and concrete implementations."""
+
+    def test_claude_provider_name(self):
+        """ClaudeAuthProvider reports name 'claude'."""
+        from src.auth import ClaudeAuthProvider
+
+        provider = ClaudeAuthProvider()
+        assert provider.name == "claude"
+
+    def test_codex_provider_name(self):
+        """CodexAuthProvider reports name 'codex'."""
+        from src.auth import CodexAuthProvider
+
+        provider = CodexAuthProvider()
+        assert provider.name == "codex"
+
+    def test_codex_validate_missing_key(self):
+        """CodexAuthProvider fails when OPENAI_API_KEY is not set."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            from src.auth import CodexAuthProvider
+
+            provider = CodexAuthProvider()
+            status = provider.validate()
+            assert status["valid"] is False
+            assert any("OPENAI_API_KEY" in e for e in status["errors"])
+
+    def test_codex_validate_valid_key(self):
+        """CodexAuthProvider passes with a valid sk-... key."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-key-12345"}):
+            from src.auth import CodexAuthProvider
+
+            provider = CodexAuthProvider()
+            status = provider.validate()
+            assert status["valid"] is True
+            assert status["config"]["api_key_present"] is True
+
+    def test_codex_validate_non_sk_key_warns(self):
+        """CodexAuthProvider warns when key doesn't start with sk-."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "not-sk-key"}):
+            from src.auth import CodexAuthProvider
+
+            provider = CodexAuthProvider()
+            status = provider.validate()
+            # Still valid, just warns
+            assert status["valid"] is True
+
+    def test_codex_build_env(self):
+        """CodexAuthProvider.build_env returns OPENAI_API_KEY."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-key-12345"}):
+            from src.auth import CodexAuthProvider
+
+            provider = CodexAuthProvider()
+            env = provider.build_env()
+            assert env == {"OPENAI_API_KEY": "sk-test-key-12345"}
+
+    def test_codex_build_env_empty_when_no_key(self):
+        """CodexAuthProvider.build_env returns empty dict without key."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            from src.auth import CodexAuthProvider
+
+            provider = CodexAuthProvider()
+            assert provider.build_env() == {}
+
+    def test_claude_isolation_vars(self):
+        """ClaudeAuthProvider isolates OPENAI_API_KEY."""
+        from src.auth import ClaudeAuthProvider
+
+        provider = ClaudeAuthProvider()
+        assert "OPENAI_API_KEY" in provider.get_isolation_vars()
+
+    def test_codex_isolation_vars(self):
+        """CodexAuthProvider isolates ANTHROPIC_AUTH_TOKEN."""
+        from src.auth import CodexAuthProvider
+
+        provider = CodexAuthProvider()
+        assert "ANTHROPIC_AUTH_TOKEN" in provider.get_isolation_vars()
+
+
+class TestCrossIsolation:
+    """Verify that backend env isolation works bidirectionally."""
+
+    def test_claude_env_excludes_openai_key(self):
+        """Claude build_env never includes OPENAI_API_KEY."""
+        with patch.dict(
+            os.environ,
+            {
+                "CLAUDE_AUTH_METHOD": "anthropic",
+                "ANTHROPIC_AUTH_TOKEN": "ant-key-12345",
+                "OPENAI_API_KEY": "sk-openai-key-12345",
+            },
+        ):
+            from src.auth import ClaudeAuthProvider
+
+            provider = ClaudeAuthProvider()
+            env = provider.build_env()
+            assert "OPENAI_API_KEY" not in env
+            assert "ANTHROPIC_AUTH_TOKEN" in env
+
+    def test_codex_env_excludes_anthropic_token(self):
+        """Codex build_env never includes ANTHROPIC_AUTH_TOKEN."""
+        with patch.dict(
+            os.environ,
+            {
+                "ANTHROPIC_AUTH_TOKEN": "ant-key-12345",
+                "OPENAI_API_KEY": "sk-openai-key-12345",
+            },
+        ):
+            from src.auth import CodexAuthProvider
+
+            provider = CodexAuthProvider()
+            env = provider.build_env()
+            assert "ANTHROPIC_AUTH_TOKEN" not in env
+            assert "OPENAI_API_KEY" in env
+
+    def test_isolation_vars_are_symmetric(self):
+        """Each provider's isolation list contains the other's key."""
+        from src.auth import ClaudeAuthProvider, CodexAuthProvider
+
+        claude_iso = ClaudeAuthProvider().get_isolation_vars()
+        codex_iso = CodexAuthProvider().get_isolation_vars()
+        # Claude isolates OPENAI_API_KEY (Codex's key)
+        assert "OPENAI_API_KEY" in claude_iso
+        # Codex isolates ANTHROPIC_AUTH_TOKEN (Claude's key)
+        assert "ANTHROPIC_AUTH_TOKEN" in codex_iso
+
+
+class TestAuthManagerGetProvider:
+    """Test ClaudeCodeAuthManager.get_provider()."""
+
+    def test_get_claude_provider(self):
+        """get_provider('claude') returns ClaudeAuthProvider."""
+        import src.auth
+
+        importlib.reload(src.auth)
+        provider = src.auth.auth_manager.get_provider("claude")
+        assert provider.name == "claude"
+
+    def test_get_codex_provider(self):
+        """get_provider('codex') returns CodexAuthProvider."""
+        import src.auth
+
+        importlib.reload(src.auth)
+        provider = src.auth.auth_manager.get_provider("codex")
+        assert provider.name == "codex"
+
+    def test_get_unknown_provider_raises(self):
+        """get_provider with unknown name raises ValueError."""
+        import src.auth
+
+        importlib.reload(src.auth)
+        with pytest.raises(ValueError, match="Unknown backend"):
+            src.auth.auth_manager.get_provider("unknown")
+
+    def test_codex_provider_is_lazy(self):
+        """Codex provider is only created on first access."""
+        import src.auth
+
+        importlib.reload(src.auth)
+        assert src.auth.auth_manager._codex_provider is None
+        src.auth.auth_manager.get_provider("codex")
+        assert src.auth.auth_manager._codex_provider is not None
+
+
+class TestValidateBackendAuth:
+    """Test validate_backend_auth() function."""
+
+    def test_validate_claude_backend(self):
+        """validate_backend_auth('claude') works."""
+        with patch.dict(os.environ, {"CLAUDE_AUTH_METHOD": "cli"}):
+            import src.auth
+
+            importlib.reload(src.auth)
+            is_valid, status = src.auth.validate_backend_auth("claude")
+            assert is_valid is True
+            assert status["method"] == "claude"
+
+    def test_validate_codex_backend_missing_key(self):
+        """validate_backend_auth('codex') fails without OPENAI_API_KEY."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        with patch.dict(os.environ, env_copy, clear=True):
+            import src.auth
+
+            importlib.reload(src.auth)
+            is_valid, status = src.auth.validate_backend_auth("codex")
+            assert is_valid is False
+
+    def test_validate_codex_backend_with_key(self):
+        """validate_backend_auth('codex') passes with OPENAI_API_KEY."""
+        with patch.dict(os.environ, {"OPENAI_API_KEY": "sk-test-12345"}):
+            import src.auth
+
+            importlib.reload(src.auth)
+            is_valid, status = src.auth.validate_backend_auth("codex")
+            assert is_valid is True
+
+
+class TestGetAllBackendsAuthInfo:
+    """Test get_all_backends_auth_info() function."""
+
+    def test_returns_both_backends(self):
+        """Returns info for both claude and codex."""
+        with patch.dict(
+            os.environ,
+            {"CLAUDE_AUTH_METHOD": "cli", "OPENAI_API_KEY": "sk-test-12345"},
+        ):
+            import src.auth
+
+            importlib.reload(src.auth)
+            info = src.auth.get_all_backends_auth_info()
+            assert "claude" in info
+            assert "codex" in info
+            assert info["claude"]["status"]["valid"] is True
+            assert info["codex"]["status"]["valid"] is True
+
+    def test_codex_invalid_when_no_key(self):
+        """Codex shows invalid when OPENAI_API_KEY is missing."""
+        env_copy = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        env_copy["CLAUDE_AUTH_METHOD"] = "cli"
+        with patch.dict(os.environ, env_copy, clear=True):
+            import src.auth
+
+            importlib.reload(src.auth)
+            info = src.auth.get_all_backends_auth_info()
+            assert info["claude"]["status"]["valid"] is True
+            assert info["codex"]["status"]["valid"] is False
 
 
 # Reset module state after tests

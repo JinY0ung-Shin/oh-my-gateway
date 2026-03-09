@@ -53,6 +53,14 @@ CLAUDE_MODELS = [
     "haiku",
 ]
 
+# Codex Models
+# Codex sub-models (e.g. "codex/o3") are resolved via slash pattern in resolve_model()
+CODEX_MODELS = [
+    "codex",
+]
+
+# Combined model list for /v1/models and validation
+ALL_MODELS = CLAUDE_MODELS + CODEX_MODELS
 
 # Default model (recommended for most use cases)
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "sonnet")
@@ -86,6 +94,14 @@ SESSION_MAX_AGE_MINUTES = int(os.getenv("SESSION_MAX_AGE_MINUTES", "60"))
 # Example: "statusline-setup,Plan"
 _raw_disallowed = os.getenv("DISALLOWED_SUBAGENT_TYPES", "statusline-setup")
 DISALLOWED_SUBAGENT_TYPES = [f"Agent({t.strip()})" for t in _raw_disallowed.split(",") if t.strip()]
+
+# Codex Backend Configuration
+# Set CODEX_ENABLED=true to activate the Codex backend for model dispatch
+CODEX_ENABLED = os.getenv("CODEX_ENABLED", "false").lower() in ("true", "1", "yes")
+CODEX_CLI_PATH = os.getenv("CODEX_CLI_PATH", "codex")
+CODEX_APPROVAL_MODE = os.getenv("CODEX_APPROVAL_MODE", "full-auto")
+CODEX_TIMEOUT_MS = int(os.getenv("CODEX_TIMEOUT_MS", str(DEFAULT_TIMEOUT_MS)))
+CODEX_CONFIG_ISOLATION = os.getenv("CODEX_CONFIG_ISOLATION", "true").lower() in ("true", "1", "yes")
 
 # MCP Server Configuration
 # Path to MCP config JSON file or inline JSON string

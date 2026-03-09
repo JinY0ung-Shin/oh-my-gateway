@@ -51,6 +51,8 @@ class Session:
     """
 
     session_id: str
+    backend: str = "claude"
+    provider_session_id: Optional[str] = None
     ttl_minutes: int = 60
     messages: List[Message] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)
@@ -267,9 +269,7 @@ class SessionManager:
         )
         return all_messages, session_id
 
-    def add_assistant_response(
-        self, session_id: Optional[str], assistant_message: Message
-    ) -> None:
+    def add_assistant_response(self, session_id: Optional[str], assistant_message: Message) -> None:
         """Add assistant response to session if session mode is active."""
         if session_id is None:
             return

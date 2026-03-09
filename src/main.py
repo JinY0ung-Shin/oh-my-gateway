@@ -31,9 +31,18 @@ from src.models import (
 from src.claude_cli import ClaudeCodeCLI
 from src.landing_page import build_root_page
 from src.message_adapter import MessageAdapter
-from src.auth import verify_api_key, security, validate_claude_code_auth, get_claude_code_auth_info, auth_manager
+from src.auth import (
+    verify_api_key,
+    security,
+    validate_claude_code_auth,
+    validate_backend_auth,
+    get_claude_code_auth_info,
+    get_all_backends_auth_info,
+    auth_manager,
+)
 from src.parameter_validator import ParameterValidator, CompatibilityReporter
 from src.session_manager import session_manager
+from src.backend_registry import BackendClient, BackendRegistry, resolve_model, ResolvedModel
 from src.response_models import (
     ResponseCreateRequest,
     ResponseObject,
@@ -47,8 +56,8 @@ from src.rate_limiter import (
     rate_limit_endpoint,
 )
 from src.constants import (
-    CLAUDE_MODELS,
     CLAUDE_TOOLS,
+    CODEX_ENABLED,
     DEFAULT_ALLOWED_TOOLS,
     DEFAULT_TIMEOUT_MS,
     DEFAULT_PORT,
@@ -142,15 +151,58 @@ def prompt_for_api_protection() -> Optional[str]:
 claude_cli = ClaudeCodeCLI(timeout=DEFAULT_TIMEOUT_MS, cwd=os.getenv("CLAUDE_CWD"))
 
 
+def _init_backend_registry() -> None:
+    """Register backend clients into the global BackendRegistry.
+
+    Called once during lifespan startup.  Claude is always registered.
+    Codex is registered only when ``CODEX_ENABLED=true`` and the binary
+    is available.
+    """
+    # Claude — always registered
+    BackendRegistry.register("claude", claude_cli)
+    logger.info("Registered backend: claude")
+
+    # Codex — conditional on feature flag
+    if not CODEX_ENABLED:
+        logger.info("Codex backend disabled (CODEX_ENABLED=false)")
+        return
+
+    try:
+        from src.codex_cli import CodexCLI
+
+        codex_cli = CodexCLI(cwd=os.getenv("CLAUDE_CWD"))
+        BackendRegistry.register("codex", codex_cli)
+        logger.info("Registered backend: codex")
+    except Exception as e:
+        logger.warning(f"Codex backend registration failed: {e}")
+        logger.warning("Codex models will not be available. Check CODEX_CLI_PATH and installation.")
+
+
+async def _verify_backends() -> None:
+    """Verify all registered backends at startup with timeout."""
+    for name, backend in BackendRegistry.all_backends().items():
+        try:
+            logger.info(f"Verifying {name} backend...")
+            verified = await asyncio.wait_for(backend.verify(), timeout=30.0)
+            if verified:
+                logger.info(f"✅ {name} backend verified successfully")
+            else:
+                logger.warning(f"⚠️  {name} backend verification returned False")
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️  {name} backend verification timed out (30s)")
+        except Exception as e:
+            logger.error(f"⚠️  {name} backend verification failed: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Verify Claude Code authentication and CLI on startup."""
-    logger.info("Verifying Claude Code authentication and CLI...")
+    """Initialize backends, verify authentication, and start background tasks."""
+    logger.info("Initializing backend registry...")
 
     # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
 
-    # Validate authentication first
+    # Validate Claude authentication first
     auth_valid, auth_info = validate_claude_code_auth()
 
     if not auth_valid:
@@ -163,25 +215,11 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"✅ Claude Code authentication validated: {auth_info['method']}")
 
-    # Verify Claude Agent SDK with timeout for graceful degradation
-    try:
-        logger.info("Testing Claude Agent SDK connection...")
-        # Use asyncio.wait_for to enforce timeout (30 seconds)
-        cli_verified = await asyncio.wait_for(claude_cli.verify_cli(), timeout=30.0)
+    # Register backends
+    _init_backend_registry()
 
-        if cli_verified:
-            logger.info("✅ Claude Agent SDK verified successfully")
-        else:
-            logger.warning("⚠️  Claude Agent SDK verification returned False")
-            logger.warning("The server will start, but requests may fail.")
-    except asyncio.TimeoutError:
-        logger.warning("⚠️  Claude Agent SDK verification timed out (30s)")
-        logger.warning("This may indicate network issues or SDK configuration problems.")
-        logger.warning("The server will start, but first request may be slow.")
-    except Exception as e:
-        logger.error(f"⚠️  Claude Agent SDK verification failed: {e}")
-        logger.warning("The server will start, but requests may fail.")
-        logger.warning("Check that Claude Code CLI is properly installed and authenticated.")
+    # Verify all registered backends
+    await _verify_backends()
 
     # Log debug information if debug mode is enabled
     if DEBUG_MODE or VERBOSE:
@@ -420,34 +458,85 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     return JSONResponse(status_code=422, content=error_response)
 
 
-def _build_claude_options(
-    request: ChatCompletionRequest, claude_headers: Optional[Dict[str, Any]] = None
+def _resolve_and_get_backend(
+    model: str,
+) -> tuple[ResolvedModel, "BackendClient"]:
+    """Resolve model → backend and validate backend availability.
+
+    Raises HTTPException if the backend is not registered (e.g. Codex disabled).
+    """
+    resolved = resolve_model(model)
+
+    if not BackendRegistry.is_registered(resolved.backend):
+        if resolved.backend == "codex":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Codex backend is not enabled. "
+                    f"Set CODEX_ENABLED=true and install Codex CLI to use model '{model}'."
+                ),
+            )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Backend '{resolved.backend}' for model '{model}' is not available.",
+        )
+
+    return resolved, BackendRegistry.get(resolved.backend)
+
+
+def _validate_backend_auth(backend_name: str) -> None:
+    """Validate backend authentication, raise HTTPException on failure."""
+    auth_valid, auth_info = validate_backend_auth(backend_name)
+    if not auth_valid:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "message": f"{backend_name} backend authentication failed",
+                "errors": auth_info.get("errors", []),
+                "help": "Check /v1/auth/status for detailed authentication information",
+            },
+        )
+
+
+def _build_backend_options(
+    request: ChatCompletionRequest,
+    resolved: ResolvedModel,
+    claude_headers: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Build Claude SDK options from request and headers."""
-    claude_options = request.to_claude_options()
+    """Build backend-agnostic options from request, resolved model, and headers."""
+    options = request.to_claude_options()
 
     if claude_headers:
-        claude_options.update(claude_headers)
+        options.update(claude_headers)
 
-    if claude_options.get("model"):
-        ParameterValidator.validate_model(claude_options["model"])
+    # Use the provider model from resolution (may differ from request.model)
+    if resolved.provider_model:
+        options["model"] = resolved.provider_model
 
-    if not request.enable_tools:
-        claude_options["disallowed_tools"] = CLAUDE_TOOLS
-        claude_options["max_turns"] = 1
-        logger.debug("Tools disabled (default behavior for OpenAI compatibility)")
+    if options.get("model"):
+        ParameterValidator.validate_model(options["model"])
+
+    if resolved.backend == "claude":
+        # Claude-specific tool configuration
+        if not request.enable_tools:
+            options["disallowed_tools"] = CLAUDE_TOOLS
+            options["max_turns"] = 1
+            logger.debug("Tools disabled (default behavior for OpenAI compatibility)")
+        else:
+            options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
+            options["permission_mode"] = PERMISSION_MODE_BYPASS
+            logger.debug(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
+
+        # Add MCP servers if configured (Claude only)
+        mcp_servers = get_mcp_servers()
+        if mcp_servers:
+            options["mcp_servers"] = mcp_servers
+            logger.debug(f"MCP servers enabled: {list(mcp_servers.keys())}")
     else:
-        claude_options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
-        claude_options["permission_mode"] = PERMISSION_MODE_BYPASS
-        logger.debug(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
+        # Non-Claude backends: basic permission mode
+        options["permission_mode"] = PERMISSION_MODE_BYPASS
 
-    # Add MCP servers if configured
-    mcp_servers = get_mcp_servers()
-    if mcp_servers:
-        claude_options["mcp_servers"] = mcp_servers
-        logger.debug(f"MCP servers enabled: {list(mcp_servers.keys())}")
-
-    return claude_options
+    return options
 
 
 def _process_chunk_content(chunk: Dict[str, Any], content_sent: bool = False):
@@ -521,14 +610,18 @@ def _prepare_stateless_completion(messages: list, claude_options: Dict[str, Any]
 def _prepare_session_prompt(
     request: ChatCompletionRequest,
 ) -> tuple:
-    """Prepare prompt and session for session-mode requests.
+    """Prepare prompt, system_prompt, and session for session-mode requests.
+
+    IMPORTANT: This function does NOT mutate session state and does NOT
+    compute ``is_new``.  The ``is_new`` check must happen inside the
+    per-session lock to prevent two concurrent first-turn requests from
+    both seeing ``is_new=True``.  Callers must call
+    ``session.add_messages()`` explicitly after acquiring the lock.
 
     Returns:
-        (prompt, session, is_new_session) tuple
+        (prompt, system_prompt, session) tuple
     """
     session = session_manager.get_or_create_session(request.session_id)
-    is_new_session = len(session.messages) == 0
-    session.add_messages(request.messages)
 
     last_user_msg = None
     for msg in reversed(request.messages):
@@ -537,49 +630,210 @@ def _prepare_session_prompt(
             break
     prompt = last_user_msg or MessageAdapter.messages_to_prompt(request.messages)[0]
 
-    return prompt, session, is_new_session
+    # Extract system prompt from messages
+    system_prompt = None
+    for msg in request.messages:
+        if msg.role == "system":
+            system_prompt = msg.content
+            break
+    if system_prompt:
+        system_prompt = MessageAdapter.filter_content(system_prompt)
+
+    return prompt, system_prompt, session
+
+
+def _capture_provider_session_id(chunks_buffer: list, session) -> None:
+    """Scan chunks for a ``codex_session`` meta-event and store the thread_id."""
+    for chunk in chunks_buffer:
+        if isinstance(chunk, dict) and chunk.get("type") == "codex_session":
+            thread_id = chunk.get("session_id")
+            if thread_id and session is not None:
+                session.provider_session_id = thread_id
+                logger.debug("Captured Codex thread_id: %s", thread_id)
+            break
+
+
+async def _streaming_session_preflight(
+    request: ChatCompletionRequest,
+    resolved,
+    backend,
+    options: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Run session guards and mutation BEFORE StreamingResponse is created.
+
+    This ensures HTTPException (400 backend mismatch, 409 Codex resume guard)
+    is raised while the endpoint can still return a proper HTTP error status,
+    rather than inside the async generator where Starlette has already committed
+    the 200 status line.
+
+    Returns a dict with keys needed by the streaming generator:
+        session, lock_acquired, prompt, sys_prompt, is_new, resume_id, chunk_kwargs
+    """
+    prompt, sys_prompt, session = _prepare_session_prompt(request)
+
+    # Acquire per-session lock BEFORE checking is_new or mutating state.
+    await session.lock.acquire()
+
+    try:
+        is_new = len(session.messages) == 0
+
+        # Enforce backend invariant (inside lock to avoid TOCTOU)
+        if not is_new and session.backend != resolved.backend:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Session '{request.session_id}' belongs to backend '{session.backend}', "
+                    f"but model '{request.model}' resolves to '{resolved.backend}'. "
+                    f"Cannot mix backends within a session."
+                ),
+            )
+
+        # Compute resume token BEFORE mutating session state
+        resume_id = None
+        if not is_new:
+            if resolved.backend == "codex" and not session.provider_session_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"Cannot resume Codex session '{request.session_id}': "
+                        f"the previous turn did not return a thread_id. "
+                        f"Start a new session instead."
+                    ),
+                )
+            resume_id = session.provider_session_id or request.session_id
+
+        # Commit messages and tag backend AFTER all checks pass
+        session.add_messages(request.messages)
+        if is_new:
+            session.backend = resolved.backend
+
+    except Exception:
+        # On any failure, release the lock before re-raising
+        session.lock.release()
+        raise
+
+    return {
+        "session": session,
+        "lock_acquired": True,
+        "prompt": prompt,
+        "sys_prompt": sys_prompt,
+        "is_new": is_new,
+        "resume_id": resume_id,
+        "chunk_kwargs": dict(
+            prompt=prompt,
+            model=options.get("model"),
+            system_prompt=sys_prompt if is_new else None,
+            permission_mode=options.get("permission_mode"),
+            mcp_servers=options.get("mcp_servers"),
+            allowed_tools=options.get("allowed_tools"),
+            disallowed_tools=options.get("disallowed_tools"),
+            output_format=options.get("output_format"),
+            max_turns=options.get("max_turns", DEFAULT_MAX_TURNS),
+            session_id=request.session_id if is_new else None,
+            resume=resume_id,
+            stream=True,
+        ),
+    }
 
 
 async def generate_streaming_response(
-    request: ChatCompletionRequest, request_id: str, claude_headers: Optional[Dict[str, Any]] = None
+    request: ChatCompletionRequest,
+    request_id: str,
+    claude_headers: Optional[Dict[str, Any]] = None,
+    *,
+    preflight: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
-    """Generate SSE formatted streaming response."""
+    """Generate SSE formatted streaming response via backend dispatch.
+
+    If ``preflight`` is provided (from ``_streaming_session_preflight``), the
+    generator skips session guards and uses the pre-validated state directly.
+    The caller is responsible for having run preflight before creating the
+    StreamingResponse so that HTTPExceptions surface as proper HTTP errors.
+    """
+    session = None
+    lock_acquired = False
     try:
-        claude_options = _build_claude_options(request, claude_headers)
+        resolved, backend = _resolve_and_get_backend(request.model)
 
-        if request.session_id:
-            # Session mode: fresh SDK call per turn with session_id/resume
-            prompt, session, is_new = _prepare_session_prompt(request)
+        if request.session_id and preflight is not None:
+            # Fast path: use pre-validated session state from preflight.
+            # Adopt lock ownership FIRST so finally can release on any failure.
+            session = preflight["session"]
+            lock_acquired = preflight["lock_acquired"]
+            prompt = preflight["prompt"]
+            chunk_source = backend.run_completion(**preflight["chunk_kwargs"])
+        elif request.session_id:
+            # Legacy path (direct calls without preflight, e.g. tests)
+            _validate_backend_auth(resolved.backend)
+            options = _build_backend_options(request, resolved, claude_headers)
+            prompt, sys_prompt, session = _prepare_session_prompt(request)
 
-            chunk_source = claude_cli.run_completion(
+            await session.lock.acquire()
+            lock_acquired = True
+
+            is_new = len(session.messages) == 0
+
+            if not is_new and session.backend != resolved.backend:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"Session '{request.session_id}' belongs to backend "
+                        f"'{session.backend}', but model '{request.model}' resolves "
+                        f"to '{resolved.backend}'. Cannot mix backends within a session."
+                    ),
+                )
+
+            resume_id = None
+            if not is_new:
+                if resolved.backend == "codex" and not session.provider_session_id:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Cannot resume Codex session '{request.session_id}': "
+                            f"the previous turn did not return a thread_id. "
+                            f"Start a new session instead."
+                        ),
+                    )
+                resume_id = session.provider_session_id or request.session_id
+
+            session.add_messages(request.messages)
+            if is_new:
+                session.backend = resolved.backend
+
+            chunk_source = backend.run_completion(
                 prompt=prompt,
-                model=claude_options.get("model"),
-                system_prompt=claude_options.get("system_prompt") if is_new else None,
-                permission_mode=claude_options.get("permission_mode"),
-                mcp_servers=claude_options.get("mcp_servers"),
-                allowed_tools=claude_options.get("allowed_tools"),
-                disallowed_tools=claude_options.get("disallowed_tools"),
-                output_format=claude_options.get("output_format"),
-                max_turns=claude_options.get("max_turns", DEFAULT_MAX_TURNS),
+                model=options.get("model"),
+                system_prompt=sys_prompt if is_new else None,
+                permission_mode=options.get("permission_mode"),
+                mcp_servers=options.get("mcp_servers"),
+                allowed_tools=options.get("allowed_tools"),
+                disallowed_tools=options.get("disallowed_tools"),
+                output_format=options.get("output_format"),
+                max_turns=options.get("max_turns", DEFAULT_MAX_TURNS),
                 session_id=request.session_id if is_new else None,
-                resume=request.session_id if not is_new else None,
+                resume=resume_id,
                 stream=True,
             )
         else:
-            # Stateless mode: existing code path
-            prompt, run_kwargs = _prepare_stateless_completion(request.messages, claude_options)
-
-            chunk_source = claude_cli.run_completion(**run_kwargs, stream=True)
+            # Stateless mode
+            _validate_backend_auth(resolved.backend)
+            options = _build_backend_options(request, resolved, claude_headers)
+            prompt, run_kwargs = _prepare_stateless_completion(request.messages, options)
+            chunk_source = backend.run_completion(**run_kwargs, stream=True)
 
         # Stream chunks using shared SSE logic
         chunks_buffer = []
         async for sse_line in _stream_chunks(chunk_source, request, request_id, chunks_buffer):
             yield sse_line
 
+        # Capture provider session id (e.g. Codex thread_id) from meta-events
+        if session is not None:
+            _capture_provider_session_id(chunks_buffer, session)
+
         # Extract assistant response from all chunks
         assistant_content = None
         if chunks_buffer:
-            assistant_content = claude_cli.parse_claude_message(chunks_buffer)
+            assistant_content = backend.parse_message(chunks_buffer)
 
             # Store in session if applicable
             actual_session_id = request.session_id
@@ -595,7 +849,7 @@ async def generate_streaming_response(
                 token_usage = sdk_usage
             else:
                 completion_text = assistant_content or ""
-                token_usage = claude_cli.estimate_token_usage(prompt, completion_text, request.model)
+                token_usage = backend.estimate_token_usage(prompt, completion_text, request.model)
             usage_data = Usage(
                 prompt_tokens=token_usage["prompt_tokens"],
                 completion_tokens=token_usage["completion_tokens"],
@@ -613,10 +867,16 @@ async def generate_streaming_response(
         )
         yield "data: [DONE]\n\n"
 
+    except HTTPException:
+        raise  # Let FastAPI handle these
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         error_chunk = {"error": {"message": str(e), "type": "streaming_error"}}
         yield f"data: {json.dumps(error_chunk)}\n\n"
+    finally:
+        # Release per-session lock only if THIS coroutine acquired it
+        if lock_acquired:
+            session.lock.release()
 
 
 @app.post("/v1/chat/completions")
@@ -626,23 +886,14 @@ async def chat_completions(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """OpenAI-compatible chat completions endpoint."""
-    # Check FastAPI API key if configured
+    """OpenAI-compatible chat completions endpoint with backend dispatch."""
     await verify_api_key(request, credentials)
 
-    # Validate Claude Code authentication
-    auth_valid, auth_info = validate_claude_code_auth()
-
-    if not auth_valid:
-        error_detail = {
-            "message": "Claude Code authentication failed",
-            "errors": auth_info.get("errors", []),
-            "method": auth_info.get("method", "none"),
-            "help": "Check /v1/auth/status for detailed authentication information",
-        }
-        raise HTTPException(status_code=503, detail=error_detail)
-
     try:
+        # Resolve model → backend and validate auth
+        resolved, backend = _resolve_and_get_backend(request_body.model)
+        _validate_backend_auth(resolved.backend)
+
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
 
         # Extract Claude-specific parameters from headers
@@ -654,9 +905,21 @@ async def chat_completions(
             logger.debug(f"Compatibility report: {compatibility_report}")
 
         if request_body.stream:
-            # Return streaming response
+            # Run session preflight BEFORE creating StreamingResponse so that
+            # HTTPExceptions (400 backend mismatch, 409 Codex guard) surface
+            # as proper HTTP error status codes instead of being swallowed
+            # inside the async generator after the 200 status line is committed.
+            preflight = None
+            if request_body.session_id:
+                options = _build_backend_options(request_body, resolved, claude_headers)
+                preflight = await _streaming_session_preflight(
+                    request_body, resolved, backend, options
+                )
+
             return StreamingResponse(
-                generate_streaming_response(request_body, request_id, claude_headers),
+                generate_streaming_response(
+                    request_body, request_id, claude_headers, preflight=preflight
+                ),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
@@ -665,54 +928,96 @@ async def chat_completions(
             )
         else:
             # Non-streaming response
-            claude_options = _build_claude_options(request_body, claude_headers)
+            options = _build_backend_options(request_body, resolved, claude_headers)
 
+            session = None
             if request_body.session_id:
-                # Session mode: fresh SDK call per turn with session_id/resume
-                prompt, session, is_new = _prepare_session_prompt(request_body)
+                prompt, sys_prompt, session = _prepare_session_prompt(request_body)
 
-                chunks = []
-                async for chunk in claude_cli.run_completion(
-                    prompt=prompt,
-                    model=claude_options.get("model"),
-                    system_prompt=claude_options.get("system_prompt") if is_new else None,
-                    permission_mode=claude_options.get("permission_mode"),
-                    mcp_servers=claude_options.get("mcp_servers"),
-                    allowed_tools=claude_options.get("allowed_tools"),
-                    disallowed_tools=claude_options.get("disallowed_tools"),
-                    output_format=claude_options.get("output_format"),
-                    max_turns=claude_options.get("max_turns", DEFAULT_MAX_TURNS),
-                    session_id=request_body.session_id if is_new else None,
-                    resume=request_body.session_id if not is_new else None,
-                    stream=False,
-                ):
-                    chunks.append(chunk)
+                # Acquire lock BEFORE is_new check to prevent concurrent first-turn race
+                async with session.lock:
+                    is_new = len(session.messages) == 0
+
+                    # Enforce backend invariant (inside lock to avoid TOCTOU)
+                    if not is_new and session.backend != resolved.backend:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=(
+                                f"Session '{request_body.session_id}' belongs to backend "
+                                f"'{session.backend}', but model '{request_body.model}' "
+                                f"resolves to '{resolved.backend}'. "
+                                f"Cannot mix backends within a session."
+                            ),
+                        )
+
+                    # Compute resume token BEFORE mutating session state
+                    resume_id = None
+                    if not is_new:
+                        if resolved.backend == "codex" and not session.provider_session_id:
+                            raise HTTPException(
+                                status_code=409,
+                                detail=(
+                                    f"Cannot resume Codex session "
+                                    f"'{request_body.session_id}': the previous turn "
+                                    f"did not return a thread_id. "
+                                    f"Start a new session instead."
+                                ),
+                            )
+                        resume_id = session.provider_session_id or request_body.session_id
+
+                    # Commit messages and tag backend AFTER all checks pass
+                    session.add_messages(request_body.messages)
+                    if is_new:
+                        session.backend = resolved.backend
+
+                    chunks = []
+                    async for chunk in backend.run_completion(
+                        prompt=prompt,
+                        model=options.get("model"),
+                        system_prompt=sys_prompt if is_new else None,
+                        permission_mode=options.get("permission_mode"),
+                        mcp_servers=options.get("mcp_servers"),
+                        allowed_tools=options.get("allowed_tools"),
+                        disallowed_tools=options.get("disallowed_tools"),
+                        output_format=options.get("output_format"),
+                        max_turns=options.get("max_turns", DEFAULT_MAX_TURNS),
+                        session_id=request_body.session_id if is_new else None,
+                        resume=resume_id,
+                        stream=False,
+                    ):
+                        chunks.append(chunk)
+
+                    # Capture provider session id + store assistant response
+                    # inside lock to prevent stale reads between requests
+                    _capture_provider_session_id(chunks, session)
+
+                    raw_assistant_content = backend.parse_message(chunks)
+                    if raw_assistant_content:
+                        assistant_message = Message(role="assistant", content=raw_assistant_content)
+                        session_manager.add_assistant_response(
+                            request_body.session_id, assistant_message
+                        )
             else:
-                # Stateless mode
-                prompt, run_kwargs = _prepare_stateless_completion(
-                    request_body.messages, claude_options
-                )
+                prompt, run_kwargs = _prepare_stateless_completion(request_body.messages, options)
 
                 logger.info(
                     f"Chat completion: session_id=None, total_messages={len(request_body.messages)}"
                 )
 
                 chunks = []
-                async for chunk in claude_cli.run_completion(**run_kwargs, stream=False):
+                async for chunk in backend.run_completion(**run_kwargs, stream=False):
                     chunks.append(chunk)
 
-            # Extract assistant message
-            raw_assistant_content = claude_cli.parse_claude_message(chunks)
+                raw_assistant_content = backend.parse_message(chunks)
 
+            # Extract assistant message
             if not raw_assistant_content:
-                raise HTTPException(status_code=500, detail="No response from Claude Code")
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"No response from {resolved.backend} backend",
+                )
 
             assistant_content = raw_assistant_content
-
-            # Add assistant response to session if using session mode
-            if request_body.session_id:
-                assistant_message = Message(role="assistant", content=assistant_content)
-                session_manager.add_assistant_response(request_body.session_id, assistant_message)
 
             # Token usage (prefer real SDK values)
             sdk_usage = streaming_utils.extract_sdk_usage(chunks)
@@ -727,7 +1032,6 @@ async def chat_completions(
             sdk_stop_reason = extract_stop_reason(chunks)
             finish_reason = map_stop_reason(sdk_stop_reason)
 
-            # Create response
             response = ChatCompletionResponse(
                 id=request_id,
                 model=request_body.model,
@@ -761,25 +1065,28 @@ async def anthropic_messages(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Anthropic Messages API compatible endpoint.
+    """Anthropic Messages API compatible endpoint (Claude-only).
 
     This endpoint provides compatibility with the native Anthropic SDK,
     allowing tools like VC to use this wrapper via the VC_API_BASE setting.
+    Codex models are not supported on this endpoint.
     """
-    # Check FastAPI API key if configured
     await verify_api_key(request, credentials)
 
-    # Validate Claude Code authentication
-    auth_valid, auth_info = validate_claude_code_auth()
+    # Claude-only guard: reject Codex models on Anthropic endpoint
+    resolved = resolve_model(request_body.model)
+    if resolved.backend != "claude":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Model '{request_body.model}' resolves to the {resolved.backend} backend. "
+                f"The /v1/messages endpoint only supports Claude models. "
+                f"Use /v1/chat/completions for {resolved.backend} models."
+            ),
+        )
 
-    if not auth_valid:
-        error_detail = {
-            "message": "Claude Code authentication failed",
-            "errors": auth_info.get("errors", []),
-            "method": auth_info.get("method", "none"),
-            "help": "Check /v1/auth/status for detailed authentication information",
-        }
-        raise HTTPException(status_code=503, detail=error_detail)
+    # Validate Claude authentication
+    _validate_backend_auth("claude")
 
     try:
         logger.info(f"Anthropic Messages API request: model={request_body.model}")
@@ -820,7 +1127,7 @@ async def anthropic_messages(
             chunks.append(chunk)
 
         # Extract assistant message
-        raw_assistant_content = claude_cli.parse_claude_message(chunks)
+        raw_assistant_content = claude_cli.parse_message(chunks)
 
         if not raw_assistant_content:
             raise HTTPException(status_code=500, detail="No response from Claude Code")
@@ -863,17 +1170,12 @@ async def anthropic_messages(
 async def list_models(
     request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """List available models."""
-    # Check FastAPI API key if configured
+    """List available models from all registered backends."""
     await verify_api_key(request, credentials)
 
-    # Use constants for single source of truth
     return {
         "object": "list",
-        "data": [
-            {"id": model_id, "object": "model", "owned_by": "anthropic"}
-            for model_id in CLAUDE_MODELS
-        ],
+        "data": BackendRegistry.available_models(),
     }
 
 
@@ -933,7 +1235,11 @@ async def check_compatibility(request_body: ChatCompletionRequest):
 @rate_limit_endpoint("health")
 async def health_check(request: Request):
     """Health check endpoint."""
-    return {"status": "healthy", "service": "claude-code-openai-wrapper"}
+    return {
+        "status": "healthy",
+        "service": "claude-code-openai-wrapper",
+        "backends": list(BackendRegistry.all_backends().keys()),
+    }
 
 
 @app.get("/version")
@@ -1029,14 +1335,18 @@ async def debug_request_validation(request: Request):
 @app.get("/v1/auth/status")
 @rate_limit_endpoint("auth")
 async def get_auth_status(request: Request):
-    """Get Claude Code authentication status."""
-    from src.auth import auth_manager
-
-    auth_info = get_claude_code_auth_info()
+    """Get authentication status for all backends."""
     active_api_key = auth_manager.get_api_key()
 
+    backends_auth = get_all_backends_auth_info()
+    registered_backends = list(BackendRegistry.all_backends().keys())
+
     return {
-        "claude_code_auth": auth_info,
+        "claude_code_auth": get_claude_code_auth_info(),
+        "backends": {
+            name: {**info, "registered": name in registered_backends}
+            for name, info in backends_auth.items()
+        },
         "server_info": {
             "api_key_required": bool(active_api_key),
             "api_key_source": (
@@ -1044,6 +1354,8 @@ async def get_auth_status(request: Request):
                 if os.getenv("API_KEY")
                 else ("runtime" if runtime_api_key else "none")
             ),
+            "registered_backends": registered_backends,
+            "codex_enabled": CODEX_ENABLED,
             "version": "1.0.0",
         },
     }
@@ -1200,7 +1512,7 @@ async def create_response(
                 # Commit turn counter and update session only on success
                 if stream_result.get("success"):
                     session.turn_counter = next_turn
-                    assistant_text = claude_cli.parse_claude_message(chunks_buffer)
+                    assistant_text = claude_cli.parse_message(chunks_buffer)
                     if assistant_text:
                         session.add_messages([Message(role="user", content=prompt)])
                         session_manager.add_assistant_response(
@@ -1244,7 +1556,7 @@ async def create_response(
             raise HTTPException(status_code=502, detail=f"Claude SDK error: {error_msg}")
 
     # Extract assistant text
-    assistant_text = claude_cli.parse_claude_message(chunks)
+    assistant_text = claude_cli.parse_message(chunks)
     if not assistant_text:
         raise HTTPException(status_code=502, detail="No response from Claude SDK")
 

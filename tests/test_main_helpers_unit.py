@@ -23,12 +23,13 @@ def _parse_chat_sse(line: str) -> dict:
     return json.loads(line[len("data: ") :])
 
 
-
 def test_map_stop_reason_and_extract_stop_reason():
     assert main.map_stop_reason("max_tokens") == "length"
     assert main.map_stop_reason("end_turn") == "stop"
 
-    assert main.extract_stop_reason([{"type": "assistant"}, {"stop_reason": "end_turn"}]) == "end_turn"
+    assert (
+        main.extract_stop_reason([{"type": "assistant"}, {"stop_reason": "end_turn"}]) == "end_turn"
+    )
     assert main.extract_stop_reason([{"type": "assistant"}]) is None
 
 
@@ -55,8 +56,9 @@ def test_prompt_for_api_protection_returns_none_for_no(monkeypatch):
 def test_prompt_for_api_protection_returns_generated_token(monkeypatch):
     monkeypatch.delenv("API_KEY", raising=False)
 
-    with patch("builtins.input", return_value="yes"), patch.object(
-        main, "generate_secure_token", return_value="generated-token"
+    with (
+        patch("builtins.input", return_value="yes"),
+        patch.object(main, "generate_secure_token", return_value="generated-token"),
     ):
         assert main.prompt_for_api_protection() == "generated-token"
 
@@ -68,17 +70,20 @@ def test_prompt_for_api_protection_handles_invalid_input_then_interrupt(monkeypa
         assert main.prompt_for_api_protection() is None
 
 
-def test_build_claude_options_disables_tools_and_adds_mcp_servers():
+def test_build_backend_options_disables_tools_and_adds_mcp_servers():
     request = ChatCompletionRequest(
         model=DEFAULT_MODEL,
         messages=[Message(role="user", content="Hi")],
         enable_tools=False,
     )
+    resolved = main.ResolvedModel(
+        public_model=DEFAULT_MODEL, backend="claude", provider_model=DEFAULT_MODEL
+    )
 
     with patch.object(
         main, "get_mcp_servers", return_value={"demo": {"type": "stdio", "command": "demo"}}
     ):
-        options = main._build_claude_options(request, {"max_turns": 9})
+        options = main._build_backend_options(request, resolved, {"max_turns": 9})
 
     assert options["model"] == DEFAULT_MODEL
     assert options["max_turns"] == 1
@@ -86,15 +91,18 @@ def test_build_claude_options_disables_tools_and_adds_mcp_servers():
     assert options["mcp_servers"] == {"demo": {"type": "stdio", "command": "demo"}}
 
 
-def test_build_claude_options_enables_tools():
+def test_build_backend_options_enables_tools():
     request = ChatCompletionRequest(
         model=DEFAULT_MODEL,
         messages=[Message(role="user", content="Hi")],
         enable_tools=True,
     )
+    resolved = main.ResolvedModel(
+        public_model=DEFAULT_MODEL, backend="claude", provider_model=DEFAULT_MODEL
+    )
 
     with patch.object(main, "get_mcp_servers", return_value={}):
-        options = main._build_claude_options(request)
+        options = main._build_backend_options(request, resolved)
 
     assert options["allowed_tools"] == main.DEFAULT_ALLOWED_TOOLS
     assert options["permission_mode"] == main.PERMISSION_MODE_BYPASS
@@ -136,11 +144,12 @@ def test_prepare_session_prompt_uses_last_user_message():
         session_id="session-helper-test",
     )
 
-    prompt, session, is_new = main._prepare_session_prompt(request)
+    prompt, system_prompt, session = main._prepare_session_prompt(request)
 
     assert prompt == "Newest user prompt"
+    assert system_prompt == "system prompt"
     assert session.session_id == "session-helper-test"
-    assert is_new is True  # new session has no prior messages
+    assert len(session.messages) == 0  # no mutation, session is still empty
 
 
 @pytest.mark.asyncio
@@ -172,7 +181,7 @@ async def test_generate_streaming_response_returns_error_chunk_on_exception():
         stream=True,
     )
 
-    with patch.object(main, "_build_claude_options", side_effect=RuntimeError("boom")):
+    with patch.object(main, "_resolve_and_get_backend", side_effect=RuntimeError("boom")):
         lines = [line async for line in main.generate_streaming_response(request, "req-2")]
 
     assert lines == ['data: {"error": {"message": "boom", "type": "streaming_error"}}\n\n']
@@ -183,13 +192,17 @@ async def test_lifespan_handles_auth_failure_timeout_and_debug_logging():
     main.DEBUG_MODE = True
     main.runtime_api_key = "runtime-token"
 
-    with patch.object(
-        main, "validate_claude_code_auth", return_value=(False, {"errors": ["missing auth"], "method": "none"})
-    ), patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}), patch.object(
-        main.claude_cli, "verify_cli", AsyncMock(side_effect=asyncio.TimeoutError)
-    ), patch.object(main.session_manager, "start_cleanup_task") as start_cleanup, patch.object(
-        main.session_manager, "async_shutdown", AsyncMock()
-    ) as async_shutdown:
+    with (
+        patch.object(
+            main,
+            "validate_claude_code_auth",
+            return_value=(False, {"errors": ["missing auth"], "method": "none"}),
+        ),
+        patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
+        patch.object(main.claude_cli, "verify_cli", AsyncMock(side_effect=asyncio.TimeoutError)),
+        patch.object(main.session_manager, "start_cleanup_task") as start_cleanup,
+        patch.object(main.session_manager, "async_shutdown", AsyncMock()) as async_shutdown,
+    ):
         async with main.lifespan(main.app):
             pass
 
@@ -228,9 +241,10 @@ def test_find_available_port_raises_when_all_ports_are_taken():
 
 
 def test_run_server_uses_default_host_and_port():
-    with patch.object(main, "prompt_for_api_protection", return_value=None), patch(
-        "uvicorn.run"
-    ) as run:
+    with (
+        patch.object(main, "prompt_for_api_protection", return_value=None),
+        patch("uvicorn.run") as run,
+    ):
         main.run_server()
 
     run.assert_called_once_with(main.app, host=DEFAULT_HOST, port=DEFAULT_PORT)
@@ -240,9 +254,12 @@ def test_run_server_falls_back_to_alternative_port():
     address_in_use = OSError("Address already in use")
     address_in_use.errno = 48
 
-    with patch.object(main, "prompt_for_api_protection", return_value="runtime-token"), patch.object(
-        main, "find_available_port", return_value=9001
-    ), patch("builtins.print"), patch("uvicorn.run", side_effect=[address_in_use, None]) as run:
+    with (
+        patch.object(main, "prompt_for_api_protection", return_value="runtime-token"),
+        patch.object(main, "find_available_port", return_value=9001),
+        patch("builtins.print"),
+        patch("uvicorn.run", side_effect=[address_in_use, None]) as run,
+    ):
         main.run_server(port=8000, host="127.0.0.1")
 
     assert main.runtime_api_key == "runtime-token"
@@ -413,7 +430,8 @@ async def test_stream_chunks_skips_assistant_in_token_mode():
     content_deltas = [
         payload["choices"][0]["delta"]["content"]
         for payload in payloads
-        if "content" in payload["choices"][0]["delta"] and payload["choices"][0]["delta"].get("role") != "assistant"
+        if "content" in payload["choices"][0]["delta"]
+        and payload["choices"][0]["delta"].get("role") != "assistant"
     ]
 
     assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
@@ -471,7 +489,8 @@ async def test_stream_chunks_thinking_with_tags():
     content_deltas = [
         payload["choices"][0]["delta"]["content"]
         for payload in payloads
-        if "content" in payload["choices"][0]["delta"] and payload["choices"][0]["delta"].get("role") != "assistant"
+        if "content" in payload["choices"][0]["delta"]
+        and payload["choices"][0]["delta"].get("role") != "assistant"
     ]
 
     assert payloads[0]["choices"][0]["delta"]["role"] == "assistant"
@@ -520,7 +539,8 @@ async def test_stream_chunks_token_mode_skips_assistantmessage_tool_use_duplicat
     content_deltas = [
         payload["choices"][0]["delta"]["content"]
         for payload in payloads
-        if "content" in payload["choices"][0]["delta"] and payload["choices"][0]["delta"].get("role") != "assistant"
+        if "content" in payload["choices"][0]["delta"]
+        and payload["choices"][0]["delta"].get("role") != "assistant"
     ]
 
     assert content_deltas == ["Let me check"]
@@ -579,24 +599,23 @@ async def test_stream_chunks_token_mode_emits_tool_use_from_stream_events():
 
     chunks = []
     streamed = []
-    async for line in main._stream_chunks(tool_use_event_source(), request, "req-tool-events", chunks):
+    async for line in main._stream_chunks(
+        tool_use_event_source(), request, "req-tool-events", chunks
+    ):
         streamed.append(line)
 
     payloads = [_parse_chat_sse(line) for line in streamed]
     content_deltas = [
         payload["choices"][0]["delta"]["content"]
         for payload in payloads
-        if "content" in payload["choices"][0]["delta"] and payload["choices"][0]["delta"].get("role") != "assistant"
+        if "content" in payload["choices"][0]["delta"]
+        and payload["choices"][0]["delta"].get("role") != "assistant"
     ]
 
     assert content_deltas[0] == "Let me check"
 
     # tool_use is now emitted as a system_event, not as content
-    system_events = [
-        payload["system_event"]
-        for payload in payloads
-        if "system_event" in payload
-    ]
+    system_events = [payload["system_event"] for payload in payloads if "system_event" in payload]
     tool_use_events = [e for e in system_events if e.get("type") == "tool_use"]
     assert len(tool_use_events) == 1
     assert tool_use_events[0]["name"] == "Read"
@@ -612,6 +631,7 @@ async def test_stream_chunks_thinking_and_tool_use_reassembly_complex():
     3. skip nested tool events (parent_tool_use_id)
     4. content_block_start/delta/stop flow
     """
+
     async def complex_source():
         # 1. Thinking block
         yield {
@@ -710,7 +730,9 @@ async def test_stream_chunks_thinking_and_tool_use_reassembly_complex():
     payloads = [_parse_chat_sse(line) for line in streamed]
     deltas = [payload["choices"][0]["delta"] for payload in payloads]
     content_deltas = [
-        delta["content"] for delta in deltas if "content" in delta and delta.get("role") != "assistant"
+        delta["content"]
+        for delta in deltas
+        if "content" in delta and delta.get("role") != "assistant"
     ]
 
     assert deltas[0]["role"] == "assistant"
@@ -720,11 +742,7 @@ async def test_stream_chunks_thinking_and_tool_use_reassembly_complex():
     assert "I will read the file." in content_deltas
 
     # tool_use is now emitted as a system_event
-    system_events = [
-        payload["system_event"]
-        for payload in payloads
-        if "system_event" in payload
-    ]
+    system_events = [payload["system_event"] for payload in payloads if "system_event" in payload]
     tool_use_events = [e for e in system_events if e.get("type") == "tool_use"]
     assert len(tool_use_events) == 1
     assert tool_use_events[0]["id"] == "tool-1"
@@ -737,9 +755,12 @@ def test_run_server_reraises_when_no_alternative_port_is_found():
     address_in_use = OSError("Address already in use")
     address_in_use.errno = 48
 
-    with patch.object(main, "prompt_for_api_protection", return_value=None), patch.object(
-        main, "find_available_port", side_effect=RuntimeError("no ports")
-    ), patch("builtins.print"), patch("uvicorn.run", side_effect=address_in_use):
+    with (
+        patch.object(main, "prompt_for_api_protection", return_value=None),
+        patch.object(main, "find_available_port", side_effect=RuntimeError("no ports")),
+        patch("builtins.print"),
+        patch("uvicorn.run", side_effect=address_in_use),
+    ):
         with pytest.raises(RuntimeError, match="no ports"):
             main.run_server(port=8000, host="127.0.0.1")
 
@@ -748,8 +769,9 @@ def test_run_server_reraises_unrelated_oserror():
     unexpected_error = OSError("permission denied")
     unexpected_error.errno = 13
 
-    with patch.object(main, "prompt_for_api_protection", return_value=None), patch(
-        "uvicorn.run", side_effect=unexpected_error
+    with (
+        patch.object(main, "prompt_for_api_protection", return_value=None),
+        patch("uvicorn.run", side_effect=unexpected_error),
     ):
         with pytest.raises(OSError, match="permission denied"):
             main.run_server(port=8000, host="127.0.0.1")
@@ -767,8 +789,10 @@ async def test_debug_logging_middleware_logs_raw_body_when_json_parse_fails(capl
     response = MagicMock(status_code=200)
     call_next = AsyncMock(return_value=response)
 
-    with patch.object(main, "DEBUG_MODE", True), patch.object(main, "VERBOSE", False), caplog.at_level(
-        logging.DEBUG
+    with (
+        patch.object(main, "DEBUG_MODE", True),
+        patch.object(main, "VERBOSE", False),
+        caplog.at_level(logging.DEBUG),
     ):
         result = await middleware.dispatch(request, call_next)
 
@@ -788,8 +812,10 @@ async def test_debug_logging_middleware_handles_body_read_and_downstream_failure
     request.body = AsyncMock(side_effect=RuntimeError("read failed"))
     call_next = AsyncMock(side_effect=RuntimeError("boom"))
 
-    with patch.object(main, "DEBUG_MODE", True), patch.object(main, "VERBOSE", False), caplog.at_level(
-        logging.DEBUG
+    with (
+        patch.object(main, "DEBUG_MODE", True),
+        patch.object(main, "VERBOSE", False),
+        caplog.at_level(logging.DEBUG),
     ):
         with pytest.raises(RuntimeError, match="boom"):
             await middleware.dispatch(request, call_next)
@@ -830,9 +856,8 @@ def test_parse_response_id_rejects_invalid_formats(response_id):
 # ---------------------------------------------------------------------------
 
 
-
-class TestBuildClaudeOptionsWithHeaders:
-    """Test _build_claude_options merges claude_headers into options."""
+class TestBuildBackendOptionsWithHeaders:
+    """Test _build_backend_options merges claude_headers into options."""
 
     def test_headers_override_max_turns(self):
         request = ChatCompletionRequest(
@@ -841,9 +866,14 @@ class TestBuildClaudeOptionsWithHeaders:
             enable_tools=True,
         )
         headers = {"max_turns": 25}
+        resolved = main.ResolvedModel(
+            public_model="claude-sonnet-4-20250514",
+            backend="claude",
+            provider_model="claude-sonnet-4-20250514",
+        )
 
         with patch.object(main, "get_mcp_servers", return_value={}):
-            options = main._build_claude_options(request, headers)
+            options = main._build_backend_options(request, resolved, headers)
 
         # claude_headers should override the default max_turns
         assert options["max_turns"] == 25
@@ -854,9 +884,14 @@ class TestBuildClaudeOptionsWithHeaders:
             messages=[Message(role="user", content="Hi")],
             enable_tools=False,
         )
+        resolved = main.ResolvedModel(
+            public_model="claude-sonnet-4-20250514",
+            backend="claude",
+            provider_model="claude-sonnet-4-20250514",
+        )
 
         with patch.object(main, "get_mcp_servers", return_value={}):
-            options = main._build_claude_options(request, None)
+            options = main._build_backend_options(request, resolved, None)
 
         # With tools disabled, max_turns is forced to 1
         assert options["max_turns"] == 1
@@ -876,7 +911,7 @@ class TestPrepareSessionPromptEdgeCases:
             session_id="session-no-user-test",
         )
 
-        prompt, session, is_new = main._prepare_session_prompt(request)
+        prompt, _sys, session = main._prepare_session_prompt(request)
 
         # last_user_msg is None, so it falls back to MessageAdapter.messages_to_prompt
         assert prompt is not None
@@ -897,7 +932,7 @@ class TestPrepareSessionPromptEdgeCases:
             session_id="session-multi-user-test",
         )
 
-        prompt, session, is_new = main._prepare_session_prompt(request)
+        prompt, _sys, session = main._prepare_session_prompt(request)
 
         assert prompt == "Third question"
 
@@ -909,7 +944,7 @@ class TestMakeSSE:
         line = make_sse("req-100", "test-model", {"content": "hello"})
         assert line.startswith("data: ")
         assert line.endswith("\n\n")
-        payload = json.loads(line[len("data: "):])
+        payload = json.loads(line[len("data: ") :])
         assert payload["id"] == "req-100"
         assert payload["model"] == "test-model"
         assert payload["choices"][0]["delta"] == {"content": "hello"}
@@ -917,13 +952,13 @@ class TestMakeSSE:
 
     def test_finish_reason_included(self):
         line = make_sse("req-101", "test-model", {}, finish_reason="stop")
-        payload = json.loads(line[len("data: "):])
+        payload = json.loads(line[len("data: ") :])
         assert payload["choices"][0]["finish_reason"] == "stop"
 
     def test_usage_included(self):
         usage = Usage(prompt_tokens=10, completion_tokens=20, total_tokens=30)
         line = make_sse("req-102", "test-model", {}, usage=usage)
-        payload = json.loads(line[len("data: "):])
+        payload = json.loads(line[len("data: ") :])
         assert payload["usage"]["prompt_tokens"] == 10
         assert payload["usage"]["completion_tokens"] == 20
         assert payload["usage"]["total_tokens"] == 30
@@ -995,22 +1030,37 @@ async def test_generate_streaming_response_with_include_usage():
         stream_options=StreamOptions(include_usage=True),
     )
 
-    with patch.object(main, "_build_claude_options", return_value={
-        "model": "claude-sonnet-4-20250514",
-        "max_turns": 1,
-        "disallowed_tools": main.CLAUDE_TOOLS,
-    }), patch.object(main.claude_cli, "run_completion", return_value=_fake_hello_chunk_source()), \
-         patch.object(main.claude_cli, "parse_claude_message", return_value="Hello"), \
-         patch.object(main.claude_cli, "estimate_token_usage", return_value={
-             "prompt_tokens": 5,
-             "completion_tokens": 10,
-             "total_tokens": 15,
-         }):
+    mock_backend = MagicMock()
+    mock_backend.run_completion = MagicMock(return_value=_fake_hello_chunk_source())
+    mock_backend.parse_message = MagicMock(return_value="Hello")
+    mock_backend.estimate_token_usage = MagicMock(
+        return_value={
+            "prompt_tokens": 5,
+            "completion_tokens": 10,
+            "total_tokens": 15,
+        }
+    )
+
+    with (
+        patch.object(
+            main,
+            "_resolve_and_get_backend",
+            return_value=(
+                main.ResolvedModel(
+                    public_model="claude-sonnet-4-20250514",
+                    backend="claude",
+                    provider_model="claude-sonnet-4-20250514",
+                ),
+                mock_backend,
+            ),
+        ),
+        patch.object(main, "_validate_backend_auth"),
+    ):
         lines = [line async for line in main.generate_streaming_response(request, "req-usage")]
 
     # Last two lines should be the final chunk (with finish_reason+usage) and [DONE]
     assert lines[-1] == "data: [DONE]\n\n"
-    final_chunk = json.loads(lines[-2][len("data: "):])
+    final_chunk = json.loads(lines[-2][len("data: ") :])
     assert final_chunk["usage"]["prompt_tokens"] == 5
     assert final_chunk["usage"]["completion_tokens"] == 10
     assert final_chunk["usage"]["total_tokens"] == 15
@@ -1026,14 +1076,34 @@ async def test_generate_streaming_response_without_include_usage():
         stream=True,
     )
 
-    with patch.object(main, "_build_claude_options", return_value={
-        "model": "claude-sonnet-4-20250514",
-        "max_turns": 1,
-        "disallowed_tools": main.CLAUDE_TOOLS,
-    }), patch.object(main.claude_cli, "run_completion", return_value=_fake_hello_chunk_source()), \
-         patch.object(main.claude_cli, "parse_claude_message", return_value="Hello"):
+    mock_backend = MagicMock()
+    mock_backend.run_completion = MagicMock(return_value=_fake_hello_chunk_source())
+    mock_backend.parse_message = MagicMock(return_value="Hello")
+    mock_backend.estimate_token_usage = MagicMock(
+        return_value={
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        }
+    )
+
+    with (
+        patch.object(
+            main,
+            "_resolve_and_get_backend",
+            return_value=(
+                main.ResolvedModel(
+                    public_model="claude-sonnet-4-20250514",
+                    backend="claude",
+                    provider_model="claude-sonnet-4-20250514",
+                ),
+                mock_backend,
+            ),
+        ),
+        patch.object(main, "_validate_backend_auth"),
+    ):
         lines = [line async for line in main.generate_streaming_response(request, "req-no-usage")]
 
     assert lines[-1] == "data: [DONE]\n\n"
-    final_chunk = json.loads(lines[-2][len("data: "):])
+    final_chunk = json.loads(lines[-2][len("data: ") :])
     assert final_chunk["usage"] is None

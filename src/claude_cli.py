@@ -30,13 +30,19 @@ logger = logging.getLogger(__name__)
 class ClaudeCodeCLI:
     """Gateway for Claude Agent SDK queries.
 
-    Each call to ``run_completion`` / ``verify_cli`` invokes the SDK's
+    Implements the ``BackendClient`` protocol defined in
+    ``src/backend_registry.py`` so it can be registered as the ``claude``
+    backend.
+
+    Each call to ``run_completion`` / ``verify`` invokes the SDK's
     ``query()`` function which is **single-use**: the underlying anyio
     channel closes after the first response completes.  Never cache or
     reuse the async generator returned by ``query()``; always create a
     fresh call.  For multi-turn conversations use the ``resume``
     parameter instead of attempting to reuse a previous query.
     """
+
+    backend_name: str = "claude"
 
     def __init__(self, timeout: int = None, cwd: Optional[str] = None):
         if timeout is None:
@@ -189,6 +195,9 @@ class ClaudeCodeCLI:
     # Environment management
     # ------------------------------------------------------------------
 
+    # Env vars from other backends that must be hidden during Claude SDK calls
+    _ISOLATION_VARS = ["OPENAI_API_KEY"]
+
     @contextlib.contextmanager
     def _sdk_env(self):
         """Temporarily inject auth env vars for an SDK call.
@@ -197,29 +206,41 @@ class ClaudeCodeCLI:
         values are constant per instance the worst-case concurrent-write
         scenario is benign (same values), but we still restore the originals
         to keep tests hermetic.
-        """
-        if not self.claude_env_vars:
-            yield
-            return
 
+        Also temporarily removes env vars belonging to other backends
+        (e.g. ``OPENAI_API_KEY``) to prevent cross-contamination.
+        """
         original = {}
+        removed = {}
         try:
-            for key, value in self.claude_env_vars.items():
+            # Inject Claude auth vars
+            for key, value in (self.claude_env_vars or {}).items():
                 original[key] = os.environ.get(key)
                 os.environ[key] = value
+
+            # Remove other backends' credentials (cross-isolation)
+            for key in self._ISOLATION_VARS:
+                if key in os.environ:
+                    removed[key] = os.environ.pop(key)
+
             yield
         finally:
+            # Restore Claude auth vars
             for key, original_value in original.items():
                 if original_value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = original_value
 
+            # Restore removed isolation vars
+            for key, value in removed.items():
+                os.environ[key] = value
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def verify_cli(self) -> bool:
+    async def verify(self) -> bool:
         """Verify Claude Agent SDK is working and authenticated."""
         try:
             logger.info("Testing Claude Agent SDK...")
@@ -254,6 +275,9 @@ class ClaudeCodeCLI:
             logger.warning("  2. Set ANTHROPIC_AUTH_TOKEN environment variable")
             logger.warning("  3. Test: claude --print 'Hello'")
             return False
+
+    # Backward-compatible alias — existing code calls verify_cli().
+    verify_cli = verify
 
     async def run_completion(
         self,
@@ -315,8 +339,10 @@ class ClaudeCodeCLI:
     # Response parsing helpers
     # ------------------------------------------------------------------
 
-    def parse_claude_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+    def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         """Extract the assistant message from Claude Agent SDK messages.
+
+        Implements ``BackendClient.parse_message()``.
 
         Renders all content blocks (text, tool_use, tool_result, thinking)
         into a single text string. Prioritizes ResultMessage.result to avoid
@@ -356,6 +382,9 @@ class ClaudeCodeCLI:
                         all_parts.append(content)
 
         return "\n".join(all_parts) if all_parts else None
+
+    # Backward-compatible alias — existing code calls parse_claude_message().
+    parse_claude_message = parse_message
 
     def estimate_token_usage(
         self, prompt: str, completion: str, model: Optional[str] = None
