@@ -400,6 +400,25 @@ def normalize_codex_event(
 # ---------------------------------------------------------------------------
 
 
+def _request_has_images(request) -> bool:
+    """Check if request contains image content parts."""
+    messages = getattr(request, "messages", None)
+    if not messages:
+        return False
+    for msg in messages:
+        content = msg.content if hasattr(msg, "content") else None
+        if isinstance(content, list):
+            for part in content:
+                part_type = (
+                    part.type
+                    if hasattr(part, "type")
+                    else (part.get("type") if isinstance(part, dict) else None)
+                )
+                if part_type == "image_url":
+                    return True
+    return False
+
+
 class CodexCLI:
     """Codex Rust CLI wrapper that satisfies the ``BackendClient`` protocol.
 
@@ -491,6 +510,10 @@ class CodexCLI:
         Raises BackendConfigError instead of HTTPException.
         """
         from src.parameter_validator import ParameterValidator
+
+        # Reject image input early — Codex CLI does not support vision
+        if _request_has_images(request):
+            raise BackendConfigError("Image input is not supported for the codex backend")
 
         options = request.to_claude_options()
 

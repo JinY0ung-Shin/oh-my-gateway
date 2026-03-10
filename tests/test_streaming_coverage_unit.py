@@ -25,7 +25,6 @@ from src.streaming_utils import (
     extract_stream_event_delta,
     extract_user_tool_results,
     make_response_sse,
-    make_sse,
     make_tool_result_response_sse,
     make_tool_use_response_sse,
     stream_chunks,

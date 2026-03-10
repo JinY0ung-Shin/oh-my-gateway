@@ -115,8 +115,8 @@ class TestMessageHandling:
 
         result = MessageAdapter.filter_content(content)
         assert isinstance(result, str)
-        # Image reference should be converted to placeholder
-        assert "[Image: Content not supported" in result
+        # [Image:...] references are now preserved (not stripped)
+        assert "[Image: example.jpg]" in result
 
 
 class TestAPIModels:

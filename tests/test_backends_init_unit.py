@@ -9,7 +9,7 @@ Targets uncovered lines in:
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from src.backends.base import BackendRegistry
 

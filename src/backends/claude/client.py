@@ -33,6 +33,7 @@ from src.backends.claude.constants import (
 from src.backends.base import ResolvedModel
 from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.message_adapter import MessageAdapter
+from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_servers
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,8 @@ class ClaudeCodeCLI:
             logger.info(f"Using temporary isolated workspace: {self.cwd}")
             atexit.register(self._cleanup_temp_dir)
 
+        self._image_handler = ImageHandler(self.cwd)
+
         from src.auth import auth_manager, validate_claude_code_auth
 
         is_valid, auth_info = validate_claude_code_auth()
@@ -89,6 +92,14 @@ class ClaudeCodeCLI:
 
         # Auth env vars for SDK – constant per instance, set before each query.
         self.claude_env_vars = auth_manager.get_claude_code_env_vars()
+
+    @property
+    def image_handler(self) -> "ImageHandler":
+        return self._image_handler
+
+    def cleanup_images(self, max_age_seconds: int = 3600) -> int:
+        """Clean up old image files from the workspace."""
+        return self._image_handler.cleanup(max_age_seconds)
 
     # ------------------------------------------------------------------
     # BackendClient protocol — new properties and methods

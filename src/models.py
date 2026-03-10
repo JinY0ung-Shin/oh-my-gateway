@@ -15,8 +15,9 @@ def get_default_model():
 class ContentPart(BaseModel):
     """Content part for multimodal messages (OpenAI format)."""
 
-    type: Literal["text"]
-    text: str
+    type: Literal["text", "image_url"]
+    text: Optional[str] = None
+    image_url: Optional[dict] = None
 
 
 class Message(BaseModel):
@@ -26,9 +27,25 @@ class Message(BaseModel):
 
     @model_validator(mode="after")
     def normalize_content(self):
-        """Convert array content to string for Claude Code compatibility."""
+        """Convert array content to string for Claude Code compatibility.
+
+        If the list contains any image_url parts, keep it as a list to preserve
+        image data for downstream image handlers. Text-only lists are collapsed
+        to a single string as before.
+        """
         if isinstance(self.content, list):
-            # Extract text from content parts and concatenate
+            # Check if any part is an image_url type
+            has_image = any(
+                (isinstance(part, ContentPart) and part.type == "image_url")
+                or (isinstance(part, dict) and part.get("type") == "image_url")
+                for part in self.content
+            )
+
+            if has_image:
+                # Keep content as list when images are present
+                return self
+
+            # Text-only: extract and concatenate as before
             text_parts = []
             for part in self.content:
                 if isinstance(part, ContentPart) and part.type == "text":
@@ -171,18 +188,23 @@ class SessionListResponse(BaseModel):
 # ============================================================================
 
 
-class AnthropicTextBlock(BaseModel):
-    """Anthropic text content block."""
+class AnthropicContentBlock(BaseModel):
+    """Anthropic content block (text or image)."""
 
-    type: Literal["text"] = "text"
-    text: str
+    type: Literal["text", "image"] = "text"
+    text: Optional[str] = None
+    source: Optional[dict] = None
+
+
+# Backward-compatible alias
+AnthropicTextBlock = AnthropicContentBlock
 
 
 class AnthropicMessage(BaseModel):
     """Anthropic message format."""
 
     role: Literal["user", "assistant"]
-    content: Union[str, List[AnthropicTextBlock]]
+    content: Union[str, List[AnthropicContentBlock]]
 
 
 class AnthropicMessagesRequest(BaseModel):
@@ -205,9 +227,14 @@ class AnthropicMessagesRequest(BaseModel):
         for msg in self.messages:
             content = msg.content
             if isinstance(content, list):
-                # Extract text from content blocks
+                # Extract text from content blocks, skip image blocks
+                # (image blocks are handled separately by the image handler)
                 text_parts = [
-                    block.text for block in content if isinstance(block, AnthropicTextBlock)
+                    block.text
+                    for block in content
+                    if isinstance(block, AnthropicContentBlock)
+                    and block.type == "text"
+                    and block.text is not None
                 ]
                 content = "\n".join(text_parts)
             result.append(Message(role=msg.role, content=content))
@@ -227,7 +254,7 @@ class AnthropicMessagesResponse(BaseModel):
     id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[AnthropicTextBlock]
+    content: List[AnthropicContentBlock]
     model: str
     stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence"]] = "end_turn"
     stop_sequence: Optional[str] = None

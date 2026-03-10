@@ -110,6 +110,51 @@ class MessageAdapter:
         return "".join(parts) if parts else None
 
     @staticmethod
+    def extract_images_to_prompt(content, image_handler) -> str:
+        """Convert multimodal content (list with images) to string prompt.
+
+        Saves images to disk via image_handler and inserts file path references.
+        Pure text strings pass through unchanged.
+        """
+        if isinstance(content, str):
+            return content
+
+        parts = []
+        for item in content:
+            # Handle ContentPart objects
+            if hasattr(item, "type"):
+                if item.type == "text":
+                    text = (
+                        item.text
+                        if hasattr(item, "text")
+                        else (item.get("text", "") if isinstance(item, dict) else "")
+                    )
+                    if text:
+                        parts.append(text)
+                elif item.type == "image_url":
+                    image_url = (
+                        item.image_url
+                        if hasattr(item, "image_url")
+                        else (
+                            item.get("image_url", {}) if isinstance(item, dict) else {}
+                        )
+                    )
+                    if image_url:
+                        path = image_handler.save_openai_image(image_url)
+                        parts.append(f'<attached_image path="{path}" />')
+            # Handle plain dicts
+            elif isinstance(item, dict):
+                if item.get("type") == "text":
+                    if item.get("text"):
+                        parts.append(item["text"])
+                elif item.get("type") == "image_url":
+                    if item.get("image_url"):
+                        path = image_handler.save_openai_image(item["image_url"])
+                        parts.append(f'<attached_image path="{path}" />')
+
+        return "\n".join(parts) if parts else ""
+
+    @staticmethod
     def messages_to_prompt(messages: List[Message]) -> tuple[str, Optional[str]]:
         """
         Convert OpenAI messages to Claude Code prompt format.
@@ -179,13 +224,9 @@ class MessageAdapter:
             for pattern in tool_patterns:
                 content = re.sub(pattern, "", content, flags=re.DOTALL)
 
-        # Pattern to match image references or base64 data
-        image_pattern = r"\[Image:.*?\]|data:image/.*?;base64,.*?(?=\s|$)"
-
-        def replace_image(match):
-            return "[Image: Content not supported by Claude Code]"
-
-        content = re.sub(image_pattern, replace_image, content)
+        # Strip raw base64 data URIs but preserve <attached_image> file references
+        image_pattern = r"data:image/.*?;base64,.*?(?=\s|$)"
+        content = re.sub(image_pattern, "[base64 image data removed]", content)
 
         # Clean up extra whitespace and newlines
         content = re.sub(r"\n\s*\n\s*\n", "\n\n", content)  # Multiple newlines to double
@@ -198,7 +239,7 @@ class MessageAdapter:
         return content
 
     @staticmethod
-    def response_input_to_prompt(input_data) -> str:
+    def response_input_to_prompt(input_data, image_handler=None) -> str:
         """Convert Responses API input to a Claude prompt string.
 
         Accepts either a plain string or an array of input items
@@ -220,6 +261,15 @@ class MessageAdapter:
                 for part in content:
                     if isinstance(part, dict) and part.get("text"):
                         text_parts.append(part["text"])
+                    elif (
+                        isinstance(part, dict)
+                        and part.get("type") == "input_image"
+                        and image_handler
+                    ):
+                        image_url = part.get("image_url", "")
+                        if image_url:
+                            path = image_handler.save_responses_image(image_url)
+                            text_parts.append(f'<attached_image path="{path}" />')
                 text = "\n".join(text_parts)
             else:
                 continue

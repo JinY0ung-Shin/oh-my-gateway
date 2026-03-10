@@ -89,6 +89,82 @@ logger = logging.getLogger(__name__)
 runtime_api_key = None
 
 
+def _truncate_image_data(obj):
+    """Deep-copy and truncate base64 image data for safe logging."""
+    if isinstance(obj, dict):
+        result = {}
+        for k, v in obj.items():
+            if k in ("data", "url") and isinstance(v, str) and len(v) > 200:
+                if "base64" in v[:50] or v.startswith("data:image"):
+                    result[k] = v[:50] + "...[truncated]"
+                    continue
+            result[k] = _truncate_image_data(v)
+        return result
+    if isinstance(obj, list):
+        return [_truncate_image_data(item) for item in obj]
+    return obj
+
+
+def _request_has_images(request) -> bool:
+    """Check if any message in the request contains image content parts."""
+    messages = getattr(request, "messages", None)
+    if not messages:
+        # Check for Responses API input
+        input_data = getattr(request, "input", None)
+        if isinstance(input_data, list):
+            for item in input_data:
+                content = getattr(item, "content", None) or (
+                    item.get("content") if isinstance(item, dict) else None
+                )
+                if isinstance(content, list):
+                    for part in content:
+                        ptype = (
+                            part.get("type")
+                            if isinstance(part, dict)
+                            else getattr(part, "type", None)
+                        )
+                        if ptype in ("image_url", "input_image", "image"):
+                            return True
+        return False
+    for msg in messages:
+        content = msg.content if hasattr(msg, "content") else None
+        if isinstance(content, list):
+            for part in content:
+                ptype = (
+                    part.type
+                    if hasattr(part, "type")
+                    else (part.get("type") if isinstance(part, dict) else None)
+                )
+                if ptype in ("image_url", "input_image", "image"):
+                    return True
+    return False
+
+
+def _validate_image_request(request, backend) -> None:
+    """Validate image requests: tools must be enabled, backend must support images.
+
+    Raises HTTPException(400) on failure.
+    """
+    if not _request_has_images(request):
+        return
+
+    # Check tools enabled (chat completions only has enable_tools)
+    enable_tools = getattr(request, "enable_tools", True)
+    if not enable_tools:
+        raise HTTPException(
+            status_code=400,
+            detail="Image input requires tools to be enabled (enable_tools=true) "
+            "because Claude Code uses the Read tool to process images.",
+        )
+
+    # Check backend supports images
+    if not hasattr(backend, "image_handler"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Image input is not supported for the {backend.name} backend.",
+        )
+
+
 def map_stop_reason(stop_reason: Optional[str] = None) -> str:
     """Map Claude SDK stop_reason to OpenAI finish_reason."""
     return streaming_utils.map_stop_reason(stop_reason)
@@ -342,8 +418,10 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
                             import json as json_lib
 
                             parsed_body = json_lib.loads(body.decode())
+                            # Truncate base64 image data in logged body
+                            logged_body = _truncate_image_data(parsed_body)
                             logger.debug(
-                                f"🔍 Request body: {json_lib.dumps(parsed_body, indent=2)}"
+                                f"🔍 Request body: {json_lib.dumps(logged_body, indent=2)}"
                             )
                             body_logged = True
                         except Exception:
@@ -562,6 +640,7 @@ def _prepare_stateless_completion(messages: list, claude_options: Dict[str, Any]
 
 def _prepare_session_prompt(
     request: ChatCompletionRequest,
+    backend=None,
 ) -> tuple:
     """Prepare prompt, system_prompt, and session for session-mode requests.
 
@@ -579,7 +658,12 @@ def _prepare_session_prompt(
     last_user_msg = None
     for msg in reversed(request.messages):
         if msg.role == "user":
-            last_user_msg = msg.content
+            if isinstance(msg.content, list) and backend and hasattr(backend, "image_handler"):
+                last_user_msg = MessageAdapter.extract_images_to_prompt(
+                    msg.content, backend.image_handler
+                )
+            else:
+                last_user_msg = msg.content
             break
     prompt = last_user_msg or MessageAdapter.messages_to_prompt(request.messages)[0]
 
@@ -587,7 +671,14 @@ def _prepare_session_prompt(
     system_prompt = None
     for msg in request.messages:
         if msg.role == "system":
-            system_prompt = msg.content
+            if isinstance(msg.content, str):
+                system_prompt = msg.content
+            elif isinstance(msg.content, list):
+                system_prompt = " ".join(
+                    p.text
+                    for p in msg.content
+                    if hasattr(p, "type") and p.type == "text" and hasattr(p, "text")
+                )
             break
     if system_prompt:
         system_prompt = MessageAdapter.filter_content(system_prompt)
@@ -622,7 +713,7 @@ async def _streaming_session_preflight(
     Returns a dict with keys needed by the streaming generator:
         session, lock_acquired, prompt, sys_prompt, is_new, resume_id, chunk_kwargs
     """
-    prompt, sys_prompt, session = _prepare_session_prompt(request)
+    prompt, sys_prompt, session = _prepare_session_prompt(request, backend=backend)
 
     # Acquire per-session lock BEFORE checking is_new or mutating state.
     await session.lock.acquire()
@@ -720,7 +811,7 @@ async def generate_streaming_response(
             # Legacy path (direct calls without preflight, e.g. tests)
             _validate_backend_auth(resolved.backend)
             options = _build_backend_options(request, resolved, claude_headers)
-            prompt, sys_prompt, session = _prepare_session_prompt(request)
+            prompt, sys_prompt, session = _prepare_session_prompt(request, backend=backend)
 
             await session.lock.acquire()
             lock_acquired = True
@@ -851,6 +942,7 @@ async def chat_completions(
         # Resolve model → backend and validate auth
         resolved, backend = _resolve_and_get_backend(request_body.model)
         _validate_backend_auth(resolved.backend)
+        _validate_image_request(request_body, backend)
 
         request_id = f"chatcmpl-{os.urandom(8).hex()}"
 
@@ -890,7 +982,9 @@ async def chat_completions(
 
             session = None
             if request_body.session_id:
-                prompt, sys_prompt, session = _prepare_session_prompt(request_body)
+                prompt, sys_prompt, session = _prepare_session_prompt(
+                    request_body, backend=backend
+                )
 
                 # Acquire lock BEFORE is_new check to prevent concurrent first-turn race
                 async with session.lock:
@@ -957,6 +1051,15 @@ async def chat_completions(
                         )
             else:
                 prompt, run_kwargs = _prepare_stateless_completion(request_body.messages, options)
+                # Materialize images in prompt if present
+                if _request_has_images(request_body) and hasattr(backend, "image_handler"):
+                    for msg in request_body.messages:
+                        if msg.role == "user" and isinstance(msg.content, list):
+                            prompt = MessageAdapter.extract_images_to_prompt(
+                                msg.content, backend.image_handler
+                            )
+                            run_kwargs["prompt"] = prompt
+                            break
 
                 logger.info(
                     f"Chat completion: session_id=None, total_messages={len(request_body.messages)}"
@@ -1046,6 +1149,9 @@ async def anthropic_messages(
     # Validate Claude authentication
     _validate_backend_auth("claude")
 
+    claude_backend = BackendRegistry.get("claude")
+    _validate_image_request(request_body, claude_backend)
+
     try:
         logger.info(f"Anthropic Messages API request: model={request_body.model}")
 
@@ -1056,7 +1162,14 @@ async def anthropic_messages(
         prompt_parts = []
         for msg in messages:
             if msg.role == "user":
-                prompt_parts.append(msg.content)
+                if isinstance(msg.content, list) and hasattr(claude_backend, "image_handler"):
+                    prompt_parts.append(
+                        MessageAdapter.extract_images_to_prompt(
+                            msg.content, claude_backend.image_handler
+                        )
+                    )
+                else:
+                    prompt_parts.append(msg.content)
             elif msg.role == "assistant":
                 prompt_parts.append(f"Assistant: {msg.content}")
 
@@ -1070,7 +1183,6 @@ async def anthropic_messages(
 
         # Run Claude Code - tools enabled by default for Anthropic SDK clients
         # (they're typically using this for agentic workflows)
-        claude_backend = BackendRegistry.get("claude")
         mcp_servers = get_mcp_servers() or None
         chunks = []
         async for chunk in claude_backend.run_completion(
@@ -1471,6 +1583,7 @@ async def create_response(
         resolved.provider_model,
     )
     _validate_backend_auth(resolved.backend)
+    _validate_image_request(body, backend)
 
     # Validate: instructions + previous_response_id is not allowed
     if body.previous_response_id and body.instructions:
@@ -1529,7 +1642,8 @@ async def create_response(
         input_for_prompt = user_items if user_items else body.input
 
     # Convert input to prompt
-    prompt = MessageAdapter.response_input_to_prompt(input_for_prompt)
+    image_handler = getattr(backend, "image_handler", None)
+    prompt = MessageAdapter.response_input_to_prompt(input_for_prompt, image_handler=image_handler)
     prompt = MessageAdapter.filter_content(prompt)
 
     # Determine if this is a new session or a follow-up

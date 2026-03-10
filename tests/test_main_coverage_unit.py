@@ -30,7 +30,6 @@ import json
 import logging
 import uuid
 from contextlib import contextmanager
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -854,7 +853,6 @@ class TestResponsesApiSessionValidation:
 
     def test_backend_mismatch_returns_400(self):
         """Lines 1402-1410: Backend mismatch on follow-up."""
-        from tests.conftest import FakeCodexBackend
 
         session_id = str(uuid.uuid4())
         session = session_manager.get_or_create_session(session_id)

@@ -217,20 +217,19 @@ class TestFilterContent:
 
         assert "<suggest>" not in result
 
-    def test_replaces_image_references(self):
-        """Image references are replaced with placeholder."""
+    def test_preserves_image_bracket_references(self):
+        """[Image:...] references are preserved (no longer stripped)."""
         content = "Here's the image: [Image: screenshot.png] as you can see"
         result = MessageAdapter.filter_content(content)
 
-        assert "[Image: Content not supported by Claude Code]" in result
-        assert "screenshot.png" not in result
+        assert "[Image: screenshot.png]" in result
 
     def test_replaces_base64_image_data(self):
-        """Base64 image data is replaced."""
+        """Base64 image data URIs are replaced with placeholder."""
         content = "Image: data:image/png;base64,iVBORw0KGgoAAAANSUhE end"
         result = MessageAdapter.filter_content(content)
 
-        assert "base64" not in result
+        assert "[base64 image data removed]" in result
         assert "iVBORw0" not in result
 
     def test_collapses_multiple_newlines(self):
