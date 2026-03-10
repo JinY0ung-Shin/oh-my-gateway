@@ -21,6 +21,10 @@ from claude_agent_sdk.types import (
     UserMessage,
     SystemMessage,
 )
+from claude_agent_sdk.types import (
+    SandboxSettings,
+    SandboxNetworkConfig,
+)
 from src.backends.claude.constants import (
     CLAUDE_MODELS,
     CLAUDE_TOOLS,
@@ -29,6 +33,12 @@ from src.backends.claude.constants import (
     THINKING_BUDGET_TOKENS,
     TOKEN_STREAMING,
     DISALLOWED_SUBAGENT_TYPES,
+    CLAUDE_SANDBOX_ENABLED,
+    CLAUDE_SANDBOX_AUTO_ALLOW_BASH,
+    CLAUDE_SANDBOX_EXCLUDED_COMMANDS,
+    CLAUDE_SANDBOX_ALLOW_UNSANDBOXED,
+    CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
+    CLAUDE_SANDBOX_WEAKER_NESTED,
 )
 from src.backends.base import ResolvedModel
 from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
@@ -212,6 +222,37 @@ class ClaudeCodeCLI:
         if base_disallowed:
             options.disallowed_tools = base_disallowed
 
+    def _configure_sandbox(self, options: ClaudeAgentOptions) -> None:
+        """Apply bash sandbox configuration to *options*.
+
+        Tri-state logic based on ``CLAUDE_SANDBOX_ENABLED``:
+
+        * ``None`` (env unset) — do **not** set ``options.sandbox`` at all,
+          allowing project-level settings (``setting_sources=["project"]``)
+          to take effect.
+        * ``True`` — force-enable sandbox with env-configured parameters.
+        * ``False`` — force-disable sandbox explicitly.
+        """
+        if CLAUDE_SANDBOX_ENABLED is None:
+            return  # Respect project-level settings
+
+        if not CLAUDE_SANDBOX_ENABLED:
+            options.sandbox = SandboxSettings(enabled=False)
+            return
+
+        network_config = SandboxNetworkConfig(
+            allowLocalBinding=CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
+        )
+
+        options.sandbox = SandboxSettings(
+            enabled=True,
+            autoAllowBashIfSandboxed=CLAUDE_SANDBOX_AUTO_ALLOW_BASH,
+            excludedCommands=list(CLAUDE_SANDBOX_EXCLUDED_COMMANDS),
+            allowUnsandboxedCommands=CLAUDE_SANDBOX_ALLOW_UNSANDBOXED,
+            network=network_config,
+            enableWeakerNestedSandbox=CLAUDE_SANDBOX_WEAKER_NESTED,
+        )
+
     def _configure_session(
         self,
         options: ClaudeAgentOptions,
@@ -246,6 +287,7 @@ class ClaudeCodeCLI:
         options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd, setting_sources=["project"])
 
         self._configure_thinking(options)
+        self._configure_sandbox(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
 
         if model:

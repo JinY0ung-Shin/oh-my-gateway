@@ -999,3 +999,58 @@ class TestConfigureHelpers:
         cli_instance._configure_session(opts, session_id=None, resume=None)
         assert not getattr(opts, "resume", None)
         assert opts.extra_args.get("session-id") is None
+
+    def test_configure_sandbox_enabled(self, cli_instance):
+        """_configure_sandbox sets sandbox when CLAUDE_SANDBOX_ENABLED=True."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", True):
+            with patch("src.backends.claude.client.CLAUDE_SANDBOX_AUTO_ALLOW_BASH", True):
+                with patch("src.backends.claude.client.CLAUDE_SANDBOX_EXCLUDED_COMMANDS", []):
+                    with patch("src.backends.claude.client.CLAUDE_SANDBOX_ALLOW_UNSANDBOXED", False):
+                        with patch(
+                            "src.backends.claude.client.CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL", False
+                        ):
+                            with patch(
+                                "src.backends.claude.client.CLAUDE_SANDBOX_WEAKER_NESTED", False
+                            ):
+                                cli_instance._configure_sandbox(opts)
+        assert opts.sandbox is not None
+        assert opts.sandbox["enabled"] is True
+        assert opts.sandbox["allowUnsandboxedCommands"] is False
+
+    def test_configure_sandbox_disabled(self, cli_instance):
+        """_configure_sandbox sets sandbox.enabled=False when env is False."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", False):
+            cli_instance._configure_sandbox(opts)
+        assert opts.sandbox is not None
+        assert opts.sandbox["enabled"] is False
+
+    def test_configure_sandbox_unset_noop(self, cli_instance):
+        """_configure_sandbox does nothing when CLAUDE_SANDBOX_ENABLED is None."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", None):
+            cli_instance._configure_sandbox(opts)
+        assert getattr(opts, "sandbox", None) is None
+
+    def test_build_sdk_options_includes_sandbox(self, cli_instance):
+        """_build_sdk_options calls _configure_sandbox."""
+        with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", True):
+            with patch("src.backends.claude.client.CLAUDE_SANDBOX_AUTO_ALLOW_BASH", True):
+                with patch("src.backends.claude.client.CLAUDE_SANDBOX_EXCLUDED_COMMANDS", []):
+                    with patch("src.backends.claude.client.CLAUDE_SANDBOX_ALLOW_UNSANDBOXED", False):
+                        with patch(
+                            "src.backends.claude.client.CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL", False
+                        ):
+                            with patch(
+                                "src.backends.claude.client.CLAUDE_SANDBOX_WEAKER_NESTED", False
+                            ):
+                                opts = cli_instance._build_sdk_options()
+        assert opts.sandbox is not None
+        assert opts.sandbox["enabled"] is True

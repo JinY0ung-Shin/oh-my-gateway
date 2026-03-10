@@ -75,10 +75,24 @@ Key environment variables (see `.env.example` for full list):
 | `MAX_TIMEOUT` | `600000` | Request timeout (ms) |
 | `DEFAULT_MAX_TURNS` | `10` | Max agent turns per request |
 | `DISALLOWED_SUBAGENT_TYPES` | `statusline-setup` | Comma-separated subagent types to block |
+| `CLAUDE_SANDBOX_ENABLED` | unset | Bash sandbox: unset = project settings, `true` = force on, `false` = force off |
 | `MCP_CONFIG` | — | MCP server config (JSON string or file path) |
 | `API_KEY` | — | Optional Bearer token for access control |
 | `SESSION_MAX_AGE_MINUTES` | `60` | Session TTL |
 | `RATE_LIMIT_CHAT_PER_MINUTE` | `10` | Chat endpoint rate limit |
+
+### Bash Sandbox
+
+The gateway can enable OS-level process isolation for Bash tool execution using the Claude Agent SDK's `SandboxSettings`. This uses macOS Seatbelt or Linux bubblewrap to restrict what Bash commands can access.
+
+`CLAUDE_SANDBOX_ENABLED` is a tri-state setting:
+- **Unset** (default) — does not configure sandbox, respects project-level Claude settings
+- **`true`** — forces sandbox on with strict defaults (`allowUnsandboxedCommands=false`, no excluded commands)
+- **`false`** — forces sandbox off, overriding project settings
+
+> **Note:** Sandbox only isolates Bash commands. File tool access (Read/Edit/Write) is controlled separately by SDK permission rules. For Docker deployments, set `CLAUDE_SANDBOX_WEAKER_NESTED=true` if running in unprivileged containers on Linux.
+
+See `.env.example` for the full list of sandbox environment variables.
 
 ### MCP Server Config Example
 
