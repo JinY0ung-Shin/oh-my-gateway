@@ -429,13 +429,44 @@ class Pipe:
                 break  # Stop at first non-system message
         return "\n".join(parts) if parts else ""
 
-    def _extract_current_input(self, messages: list) -> str:
+    def _extract_current_input(self, messages: list):
+        """Extract the latest user message as a string or Responses API input array.
+
+        Returns a plain string for text-only messages.  When image parts are
+        present, returns a ``[{"role": "user", "content": [...]}]`` array so
+        the ``/v1/responses`` endpoint can process images via ``input_image``.
+        """
         for msg in reversed(messages):
             if msg.get("role") == "user":
                 content = msg.get("content", "")
                 if isinstance(content, str):
                     return content
                 if isinstance(content, list):
+                    has_image = any(
+                        isinstance(item, dict) and item.get("type") in ("image_url", "image")
+                        for item in content
+                    )
+                    if has_image:
+                        # Build Responses API input array with input_text / input_image parts
+                        parts = []
+                        for item in content:
+                            if isinstance(item, str):
+                                parts.append({"type": "input_text", "text": item})
+                            elif isinstance(item, dict):
+                                item_type = item.get("type", "")
+                                if item_type == "text" and item.get("text"):
+                                    parts.append({"type": "input_text", "text": item["text"]})
+                                elif item_type == "image_url":
+                                    url = ""
+                                    image_url = item.get("image_url")
+                                    if isinstance(image_url, dict):
+                                        url = image_url.get("url", "")
+                                    elif isinstance(image_url, str):
+                                        url = image_url
+                                    if url:
+                                        parts.append({"type": "input_image", "image_url": url})
+                        return [{"role": "user", "content": parts}] if parts else ""
+                    # Text-only list: concatenate as before
                     texts = []
                     for item in content:
                         if isinstance(item, dict) and item.get("text"):
