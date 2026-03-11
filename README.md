@@ -192,6 +192,8 @@ The pipe uses `/v1/responses` with `previous_response_id` chaining, maintaining 
 
 Streaming (`"stream": true`) is supported on `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
 
+For detailed SSE event formats including tool call rendering, subagent events, and tool name/input schemas, see **[docs/streaming-events.md](docs/streaming-events.md)**.
+
 ### Responses API Deviations
 
 The `/v1/responses` endpoint intentionally deviates from the OpenAI Responses API in the following ways:
