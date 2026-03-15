@@ -22,7 +22,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
 from src.admin_auth import (
-    check_admin_enabled,
     get_admin_status,
     login,
     logout,
@@ -62,7 +61,6 @@ class FileWriteRequest(BaseModel):
 @router.get("", response_class=HTMLResponse)
 async def admin_page():
     """Serve the admin dashboard HTML."""
-    check_admin_enabled()
     from src.admin_page import build_admin_page
 
     return HTMLResponse(build_admin_page())
@@ -88,7 +86,6 @@ async def admin_logout(response: Response, _=Depends(require_admin)):
 @router.get("/api/status")
 async def admin_status():
     """Return admin UI status (enabled, configured — no secrets)."""
-    check_admin_enabled()
     return get_admin_status()
 
 

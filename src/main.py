@@ -131,6 +131,11 @@ async def lifespan(app: FastAPI):
     """Initialize backends, verify authentication, and start background tasks."""
     logger.info("Initializing backend registry...")
 
+    # Validate admin configuration — fail fast if ADMIN_API_KEY is missing
+    from src.admin_auth import validate_admin_config
+
+    validate_admin_config()
+
     # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
 

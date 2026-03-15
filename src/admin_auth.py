@@ -1,8 +1,11 @@
 """Admin authentication — separate from the main API key auth.
 
-Admin endpoints require a dedicated ``ADMIN_API_KEY`` and are gated behind
-``ADMIN_UI_ENABLED``.  Authentication uses a short-lived HttpOnly cookie
-(``admin_session``) scoped to ``/admin`` with ``SameSite=Strict``.
+Admin endpoints require a dedicated ``ADMIN_API_KEY``.  Authentication uses
+a short-lived HttpOnly cookie (``admin_session``) scoped to ``/admin`` with
+``SameSite=Strict``.
+
+The admin UI is always enabled.  If ``ADMIN_API_KEY`` is not set the server
+refuses to start — this is enforced in ``validate_admin_config()``.
 
 Flow:
 1. ``POST /admin/api/login`` — validates ADMIN_API_KEY, sets cookie
@@ -24,7 +27,6 @@ logger = logging.getLogger(__name__)
 # Configuration
 # ---------------------------------------------------------------------------
 
-ADMIN_UI_ENABLED = os.getenv("ADMIN_UI_ENABLED", "false").lower() in ("true", "1", "yes", "on")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "")
 ADMIN_SESSION_TTL = int(os.getenv("ADMIN_SESSION_TTL", "3600"))  # 1 hour default
 
@@ -72,26 +74,21 @@ def _verify_session_token(token: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def check_admin_enabled() -> None:
-    """Raise 404 if admin UI is disabled (stealth — don't reveal admin exists)."""
-    if not ADMIN_UI_ENABLED:
-        raise HTTPException(status_code=404, detail="Not found")
+def validate_admin_config() -> None:
+    """Validate admin configuration at startup.
 
-
-def check_admin_configured() -> None:
-    """Raise 503 if ADMIN_API_KEY is not configured."""
+    Raises ``RuntimeError`` if ``ADMIN_API_KEY`` is not set, preventing
+    the server from starting without admin protection.
+    """
     if not ADMIN_API_KEY:
-        raise HTTPException(
-            status_code=503,
-            detail="Admin API key not configured. Set ADMIN_API_KEY environment variable.",
+        raise RuntimeError(
+            "ADMIN_API_KEY environment variable is required. "
+            "Set it in your .env file or environment before starting the server."
         )
 
 
 def login(provided_key: str, response: Response) -> dict:
     """Validate the admin key and set an HttpOnly session cookie."""
-    check_admin_enabled()
-    check_admin_configured()
-
     if not hmac.compare_digest(provided_key, ADMIN_API_KEY):
         logger.warning("Admin login failed: invalid API key")
         raise HTTPException(status_code=401, detail="Invalid admin API key")
@@ -124,16 +121,9 @@ def logout(response: Response) -> dict:
 def require_admin(request: Request) -> bool:
     """FastAPI dependency that enforces admin authentication.
 
-    Checks:
-    1. ``ADMIN_UI_ENABLED`` must be true
-    2. ``ADMIN_API_KEY`` must be configured
-    3. Valid session cookie OR valid Bearer token in Authorization header
-
+    Checks valid session cookie OR valid Bearer token in Authorization header.
     Bearer token fallback allows programmatic/curl access without cookies.
     """
-    check_admin_enabled()
-    check_admin_configured()
-
     # Try cookie first
     token = request.cookies.get(_COOKIE_NAME)
     if token and _verify_session_token(token):
@@ -156,7 +146,7 @@ def require_admin(request: Request) -> bool:
 def get_admin_status() -> dict:
     """Return admin UI status for diagnostics (no secrets)."""
     return {
-        "enabled": ADMIN_UI_ENABLED,
+        "enabled": True,
         "configured": bool(ADMIN_API_KEY),
         "session_ttl": ADMIN_SESSION_TTL,
     }

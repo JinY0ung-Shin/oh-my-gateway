@@ -371,7 +371,6 @@ def get_redacted_config() -> Dict[str, Any]:
         "SESSION_CLEANUP_INTERVAL_MINUTES",
         "SESSION_MAX_AGE_MINUTES",
         "RATE_LIMIT_ENABLED",
-        "ADMIN_UI_ENABLED",
         "ADMIN_API_KEY",
         "API_KEY",
         "ANTHROPIC_AUTH_TOKEN",

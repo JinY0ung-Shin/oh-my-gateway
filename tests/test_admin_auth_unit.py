@@ -10,41 +10,27 @@ from src.admin_auth import (
     _COOKIE_NAME,
     _make_session_token,
     _verify_session_token,
-    check_admin_configured,
-    check_admin_enabled,
     login,
     logout,
     require_admin,
+    validate_admin_config,
 )
 
 
 # ---------------------------------------------------------------------------
-# Feature gate
+# Startup validation
 # ---------------------------------------------------------------------------
 
 
-class TestAdminEnabled:
-    def test_disabled_by_default(self):
-        with patch("src.admin_auth.ADMIN_UI_ENABLED", False):
-            with pytest.raises(HTTPException) as exc_info:
-                check_admin_enabled()
-            assert exc_info.value.status_code == 404
-
-    def test_enabled(self):
-        with patch("src.admin_auth.ADMIN_UI_ENABLED", True):
-            check_admin_enabled()  # should not raise
-
-
-class TestAdminConfigured:
-    def test_not_configured(self):
+class TestValidateAdminConfig:
+    def test_missing_key_raises(self):
         with patch("src.admin_auth.ADMIN_API_KEY", ""):
-            with pytest.raises(HTTPException) as exc_info:
-                check_admin_configured()
-            assert exc_info.value.status_code == 503
+            with pytest.raises(RuntimeError, match="ADMIN_API_KEY"):
+                validate_admin_config()
 
-    def test_configured(self):
+    def test_configured_key_passes(self):
         with patch("src.admin_auth.ADMIN_API_KEY", "test-key"):
-            check_admin_configured()  # should not raise
+            validate_admin_config()  # should not raise
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +65,6 @@ class TestSessionTokens:
 
 
 class TestLogin:
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "correct-key")
     def test_successful_login(self):
         response = MagicMock()
@@ -89,20 +74,12 @@ class TestLogin:
         call_kwargs = response.set_cookie.call_args
         assert call_kwargs.kwargs.get("httponly") or call_kwargs[1].get("httponly")
 
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "correct-key")
     def test_wrong_key(self):
         response = MagicMock()
         with pytest.raises(HTTPException) as exc_info:
             login("wrong-key", response)
         assert exc_info.value.status_code == 401
-
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", False)
-    def test_login_when_disabled(self):
-        response = MagicMock()
-        with pytest.raises(HTTPException) as exc_info:
-            login("any-key", response)
-        assert exc_info.value.status_code == 404
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +101,6 @@ class TestLogout:
 
 
 class TestRequireAdmin:
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
     def test_valid_cookie(self):
         token = _make_session_token(int(time.time()))
@@ -133,7 +109,6 @@ class TestRequireAdmin:
         request.headers = {}
         assert require_admin(request) is True
 
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
     def test_valid_bearer(self):
         request = MagicMock()
@@ -141,7 +116,6 @@ class TestRequireAdmin:
         request.headers = {"authorization": "Bearer test-key"}
         assert require_admin(request) is True
 
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
     def test_no_auth(self):
         request = MagicMock()
@@ -151,7 +125,6 @@ class TestRequireAdmin:
             require_admin(request)
         assert exc_info.value.status_code == 401
 
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
     def test_wrong_bearer(self):
         request = MagicMock()
@@ -161,14 +134,6 @@ class TestRequireAdmin:
             require_admin(request)
         assert exc_info.value.status_code == 401
 
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", False)
-    def test_disabled(self):
-        request = MagicMock()
-        with pytest.raises(HTTPException) as exc_info:
-            require_admin(request)
-        assert exc_info.value.status_code == 404
-
-    @patch("src.admin_auth.ADMIN_UI_ENABLED", True)
     @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
     def test_expired_cookie_with_valid_bearer(self):
         old_token = _make_session_token(int(time.time()) - 99999)
