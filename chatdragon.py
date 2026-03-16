@@ -560,8 +560,11 @@ class Pipeline:
                             result_content = str(raw_content or "").strip()
                         if not result_content and is_error:
                             result_content = event.get("error", "Tool execution failed")
+                        # Detect SDK "result exceeds maximum" messages — not a
+                        # real error (is_error=false) but should be shown inline.
+                        is_overflow = result_content.startswith("Error: result (")
                         result_content = result_content[:500]
-                        if is_error:
+                        if is_error or is_overflow:
                             yield f"\n\n**Error** (`{name}`): {result_content}\n\n"
                         else:
                             # Escape for HTML attributes
