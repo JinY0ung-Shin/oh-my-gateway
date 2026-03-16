@@ -33,6 +33,25 @@ SESSION_MAX_AGE_MINUTES = int(os.getenv("SESSION_MAX_AGE_MINUTES", "60"))
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 
+# Streaming display: wrap intermediate SDK messages in <think></think> tags
+# so frontends like Open WebUI collapse tool activity and show only the final result.
+WRAP_INTERMEDIATE_THINKING = os.getenv("WRAP_INTERMEDIATE_THINKING", "false").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+
+# Sentinel token the model emits before its final answer.
+# The streaming layer detects this across chunked deltas, replaces it with
+# </think>, and streams the remaining text as visible content.
+RESPONSE_SENTINEL = "<response>"
+RESPONSE_SENTINEL_INSTRUCTION = (
+    "\n\n## Response Format\n"
+    "When you have finished all tool calls and are ready to write your final answer, "
+    "you MUST output the exact token `<response>` on its own line before your answer. "
+    "Do not include any other text on that line. Begin your answer immediately after."
+)
+
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {

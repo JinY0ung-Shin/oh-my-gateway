@@ -5,6 +5,7 @@ Unit tests for src/streaming_utils.py.
 
 import json
 import logging
+from unittest.mock import patch
 
 import pytest
 
@@ -1251,3 +1252,376 @@ async def test_stream_response_chunks_strips_collab_from_token_deltas():
     assert "Hello" in combined
     assert "World" in combined
     assert stream_result["success"] is True
+
+
+# ---------------------------------------------------------------------------
+# SentinelStreamFilter tests
+# ---------------------------------------------------------------------------
+
+from src.streaming_utils import SentinelStreamFilter  # noqa: E402
+
+
+class TestSentinelStreamFilter:
+    """Test SentinelStreamFilter cross-chunk sentinel detection."""
+
+    def test_sentinel_in_single_chunk(self):
+        sf = SentinelStreamFilter("<response>", replacement="</think>\n")
+        text, triggered = sf.feed("before<response>after")
+        assert triggered is True
+        assert text == "before</think>\nafter"
+        assert sf.triggered is True
+
+    def test_sentinel_across_two_chunks(self):
+        sf = SentinelStreamFilter("<response>", replacement="[END]")
+        t1, tr1 = sf.feed("hello<resp")
+        assert tr1 is False
+        assert "hello" in t1
+        t2, tr2 = sf.feed("onse>world")
+        assert tr2 is True
+        assert "world" in t2
+        assert "[END]" in (t1 + t2)
+
+    def test_sentinel_across_many_chunks(self):
+        sf = SentinelStreamFilter("<response>", replacement="X")
+        parts = []
+        for ch in "<response>done":
+            t, tr = sf.feed(ch)
+            parts.append(t)
+        combined = "".join(parts)
+        assert "X" in combined
+        assert "done" in combined
+        assert "<response>" not in combined
+
+    def test_no_sentinel_passes_through(self):
+        sf = SentinelStreamFilter("<response>", replacement="X")
+        t, tr = sf.feed("no sentinel here")
+        assert tr is False
+        assert t == "no sentinel here"
+        assert sf.triggered is False
+
+    def test_partial_mismatch_flushed(self):
+        sf = SentinelStreamFilter("<response>", replacement="X")
+        t, tr = sf.feed("<resXYZ")
+        assert tr is False
+        assert "<resXYZ" in t
+
+    def test_flush_returns_remaining_buffer(self):
+        sf = SentinelStreamFilter("<response>", replacement="X")
+        t, _ = sf.feed("text<respo")
+        remaining = sf.flush()
+        assert "respo" in remaining
+
+    def test_after_trigger_passes_through(self):
+        sf = SentinelStreamFilter("<response>", replacement="X")
+        sf.feed("<response>")
+        t, tr = sf.feed("more text")
+        assert tr is False  # already triggered, not again
+        assert t == "more text"
+
+
+# ---------------------------------------------------------------------------
+# WRAP_INTERMEDIATE_THINKING tests (sentinel-based)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_wrap_thinking_sentinel_splits_think():
+    """Sentinel token closes <think> and streams final answer live."""
+
+    async def multi_turn_source():
+        # Intermediate text
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Let me check..."},
+            },
+        }
+        # Tool use block
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "tu-1", "name": "Read"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": '{"path":"f.py"}'},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop", "index": 0},
+        }
+        # Model emits sentinel then final answer
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "<response>"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "The file contains hello world."},
+            },
+        }
+
+    request = ChatCompletionRequest(
+        model="claude-test",
+        messages=[Message(role="user", content="Hi")],
+        stream=True,
+    )
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_chunks(
+                multi_turn_source(),
+                request,
+                "req-wrap",
+                [],
+                logging.getLogger("test-wrap"),
+            )
+        ]
+
+    all_content = ""
+    for line in lines:
+        parsed = _parse_chat_sse(line)
+        delta = parsed.get("choices", [{}])[0].get("delta", {})
+        all_content += delta.get("content", "")
+
+    assert "<think>" in all_content
+    assert "</think>" in all_content
+    # Sentinel token itself should NOT appear in output
+    assert "<response>" not in all_content
+    think_end = all_content.index("</think>")
+    inside = all_content[:think_end]
+    outside = all_content[think_end + len("</think>"):]
+    assert "Let me check..." in inside
+    assert "[Tool: Read]" in inside
+    assert "The file contains hello world." in outside
+    # No duplication
+    assert all_content.count("The file contains hello world.") == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_wrap_thinking_sentinel_chunked():
+    """Sentinel detection works when token is split across multiple deltas."""
+
+    async def chunked_sentinel_source():
+        # Some text then chunked sentinel
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "intermediate<resp"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "onse>final answer"},
+            },
+        }
+
+    request = ChatCompletionRequest(
+        model="claude-test",
+        messages=[Message(role="user", content="Hi")],
+        stream=True,
+    )
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_chunks(
+                chunked_sentinel_source(),
+                request,
+                "req-chunked",
+                [],
+                logging.getLogger("test-chunked"),
+            )
+        ]
+
+    all_content = ""
+    for line in lines:
+        parsed = _parse_chat_sse(line)
+        delta = parsed.get("choices", [{}])[0].get("delta", {})
+        all_content += delta.get("content", "")
+
+    assert "<response>" not in all_content
+    assert "</think>" in all_content
+    assert "intermediate" in all_content
+    assert "final answer" in all_content
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_wrap_thinking_disabled_no_think_tags():
+    """When WRAP_INTERMEDIATE_THINKING is disabled, no think tags are emitted."""
+
+    async def simple_source():
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Hello world"},
+            },
+        }
+
+    request = ChatCompletionRequest(
+        model="claude-test",
+        messages=[Message(role="user", content="Hi")],
+        stream=True,
+    )
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", False):
+        lines = [
+            line
+            async for line in stream_chunks(
+                simple_source(), request, "req-nowrap", [], logging.getLogger("test-nowrap")
+            )
+        ]
+
+    all_content = ""
+    for line in lines:
+        parsed = _parse_chat_sse(line)
+        delta = parsed.get("choices", [{}])[0].get("delta", {})
+        all_content += delta.get("content", "")
+
+    assert "<think>" not in all_content
+    assert "Hello world" in all_content
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_wrap_thinking_no_sentinel_closes_think_at_end():
+    """If model never emits sentinel, think block closes at stream end."""
+
+    async def no_sentinel_source():
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "some text"},
+            },
+        }
+        # Tool activity opens think
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "tool_use", "id": "tu-1", "name": "Bash"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "input_json_delta", "partial_json": '{"cmd":"ls"}'},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop", "index": 0},
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "no sentinel here"},
+            },
+        }
+
+    request = ChatCompletionRequest(
+        model="claude-test",
+        messages=[Message(role="user", content="Hi")],
+        stream=True,
+    )
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_chunks(
+                no_sentinel_source(),
+                request,
+                "req-no-sentinel",
+                [],
+                logging.getLogger("test-no-sentinel"),
+            )
+        ]
+
+    all_content = ""
+    for line in lines:
+        parsed = _parse_chat_sse(line)
+        delta = parsed.get("choices", [{}])[0].get("delta", {})
+        all_content += delta.get("content", "")
+
+    # Think should still be closed at stream end
+    assert "<think>" in all_content
+    assert "</think>" in all_content
+
+
+@pytest.mark.asyncio
+async def test_stream_chunks_wrap_thinking_suppresses_sdk_think_tags():
+    """SDK-native <think>/<think> tags are suppressed when wrapping is enabled."""
+
+    async def thinking_with_sentinel_source():
+        # SDK thinking block
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "content_block": {"type": "thinking"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "hmm..."},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop"},
+        }
+        # Sentinel then answer
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "<response>Answer"},
+            },
+        }
+
+    request = ChatCompletionRequest(
+        model="claude-test",
+        messages=[Message(role="user", content="Hi")],
+        stream=True,
+    )
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_chunks(
+                thinking_with_sentinel_source(),
+                request,
+                "req-wrap-think",
+                [],
+                logging.getLogger("test-wrap-think"),
+            )
+        ]
+
+    all_content = ""
+    for line in lines:
+        parsed = _parse_chat_sse(line)
+        delta = parsed.get("choices", [{}])[0].get("delta", {})
+        all_content += delta.get("content", "")
+
+    # Only ONE pair of think tags (our wrapper), no nested SDK ones
+    assert all_content.count("<think>") == 1
+    assert all_content.count("</think>") == 1

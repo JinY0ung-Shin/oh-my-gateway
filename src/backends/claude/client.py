@@ -41,7 +41,12 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
 from src.backends.base import ResolvedModel
-from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
+from src.constants import (
+    DEFAULT_TIMEOUT_MS,
+    PERMISSION_MODE_BYPASS,
+    RESPONSE_SENTINEL_INSTRUCTION,
+    WRAP_INTERMEDIATE_THINKING,
+)
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
@@ -301,7 +306,13 @@ class ClaudeCodeCLI:
         if model:
             options.model = model
         if system_prompt:
+            if WRAP_INTERMEDIATE_THINKING:
+                system_prompt = system_prompt + RESPONSE_SENTINEL_INSTRUCTION
             options.system_prompt = {"type": "text", "text": system_prompt}
+        elif WRAP_INTERMEDIATE_THINKING:
+            # Can't append to a preset, so use the instruction as a standalone
+            # system prompt. The SDK still applies its built-in behaviour.
+            options.system_prompt = {"type": "text", "text": RESPONSE_SENTINEL_INSTRUCTION.strip()}
         else:
             options.system_prompt = {"type": "preset", "preset": "claude_code"}
         if permission_mode:
