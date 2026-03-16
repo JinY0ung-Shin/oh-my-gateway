@@ -11,6 +11,7 @@ license: MIT
 
 import asyncio
 import hashlib
+import html
 import json
 import logging
 from typing import AsyncGenerator
@@ -340,7 +341,8 @@ class Pipe:
                                 think_open = True
                             yield f"[Tool: {name}]\n"
                         else:
-                            yield f"\n<think>\n🔧 {name}\n</think>\n"
+                            escaped = html.escape(name)
+                            yield f'\n<details>\n<summary>Tool: {escaped}</summary>\n\n```json\n{json.dumps(event, indent=2, ensure_ascii=False)}\n```\n\n</details>\n'
                         continue
 
                     if event_type == "response.tool_result":
@@ -356,12 +358,11 @@ class Pipe:
                             label = f"{prefix}({tool_name})" if tool_name else prefix
                             yield f"[{label}: {str(content)[:200]}]\n"
                         else:
-                            prefix = "❌" if is_error else "📎"
-                            label = f"{prefix} Result"
-                            if tool_name:
-                                label += f" ({tool_name})"
-                            snippet = str(content)[:200]
-                            yield f"\n<think>\n{label}: {snippet}\n</think>\n"
+                            prefix = "Error" if is_error else "Tool Result"
+                            escaped = html.escape(tool_name) if tool_name else ""
+                            label = f"{prefix}: {escaped}" if escaped else prefix
+                            result_text = str(content)[:500]
+                            yield f'\n<details>\n<summary>{label}</summary>\n\n```\n{result_text}\n```\n\n</details>\n'
                         continue
 
                     if event_type == "response.task_started":
@@ -373,7 +374,8 @@ class Pipe:
                                     think_open = True
                                 yield f"[Task: {desc}]\n"
                             else:
-                                yield f"\n<think>\n⏳ Task: {desc}\n</think>\n"
+                                escaped = html.escape(desc)
+                                yield f'\n<details>\n<summary>Task: {escaped}</summary>\n\n</details>\n'
                         continue
 
                     if event_type == "response.task_progress":
@@ -388,10 +390,10 @@ class Pipe:
                                 text += f" ({tool})"
                             yield text + "]\n"
                         else:
-                            text = f"🔄 Progress: {desc}"
+                            text = html.escape(desc)
                             if tool:
-                                text += f" ({tool})"
-                            yield f"\n<think>\n{text}\n</think>\n"
+                                text += f" ({html.escape(tool)})"
+                            yield f'\n<details>\n<summary>Progress: {text}</summary>\n\n</details>\n'
                         continue
 
                     if event_type == "response.task_notification":
@@ -404,7 +406,8 @@ class Pipe:
                                     think_open = True
                                 yield f"[Task {status}: {summary}]\n"
                             else:
-                                yield f"\n<think>\n✅ Task {status}: {summary}\n</think>\n"
+                                escaped = html.escape(summary)
+                                yield f'\n<details>\n<summary>Task {html.escape(status)}: {escaped}</summary>\n\n</details>\n'
                         continue
 
                     if event_type == "response.completed":
