@@ -369,6 +369,9 @@ class Pipe:
                                 "model": self.valves.MODEL,
                             }
                             log.debug("Chain updated: chat=%s, response_id=%s", chat_id, new_id)
+                        # Flush a trailing newline so the markdown renderer
+                        # finalizes the last HTML block (e.g. </details>)
+                        yield "\n"
 
                     elif event_type in ("response.failed", "error"):
                         error = event.get("response", {}).get("error", {})

@@ -421,6 +421,8 @@ class Pipe:
                                 "instructions_hash": instructions_hash,
                                 "model": self.valves.MODEL,
                             }
+                        # Flush so the renderer finalizes the last HTML block
+                        yield "\n"
                         continue
 
                     if event_type in ("response.failed", "error"):
