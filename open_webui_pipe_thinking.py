@@ -184,8 +184,15 @@ class Pipe:
             return
 
         instructions = self._extract_instructions(messages)
+        # Prepend user context to instructions
+        context_parts = []
+        if dscrowd_token:
+            context_parts.append(f"dscrowd.token_key: {dscrowd_token}")
         if owui_username:
-            instructions = f"Current user: {owui_username}\n\n{instructions}" if instructions else f"Current user: {owui_username}"
+            context_parts.append(f"mlm_username: {owui_username}")
+        if context_parts:
+            context = "\n\n".join(context_parts)
+            instructions = f"{context}\n\n{instructions}" if instructions else context
         current_input = self._extract_current_input(messages)
         if not current_input:
             yield "Error: No user message found."
