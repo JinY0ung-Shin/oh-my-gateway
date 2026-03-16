@@ -297,6 +297,9 @@ class ClaudeCodeCLI:
         resume: Optional[str] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
+        claude_md_path = os.path.join(self.cwd, "CLAUDE.md") if self.cwd else None
+        claude_md_exists = os.path.exists(claude_md_path) if claude_md_path else False
+        logger.info(f"Building options: cwd={self.cwd}, CLAUDE.md exists={claude_md_exists}")
         options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd, setting_sources=["project"])
 
         self._configure_thinking(options)
