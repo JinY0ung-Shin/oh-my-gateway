@@ -335,25 +335,25 @@ class Pipe:
                         name = event.get("name", "")
                         if tool_id:
                             tool_names[tool_id] = name
-                        parent = event.get("parent_tool_use_id")
-                        indent = "> > " if parent else "> "
                         event_json = json.dumps(event, indent=2, ensure_ascii=False)
-                        quoted_json = ("\n" + indent).join(event_json.split("\n"))
-                        yield f"\n\n{indent}🔧 **{name}**\n{indent}```json\n{indent}{quoted_json}\n{indent}```\n"
+                        yield (
+                            f"\n\n<details>\n<summary>🔧 {name}</summary>\n\n"
+                            f"```json\n{event_json}\n```\n\n</details>\n"
+                        )
 
                     elif event_type == "response.tool_result":
                         tool_id = event.get("tool_use_id", "")
                         is_error = event.get("is_error", False)
-                        parent = event.get("parent_tool_use_id")
                         tool_name = tool_names.get(tool_id, "")
                         prefix = "❌" if is_error else "📎"
-                        label = f"{prefix} **Result**"
+                        label = f"{prefix} Result"
                         if tool_name:
                             label += f" ({tool_name})"
-                        indent = "> > " if parent else "> "
                         event_json = json.dumps(event, indent=2, ensure_ascii=False)
-                        quoted_json = ("\n" + indent).join(event_json.split("\n"))
-                        yield f"\n{indent}{label}\n{indent}```json\n{indent}{quoted_json}\n{indent}```\n"
+                        yield (
+                            f"\n<details>\n<summary>{label}</summary>\n\n"
+                            f"```json\n{event_json}\n```\n\n</details>\n"
+                        )
 
                     elif event_type == "response.completed":
                         completed = True
