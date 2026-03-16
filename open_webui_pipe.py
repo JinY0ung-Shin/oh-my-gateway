@@ -342,9 +342,10 @@ class Pipe:
                         is_error = event.get("is_error", False)
                         tool_name = tool_names.get(tool_id, "")
                         prefix = "❌" if is_error else "📎"
-                        label = f"{prefix} Result"
                         if tool_name:
-                            label += f" ({html.escape(tool_name)})"
+                            label = f"{prefix} {html.escape(tool_name)} — {'Error' if is_error else 'Result'}"
+                        else:
+                            label = f"{prefix} {'Error' if is_error else 'Result'}"
                         result_text = str(event.get("content", ""))[:500]
                         yield (
                             f"\n<details>\n<summary>{label}</summary>\n\n"

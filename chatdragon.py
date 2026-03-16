@@ -536,7 +536,6 @@ class Pipeline:
                         name = event.get("name", "")
                         if tool_id:
                             tool_names[tool_id] = name
-                        # Store tool_use args for pairing with result later
                         tool_args = json.dumps(
                             event.get("input", event.get("arguments", {})),
                             ensure_ascii=False,
@@ -570,16 +569,14 @@ class Pipeline:
                         # Always render as a <details> block — errors show
                         # with status="error" so the UI can style them.
                         esc_name = html.escape(name)
-                        esc_args = html.escape(args)
-                        esc_result = html.escape(result_content)
                         status = "error" if is_error else "complete"
                         yield (
                             f'\n\n<details type="tool_calls" name="{esc_name}"'
-                            f' arguments="{esc_args}"'
-                            f' result="{esc_result}"'
                             f' status="{status}"'
                             f' done="true">\n'
-                            f"<summary>View Result from {esc_name}</summary>\n"
+                            f"<summary>View Result from {esc_name}</summary>\n\n"
+                            f"**Arguments**\n````json\n{args}\n````\n\n"
+                            f"**Result**\n````\n{result_content}\n````\n\n"
                             f"</details>\n\n"
                         )
 

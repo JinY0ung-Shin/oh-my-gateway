@@ -340,10 +340,6 @@ class Pipe:
                                 yield "<think>\n"
                                 think_open = True
                             yield f"[Tool: {name}]\n"
-                        else:
-                            escaped = html.escape(name)
-                            event_json = json.dumps(event, indent=2, ensure_ascii=False)
-                            yield f'\n<details>\n<summary>Tool: {escaped}</summary>\n\n````json\n{event_json}\n````\n\n</details>\n'
                         continue
 
                     if event_type == "response.tool_result":
@@ -359,9 +355,12 @@ class Pipe:
                             label = f"{prefix}({tool_name})" if tool_name else prefix
                             yield f"[{label}: {str(content)[:200]}]\n"
                         else:
-                            prefix = "Error" if is_error else "Tool Result"
-                            escaped = html.escape(tool_name) if tool_name else ""
-                            label = f"{prefix}: {escaped}" if escaped else prefix
+                            prefix = "❌" if is_error else "📎"
+                            if tool_name:
+                                escaped = html.escape(tool_name)
+                                label = f"{prefix} {escaped} — {'Error' if is_error else 'Result'}"
+                            else:
+                                label = f"{prefix} {'Error' if is_error else 'Result'}"
                             result_text = str(content)[:500]
                             yield f'\n<details>\n<summary>{label}</summary>\n\n````\n{result_text}\n````\n\n</details>\n'
                         continue
