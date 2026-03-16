@@ -1625,3 +1625,227 @@ async def test_stream_chunks_wrap_thinking_suppresses_sdk_think_tags():
     # Only ONE pair of think tags (our wrapper), no nested SDK ones
     assert all_content.count("<think>") == 1
     assert all_content.count("</think>") == 1
+
+
+# ---------------------------------------------------------------------------
+# WRAP_INTERMEDIATE_THINKING tests for stream_response_chunks (/v1/responses)
+# ---------------------------------------------------------------------------
+
+
+def _collect_response_deltas(lines):
+    """Extract concatenated text from response.output_text.delta SSE lines."""
+    text = ""
+    for line in lines:
+        event_type, data = _parse_response_sse(line)
+        if event_type == "response.output_text.delta":
+            text += data.get("delta", "")
+    return text
+
+
+@pytest.mark.asyncio
+async def test_response_stream_wrap_thinking_sentinel():
+    """stream_response_chunks wraps thinking and splits on sentinel when enabled."""
+
+    async def source():
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Thinking about it..."},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "<response>"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Here is the answer."},
+            },
+        }
+
+    chunks_buffer = []
+    stream_result = {}
+
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_response_chunks(
+                chunk_source=source(),
+                model="claude-test",
+                response_id="resp-wrap-1",
+                output_item_id="msg-wrap-1",
+                chunks_buffer=chunks_buffer,
+                logger=logging.getLogger("test-resp-wrap"),
+                stream_result=stream_result,
+            )
+        ]
+
+    all_text = _collect_response_deltas(lines)
+    assert "<think>" in all_text
+    assert "</think>" in all_text
+    assert "<response>" not in all_text
+    think_end = all_text.index("</think>")
+    inside = all_text[:think_end]
+    outside = all_text[think_end + len("</think>"):]
+    assert "Thinking about it..." in inside
+    assert "Here is the answer." in outside
+    assert stream_result.get("success") is True
+
+
+@pytest.mark.asyncio
+async def test_response_stream_wrap_thinking_disabled_suppresses():
+    """When disabled, thinking content is suppressed (default Responses API behavior)."""
+
+    async def source():
+        yield {
+            "type": "stream_event",
+            "event": {"type": "content_block_start", "content_block": {"type": "thinking"}},
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "hidden thinking"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop"},
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Visible answer"},
+            },
+        }
+
+    chunks_buffer = []
+    stream_result = {}
+
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", False):
+        lines = [
+            line
+            async for line in stream_response_chunks(
+                chunk_source=source(),
+                model="claude-test",
+                response_id="resp-nowrap-1",
+                output_item_id="msg-nowrap-1",
+                chunks_buffer=chunks_buffer,
+                logger=logging.getLogger("test-resp-nowrap"),
+                stream_result=stream_result,
+            )
+        ]
+
+    all_text = _collect_response_deltas(lines)
+    assert "<think>" not in all_text
+    assert "hidden thinking" not in all_text
+    assert "Visible answer" in all_text
+
+
+@pytest.mark.asyncio
+async def test_response_stream_wrap_thinking_no_sentinel_closes_at_end():
+    """If model never emits sentinel, think tag is closed at stream end."""
+
+    async def source():
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Working on it..."},
+            },
+        }
+
+    chunks_buffer = []
+    stream_result = {}
+
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_response_chunks(
+                chunk_source=source(),
+                model="claude-test",
+                response_id="resp-nosent-1",
+                output_item_id="msg-nosent-1",
+                chunks_buffer=chunks_buffer,
+                logger=logging.getLogger("test-resp-nosent"),
+                stream_result=stream_result,
+            )
+        ]
+
+    all_text = _collect_response_deltas(lines)
+    assert "<think>" in all_text
+    assert "</think>" in all_text
+    assert "Working on it..." in all_text
+
+
+@pytest.mark.asyncio
+async def test_response_stream_wrap_thinking_suppresses_sdk_think_tags():
+    """SDK-native think tags are suppressed when wrapping is on."""
+
+    async def source():
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "<think>"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "inner reasoning"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "</think>"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "<response>"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "Final answer"},
+            },
+        }
+
+    chunks_buffer = []
+    stream_result = {}
+
+    with patch("src.streaming_utils.WRAP_INTERMEDIATE_THINKING", True):
+        lines = [
+            line
+            async for line in stream_response_chunks(
+                chunk_source=source(),
+                model="claude-test",
+                response_id="resp-sdktag-1",
+                output_item_id="msg-sdktag-1",
+                chunks_buffer=chunks_buffer,
+                logger=logging.getLogger("test-resp-sdktag"),
+                stream_result=stream_result,
+            )
+        ]
+
+    all_text = _collect_response_deltas(lines)
+    # Only our wrapper tags, not SDK ones
+    assert all_text.count("<think>") == 1
+    assert all_text.count("</think>") == 1
+    assert "inner reasoning" in all_text
+    assert "Final answer" in all_text

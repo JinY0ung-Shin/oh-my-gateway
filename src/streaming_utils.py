@@ -970,6 +970,11 @@ async def stream_response_chunks(
     if stream_result is None:
         stream_result = {}
 
+    # WRAP_INTERMEDIATE_THINKING support — same sentinel logic as chat completions.
+    wrap_thinking = WRAP_INTERMEDIATE_THINKING
+    think_opened = False
+    sentinel_filter = SentinelStreamFilter(RESPONSE_SENTINEL, replacement="\n</think>\n")
+
     def _next_seq() -> int:
         nonlocal seq
         current = seq
@@ -1067,15 +1072,33 @@ async def stream_response_chunks(
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
             if text_delta is not None:
                 token_streaming = True
-                # Suppress thinking content in Responses API
-                if was_thinking or in_thinking or text_delta in ("<think>", "</think>"):
-                    continue
-                if text_delta:
-                    cleaned = collab_filter.feed(text_delta)
-                    if cleaned:
-                        yield _emit_delta(cleaned)
-                        full_text.append(cleaned)
-                        content_sent = True
+                if wrap_thinking:
+                    # Same logic as chat completions: wrap intermediate
+                    # thinking in <think> tags, use sentinel to close.
+                    if text_delta in ("<think>", "</think>"):
+                        continue
+                    if text_delta:
+                        cleaned = collab_filter.feed(text_delta)
+                        if cleaned:
+                            if not think_opened:
+                                think_opened = True
+                                yield _emit_delta("<think>\n")
+                                full_text.append("<think>\n")
+                            filtered, _triggered = sentinel_filter.feed(cleaned)
+                            if filtered:
+                                yield _emit_delta(filtered)
+                                full_text.append(filtered)
+                                content_sent = True
+                else:
+                    # Default: suppress thinking content in Responses API
+                    if was_thinking or in_thinking or text_delta in ("<think>", "</think>"):
+                        continue
+                    if text_delta:
+                        cleaned = collab_filter.feed(text_delta)
+                        if cleaned:
+                            yield _emit_delta(cleaned)
+                            full_text.append(cleaned)
+                            content_sent = True
                 continue
 
             # Accumulate tool_use blocks from stream events
@@ -1129,9 +1152,20 @@ async def stream_response_chunks(
             chunks_buffer.append(chunk)
             text = format_chunk_content(chunk, content_sent)
             if text:
-                yield _emit_delta(text)
-                full_text.append(text)
-                content_sent = True
+                if wrap_thinking:
+                    if not think_opened:
+                        think_opened = True
+                        yield _emit_delta("<think>\n")
+                        full_text.append("<think>\n")
+                    filtered, _triggered = sentinel_filter.feed(text)
+                    if filtered:
+                        yield _emit_delta(filtered)
+                        full_text.append(filtered)
+                        content_sent = True
+                else:
+                    yield _emit_delta(text)
+                    full_text.append(text)
+                    content_sent = True
 
     except Exception as e:
         logger.error("Responses stream: unexpected error: %s", e, exc_info=True)
@@ -1140,11 +1174,31 @@ async def stream_response_chunks(
         return
 
     # Flush any remaining buffered text from the collab filter
-    remaining = collab_filter.flush()
-    if remaining:
-        yield _emit_delta(remaining)
-        full_text.append(remaining)
-        content_sent = True
+    remaining_collab = collab_filter.flush()
+    if remaining_collab:
+        if wrap_thinking:
+            filtered, _triggered = sentinel_filter.feed(remaining_collab)
+            if filtered:
+                yield _emit_delta(filtered)
+                full_text.append(filtered)
+                content_sent = True
+        else:
+            yield _emit_delta(remaining_collab)
+            full_text.append(remaining_collab)
+            content_sent = True
+
+    # Flush sentinel filter buffer
+    if wrap_thinking:
+        remaining_sentinel = sentinel_filter.flush()
+        if remaining_sentinel:
+            yield _emit_delta(remaining_sentinel)
+            full_text.append(remaining_sentinel)
+            content_sent = True
+
+        # If think was opened but sentinel never fired, close it at stream end
+        if think_opened and not sentinel_filter.triggered:
+            yield _emit_delta("\n</think>\n")
+            full_text.append("\n</think>\n")
 
     if tool_acc.has_incomplete:
         logger.warning("Incomplete tool_use blocks at stream end: %s", tool_acc.incomplete_keys)

@@ -69,6 +69,8 @@ from src.constants import (
     DEFAULT_MAX_TURNS,
     MAX_REQUEST_SIZE,
     PERMISSION_MODE_BYPASS,
+    RESPONSE_SENTINEL,
+    WRAP_INTERMEDIATE_THINKING,
 )
 from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS
 from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
@@ -1833,6 +1835,11 @@ async def create_response(
             assistant_text = backend.parse_message(chunks)
             if not assistant_text:
                 raise HTTPException(status_code=502, detail="No response from backend")
+
+            # Apply thinking wrapper for non-streaming responses
+            if WRAP_INTERMEDIATE_THINKING and RESPONSE_SENTINEL in assistant_text:
+                parts = assistant_text.split(RESPONSE_SENTINEL, 1)
+                assistant_text = f"<think>\n{parts[0]}\n</think>\n{parts[1]}"
 
             # SUCCESS-ONLY: commit turn counter and session messages
             session.turn_counter = next_turn
