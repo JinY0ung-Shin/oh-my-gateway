@@ -536,6 +536,7 @@ class Pipeline:
                         name = event.get("name", "")
                         if tool_id:
                             tool_names[tool_id] = name
+                        # Store tool_use args for pairing with result later
                         tool_args = json.dumps(
                             event.get("input", event.get("arguments", {})),
                             ensure_ascii=False,
@@ -574,13 +575,11 @@ class Pipeline:
                         status = "error" if is_error else "complete"
                         yield (
                             f'\n\n<details type="tool_calls" name="{esc_name}"'
+                            f' arguments="{esc_args}"'
+                            f' result="{esc_result}"'
                             f' status="{status}"'
                             f' done="true">\n'
                             f"<summary>View Result from {esc_name}</summary>\n"
-                            f"<p><b>Arguments</b></p>\n"
-                            f"<pre><code>{esc_args}</code></pre>\n"
-                            f"<p><b>Result</b></p>\n"
-                            f"<pre><code>{esc_result}</code></pre>\n"
                             f"</details>\n\n"
                         )
 
