@@ -54,12 +54,6 @@ RESPONSE_SENTINEL_INSTRUCTION = (
 
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
-# Open WebUI integration mode
-# When enabled, the gateway extracts X-OpenWebUI-Chat-Id from request headers
-# and uses it as session_id for conversation continuity across turns.
-CD_OPENWEBUI = os.getenv("CD_OPENWEBUI", "false").lower() in ("true", "1", "yes")
-
-# Rate Limiting defaults (requests per minute)
 RATE_LIMITS = {
     "chat": int(os.getenv("RATE_LIMIT_CHAT_PER_MINUTE", "10")),
     "debug": int(os.getenv("RATE_LIMIT_DEBUG_PER_MINUTE", "2")),
