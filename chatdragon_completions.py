@@ -258,6 +258,7 @@ class Pipeline:
                         sys_event = event.get("system_event")
                         if sys_event:
                             event_type = sys_event.get("type", "")
+                            log.info("[PIPE] system_event type=%s", event_type)
                             rendered = self._render_system_event(
                                 event_type, sys_event, tool_names, tool_pending
                             )
@@ -351,6 +352,7 @@ class Pipeline:
                 return f"\n> **Task {status}**: {summary}\n\n"
 
         elif event_type == "tool_use":
+            log.info("[PIPE] tool_use event keys=%s", list(event.keys()))
             tool_id = event.get("tool_use_id", event.get("id", ""))
             name = event.get("name", "")
             if tool_id:
@@ -367,7 +369,11 @@ class Pipeline:
             name = pending.get("name", tool_names.get(tool_id, ""))
             args = pending.get("args", "{}")
             is_error = event.get("is_error", False)
-            raw_content = event.get("content", "")
+            log.info(
+                "[PIPE] tool_result event keys=%s, tool_id=%s, name=%s",
+                list(event.keys()), tool_id, name,
+            )
+            raw_content = event.get("content", "") or event.get("output", "") or event.get("result", "")
             if isinstance(raw_content, list):
                 result_content = " ".join(
                     b.get("text", "") if isinstance(b, dict) else str(b)
