@@ -19,6 +19,19 @@ import re
 from typing import Iterator, Optional
 
 import httpx
+
+# Regex to detect SDK tool-execution noise that leaks into text deltas:
+#   - Bare tool names like "mcp__mcp_router__cql", "Read", "Bash"
+#   - "Executing tool_name..." status lines
+_TOOL_NOISE_RE = re.compile(
+    r"^(?:Executing\s+)?(?:mcp__\w+|Read|Bash|Write|Edit|Glob|Grep|WebFetch|WebSearch|"
+    r"NotebookEdit|Agent|TodoWrite|Skill)(?:\.\.\.)?\s*$"
+)
+
+
+def _is_tool_noise(text: str) -> bool:
+    """Return True if *text* is SDK tool-execution noise."""
+    return bool(text) and _TOOL_NOISE_RE.match(text) is not None
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
@@ -229,8 +242,6 @@ class Pipeline:
 
         tool_names: dict = {}
         tool_pending: dict = {}
-        active_tools: set = set()
-
         try:
             if thought_wrapped:
                 yield "<thought>\n"
@@ -262,7 +273,6 @@ class Pipeline:
                             log.info("[PIPE] system_event type=%s", event_type)
                             rendered = self._render_system_event(
                                 event_type, sys_event, tool_names, tool_pending,
-                                active_tools,
                             )
                             if rendered:
                                 if thought_wrapped and not response_tag_sent:
@@ -284,10 +294,10 @@ class Pipeline:
                         if not chunk:
                             continue
 
-                        # Suppress text while tools are executing —
-                        # the SDK emits bare tool names and
-                        # "Executing tool_name..." as text deltas.
-                        if active_tools:
+                        # Filter SDK tool-execution noise: bare tool
+                        # names and "Executing tool_name..." status lines.
+                        stripped = chunk.strip()
+                        if _is_tool_noise(stripped):
                             continue
 
                         if thought_wrapped:
@@ -335,7 +345,6 @@ class Pipeline:
         event: dict,
         tool_names: dict,
         tool_pending: dict,
-        active_tools: set,
     ) -> Optional[str]:
         """Render a system_event into display text (tool blocks, task progress)."""
 
@@ -366,7 +375,6 @@ class Pipeline:
             name = event.get("name", "")
             if tool_id:
                 tool_names[tool_id] = name
-                active_tools.add(tool_id)
             tool_args = json.dumps(
                 event.get("input", event.get("arguments", {})),
                 ensure_ascii=False,
@@ -375,7 +383,6 @@ class Pipeline:
 
         elif event_type == "tool_result":
             tool_id = event.get("tool_use_id", "")
-            active_tools.discard(tool_id)
             pending = tool_pending.pop(tool_id, {})
             name = pending.get("name", tool_names.get(tool_id, ""))
             args = pending.get("args", "{}")
@@ -396,10 +403,11 @@ class Pipeline:
                 result_content = f"Result truncated ({chars} chars)"
             result_content = result_content[:10000]
             esc_name = html.escape(name)
-            # Use single-quote wrappers for arguments and result to avoid
-            # &quot; inside the value breaking Open WebUI's parser.
-            esc_args = args.replace("'", "&#39;")
-            esc_result = result_content.replace("'", "&#39;")
+            # html.escape(quote=False) escapes &, <, > but leaves " and '
+            # alone.  We then only escape ' for the single-quote wrapper.
+            # This avoids &quot; which broke Open WebUI's parser.
+            esc_args = html.escape(args, quote=False).replace("'", "&#39;")
+            esc_result = html.escape(result_content, quote=False).replace("'", "&#39;")
             return (
                 f'\n\n<details type="tool_calls"'
                 f' name="{esc_name}"'
