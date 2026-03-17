@@ -374,6 +374,12 @@ class Pipeline:
                 list(event.keys()), tool_id, name,
             )
             raw_content = event.get("content", "") or event.get("output", "") or event.get("result", "")
+            log.info(
+                "[PIPE] tool_result raw_content type=%s, len=%s, preview=%s",
+                type(raw_content).__name__,
+                len(raw_content) if isinstance(raw_content, (str, list)) else "N/A",
+                str(raw_content)[:500],
+            )
             if isinstance(raw_content, list):
                 result_content = " ".join(
                     b.get("text", "") if isinstance(b, dict) else str(b)
