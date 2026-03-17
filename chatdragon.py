@@ -566,30 +566,17 @@ class Pipeline:
                             m = re.search(r"\(([0-9,]+) characters?\)", result_content)
                             chars = m.group(1) if m else "large"
                             result_content = f"Result truncated ({chars} chars)"
-                        # Build Open WebUI-compatible tool_calls widget attributes.
-                        # ``content`` = JSON array of tool-call objects (name + arguments).
-                        # ``results`` = JSON array of result objects (tool_call_id + content).
-                        block_content = [
-                            {"name": name, "arguments": args},
-                        ]
-                        results_list = [
-                            {"tool_call_id": tool_id, "content": result_content},
-                        ]
-                        esc_content = html.escape(
-                            json.dumps(block_content, ensure_ascii=False)
-                        )
-                        esc_results = html.escape(
-                            json.dumps(results_list, ensure_ascii=False)
-                        )
-                        # Short display text for inside the collapsible body.
-                        display_result = html.escape(result_content[:500])
+                        result_content = result_content[:10000]
                         esc_name = html.escape(name)
+                        esc_args = html.escape(args)
+                        esc_result = html.escape(result_content)
                         yield (
-                            f'\n\n<details type="tool_calls" done="true"'
-                            f' content="{esc_content}"'
-                            f' results="{esc_results}">\n'
+                            f'\n\n<details type="tool_calls"'
+                            f' name="{esc_name}"'
+                            f' arguments="{esc_args}"'
+                            f' result="{esc_result}"'
+                            f' done="true">\n'
                             f"<summary>Tool: {esc_name}</summary>\n"
-                            f"> {esc_name}: {display_result}\n"
                             f"</details>\n\n"
                         )
 
