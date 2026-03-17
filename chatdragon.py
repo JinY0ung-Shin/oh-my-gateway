@@ -566,15 +566,18 @@ class Pipeline:
                         if tool_id:
                             tool_names[tool_id] = name
                             active_tools.add(tool_id)
-                        tool_input = event.get("input", event.get("arguments", {}))
-                        tool_pending[tool_id] = {"name": name, "input": tool_input}
+                        tool_args = json.dumps(
+                            event.get("input", event.get("arguments", {})),
+                            ensure_ascii=False,
+                        )
+                        tool_pending[tool_id] = {"name": name, "args": tool_args}
 
                     elif event_type == "response.tool_result":
                         tool_id = event.get("tool_use_id", "")
                         active_tools.discard(tool_id)
                         pending = tool_pending.pop(tool_id, {})
                         name = pending.get("name", tool_names.get(tool_id, ""))
-                        tool_input = pending.get("input", {})
+                        args = pending.get("args", "{}")
                         is_error = event.get("is_error", False)
                         raw_content = event.get("content", "")
                         log.info(
@@ -611,7 +614,7 @@ class Pipeline:
                             f' done="true"'
                             f' id="{html.escape(tool_id)}"'
                             f' name="{html.escape(name)}"'
-                            f' arguments="{_owui_attr(tool_input)}"'
+                            f' arguments="{_owui_attr(args)}"'
                             f' result="{_owui_attr(result_content)}">\n'
                             f"<summary>Tool Executed</summary>\n"
                             f"</details>\n\n"
