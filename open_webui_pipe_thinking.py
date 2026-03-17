@@ -42,6 +42,11 @@ class SentinelFilter:
     def triggered(self) -> bool:
         return self._triggered
 
+    def reset(self) -> None:
+        """Reset to un-triggered state so the sentinel can be matched again."""
+        self._triggered = False
+        self._buf = ""
+
     def feed(self, text: str) -> tuple[str, bool]:
         """Return ``(output_text, just_triggered)``."""
         if self._triggered:
@@ -281,11 +286,17 @@ class Pipe:
                 yield f"Error: {e}"
 
     async def _stream_responses(
-        self, chat_id: str, payload: dict, instructions_hash: str    ) -> AsyncGenerator[str, None]:
+        self, chat_id: str, payload: dict, instructions_hash: str,
+    ) -> AsyncGenerator[str, None]:
         """Streaming /v1/responses call with <think> wrapping."""
         wrap = self.valves.WRAP_THINKING
         think_open = False
         sentinel_filter = SentinelFilter(RESPONSE_SENTINEL, replacement="\n</think>\n")
+        # Post-sentinel buffering: hold text after <response> briefly so we can
+        # re-absorb into the think block if tool activity follows.
+        post_sentinel_buf: list[str] = []
+        post_sentinel_len = 0
+        POST_SENTINEL_LIMIT = 200
         tool_names: dict[str, str] = {}
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(self.valves.TIMEOUT)) as client:
@@ -321,14 +332,43 @@ class Pipe:
                                     yield "<think>\n"
                                     think_open = True
                                 # Sentinel filter replaces <response> with </think>
-                                filtered, _triggered = sentinel_filter.feed(delta)
-                                if filtered:
+                                filtered, just_triggered = sentinel_filter.feed(delta)
+                                if just_triggered:
+                                    # Start buffering: don't emit </think>
+                                    # replacement yet in case tools follow.
+                                    if filtered:
+                                        post_sentinel_buf.append(filtered)
+                                        post_sentinel_len += len(filtered)
+                                elif sentinel_filter.triggered:
+                                    # Post-sentinel: buffer text briefly
+                                    if filtered:
+                                        post_sentinel_buf.append(filtered)
+                                        post_sentinel_len += len(filtered)
+                                    if post_sentinel_len >= POST_SENTINEL_LIMIT:
+                                        yield "".join(post_sentinel_buf)
+                                        post_sentinel_buf.clear()
+                                        post_sentinel_len = 0
+                                elif filtered:
                                     yield filtered
                             else:
                                 yield delta
                         continue
 
                     # --- Intermediate events: wrap in <think> ---
+
+                    # Tool activity after sentinel → re-absorb buffered text
+                    # into think so everything stays in one collapsible.
+                    if (
+                        wrap
+                        and sentinel_filter.triggered
+                        and event_type in ("response.tool_use", "response.tool_result")
+                    ):
+                        if post_sentinel_buf:
+                            yield "".join(post_sentinel_buf)
+                            post_sentinel_buf.clear()
+                            post_sentinel_len = 0
+                        sentinel_filter.reset()
+                        # think_open stays True, we're back inside the block
 
                     if event_type == "response.tool_use":
                         tool_id = event.get("tool_use_id", "")
@@ -437,13 +477,23 @@ class Pipe:
                             raise Exception(f"Response failed: {error_msg}")
                         raise ChainResetError(f"Response failed: {error_code} - {error_msg}")
 
-                # Flush sentinel filter buffer
+                # Flush sentinel filter buffer and post-sentinel buffer
                 if wrap:
                     remaining = sentinel_filter.flush()
                     if remaining:
-                        yield remaining
-                    # If think was opened but sentinel never fired, close it
-                    if think_open and not sentinel_filter.triggered:
+                        if sentinel_filter.triggered:
+                            post_sentinel_buf.append(remaining)
+                        else:
+                            yield remaining
+                    if sentinel_filter.triggered and post_sentinel_buf:
+                        # Commit: close think and emit buffered response text
+                        yield "\n</think>\n"
+                        yield "".join(post_sentinel_buf)
+                        post_sentinel_buf.clear()
+                    elif sentinel_filter.triggered:
+                        yield "\n</think>\n"
+                    elif think_open:
+                        # Think opened but sentinel never fired — close it
                         yield "\n</think>\n"
 
                 if not completed:

@@ -257,6 +257,11 @@ class Pipeline:
         thought_opened = False
         response_tag_sent = False
         text_buffer = ""
+        # Buffer for post-sentinel text: after <response> fires we hold text
+        # briefly so that if tool activity follows we can re-absorb it into
+        # the <thought> block (keeps everything in one collapsible).
+        post_response_buffer = ""
+        POST_RESPONSE_LIMIT = 200
         BUFFER_SIZE = 50
         RESPONSE_TAG = "<response>"
         TOOL_DETAILS_PREFIX = "\n\n<details "
@@ -299,9 +304,20 @@ class Pipeline:
                         if sys_event:
                             event_type = sys_event.get("type", "")
                             log.info("[PIPE] system_event type=%s", event_type)
+                            is_tool_event = event_type in ("tool_use", "tool_result")
                             rendered = self._render_system_event(
                                 event_type, sys_event, tool_names, tool_pending,
                             )
+
+                            # Tool activity after <response> → re-open thought
+                            # and absorb the buffered text back inside it.
+                            if thought_wrapped and response_tag_sent and is_tool_event:
+                                yield "<thought>\n"
+                                if post_response_buffer:
+                                    yield post_response_buffer
+                                    post_response_buffer = ""
+                                response_tag_sent = False
+
                             if rendered:
                                 if thought_wrapped and not response_tag_sent:
                                     # Tool <details> blocks bypass the buffer
@@ -330,7 +346,12 @@ class Pipeline:
 
                         if thought_wrapped:
                             if response_tag_sent:
-                                yield chunk
+                                # Buffer post-response text briefly so we can
+                                # re-absorb into thought if tools follow.
+                                post_response_buffer += chunk
+                                if len(post_response_buffer) >= POST_RESPONSE_LIMIT:
+                                    yield post_response_buffer
+                                    post_response_buffer = ""
                             elif chunk.startswith(TOOL_DETAILS_PREFIX):
                                 # Tool <details> blocks bypass the buffer
                                 if text_buffer:
@@ -342,13 +363,14 @@ class Pipeline:
                                 if RESPONSE_TAG in text_buffer:
                                     idx = text_buffer.index(RESPONSE_TAG)
                                     before = text_buffer[:idx]
-                                    after = text_buffer[idx + len(RESPONSE_TAG):]
+                                    after = text_buffer[idx + len(RESPONSE_TAG) :]
                                     if before:
                                         yield before
                                     yield "\n</thought>\n\n"
                                     response_tag_sent = True
+                                    post_response_buffer = ""
                                     if after:
-                                        yield after
+                                        post_response_buffer = after
                                     text_buffer = ""
                                 elif len(text_buffer) > BUFFER_SIZE:
                                     safe_len = len(text_buffer) - len(RESPONSE_TAG)
@@ -357,6 +379,11 @@ class Pipeline:
                                         text_buffer = text_buffer[safe_len:]
                         else:
                             yield chunk
+
+                    # Flush remaining post-response buffer at stream end
+                    if post_response_buffer:
+                        yield post_response_buffer
+                        post_response_buffer = ""
 
                     if not stream_done:
                         log.warning("[STREAM] Stream ended without [DONE] marker")
