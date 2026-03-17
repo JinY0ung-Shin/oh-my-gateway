@@ -369,24 +369,8 @@ class Pipeline:
             name = pending.get("name", tool_names.get(tool_id, ""))
             args = pending.get("args", "{}")
             is_error = event.get("is_error", False)
-            log.info(
-                "[PIPE] tool_result event keys=%s, tool_id=%s, name=%s",
-                list(event.keys()), tool_id, name,
-            )
             raw_content = event.get("content", "") or event.get("output", "") or event.get("result", "")
-            log.info(
-                "[PIPE] tool_result raw_content type=%s, len=%s, preview=%s",
-                type(raw_content).__name__,
-                len(raw_content) if isinstance(raw_content, (str, list)) else "N/A",
-                str(raw_content)[:500],
-            )
-            if isinstance(raw_content, list):
-                result_content = " ".join(
-                    b.get("text", "") if isinstance(b, dict) else str(b)
-                    for b in raw_content
-                ).strip()
-            else:
-                result_content = str(raw_content or "").strip()
+            result_content = self._extract_tool_result_text(raw_content)
             if not result_content and is_error:
                 result_content = event.get("error", "Tool execution failed")
             # SDK overflow: shorten the verbose message.
@@ -397,18 +381,60 @@ class Pipeline:
             result_content = result_content[:10000]
             esc_name = html.escape(name)
             esc_args = html.escape(args)
-            esc_result = html.escape(result_content)
+            # Use single-quote wrapper for result attribute to avoid
+            # &quot; inside the value breaking Open WebUI's parser.
+            esc_result = result_content.replace("'", "&#39;")
             return (
                 f'\n\n<details type="tool_calls"'
                 f' name="{esc_name}"'
                 f' arguments="{esc_args}"'
-                f' result="{esc_result}"'
+                f" result='{esc_result}'"
                 f' done="true">\n'
                 f"<summary>Tool: {esc_name}</summary>\n"
                 f"</details>\n\n"
             )
 
         return None
+
+    @staticmethod
+    def _extract_tool_result_text(raw_content) -> str:
+        """Extract plain text from tool result content.
+
+        Content may be a string, a list of text-block dicts, or a JSON-serialized
+        version of either.  This method normalises all variants into a single
+        plain-text string so the result can be safely placed in an HTML attribute.
+        """
+        if not raw_content:
+            return ""
+
+        # List of content blocks: [{"type": "text", "text": "..."}]
+        if isinstance(raw_content, list):
+            parts = []
+            for b in raw_content:
+                if isinstance(b, dict):
+                    parts.append(b.get("text", ""))
+                else:
+                    parts.append(str(b))
+            return " ".join(parts).strip()
+
+        text = str(raw_content).strip()
+
+        # If the string looks like a JSON array of text blocks, parse it
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    parts = []
+                    for b in parsed:
+                        if isinstance(b, dict):
+                            parts.append(b.get("text", ""))
+                        else:
+                            parts.append(str(b))
+                    return " ".join(parts).strip()
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return text
 
     # ------------------------------------------------------------------
     # Non-streaming
