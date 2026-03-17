@@ -423,16 +423,9 @@ class Pipeline:
                 result_content = f"Result truncated ({chars} chars)"
             result_content = result_content[:10000]
             esc_name = html.escape(name)
-            # Sanitize for HTML attribute safety: Open WebUI doesn't
-            # decode HTML entities, so we can't use html.escape().
-            # Replace chars that would break the tag or attribute boundary.
             safe_args = _safe_attr(args)
             safe_result = _safe_attr(result_content)
-            log.info(
-                "[PIPE] tool_result rendered: name=%s result_len=%d preview=%s",
-                name, len(result_content), safe_result[:200],
-            )
-            return (
+            details_tag = (
                 f'\n\n<details type="tool_calls"'
                 f' name="{esc_name}"'
                 f' arguments="{safe_args}"'
@@ -441,6 +434,31 @@ class Pipeline:
                 f"<summary>Tool: {esc_name}</summary>\n"
                 f"</details>\n\n"
             )
+            log.info(
+                "[PIPE-DEBUG] tool_id=%s name=%s args_len=%d result_len=%d",
+                tool_id, name, len(safe_args), len(safe_result),
+            )
+            log.info(
+                "[PIPE-DEBUG] raw_args=%s",
+                args[:500],
+            )
+            log.info(
+                "[PIPE-DEBUG] safe_args=%s",
+                safe_args[:500],
+            )
+            log.info(
+                "[PIPE-DEBUG] result_preview=%s",
+                result_content[:500],
+            )
+            log.info(
+                "[PIPE-DEBUG] safe_result_preview=%s",
+                safe_result[:500],
+            )
+            log.info(
+                "[PIPE-DEBUG] details_tag_first_300=%s",
+                details_tag[:300],
+            )
+            return details_tag
 
         return None
 
