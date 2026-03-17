@@ -99,6 +99,10 @@ class Pipeline:
             default=True,
             description="Inject instruction for model to output <response> tag when done thinking",
         )
+        SHOW_NON_MCP_TOOLS: bool = Field(
+            default=False,
+            description="Show built-in SDK tool events (Read, Bash, Grep, etc.) in the streamed output",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -440,18 +444,18 @@ class Pipeline:
                 ensure_ascii=False,
             )
             tool_pending[tool_id] = {"name": name, "args": tool_args}
-            # Only render MCP tools; skip built-in SDK tools (Read, Bash,
-            # Grep, etc.) — but keep the pending entry so tool_result can
-            # look up the name for its contextual label.
-            if "mcp" not in name.lower():
+            # By default only render MCP tools; skip built-in SDK tools
+            # (Read, Bash, Grep, etc.) unless SHOW_NON_MCP_TOOLS is on.
+            # Always keep the pending entry so tool_result can look up the name.
+            if "mcp" not in name.lower() and not self.valves.SHOW_NON_MCP_TOOLS:
                 return None
 
         elif event_type == "tool_result":
             tool_id = event.get("tool_use_id", "")
             pending = tool_pending.pop(tool_id, {})
             name = pending.get("name", tool_names.get(tool_id, ""))
-            # Only show MCP tool results; hide built-in SDK tool results.
-            if "mcp" not in name.lower():
+            # Hide built-in SDK tool results unless SHOW_NON_MCP_TOOLS is on.
+            if "mcp" not in name.lower() and not self.valves.SHOW_NON_MCP_TOOLS:
                 return None
             args = pending.get("args", "{}")
             is_error = event.get("is_error", False)
