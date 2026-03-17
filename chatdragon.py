@@ -578,6 +578,9 @@ class Pipeline:
                             f' status="{status}"'
                             f' done="true">\n'
                             f"<summary>Tool: {esc_name}</summary>\n"
+                            f"<b>Arguments:</b>\n"
+                            f"<pre>{esc_args}</pre>\n"
+                            f"<b>Result:</b>\n"
                             f"<pre>{esc_result}</pre>\n"
                             f"</details>\n\n"
                         )
