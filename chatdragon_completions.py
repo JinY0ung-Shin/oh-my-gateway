@@ -3,8 +3,8 @@ title: Development Assistant (Completions)
 author: claude-code-openai-wrapper
 version: 0.1.0
 description: .
-    Stateless chat completions pipe via /v1/chat/completions.
-    Passes full message history each turn (no previous_response_id chaining).
+    Session-aware chat completions pipe via /v1/chat/completions.
+    Uses Open WebUI chat_id as session_id for conversation continuity and SDK auto-compaction.
     Features:
     - User context injection (mlm_username from metadata.user_id or user.name)
     - Credential fetching from Open WebUI API for MCP authentication
@@ -199,12 +199,15 @@ class Pipeline:
                 break
 
         use_stream = body.get("stream", True)
+        chat_id = __metadata__.get("chat_id", "")
 
         payload = {
             "model": self.valves.MODEL,
             "messages": messages,
             "stream": use_stream,
         }
+        if chat_id:
+            payload["session_id"] = chat_id
 
         if use_stream:
             return self._stream(payload, __task__)
