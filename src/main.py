@@ -674,7 +674,7 @@ def _prepare_session_prompt(
                     msg.content, backend.image_handler
                 )
             else:
-                last_user_msg = msg.content
+                last_user_msg = MessageAdapter._content_to_text(msg.content)
             break
     prompt = last_user_msg or MessageAdapter.messages_to_prompt(request.messages)[0]
 
@@ -1185,9 +1185,9 @@ async def anthropic_messages(
                         )
                     )
                 else:
-                    prompt_parts.append(msg.content)
+                    prompt_parts.append(MessageAdapter._content_to_text(msg.content))
             elif msg.role == "assistant":
-                prompt_parts.append(f"Assistant: {msg.content}")
+                prompt_parts.append(f"Assistant: {MessageAdapter._content_to_text(msg.content)}")
 
         prompt = "\n\n".join(prompt_parts)
         system_prompt = request_body.system

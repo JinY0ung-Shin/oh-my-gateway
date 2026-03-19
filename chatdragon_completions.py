@@ -252,6 +252,34 @@ class Pipeline:
                     ):
                         content += self._get_thought_wrapped_instruction()
                     messages[i] = {**messages[i], "content": content}
+                elif isinstance(content, list):
+                    # Multimodal content (e.g. image + text from VQA queries).
+                    # Find the last text part and inject context into it.
+                    last_text_idx = None
+                    for j in range(len(content) - 1, -1, -1):
+                        part = content[j]
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            last_text_idx = j
+                            break
+                    if last_text_idx is not None:
+                        text = content[last_text_idx].get("text", "")
+                        text = self._inject_context(
+                            text,
+                            __user__,
+                            __user_id__,
+                            __cookies__,
+                            dscrowd_token=dscrowd_token or None,
+                            mlm_username=owui_username or None,
+                        )
+                        if (
+                            self.valves.OUTPUT_FORMAT == "thought_wrapped"
+                            and self.valves.THOUGHT_WRAPPED_INSTRUCTION
+                            and not __task__
+                        ):
+                            text += self._get_thought_wrapped_instruction()
+                        content = list(content)
+                        content[last_text_idx] = {**content[last_text_idx], "text": text}
+                    messages[i] = {**messages[i], "content": content}
                 break
 
         use_stream = body.get("stream", True)

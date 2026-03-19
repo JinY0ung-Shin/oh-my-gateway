@@ -155,6 +155,23 @@ class MessageAdapter:
         return "\n".join(parts) if parts else ""
 
     @staticmethod
+    def _content_to_text(content) -> str:
+        """Extract plain text from message content (string or multimodal list)."""
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif hasattr(item, "type") and item.type == "text" and hasattr(item, "text"):
+                    parts.append(item.text)
+                elif isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
+                    parts.append(item["text"])
+            return "\n".join(parts) if parts else ""
+        return str(content) if content else ""
+
+    @staticmethod
     def messages_to_prompt(messages: List[Message]) -> tuple[str, Optional[str]]:
         """
         Convert OpenAI messages to Claude Code prompt format.
@@ -166,11 +183,11 @@ class MessageAdapter:
         for message in messages:
             if message.role == "system":
                 # Use the last system message as the system prompt
-                system_prompt = message.content
+                system_prompt = MessageAdapter._content_to_text(message.content)
             elif message.role == "user":
-                conversation_parts.append(message.content)
+                conversation_parts.append(MessageAdapter._content_to_text(message.content))
             elif message.role == "assistant":
-                conversation_parts.append(message.content)
+                conversation_parts.append(MessageAdapter._content_to_text(message.content))
 
         # Join conversation parts
         prompt = "\n\n".join(conversation_parts)
