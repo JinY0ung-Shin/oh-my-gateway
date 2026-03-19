@@ -485,8 +485,9 @@ class Pipeline:
                 return None
 
             if not self.valves.TOOL_DISPLAY:
-                status = "error" if is_error else "done"
-                details_tag = f"\n> **Tool**: {esc_name} — {status}\n"
+                status = "failed" if is_error else "completed"
+                friendly = self._friendly_tool_name(name)
+                details_tag = f"\n> {friendly} — {status}\n"
             else:
                 safe_args = _safe_attr(args)
                 safe_result = _safe_attr(result_content)
@@ -511,6 +512,48 @@ class Pipeline:
             return details_tag
 
         return None
+
+    @staticmethod
+    def _friendly_tool_name(raw_name: str) -> str:
+        """Turn a raw tool name into a short, user-friendly label.
+
+        Examples:
+            mcp__mcp_router__mlm_cql  -> "Used mlm_cql"
+            mcp__mcp_router__basic_knowledge -> "Used basic_knowledge"
+            Read                      -> "Read a file"
+            Edit                      -> "Edited a file"
+            Bash                      -> "Ran a command"
+            Grep / grep               -> "Searched code"
+            Glob                      -> "Found files"
+            Write                     -> "Wrote a file"
+            TodoWrite                 -> "Updated tasks"
+        """
+        builtin_labels = {
+            "read": "Read a file",
+            "edit": "Edited a file",
+            "write": "Wrote a file",
+            "bash": "Ran a command",
+            "grep": "Searched code",
+            "glob": "Found files",
+            "todowrite": "Updated tasks",
+            "webfetch": "Fetched a webpage",
+            "websearch": "Searched the web",
+            "notebookedit": "Edited notebook",
+        }
+        lower = raw_name.lower()
+
+        # Built-in SDK tools
+        if lower in builtin_labels:
+            return builtin_labels[lower]
+
+        # MCP tools: mcp__<server>__<tool> → "Used <tool>"
+        if lower.startswith("mcp__"):
+            parts = raw_name.split("__")
+            tool_part = parts[-1] if len(parts) >= 3 else parts[-1]
+            return f"Used **{tool_part}**"
+
+        # Fallback: title-case the name
+        return f"Used {raw_name}"
 
     @staticmethod
     def _extract_tool_result_text(raw_content) -> str:
