@@ -97,6 +97,10 @@ class Pipeline:
             default=True,
             description="Inject instruction for model to output <response> tag when done thinking",
         )
+        TOOL_DISPLAY: str = Field(
+            default="detailed",
+            description="Tool display mode: 'detailed' (full <details> block with args/result), 'simple' (short status message), or 'mcp_only' (show only MCP tool results)",
+        )
 
     def __init__(self):
         self.valves = self.Valves()
@@ -149,15 +153,19 @@ class Pipeline:
     def _get_thought_wrapped_instruction(self) -> str:
         return """
 
-## 검색 완료 후 답변 작성
+## 답변 작성 규칙
 
-모든 검색이 완료되면 답변 작성을 시작하기 직전에 반드시 `<response>` 토큰을 출력한다. 이 토큰은 검색 단계가 끝났음을 명시적으로 나타낸다.
+사용자에게 보여줄 최종 답변을 작성하기 직전에 반드시 `<response>` 토큰을 한 번 출력한다.
+검색이나 도구 사용 여부와 관계없이 항상 `<response>` 토큰을 출력해야 한다.
+
+- 검색/도구를 사용한 경우: 모든 검색이 끝난 뒤 답변 직전에 `<response>` 출력
+- 검색/도구 없이 바로 답변하는 경우: 답변 시작 직전에 `<response>` 출력
 
 ```
 <response>
 ```
 
-이 후 검색 결과를 바탕으로 답변을 작성한다."""
+이 토큰 이후에 최종 답변을 작성한다."""
 
     def _wrap_thought_content(self, text: str) -> str:
         if not text:
@@ -262,6 +270,7 @@ class Pipeline:
 
         tool_names: dict = {}
         tool_pending: dict = {}
+        any_tool_used = False
         try:
             if thought_wrapped:
                 yield "<thought>\n"
@@ -304,6 +313,7 @@ class Pipeline:
                                 event_type, list(sys_event.keys()),
                             )
                             if event_type in ("tool_use", "tool_result"):
+                                any_tool_used = True
                                 log.info(
                                     "[PIPE-DEBUG] %s raw_event=%s",
                                     event_type, json.dumps(sys_event, default=str)[:500],
@@ -372,9 +382,15 @@ class Pipeline:
             yield f"\n\nError: {e}"
         finally:
             if thought_wrapped and thought_opened and not response_tag_sent:
-                if text_buffer:
+                if not any_tool_used and text_buffer:
+                    # No tools were used and model didn't emit <response> —
+                    # treat the entire content as the response, not thought.
+                    yield "\n</thought>\n\n"
                     yield text_buffer
-                yield "\n</thought>"
+                else:
+                    if text_buffer:
+                        yield text_buffer
+                    yield "\n</thought>"
 
     def _render_system_event(
         self,
@@ -440,41 +456,34 @@ class Pipeline:
                 result_content = f"Result truncated ({chars} chars)"
             result_content = result_content[:10000]
             esc_name = html.escape(name)
-            safe_args = _safe_attr(args)
-            safe_result = _safe_attr(result_content)
-            details_tag = (
-                f'\n\n<details type="tool_calls"'
-                f' name="{esc_name}"'
-                f' arguments="{safe_args}"'
-                f' result="{safe_result}"'
-                f' done="true">\n'
-                f"<summary>Tool: {esc_name}</summary>\n"
-                f"</details>\n\n"
-            )
-            log.info(
-                "[PIPE-DEBUG] tool_id=%s name=%s args_len=%d result_len=%d",
-                tool_id, name, len(safe_args), len(safe_result),
-            )
-            log.info(
-                "[PIPE-DEBUG] raw_args=%s",
-                args[:500],
-            )
-            log.info(
-                "[PIPE-DEBUG] safe_args=%s",
-                safe_args[:500],
-            )
-            log.info(
-                "[PIPE-DEBUG] result_preview=%s",
-                result_content[:500],
-            )
-            log.info(
-                "[PIPE-DEBUG] safe_result_preview=%s",
-                safe_result[:500],
-            )
-            log.info(
-                "[PIPE-DEBUG] details_tag_first_300=%s",
-                details_tag[:300],
-            )
+
+            if self.valves.TOOL_DISPLAY == "mcp_only" and not name.startswith("mcp__"):
+                return None
+
+            if self.valves.TOOL_DISPLAY == "simple":
+                status = "error" if is_error else "done"
+                details_tag = f"\n> **Tool**: {esc_name} — {status}\n"
+            else:
+                safe_args = _safe_attr(args)
+                safe_result = _safe_attr(result_content)
+                details_tag = (
+                    f'\n\n<details type="tool_calls"'
+                    f' name="{esc_name}"'
+                    f' arguments="{safe_args}"'
+                    f' result="{safe_result}"'
+                    f' done="true">\n'
+                    f"<summary>Tool: {esc_name}</summary>\n"
+                    f"</details>\n\n"
+                )
+                log.info(
+                    "[PIPE-DEBUG] tool_id=%s name=%s args_len=%d result_len=%d",
+                    tool_id, name, len(safe_args), len(safe_result),
+                )
+                log.info("[PIPE-DEBUG] raw_args=%s", args[:500])
+                log.info("[PIPE-DEBUG] safe_args=%s", safe_args[:500])
+                log.info("[PIPE-DEBUG] result_preview=%s", result_content[:500])
+                log.info("[PIPE-DEBUG] safe_result_preview=%s", safe_result[:500])
+            log.info("[PIPE-DEBUG] details_tag_first_300=%s", details_tag[:300])
             return details_tag
 
         return None
