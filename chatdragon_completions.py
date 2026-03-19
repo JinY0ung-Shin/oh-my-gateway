@@ -236,6 +236,22 @@ class Pipeline:
         for i in range(len(messages) - 1, -1, -1):
             if messages[i].get("role") == "user":
                 content = messages[i].get("content", "")
+                # Debug: log what Open WebUI actually sends for image messages
+                if isinstance(content, list):
+                    log.info("[IMAGE-DEBUG] content is list, %d parts:", len(content))
+                    for j, part in enumerate(content):
+                        if isinstance(part, dict):
+                            ptype = part.get("type", "?")
+                            if ptype == "image_url":
+                                img = part.get("image_url", {})
+                                url = img.get("url", "") if isinstance(img, dict) else str(img)
+                                log.info("[IMAGE-DEBUG]   part[%d] type=image_url url_prefix=%s len=%d", j, url[:80], len(url))
+                            else:
+                                log.info("[IMAGE-DEBUG]   part[%d] type=%s keys=%s", j, ptype, list(part.keys()))
+                        else:
+                            log.info("[IMAGE-DEBUG]   part[%d] raw_type=%s preview=%s", j, type(part).__name__, str(part)[:100])
+                elif isinstance(content, str) and ("<img" in content or "image" in content.lower()):
+                    log.info("[IMAGE-DEBUG] content is str with image reference, preview=%s", content[:200])
                 if isinstance(content, str):
                     content = self._inject_context(
                         content,
