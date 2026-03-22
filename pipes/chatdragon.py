@@ -113,7 +113,7 @@ class Pipeline:
         self.chat_state: dict = {}
         self._locks: dict = {}
         self._lock = threading.Lock()
-        self._extra_headers: dict = {}
+        self._local = threading.local()  # per-thread request context
 
     def pipes(self) -> list:
         return [
@@ -256,13 +256,13 @@ class Pipeline:
         # Extract headers from metadata (forwarded by Open WebUI with ENABLE_FORWARD_USER_INFO_HEADERS)
         meta_headers = __metadata__.get("headers", {})
 
-        # Forward cookies and user info as headers to the gateway
-        self._extra_headers = {}
+        # Build per-request headers (never store on self to avoid cross-request leakage)
+        extra_headers: dict = {}
 
         # Forward dscrowd.token_key cookie for MCP Confluence auth
         dscrowd_token = meta_headers.get("x-cookie-dscrowd.token_key", "")
         if dscrowd_token:
-            self._extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
+            extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
             log.info("[PIPE] Forwarding X-Cookie-dscrowd.token_key header (len=%d)", len(dscrowd_token))
 
         # Forward username from ENABLE_FORWARD_USER_INFO_HEADERS (lowercased in metadata)
@@ -270,7 +270,7 @@ class Pipeline:
         if not owui_username and __user__:
             owui_username = __user__.get("name", "") or __user__.get("email", "")
         if owui_username:
-            self._extra_headers["X-OpenWebUI-User-Name"] = owui_username
+            extra_headers["X-OpenWebUI-User-Name"] = owui_username
             log.info("[PIPE] Forwarding X-OpenWebUI-User-Name header: %s", owui_username)
 
         # Also check for cookies dict (legacy support)
@@ -278,15 +278,14 @@ class Pipeline:
         if __cookies__ and not dscrowd_token:
             dscrowd_token = __cookies__.get("dscrowd.token_key", "")
             if dscrowd_token:
-                self._extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
+                extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
                 log.info("[PIPE] Forwarding X-Cookie-dscrowd.token_key from cookies dict (len=%d)", len(dscrowd_token))
 
         log.info("[PIPE] __task__=%s, user_id=%s, chat_id=%s", __task__, __user_id__, __chat_id__)
-        log.info("[PIPE] __user__=%s", __user__)
         log.info("[PIPE] meta_headers keys=%s", list(meta_headers.keys()) if meta_headers else "none")
-        log.info("[PIPE] __cookies__=%s", __cookies__)
-        log.info("[PIPE] body keys=%s", list(body.keys()))
-        log.info("[PIPE] _extra_headers keys=%s", list(self._extra_headers.keys()))
+        log.info("[PIPE] cookies keys=%s", list(__cookies__.keys()) if __cookies__ else "none")
+        self._local.extra_headers = extra_headers
+        log.info("[PIPE] extra_headers keys=%s", list(extra_headers.keys()))
         log.info("[PIPE] chat_state keys=%s", list(self.chat_state.keys()))
         log.info("[PIPE] OUTPUT_FORMAT=%s", self.valves.OUTPUT_FORMAT)
 
@@ -307,22 +306,23 @@ class Pipeline:
         if not current_input:
             return "Error: No user message found."
 
-        # Inject context into current_input (credentials from headers or cookies)
-        current_input = self._inject_context(
-            current_input,
-            __user__,
-            __user_id__,
-            __cookies__,
-            dscrowd_token=dscrowd_token if dscrowd_token else None,
-            mlm_username=owui_username if owui_username else None,
-        )
+        # Inject context into current_input (credentials from headers or cookies).
+        # _inject_context only operates on text; skip when input is a multimodal list.
+        if isinstance(current_input, str):
+            current_input = self._inject_context(
+                current_input,
+                __user__,
+                __user_id__,
+                __cookies__,
+                dscrowd_token=dscrowd_token if dscrowd_token else None,
+                mlm_username=owui_username if owui_username else None,
+            )
 
-        # Add thought_wrapped instruction to user message if enabled
-        if self.valves.OUTPUT_FORMAT == "thought_wrapped" and self.valves.THOUGHT_WRAPPED_INSTRUCTION:
-            thought_instruction = self._get_thought_wrapped_instruction()
-            # Inject into user message (current_input)
-            current_input = current_input + thought_instruction
-            log.info("[PIPE] Injected thought_wrapped instruction into user message")
+            # Add thought_wrapped instruction to user message if enabled
+            if self.valves.OUTPUT_FORMAT == "thought_wrapped" and self.valves.THOUGHT_WRAPPED_INSTRUCTION:
+                thought_instruction = self._get_thought_wrapped_instruction()
+                current_input = current_input + thought_instruction
+                log.info("[PIPE] Injected thought_wrapped instruction into user message")
 
         instructions_hash = self._hash(instructions) if instructions else "_none_"
         model = self.valves.MODEL
@@ -742,8 +742,9 @@ class Pipeline:
         headers = {"Content-Type": "application/json"}
         if self.valves.API_KEY:
             headers["Authorization"] = f"Bearer {self.valves.API_KEY}"
-        # Add extra headers (forwarded from Open WebUI metadata)
-        headers.update(self._extra_headers)
+        extra = getattr(self._local, "extra_headers", None)
+        if extra:
+            headers.update(extra)
         return headers
 
     def _responses_url(self) -> str:

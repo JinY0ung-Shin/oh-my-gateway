@@ -14,6 +14,7 @@ import hashlib
 import html
 import json
 import logging
+import threading
 from typing import AsyncGenerator
 
 import httpx
@@ -132,7 +133,7 @@ class Pipe:
         self.chat_state: dict[str, dict] = {}
         # Per-chat locks for concurrency safety
         self._locks: dict[str, asyncio.Lock] = {}
-        self._extra_headers: dict[str, str] = {}
+        self._local = threading.local()  # per-thread request context
 
     def pipes(self) -> list[dict]:
         return [
@@ -167,19 +168,20 @@ class Pipe:
         __metadata__ = __metadata__ or {}
         chat_id = __metadata__.get("chat_id", "")
 
-        # Forward cookies and user info as headers to the gateway
-        self._extra_headers = {}
+        # Build per-request headers (never store on self to avoid cross-request leakage)
+        extra_headers: dict = {}
         meta_headers = __metadata__.get("headers", {})
         # Forward dscrowd.token_key cookie for MCP Confluence auth
         dscrowd_token = meta_headers.get("x-cookie-dscrowd.token_key", "")
         if dscrowd_token:
-            self._extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
+            extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
         # Forward username from ENABLE_FORWARD_USER_INFO_HEADERS (lowercased in metadata)
         owui_username = meta_headers.get("x-openwebui-user-name", "")
         if not owui_username and __user__ and isinstance(__user__, dict):
             owui_username = __user__.get("name", "") or __user__.get("email", "")
         if owui_username:
-            self._extra_headers["X-MLM-Username"] = owui_username
+            extra_headers["X-MLM-Username"] = owui_username
+        self._local.extra_headers = extra_headers
 
         if not chat_id:
             log.warning("[THINK-PIPE] No chat_id in metadata, multi-turn chaining disabled")
@@ -256,6 +258,17 @@ class Pipe:
     # Streaming
     # ------------------------------------------------------------------
 
+    def _build_full_instructions(self, instructions: str) -> str:
+        """Build instructions with sentinel appended when WRAP_THINKING is on."""
+        sentinel = (
+            self.valves.RESPONSE_SENTINEL_INSTRUCTION.strip()
+            if self.valves.WRAP_THINKING
+            else ""
+        )
+        if instructions and sentinel:
+            return instructions + "\n\n" + sentinel
+        return instructions or sentinel or ""
+
     async def _pipe_stream(
         self, chat_id: str, payload: dict, instructions: str, instructions_hash: str, body: dict
     ) -> AsyncGenerator[str, None]:
@@ -267,8 +280,9 @@ class Pipe:
             if chat_id:
                 self.chat_state.pop(chat_id, None)
             payload.pop("previous_response_id", None)
-            if instructions:
-                payload["instructions"] = instructions
+            full_instructions = self._build_full_instructions(instructions)
+            if full_instructions:
+                payload["instructions"] = full_instructions
             try:
                 async for chunk in self._stream_responses(chat_id, payload, instructions_hash):
                     yield chunk
@@ -513,8 +527,9 @@ class Pipe:
             if chat_id:
                 self.chat_state.pop(chat_id, None)
             payload.pop("previous_response_id", None)
-            if instructions:
-                payload["instructions"] = instructions
+            full_instructions = self._build_full_instructions(instructions)
+            if full_instructions:
+                payload["instructions"] = full_instructions
             try:
                 return await self._call_responses(chat_id, payload, instructions_hash)
             except ChainResetError:
@@ -565,7 +580,9 @@ class Pipe:
         headers = {"Content-Type": "application/json"}
         if self.valves.API_KEY:
             headers["Authorization"] = f"Bearer {self.valves.API_KEY}"
-        headers.update(self._extra_headers)
+        extra = getattr(self._local, "extra_headers", None)
+        if extra:
+            headers.update(extra)
         return headers
 
     def _responses_url(self) -> str:

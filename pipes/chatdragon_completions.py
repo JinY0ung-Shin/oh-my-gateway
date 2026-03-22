@@ -18,6 +18,7 @@ import json
 import logging
 import random
 import re
+import threading
 from pathlib import Path
 from typing import Iterator, Optional
 from uuid import uuid4
@@ -127,7 +128,7 @@ class Pipeline:
 
     def __init__(self):
         self.valves = self.Valves()
-        self._extra_headers: dict = {}
+        self._local = threading.local()  # per-thread request context
 
     def pipes(self) -> list:
         return [
@@ -218,23 +219,25 @@ class Pipeline:
 
         meta_headers = __metadata__.get("headers", {})
 
-        self._extra_headers = {}
+        extra_headers: dict = {}
 
         dscrowd_token = meta_headers.get("x-cookie-dscrowd.token_key", "")
         if dscrowd_token:
-            self._extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
+            extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
 
         owui_username = meta_headers.get("x-openwebui-user-name", "")
         if not owui_username and __user__:
             owui_username = __user__.get("name", "") or __user__.get("email", "")
         if owui_username:
-            self._extra_headers["X-OpenWebUI-User-Name"] = owui_username
+            extra_headers["X-OpenWebUI-User-Name"] = owui_username
 
         __cookies__ = body.get("cookies", {})
         if __cookies__ and not dscrowd_token:
             dscrowd_token = __cookies__.get("dscrowd.token_key", "")
             if dscrowd_token:
-                self._extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
+                extra_headers["X-Cookie-dscrowd.token_key"] = dscrowd_token
+
+        self._local.extra_headers = extra_headers
 
         if not messages:
             return "No messages provided."
@@ -738,5 +741,7 @@ class Pipeline:
         headers = {"Content-Type": "application/json"}
         if self.valves.API_KEY:
             headers["Authorization"] = f"Bearer {self.valves.API_KEY}"
-        headers.update(self._extra_headers)
+        extra = getattr(self._local, "extra_headers", None)
+        if extra:
+            headers.update(extra)
         return headers
