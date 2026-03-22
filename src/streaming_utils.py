@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import re
@@ -6,6 +7,7 @@ from typing import Any, AsyncGenerator, Dict, Optional
 
 from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
+from src.constants import SSE_KEEPALIVE_INTERVAL
 from src.message_adapter import MessageAdapter
 from src.models import ChatCompletionRequest, ChatCompletionStreamResponse, StreamChoice
 from src.response_models import (
@@ -679,6 +681,46 @@ def format_chunk_content(chunk: Dict[str, Any], content_sent: bool) -> Optional[
 
 
 # ---------------------------------------------------------------------------
+# SSE keepalive
+# ---------------------------------------------------------------------------
+
+# SSE comment line — compliant clients silently ignore these.
+_SSE_KEEPALIVE = ": keepalive\n\n"
+
+_SENTINEL = object()
+
+
+async def _keepalive_wrapper(
+    source: AsyncGenerator,
+    interval: int,
+) -> AsyncGenerator:
+    """Wrap *source* to yield ``_SSE_KEEPALIVE`` during idle periods.
+
+    When the underlying async generator produces no item for *interval*
+    seconds, a keepalive SSE comment is yielded instead.  This prevents
+    HTTP intermediaries and client-side read timeouts from killing the
+    connection while the SDK is busy (tool execution, context compaction).
+
+    If *interval* is ``<= 0`` keepalives are disabled and the source is
+    yielded through unchanged.
+    """
+    if interval <= 0:
+        async for item in source:
+            yield item
+        return
+
+    ait = source.__aiter__()
+    while True:
+        try:
+            item = await asyncio.wait_for(ait.__anext__(), timeout=interval)
+            yield item
+        except asyncio.TimeoutError:
+            yield _SSE_KEEPALIVE
+        except StopAsyncIteration:
+            break
+
+
+# ---------------------------------------------------------------------------
 # Chat Completions streaming (/v1/chat/completions)
 # ---------------------------------------------------------------------------
 
@@ -708,7 +750,12 @@ async def stream_chunks(
             ]
         return [make_sse(request_id, request.model, {"content": text})]
 
-    async for chunk in chunk_source:
+    async for chunk in _keepalive_wrapper(chunk_source, SSE_KEEPALIVE_INTERVAL):
+        # Keepalive SSE comments — forward directly to the client
+        if chunk is _SSE_KEEPALIVE:
+            yield _SSE_KEEPALIVE
+            continue
+
         # Handle AssistantMessage.error (auth failures, rate limits, etc.)
         if chunk.get("type") == "assistant" and chunk.get("error"):
             chunks_buffer.append(chunk)
@@ -926,7 +973,12 @@ async def stream_response_chunks(
     # --- Main streaming loop ---
 
     try:
-        async for chunk in chunk_source:
+        async for chunk in _keepalive_wrapper(chunk_source, SSE_KEEPALIVE_INTERVAL):
+            # Keepalive SSE comments — forward directly to the client
+            if chunk is _SSE_KEEPALIVE:
+                yield _SSE_KEEPALIVE
+                continue
+
             # Detect SDK in-band error chunks
             if isinstance(chunk, dict) and chunk.get("is_error"):
                 error_msg = chunk.get("error_message", "Unknown SDK error")

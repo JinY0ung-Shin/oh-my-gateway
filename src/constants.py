@@ -36,6 +36,13 @@ SESSION_MAX_AGE_MINUTES = int(os.getenv("SESSION_MAX_AGE_MINUTES", "60"))
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 
+# SSE keepalive interval (seconds).  During long SDK operations (tool
+# execution, context compaction) no events flow to the client.  Emitting
+# an SSE comment (`: keepalive\n\n`) on this interval prevents HTTP
+# proxies, load balancers, and client-side timeouts from closing the
+# connection.  Set to 0 to disable.
+SSE_KEEPALIVE_INTERVAL = int(os.getenv("SSE_KEEPALIVE_INTERVAL", "15"))
+
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {
