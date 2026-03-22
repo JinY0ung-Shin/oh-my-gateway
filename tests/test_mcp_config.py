@@ -5,7 +5,7 @@ Unit tests for src/mcp_config.py
 
 import json
 from unittest.mock import patch
-from src.mcp_config import load_mcp_config, get_mcp_servers
+from src.mcp_config import load_mcp_config, get_mcp_servers, get_mcp_tool_patterns
 
 
 class TestLoadMcpConfig:
@@ -124,6 +124,60 @@ class TestLoadMcpConfig:
         with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
             result = load_mcp_config()
             assert "empty-cmd" not in result
+
+
+class TestStreamableHttpSupport:
+    """Test streamable-http transport type support."""
+
+    def test_streamable_http_with_url_is_accepted(self):
+        """streamable-http server with 'url' field is accepted."""
+        config = {
+            "mcpServers": {
+                "sh-server": {"type": "streamable-http", "url": "http://localhost:3000/mcp"}
+            }
+        }
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
+            result = load_mcp_config()
+            assert "sh-server" in result
+
+    def test_streamable_http_missing_url_is_skipped(self):
+        """streamable-http server without 'url' field is rejected."""
+        config = {"mcpServers": {"bad-sh": {"type": "streamable-http"}}}
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
+            result = load_mcp_config()
+            assert "bad-sh" not in result
+
+
+class TestGetMcpToolPatterns:
+    """Test get_mcp_tool_patterns() symbolic tool name generation."""
+
+    def test_empty_servers_returns_empty(self):
+        assert get_mcp_tool_patterns({}) == []
+
+    def test_single_server_pattern(self):
+        servers = {"my-router": {"type": "stdio", "command": "echo"}}
+        patterns = get_mcp_tool_patterns(servers)
+        assert patterns == ["mcp__my_router__*"]
+
+    def test_multiple_servers_patterns(self):
+        servers = {
+            "docs": {"type": "stdio", "command": "echo"},
+            "mcp-router": {"type": "sse", "url": "http://localhost:3000"},
+        }
+        patterns = get_mcp_tool_patterns(servers)
+        assert len(patterns) == 2
+        assert "mcp__docs__*" in patterns
+        assert "mcp__mcp_router__*" in patterns
+
+    def test_hyphenated_names_converted_to_underscores(self):
+        servers = {"my-cool-server": {"type": "stdio", "command": "echo"}}
+        patterns = get_mcp_tool_patterns(servers)
+        assert patterns == ["mcp__my_cool_server__*"]
+
+    def test_underscore_names_preserved(self):
+        servers = {"my_server": {"type": "stdio", "command": "echo"}}
+        patterns = get_mcp_tool_patterns(servers)
+        assert patterns == ["mcp__my_server__*"]
 
 
 class TestGetMcpServers:

@@ -242,6 +242,26 @@ class TestBuildOptions:
         options = mock_claude_cli.build_options(req, resolved, overrides={"max_turns": 5})
         assert options["max_turns"] == 5
 
+    def test_claude_build_options_mcp_tools_added_when_enabled(self, mock_claude_cli):
+        """MCP tool patterns are added to allowed_tools when tools are enabled."""
+        servers = {"my-router": {"type": "stdio", "command": "echo"}}
+        with patch("src.backends.claude.client.get_mcp_servers", return_value=servers):
+            req = self._make_request(enable_tools=True)
+            resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
+            options = mock_claude_cli.build_options(req, resolved)
+            assert "mcp__my_router__*" in options["allowed_tools"]
+            assert "mcp_servers" in options
+
+    def test_claude_build_options_mcp_tools_not_added_when_disabled(self, mock_claude_cli):
+        """MCP tool patterns are not added when tools are disabled."""
+        servers = {"my-router": {"type": "stdio", "command": "echo"}}
+        with patch("src.backends.claude.client.get_mcp_servers", return_value=servers):
+            req = self._make_request(enable_tools=False)
+            resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
+            options = mock_claude_cli.build_options(req, resolved)
+            assert "allowed_tools" not in options
+            assert "mcp_servers" in options
+
     def test_codex_build_options_tools_enabled(self, mock_codex_cli):
         req = self._make_request(enable_tools=True, model="codex")
         resolved = ResolvedModel(public_model="codex", backend="codex", provider_model="gpt-5.4")

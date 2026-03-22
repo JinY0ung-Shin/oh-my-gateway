@@ -43,7 +43,7 @@ from src.backends.base import ResolvedModel
 from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
-from src.mcp_config import get_mcp_servers
+from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -179,10 +179,18 @@ class ClaudeCodeCLI:
             options["permission_mode"] = PERMISSION_MODE_BYPASS
             logger.debug(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
 
-        # Add MCP servers if configured (Claude only)
+        # Add MCP servers if configured (Claude only).
+        # The SDK connects to the servers and resolves tool schemas internally.
+        # We add symbolic tool patterns (mcp__<server>__*) to allowed_tools
+        # so the SDK knows which MCP tools to enable without serializing full
+        # JSON schemas into the API request payload.
         mcp_servers = get_mcp_servers()
         if mcp_servers:
             options["mcp_servers"] = mcp_servers
+            if request.enable_tools:
+                mcp_patterns = get_mcp_tool_patterns(mcp_servers)
+                options.setdefault("allowed_tools", []).extend(mcp_patterns)
+                logger.debug(f"MCP tools enabled symbolically: {mcp_patterns}")
             logger.debug(f"MCP servers enabled: {list(mcp_servers.keys())}")
 
         return options

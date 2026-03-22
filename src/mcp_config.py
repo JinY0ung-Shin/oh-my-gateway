@@ -6,7 +6,7 @@ Loads server-level MCP config from the MCP_CONFIG environment variable.
 import json
 import logging
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from src.constants import MCP_CONFIG
 
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 McpServersDict = Dict[str, Dict[str, Any]]
 
-ALLOWED_TYPES = {"stdio", "sse", "http"}
+ALLOWED_TYPES = {"stdio", "sse", "http", "streamable-http"}
 
 
 def load_mcp_config() -> McpServersDict:
@@ -56,6 +56,7 @@ def load_mcp_config() -> McpServersDict:
         "stdio": ("command",),
         "sse": ("url",),
         "http": ("url",),
+        "streamable-http": ("url",),
     }
 
     validated: McpServersDict = {}
@@ -80,6 +81,17 @@ def load_mcp_config() -> McpServersDict:
         logger.info(f"Loaded {len(validated)} MCP server(s): {list(validated.keys())}")
 
     return validated
+
+
+def get_mcp_tool_patterns(servers: McpServersDict) -> List[str]:
+    """Return symbolic MCP tool patterns for allowed_tools.
+
+    The Claude Agent SDK resolves MCP tools using the naming convention
+    ``mcp__<server_name>__*``.  By adding these patterns to ``allowed_tools``
+    the SDK manages tool schemas internally — the gateway never needs to
+    serialize full MCP tool JSON schemas into the API request payload.
+    """
+    return [f"mcp__{'_'.join(name.split('-'))}__*" for name in servers]
 
 
 _server_mcp_config: McpServersDict = load_mcp_config()
