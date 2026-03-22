@@ -7,6 +7,8 @@ All configurable values can be overridden via environment variables.
 import logging as _logging
 import os
 
+from src.env_utils import parse_bool_env
+
 # Claude Agent SDK Tool Names
 # These are the built-in tools available in the Claude Agent SDK
 # See: https://docs.anthropic.com/en/docs/claude-code/sdk
@@ -58,7 +60,7 @@ THINKING_BUDGET_TOKENS = int(os.getenv("THINKING_BUDGET_TOKENS", "10000"))
 # Token-Level Streaming
 # When enabled, uses SDK's include_partial_messages to stream individual tokens
 # instead of waiting for complete messages
-TOKEN_STREAMING = os.getenv("TOKEN_STREAMING", "true").lower() in ("true", "1", "yes")
+TOKEN_STREAMING = parse_bool_env("TOKEN_STREAMING", "true")
 
 # Disallowed Subagent Types
 # Comma-separated list of subagent types to block via Agent(type) syntax
@@ -95,12 +97,12 @@ else:
 def _parse_sandbox_bool(name: str, default: str) -> bool:
     """Parse a sandbox boolean env var with strict validation.
 
-    Valid values: true/false/1/0/yes/no (case-insensitive).
+    Valid values: true/false/1/0/yes/no/on/off (case-insensitive).
     Invalid values log a warning and fall back to *default*.
     """
     raw = os.getenv(name)
     if raw is None:
-        raw = default
+        return parse_bool_env(name, default)
     if raw.lower() in _SANDBOX_VALID_ALL:
         return raw.lower() in _SANDBOX_VALID_TRUE
     _sandbox_logger.warning(

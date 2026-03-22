@@ -11,7 +11,7 @@ from src.constants import SSE_KEEPALIVE_INTERVAL
 from src.message_adapter import MessageAdapter
 from src.models import ChatCompletionRequest, ChatCompletionStreamResponse, StreamChoice
 from src.response_models import (
-    ContentPart as ResponseContentPart,
+    ResponseContentPart,
     OutputItem,
     ResponseErrorDetail,
     ResponseObject,

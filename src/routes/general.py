@@ -22,14 +22,11 @@ from src.auth import (
 from src.parameter_validator import CompatibilityReporter
 from src.backends import BackendRegistry
 from src.rate_limiter import rate_limit_endpoint
-from src.constants import DEFAULT_PORT
+from src.constants import DEFAULT_PORT, DEBUG_MODE, VERBOSE
 from src.mcp_config import get_mcp_servers
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
-
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() in ("true", "1", "yes", "on")
-VERBOSE = os.getenv("VERBOSE", "false").lower() in ("true", "1", "yes", "on")
 
 
 @router.get("/v1/models")

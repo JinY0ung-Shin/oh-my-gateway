@@ -28,6 +28,8 @@ from src.rate_limiter import (
     rate_limit_exceeded_handler,
 )
 from src.constants import (
+    DEBUG_MODE,
+    VERBOSE,
     DEFAULT_TIMEOUT_MS,
     DEFAULT_PORT,
     DEFAULT_HOST,
@@ -39,10 +41,7 @@ from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
 
 # Note: load_dotenv() is called in constants.py at import time
-
-# Configure logging based on debug mode
-DEBUG_MODE = os.getenv("DEBUG_MODE", "false").lower() in ("true", "1", "yes", "on")
-VERBOSE = os.getenv("VERBOSE", "false").lower() in ("true", "1", "yes", "on")
+# DEBUG_MODE and VERBOSE are imported from src.constants (single source of truth)
 
 # Set logging level based on debug/verbose mode
 log_level = logging.DEBUG if (DEBUG_MODE or VERBOSE) else logging.INFO

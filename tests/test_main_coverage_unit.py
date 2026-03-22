@@ -283,7 +283,7 @@ class TestValidateBackendAuth:
                 main._validate_backend_auth("claude")
 
             assert exc_info.value.status_code == 503
-            assert "authentication failed" in exc_info.value.detail["message"]
+            assert "authentication failed" in exc_info.value.detail
 
 
 # ===========================================================================

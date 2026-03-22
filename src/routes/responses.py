@@ -16,10 +16,10 @@ from src.session_manager import session_manager
 from src.backends import BackendClient, ResolvedModel
 from src.response_models import (
     ResponseCreateRequest,
+    ResponseContentPart,
     ResponseErrorDetail,
     ResponseObject,
     OutputItem,
-    ContentPart,
     ResponseUsage,
 )
 from src.rate_limiter import rate_limit_endpoint
@@ -457,7 +457,7 @@ async def create_response(
         output=[
             OutputItem(
                 id=_generate_msg_id(),
-                content=[ContentPart(text=assistant_text)],
+                content=[ResponseContentPart(text=assistant_text)],
             )
         ],
         usage=ResponseUsage(

@@ -1,4 +1,3 @@
-import os
 import re
 from typing import Optional
 from slowapi import Limiter
@@ -8,6 +7,7 @@ from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from src.constants import RATE_LIMITS
+from src.env_utils import parse_bool_env
 
 
 def get_rate_limit_key(request: Request) -> str:
@@ -17,12 +17,7 @@ def get_rate_limit_key(request: Request) -> str:
 
 def create_rate_limiter() -> Optional[Limiter]:
     """Create and configure the rate limiter based on environment variables."""
-    rate_limit_enabled = os.getenv("RATE_LIMIT_ENABLED", "true").lower() in (
-        "true",
-        "1",
-        "yes",
-        "on",
-    )
+    rate_limit_enabled = parse_bool_env("RATE_LIMIT_ENABLED", "true")
 
     if not rate_limit_enabled:
         return None

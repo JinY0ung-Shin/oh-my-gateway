@@ -9,6 +9,8 @@ All configurable values can be overridden via environment variables.
 import os
 from dotenv import load_dotenv
 
+from src.env_utils import parse_bool_env, parse_int_env
+
 load_dotenv()
 
 # Default model (recommended for most use cases)
@@ -19,7 +21,7 @@ SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "")
 
 # API Configuration
 DEFAULT_MAX_TURNS = int(os.getenv("DEFAULT_MAX_TURNS", "10"))
-DEFAULT_TIMEOUT_MS = int(os.getenv("MAX_TIMEOUT", "600000"))  # 10 minutes
+DEFAULT_TIMEOUT_MS = parse_int_env("MAX_TIMEOUT", 600_000)  # 10 minutes
 DEFAULT_PORT = int(os.getenv("PORT", "8000"))
 DEFAULT_HOST = os.getenv("CLAUDE_WRAPPER_HOST", "0.0.0.0")  # nosec B104
 MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))  # 10MB
@@ -79,3 +81,7 @@ from src.backends.codex.constants import (  # noqa: E402, F401
 )
 
 ALL_MODELS = CLAUDE_MODELS + CODEX_MODELS
+
+# Debug / Verbose mode — single source of truth
+DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
+VERBOSE = parse_bool_env("VERBOSE", "false")

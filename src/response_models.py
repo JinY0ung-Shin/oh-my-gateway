@@ -33,8 +33,8 @@ class ResponseCreateRequest(BaseModel):
     max_output_tokens: Optional[int] = None
 
 
-class ContentPart(BaseModel):
-    """A content part within an output item."""
+class ResponseContentPart(BaseModel):
+    """A content part within a Responses API output item."""
 
     type: Literal["output_text"] = "output_text"
     text: str = ""
@@ -48,7 +48,7 @@ class OutputItem(BaseModel):
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
     status: Literal["completed", "in_progress", "failed"] = "completed"
-    content: List[ContentPart] = Field(default_factory=list)
+    content: List[ResponseContentPart] = Field(default_factory=list)
 
 
 class ResponseUsage(BaseModel):

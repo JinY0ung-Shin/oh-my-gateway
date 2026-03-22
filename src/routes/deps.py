@@ -1,6 +1,7 @@
 """Shared dependencies and helpers for route handlers."""
 
 import logging
+from typing import Any
 
 from fastapi import HTTPException
 
@@ -44,17 +45,18 @@ def validate_backend_auth_or_raise(backend_name: str) -> None:
     """Validate backend authentication, raise HTTPException on failure."""
     auth_valid, auth_info = validate_backend_auth(backend_name)
     if not auth_valid:
+        errors = auth_info.get("errors", [])
+        error_suffix = f" ({'; '.join(errors)})" if errors else ""
         raise HTTPException(
             status_code=503,
-            detail={
-                "message": f"{backend_name} backend authentication failed",
-                "errors": auth_info.get("errors", []),
-                "help": "Check /v1/auth/status for detailed authentication information",
-            },
+            detail=(
+                f"{backend_name} backend authentication failed{error_suffix}. "
+                "Check /v1/auth/status for detailed information."
+            ),
         )
 
 
-def request_has_images(request) -> bool:
+def request_has_images(request: Any) -> bool:
     """Check if any message in the request contains image content parts."""
     messages = getattr(request, "messages", None)
     if not messages:
@@ -89,7 +91,7 @@ def request_has_images(request) -> bool:
     return False
 
 
-def validate_image_request(request, backend) -> None:
+def validate_image_request(request: Any, backend: BackendClient) -> None:
     """Validate image requests: tools must be enabled, backend must support images.
 
     Raises HTTPException(400) on failure.
@@ -114,7 +116,7 @@ def validate_image_request(request, backend) -> None:
         )
 
 
-def capture_provider_session_id(chunks_buffer: list, session) -> None:
+def capture_provider_session_id(chunks_buffer: list, session: Any) -> None:
     """Scan chunks for a ``codex_session`` meta-event and store the thread_id."""
     for chunk in chunks_buffer:
         if isinstance(chunk, dict) and chunk.get("type") == "codex_session":
@@ -125,7 +127,7 @@ def capture_provider_session_id(chunks_buffer: list, session) -> None:
             break
 
 
-def truncate_image_data(obj):
+def truncate_image_data(obj: Any) -> Any:
     """Deep-copy and truncate base64 image data for safe logging."""
     if isinstance(obj, dict):
         result = {}

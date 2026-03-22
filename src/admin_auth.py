@@ -21,6 +21,8 @@ import secrets
 import time
 from fastapi import HTTPException, Request, Response
 
+from src.env_utils import parse_bool_env
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
@@ -101,7 +103,7 @@ def login(provided_key: str, response: Response) -> dict:
         samesite="strict",
         path="/admin",
         max_age=ADMIN_SESSION_TTL,
-        secure=os.getenv("ADMIN_COOKIE_SECURE", "false").lower() in ("true", "1"),
+        secure=parse_bool_env("ADMIN_COOKIE_SECURE", "false"),
     )
     logger.info("Admin login successful")
     return {"status": "ok", "ttl": ADMIN_SESSION_TTL}

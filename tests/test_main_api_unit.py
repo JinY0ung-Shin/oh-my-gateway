@@ -186,11 +186,7 @@ def test_chat_completions_streaming_response_with_usage():
 def test_returns_503_when_auth_is_invalid(endpoint):
     _auth_exc = HTTPException(
         status_code=503,
-        detail={
-            "message": "claude backend authentication failed",
-            "errors": ["missing auth"],
-            "help": "Check /v1/auth/status for detailed authentication information",
-        },
+        detail="claude backend authentication failed (missing auth). Check /v1/auth/status for detailed information.",
     )
     with (
         client_context() as (client, _mock_cli),
@@ -211,7 +207,7 @@ def test_returns_503_when_auth_is_invalid(endpoint):
     assert response.status_code == 503
     assert body["error"]["type"] == "api_error"
     assert body["error"]["code"] == "503"
-    assert "authentication failed" in body["error"]["message"]["message"]
+    assert "authentication failed" in body["error"]["message"]
 
 
 @pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
@@ -555,11 +551,7 @@ def test_create_response_returns_404_when_previous_response_session_is_missing()
 def test_create_response_returns_503_when_auth_is_invalid():
     auth_error = HTTPException(
         status_code=503,
-        detail={
-            "message": "claude backend authentication failed",
-            "errors": ["missing auth"],
-            "help": "Check /v1/auth/status for detailed authentication information",
-        },
+        detail="claude backend authentication failed (missing auth). Check /v1/auth/status for detailed information.",
     )
     with (
         client_context() as (client, _mock_cli),
