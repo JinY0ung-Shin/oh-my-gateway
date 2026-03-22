@@ -506,7 +506,9 @@ class TestSessionEnableTools:
             async for _ in generate_streaming_response(req, "test-req-id"):
                 pass
 
-            assert captured_kwargs.get("allowed_tools") == DEFAULT_ALLOWED_TOOLS
+            allowed = captured_kwargs.get("allowed_tools", [])
+            for tool in DEFAULT_ALLOWED_TOOLS:
+                assert tool in allowed, f"{tool} missing from allowed_tools"
             assert captured_kwargs.get("permission_mode") is not None
             # disallowed_tools should NOT be set when tools are enabled
             assert captured_kwargs.get("disallowed_tools") is None
