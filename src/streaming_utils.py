@@ -803,16 +803,6 @@ async def stream_chunks(
                 yield make_task_sse(request_id, request.model, tool_block)
             continue
 
-        # Skip duplicate assistant content in token-streaming mode
-        if token_streaming:
-            if chunk.get("type") == "stream_event":
-                continue
-            if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
-                # Preserve assistant chunks that carry per-turn usage (SDK 0.1.49+)
-                if chunk.get("type") == "assistant" and chunk.get("usage"):
-                    chunks_buffer.append(chunk)
-                continue
-
         # User chunks with tool_result blocks
         if chunk.get("type") == "user":
             tool_results, parent_id = extract_user_tool_results(chunk)
@@ -824,8 +814,11 @@ async def stream_chunks(
             chunks_buffer.append(chunk)
             continue
 
-        # Emit tool_use/tool_result blocks embedded in assistant content
-        # (Codex collab_tool_call → tool blocks arrive here, not via stream_event)
+        # Emit tool_use/tool_result blocks embedded in assistant content.
+        # This MUST run before the token-streaming skip below so that tool
+        # blocks inside assistant content chunks are not silently dropped
+        # when token_streaming is True (which suppresses duplicate text but
+        # must not suppress structured tool events).
         embedded_tools = extract_embedded_tool_blocks(chunk)
         for tb in embedded_tools:
             if tb.get("type") == "tool_use":
@@ -833,6 +826,16 @@ async def stream_chunks(
             elif tb.get("type") == "tool_result":
                 result_data = _normalize_tool_result(tb)
                 yield make_task_sse(request_id, request.model, result_data)
+
+        # Skip duplicate assistant text in token-streaming mode.
+        # Tool blocks were already extracted above, so only text is suppressed.
+        if token_streaming:
+            if chunk.get("type") == "stream_event":
+                continue
+            if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
+                if chunk.get("type") == "assistant" and chunk.get("usage"):
+                    chunks_buffer.append(chunk)
+                continue
 
         # Content chunks (assistant messages, results)
         chunks_buffer.append(chunk)
@@ -842,10 +845,10 @@ async def stream_chunks(
                 yield sse
             content_sent = True
 
-    # Flush any remaining buffered text from the collab filter
-    remaining = collab_filter.flush()
-    if remaining:
-        for sse in _emit_sse(remaining):
+    # Flush remaining buffered chars from collab filter
+    remaining_collab = collab_filter.flush()
+    if remaining_collab:
+        for sse in _emit_sse(remaining_collab):
             yield sse
         content_sent = True
 
@@ -1040,16 +1043,6 @@ async def stream_response_chunks(
                     )
                 continue
 
-            # Skip duplicate assistant content in token-streaming mode
-            if token_streaming:
-                if chunk.get("type") == "stream_event":
-                    continue
-                if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
-                    # Preserve assistant chunks that carry per-turn usage (SDK 0.1.49+)
-                    if chunk.get("type") == "assistant" and chunk.get("usage"):
-                        chunks_buffer.append(chunk)
-                    continue
-
             # User chunks with tool_result blocks
             if chunk.get("type") == "user":
                 tool_results, parent_id = extract_user_tool_results(chunk)
@@ -1062,8 +1055,10 @@ async def stream_response_chunks(
                 chunks_buffer.append(chunk)
                 continue
 
-            # Emit tool_use/tool_result blocks embedded in assistant content
-            # (Codex collab_tool_call → tool blocks arrive here, not via stream_event)
+            # Emit tool_use/tool_result blocks embedded in assistant content.
+            # This MUST run before the token-streaming skip below so that tool
+            # blocks inside assistant content chunks are not silently dropped
+            # when token_streaming is True.
             embedded_tools = extract_embedded_tool_blocks(chunk)
             for tb in embedded_tools:
                 if tb.get("type") == "tool_use":
@@ -1079,6 +1074,16 @@ async def stream_response_chunks(
                         parent_tool_use_id=tb.get("parent_tool_use_id"),
                     )
 
+            # Skip duplicate assistant text in token-streaming mode.
+            # Tool blocks were already extracted above, so only text is suppressed.
+            if token_streaming:
+                if chunk.get("type") == "stream_event":
+                    continue
+                if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
+                    if chunk.get("type") == "assistant" and chunk.get("usage"):
+                        chunks_buffer.append(chunk)
+                    continue
+
             # Content chunks (assistant messages, results)
             chunks_buffer.append(chunk)
             text = format_chunk_content(chunk, content_sent)
@@ -1093,11 +1098,11 @@ async def stream_response_chunks(
         yield _make_failed_event("server_error", "Internal server error")
         return
 
-    # Flush any remaining buffered text from the collab filter
-    remaining = collab_filter.flush()
-    if remaining:
-        yield _emit_delta(remaining)
-        full_text.append(remaining)
+    # Flush remaining buffered chars from collab filter
+    remaining_collab = collab_filter.flush()
+    if remaining_collab:
+        yield _emit_delta(remaining_collab)
+        full_text.append(remaining_collab)
         content_sent = True
 
     if tool_acc.has_incomplete:
