@@ -704,39 +704,49 @@ async def _keepalive_wrapper(
     If *interval* is ``<= 0`` keepalives are disabled and the source is
     yielded through unchanged.
 
-    The implementation keeps a single pending ``__anext__()`` task alive
-    across timeout cycles so that the upstream generator / stream read is
-    never cancelled by a keepalive timeout.
+    The source generator is iterated inside a **single dedicated task** so
+    that anyio cancel scopes within the SDK never cross task boundaries.
+    Items are bridged to this generator via an ``asyncio.Queue``; when the
+    queue is empty for ``interval`` seconds a keepalive is emitted instead.
     """
     if interval <= 0:
         async for item in source:
             yield item
         return
 
-    ait = source.__aiter__()
-    next_task: asyncio.Task | None = None
+    _SENTINEL = object()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _reader():
+        """Iterate *source* entirely within one task (cancel-scope safe)."""
+        try:
+            async for item in source:
+                await queue.put(item)
+        except Exception as exc:
+            await queue.put(exc)
+        finally:
+            await queue.put(_SENTINEL)
+
+    task = asyncio.create_task(_reader())
     try:
         while True:
-            if next_task is None:
-                next_task = asyncio.ensure_future(ait.__anext__())
-            done, _ = await asyncio.wait({next_task}, timeout=interval)
-            if done:
-                try:
-                    yield next_task.result()
-                except StopAsyncIteration:
-                    break
-                finally:
-                    next_task = None
-            else:
-                # Timeout — upstream task is still pending; emit keepalive
-                yield _SSE_KEEPALIVE
-    finally:
-        if next_task is not None and not next_task.done():
-            next_task.cancel()
             try:
-                await next_task
-            except (asyncio.CancelledError, StopAsyncIteration):
-                pass
+                item = await asyncio.wait_for(queue.get(), timeout=interval)
+            except asyncio.TimeoutError:
+                yield _SSE_KEEPALIVE
+                continue
+
+            if item is _SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 
 # ---------------------------------------------------------------------------
