@@ -3,6 +3,7 @@
 import base64
 import os
 import time
+from pathlib import Path
 
 import pytest
 
@@ -161,3 +162,25 @@ def test_image_dir_created(tmp_path):
     assert not target.exists()
     ImageHandler(target)
     assert (target / ".claude_images").is_dir()
+
+
+def test_readonly_base_dir_falls_back_to_temp(tmp_path, monkeypatch):
+    """When base_dir mkdir raises PermissionError, ImageHandler falls back to temp."""
+    from unittest.mock import patch
+
+    original_mkdir = Path.mkdir
+
+    def _fail_mkdir(self, *args, **kwargs):
+        if ".claude_images" in str(self):
+            raise PermissionError("read-only filesystem")
+        return original_mkdir(self, *args, **kwargs)
+
+    with patch.object(Path, "mkdir", _fail_mkdir):
+        handler = ImageHandler(tmp_path)
+
+    # Should have fallen back — image_dir is NOT under tmp_path
+    assert handler.image_dir != tmp_path / ".claude_images"
+    assert handler.image_dir.exists()
+    # Saving should still work
+    path = handler.save_base64_image(TINY_PNG, "image/png")
+    assert path.exists()

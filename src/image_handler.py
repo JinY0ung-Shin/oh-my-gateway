@@ -10,6 +10,7 @@ Only synchronous operations — no remote URL fetching (SSRF-free).
 import base64
 import hashlib
 import logging
+import tempfile
 import time
 from pathlib import Path
 from typing import Tuple
@@ -31,7 +32,16 @@ class ImageHandler:
 
     def __init__(self, base_dir: Path):
         self.image_dir = base_dir / ".claude_images"
-        self.image_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            self.image_dir.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            fallback = Path(tempfile.mkdtemp(prefix="claude_images_"))
+            logger.warning(
+                "Cannot create %s (read-only?). Using fallback: %s",
+                self.image_dir,
+                fallback,
+            )
+            self.image_dir = fallback
 
     # ------------------------------------------------------------------
     # Core: decode + save
