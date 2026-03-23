@@ -90,11 +90,10 @@ def _prepare_session_prompt(
 ) -> tuple:
     """Prepare prompt, system_prompt, and session for session-mode requests.
 
-    IMPORTANT: This function does NOT mutate session state and does NOT
-    compute ``is_new``.  The ``is_new`` check must happen inside the
-    per-session lock to prevent two concurrent first-turn requests from
-    both seeing ``is_new=True``.  Callers must call
-    ``session.add_messages()`` explicitly after acquiring the lock.
+    This function does NOT mutate session state and does NOT compute
+    ``is_new``.  Lock acquisition, ``is_new`` checks, and message
+    commits are handled by :func:`~src.session_guard.acquire_session_preflight`
+    which callers invoke after this function.
 
     Returns:
         (prompt, system_prompt, session) tuple

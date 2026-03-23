@@ -97,8 +97,8 @@ async def acquire_session_preflight(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"Session belongs to backend '{session.backend}', "
-                    f"but model resolves to '{resolved.backend}'. "
+                    f"Session '{session_id}' belongs to backend '{session.backend}', "
+                    f"but model '{resolved.public_model}' resolves to '{resolved.backend}'. "
                     f"Cannot mix backends within a session."
                 ),
             )
@@ -108,8 +108,9 @@ async def acquire_session_preflight(
             raise HTTPException(
                 status_code=409,
                 detail=(
-                    "Cannot resume Codex session: the previous turn did not "
-                    "return a thread_id. Start a new session instead."
+                    f"Cannot resume Codex session '{session_id}': "
+                    f"the previous turn did not return a thread_id. "
+                    f"Start a new session instead."
                 ),
             )
 
