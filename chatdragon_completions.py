@@ -112,6 +112,10 @@ class Pipeline:
             default=False,
             description="Only display MCP tool results; hide all built-in SDK tools (Read, Bash, Edit, etc.)",
         )
+        TOOLS_IN_THOUGHT_ONLY: bool = Field(
+            default=False,
+            description="In thought_wrapped mode, only show tool notifications inside the thought collapsible and hide the model's narration text (requires thought_wrapped mode)",
+        )
         VQA_IMAGE_DIR: str = Field(
             default="/app/shared_images",
             description="Shared directory for saving uploaded images (must be mounted in both Open WebUI and gateway containers)",
@@ -432,7 +436,11 @@ class Pipeline:
                                 if thought_wrapped and not response_tag_sent:
                                     # Tool <details> blocks bypass the buffer
                                     if text_buffer:
-                                        yield text_buffer
+                                        # When TOOLS_IN_THOUGHT_ONLY, discard buffered
+                                        # narration text so only tool lines appear
+                                        # inside the thought collapsible.
+                                        if not self.valves.TOOLS_IN_THOUGHT_ONLY:
+                                            yield text_buffer
                                         text_buffer = ""
                                     yield rendered
                                 else:
@@ -460,9 +468,24 @@ class Pipeline:
                             elif chunk.startswith(TOOL_DETAILS_PREFIX):
                                 # Tool <details> blocks bypass the buffer
                                 if text_buffer:
-                                    yield text_buffer
+                                    if not self.valves.TOOLS_IN_THOUGHT_ONLY:
+                                        yield text_buffer
                                     text_buffer = ""
                                 yield chunk
+                            elif self.valves.TOOLS_IN_THOUGHT_ONLY:
+                                # Only keep text in buffer for <response>
+                                # tag detection; discard it for display.
+                                text_buffer += chunk
+                                if RESPONSE_TAG in text_buffer:
+                                    after = text_buffer.split(RESPONSE_TAG, 1)[1]
+                                    yield "\n</thought>\n\n"
+                                    response_tag_sent = True
+                                    if after:
+                                        yield after
+                                    text_buffer = ""
+                                elif len(text_buffer) > BUFFER_SIZE:
+                                    # Keep only enough to detect the tag
+                                    text_buffer = text_buffer[-(len(RESPONSE_TAG)):]
                             else:
                                 text_buffer += chunk
                                 if RESPONSE_TAG in text_buffer:
@@ -493,9 +516,10 @@ class Pipeline:
                     # No tools were used and model didn't emit <response> —
                     # treat the entire content as the response, not thought.
                     yield "\n</thought>\n\n"
-                    yield text_buffer
+                    if not self.valves.TOOLS_IN_THOUGHT_ONLY:
+                        yield text_buffer
                 else:
-                    if text_buffer:
+                    if text_buffer and not self.valves.TOOLS_IN_THOUGHT_ONLY:
                         yield text_buffer
                     yield "\n</thought>"
 
