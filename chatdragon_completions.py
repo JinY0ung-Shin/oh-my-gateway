@@ -404,15 +404,17 @@ class Pipeline:
                 _track_yield()
 
             url = f"{self.valves.BASE_URL.rstrip('/')}/v1/chat/completions"
-            # Use a generous read timeout — the gateway sends SSE keepalive
-            # comments every ~15s during idle periods (tool execution, context
-            # compaction), so a 60s read timeout catches truly dead connections
-            # while not killing active-but-quiet streams.
+            # Match read timeout to the total TIMEOUT valve so a long SDK
+            # operation (tool execution, context compaction) can never be
+            # killed by a premature read timeout.  The gateway sends SSE
+            # keepalive comments every ~15s which reset the wire-level
+            # idle timer, but edge cases (slow SDK init, MCP cold-start)
+            # can exceed 60s before the first keepalive fires.
             timeout = httpx.Timeout(
                 connect=30.0,
-                read=60.0,
+                read=float(self.valves.TIMEOUT),
                 write=30.0,
-                pool=self.valves.TIMEOUT,
+                pool=float(self.valves.TIMEOUT),
             )
             with httpx.Client(timeout=timeout) as client:
                 with client.stream("POST", url, json=payload, headers=self._make_headers()) as resp:
