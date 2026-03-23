@@ -54,7 +54,11 @@ def _build_backend_options(
         raise HTTPException(status_code=e.status_code, detail=str(e))
 
 
-def _prepare_stateless_completion(messages: list, claude_options: Dict[str, Any]) -> tuple:
+def _prepare_stateless_completion(
+    messages: list,
+    claude_options: Dict[str, Any],
+    metadata: Optional[Dict[str, str]] = None,
+) -> tuple:
     """Prepare prompt and run_completion kwargs for stateless mode.
 
     Returns:
@@ -75,6 +79,7 @@ def _prepare_stateless_completion(messages: list, claude_options: Dict[str, Any]
         permission_mode=claude_options.get("permission_mode"),
         output_format=claude_options.get("output_format"),
         mcp_servers=claude_options.get("mcp_servers"),
+        _metadata=metadata,
     )
     return prompt, run_kwargs
 
@@ -164,6 +169,7 @@ async def _streaming_session_preflight(
             model=options.get("model"),
             system_prompt=sys_prompt if pf.is_new else None,
             _custom_base=session.base_system_prompt,
+            _metadata=request.metadata,
             permission_mode=options.get("permission_mode"),
             mcp_servers=options.get("mcp_servers"),
             allowed_tools=options.get("allowed_tools"),
@@ -223,6 +229,7 @@ async def generate_streaming_response(
                 model=options.get("model"),
                 system_prompt=sys_prompt if pf.is_new else None,
                 _custom_base=session.base_system_prompt,
+                _metadata=request.metadata,
                 permission_mode=options.get("permission_mode"),
                 mcp_servers=options.get("mcp_servers"),
                 allowed_tools=options.get("allowed_tools"),
@@ -237,7 +244,9 @@ async def generate_streaming_response(
             # Stateless mode
             _validate_backend_auth(resolved.backend)
             options = _build_backend_options(request, resolved, claude_headers)
-            prompt, run_kwargs = _prepare_stateless_completion(request.messages, options)
+            prompt, run_kwargs = _prepare_stateless_completion(
+                request.messages, options, metadata=request.metadata
+            )
             chunk_source = backend.run_completion(**run_kwargs, stream=True)
 
         # Stream chunks via a background task to keep SDK cancel scopes
@@ -411,6 +420,7 @@ async def chat_completions(
                         model=options.get("model"),
                         system_prompt=sys_prompt if pf.is_new else None,
                         _custom_base=session.base_system_prompt,
+                        _metadata=request_body.metadata,
                         permission_mode=options.get("permission_mode"),
                         mcp_servers=options.get("mcp_servers"),
                         allowed_tools=options.get("allowed_tools"),
@@ -434,7 +444,9 @@ async def chat_completions(
                             request_body.session_id, assistant_message
                         )
             else:
-                prompt, run_kwargs = _prepare_stateless_completion(request_body.messages, options)
+                prompt, run_kwargs = _prepare_stateless_completion(
+                    request_body.messages, options, metadata=request_body.metadata
+                )
                 # Materialize images in prompt if present
                 if _request_has_images(request_body) and hasattr(backend, "image_handler"):
                     for msg in request_body.messages:

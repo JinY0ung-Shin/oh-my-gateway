@@ -150,6 +150,59 @@ def test_chat_completions_non_streaming_success():
     assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio", "command": "demo"}}
 
 
+def test_chat_completions_metadata_forwarded_to_backend():
+    """Metadata from chat completion requests should reach run_completion as _metadata."""
+    run_calls = []
+
+    async def fake_run_completion(**kwargs):
+        run_calls.append(kwargs)
+        yield {"content": [{"type": "text", "text": "OK"}]}
+        yield {"subtype": "success", "result": "OK", "stop_reason": "end_turn"}
+
+    with client_context() as (client, mock_cli):
+        mock_cli.run_completion = fake_run_completion
+        mock_cli.parse_message.return_value = "OK"
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": DEFAULT_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+                "metadata": {"THREAD_ID": "thread-abc"},
+            },
+        )
+
+    assert response.status_code == 200
+    assert run_calls[0]["_metadata"] == {"THREAD_ID": "thread-abc"}
+
+
+def test_chat_completions_no_metadata_passes_none():
+    """Without metadata field, _metadata should be None."""
+    run_calls = []
+
+    async def fake_run_completion(**kwargs):
+        run_calls.append(kwargs)
+        yield {"content": [{"type": "text", "text": "OK"}]}
+        yield {"subtype": "success", "result": "OK", "stop_reason": "end_turn"}
+
+    with client_context() as (client, mock_cli):
+        mock_cli.run_completion = fake_run_completion
+        mock_cli.parse_message.return_value = "OK"
+
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": DEFAULT_MODEL,
+                "messages": [{"role": "user", "content": "Hi"}],
+                "stream": False,
+            },
+        )
+
+    assert response.status_code == 200
+    assert run_calls[0]["_metadata"] is None
+
+
 def test_chat_completions_streaming_response_with_usage():
     async def fake_run_completion(**kwargs):
         yield {"content": [{"type": "text", "text": "Hello"}]}

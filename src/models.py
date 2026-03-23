@@ -96,6 +96,10 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Dict[str, Any]] = Field(
         default=None, description="Response format (supports json_schema type)"
     )
+    metadata: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="Key-value metadata forwarded as env vars to the backend subprocess (filtered by METADATA_ENV_ALLOWLIST)",
+    )
 
     @field_validator("n")
     @classmethod
