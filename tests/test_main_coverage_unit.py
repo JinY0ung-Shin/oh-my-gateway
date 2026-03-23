@@ -2080,21 +2080,27 @@ class TestResponsesNonStreamingInsideLockFutureTurn:
         # Monkey-patch session.lock to decrement turn_counter AFTER acquire
         # simulating a TOCTOU race where another request decremented it
         class SimulateRaceLock:
-            """Async context manager that changes turn_counter on entry."""
+            """Async context manager / lock that changes turn_counter on acquire."""
 
             def __init__(self, real_lock, sess):
                 self._real_lock = real_lock
                 self._sess = sess
 
-            async def __aenter__(self):
+            async def acquire(self):
                 await self._real_lock.acquire()
                 # Simulate race: turn_counter was 3 outside,
                 # but another request completed and reset to 1
                 self._sess.turn_counter = 1
+
+            def release(self):
+                self._real_lock.release()
+
+            async def __aenter__(self):
+                await self.acquire()
                 return self
 
             async def __aexit__(self, *args):
-                self._real_lock.release()
+                self.release()
 
         original_lock = session.lock
         session.lock = SimulateRaceLock(original_lock, session)
