@@ -141,6 +141,10 @@ class Pipeline:
             default=True,
             description="Show tool use/result details inline. Disable for cleaner output.",
         )
+        PRINT_RESEARCH_TEXT: bool = Field(
+            default=True,
+            description="Show Claude's narration text in the thought collapsible. Disable to show only tool blocks.",
+        )
 
         @field_validator("TOOL_DISPLAY", mode="before")
         @classmethod
@@ -456,9 +460,10 @@ class Pipeline:
                     # Collect Claude's narration as research context
                     self._research_text_parts.append(chunk)
 
-                    # Show Claude's narration inside thought
-                    yield chunk
-                    _track_yield()
+                    # Show Claude's narration inside thought (unless suppressed)
+                    if self.valves.PRINT_RESEARCH_TEXT:
+                        yield chunk
+                        _track_yield()
 
     # ------------------------------------------------------------------
     # Phase 2: Stream domain LLM answer
