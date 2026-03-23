@@ -619,6 +619,40 @@ class TestClaudeCodeCLIRunCompletion:
         else:
             assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original_key
 
+    @pytest.mark.asyncio
+    async def test_run_completion_metadata_sets_options_env(self, cli_instance):
+        """Metadata with a2a_thread_id should set options.env THREAD_ID."""
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield {"type": "assistant"}
+
+        with patch("src.backends.claude.client.query", mock_query):
+            async for _ in cli_instance.run_completion(
+                "Hello", _metadata={"a2a_thread_id": "thread-123"}
+            ):
+                pass
+
+            assert len(captured_options) == 1
+            assert captured_options[0].env == {"THREAD_ID": "thread-123"}
+
+    @pytest.mark.asyncio
+    async def test_run_completion_no_metadata_empty_env(self, cli_instance):
+        """Without metadata, options.env should remain default (empty dict)."""
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield {"type": "assistant"}
+
+        with patch("src.backends.claude.client.query", mock_query):
+            async for _ in cli_instance.run_completion("Hello"):
+                pass
+
+            assert len(captured_options) == 1
+            assert captured_options[0].env == {}
+
 
 class TestClaudeCodeCLICleanupException:
     """Test ClaudeCodeCLI._cleanup_temp_dir() exception handling."""

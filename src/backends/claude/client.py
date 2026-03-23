@@ -295,6 +295,7 @@ class ClaudeCodeCLI:
         session_id: Optional[str] = None,
         resume: Optional[str] = None,
         _custom_base: object = _UNSET,
+        extra_env: Optional[Dict[str, str]] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         options = ClaudeAgentOptions(max_turns=max_turns, cwd=self.cwd, setting_sources=["project"])
@@ -340,6 +341,14 @@ class ClaudeCodeCLI:
             options.include_partial_messages = True
 
         self._configure_session(options, session_id, resume)
+
+        # Map metadata keys to subprocess env vars (concurrency-safe via options.env)
+        if extra_env:
+            env_map = {}
+            if "a2a_thread_id" in extra_env:
+                env_map["THREAD_ID"] = extra_env["a2a_thread_id"]
+            if env_map:
+                options.env = env_map
 
         return options
 
@@ -500,6 +509,7 @@ class ClaudeCodeCLI:
                     mcp_servers=mcp_servers,
                     session_id=session_id,
                     resume=resume,
+                    extra_env=_extra.get("_metadata"),
                 )
 
                 async for message in query(prompt=prompt, options=options):
