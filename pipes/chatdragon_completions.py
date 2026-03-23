@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 from uuid import uuid4
 
-from pydantic import field_validator
+from pydantic import BaseModel, Field, field_validator
 
 import httpx
 
@@ -59,7 +59,6 @@ def _safe_attr(value: str) -> str:
         .replace("\n", " ")
         .replace("\r", "")
     )
-from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 

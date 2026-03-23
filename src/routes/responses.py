@@ -85,85 +85,36 @@ async def _responses_streaming_preflight(
     Returns a dict consumed by the streaming generator.  The generator's
     ``finally`` block is responsible for releasing the lock.
     """
-    await session.lock.acquire()
+    from src.session_guard import acquire_session_preflight
 
-    try:
-        # --- Validation inside lock (TOCTOU-safe) ---
+    # Pre-parse turn for validation inside the lock
+    turn: Optional[int] = None
+    if not is_new_session:
+        assert body.previous_response_id is not None
+        parsed = _parse_response_id(body.previous_response_id)
+        _, turn = parsed  # guaranteed valid at this point
 
-        if not is_new_session:
-            # _parse_response_id already extracted ``turn``; re-parse here
-            parsed = _parse_response_id(body.previous_response_id)
-            _, turn = parsed  # guaranteed valid at this point
-
-            if turn != session.turn_counter:
-                if turn < session.turn_counter:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Stale previous_response_id: only the latest response "
-                            f"(resp_{session_id}_{session.turn_counter}) can be continued"
-                        ),
-                    )
-                else:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=(
-                            f"previous_response_id '{body.previous_response_id}' "
-                            f"references a future turn"
-                        ),
-                    )
-
-            # Backend mismatch guard
-            if session.backend and session.backend != resolved.backend:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Session belongs to backend '{session.backend}', "
-                        f"but model '{body.model}' resolves to '{resolved.backend}'. "
-                        f"Cannot mix backends within a session."
-                    ),
-                )
-
-            # Codex resume guard
-            if resolved.backend == "codex" and not session.provider_session_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Cannot resume Codex session: no thread_id from previous turn. "
-                        "Start a new session instead."
-                    ),
-                )
-
-        # Compute resume_id and next_turn
-        resume_id = session.provider_session_id or session_id if not is_new_session else None
-        next_turn = session.turn_counter + 1
-
-        # Tag backend on first turn and snapshot base system prompt
-        if is_new_session:
-            session.backend = resolved.backend
-            from src.system_prompt import get_system_prompt
-
-            session.base_system_prompt = get_system_prompt()  # None = preset mode
-
-    except Exception:
-        session.lock.release()
-        raise
+    pf = await acquire_session_preflight(
+        session, resolved, session_id,
+        is_new=is_new_session,
+        turn=turn,
+    )
 
     return {
-        "session": session,
-        "lock_acquired": True,
-        "next_turn": next_turn,
-        "resume_id": resume_id,
+        "session": pf.session,
+        "lock_acquired": pf.lock_acquired,
+        "next_turn": pf.next_turn,
+        "resume_id": pf.resume_id,
         "chunk_kwargs": dict(
             prompt=prompt,
             model=resolved.provider_model,
-            system_prompt=system_prompt if is_new_session else None,
+            system_prompt=system_prompt if pf.is_new else None,
             _custom_base=session.base_system_prompt,
             _metadata=body.metadata,
             permission_mode=PERMISSION_MODE_BYPASS,
             mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-            session_id=session_id if is_new_session else None,
-            resume=resume_id,
+            session_id=session_id if pf.is_new else None,
+            resume=pf.resume_id,
         ),
     }
 
@@ -359,81 +310,37 @@ async def create_response(
 
     # --- Non-streaming path ---
     try:
-        async with session.lock:
-            # --- Validation inside lock (TOCTOU-safe) ---
-            if not is_new_session:
-                parsed = _parse_response_id(body.previous_response_id)
-                _, turn = parsed
+        from src.session_guard import session_preflight_scope
 
-                if turn != session.turn_counter:
-                    if turn < session.turn_counter:
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Stale previous_response_id: only the latest response "
-                                f"(resp_{session_id}_{session.turn_counter}) can be continued"
-                            ),
-                        )
-                    else:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=(
-                                f"previous_response_id '{body.previous_response_id}' "
-                                f"references a future turn"
-                            ),
-                        )
+        # Pre-parse turn for validation inside the lock
+        _turn: Optional[int] = None
+        if not is_new_session:
+            assert body.previous_response_id is not None
+            _parsed = _parse_response_id(body.previous_response_id)
+            _, _turn = _parsed
 
-                # Backend mismatch guard
-                if session.backend and session.backend != resolved.backend:
-                    raise HTTPException(
-                        status_code=400,
-                        detail=(
-                            f"Session belongs to backend '{session.backend}', "
-                            f"but model '{body.model}' resolves to '{resolved.backend}'. "
-                            f"Cannot mix backends within a session."
-                        ),
-                    )
-
-                # Codex resume guard
-                if resolved.backend == "codex" and not session.provider_session_id:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "Cannot resume Codex session: no thread_id from previous turn. "
-                            "Start a new session instead."
-                        ),
-                    )
-
-            # Compute resume_id and next_turn
-            resume_id = session.provider_session_id or session_id if not is_new_session else None
-            next_turn = session.turn_counter + 1
-
-            # Tag backend on first turn and snapshot base system prompt
-            if is_new_session:
-                session.backend = resolved.backend
-                from src.system_prompt import get_system_prompt
-
-                session.base_system_prompt = get_system_prompt()  # None = preset mode
-
+        async with session_preflight_scope(
+            session, resolved, session_id,
+            is_new=is_new_session,
+            turn=_turn,
+        ) as pf:
             # Execute backend
             chunks = []
             try:
                 async for chunk in backend.run_completion(
                     prompt=prompt,
                     model=resolved.provider_model,
-                    system_prompt=system_prompt if is_new_session else None,
+                    system_prompt=system_prompt if pf.is_new else None,
                     _custom_base=session.base_system_prompt,
                     _metadata=body.metadata,
                     permission_mode=PERMISSION_MODE_BYPASS,
                     mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-                    session_id=session_id if is_new_session else None,
-                    resume=resume_id,
+                    session_id=session_id if pf.is_new else None,
+                    resume=pf.resume_id,
                 ):
                     chunks.append(chunk)
             finally:
                 # ALWAYS capture provider_session_id (even on failure/exception).
-                # On failure, this is internal-only: no response_id is committed for the
-                # client, so the captured thread_id is not externally recoverable.
                 if chunks:
                     capture_provider_session_id(chunks, session)
 
@@ -449,7 +356,7 @@ async def create_response(
                 raise HTTPException(status_code=502, detail="No response from backend")
 
             # SUCCESS-ONLY: commit turn counter and session messages
-            session.turn_counter = next_turn
+            session.turn_counter = pf.next_turn
             session.add_messages([Message(role="user", content=prompt)])
             session_manager.add_assistant_response(
                 session_id, Message(role="assistant", content=assistant_text)

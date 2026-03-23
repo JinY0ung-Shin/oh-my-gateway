@@ -3,7 +3,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Literal, Optional
 
 from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
@@ -91,9 +91,17 @@ def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
     return getattr(info, "status", "unknown")
 
 
-def map_stop_reason(stop_reason: Optional[str] = None) -> str:
+FinishReason = Literal["stop", "length", "content_filter", "tool_calls"]
+
+
+def map_stop_reason(stop_reason: Optional[str] = None) -> FinishReason:
     """Map Claude SDK stop_reason to OpenAI finish_reason."""
-    return _STOP_REASON_MAP.get(stop_reason, "stop")
+    if stop_reason is None:
+        return "stop"
+    mapped = _STOP_REASON_MAP.get(stop_reason, "stop")
+    if mapped in ("length", "tool_calls", "content_filter"):
+        return mapped  # type: ignore[return-value]
+    return "stop"
 
 
 def extract_stop_reason(messages: list) -> Optional[str]:
@@ -118,8 +126,8 @@ def _extract_tool_blocks(content) -> tuple[list, list]:
     """
     if not isinstance(content, list):
         return [], content if content else []
-    tool_blocks = []
-    non_tool = []
+    tool_blocks: list[Any] = []
+    non_tool: list[Any] = []
     for b in content:
         if isinstance(b, (ToolUseBlock, ToolResultBlock)):
             tool_blocks.append(b)

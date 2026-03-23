@@ -99,9 +99,10 @@ def _prepare_session_prompt(
     Returns:
         (prompt, system_prompt, session) tuple
     """
+    assert request.session_id is not None  # caller guarantees session_id is set
     session = session_manager.get_or_create_session(request.session_id)
 
-    last_user_msg = None
+    last_user_msg: Any = None
     for msg in reversed(request.messages):
         if msg.role == "user":
             if isinstance(msg.content, list) and backend and hasattr(backend, "image_handler"):
@@ -111,7 +112,7 @@ def _prepare_session_prompt(
             else:
                 last_user_msg = msg.content
             break
-    prompt = last_user_msg or MessageAdapter.messages_to_prompt(request.messages)[0]
+    prompt: Any = last_user_msg or MessageAdapter.messages_to_prompt(request.messages)[0]
 
     # Extract system prompt from messages
     system_prompt = None
@@ -123,7 +124,7 @@ def _prepare_session_prompt(
                 system_prompt = " ".join(
                     p.text
                     for p in msg.content
-                    if hasattr(p, "type") and p.type == "text" and hasattr(p, "text")
+                    if hasattr(p, "type") and p.type == "text" and hasattr(p, "text") and p.text
                 )
             break
     if system_prompt:
@@ -148,66 +149,26 @@ async def _streaming_session_preflight(
     Returns a dict with keys needed by the streaming generator:
         session, lock_acquired, prompt, sys_prompt, is_new, resume_id, chunk_kwargs
     """
+    from src.session_guard import acquire_session_preflight
+
     prompt, sys_prompt, session = _prepare_session_prompt(request, backend=backend)
 
-    # Acquire per-session lock BEFORE checking is_new or mutating state.
-    await session.lock.acquire()
-
-    try:
-        is_new = len(session.messages) == 0
-
-        # Enforce backend invariant (inside lock to avoid TOCTOU)
-        if not is_new and session.backend != resolved.backend:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"Session '{request.session_id}' belongs to backend '{session.backend}', "
-                    f"but model '{request.model}' resolves to '{resolved.backend}'. "
-                    f"Cannot mix backends within a session."
-                ),
-            )
-
-        # Compute resume token BEFORE mutating session state
-        resume_id = None
-        if not is_new:
-            if resolved.backend == "codex" and not session.provider_session_id:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        f"Cannot resume Codex session '{request.session_id}': "
-                        f"the previous turn did not return a thread_id. "
-                        f"Start a new session instead."
-                    ),
-                )
-            resume_id = session.provider_session_id or request.session_id
-
-        # Commit messages and tag backend AFTER all checks pass
-        session.add_messages(request.messages)
-        if is_new:
-            session.backend = resolved.backend
-            # Snapshot the global base prompt so later admin changes
-            # don't affect this session.  Only the base is stored;
-            # per-request sys_prompt is passed separately to the backend.
-            from src.system_prompt import get_system_prompt
-
-            session.base_system_prompt = get_system_prompt()  # None = preset mode
-
-    except Exception:
-        # On any failure, release the lock before re-raising
-        session.lock.release()
-        raise
+    assert request.session_id is not None
+    pf = await acquire_session_preflight(
+        session, resolved, request.session_id, messages=request.messages
+    )
 
     return {
-        "session": session,
-        "lock_acquired": True,
+        "session": pf.session,
+        "lock_acquired": pf.lock_acquired,
         "prompt": prompt,
         "sys_prompt": sys_prompt,
-        "is_new": is_new,
-        "resume_id": resume_id,
+        "is_new": pf.is_new,
+        "resume_id": pf.resume_id,
         "chunk_kwargs": dict(
             prompt=prompt,
             model=options.get("model"),
-            system_prompt=sys_prompt if is_new else None,
+            system_prompt=sys_prompt if pf.is_new else None,
             _custom_base=session.base_system_prompt,
             _metadata=request.metadata,
             permission_mode=options.get("permission_mode"),
@@ -216,8 +177,8 @@ async def _streaming_session_preflight(
             disallowed_tools=options.get("disallowed_tools"),
             output_format=options.get("output_format"),
             max_turns=options.get("max_turns", get_default_max_turns()),
-            session_id=request.session_id if is_new else None,
-            resume=resume_id,
+            session_id=request.session_id if pf.is_new else None,
+            resume=pf.resume_id,
             stream=True,
         ),
     }
@@ -256,45 +217,18 @@ async def generate_streaming_response(
             options = _build_backend_options(request, resolved, claude_headers)
             prompt, sys_prompt, session = _prepare_session_prompt(request, backend=backend)
 
-            await session.lock.acquire()
-            lock_acquired = True
+            from src.session_guard import acquire_session_preflight
 
-            is_new = len(session.messages) == 0
-
-            if not is_new and session.backend != resolved.backend:
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"Session '{request.session_id}' belongs to backend "
-                        f"'{session.backend}', but model '{request.model}' resolves "
-                        f"to '{resolved.backend}'. Cannot mix backends within a session."
-                    ),
-                )
-
-            resume_id = None
-            if not is_new:
-                if resolved.backend == "codex" and not session.provider_session_id:
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            f"Cannot resume Codex session '{request.session_id}': "
-                            f"the previous turn did not return a thread_id. "
-                            f"Start a new session instead."
-                        ),
-                    )
-                resume_id = session.provider_session_id or request.session_id
-
-            session.add_messages(request.messages)
-            if is_new:
-                session.backend = resolved.backend
-                from src.system_prompt import get_system_prompt
-
-                session.base_system_prompt = get_system_prompt()  # None = preset mode
+            assert request.session_id is not None
+            pf = await acquire_session_preflight(
+                session, resolved, request.session_id, messages=request.messages
+            )
+            lock_acquired = pf.lock_acquired
 
             chunk_source = backend.run_completion(
                 prompt=prompt,
                 model=options.get("model"),
-                system_prompt=sys_prompt if is_new else None,
+                system_prompt=sys_prompt if pf.is_new else None,
                 _custom_base=session.base_system_prompt,
                 _metadata=request.metadata,
                 permission_mode=options.get("permission_mode"),
@@ -303,8 +237,8 @@ async def generate_streaming_response(
                 disallowed_tools=options.get("disallowed_tools"),
                 output_format=options.get("output_format"),
                 max_turns=options.get("max_turns", get_default_max_turns()),
-                session_id=request.session_id if is_new else None,
-                resume=resume_id,
+                session_id=request.session_id if pf.is_new else None,
+                resume=pf.resume_id,
                 stream=True,
             )
         else:
@@ -415,6 +349,7 @@ async def generate_streaming_response(
     finally:
         # Release per-session lock only if THIS coroutine acquired it
         if lock_acquired:
+            assert session is not None  # lock_acquired implies session is set
             session.lock.release()
 
 
@@ -472,52 +407,19 @@ async def chat_completions(
 
             session = None
             if request_body.session_id:
+                from src.session_guard import session_preflight_scope
+
                 prompt, sys_prompt, session = _prepare_session_prompt(request_body, backend=backend)
 
-                # Acquire lock BEFORE is_new check to prevent concurrent first-turn race
-                async with session.lock:
-                    is_new = len(session.messages) == 0
-
-                    # Enforce backend invariant (inside lock to avoid TOCTOU)
-                    if not is_new and session.backend != resolved.backend:
-                        raise HTTPException(
-                            status_code=400,
-                            detail=(
-                                f"Session '{request_body.session_id}' belongs to backend "
-                                f"'{session.backend}', but model '{request_body.model}' "
-                                f"resolves to '{resolved.backend}'. "
-                                f"Cannot mix backends within a session."
-                            ),
-                        )
-
-                    # Compute resume token BEFORE mutating session state
-                    resume_id = None
-                    if not is_new:
-                        if resolved.backend == "codex" and not session.provider_session_id:
-                            raise HTTPException(
-                                status_code=409,
-                                detail=(
-                                    f"Cannot resume Codex session "
-                                    f"'{request_body.session_id}': the previous turn "
-                                    f"did not return a thread_id. "
-                                    f"Start a new session instead."
-                                ),
-                            )
-                        resume_id = session.provider_session_id or request_body.session_id
-
-                    # Commit messages and tag backend AFTER all checks pass
-                    session.add_messages(request_body.messages)
-                    if is_new:
-                        session.backend = resolved.backend
-                        from src.system_prompt import get_system_prompt
-
-                        session.base_system_prompt = get_system_prompt()  # None = preset mode
-
+                async with session_preflight_scope(
+                    session, resolved, request_body.session_id,
+                    messages=request_body.messages,
+                ) as pf:
                     chunks = []
                     async for chunk in backend.run_completion(
                         prompt=prompt,
                         model=options.get("model"),
-                        system_prompt=sys_prompt if is_new else None,
+                        system_prompt=sys_prompt if pf.is_new else None,
                         _custom_base=session.base_system_prompt,
                         _metadata=request_body.metadata,
                         permission_mode=options.get("permission_mode"),
@@ -526,8 +428,8 @@ async def chat_completions(
                         disallowed_tools=options.get("disallowed_tools"),
                         output_format=options.get("output_format"),
                         max_turns=options.get("max_turns", get_default_max_turns()),
-                        session_id=request_body.session_id if is_new else None,
-                        resume=resume_id,
+                        session_id=request_body.session_id if pf.is_new else None,
+                        resume=pf.resume_id,
                         stream=False,
                     ):
                         chunks.append(chunk)

@@ -7,7 +7,16 @@ so endpoint code dispatches by interface rather than concrete backend type.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -99,7 +108,7 @@ class BackendClient(Protocol):
 
     def get_auth_provider(self) -> Any: ...
 
-    async def run_completion(
+    def run_completion(
         self,
         prompt: str,
         system_prompt: Optional[str] = None,
@@ -114,7 +123,7 @@ class BackendClient(Protocol):
         output_format: Optional[Dict[str, Any]] = None,
         mcp_servers: Optional[Dict[str, Any]] = None,
         **_extra: Any,
-    ) -> AsyncGenerator[Dict[str, Any], None]: ...
+    ) -> AsyncIterator[Dict[str, Any]]: ...
 
     def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]: ...
 
