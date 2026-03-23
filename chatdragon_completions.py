@@ -16,9 +16,9 @@ import base64
 import html
 import json
 import logging
-import os
 import random
 import re
+import time
 from pathlib import Path
 from typing import Iterator, Optional
 from uuid import uuid4
@@ -51,14 +51,15 @@ def _safe_attr(value: str) -> str:
     would break the attribute boundary.
     """
     return (
-        value
-        .replace("&", "+")   # neutralise entities (must be first)
-        .replace('"', "'")   # prevent closing the attribute
+        value.replace("&", "+")  # neutralise entities (must be first)
+        .replace('"', "'")  # prevent closing the attribute
         .replace("<", "[")
         .replace(">", "]")
         .replace("\n", " ")
         .replace("\r", "")
     )
+
+
 from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
@@ -120,7 +121,10 @@ class Pipeline:
             default="/app/shared_images",
             description="Shared directory for saving uploaded images (must be mounted in both Open WebUI and gateway containers)",
         )
-
+        PRINT_TOOL_ACTIVITY: bool = Field(
+            default=True,
+            description="Show tool use/result details inline. Disable for cleaner output with no tool blocks.",
+        )
 
         @field_validator("TOOL_DISPLAY", mode="before")
         @classmethod
@@ -269,7 +273,11 @@ class Pipeline:
                                 try:
                                     header, encoded = url.split(",", 1)
                                     # e.g. data:image/png;base64 -> png
-                                    ext = header.split("/")[1].split(";")[0] if "/" in header else "png"
+                                    ext = (
+                                        header.split("/")[1].split(";")[0]
+                                        if "/" in header
+                                        else "png"
+                                    )
                                     filename = f"{uuid4().hex}.{ext}"
                                     filepath = image_dir / filename
                                     filepath.write_bytes(base64.b64decode(encoded))
@@ -368,14 +376,32 @@ class Pipeline:
         BUFFER_SIZE = 50
         RESPONSE_TAG = "<response>"
         TOOL_DETAILS_PREFIX = "\n\n<details "
+        KEEPALIVE_INTERVAL = 15  # seconds
 
         tool_names: dict = {}
         tool_pending: dict = {}
         any_tool_used = False
+        show_tools = self.valves.PRINT_TOOL_ACTIVITY
+        last_yield_time = time.monotonic()
+
+        def _keepalive_yield() -> Optional[str]:
+            """Return a zero-width space if we haven't yielded recently."""
+            nonlocal last_yield_time
+            now = time.monotonic()
+            if now - last_yield_time > KEEPALIVE_INTERVAL:
+                last_yield_time = now
+                return "\u200b"
+            return None
+
+        def _track_yield():
+            nonlocal last_yield_time
+            last_yield_time = time.monotonic()
+
         try:
             if thought_wrapped:
                 yield "<thought>\n"
                 thought_opened = True
+                _track_yield()
 
             url = f"{self.valves.BASE_URL.rstrip('/')}/v1/chat/completions"
             # Use a generous read timeout — the gateway sends SSE keepalive
@@ -395,6 +421,12 @@ class Pipeline:
                         raise Exception(f"Server error ({resp.status_code}): {body_text}")
 
                     for line in resp.iter_lines():
+                        # Keepalive: emit invisible char so Open WebUI
+                        # doesn't consider the stream dead.
+                        ka = _keepalive_yield()
+                        if ka:
+                            yield ka
+
                         if not line.startswith("data: "):
                             continue
                         data_str = line[6:]
@@ -412,7 +444,8 @@ class Pipeline:
                         if "system_event" in evt_keys or "choices" not in evt_keys:
                             log.info(
                                 "[PIPE-DEBUG] sse_event keys=%s preview=%s",
-                                evt_keys, data_str[:300],
+                                evt_keys,
+                                data_str[:300],
                             )
 
                         # Handle system_event (tool_use, tool_result, task events)
@@ -421,18 +454,23 @@ class Pipeline:
                             event_type = sys_event.get("type", "")
                             log.info(
                                 "[PIPE] system_event type=%s keys=%s",
-                                event_type, list(sys_event.keys()),
+                                event_type,
+                                list(sys_event.keys()),
                             )
                             if event_type in ("tool_use", "tool_result"):
                                 any_tool_used = True
                                 log.info(
                                     "[PIPE-DEBUG] %s raw_event=%s",
-                                    event_type, json.dumps(sys_event, default=str)[:500],
+                                    event_type,
+                                    json.dumps(sys_event, default=str)[:500],
                                 )
                             rendered = self._render_system_event(
-                                event_type, sys_event, tool_names, tool_pending,
+                                event_type,
+                                sys_event,
+                                tool_names,
+                                tool_pending,
                             )
-                            if rendered:
+                            if rendered and show_tools:
                                 if thought_wrapped and not response_tag_sent:
                                     # Tool <details> blocks bypass the buffer
                                     if text_buffer:
@@ -441,10 +479,13 @@ class Pipeline:
                                         # inside the thought collapsible.
                                         if not self.valves.ONLY_TOOLS_IN_THOUGHT:
                                             yield text_buffer
+                                            _track_yield()
                                         text_buffer = ""
                                     yield rendered
+                                    _track_yield()
                                 else:
                                     yield rendered
+                                    _track_yield()
                             continue
 
                         choices = event.get("choices", [])
@@ -465,13 +506,17 @@ class Pipeline:
                         if thought_wrapped:
                             if response_tag_sent:
                                 yield chunk
+                                _track_yield()
                             elif chunk.startswith(TOOL_DETAILS_PREFIX):
                                 # Tool <details> blocks bypass the buffer
                                 if text_buffer:
                                     if not self.valves.ONLY_TOOLS_IN_THOUGHT:
                                         yield text_buffer
+                                        _track_yield()
                                     text_buffer = ""
-                                yield chunk
+                                if show_tools:
+                                    yield chunk
+                                    _track_yield()
                             elif self.valves.ONLY_TOOLS_IN_THOUGHT:
                                 # Only keep text in buffer for <response>
                                 # tag detection; discard it for display.
@@ -479,33 +524,40 @@ class Pipeline:
                                 if RESPONSE_TAG in text_buffer:
                                     after = text_buffer.split(RESPONSE_TAG, 1)[1]
                                     yield "\n</thought>\n\n"
+                                    _track_yield()
                                     response_tag_sent = True
                                     if after:
                                         yield after
+                                        _track_yield()
                                     text_buffer = ""
                                 elif len(text_buffer) > BUFFER_SIZE:
                                     # Keep only enough to detect the tag
-                                    text_buffer = text_buffer[-(len(RESPONSE_TAG)):]
+                                    text_buffer = text_buffer[-(len(RESPONSE_TAG)) :]
                             else:
                                 text_buffer += chunk
                                 if RESPONSE_TAG in text_buffer:
                                     idx = text_buffer.index(RESPONSE_TAG)
                                     before = text_buffer[:idx]
-                                    after = text_buffer[idx + len(RESPONSE_TAG):]
+                                    after = text_buffer[idx + len(RESPONSE_TAG) :]
                                     if before:
                                         yield before
+                                        _track_yield()
                                     yield "\n</thought>\n\n"
+                                    _track_yield()
                                     response_tag_sent = True
                                     if after:
                                         yield after
+                                        _track_yield()
                                     text_buffer = ""
                                 elif len(text_buffer) > BUFFER_SIZE:
                                     safe_len = len(text_buffer) - len(RESPONSE_TAG)
                                     if safe_len > 0:
                                         yield text_buffer[:safe_len]
+                                        _track_yield()
                                         text_buffer = text_buffer[safe_len:]
                         else:
                             yield chunk
+                            _track_yield()
 
         except Exception as e:
             log.error("Stream error: %s", e)
@@ -571,10 +623,14 @@ class Pipeline:
             name = pending.get("name", tool_names.get(tool_id, ""))
             args = pending.get("args", "{}")
             is_error = event.get("is_error", False)
-            raw_content = event.get("content", "") or event.get("output", "") or event.get("result", "")
+            raw_content = (
+                event.get("content", "") or event.get("output", "") or event.get("result", "")
+            )
             log.info(
                 "[PIPE] tool_result id=%s name=%s content_type=%s content_preview=%s",
-                tool_id, name, type(raw_content).__name__,
+                tool_id,
+                name,
+                type(raw_content).__name__,
                 str(raw_content)[:300],
             )
             result_content = self._extract_tool_result_text(raw_content)
@@ -608,7 +664,10 @@ class Pipeline:
                 )
                 log.info(
                     "[PIPE-DEBUG] tool_id=%s name=%s args_len=%d result_len=%d",
-                    tool_id, name, len(safe_args), len(safe_result),
+                    tool_id,
+                    name,
+                    len(safe_args),
+                    len(safe_result),
                 )
                 log.info("[PIPE-DEBUG] raw_args=%s", args[:500])
                 log.info("[PIPE-DEBUG] safe_args=%s", safe_args[:500])
