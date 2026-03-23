@@ -82,6 +82,15 @@ from src.backends.codex.constants import (  # noqa: E402, F401
 
 ALL_MODELS = CLAUDE_MODELS + CODEX_MODELS
 
+# Metadata → subprocess env var allowlist (comma-separated).
+# Only metadata keys listed here are passed as env vars to the Claude subprocess.
+# Example: METADATA_ENV_ALLOWLIST=THREAD_ID,A2A_BASE_URL
+METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
+    k.strip()
+    for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",")
+    if k.strip()
+)
+
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")

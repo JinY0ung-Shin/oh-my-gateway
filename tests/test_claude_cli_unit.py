@@ -621,16 +621,20 @@ class TestClaudeCodeCLIRunCompletion:
 
     @pytest.mark.asyncio
     async def test_run_completion_metadata_sets_options_env(self, cli_instance):
-        """Metadata with a2a_thread_id should set options.env THREAD_ID."""
+        """Allowlisted metadata keys should be passed as options.env."""
         captured_options = []
 
         async def mock_query(prompt, options):
             captured_options.append(options)
             yield {"type": "assistant"}
 
-        with patch("src.backends.claude.client.query", mock_query):
+        allowlist = frozenset({"THREAD_ID"})
+        with (
+            patch("src.backends.claude.client.query", mock_query),
+            patch("src.constants.METADATA_ENV_ALLOWLIST", allowlist),
+        ):
             async for _ in cli_instance.run_completion(
-                "Hello", _metadata={"a2a_thread_id": "thread-123"}
+                "Hello", _metadata={"THREAD_ID": "thread-123", "IGNORED": "nope"}
             ):
                 pass
 

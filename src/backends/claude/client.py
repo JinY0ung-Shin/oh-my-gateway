@@ -342,11 +342,12 @@ class ClaudeCodeCLI:
 
         self._configure_session(options, session_id, resume)
 
-        # Map metadata keys to subprocess env vars (concurrency-safe via options.env)
+        # Pass allowlisted metadata keys as subprocess env vars.
+        # Allowlist is configured via METADATA_ENV_ALLOWLIST in .env.
         if extra_env:
-            env_map = {}
-            if "a2a_thread_id" in extra_env:
-                env_map["THREAD_ID"] = extra_env["a2a_thread_id"]
+            from src.constants import METADATA_ENV_ALLOWLIST
+
+            env_map = {k: v for k, v in extra_env.items() if k in METADATA_ENV_ALLOWLIST}
             if env_map:
                 options.env = env_map
 
