@@ -540,6 +540,47 @@ async def get_backends_health() -> List[Dict[str, Any]]:
     return results
 
 
+def get_sandbox_config() -> Dict[str, Any]:
+    """Return sandbox and permission mode configuration."""
+    return {
+        "permission_mode": os.getenv("PERMISSION_MODE", "default"),
+        "sandbox_enabled": os.getenv("CLAUDE_SANDBOX_ENABLED", "true"),
+        "sandbox_auto_allow_bash": os.getenv("CLAUDE_SANDBOX_AUTO_ALLOW_BASH", "false"),
+        "metadata_env_allowlist": sorted(
+            k.strip() for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",") if k.strip()
+        ),
+    }
+
+
+def get_tools_registry() -> Dict[str, Any]:
+    """Return available tools and their configuration."""
+    result: Dict[str, Any] = {"backends": {}}
+
+    try:
+        from src.backends.claude.constants import CLAUDE_TOOLS, DEFAULT_ALLOWED_TOOLS
+
+        result["backends"]["claude"] = {
+            "all_tools": CLAUDE_TOOLS,
+            "default_allowed": DEFAULT_ALLOWED_TOOLS,
+        }
+    except ImportError:
+        pass
+
+    # MCP tool patterns
+    try:
+        from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
+
+        servers = get_mcp_servers()
+        if servers:
+            result["mcp_tools"] = get_mcp_tool_patterns(servers)
+        else:
+            result["mcp_tools"] = []
+    except Exception:
+        result["mcp_tools"] = []
+
+    return result
+
+
 def get_mcp_servers_detail() -> List[Dict[str, Any]]:
     """Return detailed MCP server configuration (names, types, tool patterns)."""
     try:

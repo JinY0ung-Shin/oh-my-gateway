@@ -123,7 +123,7 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
         <button :class="{ active: tab === 'files' }" @click="tab='files'; loadFiles()">Workspace</button>
         <button :class="{ active: tab === 'skills' }" @click="tab='skills'; loadSkills()">Skills</button>
         <button :class="{ active: tab === 'sessions' }" @click="tab='sessions'; loadSummary()">Sessions</button>
-        <button :class="{ active: tab === 'config' }" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt()">Config</button>
+        <button :class="{ active: tab === 'config' }" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">Config</button>
       </nav>
 
       <!-- Dashboard Tab -->
@@ -140,6 +140,49 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
           <div class="card stat">
             <div class="value" x-text="backendsDetail.length || '-'"></div>
             <div class="label">Backends</div>
+          </div>
+        </div>
+
+        <!-- Performance Metrics -->
+        <div class="card" style="margin-bottom:1rem">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem">
+            <h3 style="margin:0">Performance Metrics</h3>
+            <button class="btn btn-sm btn-ghost" @click="loadMetrics()">Refresh</button>
+          </div>
+          <div class="grid-3" style="gap:0.5rem">
+            <div class="stat" style="padding:0.5rem">
+              <div class="value" style="font-size:1.5rem" x-text="metrics.stats?.total_requests ?? '-'"></div>
+              <div class="label">Requests (buffered)</div>
+            </div>
+            <div class="stat" style="padding:0.5rem">
+              <div class="value" style="font-size:1.5rem" :style="(metrics.stats?.error_rate ?? 0) > 0.05 ? 'color:#ef4444' : ''"
+                x-text="((metrics.stats?.error_rate ?? 0) * 100).toFixed(1) + '%'"></div>
+              <div class="label">Error Rate</div>
+            </div>
+            <div class="stat" style="padding:0.5rem">
+              <div class="value" style="font-size:1.5rem" x-text="metrics.total_logged ?? '-'"></div>
+              <div class="label">Total Logged</div>
+            </div>
+          </div>
+          <div style="display:flex; gap:1.5rem; margin-top:0.75rem; justify-content:center">
+            <div style="text-align:center">
+              <div style="font-size:1.1rem; font-weight:bold; color:var(--accent)" x-text="(metrics.stats?.p50_latency_ms ?? '-') + 'ms'"></div>
+              <div style="font-size:0.7rem; color:var(--text-muted)">p50 Latency</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:1.1rem; font-weight:bold; color:var(--accent)" x-text="(metrics.stats?.avg_latency_ms ?? '-') + 'ms'"></div>
+              <div style="font-size:0.7rem; color:var(--text-muted)">Avg Latency</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:1.1rem; font-weight:bold" :style="(metrics.stats?.p95_latency_ms ?? 0) > 5000 ? 'color:#f59e0b' : 'color:var(--accent)'"
+                x-text="(metrics.stats?.p95_latency_ms ?? '-') + 'ms'"></div>
+              <div style="font-size:0.7rem; color:var(--text-muted)">p95 Latency</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:1.1rem; font-weight:bold" :style="(metrics.stats?.p99_latency_ms ?? 0) > 10000 ? 'color:#ef4444' : 'color:var(--accent)'"
+                x-text="(metrics.stats?.p99_latency_ms ?? '-') + 'ms'"></div>
+              <div style="font-size:0.7rem; color:var(--text-muted)">p99 Latency</div>
+            </div>
           </div>
         </div>
 
@@ -262,8 +305,8 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
           <table>
             <thead><tr><th>Time</th><th>Method</th><th>Path</th><th>Status</th><th>Latency</th><th>IP</th><th>Model</th></tr></thead>
             <tbody>
-              <template x-for="e in (logs.items ?? [])" :key="e.timestamp + e.path">
-                <tr>
+              <template x-for="(e, idx) in (logs.items ?? [])" :key="e.timestamp + e.path + idx">
+                <tr @click="expandedLog = expandedLog === idx ? null : idx" style="cursor:pointer">
                   <td style="font-size:0.75rem; white-space:nowrap" x-text="formatTime(new Date(e.timestamp * 1000).toISOString())"></td>
                   <td><span class="badge badge-ok" x-text="e.method"></span></td>
                   <td style="font-family:monospace; font-size:0.8rem; max-width:250px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" x-text="e.path"></td>
@@ -271,6 +314,18 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
                   <td style="font-size:0.8rem" x-text="e.response_time_ms + 'ms'"></td>
                   <td style="font-size:0.8rem; font-family:monospace" x-text="e.client_ip"></td>
                   <td style="font-size:0.8rem" x-text="e.model || '-'"></td>
+                </tr>
+              </template>
+              <template x-for="(e, idx) in (logs.items ?? [])" :key="'detail-' + idx">
+                <tr x-show="expandedLog === idx" style="background:var(--subtle-bg)">
+                  <td colspan="7" style="font-size:0.75rem; padding:8px 12px">
+                    <div style="display:flex; flex-wrap:wrap; gap:1rem">
+                      <span><strong>Backend:</strong> <span x-text="e.backend || '-'"></span></span>
+                      <span><strong>Session:</strong> <span style="font-family:monospace" x-text="e.session_id ? e.session_id.substring(0,16) + '...' : '-'"></span></span>
+                      <span><strong>Bucket:</strong> <span x-text="e.bucket || '-'"></span></span>
+                      <span><strong>Latency:</strong> <span x-text="e.response_time_ms + 'ms'"></span></span>
+                    </div>
+                  </td>
                 </tr>
               </template>
             </tbody>
@@ -290,9 +345,20 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
       <!-- Rate Limits Tab -->
       <div x-show="tab==='ratelimits'">
         <div class="card" style="margin-bottom:0.75rem">
-          <p style="font-size:0.8rem; color:var(--text-muted); margin:0">
-            Approximate monitoring based on request logs. Actual enforcement is handled by slowapi.
-          </p>
+          <div style="display:flex; justify-content:space-between; align-items:center">
+            <p style="font-size:0.8rem; color:var(--text-muted); margin:0">
+              Approximate monitoring based on request logs. Actual enforcement by slowapi.
+              Rate limits require server restart to change.
+            </p>
+            <button class="btn btn-sm btn-ghost" @click="loadRateLimits()">Refresh</button>
+          </div>
+          <div x-show="config.rate_limits" style="display:flex; flex-wrap:wrap; gap:0.5rem; margin-top:0.5rem">
+            <template x-for="(v, k) in (config.rate_limits ?? {})" :key="k">
+              <span style="font-size:0.7rem; padding:2px 8px; border-radius:4px; background:var(--subtle-bg)">
+                <strong x-text="k"></strong>: <span x-text="v + '/min'"></span>
+              </span>
+            </template>
+          </div>
         </div>
         <div class="grid-2">
           <template x-for="(data, bucket) in (rateLimits.snapshot ?? {})" :key="bucket">
@@ -652,6 +718,65 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
             </template>
           </div>
         </template>
+
+        <!-- Sandbox & Permissions -->
+        <div class="card" style="margin-bottom:1rem">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem">
+            <h3 style="margin:0">Sandbox & Permissions</h3>
+            <button class="btn btn-sm btn-ghost" @click="loadSandbox()">Refresh</button>
+          </div>
+          <div style="display:flex; flex-wrap:wrap; gap:1rem; font-size:0.85rem">
+            <div>
+              <span style="color:var(--text-muted)">Permission Mode:</span>
+              <span class="badge" :class="sandboxConfig.permission_mode === 'bypassPermissions' ? 'badge-warn' : 'badge-ok'"
+                x-text="sandboxConfig.permission_mode || 'default'"></span>
+            </div>
+            <div>
+              <span style="color:var(--text-muted)">Sandbox:</span>
+              <span class="badge" :class="sandboxConfig.sandbox_enabled === 'true' ? 'badge-ok' : 'badge-warn'"
+                x-text="sandboxConfig.sandbox_enabled === 'true' ? 'enabled' : 'disabled'"></span>
+            </div>
+          </div>
+          <div x-show="(sandboxConfig.metadata_env_allowlist ?? []).length > 0" style="margin-top:0.5rem">
+            <div style="font-size:0.8rem; color:var(--text-muted); margin-bottom:0.25rem">Metadata Env Allowlist:</div>
+            <div style="display:flex; flex-wrap:wrap; gap:0.25rem">
+              <template x-for="v in (sandboxConfig.metadata_env_allowlist ?? [])">
+                <span class="badge" style="background:var(--subtle-bg); font-size:0.7rem; font-family:monospace" x-text="v"></span>
+              </template>
+            </div>
+          </div>
+        </div>
+
+        <!-- Tools Registry -->
+        <div class="card">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem">
+            <h3 style="margin:0">Tools Registry</h3>
+            <button class="btn btn-sm btn-ghost" @click="loadTools()">Refresh</button>
+          </div>
+          <template x-for="(info, backend) in (toolsRegistry.backends ?? {})" :key="backend">
+            <div style="margin-bottom:0.75rem">
+              <div style="font-weight:600; margin-bottom:0.25rem; text-transform:capitalize" x-text="backend + ' Tools'"></div>
+              <div style="display:flex; flex-wrap:wrap; gap:0.25rem">
+                <template x-for="t in (info.all_tools ?? [])">
+                  <span :class="(info.default_allowed ?? []).includes(t) ? 'badge badge-ok' : 'badge'"
+                    :style="(info.default_allowed ?? []).includes(t) ? '' : 'background:var(--subtle-bg); opacity:0.6'"
+                    style="font-size:0.7rem" x-text="t"></span>
+                </template>
+              </div>
+              <div style="font-size:0.7rem; color:var(--text-muted); margin-top:0.25rem">
+                Green = default allowed
+              </div>
+            </div>
+          </template>
+          <div x-show="(toolsRegistry.mcp_tools ?? []).length > 0" style="margin-top:0.5rem">
+            <div style="font-weight:600; margin-bottom:0.25rem">MCP Tool Patterns</div>
+            <div style="display:flex; flex-wrap:wrap; gap:0.25rem">
+              <template x-for="t in (toolsRegistry.mcp_tools ?? [])">
+                <span class="badge" style="background:var(--subtle-bg); font-size:0.7rem; font-family:monospace" x-text="t"></span>
+              </template>
+            </div>
+          </div>
+        </div>
       </div>
 
     </div>
@@ -676,8 +801,10 @@ function adminApp() {
     logsFilter: { endpoint: '', status: '' },
     logsPage: 0,
     logsAutoRefresh: false,
+    expandedLog: null,
     logsPollTimer: null,
     rateLimits: {},
+    metrics: {},
     backendsDetail: [],
     mcpServers: [],
     expandedSession: null,
@@ -694,6 +821,8 @@ function adminApp() {
     skillCreating: false,
     newSkillName: '',
     newSkillNameError: '',
+    toolsRegistry: {},
+    sandboxConfig: {},
     systemPrompt: { mode: 'preset', prompt: null, default_prompt: null, preset_text: null, char_count: 0 },
     systemPromptText: '',
     systemPromptEditing: false,
@@ -702,7 +831,7 @@ function adminApp() {
       // Check if already authenticated (cookie-based)
       try {
         const r = await this.api('/admin/api/summary');
-        if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpServers(); this.startPolling(); }
+        if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpServers(); this.loadMetrics(); this.startPolling(); }
       } catch(e) {}
     },
 
@@ -719,6 +848,7 @@ function adminApp() {
           await this.loadSummary();
           this.loadBackends();
           this.loadMcpServers();
+          this.loadMetrics();
           this.startPolling();
         } else {
           const d = await r.json();
@@ -743,6 +873,12 @@ function adminApp() {
       } catch(e) {}
     },
 
+    async loadMetrics() {
+      try {
+        const r = await this.api('/admin/api/metrics');
+        if (r.ok) this.metrics = await r.json();
+      } catch(e) {}
+    },
     async loadBackends() {
       try {
         const r = await this.api('/admin/api/backends');
@@ -835,7 +971,7 @@ function adminApp() {
     },
 
     async refreshAll() {
-      await Promise.all([this.loadSummary(), this.loadFiles(), this.loadConfig(), this.loadBackends(), this.loadMcpServers()]);
+      await Promise.all([this.loadSummary(), this.loadFiles(), this.loadConfig(), this.loadBackends(), this.loadMcpServers(), this.loadMetrics()]);
       this.showToast('Refreshed', 'ok');
     },
 
@@ -859,6 +995,22 @@ function adminApp() {
       try {
         const r = await this.api('/admin/api/rate-limits');
         if (r.ok) this.rateLimits = await r.json();
+      } catch(e) {}
+    },
+
+    // --- Sandbox ---
+    async loadSandbox() {
+      try {
+        const r = await this.api('/admin/api/sandbox');
+        if (r.ok) this.sandboxConfig = await r.json();
+      } catch(e) {}
+    },
+
+    // --- Tools ---
+    async loadTools() {
+      try {
+        const r = await this.api('/admin/api/tools');
+        if (r.ok) this.toolsRegistry = await r.json();
       } catch(e) {}
     },
 

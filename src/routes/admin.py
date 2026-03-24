@@ -39,9 +39,11 @@ from src.admin_service import (
     get_backends_health,
     get_mcp_servers_detail,
     get_redacted_config,
+    get_sandbox_config,
     get_session_detail,
     get_session_messages,
     get_skill,
+    get_tools_registry,
     list_skills,
     list_workspace_files,
     read_file,
@@ -185,6 +187,28 @@ async def get_mcp_servers_endpoint(_=Depends(require_admin)):
 
 
 # ---------------------------------------------------------------------------
+# Sandbox & permissions
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/sandbox")
+async def get_sandbox(_=Depends(require_admin)):
+    """Return sandbox and permission mode configuration."""
+    return get_sandbox_config()
+
+
+# ---------------------------------------------------------------------------
+# Tools registry
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/tools")
+async def get_tools(_=Depends(require_admin)):
+    """Return available tools per backend and MCP tool patterns."""
+    return get_tools_registry()
+
+
+# ---------------------------------------------------------------------------
 # Session detail & export
 # ---------------------------------------------------------------------------
 
@@ -306,6 +330,24 @@ async def get_logs(
         limit=min(limit, 200),
         offset=max(offset, 0),
     )
+
+
+# ---------------------------------------------------------------------------
+# Performance metrics
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/metrics")
+async def get_metrics(_=Depends(require_admin)):
+    """Return performance metrics derived from request logs."""
+    from src.request_logger import request_logger
+
+    data = request_logger.query(limit=0)  # stats over all buffered entries
+    return {
+        "stats": data.get("stats", {}),
+        "total_logged": data.get("total_logged", 0),
+        "buffer_size": data.get("total", 0),
+    }
 
 
 # ---------------------------------------------------------------------------

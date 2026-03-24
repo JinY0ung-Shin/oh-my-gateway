@@ -199,13 +199,17 @@ class RequestLogger:
         error_count = sum(1 for e in entries if e.status_code >= 400)
 
         # For p95: use ceiling to pick from the upper tail, not the lower
+        p50_idx = min(len(latencies) - 1, math.ceil(len(latencies) * 0.50) - 1)
         p95_idx = min(len(latencies) - 1, math.ceil(len(latencies) * 0.95) - 1)
+        p99_idx = min(len(latencies) - 1, math.ceil(len(latencies) * 0.99) - 1)
         return {
             "total_requests": len(entries),
             "error_count": error_count,
             "error_rate": round(error_count / len(entries), 4),
             "avg_latency_ms": round(sum(latencies) / len(latencies), 2),
+            "p50_latency_ms": round(latencies[p50_idx], 2),
             "p95_latency_ms": round(latencies[p95_idx], 2),
+            "p99_latency_ms": round(latencies[p99_idx], 2),
         }
 
     # ----- rate-limit snapshot (Feature 2) -----
