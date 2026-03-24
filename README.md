@@ -194,6 +194,34 @@ Streaming (`"stream": true`) is supported on `/v1/chat/completions`, `/v1/messag
 
 For detailed SSE event formats including tool call rendering, subagent events, and tool name/input schemas, see **[docs/streaming-events.md](docs/streaming-events.md)**.
 
+### Admin Panel
+
+The gateway includes a built-in admin dashboard at `/admin` (requires `ADMIN_API_KEY`).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin` | Admin dashboard HTML |
+| `POST` | `/admin/api/login` | Authenticate with admin API key |
+| `GET` | `/admin/api/summary` | Dashboard summary (models, sessions, backends) |
+| `GET` | `/admin/api/backends` | Backend health, auth status, model availability |
+| `GET` | `/admin/api/mcp-servers` | MCP server config and tool patterns |
+| `GET` | `/admin/api/metrics` | Performance metrics (latency percentiles, error rate) |
+| `GET` | `/admin/api/tools` | Tool registry per backend and MCP patterns |
+| `GET` | `/admin/api/sandbox` | Sandbox and permission mode config |
+| `GET` | `/admin/api/skills` | List skills with metadata |
+| `GET/PUT/DELETE` | `/admin/api/skills/{name}` | Skill CRUD with ETag concurrency |
+| `GET` | `/admin/api/files` | List workspace files |
+| `GET/PUT` | `/admin/api/files/{path}` | Read/write workspace files |
+| `GET` | `/admin/api/sessions/{id}/detail` | Session metadata (backend, turns, TTL) |
+| `GET` | `/admin/api/sessions/{id}/export` | Export session as JSON |
+| `GET` | `/admin/api/sessions/{id}/messages` | Session message history |
+| `DELETE` | `/admin/api/sessions/{id}` | Delete session |
+| `GET` | `/admin/api/config` | Redacted runtime configuration |
+| `GET/PATCH` | `/admin/api/runtime-config` | Hot-reloadable settings |
+| `GET/PUT/DELETE` | `/admin/api/system-prompt` | System prompt management |
+| `GET` | `/admin/api/logs` | Request logs with filtering |
+| `GET` | `/admin/api/rate-limits` | Rate limit usage snapshot |
+
 ### Responses API Deviations
 
 The `/v1/responses` endpoint intentionally deviates from the OpenAI Responses API in the following ways:
