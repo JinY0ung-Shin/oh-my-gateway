@@ -35,7 +35,11 @@ from src.admin_auth import (
 from src.admin_service import (
     create_or_update_skill,
     delete_skill,
+    export_session_json,
+    get_backends_health,
+    get_mcp_servers_detail,
     get_redacted_config,
+    get_session_detail,
     get_session_messages,
     get_skill,
     list_skills,
@@ -156,6 +160,51 @@ async def admin_summary(_=Depends(require_admin)):
         "auth": auth_info,
         "admin": get_admin_status(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Backend health & auth
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/backends")
+async def get_backends(_=Depends(require_admin)):
+    """Detailed backend health, auth status, and model availability."""
+    return {"backends": await get_backends_health()}
+
+
+# ---------------------------------------------------------------------------
+# MCP servers
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/mcp-servers")
+async def get_mcp_servers_endpoint(_=Depends(require_admin)):
+    """Return detailed MCP server configuration and tool patterns."""
+    return {"servers": get_mcp_servers_detail()}
+
+
+# ---------------------------------------------------------------------------
+# Session detail & export
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/sessions/{session_id}/detail")
+async def get_session_detail_endpoint(session_id: str, _=Depends(require_admin)):
+    """Return detailed session metadata (backend, turns, TTL, etc)."""
+    detail = get_session_detail(session_id)
+    if detail is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    return detail
+
+
+@router.get("/api/sessions/{session_id}/export")
+async def export_session_endpoint(session_id: str, _=Depends(require_admin)):
+    """Export full session data as JSON."""
+    data = export_session_json(session_id)
+    if data is None:
+        return JSONResponse(status_code=404, content={"error": "Session not found"})
+    return data
 
 
 # ---------------------------------------------------------------------------

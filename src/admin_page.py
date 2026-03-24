@@ -138,44 +138,89 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
             <div class="label">Available Models</div>
           </div>
           <div class="card stat">
-            <div class="value" x-text="Object.keys(summary.health?.backends ?? {}).length || '-'"></div>
+            <div class="value" x-text="backendsDetail.length || '-'"></div>
             <div class="label">Backends</div>
           </div>
         </div>
 
-        <div class="grid-2">
-          <!-- Backends -->
-          <div class="card">
-            <h3>Backends</h3>
-            <table>
-              <thead><tr><th>Name</th><th>Status</th><th>Auth</th></tr></thead>
-              <tbody>
-                <template x-for="(status, name) in (summary.health?.backends ?? {})" :key="name">
-                  <tr>
-                    <td x-text="name"></td>
-                    <td><span class="badge badge-ok" x-text="status"></span></td>
-                    <td>
-                      <span :class="summary.auth?.[name]?.status?.valid ? 'badge badge-ok' : 'badge badge-err'"
-                        x-text="summary.auth?.[name]?.status?.valid ? 'valid' : 'invalid'"></span>
-                    </td>
-                  </tr>
-                </template>
-              </tbody>
-            </table>
+        <!-- Backend Health & Auth Detail -->
+        <div class="card" style="margin-bottom:1rem">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem">
+            <h3 style="margin:0">Backend Health & Auth</h3>
+            <button class="btn btn-sm btn-ghost" @click="loadBackends()">Refresh</button>
           </div>
+          <template x-for="b in backendsDetail" :key="b.name">
+            <div style="border:1px solid var(--border); border-radius:6px; padding:0.75rem; margin-bottom:0.5rem">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem">
+                <div style="display:flex; align-items:center; gap:0.5rem">
+                  <strong x-text="b.name"></strong>
+                  <span :class="b.healthy ? 'badge badge-ok' : 'badge badge-err'"
+                    x-text="b.healthy ? 'healthy' : 'unhealthy'"></span>
+                  <span :class="b.registered ? 'badge badge-ok' : 'badge badge-warn'"
+                    x-text="b.registered ? 'registered' : 'not registered'"></span>
+                </div>
+                <span :class="b.auth?.valid ? 'badge badge-ok' : 'badge badge-err'"
+                  x-text="'Auth: ' + (b.auth?.valid ? 'valid' : 'invalid')"></span>
+              </div>
+              <!-- Auth details -->
+              <div style="font-size:0.8rem; color:var(--text-muted)">
+                <span x-show="b.auth?.method" x-text="'Method: ' + b.auth?.method" style="margin-right:1rem"></span>
+                <span x-show="b.auth?.env_vars?.length" x-text="'Env: ' + (b.auth?.env_vars?.join(', ') || '')" style="margin-right:1rem"></span>
+              </div>
+              <div x-show="b.auth?.errors?.length" style="margin-top:0.25rem">
+                <template x-for="err in (b.auth?.errors ?? [])">
+                  <div style="font-size:0.75rem; color:#ef4444" x-text="err"></div>
+                </template>
+              </div>
+              <div x-show="b.health_error" style="font-size:0.75rem; color:#ef4444; margin-top:0.25rem" x-text="b.health_error"></div>
+              <!-- Models -->
+              <div x-show="b.models?.length" style="margin-top:0.5rem; display:flex; flex-wrap:wrap; gap:0.25rem">
+                <template x-for="m in (b.models ?? [])">
+                  <span class="badge" style="background:var(--subtle-bg); font-size:0.7rem" x-text="m"></span>
+                </template>
+              </div>
+            </div>
+          </template>
+          <div x-show="backendsDetail.length === 0" style="color:var(--text-muted); text-align:center; padding:1rem">
+            No backends detected
+          </div>
+        </div>
 
-          <!-- Models -->
-          <div class="card">
-            <h3>Models</h3>
-            <table>
-              <thead><tr><th>Model</th><th>Backend</th></tr></thead>
-              <tbody>
-                <template x-for="m in (summary.models ?? [])" :key="m.id">
-                  <tr><td x-text="m.id"></td><td><span class="badge badge-ok" x-text="m.backend"></span></td></tr>
-                </template>
-              </tbody>
-            </table>
+        <!-- MCP Servers -->
+        <div class="card" style="margin-bottom:1rem">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem">
+            <h3 style="margin:0">MCP Servers</h3>
+            <button class="btn btn-sm btn-ghost" @click="loadMcpServers()">Refresh</button>
           </div>
+          <template x-for="s in mcpServers" :key="s.name">
+            <div style="border:1px solid var(--border); border-radius:6px; padding:0.75rem; margin-bottom:0.5rem">
+              <div style="display:flex; align-items:center; gap:0.5rem; margin-bottom:0.25rem">
+                <strong x-text="s.name"></strong>
+                <span class="badge" style="background:var(--subtle-bg); font-size:0.7rem" x-text="s.type"></span>
+              </div>
+              <div x-show="s.tools?.length" style="display:flex; flex-wrap:wrap; gap:0.25rem; margin-top:0.25rem">
+                <template x-for="t in (s.tools ?? [])">
+                  <span style="font-size:0.7rem; color:var(--text-muted); font-family:monospace" x-text="t"></span>
+                </template>
+              </div>
+            </div>
+          </template>
+          <div x-show="mcpServers.length === 0" style="color:var(--text-muted); text-align:center; padding:0.5rem">
+            No MCP servers configured
+          </div>
+        </div>
+
+        <!-- Models table -->
+        <div class="card">
+          <h3>Models</h3>
+          <table>
+            <thead><tr><th>Model</th><th>Backend</th></tr></thead>
+            <tbody>
+              <template x-for="m in (summary.models ?? [])" :key="m.id">
+                <tr><td x-text="m.id"></td><td><span class="badge badge-ok" x-text="m.backend"></span></td></tr>
+              </template>
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -391,7 +436,7 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
         <div class="card">
           <h3>Active Sessions</h3>
           <table>
-            <thead><tr><th>Session ID</th><th>Messages</th><th>Last Active</th><th>Expires</th><th></th></tr></thead>
+            <thead><tr><th>Session ID</th><th>Backend</th><th>Msgs</th><th>Turns</th><th>Last Active</th><th></th></tr></thead>
             <tbody>
               <template x-for="s in (summary.sessions?.sessions ?? [])" :key="s.session_id">
                 <tr @click="toggleSessionHistory(s.session_id)" style="cursor:pointer">
@@ -399,18 +444,28 @@ table td, table th { padding: 8px 12px; border-bottom: 1px solid var(--border); 
                     <span x-text="expandedSession === s.session_id ? '▼ ' : '▶ '"></span>
                     <span x-text="s.session_id?.substring(0,16) + '...'"></span>
                   </td>
+                  <td><span class="badge" style="background:var(--subtle-bg); font-size:0.7rem" x-text="s.backend || 'claude'"></span></td>
                   <td x-text="s.message_count ?? '-'"></td>
+                  <td x-text="s.turn_counter ?? '-'"></td>
                   <td x-text="formatTime(s.last_accessed)"></td>
-                  <td x-text="formatTime(s.expires_at)"></td>
-                  <td>
+                  <td style="white-space:nowrap">
+                    <button class="btn btn-sm btn-ghost" @click.stop="exportSession(s.session_id)" title="Export JSON">Export</button>
                     <button class="btn btn-sm btn-ghost" @click.stop="deleteSession(s.session_id)">Delete</button>
                   </td>
                 </tr>
                 <!-- Expanded message history -->
                 <template x-if="expandedSession === s.session_id && sessionMessages">
                   <tr>
-                    <td colspan="5" style="padding:0">
+                    <td colspan="6" style="padding:0">
                       <div style="background:var(--subtle-bg); padding:1rem; border-radius:0 0 4px 4px">
+                        <!-- Session detail row -->
+                        <div x-show="sessionDetail" style="display:flex; flex-wrap:wrap; gap:0.75rem; margin-bottom:0.75rem; font-size:0.75rem; color:var(--text-muted)">
+                          <span x-text="'Backend: ' + (sessionDetail?.backend || '-')"></span>
+                          <span x-text="'Turns: ' + (sessionDetail?.turn_counter ?? '-')"></span>
+                          <span x-text="'TTL: ' + (sessionDetail?.ttl_minutes ?? '-') + 'min'"></span>
+                          <span x-show="sessionDetail?.provider_session_id" x-text="'Provider: ' + (sessionDetail?.provider_session_id?.substring(0,16) || '') + '...'"></span>
+                          <span x-text="'Created: ' + formatTime(sessionDetail?.created_at)"></span>
+                        </div>
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.75rem">
                           <span style="font-size:0.8rem; color:var(--text-muted)">
                             Message History (<span x-text="sessionMessages.total"></span> messages)
@@ -623,8 +678,11 @@ function adminApp() {
     logsAutoRefresh: false,
     logsPollTimer: null,
     rateLimits: {},
+    backendsDetail: [],
+    mcpServers: [],
     expandedSession: null,
     sessionMessages: null,
+    sessionDetail: null,
     runtimeConfig: {},
     skills: [],
     selectedSkill: null,
@@ -644,7 +702,7 @@ function adminApp() {
       // Check if already authenticated (cookie-based)
       try {
         const r = await this.api('/admin/api/summary');
-        if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.startPolling(); }
+        if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpServers(); this.startPolling(); }
       } catch(e) {}
     },
 
@@ -659,6 +717,8 @@ function adminApp() {
           this.authenticated = true;
           this.loginKey = '';
           await this.loadSummary();
+          this.loadBackends();
+          this.loadMcpServers();
           this.startPolling();
         } else {
           const d = await r.json();
@@ -680,6 +740,19 @@ function adminApp() {
         const r = await this.api('/admin/api/summary');
         if (r.ok) this.summary = await r.json();
         else if (r.status === 401) { this.authenticated = false; this.stopPolling(); }
+      } catch(e) {}
+    },
+
+    async loadBackends() {
+      try {
+        const r = await this.api('/admin/api/backends');
+        if (r.ok) { const d = await r.json(); this.backendsDetail = d.backends || []; }
+      } catch(e) {}
+    },
+    async loadMcpServers() {
+      try {
+        const r = await this.api('/admin/api/mcp-servers');
+        if (r.ok) { const d = await r.json(); this.mcpServers = d.servers || []; }
       } catch(e) {}
     },
 
@@ -762,7 +835,7 @@ function adminApp() {
     },
 
     async refreshAll() {
-      await Promise.all([this.loadSummary(), this.loadFiles(), this.loadConfig()]);
+      await Promise.all([this.loadSummary(), this.loadFiles(), this.loadConfig(), this.loadBackends(), this.loadMcpServers()]);
       this.showToast('Refreshed', 'ok');
     },
 
@@ -991,18 +1064,35 @@ Skill description here.
       if (this.expandedSession === sessionId) {
         this.expandedSession = null;
         this.sessionMessages = null;
+        this.sessionDetail = null;
         return;
       }
       this.expandedSession = sessionId;
       this.sessionMessages = null;
+      this.sessionDetail = null;
       try {
-        const r = await this.api('/admin/api/sessions/' + encodeURIComponent(sessionId) + '/messages?truncate=500');
-        if (!r.ok) { if (this.expandedSession === sessionId) { this.showToast('Failed to load messages', 'err'); this.expandedSession = null; } return; }
-        const data = await r.json();
-        // Guard after all async work: only mutate state if still viewing the same session
+        const [msgR, detR] = await Promise.all([
+          this.api('/admin/api/sessions/' + encodeURIComponent(sessionId) + '/messages?truncate=500'),
+          this.api('/admin/api/sessions/' + encodeURIComponent(sessionId) + '/detail')
+        ]);
         if (this.expandedSession !== sessionId) return;
-        this.sessionMessages = data;
+        if (msgR.ok) this.sessionMessages = await msgR.json();
+        else { this.showToast('Failed to load messages', 'err'); this.expandedSession = null; return; }
+        if (detR.ok) this.sessionDetail = await detR.json();
       } catch(e) { if (this.expandedSession === sessionId) { this.showToast('Connection error', 'err'); this.expandedSession = null; } }
+    },
+    async exportSession(sessionId) {
+      try {
+        const r = await this.api('/admin/api/sessions/' + encodeURIComponent(sessionId) + '/export');
+        if (!r.ok) { this.showToast('Export failed', 'err'); return; }
+        const data = await r.json();
+        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'session-' + sessionId.substring(0, 8) + '.json';
+        a.click(); URL.revokeObjectURL(url);
+        this.showToast('Session exported', 'ok');
+      } catch(e) { this.showToast('Export failed', 'err'); }
     },
     async loadFullMessage(sessionId, msgIndex) {
       try {

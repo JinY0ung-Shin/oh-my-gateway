@@ -487,6 +487,145 @@ def get_redacted_config() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Backend health & auth inspection
+# ---------------------------------------------------------------------------
+
+
+async def get_backends_health() -> List[Dict[str, Any]]:
+    """Return detailed health and auth info for every known backend."""
+    from src.backends.base import BackendRegistry
+    from src.auth import auth_manager
+
+    descriptors = BackendRegistry.all_descriptors()
+    backend_names = sorted(set(descriptors.keys()) | {"claude", "codex"})
+
+    results: List[Dict[str, Any]] = []
+    for name in backend_names:
+        info: Dict[str, Any] = {"name": name, "registered": False}
+
+        # Registration status
+        if BackendRegistry.is_registered(name):
+            info["registered"] = True
+            client = BackendRegistry.get(name)
+            info["models"] = client.supported_models()
+
+            # Active health check via verify()
+            try:
+                info["healthy"] = await client.verify()
+            except Exception as e:
+                info["healthy"] = False
+                info["health_error"] = str(e)
+        else:
+            desc = descriptors.get(name)
+            info["models"] = list(desc.models) if desc else []
+            info["healthy"] = False
+            info["health_error"] = "Backend not registered"
+
+        # Auth details
+        try:
+            provider = auth_manager.get_provider(name)
+            auth_status = provider.validate()
+            info["auth"] = {
+                "valid": auth_status.get("valid", False),
+                "method": auth_status.get("config", {}).get("auth_method", "unknown"),
+                "errors": auth_status.get("errors", []),
+                "env_vars": list(provider.build_env().keys()),
+                "isolation_vars": provider.get_isolation_vars(),
+            }
+        except Exception as e:
+            info["auth"] = {"valid": False, "method": "unknown", "errors": [str(e)]}
+
+        results.append(info)
+
+    return results
+
+
+def get_mcp_servers_detail() -> List[Dict[str, Any]]:
+    """Return detailed MCP server configuration (names, types, tool patterns)."""
+    try:
+        from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
+
+        servers = get_mcp_servers()
+        if not servers:
+            return []
+
+        patterns = get_mcp_tool_patterns(servers)
+        result = []
+        for name, config in servers.items():
+            server_patterns = [p for p in patterns if p.startswith(f"mcp__{name}__")]
+            result.append(
+                {
+                    "name": name,
+                    "type": config.get("type", "unknown"),
+                    "tools": server_patterns,
+                    "config_keys": [k for k in config.keys() if k not in ("type",)],
+                }
+            )
+        return result
+    except Exception:
+        return []
+
+
+def get_session_detail(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return detailed session metadata (beyond message history)."""
+    from src.session_manager import session_manager
+
+    session = session_manager.peek_session(session_id)
+    if session is None:
+        return None
+
+    return {
+        "session_id": session.session_id,
+        "backend": session.backend,
+        "provider_session_id": session.provider_session_id,
+        "turn_counter": session.turn_counter,
+        "ttl_minutes": session.ttl_minutes,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "last_accessed": session.last_accessed.isoformat() if session.last_accessed else None,
+        "expires_at": session.expires_at.isoformat() if session.expires_at else None,
+        "message_count": len(session.messages),
+        "has_system_prompt": session.base_system_prompt is not None,
+    }
+
+
+def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
+    """Export full session data as JSON-serializable dict."""
+    from src.session_manager import session_manager
+
+    session = session_manager.peek_session(session_id)
+    if session is None:
+        return None
+
+    messages = []
+    for msg in session.get_all_messages():
+        content = msg.content
+        if isinstance(content, list):
+            parts = []
+            for part in content:
+                if hasattr(part, "type"):
+                    if part.type == "image_url":
+                        parts.append({"type": "image_url", "url": "[redacted]"})
+                    elif part.type == "text" and part.text:
+                        parts.append({"type": "text", "text": part.text})
+                elif isinstance(part, dict):
+                    parts.append(part)
+            display = parts
+        else:
+            display = str(content) if content else ""
+
+        messages.append({"role": msg.role, "content": display, "name": msg.name})
+
+    return {
+        "session_id": session.session_id,
+        "backend": session.backend,
+        "provider_session_id": session.provider_session_id,
+        "turn_counter": session.turn_counter,
+        "created_at": session.created_at.isoformat() if session.created_at else None,
+        "messages": messages,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Skills management
 # ---------------------------------------------------------------------------
 
