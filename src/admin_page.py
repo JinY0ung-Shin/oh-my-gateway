@@ -58,7 +58,8 @@ nav.tabs button:hover { color: var(--text); }
 .file-item:hover { background: var(--subtle-bg); }
 .file-item.active { background: var(--accent); color: #fff; }
 .file-item .icon { margin-right: 6px; }
-.CodeMirror { height: auto; min-height: 300px; max-height: 70vh; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; }
+.CodeMirror { height: auto; min-height: 300px; max-height: 70vh; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; overflow: hidden; }
+.CodeMirror-scroll { max-height: 70vh; overflow-y: auto !important; }
 .editor-toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 0.5rem; }
 .editor-toolbar .path { font-family: monospace; font-size: 0.85rem; color: var(--text-muted); }
 .btn { display: inline-block; padding: 6px 16px; border-radius: 6px; border: none;
