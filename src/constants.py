@@ -49,6 +49,22 @@ MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 # connection.  Set to 0 to disable.
 SSE_KEEPALIVE_INTERVAL = int(os.getenv("SSE_KEEPALIVE_INTERVAL", "15"))
 
+# ---------------------------------------------------------------------------
+# Subagent Streaming Visibility
+# ---------------------------------------------------------------------------
+# Control which subagent outputs are forwarded to the client during streaming.
+# These only affect events with parent_tool_use_id (i.e., from subagents).
+#
+# SUBAGENT_STREAM_TEXT: Forward subagent text deltas (thinking/response).
+#   Default false — subagent text is suppressed, only final summary reaches orchestrator.
+# SUBAGENT_STREAM_TOOL_BLOCKS: Forward subagent tool_use/tool_result blocks.
+#   Default true — clients can render "View Result" for subagent tool calls.
+# SUBAGENT_STREAM_PROGRESS: Forward task_started/task_progress/task_notification events.
+#   Default true — clients can show subagent execution progress.
+SUBAGENT_STREAM_TEXT = parse_bool_env("SUBAGENT_STREAM_TEXT", "false")
+SUBAGENT_STREAM_TOOL_BLOCKS = parse_bool_env("SUBAGENT_STREAM_TOOL_BLOCKS", "true")
+SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")
+
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {

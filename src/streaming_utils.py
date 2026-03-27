@@ -7,7 +7,12 @@ from typing import Any, AsyncGenerator, Dict, Literal, Optional
 
 from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
-from src.constants import SSE_KEEPALIVE_INTERVAL
+from src.constants import (
+    SSE_KEEPALIVE_INTERVAL,
+    SUBAGENT_STREAM_TEXT,
+    SUBAGENT_STREAM_TOOL_BLOCKS,
+    SUBAGENT_STREAM_PROGRESS,
+)
 from src.message_adapter import MessageAdapter
 from src.models import ChatCompletionRequest, ChatCompletionStreamResponse, StreamChoice
 from src.response_models import (
@@ -305,7 +310,7 @@ def extract_stream_event_delta(chunk: Dict[str, Any], in_thinking: bool = False)
     """Extract streamable text from a StreamEvent chunk."""
     if chunk.get("type") != "stream_event":
         return None, in_thinking
-    if chunk.get("parent_tool_use_id") is not None:
+    if chunk.get("parent_tool_use_id") is not None and not SUBAGENT_STREAM_TEXT:
         return None, in_thinking
 
     event = chunk.get("event", {})
@@ -817,9 +822,10 @@ async def stream_chunks(
 
         # Handle task system messages (subagent progress — structured JSON, not content)
         if chunk.get("type") == "system":
-            task_event = _build_task_event(chunk)
-            if task_event:
-                yield make_task_sse(request_id, request.model, task_event)
+            if SUBAGENT_STREAM_PROGRESS:
+                task_event = _build_task_event(chunk)
+                if task_event:
+                    yield make_task_sse(request_id, request.model, task_event)
             continue
 
         # Token-level streaming (text/thinking deltas)
@@ -841,17 +847,21 @@ async def stream_chunks(
         handled, tool_block = tool_acc.process_stream_event(chunk)
         if handled:
             if tool_block:
-                yield make_task_sse(request_id, request.model, tool_block)
+                is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
+                if not is_subagent_tool or SUBAGENT_STREAM_TOOL_BLOCKS:
+                    yield make_task_sse(request_id, request.model, tool_block)
             continue
 
         # User chunks with tool_result blocks
         if chunk.get("type") == "user":
             tool_results, parent_id = extract_user_tool_results(chunk)
-            for tr_block in tool_results:
-                result_data = _normalize_tool_result(tr_block)
-                if parent_id:
-                    result_data["parent_tool_use_id"] = parent_id
-                yield make_task_sse(request_id, request.model, result_data)
+            is_subagent_result = parent_id is not None
+            if not is_subagent_result or SUBAGENT_STREAM_TOOL_BLOCKS:
+                for tr_block in tool_results:
+                    result_data = _normalize_tool_result(tr_block)
+                    if parent_id:
+                        result_data["parent_tool_use_id"] = parent_id
+                    yield make_task_sse(request_id, request.model, result_data)
             chunks_buffer.append(chunk)
             continue
 
@@ -862,11 +872,13 @@ async def stream_chunks(
         # must not suppress structured tool events).
         embedded_tools = extract_embedded_tool_blocks(chunk)
         for tb in embedded_tools:
-            if tb.get("type") == "tool_use":
-                yield make_task_sse(request_id, request.model, tb)
-            elif tb.get("type") == "tool_result":
-                result_data = _normalize_tool_result(tb)
-                yield make_task_sse(request_id, request.model, result_data)
+            is_subagent_tb = tb.get("parent_tool_use_id") is not None
+            if not is_subagent_tb or SUBAGENT_STREAM_TOOL_BLOCKS:
+                if tb.get("type") == "tool_use":
+                    yield make_task_sse(request_id, request.model, tb)
+                elif tb.get("type") == "tool_result":
+                    result_data = _normalize_tool_result(tb)
+                    yield make_task_sse(request_id, request.model, result_data)
 
         # Skip duplicate assistant text in token-streaming mode.
         # Tool blocks were already extracted above, so only text is suppressed.
@@ -1052,9 +1064,10 @@ async def stream_response_chunks(
 
             # Handle task system messages (subagent progress — structured JSON, not content)
             if chunk.get("type") == "system":
-                task_event = _build_task_event(chunk)
-                if task_event:
-                    yield make_task_response_sse(task_event, sequence_number=_next_seq())
+                if SUBAGENT_STREAM_PROGRESS:
+                    task_event = _build_task_event(chunk)
+                    if task_event:
+                        yield make_task_response_sse(task_event, sequence_number=_next_seq())
                 continue
 
             # Token-level streaming (text/thinking deltas)
@@ -1077,22 +1090,26 @@ async def stream_response_chunks(
             handled, tool_block = tool_acc.process_stream_event(chunk)
             if handled:
                 if tool_block:
-                    yield make_tool_use_response_sse(
-                        tool_block,
-                        sequence_number=_next_seq(),
-                        parent_tool_use_id=tool_block.get("parent_tool_use_id"),
-                    )
+                    is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
+                    if not is_subagent_tool or SUBAGENT_STREAM_TOOL_BLOCKS:
+                        yield make_tool_use_response_sse(
+                            tool_block,
+                            sequence_number=_next_seq(),
+                            parent_tool_use_id=tool_block.get("parent_tool_use_id"),
+                        )
                 continue
 
             # User chunks with tool_result blocks
             if chunk.get("type") == "user":
                 tool_results, parent_id = extract_user_tool_results(chunk)
-                for tr_block in tool_results:
-                    yield make_tool_result_response_sse(
-                        tr_block,
-                        sequence_number=_next_seq(),
-                        parent_tool_use_id=parent_id,
-                    )
+                is_subagent_result = parent_id is not None
+                if not is_subagent_result or SUBAGENT_STREAM_TOOL_BLOCKS:
+                    for tr_block in tool_results:
+                        yield make_tool_result_response_sse(
+                            tr_block,
+                            sequence_number=_next_seq(),
+                            parent_tool_use_id=parent_id,
+                        )
                 chunks_buffer.append(chunk)
                 continue
 
@@ -1102,18 +1119,20 @@ async def stream_response_chunks(
             # when token_streaming is True.
             embedded_tools = extract_embedded_tool_blocks(chunk)
             for tb in embedded_tools:
-                if tb.get("type") == "tool_use":
-                    yield make_tool_use_response_sse(
-                        tb,
-                        sequence_number=_next_seq(),
-                        parent_tool_use_id=tb.get("parent_tool_use_id"),
-                    )
-                elif tb.get("type") == "tool_result":
-                    yield make_tool_result_response_sse(
-                        tb,
-                        sequence_number=_next_seq(),
-                        parent_tool_use_id=tb.get("parent_tool_use_id"),
-                    )
+                is_subagent_tb = tb.get("parent_tool_use_id") is not None
+                if not is_subagent_tb or SUBAGENT_STREAM_TOOL_BLOCKS:
+                    if tb.get("type") == "tool_use":
+                        yield make_tool_use_response_sse(
+                            tb,
+                            sequence_number=_next_seq(),
+                            parent_tool_use_id=tb.get("parent_tool_use_id"),
+                        )
+                    elif tb.get("type") == "tool_result":
+                        yield make_tool_result_response_sse(
+                            tb,
+                            sequence_number=_next_seq(),
+                            parent_tool_use_id=tb.get("parent_tool_use_id"),
+                        )
 
             # Skip duplicate assistant text in token-streaming mode.
             # Tool blocks were already extracted above, so only text is suppressed.
