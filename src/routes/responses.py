@@ -1,6 +1,5 @@
 """Responses API endpoint (/v1/responses)."""
 
-import asyncio
 import logging
 import secrets
 import uuid
@@ -225,51 +224,23 @@ async def create_response(
                 chunks_buffer = []
                 chunk_source = backend.run_completion(**preflight["chunk_kwargs"])
 
-                # Run SDK iteration in a dedicated task to keep anyio cancel
-                # scopes task-local.  Starlette may close the response generator
-                # from a different ASGI task during teardown; bridging with a
-                # queue prevents cancel-scope crossing.
-                _SENTINEL = object()
-                sse_queue: asyncio.Queue = asyncio.Queue()
-
-                async def _sdk_reader():
-                    try:
-                        async for line in streaming_utils.stream_response_chunks(
-                            chunk_source=chunk_source,
-                            model=body.model,
-                            response_id=resp_id,
-                            output_item_id=output_item_id,
-                            chunks_buffer=chunks_buffer,
-                            logger=logger,
-                            prompt_text=prompt,
-                            metadata=body.metadata or {},
-                            stream_result=stream_result,
-                        ):
-                            await sse_queue.put(("sse", line))
-                    except Exception as exc:
-                        await sse_queue.put(("error", exc))
-                    finally:
-                        try:
-                            await chunk_source.aclose()
-                        except Exception:
-                            pass  # generator already running/closed or subprocess dead
-                        await sse_queue.put(("done", _SENTINEL))
-
-                reader_task = asyncio.create_task(_sdk_reader())
-                try:
-                    while True:
-                        msg = await sse_queue.get()
-                        if msg[0] == "done":
-                            break
-                        if msg[0] == "error":
-                            raise msg[1]
-                        yield msg[1]
-                finally:
-                    reader_task.cancel()
-                    try:
-                        await reader_task
-                    except (asyncio.CancelledError, RuntimeError):
-                        pass
+                # Bridge SDK iteration through a background task to keep
+                # anyio cancel scopes task-local.
+                sse_source = streaming_utils.stream_response_chunks(
+                    chunk_source=chunk_source,
+                    model=body.model,
+                    response_id=resp_id,
+                    output_item_id=output_item_id,
+                    chunks_buffer=chunks_buffer,
+                    logger=logger,
+                    prompt_text=prompt,
+                    metadata=body.metadata or {},
+                    stream_result=stream_result,
+                )
+                async for line in streaming_utils.bridge_sse_stream(
+                    sse_source, chunk_source
+                ):
+                    yield line
 
                 # SUCCESS-ONLY: commit turn counter and session messages.
                 if stream_result.get("success"):
@@ -357,14 +328,9 @@ async def create_response(
         raise HTTPException(status_code=502, detail=f"Backend error: {e}")
 
     # Token usage (prefer real SDK values)
-    sdk_usage = streaming_utils.extract_sdk_usage(chunks)
-    if sdk_usage:
-        prompt_tokens = sdk_usage["prompt_tokens"]
-        completion_tokens = sdk_usage["completion_tokens"]
-    else:
-        token_usage = backend.estimate_token_usage(prompt, assistant_text, body.model)
-        prompt_tokens = token_usage["prompt_tokens"]
-        completion_tokens = token_usage["completion_tokens"]
+    prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
+        chunks, prompt, assistant_text, body.model, backend=backend
+    )
 
     # Build response object
     resp_id = _make_response_id(session_id, session.turn_counter)

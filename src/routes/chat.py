@@ -1,6 +1,5 @@
 """Chat completions endpoint (/v1/chat/completions)."""
 
-import asyncio
 import json
 import logging
 import os
@@ -248,50 +247,20 @@ async def generate_streaming_response(
             )
             chunk_source = backend.run_completion(**run_kwargs, stream=True)
 
-        # Stream chunks via a background task to keep SDK cancel scopes
-        # task-local.  Starlette may close the response generator from a
-        # different ASGI task during teardown; if the SDK generator is still
-        # open at that point its anyio cancel scope would be exited from the
-        # wrong task.  By running the SDK iteration in a dedicated task and
-        # bridging with an asyncio.Queue we avoid the crossing entirely.
-        _SENTINEL = object()
-        sse_queue: asyncio.Queue = asyncio.Queue()
+        # Bridge SDK iteration through a background task to keep anyio
+        # cancel scopes task-local (Starlette may close the generator
+        # from a different ASGI task during teardown).
         chunks_buffer = []
 
-        async def _sdk_reader():
-            try:
-                async for sse_line in streaming_utils.stream_chunks(
-                    chunk_source=chunk_source,
-                    request=request,
-                    request_id=request_id,
-                    chunks_buffer=chunks_buffer,
-                    logger=logger,
-                ):
-                    await sse_queue.put(("sse", sse_line))
-            except Exception as exc:
-                await sse_queue.put(("error", exc))
-            finally:
-                try:
-                    await chunk_source.aclose()
-                except Exception:
-                    pass  # generator already running/closed or subprocess dead
-                await sse_queue.put(("done", _SENTINEL))
-
-        reader_task = asyncio.create_task(_sdk_reader())
-        try:
-            while True:
-                msg = await sse_queue.get()
-                if msg[0] == "done":
-                    break
-                if msg[0] == "error":
-                    raise msg[1]
-                yield msg[1]  # SSE line
-        finally:
-            reader_task.cancel()
-            try:
-                await reader_task
-            except (asyncio.CancelledError, RuntimeError):
-                pass
+        sse_source = streaming_utils.stream_chunks(
+            chunk_source=chunk_source,
+            request=request,
+            request_id=request_id,
+            chunks_buffer=chunks_buffer,
+            logger=logger,
+        )
+        async for sse_line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
+            yield sse_line
 
         # Extract assistant response from all chunks
         assistant_content = None
@@ -307,16 +276,14 @@ async def generate_streaming_response(
         # Prepare usage data if requested (prefer real SDK values)
         usage_data = None
         if request.stream_options and request.stream_options.include_usage:
-            sdk_usage = streaming_utils.extract_sdk_usage(chunks_buffer)
-            if sdk_usage:
-                token_usage = sdk_usage
-            else:
-                completion_text = assistant_content or ""
-                token_usage = backend.estimate_token_usage(prompt, completion_text, request.model)
+            completion_text = assistant_content or ""
+            p_tok, c_tok = streaming_utils.resolve_token_usage(
+                chunks_buffer, prompt, completion_text, request.model, backend=backend
+            )
             usage_data = Usage(
-                prompt_tokens=token_usage["prompt_tokens"],
-                completion_tokens=token_usage["completion_tokens"],
-                total_tokens=token_usage["total_tokens"],
+                prompt_tokens=p_tok,
+                completion_tokens=c_tok,
+                total_tokens=p_tok + c_tok,
             )
             logger.debug(f"Usage: {usage_data}")
 
@@ -464,13 +431,9 @@ async def chat_completions(
             assistant_content = raw_assistant_content
 
             # Token usage (prefer real SDK values)
-            sdk_usage = streaming_utils.extract_sdk_usage(chunks)
-            if sdk_usage:
-                prompt_tokens = sdk_usage["prompt_tokens"]
-                completion_tokens = sdk_usage["completion_tokens"]
-            else:
-                prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-                completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+            prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
+                chunks, prompt, assistant_content
+            )
 
             # Extract stop_reason from SDK messages and map to OpenAI finish_reason
             sdk_stop_reason = streaming_utils.extract_stop_reason(chunks)

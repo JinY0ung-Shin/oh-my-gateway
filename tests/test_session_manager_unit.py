@@ -134,9 +134,8 @@ class TestSessionManager:
     """Test the SessionManager class."""
 
     @pytest.fixture
-    def manager(self):
-        """Create a fresh SessionManager for each test."""
-        return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
+    def manager(self, fresh_session_manager):
+        return fresh_session_manager
 
     def test_manager_initialization(self, manager):
         """SessionManager initializes with empty sessions."""
@@ -321,9 +320,8 @@ class TestSessionManagerAsync:
     """Test async functionality of SessionManager."""
 
     @pytest.fixture
-    def manager(self):
-        """Create a fresh SessionManager for each test."""
-        return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
+    def manager(self, fresh_session_manager):
+        return fresh_session_manager
 
     async def test_start_cleanup_task_creates_task(self, manager):
         """start_cleanup_task() creates an async task when loop is running."""
@@ -484,8 +482,8 @@ class TestAsyncShutdown:
     """Test async_shutdown() method."""
 
     @pytest.fixture
-    def manager(self):
-        return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
+    def manager(self, fresh_session_manager):
+        return fresh_session_manager
 
     async def test_async_shutdown_cancels_cleanup_task(self, manager):
         """async_shutdown() cancels the cleanup task if one exists."""
@@ -528,8 +526,8 @@ class TestProcessMessagesEdgeCases:
     """Test edge cases of process_messages()."""
 
     @pytest.fixture
-    def manager(self):
-        return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
+    def manager(self, fresh_session_manager):
+        return fresh_session_manager
 
     def test_session_mode_with_empty_messages(self, manager):
         """Session mode with empty messages list creates session but adds nothing."""

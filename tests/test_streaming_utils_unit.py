@@ -13,6 +13,7 @@ from src.response_models import OutputItem, ResponseObject
 from src.streaming_utils import (
     CollabJsonStreamFilter,
     ToolUseAccumulator,
+    bridge_sse_stream,
     extract_embedded_tool_blocks,
     extract_sdk_usage,
     extract_user_tool_results,
@@ -20,6 +21,7 @@ from src.streaming_utils import (
     make_response_sse,
     make_sse,
     map_stop_reason,
+    resolve_token_usage,
     stream_chunks,
     stream_response_chunks,
     strip_collab_json,
@@ -1412,3 +1414,171 @@ async def test_stream_response_chunks_strips_collab_from_token_deltas():
     assert "Hello" in combined
     assert "World" in combined
     assert stream_result["success"] is True
+
+
+# ===========================================================================
+# resolve_token_usage tests
+# ===========================================================================
+
+
+class TestResolveTokenUsage:
+    """Tests for resolve_token_usage() fallback paths."""
+
+    def test_returns_sdk_usage_when_available(self):
+        """Path 1: SDK usage present → use it directly."""
+        chunks = [
+            {"type": "result", "usage": {"input_tokens": 100, "output_tokens": 50}}
+        ]
+        p, c = resolve_token_usage(chunks, "ignored prompt", "ignored completion")
+        assert p == 100
+        assert c == 50
+
+    def test_falls_back_to_backend_estimation(self):
+        """Path 2: No SDK usage, backend provided → use backend.estimate_token_usage."""
+        from unittest.mock import MagicMock
+
+        backend = MagicMock()
+        backend.estimate_token_usage.return_value = {
+            "prompt_tokens": 200,
+            "completion_tokens": 80,
+            "total_tokens": 280,
+        }
+        p, c = resolve_token_usage([], "prompt", "completion", "model-x", backend=backend)
+        assert p == 200
+        assert c == 80
+        backend.estimate_token_usage.assert_called_once_with("prompt", "completion", "model-x")
+
+    def test_falls_back_to_character_estimation(self):
+        """Path 3: No SDK usage, no backend → MessageAdapter.estimate_tokens."""
+        p, c = resolve_token_usage([], "abcd", "efghijkl")
+        # MessageAdapter.estimate_tokens = len(text) // 4
+        assert p == 1  # len("abcd") // 4
+        assert c == 2  # len("efghijkl") // 4
+
+    def test_sdk_usage_takes_priority_over_backend(self):
+        """SDK usage wins even when backend is provided."""
+        from unittest.mock import MagicMock
+
+        backend = MagicMock()
+        chunks = [
+            {"type": "result", "usage": {"input_tokens": 10, "output_tokens": 5}}
+        ]
+        p, c = resolve_token_usage(chunks, "prompt", "text", "model", backend=backend)
+        assert p == 10
+        assert c == 5
+        backend.estimate_token_usage.assert_not_called()
+
+    def test_includes_cache_tokens_in_sdk_usage(self):
+        """SDK usage includes cache_creation + cache_read tokens."""
+        chunks = [
+            {
+                "type": "result",
+                "usage": {
+                    "input_tokens": 50,
+                    "output_tokens": 30,
+                    "cache_creation_input_tokens": 10,
+                    "cache_read_input_tokens": 5,
+                },
+            }
+        ]
+        p, c = resolve_token_usage(chunks, "", "")
+        assert p == 65  # 50 + 10 + 5
+        assert c == 30
+
+
+# ===========================================================================
+# bridge_sse_stream tests
+# ===========================================================================
+
+
+class TestBridgeSSEStream:
+    """Tests for bridge_sse_stream() async generator bridge."""
+
+    async def test_forwards_lines_from_source(self):
+        """Lines from the SSE source are yielded in order."""
+
+        async def source():
+            yield "data: line1\n\n"
+            yield "data: line2\n\n"
+
+        class FakeChunkSource:
+            async def aclose(self):
+                pass
+
+        lines = [line async for line in bridge_sse_stream(source(), FakeChunkSource())]
+        assert lines == ["data: line1\n\n", "data: line2\n\n"]
+
+    async def test_propagates_source_error(self):
+        """Errors raised inside the source propagate to the consumer."""
+
+        async def failing_source():
+            yield "data: ok\n\n"
+            raise ValueError("boom")
+
+        class FakeChunkSource:
+            async def aclose(self):
+                pass
+
+        with pytest.raises(ValueError, match="boom"):
+            lines = []
+            async for line in bridge_sse_stream(failing_source(), FakeChunkSource()):
+                lines.append(line)
+
+        assert lines == ["data: ok\n\n"]
+
+    async def test_closes_chunk_source_on_completion(self):
+        """chunk_source.aclose() is called when the stream completes normally."""
+
+        async def source():
+            yield "data: done\n\n"
+
+        class TrackingChunkSource:
+            def __init__(self):
+                self.closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        cs = TrackingChunkSource()
+        _ = [line async for line in bridge_sse_stream(source(), cs)]
+        assert cs.closed is True
+
+    async def test_closes_chunk_source_on_error(self):
+        """chunk_source.aclose() is called even when the source raises."""
+
+        async def failing_source():
+            raise RuntimeError("fail")
+            yield  # make it an async generator  # pragma: no cover
+
+        class TrackingChunkSource:
+            def __init__(self):
+                self.closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        cs = TrackingChunkSource()
+        with pytest.raises(RuntimeError, match="fail"):
+            async for _ in bridge_sse_stream(failing_source(), cs):
+                pass
+
+        assert cs.closed is True
+
+    async def test_handles_empty_source(self):
+        """An empty source yields nothing and still cleans up."""
+
+        async def empty_source():
+            return
+            yield  # make it an async generator  # pragma: no cover
+
+        class TrackingChunkSource:
+            def __init__(self):
+                self.closed = False
+
+            async def aclose(self):
+                self.closed = True
+
+        cs = TrackingChunkSource()
+        lines = [line async for line in bridge_sse_stream(empty_source(), cs)]
+        assert lines == []
+        assert cs.closed is True

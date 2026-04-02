@@ -12,7 +12,11 @@ import src.main as main
 import src.routes.chat as chat_module
 from src.backend_registry import BackendRegistry
 from src.constants import DEFAULT_MODEL
-from src.main import _request_has_images, _validate_image_request, _truncate_image_data
+from src.routes.deps import (
+    request_has_images as _request_has_images,
+    validate_image_request as _validate_image_request,
+    truncate_image_data as _truncate_image_data,
+)
 
 # Tiny valid PNG for testing
 TINY_PNG_B64 = base64.b64encode(

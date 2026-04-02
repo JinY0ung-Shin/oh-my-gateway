@@ -65,6 +65,24 @@ def reset_main_state():
 
 
 @pytest.fixture
+def fresh_session_manager():
+    """Create a fresh SessionManager for unit tests."""
+    return SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
+
+
+@pytest.fixture
+def clean_registry():
+    """Ensure a clean BackendRegistry with descriptors registered.
+
+    Re-registers descriptors so resolve_model() works against known model names.
+    """
+    BackendRegistry.clear()
+    register_all_descriptors()
+    yield
+    BackendRegistry.clear()
+
+
+@pytest.fixture
 def isolated_session_manager(monkeypatch):
     """Patch all modules that hold a session_manager reference to use a fresh instance."""
     manager = SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)

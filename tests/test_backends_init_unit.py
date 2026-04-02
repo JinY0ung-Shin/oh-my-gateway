@@ -18,8 +18,8 @@ from src.backends.base import BackendRegistry
 
 
 @pytest.fixture(autouse=True)
-def clean_registry():
-    """Ensure a clean BackendRegistry before and after each test."""
+def empty_registry():
+    """Ensure an empty BackendRegistry (no descriptors) before and after each test."""
     BackendRegistry.clear()
     yield
     BackendRegistry.clear()

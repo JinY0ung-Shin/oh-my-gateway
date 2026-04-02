@@ -520,9 +520,6 @@ from src.routes.responses import (  # noqa: E402, F401, F811
     _parse_response_id,
     _responses_streaming_preflight,
 )
-from src.routes.deps import (  # noqa: E402, F401, F811
-    truncate_image_data as _truncate_image_data,
-)
 from src.session_manager import session_manager  # noqa: E402, F401, F811
 from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS  # noqa: E402, F401, F811
 from src.constants import PERMISSION_MODE_BYPASS  # noqa: E402, F401, F811

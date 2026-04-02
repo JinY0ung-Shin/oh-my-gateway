@@ -128,13 +128,9 @@ async def anthropic_messages(
         assistant_content = raw_assistant_content
 
         # Token usage (prefer real SDK values)
-        sdk_usage = streaming_utils.extract_sdk_usage(chunks)
-        if sdk_usage:
-            prompt_tokens = sdk_usage["prompt_tokens"]
-            completion_tokens = sdk_usage["completion_tokens"]
-        else:
-            prompt_tokens = MessageAdapter.estimate_tokens(prompt)
-            completion_tokens = MessageAdapter.estimate_tokens(assistant_content)
+        prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
+            chunks, prompt, assistant_content
+        )
 
         # Extract stop_reason from SDK messages (use as-is for Anthropic format)
         sdk_stop_reason = streaming_utils.extract_stop_reason(chunks)

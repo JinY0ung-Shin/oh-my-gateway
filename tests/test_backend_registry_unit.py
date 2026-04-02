@@ -48,17 +48,9 @@ class FakeBackend:
 
 
 @pytest.fixture(autouse=True)
-def clean_registry():
-    """Ensure registry is clean before and after each test.
-
-    Re-registers descriptors so resolve_model() works against known model names.
-    """
-    BackendRegistry.clear()
-    from tests.conftest import register_all_descriptors
-
-    register_all_descriptors()
-    yield
-    BackendRegistry.clear()
+def _auto_clean_registry(clean_registry):
+    """Use the shared clean_registry fixture from conftest.py."""
+    pass
 
 
 class TestBackendRegistry:

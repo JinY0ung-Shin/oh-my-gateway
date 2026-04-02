@@ -83,6 +83,29 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     return None
 
 
+def resolve_token_usage(
+    chunks: list,
+    prompt: str,
+    completion_text: str,
+    model: str = "",
+    *,
+    backend=None,
+) -> tuple[int, int]:
+    """Return (prompt_tokens, completion_tokens) from SDK usage or estimation.
+
+    If *backend* is provided, uses ``backend.estimate_token_usage`` as
+    fallback.  Otherwise falls back to character-based estimation via
+    ``MessageAdapter.estimate_tokens``.
+    """
+    sdk_usage = extract_sdk_usage(chunks)
+    if sdk_usage:
+        return sdk_usage["prompt_tokens"], sdk_usage["completion_tokens"]
+    if backend is not None:
+        est = backend.estimate_token_usage(prompt, completion_text, model)
+        return est["prompt_tokens"], est["completion_tokens"]
+    return MessageAdapter.estimate_tokens(prompt), MessageAdapter.estimate_tokens(completion_text)
+
+
 def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
     """Extract the status string from a rate_limit chunk.
 
@@ -116,6 +139,58 @@ def extract_stop_reason(messages: list) -> Optional[str]:
         if isinstance(msg, dict) and msg.get("stop_reason") is not None:
             return msg["stop_reason"]
     return None
+
+
+# ---------------------------------------------------------------------------
+# SSE bridge helper
+# ---------------------------------------------------------------------------
+
+
+async def bridge_sse_stream(
+    sse_source: AsyncGenerator[str, None],
+    chunk_source,
+) -> AsyncGenerator[str, None]:
+    """Bridge an SSE async generator through a background asyncio task.
+
+    Runs *sse_source* in a dedicated task, forwarding lines through a
+    queue.  This keeps anyio cancel scopes task-local when Starlette
+    closes the response generator from a different ASGI task during
+    teardown.
+
+    *chunk_source* is closed in the ``finally`` block of the reader task
+    so that the SDK subprocess is cleaned up regardless of cancellation.
+    """
+    _SENTINEL = object()
+    sse_queue: asyncio.Queue = asyncio.Queue()
+
+    async def _reader():
+        try:
+            async for line in sse_source:
+                await sse_queue.put(("sse", line))
+        except Exception as exc:
+            await sse_queue.put(("error", exc))
+        finally:
+            try:
+                await chunk_source.aclose()
+            except Exception:
+                pass  # generator already running/closed or subprocess dead
+            await sse_queue.put(("done", _SENTINEL))
+
+    reader_task = asyncio.create_task(_reader())
+    try:
+        while True:
+            msg = await sse_queue.get()
+            if msg[0] == "done":
+                break
+            if msg[0] == "error":
+                raise msg[1]
+            yield msg[1]
+    finally:
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, RuntimeError):
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1231,13 +1306,9 @@ async def stream_response_chunks(
     )
 
     # response.completed (with usage — prefer real SDK values)
-    sdk_usage = extract_sdk_usage(chunks_buffer)
-    if sdk_usage:
-        prompt_tokens = sdk_usage["prompt_tokens"]
-        completion_tokens = sdk_usage["completion_tokens"]
-    else:
-        prompt_tokens = MessageAdapter.estimate_tokens(prompt_text) if prompt_text else 0
-        completion_tokens = MessageAdapter.estimate_tokens(final_text)
+    prompt_tokens, completion_tokens = resolve_token_usage(
+        chunks_buffer, prompt_text or "", final_text
+    )
     final_resp = ResponseObject(
         id=response_id,
         model=model,
