@@ -525,7 +525,7 @@ class TestClaudeCodeCLIRunCompletion:
 
     @pytest.mark.asyncio
     async def test_run_completion_with_session_id(self, cli_instance):
-        """run_completion sets extra_args session-id for new sessions."""
+        """run_completion sets native session_id option for new sessions."""
         mock_message = {"type": "assistant"}
         captured_options = []
 
@@ -537,7 +537,7 @@ class TestClaudeCodeCLIRunCompletion:
             async for _ in cli_instance.run_completion("Hello", session_id="sess-123"):
                 pass
 
-            assert captured_options[0].extra_args.get("session-id") == "sess-123"
+            assert captured_options[0].session_id == "sess-123"
 
     @pytest.mark.asyncio
     async def test_run_completion_resume_session(self, cli_instance):
@@ -554,6 +554,24 @@ class TestClaudeCodeCLIRunCompletion:
                 pass
 
             assert captured_options[0].resume == "sess-123"
+
+    @pytest.mark.asyncio
+    async def test_run_completion_with_task_budget(self, cli_instance):
+        """run_completion forwards task_budget to SDK options."""
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield {"type": "assistant"}
+
+        with (
+            patch("src.backends.claude.client.query", mock_query),
+            patch("src.backends.claude.client.DEFAULT_TASK_BUDGET", None),
+        ):
+            async for _ in cli_instance.run_completion("Hello", task_budget=75000):
+                pass
+
+            assert captured_options[0].task_budget == {"total": 75000}
 
     @pytest.mark.asyncio
     async def test_run_completion_converts_objects_to_dicts(self, cli_instance):
@@ -761,12 +779,12 @@ class TestBuildSdkOptions:
         """When both resume and session_id given, resume wins."""
         opts = cli_instance._build_sdk_options(resume="resume-abc", session_id="sess-xyz")
         assert opts.resume == "resume-abc"
-        assert opts.extra_args.get("session-id") is None
+        assert opts.session_id is None
 
     def test_session_id_used_when_no_resume(self, cli_instance):
-        """session_id is set as extra_args when resume is not given."""
+        """session_id is set via native option when resume is not given."""
         opts = cli_instance._build_sdk_options(session_id="sess-xyz")
-        assert opts.extra_args.get("session-id") == "sess-xyz"
+        assert opts.session_id == "sess-xyz"
         assert not getattr(opts, "resume", None)
 
     def test_max_turns_set(self, cli_instance):
@@ -792,6 +810,29 @@ class TestBuildSdkOptions:
         """permission_mode is forwarded."""
         opts = cli_instance._build_sdk_options(permission_mode="bypassPermissions")
         assert opts.permission_mode == "bypassPermissions"
+
+    def test_task_budget_per_request(self, cli_instance):
+        """Per-request task_budget is forwarded as SDK TaskBudget dict."""
+        opts = cli_instance._build_sdk_options(task_budget=50000)
+        assert opts.task_budget == {"total": 50000}
+
+    def test_task_budget_none_without_default(self, cli_instance):
+        """task_budget is not set when both request and env default are None."""
+        with patch("src.backends.claude.client.DEFAULT_TASK_BUDGET", None):
+            opts = cli_instance._build_sdk_options()
+            assert opts.task_budget is None
+
+    def test_task_budget_global_default(self, cli_instance):
+        """Global DEFAULT_TASK_BUDGET is used when per-request value is None."""
+        with patch("src.backends.claude.client.DEFAULT_TASK_BUDGET", 100000):
+            opts = cli_instance._build_sdk_options()
+            assert opts.task_budget == {"total": 100000}
+
+    def test_task_budget_per_request_overrides_global(self, cli_instance):
+        """Per-request task_budget overrides the global default."""
+        with patch("src.backends.claude.client.DEFAULT_TASK_BUDGET", 100000):
+            opts = cli_instance._build_sdk_options(task_budget=25000)
+            assert opts.task_budget == {"total": 25000}
 
 
 class TestConvertMessageTypeMap:
@@ -1041,15 +1082,15 @@ class TestConfigureHelpers:
         opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
         cli_instance._configure_session(opts, session_id="sess-1", resume="resume-1")
         assert opts.resume == "resume-1"
-        assert opts.extra_args.get("session-id") is None
+        assert opts.session_id is None
 
     def test_configure_session_id_only(self, cli_instance):
-        """_configure_session sets session-id when no resume."""
+        """_configure_session sets native session_id when no resume."""
         from claude_agent_sdk import ClaudeAgentOptions
 
         opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
         cli_instance._configure_session(opts, session_id="sess-1", resume=None)
-        assert opts.extra_args.get("session-id") == "sess-1"
+        assert opts.session_id == "sess-1"
         assert not getattr(opts, "resume", None)
 
     def test_configure_session_neither(self, cli_instance):
@@ -1059,7 +1100,7 @@ class TestConfigureHelpers:
         opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
         cli_instance._configure_session(opts, session_id=None, resume=None)
         assert not getattr(opts, "resume", None)
-        assert opts.extra_args.get("session-id") is None
+        assert opts.session_id is None
 
     def test_configure_sandbox_enabled(self, cli_instance):
         """_configure_sandbox sets sandbox when CLAUDE_SANDBOX_ENABLED=True."""

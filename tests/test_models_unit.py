@@ -197,6 +197,33 @@ class TestChatCompletionRequest:
         assert "thinking" not in options
         assert "max_tokens" not in options
 
+    def test_to_claude_options_with_task_budget(self):
+        """to_claude_options() includes task_budget when set."""
+        request = ChatCompletionRequest(
+            messages=[Message(role="user", content="Hi")], task_budget=50000
+        )
+        options = request.to_claude_options()
+        assert options["task_budget"] == 50000
+
+    def test_to_claude_options_without_task_budget(self):
+        """to_claude_options() omits task_budget when not set."""
+        request = ChatCompletionRequest(messages=[Message(role="user", content="Hi")])
+        options = request.to_claude_options()
+        assert "task_budget" not in options
+
+    def test_task_budget_rejects_non_positive(self):
+        """task_budget rejects zero and negative values."""
+        import pytest
+
+        with pytest.raises(Exception):
+            ChatCompletionRequest(
+                messages=[Message(role="user", content="Hi")], task_budget=0
+            )
+        with pytest.raises(Exception):
+            ChatCompletionRequest(
+                messages=[Message(role="user", content="Hi")], task_budget=-100
+            )
+
 
 class TestChatCompletionResponse:
     """Test ChatCompletionResponse model."""

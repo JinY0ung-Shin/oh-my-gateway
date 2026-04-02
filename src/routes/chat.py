@@ -77,6 +77,7 @@ def _prepare_stateless_completion(
         permission_mode=claude_options.get("permission_mode"),
         output_format=claude_options.get("output_format"),
         mcp_servers=claude_options.get("mcp_servers"),
+        task_budget=claude_options.get("task_budget"),
         _metadata=metadata,
     )
     return prompt, run_kwargs
@@ -173,6 +174,7 @@ async def _streaming_session_preflight(
             allowed_tools=options.get("allowed_tools"),
             disallowed_tools=options.get("disallowed_tools"),
             output_format=options.get("output_format"),
+            task_budget=options.get("task_budget"),
             max_turns=options.get("max_turns", get_default_max_turns()),
             session_id=request.session_id if pf.is_new else None,
             resume=pf.resume_id,
@@ -233,6 +235,7 @@ async def generate_streaming_response(
                 allowed_tools=options.get("allowed_tools"),
                 disallowed_tools=options.get("disallowed_tools"),
                 output_format=options.get("output_format"),
+                task_budget=options.get("task_budget"),
                 max_turns=options.get("max_turns", get_default_max_turns()),
                 session_id=request.session_id if pf.is_new else None,
                 resume=pf.resume_id,
@@ -384,6 +387,7 @@ async def chat_completions(
                         allowed_tools=options.get("allowed_tools"),
                         disallowed_tools=options.get("disallowed_tools"),
                         output_format=options.get("output_format"),
+                        task_budget=options.get("task_budget"),
                         max_turns=options.get("max_turns", get_default_max_turns()),
                         session_id=request_body.session_id if pf.is_new else None,
                         resume=pf.resume_id,

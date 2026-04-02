@@ -71,6 +71,7 @@ Key environment variables (see `.env.example` for full list):
 | `CLAUDE_CWD` | temp dir | Working directory for Claude Code |
 | `THINKING_MODE` | `adaptive` | `adaptive`, `enabled`, or `disabled` |
 | `THINKING_BUDGET_TOKENS` | `10000` | Budget for `enabled` mode |
+| `TASK_BUDGET` | _(unset)_ | Global task token budget (per-request `task_budget` overrides) |
 | `TOKEN_STREAMING` | `true` | Token-level partial streaming |
 | `MAX_TIMEOUT` | `600000` | Request timeout (ms) |
 | `DEFAULT_MAX_TURNS` | `10` | Max agent turns per request |

@@ -122,6 +122,7 @@ class BackendClient(Protocol):
         permission_mode: Optional[str] = None,
         output_format: Optional[Dict[str, Any]] = None,
         mcp_servers: Optional[Dict[str, Any]] = None,
+        task_budget: Optional[int] = None,
         **_extra: Any,
     ) -> AsyncIterator[Dict[str, Any]]: ...
 

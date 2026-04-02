@@ -96,6 +96,11 @@ class ChatCompletionRequest(BaseModel):
     response_format: Optional[Dict[str, Any]] = Field(
         default=None, description="Response format (supports json_schema type)"
     )
+    task_budget: Optional[int] = Field(
+        default=None,
+        gt=0,
+        description="Token budget for the task — the model paces tool use and wraps up before exceeding this limit",
+    )
     metadata: Optional[Dict[str, str]] = Field(
         default=None,
         description="Key-value metadata forwarded as env vars to the backend subprocess (filtered by METADATA_ENV_ALLOWLIST)",
@@ -129,6 +134,9 @@ class ChatCompletionRequest(BaseModel):
                 schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
                 if schema:
                     options["output_format"] = {"type": "json_schema", "schema": schema}
+
+        if self.task_budget is not None:
+            options["task_budget"] = self.task_budget
 
         return options
 

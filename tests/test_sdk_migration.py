@@ -176,30 +176,30 @@ class TestClaudeAgentOptionsAllParameters:
         assert options.resume == "session-abc-123"
 
 
-class TestClaudeAgentOptionsExtraArgs:
-    """Test ClaudeAgentOptions extra_args for session-id and other flags."""
+class TestClaudeAgentOptionsSessionAndExtraArgs:
+    """Test ClaudeAgentOptions native session_id and extra_args."""
 
     def test_extra_args_empty_by_default(self):
         """Test that extra_args defaults to empty dict."""
         options = ClaudeAgentOptions(max_turns=1)
         assert options.extra_args == {}
 
-    def test_extra_args_with_session_id(self):
-        """Test that session-id can be set via extra_args."""
+    def test_native_session_id(self):
+        """Test that session_id can be set via the native option."""
         options = ClaudeAgentOptions(
             max_turns=1,
-            extra_args={"session-id": "my-session-42"},
+            session_id="my-session-42",
         )
-        assert options.extra_args["session-id"] == "my-session-42"
+        assert options.session_id == "my-session-42"
 
     def test_extra_args_with_multiple_entries(self):
         """Test extra_args with multiple key-value pairs."""
         options = ClaudeAgentOptions(
             max_turns=1,
-            extra_args={"session-id": "sess-1", "verbose": None},
+            extra_args={"verbose": None, "debug": "true"},
         )
-        assert options.extra_args["session-id"] == "sess-1"
         assert options.extra_args["verbose"] is None
+        assert options.extra_args["debug"] == "true"
 
 
 class TestMessageAdapterFormatBlocks:

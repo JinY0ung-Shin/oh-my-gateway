@@ -57,6 +57,22 @@ CLAUDE_MODELS = [
 THINKING_MODE = os.getenv("THINKING_MODE", "adaptive")
 THINKING_BUDGET_TOKENS = int(os.getenv("THINKING_BUDGET_TOKENS", "10000"))
 
+# Task Budget (tokens)
+# When set, the model is made aware of its remaining token budget so it can
+# pace tool use and wrap up before the limit.  Unset (None) means no limit.
+_task_budget_raw = os.getenv("TASK_BUDGET")
+if _task_budget_raw:
+    try:
+        DEFAULT_TASK_BUDGET: int | None = int(_task_budget_raw)
+    except ValueError:
+        _sandbox_logger.warning(
+            "Invalid TASK_BUDGET=%r (expected integer), treating as unset",
+            _task_budget_raw,
+        )
+        DEFAULT_TASK_BUDGET = None
+else:
+    DEFAULT_TASK_BUDGET: int | None = None
+
 # Token-Level Streaming
 # When enabled, uses SDK's include_partial_messages to stream individual tokens
 # instead of waiting for complete messages

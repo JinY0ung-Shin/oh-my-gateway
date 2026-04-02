@@ -30,6 +30,7 @@ from src.backends.claude.constants import (
     CLAUDE_MODELS,
     CLAUDE_TOOLS,
     DEFAULT_ALLOWED_TOOLS,
+    DEFAULT_TASK_BUDGET,
     THINKING_BUDGET_TOKENS,
     DISALLOWED_SUBAGENT_TYPES,
     CLAUDE_SANDBOX_ENABLED,
@@ -273,12 +274,12 @@ class ClaudeCodeCLI:
 
         ``resume`` takes priority: when set, the SDK picks up the existing
         conversation by its session ID.  ``session_id`` is only used for
-        brand-new sessions (passed as ``--session-id`` via extra_args).
+        brand-new sessions via the native ``session_id`` option.
         """
         if resume:
             options.resume = resume
         elif session_id:
-            options.extra_args["session-id"] = session_id
+            options.session_id = session_id
 
     _UNSET = object()  # sentinel for _custom_base default
 
@@ -296,6 +297,7 @@ class ClaudeCodeCLI:
         resume: Optional[str] = None,
         _custom_base: object = _UNSET,
         extra_env: Optional[Dict[str, str]] = None,
+        task_budget: Optional[int] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         options = ClaudeAgentOptions(
@@ -343,6 +345,11 @@ class ClaudeCodeCLI:
             options.include_partial_messages = True
 
         self._configure_session(options, session_id, resume)
+
+        # Task budget: per-request value overrides the global default.
+        effective_budget = task_budget if task_budget is not None else DEFAULT_TASK_BUDGET
+        if effective_budget is not None:
+            options.task_budget = {"total": effective_budget}
 
         # Pass allowlisted metadata keys as subprocess env vars.
         # Allowlist is configured via METADATA_ENV_ALLOWLIST in .env.
@@ -487,12 +494,13 @@ class ClaudeCodeCLI:
         permission_mode: Optional[str] = None,
         output_format: Optional[Dict[str, Any]] = None,
         mcp_servers: Optional[Dict[str, Any]] = None,
+        task_budget: Optional[int] = None,
         **_extra,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run a single-use SDK query and yield converted message dicts.
 
         For multi-turn conversations:
-        - First turn: pass ``session_id`` (uses ``--session-id`` CLI flag)
+        - First turn: pass ``session_id`` (native SDK option)
         - Follow-up turns: pass ``resume=<session_id>`` (uses ``--resume``)
 
         The SDK ``query()`` function is always invoked fresh per call — see
@@ -513,6 +521,7 @@ class ClaudeCodeCLI:
                     session_id=session_id,
                     resume=resume,
                     extra_env=_extra.get("_metadata"),
+                    task_budget=task_budget,
                 )
 
                 async for message in query(prompt=prompt, options=options):
