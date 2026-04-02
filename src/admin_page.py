@@ -1360,6 +1360,20 @@ input[type="checkbox"] {
           </div>
         </div>
 
+        <!-- Active prompt status bar -->
+        <div style="border:1px solid var(--border); background:var(--bg-raised); padding:8px 16px; margin-bottom:2px; display:flex; justify-content:space-between; align-items:center">
+          <div class="flex-gap-sm">
+            <span class="text-xs text-muted">ACTIVE_PROMPT:</span>
+            <span x-show="systemPrompt.active_name" style="color:var(--green); font-weight:600; font-size:var(--fs-sm); text-shadow: 0 0 6px var(--green-muted)" x-text="systemPrompt.active_name"></span>
+            <span x-show="!systemPrompt.active_name && systemPrompt.mode !== 'custom'" style="color:var(--text-dim); font-size:var(--fs-sm)">claude_code (preset)</span>
+            <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'custom'" style="color:var(--amber); font-size:var(--fs-sm)">custom (unnamed)</span>
+          </div>
+          <div class="flex-gap-sm">
+            <span class="text-xs text-muted" x-text="'MODE=' + systemPrompt.mode"></span>
+            <span class="text-xs text-muted" x-text="systemPrompt.char_count + ' chars'"></span>
+          </div>
+        </div>
+
         <!-- System Prompt: Sidebar + Editor layout -->
         <div class="sidebar mb-lg">
           <!-- Prompt list sidebar -->
@@ -1428,7 +1442,7 @@ input[type="checkbox"] {
                 <label class="text-xs text-muted">CONTENT:</label>
                 <textarea x-model="newPromptContent"
                   style="width:100%; min-height:300px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
-                    background:var(--bg); color:var(--text); border:1px solid var(--border);
+                    background:var(--bg-surface); color:var(--text-bright); border:1px solid var(--border-bright);
                     padding:8px; resize:vertical; border-radius:0; margin-top:4px"
                   placeholder="// enter system prompt content..."></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
@@ -1462,8 +1476,8 @@ input[type="checkbox"] {
                 <p class="text-xs text-muted mb-md">// built-in claude_code preset. read-only.</p>
                 <textarea readonly :value="systemPrompt.preset_text || ''"
                   style="width:100%; min-height:350px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
-                    background:var(--bg); color:var(--text-muted); border:1px solid var(--border);
-                    padding:8px; resize:vertical; opacity:0.5; cursor:default; border-radius:0"></textarea>
+                    background:var(--bg-surface); color:var(--text-dim); border:1px solid var(--border);
+                    padding:8px; resize:vertical; cursor:default; border-radius:0"></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
                   <button class="btn btn-sm btn-primary" @click="activatePreset()"
                     :disabled="systemPrompt.active_name == null && systemPrompt.mode !== 'custom'">[ACTIVATE]</button>
@@ -1485,8 +1499,8 @@ input[type="checkbox"] {
                 <p class="text-xs text-muted mb-md">// template from docs/. save as named prompt to edit.</p>
                 <textarea readonly :value="promptEditorContent || ''"
                   style="width:100%; min-height:350px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
-                    background:var(--bg); color:var(--text-muted); border:1px solid var(--border);
-                    padding:8px; resize:vertical; opacity:0.5; cursor:default; border-radius:0"></textarea>
+                    background:var(--bg-surface); color:var(--text-dim); border:1px solid var(--border);
+                    padding:8px; resize:vertical; cursor:default; border-radius:0"></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
                   <button class="btn btn-sm btn-ghost" @click="forkFromTemplate()">[SAVE AS NEW]</button>
                 </div>
@@ -1507,7 +1521,7 @@ input[type="checkbox"] {
                 <p class="text-xs text-muted mb-md">// affects new sessions only after activation.</p>
                 <textarea x-model="promptEditorContent"
                   style="width:100%; min-height:350px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
-                    background:var(--bg); color:var(--text); border:1px solid var(--border);
+                    background:var(--bg-surface); color:var(--text-bright); border:1px solid var(--border-bright);
                     padding:8px; resize:vertical; border-radius:0"
                   @input="promptDirty = true"></textarea>
                 <div class="flex-between" style="margin-top:0.75rem">
