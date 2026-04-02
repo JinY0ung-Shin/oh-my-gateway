@@ -623,7 +623,7 @@ class ToolUseAccumulator:
                 try:
                     input_parsed = json.loads(input_str) if input_str else {}
                 except json.JSONDecodeError:
-                    input_parsed = input_str
+                    input_parsed = {"raw_input": input_str}
                 tool_block: Dict[str, Any] = {
                     "type": "tool_use",
                     "id": acc["id"],

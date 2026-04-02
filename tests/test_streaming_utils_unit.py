@@ -205,7 +205,7 @@ async def test_stream_chunks_reassembles_tool_use_with_invalid_json_as_raw_text(
     assert "system_event" in payload
     assert payload["system_event"]["type"] == "tool_use"
     assert payload["system_event"]["name"] == "Read"
-    assert payload["system_event"]["input"] == "{bad json"
+    assert payload["system_event"]["input"] == {"raw_input": "{bad json"}
 
 
 @pytest.mark.asyncio
