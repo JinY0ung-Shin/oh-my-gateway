@@ -9,6 +9,7 @@ from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
 from src.constants import (
     SSE_KEEPALIVE_INTERVAL,
+    STREAM_FINAL_ONLY,
     SUBAGENT_STREAM_TEXT,
     SUBAGENT_STREAM_TOOL_BLOCKS,
     SUBAGENT_STREAM_PROGRESS,
@@ -776,6 +777,25 @@ async def stream_chunks(
     logger: logging.Logger,
 ) -> AsyncGenerator[str, None]:
     """Shared SSE streaming logic for both stateless and session modes."""
+
+    # STREAM_FINAL_ONLY: collect all chunks, only emit the final result at the end.
+    if STREAM_FINAL_ONLY:
+        final_text = None
+        async for chunk in _keepalive_wrapper(chunk_source, SSE_KEEPALIVE_INTERVAL):
+            if chunk is _SSE_KEEPALIVE:
+                yield _SSE_KEEPALIVE
+                continue
+            if isinstance(chunk, dict):
+                chunks_buffer.append(chunk)
+                if chunk.get("subtype") == "success" and "result" in chunk:
+                    final_text = chunk["result"]
+                elif chunk.get("type") == "assistant" and chunk.get("error"):
+                    final_text = f"[Error: {chunk['error']}]"
+        text = final_text or "No response generated."
+        yield make_sse(request_id, request.model, {"role": "assistant", "content": ""})
+        yield make_sse(request_id, request.model, {"content": text})
+        return
+
     role_sent = False
     content_sent = False
     token_streaming = False

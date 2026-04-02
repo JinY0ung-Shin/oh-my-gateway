@@ -65,6 +65,11 @@ SUBAGENT_STREAM_TEXT = parse_bool_env("SUBAGENT_STREAM_TEXT", "false")
 SUBAGENT_STREAM_TOOL_BLOCKS = parse_bool_env("SUBAGENT_STREAM_TOOL_BLOCKS", "true")
 SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")
 
+# When true, skip all intermediate streaming events (text deltas, tool blocks,
+# progress events) and only emit the final ResultMessage content.
+# Useful for simple integrations that only need the final answer.
+STREAM_FINAL_ONLY = parse_bool_env("STREAM_FINAL_ONLY", "false")
+
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {
