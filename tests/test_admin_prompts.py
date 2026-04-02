@@ -225,3 +225,7 @@ class TestPromptEndpoints:
     def test_empty_content_rejected(self, admin_client):
         r = admin_client.put("/admin/api/prompts/bad", json={"content": ""})
         assert r.status_code == 422
+
+    def test_get_invalid_name(self, admin_client):
+        r = admin_client.get("/admin/api/prompts/-bad-start")
+        assert r.status_code == 422

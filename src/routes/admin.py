@@ -613,7 +613,10 @@ async def get_prompt_endpoint(name: str, _=Depends(require_admin)):
     """Get a single named prompt by name."""
     from src.system_prompt import get_named_prompt
 
-    data = get_named_prompt(name)
+    try:
+        data = get_named_prompt(name)
+    except ValueError as e:
+        return JSONResponse(status_code=422, content={"error": str(e)})
     if data is None:
         return JSONResponse(status_code=404, content={"error": f"Prompt not found: {name}"})
     return data

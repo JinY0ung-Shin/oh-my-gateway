@@ -1423,7 +1423,7 @@ input[type="checkbox"] {
                 <h3 style="margin-top:0">Create Prompt</h3>
                 <label class="text-xs text-muted">PROMPT_NAME:</label>
                 <input type="text" x-model="newPromptName" placeholder="my-prompt-name"
-                  style="width:100%; margin-bottom:0.5rem; margin-top:4px">
+                  style="width:100%; margin-bottom:0.5rem; margin-top:4px" @input="validateNewPromptName()">
                 <p x-show="newPromptNameError" class="text-sm text-danger" style="margin:0 0 0.5rem 0" x-text="'! ' + newPromptNameError"></p>
                 <label class="text-xs text-muted">CONTENT:</label>
                 <textarea x-model="newPromptContent"
@@ -1997,6 +1997,25 @@ function adminApp() {
       this.newPromptNameError = '';
       this.newPromptContent = '';
       this.promptDirty = false;
+    },
+
+    validateNewPromptName() {
+      const n = this.newPromptName.trim();
+      if (!n) { this.newPromptNameError = ''; return; }
+      if (!/^[a-zA-Z0-9][a-zA-Z0-9 _-]*$/.test(n)) {
+        this.newPromptNameError = 'letters, digits, spaces, hyphens, underscores only (start with letter/digit)';
+        return;
+      }
+      if (n.length > 64) {
+        this.newPromptNameError = 'max 64 characters';
+        return;
+      }
+      if (this.namedPrompts.some(p => p.name === n)) {
+        this.newPromptNameError = 'prompt already exists (will overwrite on create)';
+        // Allow overwrite — just warn, don't block
+      } else {
+        this.newPromptNameError = '';
+      }
     },
 
     // --- Named prompt CRUD ---
