@@ -255,6 +255,7 @@ def list_plugins() -> List[Dict[str, Any]]:
                 "scope": resolved["scope"],
                 "installed_at": resolved["installed_at"],
                 "last_updated": resolved["last_updated"],
+                "skills": resolved["skills"],
                 "skill_count": len(resolved["skills"]),
                 "command_count": len(resolved["commands"]),
             }
