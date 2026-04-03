@@ -82,6 +82,11 @@ RATE_LIMITS = {
     "general": int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
 }
 
+# Image Server Proxy
+IMAGE_SERVER_BASE = os.getenv("IMAGE_SERVER_BASE", "")
+IMAGE_INTERNAL_SECRET = os.getenv("IMAGE_INTERNAL_SECRET", "")
+IMAGE_TLS_VERIFY = parse_bool_env("IMAGE_TLS_VERIFY", "true")
+
 # ---------------------------------------------------------------------------
 # Backward compatibility — import backend-specific constants directly from
 # the constants submodules (NOT the backend __init__.py) to avoid triggering

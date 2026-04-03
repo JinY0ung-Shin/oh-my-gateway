@@ -115,6 +115,11 @@ class Pipeline:
             default="/app/shared_images",
             description="Shared directory for saving uploaded images (must be mounted in both Open WebUI and gateway containers)",
         )
+        IMAGE_SERVER_BASE: str = Field(
+            default="",
+            description="Base URL pattern for the image server (e.g. 'https://image-server.example.com'). "
+                        "When set, image links matching this URL will trigger the gallery sidebar in Open WebUI.",
+        )
 
 
         @field_validator("TOOL_DISPLAY", mode="before")
@@ -199,6 +204,45 @@ class Pipeline:
             response_content = parts[1].strip() if len(parts) > 1 else ""
             return f"<thought>\n{thought_content}\n</thought>\n\n{response_content}"
         return f"<thought>\n{text}\n</thought>"
+
+    # ------------------------------------------------------------------
+    # Image gallery detection
+    # ------------------------------------------------------------------
+
+    def _detect_image_gallery_urls(self, text: str) -> list[dict]:
+        """Detect image URLs from IMAGE_SERVER_BASE in text and return gallery info."""
+        if not self.valves.IMAGE_SERVER_BASE:
+            return []
+
+        base = self.valves.IMAGE_SERVER_BASE.rstrip("/")
+        # Match URLs that look like image paths from the configured server
+        # Pattern: base_url/path/to/folder/image.ext
+        import re
+        pattern = re.escape(base) + r"(/[^\s\)\"'<>]+\.(?:jpg|jpeg|png|gif|webp|bmp|tiff))"
+        matches = re.findall(pattern, text, re.IGNORECASE)
+
+        results = []
+        seen_folders = set()
+        for match in matches:
+            import os.path
+            folder = os.path.dirname(match)
+            filename = os.path.basename(match)
+            if folder not in seen_folders:
+                seen_folders.add(folder)
+                results.append({"folder": folder, "current": filename, "base_url": base})
+        return results
+
+    def _build_gallery_tag(self, folder: str, current: str, base_url: str) -> str:
+        """Build a <details type='image_gallery'> tag for the frontend."""
+        safe_folder = _safe_attr(folder)
+        safe_current = _safe_attr(current)
+        safe_base = _safe_attr(base_url)
+        return (
+            f'\n\n<details type="image_gallery" folder="{safe_folder}" '
+            f'current="{safe_current}" base_url="{safe_base}" done="true">\n'
+            f'<summary>Image Gallery</summary>\n'
+            f'</details>\n\n'
+        )
 
     # ------------------------------------------------------------------
     # Main entry point
@@ -362,6 +406,7 @@ class Pipeline:
         thought_opened = False
         response_tag_sent = False
         text_buffer = ""
+        full_text_acc = ""  # Accumulate full response for image URL detection
         BUFFER_SIZE = 50
         RESPONSE_TAG = "<response>"
         TOOL_DETAILS_PREFIX = "\n\n<details "
@@ -457,6 +502,7 @@ class Pipeline:
 
                         if thought_wrapped:
                             if response_tag_sent:
+                                full_text_acc += chunk
                                 yield chunk
                             elif chunk.startswith(TOOL_DETAILS_PREFIX):
                                 # Tool <details> blocks bypass the buffer
@@ -475,6 +521,7 @@ class Pipeline:
                                     yield "\n</thought>\n\n"
                                     response_tag_sent = True
                                     if after:
+                                        full_text_acc += after
                                         yield after
                                     text_buffer = ""
                                 elif len(text_buffer) > BUFFER_SIZE:
@@ -483,6 +530,7 @@ class Pipeline:
                                         yield text_buffer[:safe_len]
                                         text_buffer = text_buffer[safe_len:]
                         else:
+                            full_text_acc += chunk
                             yield chunk
 
         except Exception as e:
@@ -494,11 +542,18 @@ class Pipeline:
                     # No tools were used and model didn't emit <response> —
                     # treat the entire content as the response, not thought.
                     yield "\n</thought>\n\n"
+                    full_text_acc += text_buffer
                     yield text_buffer
                 else:
                     if text_buffer:
+                        full_text_acc += text_buffer
                         yield text_buffer
                     yield "\n</thought>"
+
+            # Emit image gallery tags for any IMAGE_SERVER_BASE URLs found
+            gallery_matches = self._detect_image_gallery_urls(full_text_acc)
+            for match in gallery_matches:
+                yield self._build_gallery_tag(match["folder"], match["current"], match["base_url"])
 
     def _render_system_event(
         self,
