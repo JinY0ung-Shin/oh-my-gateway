@@ -276,6 +276,48 @@ class Pipeline:
 
         return thumbnails
 
+    @staticmethod
+    def _extract_tool_results_for_explorer(raw_content) -> list[dict]:
+        """Extract structured results from MCP tool result for the explorer sidebar.
+
+        Returns a list of dicts with keys: title, content, url, thumbnail, doc_type.
+        """
+        if not raw_content:
+            return []
+
+        data = raw_content
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                return []
+
+        items_list = None
+        if isinstance(data, dict):
+            for key in ("responses", "results", "data", "items"):
+                if isinstance(data.get(key), list):
+                    items_list = data[key]
+                    break
+        elif isinstance(data, list):
+            items_list = data
+
+        if not items_list:
+            return []
+
+        results = []
+        for item in items_list:
+            if not isinstance(item, dict):
+                continue
+            meta = item.get("metadata") or {}
+            results.append({
+                "title": item.get("title", ""),
+                "content": (item.get("content") or "")[:200],
+                "url": meta.get("url") or item.get("url") or "",
+                "thumbnail": meta.get("thumbnail") or item.get("thumbnail") or "",
+                "doc_type": item.get("doc_type") or meta.get("type") or "",
+            })
+        return results
+
     def _build_gallery_tag(
         self,
         folder: str = "",
@@ -303,6 +345,21 @@ class Pipeline:
         return (
             f'\n\n<details {attrs}>\n'
             f'<summary>Image Gallery</summary>\n'
+            f'</details>\n\n'
+        )
+
+    @staticmethod
+    def _build_tool_explorer_tag(tool_data: dict) -> str:
+        """Build a <details type='tool_explorer'> tag with JSON body.
+
+        *tool_data* is a dict keyed by tool label, each value being a list
+        of call dicts with ``query`` and ``results`` keys.
+        """
+        body = json.dumps(tool_data, ensure_ascii=False)
+        return (
+            f'\n\n<details type="tool_explorer" done="true">\n'
+            f'<summary>Tool Results</summary>\n'
+            f'{body}\n'
             f'</details>\n\n'
         )
 
@@ -482,6 +539,8 @@ class Pipeline:
         tool_pending: dict = {}
         any_tool_used = False
         collected_thumbnails: list[str] = []  # Thumbnails from MCP tool results
+        # Tool explorer: {tool_label: [{query, results}]}
+        tool_explorer_data: dict[str, list[dict]] = {}
         try:
             if thought_wrapped:
                 yield "<thought>\n"
@@ -539,17 +598,51 @@ class Pipeline:
                                     "[PIPE-DEBUG] %s raw_event=%s",
                                     event_type, json.dumps(sys_event, default=str)[:500],
                                 )
-                            # Extract thumbnails from MCP tool results
+                            # Extract data from MCP tool results
                             if event_type == "tool_result":
+                                tool_id = sys_event.get("tool_use_id", "")
                                 raw = (
                                     sys_event.get("content", "")
                                     or sys_event.get("output", "")
                                     or sys_event.get("result", "")
                                 )
+                                # Thumbnails for gallery
                                 thumbs = self._extract_thumbnails_from_tool_result(raw)
                                 if thumbs:
                                     collected_thumbnails.extend(thumbs)
                                     log.info("[PIPE] collected %d thumbnails", len(thumbs))
+                                # Structured results for tool explorer
+                                t_name = tool_names.get(tool_id, "")
+                                if t_name.startswith("mcp__"):
+                                    results = self._extract_tool_results_for_explorer(raw)
+                                    if results:
+                                        # Derive label from mcp__server__tool
+                                        parts = t_name.split("__")
+                                        label = parts[1] if len(parts) >= 2 else t_name
+                                        # Get query from pending args
+                                        pending = tool_pending.get(tool_id, {})
+                                        query = pending.get("args", "{}")
+                                        try:
+                                            q_parsed = json.loads(query)
+                                            # Use first string value as display query
+                                            query_str = ""
+                                            for v in q_parsed.values():
+                                                if isinstance(v, str) and len(v) > 2:
+                                                    query_str = v
+                                                    break
+                                            query = query_str or query
+                                        except (json.JSONDecodeError, AttributeError):
+                                            pass
+                                        if label not in tool_explorer_data:
+                                            tool_explorer_data[label] = []
+                                        tool_explorer_data[label].append({
+                                            "query": query[:200],
+                                            "results": results,
+                                        })
+                                        log.info(
+                                            "[PIPE] tool_explorer: %s +%d results",
+                                            label, len(results),
+                                        )
                             rendered = self._render_system_event(
                                 event_type, sys_event, tool_names, tool_pending,
                             )
@@ -628,6 +721,10 @@ class Pipeline:
                         full_text_acc += text_buffer
                         yield text_buffer
                     yield "\n</thought>"
+
+            # Emit tool explorer sidebar for collected MCP results
+            if tool_explorer_data:
+                yield self._build_tool_explorer_tag(tool_explorer_data)
 
             # Emit image gallery for collected MCP thumbnails
             if collected_thumbnails:
