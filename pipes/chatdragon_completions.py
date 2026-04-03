@@ -232,14 +232,76 @@ class Pipeline:
                 results.append({"folder": folder, "current": filename, "base_url": base})
         return results
 
-    def _build_gallery_tag(self, folder: str, current: str, base_url: str) -> str:
-        """Build a <details type='image_gallery'> tag for the frontend."""
-        safe_folder = _safe_attr(folder)
-        safe_current = _safe_attr(current)
-        safe_base = _safe_attr(base_url)
+    @staticmethod
+    def _extract_thumbnails_from_tool_result(raw_content) -> list[str]:
+        """Extract thumbnail URLs from MCP tool result content.
+
+        Supports both JSON string and pre-parsed structures.  Looks for
+        ``thumbnail`` fields inside ``responses`` / ``results`` / ``data``
+        arrays, as well as flat lists of dicts.
+        """
+        if not raw_content:
+            return []
+
+        data = raw_content
+        if isinstance(data, str):
+            try:
+                data = json.loads(data)
+            except (json.JSONDecodeError, ValueError):
+                return []
+
+        thumbnails: list[str] = []
+
+        def _collect(items):
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                # Direct thumbnail field
+                thumb = item.get("thumbnail") or ""
+                if not thumb:
+                    meta = item.get("metadata") or {}
+                    thumb = meta.get("thumbnail") or ""
+                if thumb and isinstance(thumb, str):
+                    thumbnails.append(thumb)
+
+        if isinstance(data, dict):
+            for key in ("responses", "results", "data", "items"):
+                if isinstance(data.get(key), list):
+                    _collect(data[key])
+                    break
+        elif isinstance(data, list):
+            _collect(data)
+
+        return thumbnails
+
+    def _build_gallery_tag(
+        self,
+        folder: str = "",
+        current: str = "",
+        base_url: str = "",
+        images: list[str] | None = None,
+    ) -> str:
+        """Build a <details type='image_gallery'> tag for the frontend.
+
+        When *images* is provided the tag carries an inline JSON array of
+        image URLs so the frontend can display them without an extra API
+        call.  Otherwise the folder-based approach is used.
+        """
+        parts = ['type="image_gallery"', 'done="true"']
+        if folder:
+            parts.append(f'folder="{_safe_attr(folder)}"')
+        if current:
+            parts.append(f'current="{_safe_attr(current)}"')
+        if base_url:
+            parts.append(f'base_url="{_safe_attr(base_url)}"')
+        if images:
+            safe_images = _safe_attr(json.dumps(images, ensure_ascii=False))
+            parts.append(f'images="{safe_images}"')
+        attrs = " ".join(parts)
         return (
-            f'\n\n<details type="image_gallery" folder="{safe_folder}" '
-            f'current="{safe_current}" base_url="{safe_base}" done="true">\n'
+            f'\n\n<details {attrs}>\n'
             f'<summary>Image Gallery</summary>\n'
             f'</details>\n\n'
         )
@@ -419,6 +481,7 @@ class Pipeline:
         tool_names: dict = {}
         tool_pending: dict = {}
         any_tool_used = False
+        collected_thumbnails: list[str] = []  # Thumbnails from MCP tool results
         try:
             if thought_wrapped:
                 yield "<thought>\n"
@@ -476,6 +539,17 @@ class Pipeline:
                                     "[PIPE-DEBUG] %s raw_event=%s",
                                     event_type, json.dumps(sys_event, default=str)[:500],
                                 )
+                            # Extract thumbnails from MCP tool results
+                            if event_type == "tool_result":
+                                raw = (
+                                    sys_event.get("content", "")
+                                    or sys_event.get("output", "")
+                                    or sys_event.get("result", "")
+                                )
+                                thumbs = self._extract_thumbnails_from_tool_result(raw)
+                                if thumbs:
+                                    collected_thumbnails.extend(thumbs)
+                                    log.info("[PIPE] collected %d thumbnails", len(thumbs))
                             rendered = self._render_system_event(
                                 event_type, sys_event, tool_names, tool_pending,
                             )
@@ -555,10 +629,18 @@ class Pipeline:
                         yield text_buffer
                     yield "\n</thought>"
 
+            # Emit image gallery for collected MCP thumbnails
+            if collected_thumbnails:
+                yield self._build_gallery_tag(images=collected_thumbnails)
+
             # Emit image gallery tags for any IMAGE_SERVER_BASE URLs found
             gallery_matches = self._detect_image_gallery_urls(full_text_acc)
             for match in gallery_matches:
-                yield self._build_gallery_tag(match["folder"], match["current"], match["base_url"])
+                yield self._build_gallery_tag(
+                    folder=match["folder"],
+                    current=match["current"],
+                    base_url=match["base_url"],
+                )
 
     def _render_system_event(
         self,
