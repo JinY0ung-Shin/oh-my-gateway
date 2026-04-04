@@ -12,6 +12,10 @@ File read:      GET  /admin/api/files/{path:path}
 File write:     PUT  /admin/api/files/{path:path}
 Config:         GET  /admin/api/config
 Session delete: DELETE /admin/api/sessions/{session_id}
+Session stats:  GET  /admin/api/sessions/stats
+Session clean:  POST /admin/api/sessions/cleanup
+Bulk delete:    POST /admin/api/sessions/bulk-delete
+Server info:    GET  /admin/api/server-info
 Logs:           GET  /admin/api/logs
 Rate limits:    GET  /admin/api/rate-limits
 Session msgs:   GET  /admin/api/sessions/{session_id}/messages
@@ -29,7 +33,7 @@ Blocklist:      GET  /admin/api/plugins/blocklist
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, Response
+from fastapi import APIRouter, Depends, Header, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -175,6 +179,27 @@ async def admin_summary(_=Depends(require_admin)):
     }
 
 
+@router.get("/api/server-info")
+async def get_server_info(request: Request, _=Depends(require_admin)):
+    """Return server uptime, version, and basic runtime info."""
+    import time
+
+    from src import __version__
+    from src.session_manager import session_manager
+
+    started_at = getattr(request.app.state, "started_at", None)
+    uptime_seconds = round(time.time() - started_at, 1) if started_at else None
+
+    return {
+        "version": __version__,
+        "started_at": started_at,
+        "uptime_seconds": uptime_seconds,
+        "session_stats": session_manager.get_stats(),
+        "cleanup_task_alive": session_manager._cleanup_task is not None
+        and not session_manager._cleanup_task.done(),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Backend health & auth
 # ---------------------------------------------------------------------------
@@ -217,6 +242,61 @@ async def get_sandbox(_=Depends(require_admin)):
 async def get_tools(_=Depends(require_admin)):
     """Return available tools per backend and MCP tool patterns."""
     return get_tools_registry()
+
+
+# ---------------------------------------------------------------------------
+# Session stats & bulk operations (must precede {session_id} routes)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/sessions/stats")
+async def get_session_stats(_=Depends(require_admin)):
+    """Return session statistics (active, expired, total messages)."""
+    from src.session_manager import session_manager
+
+    return session_manager.get_stats()
+
+
+@router.post("/api/sessions/cleanup")
+async def trigger_session_cleanup(_=Depends(require_admin)):
+    """Manually trigger expired session cleanup."""
+    from src.session_manager import session_manager
+
+    removed = await session_manager.cleanup_expired_sessions()
+    stats = session_manager.get_stats()
+    return {"removed": removed, **stats}
+
+
+class BulkDeleteRequest(BaseModel):
+    session_ids: Optional[list[str]] = None
+    expired_only: bool = False
+
+
+@router.post("/api/sessions/bulk-delete")
+async def bulk_delete_sessions(body: BulkDeleteRequest, _=Depends(require_admin)):
+    """Delete multiple sessions or all expired sessions."""
+    from src.session_manager import session_manager
+
+    deleted_ids: list[str] = []
+
+    if body.expired_only:
+        removed = await session_manager.cleanup_expired_sessions()
+        return {"deleted_count": removed, "mode": "expired_only"}
+
+    if body.session_ids:
+        for sid in body.session_ids:
+            if session_manager.delete_session(sid):
+                deleted_ids.append(sid)
+        return {
+            "deleted_count": len(deleted_ids),
+            "deleted_ids": deleted_ids,
+            "not_found": [sid for sid in body.session_ids if sid not in deleted_ids],
+        }
+
+    return JSONResponse(
+        status_code=400,
+        content={"error": "Provide session_ids or set expired_only=true"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -325,6 +405,8 @@ async def get_config(_=Depends(require_admin)):
 async def get_logs(
     endpoint: Optional[str] = None,
     status: Optional[str] = None,
+    session_id: Optional[str] = None,
+    backend: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     _=Depends(require_admin),
@@ -338,6 +420,8 @@ async def get_logs(
     return request_logger.query(
         endpoint=endpoint,
         status=status,
+        session_id=session_id,
+        backend=backend,
         limit=min(limit, 200),
         offset=max(offset, 0),
     )

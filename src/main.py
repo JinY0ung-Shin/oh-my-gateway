@@ -4,6 +4,7 @@ import asyncio
 import logging
 import secrets
 import string
+import time
 import uuid
 from typing import Optional
 from contextlib import asynccontextmanager
@@ -206,6 +207,9 @@ async def lifespan(app: FastAPI):
 
     # Start session cleanup task
     session_manager.start_cleanup_task()
+
+    # Record server start time for uptime tracking
+    app.state.started_at = time.time()
 
     yield
 
