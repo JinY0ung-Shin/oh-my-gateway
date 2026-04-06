@@ -786,12 +786,21 @@ class Pipeline:
                                             query = orig_args or pending.get("args", "{}")
                                             try:
                                                 q_parsed = json.loads(query)
+                                                # Extract readable search query
                                                 query_str = ""
                                                 for v in q_parsed.values():
                                                     if isinstance(v, str) and len(v) > 2:
                                                         query_str = v
                                                         break
-                                                query = query_str or query
+                                                if query_str:
+                                                    query = query_str
+                                                else:
+                                                    # No obvious string value; show key=value pairs
+                                                    pairs = [
+                                                        f"{k}={v}" for k, v in q_parsed.items()
+                                                        if isinstance(v, (str, int, float)) and str(v).strip()
+                                                    ]
+                                                    query = ", ".join(pairs) if pairs else query
                                             except (json.JSONDecodeError, AttributeError):
                                                 pass
                                             if label not in tool_explorer_data:
