@@ -297,10 +297,11 @@ class Pipeline:
             for item in items:
                 if not isinstance(item, dict):
                     continue
-                thumb = item.get("thumbnail") or ""
-                if not thumb:
-                    meta = item.get("metadata") or {}
-                    thumb = meta.get("thumbnail") or ""
+                meta = item.get("metadata") or {}
+                thumb = (
+                    item.get("thumbnail") or item.get("thumbnail_url") or ""
+                    or meta.get("thumbnail") or meta.get("thumbnail_url") or ""
+                )
                 if thumb and isinstance(thumb, str):
                     thumbnails.append(thumb)
 
@@ -341,8 +342,14 @@ class Pipeline:
             results.append({
                 "title": item.get("title", ""),
                 "content": (item.get("content") or "")[:200],
-                "url": meta.get("url") or item.get("url") or "",
-                "thumbnail": meta.get("thumbnail") or item.get("thumbnail") or "",
+                "url": (
+                    meta.get("url") or meta.get("edm_link")
+                    or item.get("url") or item.get("edm_link") or ""
+                ),
+                "thumbnail": (
+                    meta.get("thumbnail") or meta.get("thumbnail_url")
+                    or item.get("thumbnail") or item.get("thumbnail_url") or ""
+                ),
                 "doc_type": item.get("doc_type") or meta.get("type") or "",
             })
         return results
