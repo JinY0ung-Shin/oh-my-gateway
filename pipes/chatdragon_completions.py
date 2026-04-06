@@ -668,6 +668,18 @@ class Pipeline:
                                     or sys_event.get("output", "")
                                     or sys_event.get("result", "")
                                 )
+                                log.info(
+                                    "[PIPE-PARSE] raw type=%s len=%s preview=%s",
+                                    type(raw).__name__,
+                                    len(str(raw)),
+                                    str(raw)[:300],
+                                )
+                                parsed = self._parse_tool_content(raw)
+                                log.info(
+                                    "[PIPE-PARSE] parsed type=%s result=%s",
+                                    type(parsed).__name__ if parsed else "None",
+                                    str(parsed)[:300] if parsed else "None",
+                                )
                                 # Thumbnails for gallery
                                 thumbs = self._extract_thumbnails_from_tool_result(raw)
                                 if thumbs:
