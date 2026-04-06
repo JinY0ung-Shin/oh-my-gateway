@@ -803,14 +803,27 @@ class Pipeline:
                                                     query = ", ".join(pairs) if pairs else query
                                             except (json.JSONDecodeError, AttributeError):
                                                 pass
-                                            if label not in tool_explorer_data:
-                                                tool_explorer_data[label] = []
-                                            tool_explorer_data[label].append({
+                                            call_data = {
                                                 "query": query[:200],
                                                 "results": results,
-                                            })
+                                            }
+                                            # Track for dedup
+                                            if label not in tool_explorer_data:
+                                                tool_explorer_data[label] = []
+                                            tool_explorer_data[label].append(call_data)
+                                            # Emit immediately so sidebar updates live
+                                            explorer_tag = self._build_tool_explorer_tag(
+                                                {label: [call_data]}
+                                            )
+                                            if thought_wrapped and not response_tag_sent:
+                                                if text_buffer:
+                                                    yield text_buffer
+                                                    text_buffer = ""
+                                                yield explorer_tag
+                                            else:
+                                                yield explorer_tag
                                             log.info(
-                                                "[PIPE] tool_explorer: %s +%d results",
+                                                "[PIPE] tool_explorer: %s +%d results (live)",
                                                 label, len(results),
                                             )
                                     # (persisted_map entries auto-removed via .pop above)
@@ -893,9 +906,7 @@ class Pipeline:
                         yield text_buffer
                     yield "\n</thought>"
 
-            # Emit tool explorer sidebar for collected MCP results
-            if tool_explorer_data:
-                yield self._build_tool_explorer_tag(tool_explorer_data)
+            # (tool_explorer tags already emitted live during streaming)
 
             # Emit image gallery for collected MCP thumbnails
             if collected_thumbnails:
