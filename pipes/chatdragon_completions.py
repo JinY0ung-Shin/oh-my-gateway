@@ -339,17 +339,43 @@ class Pipeline:
             if not isinstance(item, dict):
                 continue
             meta = item.get("metadata") or {}
+            # URL: try multiple field names and Confluence _links
+            url = (
+                meta.get("url") or meta.get("edm_link")
+                or item.get("url") or item.get("edm_link") or ""
+            )
+            if not url:
+                # Confluence: build URL from _links.webui or page id
+                links = meta.get("_links") or item.get("_links") or {}
+                if links.get("webui"):
+                    # Try to get base from space self link
+                    space = meta.get("space") or {}
+                    space_links = space.get("_links") or {}
+                    base = ""
+                    if space_links.get("self"):
+                        # e.g. https://confluence.example.com/rest/api/space/KEY
+                        base = space_links["self"].split("/rest/")[0]
+                    if base:
+                        url = f"{base}{links['webui']}"
+                    else:
+                        url = links["webui"]
+                elif meta.get("page_id") or meta.get("id"):
+                    page_id = meta.get("page_id") or meta.get("id")
+                    space = meta.get("space") or {}
+                    space_links = space.get("_links") or {}
+                    if space_links.get("self"):
+                        base = space_links["self"].split("/rest/")[0]
+                        url = f"{base}/pages/viewpage.action?pageId={page_id}"
+            # Thumbnail
+            thumbnail = (
+                meta.get("thumbnail") or meta.get("thumbnail_url")
+                or item.get("thumbnail") or item.get("thumbnail_url") or ""
+            )
             results.append({
                 "title": item.get("title", ""),
                 "content": (item.get("content") or "")[:200],
-                "url": (
-                    meta.get("url") or meta.get("edm_link")
-                    or item.get("url") or item.get("edm_link") or ""
-                ),
-                "thumbnail": (
-                    meta.get("thumbnail") or meta.get("thumbnail_url")
-                    or item.get("thumbnail") or item.get("thumbnail_url") or ""
-                ),
+                "url": url,
+                "thumbnail": thumbnail,
                 "doc_type": item.get("doc_type") or meta.get("type") or "",
             })
         return results
