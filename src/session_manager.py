@@ -19,6 +19,7 @@ Concurrency model
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from threading import Lock
@@ -61,6 +62,8 @@ class Session:
     turn_counter: int = 0
     base_system_prompt: Optional[str] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    user: Optional[str] = None
+    workspace: Optional[str] = None
 
     def __post_init__(self) -> None:
         self.created_at = _ensure_utc(self.created_at)
@@ -135,9 +138,22 @@ class SessionManager:
         """Remove every expired session.  Returns the count removed."""
         expired = [sid for sid, s in self.sessions.items() if s.is_expired()]
         for sid in expired:
+            session = self.sessions[sid]
+            if session.workspace:
+                self._cleanup_workspace(session.workspace)
             del self.sessions[sid]
             logger.info(f"Cleaned up expired session: {sid}")
         return len(expired)
+
+    def _cleanup_workspace(self, workspace_path: str) -> None:
+        """Remove temporary workspace directory on session expiry."""
+        try:
+            from src.workspace_manager import WorkspaceManager
+
+            wm = WorkspaceManager(base_path=Path(workspace_path).parent)
+            wm.cleanup_temp_workspace(Path(workspace_path))
+        except Exception:
+            logger.debug("Workspace cleanup skipped for %s", workspace_path, exc_info=True)
 
     # ------------------------------------------------------------------
     # Cleanup task

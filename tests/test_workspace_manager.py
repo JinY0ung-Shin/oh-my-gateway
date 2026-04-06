@@ -137,3 +137,24 @@ class TestCleanupTempWorkspace:
 
     def test_ignores_nonexistent_directory(self, manager):
         manager.cleanup_temp_workspace(Path("/nonexistent/_tmp_abc"))
+
+
+from src.session_manager import Session
+
+
+class TestSessionUserField:
+    def test_session_has_user_field(self):
+        session = Session(session_id="test-1", user="alice")
+        assert session.user == "alice"
+
+    def test_session_user_defaults_to_none(self):
+        session = Session(session_id="test-2")
+        assert session.user is None
+
+    def test_session_has_workspace_field(self):
+        session = Session(session_id="test-3", workspace="/tmp/ws/alice")
+        assert session.workspace == "/tmp/ws/alice"
+
+    def test_session_workspace_defaults_to_none(self):
+        session = Session(session_id="test-4")
+        assert session.workspace is None
