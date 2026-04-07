@@ -521,6 +521,44 @@ class TestAsyncShutdown:
 
         assert len(manager.sessions) == 0
 
+    async def test_async_shutdown_cleans_temp_workspaces(self, manager, tmp_path):
+        """async_shutdown() removes _tmp_ workspaces before clearing sessions."""
+        tmp_ws = tmp_path / "_tmp_abc123"
+        tmp_ws.mkdir()
+        (tmp_ws / "file.txt").write_text("data")
+
+        permanent_ws = tmp_path / "alice"
+        permanent_ws.mkdir()
+        (permanent_ws / "file.txt").write_text("keep")
+
+        s1 = manager.get_or_create_session("s-tmp")
+        s1.workspace = str(tmp_ws)
+
+        s2 = manager.get_or_create_session("s-perm")
+        s2.workspace = str(permanent_ws)
+
+        manager.get_or_create_session("s-none")
+        # workspace is None — should not cause errors
+
+        await manager.async_shutdown()
+
+        assert not tmp_ws.exists(), "Temporary workspace should be removed on shutdown"
+        assert permanent_ws.exists(), "Permanent workspace should survive shutdown"
+        assert len(manager.sessions) == 0
+
+    def test_shutdown_cleans_temp_workspaces(self, manager, tmp_path):
+        """shutdown() removes _tmp_ workspaces before clearing sessions."""
+        tmp_ws = tmp_path / "_tmp_xyz789"
+        tmp_ws.mkdir()
+
+        s1 = manager.get_or_create_session("s-tmp")
+        s1.workspace = str(tmp_ws)
+
+        manager.shutdown()
+
+        assert not tmp_ws.exists(), "Temporary workspace should be removed on shutdown"
+        assert len(manager.sessions) == 0
+
 
 class TestProcessMessagesEdgeCases:
     """Test edge cases of process_messages()."""

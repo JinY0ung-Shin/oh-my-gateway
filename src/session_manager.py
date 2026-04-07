@@ -212,22 +212,34 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def async_shutdown(self) -> None:
-        """Async shutdown: cancel cleanup task and clear all sessions."""
+        """Async shutdown: cancel cleanup task, clean temp workspaces, and clear sessions."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
 
         with self.lock:
+            self._cleanup_all_temp_workspaces()
             self.sessions.clear()
             logger.info("Session manager async shutdown complete")
 
     def shutdown(self) -> None:
-        """Synchronous shutdown: cancel cleanup task and clear all sessions."""
+        """Synchronous shutdown: cancel cleanup task, clean temp workspaces, and clear sessions."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
 
         with self.lock:
+            self._cleanup_all_temp_workspaces()
             self.sessions.clear()
             logger.info("Session manager shutdown complete")
+
+    def _cleanup_all_temp_workspaces(self) -> None:
+        """Remove temporary workspaces for all active sessions.
+
+        Called during shutdown to prevent ``_tmp_*`` directory leaks.
+        Must be called while holding ``self.lock``.
+        """
+        for session in self.sessions.values():
+            if session.workspace:
+                self._cleanup_workspace(session.workspace)
 
     # ------------------------------------------------------------------
     # Session CRUD
