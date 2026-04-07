@@ -107,9 +107,7 @@ class TestExistingSession:
         session = _make_session(backend="claude")
         session.messages.append(Message(role="user", content="prev"))
 
-        pf = await acquire_session_preflight(
-            session, _claude_resolved(), "sid-1", is_new=True
-        )
+        pf = await acquire_session_preflight(session, _claude_resolved(), "sid-1", is_new=True)
         try:
             assert pf.is_new is True
         finally:
@@ -208,9 +206,7 @@ class TestSessionPreflightScope:
     async def test_releases_lock_on_exception(self):
         session = _make_session()
         with pytest.raises(RuntimeError):
-            async with session_preflight_scope(
-                session, _claude_resolved(), "sid-1"
-            ):
+            async with session_preflight_scope(session, _claude_resolved(), "sid-1"):
                 raise RuntimeError("boom")
         assert not session.lock.locked()
 
@@ -219,8 +215,6 @@ class TestSessionPreflightScope:
         session.messages.append(Message(role="user", content="prev"))
 
         with pytest.raises(HTTPException):
-            async with session_preflight_scope(
-                session, _other_resolved(), "sid-1"
-            ):
+            async with session_preflight_scope(session, _other_resolved(), "sid-1"):
                 pass  # should not reach here
         assert not session.lock.locked()

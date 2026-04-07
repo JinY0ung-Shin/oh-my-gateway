@@ -45,6 +45,7 @@ class TestAuthGetProviderRegistryException:
             provider = src.auth.auth_manager.get_provider("claude")
             assert provider.name == "claude"
 
+
 class TestAuthGetApiKeyImportException:
     """Cover lines 139-140: Exception in get_api_key() when importing main fails."""
 

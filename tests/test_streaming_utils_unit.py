@@ -1426,9 +1426,7 @@ class TestResolveTokenUsage:
 
     def test_returns_sdk_usage_when_available(self):
         """Path 1: SDK usage present → use it directly."""
-        chunks = [
-            {"type": "result", "usage": {"input_tokens": 100, "output_tokens": 50}}
-        ]
+        chunks = [{"type": "result", "usage": {"input_tokens": 100, "output_tokens": 50}}]
         p, c = resolve_token_usage(chunks, "ignored prompt", "ignored completion")
         assert p == 100
         assert c == 50
@@ -1460,9 +1458,7 @@ class TestResolveTokenUsage:
         from unittest.mock import MagicMock
 
         backend = MagicMock()
-        chunks = [
-            {"type": "result", "usage": {"input_tokens": 10, "output_tokens": 5}}
-        ]
+        chunks = [{"type": "result", "usage": {"input_tokens": 10, "output_tokens": 5}}]
         p, c = resolve_token_usage(chunks, "prompt", "text", "model", backend=backend)
         assert p == 10
         assert c == 5

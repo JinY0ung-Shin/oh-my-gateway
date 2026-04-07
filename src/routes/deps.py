@@ -30,10 +30,7 @@ def resolve_and_get_backend(
         supported = sorted(BackendRegistry.all_model_ids())
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Model '{model}' is not supported. "
-                f"Supported models: {supported}"
-            ),
+            detail=(f"Model '{model}' is not supported. Supported models: {supported}"),
         )
 
     if not BackendRegistry.is_registered(resolved.backend):
@@ -118,7 +115,6 @@ def validate_image_request(request: Any, backend: BackendClient) -> None:
             status_code=400,
             detail=f"Image input is not supported for the {backend.name} backend.",
         )
-
 
 
 def truncate_image_data(obj: Any) -> Any:

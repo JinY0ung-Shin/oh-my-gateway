@@ -304,10 +304,12 @@ class ClaudeCodeCLI:
         _custom_base: object = _UNSET,
         extra_env: Optional[Dict[str, str]] = None,
         task_budget: Optional[int] = None,
+        cwd: Optional[Path] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
+        effective_cwd = cwd or self.cwd
         options = ClaudeAgentOptions(
-            max_turns=max_turns, cwd=self.cwd, setting_sources=["project", "local"]
+            max_turns=max_turns, cwd=effective_cwd, setting_sources=["project", "local"]
         )
 
         self._configure_thinking(options)
@@ -501,6 +503,7 @@ class ClaudeCodeCLI:
         output_format: Optional[Dict[str, Any]] = None,
         mcp_servers: Optional[Dict[str, Any]] = None,
         task_budget: Optional[int] = None,
+        cwd: Optional[str] = None,
         **_extra,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run a single-use SDK query and yield converted message dicts.
@@ -528,6 +531,7 @@ class ClaudeCodeCLI:
                     resume=resume,
                     extra_env=_extra.get("_metadata"),
                     task_budget=task_budget,
+                    cwd=Path(cwd) if cwd else None,
                 )
 
                 async for message in query(prompt=prompt, options=options):

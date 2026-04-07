@@ -372,7 +372,9 @@ async def chat_completions(
                 prompt, sys_prompt, session = _prepare_session_prompt(request_body, backend=backend)
 
                 async with session_preflight_scope(
-                    session, resolved, request_body.session_id,
+                    session,
+                    resolved,
+                    request_body.session_id,
                     messages=request_body.messages,
                 ) as pf:
                     chunks = []

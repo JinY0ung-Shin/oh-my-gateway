@@ -52,8 +52,7 @@ async def anthropic_messages(
         raise HTTPException(
             status_code=400,
             detail=(
-                f"Model '{request_body.model}' is not supported. "
-                f"Supported models: {supported}"
+                f"Model '{request_body.model}' is not supported. Supported models: {supported}"
             ),
         )
 

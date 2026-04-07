@@ -246,10 +246,6 @@ class MessageAdapter:
         content = re.sub(r"\n\s*\n\s*\n", "\n\n", content)  # Multiple newlines to double
         content = content.strip()
 
-        # If content is now empty or only whitespace, provide a fallback
-        if not content or content.isspace():
-            return "I understand you're testing the system. How can I help you today?"
-
         return content
 
     @staticmethod

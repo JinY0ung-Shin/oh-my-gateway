@@ -160,6 +160,27 @@ curl http://localhost:8000/v1/messages \
   -d '{"model": "sonnet", "max_tokens": 512, "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
+### Per-User Workspace Isolation
+
+Each `/v1/responses` request can include a `user` field to isolate working directories:
+
+```json
+{
+  "model": "sonnet",
+  "input": "Create a Python script",
+  "user": "alice"
+}
+```
+
+**Behavior:**
+- `user` specified: Permanent workspace at `{base_path}/{user}/` (survives server restarts)
+- `user` omitted: Temporary workspace created per session, cleaned up on expiry
+- On new sessions, `.claude/` config is copied from `CLAUDE_CWD` to the workspace
+
+**Configuration:**
+- `USER_WORKSPACES_DIR`: Base directory for workspaces (defaults to `CLAUDE_CWD`)
+- User identifiers must match `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`
+
 ## API Reference
 
 | Method | Endpoint | Description |

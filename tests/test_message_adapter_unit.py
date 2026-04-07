@@ -240,19 +240,19 @@ class TestFilterContent:
         # Should have at most double newlines
         assert "\n\n\n" not in result
 
-    def test_empty_after_filtering_returns_fallback(self):
-        """If content is empty after filtering, returns fallback message."""
+    def test_empty_after_filtering_returns_empty(self):
+        """If content is empty after filtering, returns empty string."""
         content = "<thinking>Only thinking content</thinking>"
         result = MessageAdapter.filter_content(content)
 
-        assert "How can I help you today?" in result
+        assert result == ""
 
-    def test_whitespace_only_after_filtering_returns_fallback(self):
-        """If content is only whitespace after filtering, returns fallback."""
+    def test_whitespace_only_after_filtering_returns_empty(self):
+        """If content is only whitespace after filtering, returns empty string."""
         content = "<thinking>content</thinking>   \n   \n   "
         result = MessageAdapter.filter_content(content)
 
-        assert "How can I help you today?" in result
+        assert result == ""
 
 
 class TestTruncateToolContent:

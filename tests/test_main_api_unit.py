@@ -810,7 +810,6 @@ def test_create_response_returns_502_when_sdk_returns_no_message():
     assert response.json()["error"]["message"] == "No response from backend"
 
 
-
 def test_responses_stale_previous_response_id(isolated_session_manager):
     """Past turn → 409 with latest response ID in message."""
     sid = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
@@ -864,8 +863,6 @@ def test_responses_latest_previous_response_id(isolated_session_manager):
     assert session.turn_counter == 2
 
 
-
-
 def test_responses_claude_unchanged(isolated_session_manager):
     """Existing Claude behavior regression check — still works after refactor."""
     run_calls = []
@@ -901,9 +898,6 @@ def test_responses_claude_unchanged(isolated_session_manager):
     assert run_calls[0]["system_prompt"] == "Be helpful"
     assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
     assert session.backend == "claude"
-
-
-
 
 
 def test_responses_concurrent_stale_id_race(isolated_session_manager):
@@ -1026,7 +1020,6 @@ def test_responses_streaming_success_commits_with_streamed_text(isolated_session
     assert session.messages[0].content == "Stream this"
     # The committed text comes from stream_response_chunks' full_text
     assert session.messages[1].content == "streamed text"
-
 
 
 async def test_responses_truly_concurrent_lock_serialization(isolated_session_manager):

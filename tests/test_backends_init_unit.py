@@ -209,5 +209,3 @@ class TestClaudeRegister:
             register(cwd=None)
 
             assert BackendRegistry.is_registered("claude")
-
-

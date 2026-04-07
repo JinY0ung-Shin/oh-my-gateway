@@ -3,6 +3,7 @@
 import logging
 import secrets
 import uuid
+from pathlib import Path
 from typing import Optional, Dict, Any
 
 from fastapi import APIRouter, HTTPException, Request, Depends
@@ -26,6 +27,8 @@ from src.rate_limiter import rate_limit_endpoint
 from src.constants import PERMISSION_MODE_BYPASS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
+from src.workspace_manager import workspace_manager
+from src.image_handler import ImageHandler
 from src.routes.deps import (
     resolve_and_get_backend,
     validate_backend_auth_or_raise,
@@ -73,6 +76,7 @@ async def _responses_streaming_preflight(
     is_new_session: bool,
     prompt: str,
     system_prompt: Optional[str],
+    workspace_str: str = "",
 ) -> Dict[str, Any]:
     """Run session guards BEFORE StreamingResponse is created for /v1/responses.
 
@@ -93,7 +97,9 @@ async def _responses_streaming_preflight(
         _, turn = parsed  # guaranteed valid at this point
 
     pf = await acquire_session_preflight(
-        session, resolved, session_id,
+        session,
+        resolved,
+        session_id,
         is_new=is_new_session,
         turn=turn,
     )
@@ -113,6 +119,7 @@ async def _responses_streaming_preflight(
             mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
             session_id=session_id if pf.is_new else None,
             resume=pf.resume_id,
+            cwd=workspace_str,
         ),
     }
 
@@ -141,6 +148,9 @@ async def create_response(
     )
     validate_backend_auth_or_raise(resolved.backend)
     validate_image_request(body, backend)
+
+    # Moved earlier — needed for workspace sync_template decision
+    is_new_session = body.previous_response_id is None
 
     # Validate: instructions + previous_response_id is not allowed
     if body.previous_response_id and body.instructions:
@@ -180,6 +190,33 @@ async def create_response(
         session_id = str(uuid.uuid4())
         session = session_manager.get_or_create_session(session_id)
 
+    # --- Per-user workspace isolation ---
+    if not is_new_session and session.user != body.user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User mismatch: session belongs to {session.user!r}, "
+            f"but request specifies {body.user!r}",
+        )
+
+    if is_new_session:
+        try:
+            workspace = workspace_manager.resolve(body.user, sync_template=True)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        session.user = body.user
+        session.workspace = str(workspace)
+    else:
+        # Follow-up: reuse stored workspace, no template sync
+        if session.workspace:
+            workspace = Path(session.workspace)
+        else:
+            try:
+                workspace = workspace_manager.resolve(body.user, sync_template=False)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            session.workspace = str(workspace)
+    workspace_str = str(workspace)
+
     # Extract system prompt from array input if present
     system_prompt = body.instructions
     input_for_prompt = body.input
@@ -199,18 +236,24 @@ async def create_response(
         input_for_prompt = user_items if user_items else body.input
 
     # Convert input to prompt
-    image_handler = getattr(backend, "image_handler", None)
+    # Per-request ImageHandler pointing to user workspace
+    image_handler = ImageHandler(workspace)
     prompt = MessageAdapter.response_input_to_prompt(input_for_prompt, image_handler=image_handler)
     prompt = MessageAdapter.filter_content(prompt)
-
-    # Determine if this is a new session or a follow-up
-    is_new_session = body.previous_response_id is None
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
         # proper HTTP error status codes (not swallowed inside the generator).
         preflight = await _responses_streaming_preflight(
-            body, resolved, backend, session, session_id, is_new_session, prompt, system_prompt
+            body,
+            resolved,
+            backend,
+            session,
+            session_id,
+            is_new_session,
+            prompt,
+            system_prompt,
+            workspace_str=workspace_str,
         )
 
         next_turn = preflight["next_turn"]
@@ -237,9 +280,7 @@ async def create_response(
                     metadata=body.metadata or {},
                     stream_result=stream_result,
                 )
-                async for line in streaming_utils.bridge_sse_stream(
-                    sse_source, chunk_source
-                ):
+                async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
                     yield line
 
                 # SUCCESS-ONLY: commit turn counter and session messages.
@@ -284,7 +325,9 @@ async def create_response(
             _, _turn = _parsed
 
         async with session_preflight_scope(
-            session, resolved, session_id,
+            session,
+            resolved,
+            session_id,
             is_new=is_new_session,
             turn=_turn,
         ) as pf:
@@ -300,6 +343,7 @@ async def create_response(
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
                 session_id=session_id if pf.is_new else None,
                 resume=pf.resume_id,
+                cwd=workspace_str,
             ):
                 chunks.append(chunk)
 

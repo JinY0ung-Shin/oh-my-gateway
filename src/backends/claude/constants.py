@@ -57,6 +57,9 @@ CLAUDE_MODELS = [
 THINKING_MODE = os.getenv("THINKING_MODE", "adaptive")
 THINKING_BUDGET_TOKENS = int(os.getenv("THINKING_BUDGET_TOKENS", "10000"))
 
+# Logger used by config parsing below (must be defined before first use)
+_sandbox_logger = _logging.getLogger(__name__)
+
 # Task Budget (tokens)
 # When set, the model is made aware of its remaining token budget so it can
 # pace tool use and wrap up before the limit.  Unset (None) means no limit.
@@ -94,8 +97,6 @@ DISALLOWED_SUBAGENT_TYPES = [f"Agent({t.strip()})" for t in _raw_disallowed.spli
 _SANDBOX_VALID_TRUE = {"true", "1", "yes"}
 _SANDBOX_VALID_FALSE = {"false", "0", "no"}
 _SANDBOX_VALID_ALL = _SANDBOX_VALID_TRUE | _SANDBOX_VALID_FALSE
-
-_sandbox_logger = _logging.getLogger(__name__)
 
 _sandbox_raw = os.getenv("CLAUDE_SANDBOX_ENABLED")
 if _sandbox_raw is None:

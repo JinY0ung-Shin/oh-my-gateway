@@ -354,6 +354,7 @@ class TestStreamingSessionPreflightErrors:
         # Lock should have been released
         assert not session.lock.locked()
 
+
 # ===========================================================================
 # Lines 715-718: Preflight fast-path for pre-validated session
 # ===========================================================================
@@ -772,6 +773,7 @@ class TestResponsesApiSessionValidation:
         assert response.status_code == 400
         assert "Cannot mix backends" in response.json()["error"]["message"]
 
+
 # ===========================================================================
 # Lines 1430-1432: Responses API preflight lock release on error
 # ===========================================================================
@@ -875,6 +877,7 @@ class TestResponsesStreamingPreflightLockRelease:
 
         assert exc_info.value.status_code == 400
         assert not session.lock.locked()
+
 
 # ===========================================================================
 # Line 1591: Additional uncovered path (Responses streaming exception with

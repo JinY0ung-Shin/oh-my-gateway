@@ -67,8 +67,13 @@ async def list_mcp_servers(
 
 
 @router.post("/v1/compatibility")
-async def check_compatibility(request_body: ChatCompletionRequest):
+async def check_compatibility(
+    request_body: ChatCompletionRequest,
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Check OpenAI API compatibility for a request."""
+    await verify_api_key(request, credentials)
     report = CompatibilityReporter.generate_compatibility_report(request_body)
     return {
         "compatibility_report": report,
@@ -145,8 +150,13 @@ async def root():
 
 @router.post("/v1/debug/request")
 @rate_limit_endpoint("debug")
-async def debug_request_validation(request: Request):
+async def debug_request_validation(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
     """Debug endpoint to test request validation and see what's being sent."""
+    await verify_api_key(request, credentials)
+
     try:
         # Get the raw request body
         body = await request.body()

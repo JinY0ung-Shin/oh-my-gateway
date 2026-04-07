@@ -31,6 +31,10 @@ class ResponseCreateRequest(BaseModel):
     store: Optional[bool] = True
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
+    user: Optional[str] = Field(
+        default=None,
+        description="Unique user identifier for workspace isolation",
+    )
 
 
 class ResponseContentPart(BaseModel):

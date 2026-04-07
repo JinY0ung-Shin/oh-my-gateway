@@ -135,6 +135,8 @@ class RequestLogger:
         *,
         endpoint: Optional[str] = None,
         status: Optional[str] = None,
+        session_id: Optional[str] = None,
+        backend: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> Dict[str, Any]:
@@ -152,6 +154,10 @@ class RequestLogger:
         filtered = snapshot
         if endpoint:
             filtered = [e for e in filtered if endpoint in e.path]
+        if session_id is not None:
+            filtered = [e for e in filtered if e.session_id == session_id]
+        if backend is not None:
+            filtered = [e for e in filtered if e.backend == backend]
         if status is not None:
             status_str = str(status)
             if status_str.endswith("xx"):

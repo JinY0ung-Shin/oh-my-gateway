@@ -37,6 +37,10 @@ PERMISSION_MODE_BYPASS = "bypassPermissions"
 SESSION_CLEANUP_INTERVAL_MINUTES = int(os.getenv("SESSION_CLEANUP_INTERVAL_MINUTES", "5"))
 SESSION_MAX_AGE_MINUTES = int(os.getenv("SESSION_MAX_AGE_MINUTES", "60"))
 
+# Per-user workspace isolation
+# Base directory for user workspaces. Falls back to CLAUDE_CWD if empty.
+USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
+
 # MCP Server Configuration
 # Path to MCP config JSON file or inline JSON string
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
@@ -97,15 +101,14 @@ from src.backends.claude.constants import (  # noqa: E402, F401
     TOKEN_STREAMING,
     DISALLOWED_SUBAGENT_TYPES,
 )
+
 ALL_MODELS = CLAUDE_MODELS
 
 # Metadata → subprocess env var allowlist (comma-separated).
 # Only metadata keys listed here are passed as env vars to the Claude subprocess.
 # Example: METADATA_ENV_ALLOWLIST=THREAD_ID,A2A_BASE_URL
 METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
-    k.strip()
-    for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",")
-    if k.strip()
+    k.strip() for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",") if k.strip()
 )
 
 # Debug / Verbose mode — single source of truth

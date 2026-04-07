@@ -59,7 +59,6 @@ def _get_claude_auth_provider_class():
     return ClaudeAuthProvider
 
 
-
 # ============================================================================
 # ClaudeCodeAuthManager — backward-compatible gateway auth manager
 # ============================================================================

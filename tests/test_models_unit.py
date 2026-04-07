@@ -216,13 +216,9 @@ class TestChatCompletionRequest:
         import pytest
 
         with pytest.raises(Exception):
-            ChatCompletionRequest(
-                messages=[Message(role="user", content="Hi")], task_budget=0
-            )
+            ChatCompletionRequest(messages=[Message(role="user", content="Hi")], task_budget=0)
         with pytest.raises(Exception):
-            ChatCompletionRequest(
-                messages=[Message(role="user", content="Hi")], task_budget=-100
-            )
+            ChatCompletionRequest(messages=[Message(role="user", content="Hi")], task_budget=-100)
 
 
 class TestChatCompletionResponse:
