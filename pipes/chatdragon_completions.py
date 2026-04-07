@@ -387,6 +387,12 @@ class Pipeline:
             if not isinstance(item, dict):
                 continue
             meta = item.get("metadata") or {}
+            # Skip error results
+            if meta.get("error") or (
+                item.get("content", "").startswith("오류 발생")
+                or item.get("content", "").lower().startswith("error")
+            ):
+                continue
             # URL: try multiple field names and Confluence _links
             url = (
                 meta.get("url") or meta.get("edm_link")
