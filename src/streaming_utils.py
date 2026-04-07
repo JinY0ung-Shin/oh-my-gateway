@@ -912,9 +912,10 @@ async def stream_chunks(
                 content_sent = True
             continue
 
-        # Handle task system messages (subagent progress — structured JSON, not content)
+        # Handle task system messages (structured JSON, not content)
         if chunk.get("type") == "system":
-            if SUBAGENT_STREAM_PROGRESS:
+            is_subagent_task = chunk.get("parent_tool_use_id") is not None
+            if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
                 task_event = _build_task_event(chunk)
                 if task_event:
                     yield make_task_sse(request_id, request.model, task_event)
@@ -1154,9 +1155,10 @@ async def stream_response_chunks(
                     return
                 continue
 
-            # Handle task system messages (subagent progress — structured JSON, not content)
+            # Handle task system messages (structured JSON, not content)
             if chunk.get("type") == "system":
-                if SUBAGENT_STREAM_PROGRESS:
+                is_subagent_task = chunk.get("parent_tool_use_id") is not None
+                if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
                     task_event = _build_task_event(chunk)
                     if task_event:
                         yield make_task_response_sse(task_event, sequence_number=_next_seq())

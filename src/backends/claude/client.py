@@ -175,6 +175,11 @@ class ClaudeCodeCLI:
             options["disallowed_tools"] = CLAUDE_TOOLS
             options["max_turns"] = 1
             logger.debug("Tools disabled (default behavior for OpenAI compatibility)")
+        elif request.allowed_tools is not None:
+            # Caller provided explicit tool list — use it directly
+            options["allowed_tools"] = list(request.allowed_tools)
+            options["permission_mode"] = PERMISSION_MODE_BYPASS
+            logger.debug(f"Tools enabled (caller-specified): {request.allowed_tools}")
         else:
             options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
             options["permission_mode"] = PERMISSION_MODE_BYPASS
@@ -188,7 +193,8 @@ class ClaudeCodeCLI:
         mcp_servers = get_mcp_servers()
         if mcp_servers:
             options["mcp_servers"] = mcp_servers
-            if request.enable_tools:
+            if request.enable_tools and request.allowed_tools is None:
+                # Only add all MCP patterns when no explicit list was given
                 mcp_patterns = get_mcp_tool_patterns(mcp_servers)
                 options.setdefault("allowed_tools", []).extend(mcp_patterns)
                 logger.debug(f"MCP tools enabled symbolically: {mcp_patterns}")
