@@ -282,9 +282,9 @@ async def create_response(
     # ------------------------------------------------------------------
     # Create a persistent ClaudeSDKClient on the second turn if the
     # backend supports it.  We intentionally omit permission_mode so the
-    # CLI uses its default permission checks — our can_use_tool callback
-    # (registered inside create_client) handles all allow/deny decisions,
-    # which is required for AskUserQuestion interception.
+    # CLI uses its default permission checks — our PreToolUse hook
+    # (registered inside create_client) intercepts AskUserQuestion,
+    # which is required for user-input interception.
     if not is_new_session and session.client is None and hasattr(backend, "create_client"):
         try:
             session.client = await backend.create_client(
@@ -543,9 +543,8 @@ async def _handle_function_call_output(
     """Handle a function_call_output continuation request.
 
     Validates that the session has a pending tool call with a matching
-    ``call_id``, unblocks the SDK's ``can_use_tool`` callback, and then
-    streams the continuation response from the existing
-    :class:`ClaudeSDKClient`.
+    ``call_id``, unblocks the SDK's PreToolUse hook, and then streams
+    the continuation response from the existing :class:`ClaudeSDKClient`.
     """
     # --- Validation ---
     if session.pending_tool_call is None:
@@ -576,7 +575,7 @@ async def _handle_function_call_output(
             detail="function_call_output received but session has no active SDK client",
         )
 
-    # --- Unblock the can_use_tool callback ---
+    # --- Unblock the PreToolUse hook ---
     session.input_response = fc_output["output"]
     pending_event = session.input_event
     if pending_event is None:

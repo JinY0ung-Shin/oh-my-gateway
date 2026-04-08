@@ -1,6 +1,6 @@
 """Tests for ClaudeSDKClient integration methods on ClaudeCodeCLI.
 
-Covers create_client(), run_completion_with_client(), and _make_can_use_tool().
+Covers create_client(), run_completion_with_client(), and _make_ask_user_hook().
 All SDK interactions are mocked — no real subprocess or Anthropic credentials required.
 """
 
@@ -57,8 +57,8 @@ async def test_create_client_returns_connected_client():
     assert client is mock_client_instance
 
 
-async def test_create_client_sets_can_use_tool():
-    """create_client() sets options.can_use_tool before constructing the client."""
+async def test_create_client_sets_hooks():
+    """create_client() sets options.hooks with a PreToolUse entry for AskUserQuestion."""
     cli = _make_cli()
     session = Session(session_id="sess-2")
 
@@ -75,11 +75,16 @@ async def test_create_client_sets_can_use_tool():
         MockSDKClient.side_effect = capture_init
         await cli.create_client(session)
 
-    # The options object passed to ClaudeSDKClient must have can_use_tool set
+    # The options object passed to ClaudeSDKClient must have hooks set
     options = captured_options.get("options")
     assert options is not None
-    assert options.can_use_tool is not None
-    assert callable(options.can_use_tool)
+    assert options.hooks is not None
+    assert "PreToolUse" in options.hooks
+    matchers = options.hooks["PreToolUse"]
+    assert len(matchers) == 1
+    assert matchers[0].matcher == "AskUserQuestion"
+    assert len(matchers[0].hooks) == 1
+    assert callable(matchers[0].hooks[0])
 
 
 async def test_create_client_passes_session_id_to_options():
@@ -187,49 +192,58 @@ async def test_run_completion_with_client_error_during_receive():
 
 
 # ---------------------------------------------------------------------------
-# _make_can_use_tool callback
+# _make_ask_user_hook (PreToolUse hook)
 # ---------------------------------------------------------------------------
 
 
-async def test_can_use_tool_callback_allows_other_tools():
-    """Non-AskUserQuestion tools get immediate PermissionResultAllow."""
-    from claude_agent_sdk.types import PermissionResultAllow, ToolPermissionContext
+async def test_hook_allows_other_tools():
+    """Non-AskUserQuestion tools get an empty dict (allow and proceed)."""
+    from types import SimpleNamespace
 
     cli = _make_cli()
     session = Session(session_id="sess-other-tool")
 
-    callback = cli._make_can_use_tool(session)
-    context = ToolPermissionContext(tool_use_id="tu_123")
+    hook = cli._make_ask_user_hook(session)
 
-    result = await callback("BashTool", {"command": "ls"}, context)
+    # PreToolUseHookInput is a dataclass; simulate with SimpleNamespace
+    input_data = SimpleNamespace(
+        tool_name="BashTool",
+        tool_input={"command": "ls"},
+        tool_use_id="tu_123",
+    )
+    result = await hook(input_data, "tu_123", {})
 
-    assert isinstance(result, PermissionResultAllow)
+    assert result == {}
     # Session fields should NOT be modified
     assert session.pending_tool_call is None
     assert session.input_event is None
 
 
-async def test_can_use_tool_callback_ask_user_question():
-    """AskUserQuestion callback sets pending_tool_call and waits for input_event."""
-    from claude_agent_sdk.types import PermissionResultAllow, ToolPermissionContext
+async def test_hook_intercepts_ask_user_question():
+    """AskUserQuestion hook sets pending_tool_call and waits for input_event."""
+    from types import SimpleNamespace
 
     cli = _make_cli()
     session = Session(session_id="sess-ask")
 
-    callback = cli._make_can_use_tool(session)
-    context = ToolPermissionContext(tool_use_id="tu_ask_1")
-    tool_input = {"question": "Continue?"}
+    hook = cli._make_ask_user_hook(session)
 
-    # Run callback in a task — it will block on input_event.wait()
+    input_data = SimpleNamespace(
+        tool_name="AskUserQuestion",
+        tool_input={"question": "Continue?"},
+        tool_use_id="tu_ask_1",
+    )
+
+    # Run hook in a task — it will block on input_event.wait()
     result_holder = []
 
-    async def run_callback():
-        result = await callback("AskUserQuestion", tool_input, context)
+    async def run_hook():
+        result = await hook(input_data, None, {})
         result_holder.append(result)
 
-    task = asyncio.create_task(run_callback())
+    task = asyncio.create_task(run_hook())
 
-    # Allow the callback to start and park
+    # Allow the hook to start and park
     await asyncio.sleep(0.05)
 
     # Verify the session was updated with pending_tool_call
@@ -245,13 +259,15 @@ async def test_can_use_tool_callback_ask_user_question():
     session.input_response = "Yes, continue"
     session.input_event.set()
 
-    # Wait for callback to complete
+    # Wait for hook to complete
     await task
 
-    # Callback should have returned PermissionResultAllow
+    # Hook should have returned a SyncHookJSONOutput with permissionDecision
     assert len(result_holder) == 1
-    assert isinstance(result_holder[0], PermissionResultAllow)
+    result = result_holder[0]
+    assert "hookSpecificOutput" in result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
 
-    # After callback completes, input_response and input_event are reset
+    # After hook completes, input_response and input_event are reset
     assert session.input_response is None
     assert session.input_event is None

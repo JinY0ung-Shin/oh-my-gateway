@@ -22,8 +22,7 @@ from claude_agent_sdk.types import (
     UserMessage,
     SystemMessage,
     RateLimitEvent,
-    PermissionResultAllow,
-    ToolPermissionContext,
+    HookMatcher,
 )
 from claude_agent_sdk.types import (
     SandboxSettings,
@@ -495,32 +494,45 @@ class ClaudeCodeCLI:
     # ClaudeSDKClient lifecycle (persistent, bidirectional sessions)
     # ------------------------------------------------------------------
 
-    def _make_can_use_tool(self, session):
-        """Create a ``can_use_tool`` callback bound to *session*.
+    def _make_ask_user_hook(self, session):
+        """Create a PreToolUse hook that intercepts AskUserQuestion.
 
-        When the SDK invokes the ``AskUserQuestion`` tool the callback
-        parks the session (sets ``pending_tool_call`` and waits on
-        ``input_event``) so the HTTP layer can surface it as a
-        ``function_call`` and later unblock with the user's response.
+        When AskUserQuestion is detected, sets ``session.pending_tool_call``
+        and waits on ``session.input_event`` for the client's response.
+        Returns ``permissionDecision: "allow"`` after the response is received.
 
-        All other tools are allowed immediately.
+        The hook is registered with ``matcher="AskUserQuestion"`` so the CLI
+        only invokes it for that specific tool.
         """
 
-        async def can_use_tool(tool_name: str, tool_input: dict, context: ToolPermissionContext):
-            if tool_name == "AskUserQuestion":
-                session.pending_tool_call = {
-                    "call_id": context.tool_use_id,
-                    "name": "AskUserQuestion",
-                    "arguments": tool_input,
-                }
-                session.input_event = asyncio.Event()
-                await session.input_event.wait()
-                session.input_response = None
-                session.input_event = None
-                return PermissionResultAllow()
-            return PermissionResultAllow()
+        async def hook(input_data, tool_use_id, context):
+            tool_name = getattr(input_data, "tool_name", "")
+            tool_input = getattr(input_data, "tool_input", {})
+            actual_tool_use_id = getattr(input_data, "tool_use_id", tool_use_id)
 
-        return can_use_tool
+            if tool_name != "AskUserQuestion":
+                return {}  # Allow other tools to proceed
+
+            session.pending_tool_call = {
+                "call_id": actual_tool_use_id,
+                "name": "AskUserQuestion",
+                "arguments": tool_input,
+            }
+            session.input_event = asyncio.Event()
+            await session.input_event.wait()
+
+            # Reset state
+            session.input_response = None
+            session.input_event = None
+
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                }
+            }
+
+        return hook
 
     async def create_client(
         self,
@@ -552,7 +564,14 @@ class ClaudeCodeCLI:
             task_budget=task_budget,
             cwd=Path(cwd) if cwd else None,
         )
-        options.can_use_tool = self._make_can_use_tool(session)
+        options.hooks = {
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="AskUserQuestion",
+                    hooks=[self._make_ask_user_hook(session)],
+                )
+            ]
+        }
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)

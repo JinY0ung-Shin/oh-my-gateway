@@ -4,9 +4,11 @@
 
 **Goal:** Migrate session requests from `query()` to `ClaudeSDKClient`, add AskUserQuestion support via OpenAI-standard `function_call`/`function_call_output` pattern, and remove deprecated endpoints.
 
-**Architecture:** Session requests use a persistent `ClaudeSDKClient` per session (subprocess stays alive across turns). AskUserQuestion is intercepted via `can_use_tool` callback, emitted as a `function_call` output item, and resumed when the client sends `function_call_output` in the next request. Non-session requests stay on `query()`.
+**Architecture:** Session requests use a persistent `ClaudeSDKClient` per session (subprocess stays alive across turns). AskUserQuestion is intercepted via a `PreToolUse` hook, emitted as a `function_call` output item, and resumed when the client sends `function_call_output` in the next request. Non-session requests stay on `query()`.
 
-**Tech Stack:** Python 3.10+, FastAPI, claude-agent-sdk (ClaudeSDKClient, PermissionResultAllow), pytest, pytest-asyncio
+> **NOTE**: `can_use_tool` callback was found not to work (CLI never sends `control_request`). PreToolUse hooks are the correct mechanism.
+
+**Tech Stack:** Python 3.10+, FastAPI, claude-agent-sdk (ClaudeSDKClient, HookMatcher), pytest, pytest-asyncio
 
 **Spec:** `docs/plans/2026-04-08-sdk-client-migration-and-ask-user-question.md`
 
@@ -17,7 +19,7 @@
 | File | Action | Responsibility |
 |------|--------|---------------|
 | `src/session_manager.py` | Modify | Add `client`, `input_event`, `input_response`, `pending_tool_call` fields; async disconnect on cleanup |
-| `src/backends/claude/client.py` | Modify | Add `create_client()`, `run_completion_with_client()`, `_make_can_use_tool()` |
+| `src/backends/claude/client.py` | Modify | Add `create_client()`, `run_completion_with_client()`, `_make_PreToolUse hook()` |
 | `src/response_models.py` | Modify | Add `FunctionCallOutputItem`, `FunctionCallOutputInput`; extend `ResponseObject.output` union |
 | `src/routes/responses.py` | Modify | Detect `function_call_output` input, route to ClaudeSDKClient path, emit function_call on AskUserQuestion |
 | `src/session_guard.py` | Modify | Handle `function_call_output` continuation (skip turn increment) |
@@ -483,7 +485,7 @@ def session():
 
 
 async def test_create_client_returns_connected_client(cli, session):
-    """create_client() returns a ClaudeSDKClient with can_use_tool callback."""
+    """create_client() returns a ClaudeSDKClient with PreToolUse hook callback."""
     mock_client = AsyncMock()
     mock_client.connect = AsyncMock()
 
@@ -494,8 +496,8 @@ async def test_create_client_returns_connected_client(cli, session):
     assert client is mock_client
 
 
-async def test_create_client_sets_can_use_tool(cli, session):
-    """create_client() configures can_use_tool in options."""
+async def test_create_client_sets_PreToolUse hook(cli, session):
+    """create_client() configures PreToolUse hook in options."""
     captured_options = {}
 
     def capture_client(options=None, **kwargs):
@@ -507,7 +509,7 @@ async def test_create_client_sets_can_use_tool(cli, session):
     with patch("src.backends.claude.client.ClaudeSDKClient", side_effect=capture_client):
         await cli.create_client(session=session, model="sonnet")
 
-    assert captured_options["options"].can_use_tool is not None
+    assert captured_options["options"].PreToolUse hook is not None
 
 
 async def test_run_completion_with_client_yields_messages(cli, session):
@@ -534,9 +536,9 @@ async def test_run_completion_with_client_yields_messages(cli, session):
     assert len(chunks) >= 1
 
 
-async def test_can_use_tool_callback_ask_user_question(cli, session):
-    """can_use_tool callback sets pending_tool_call and waits for input_event."""
-    callback = cli._make_can_use_tool(session)
+async def test_PreToolUse hook_callback_ask_user_question(cli, session):
+    """PreToolUse hook callback sets pending_tool_call and waits for input_event."""
+    callback = cli._make_PreToolUse hook(session)
 
     context = MagicMock()
     context.tool_use_id = "toolu_123"
@@ -558,9 +560,9 @@ async def test_can_use_tool_callback_ask_user_question(cli, session):
     assert session.pending_tool_call is not None or session.input_event is None
 
 
-async def test_can_use_tool_callback_allows_other_tools(cli, session):
-    """can_use_tool callback allows non-AskUserQuestion tools immediately."""
-    callback = cli._make_can_use_tool(session)
+async def test_PreToolUse hook_callback_allows_other_tools(cli, session):
+    """PreToolUse hook callback allows non-AskUserQuestion tools immediately."""
+    callback = cli._make_PreToolUse hook(session)
     context = MagicMock()
     context.tool_use_id = "toolu_456"
 
@@ -584,19 +586,19 @@ from claude_agent_sdk import ClaudeSDKClient
 from claude_agent_sdk.types import PermissionResultAllow, ToolPermissionContext
 ```
 
-- [ ] **Step 4: Implement `_make_can_use_tool()` on `ClaudeCodeCLI`**
+- [ ] **Step 4: Implement `_make_PreToolUse hook()` on `ClaudeCodeCLI`**
 
 Add method to `ClaudeCodeCLI` class:
 
 ```python
-    def _make_can_use_tool(self, session):
-        """Create a can_use_tool callback bound to a session.
+    def _make_PreToolUse hook(self, session):
+        """Create a PreToolUse hook callback bound to a session.
 
         When AskUserQuestion is detected, sets session.pending_tool_call
         and waits on session.input_event for the client's response.
         All other tools are allowed immediately.
         """
-        async def can_use_tool(tool_name: str, tool_input: dict, context: ToolPermissionContext):
+        async def PreToolUse hook(tool_name: str, tool_input: dict, context: ToolPermissionContext):
             if tool_name == "AskUserQuestion":
                 session.pending_tool_call = {
                     "call_id": context.tool_use_id,
@@ -612,7 +614,7 @@ Add method to `ClaudeCodeCLI` class:
                 return PermissionResultAllow()
             return PermissionResultAllow()
 
-        return can_use_tool
+        return PreToolUse hook
 ```
 
 Add `import asyncio` if not already imported.
@@ -636,7 +638,7 @@ Add method to `ClaudeCodeCLI`:
     ):
         """Create and connect a ClaudeSDKClient for a session.
 
-        The client persists across turns. A can_use_tool callback is
+        The client persists across turns. A PreToolUse hook callback is
         registered to intercept AskUserQuestion.
         """
         options = self._build_sdk_options(
@@ -652,7 +654,7 @@ Add method to `ClaudeCodeCLI`:
             task_budget=task_budget,
             cwd=cwd,
         )
-        options.can_use_tool = self._make_can_use_tool(session)
+        options.PreToolUse hook = self._make_PreToolUse hook(session)
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
@@ -886,14 +888,14 @@ In `src/routes/responses.py`, in the `create_response()` function, after session
                 status_code=400,
                 detail=f"call_id mismatch: expected {session.pending_tool_call['call_id']}",
             )
-        # Feed response to waiting can_use_tool callback
+        # Feed response to waiting PreToolUse hook callback
         session.input_response = fc_output["output"]
         session.input_event.set()
 
         # Stream the continuation from the SDK (callback resumes, SDK continues)
         if body.stream:
             # The ClaudeSDKClient is still alive and will resume streaming
-            # after the can_use_tool callback returns
+            # after the PreToolUse hook callback returns
             return StreamingResponse(
                 _run_client_continuation_stream(session, body, response_id, next_turn),
                 media_type="text/event-stream",
@@ -911,7 +913,7 @@ Add to `src/routes/responses.py`:
 async def _run_client_continuation_stream(session, body, response_id, next_turn):
     """Stream the SDK continuation after function_call_output is provided.
 
-    The can_use_tool callback has been unblocked, so client.receive_response()
+    The PreToolUse hook callback has been unblocked, so client.receive_response()
     will yield new messages as the SDK resumes processing.
     """
     stream_result = {"success": False}
@@ -989,7 +991,7 @@ Modify `_run_stream()` to use `run_completion_with_client()` when `session.clien
 In `src/streaming_utils.py`, in `stream_response_chunks()`, after the main streaming loop, add a check for pending_tool_call. Pass `session` as a new parameter:
 
 ```python
-    # After the streaming loop ends (SDK paused on can_use_tool)
+    # After the streaming loop ends (SDK paused on PreToolUse hook)
     if session and session.pending_tool_call:
         tc = session.pending_tool_call
         yield make_function_call_response_sse(
