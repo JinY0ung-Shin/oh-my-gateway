@@ -56,6 +56,7 @@ def _prepare_stateless_completion(
     messages: list,
     claude_options: Dict[str, Any],
     metadata: Optional[Dict[str, str]] = None,
+    user: Optional[str] = None,
 ) -> tuple:
     """Prepare prompt and run_completion kwargs for stateless mode.
 
@@ -79,6 +80,7 @@ def _prepare_stateless_completion(
         mcp_servers=claude_options.get("mcp_servers"),
         task_budget=claude_options.get("task_budget"),
         _metadata=metadata,
+        _user=user,
     )
     return prompt, run_kwargs
 
@@ -169,6 +171,7 @@ async def _streaming_session_preflight(
             system_prompt=sys_prompt if pf.is_new else None,
             _custom_base=session.base_system_prompt,
             _metadata=request.metadata,
+            _user=request.user,
             permission_mode=options.get("permission_mode"),
             mcp_servers=options.get("mcp_servers"),
             allowed_tools=options.get("allowed_tools"),
@@ -230,6 +233,7 @@ async def generate_streaming_response(
                 system_prompt=sys_prompt if pf.is_new else None,
                 _custom_base=session.base_system_prompt,
                 _metadata=request.metadata,
+                _user=request.user,
                 permission_mode=options.get("permission_mode"),
                 mcp_servers=options.get("mcp_servers"),
                 allowed_tools=options.get("allowed_tools"),
@@ -246,7 +250,7 @@ async def generate_streaming_response(
             _validate_backend_auth(resolved.backend)
             options = _build_backend_options(request, resolved, claude_headers)
             prompt, run_kwargs = _prepare_stateless_completion(
-                request.messages, options, metadata=request.metadata
+                request.messages, options, metadata=request.metadata, user=request.user
             )
             chunk_source = backend.run_completion(**run_kwargs, stream=True)
 
@@ -384,6 +388,7 @@ async def chat_completions(
                         system_prompt=sys_prompt if pf.is_new else None,
                         _custom_base=session.base_system_prompt,
                         _metadata=request_body.metadata,
+                        _user=request_body.user,
                         permission_mode=options.get("permission_mode"),
                         mcp_servers=options.get("mcp_servers"),
                         allowed_tools=options.get("allowed_tools"),
@@ -405,7 +410,10 @@ async def chat_completions(
                         )
             else:
                 prompt, run_kwargs = _prepare_stateless_completion(
-                    request_body.messages, options, metadata=request_body.metadata
+                    request_body.messages,
+                    options,
+                    metadata=request_body.metadata,
+                    user=request_body.user,
                 )
                 # Materialize images in prompt if present
                 if _request_has_images(request_body) and hasattr(backend, "image_handler"):

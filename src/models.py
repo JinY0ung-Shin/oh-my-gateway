@@ -93,7 +93,7 @@ class ChatCompletionRequest(BaseModel):
     allowed_tools: Optional[List[str]] = Field(
         default=None,
         description="Explicit list of allowed tools. When set, overrides the default tool list. "
-                    "Supports exact names (Read, Bash) and MCP patterns (mcp__server__*).",
+        "Supports exact names (Read, Bash) and MCP patterns (mcp__server__*).",
     )
     stream_options: Optional[StreamOptions] = Field(
         default=None, description="Options for streaming responses"

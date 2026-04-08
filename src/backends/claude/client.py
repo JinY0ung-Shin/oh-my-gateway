@@ -305,6 +305,7 @@ class ClaudeCodeCLI:
         extra_env: Optional[Dict[str, str]] = None,
         task_budget: Optional[int] = None,
         cwd: Optional[Path] = None,
+        user: Optional[str] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
@@ -318,6 +319,14 @@ class ClaudeCodeCLI:
 
         if model:
             options.model = model
+
+        # Inject user identity into system prompt so Claude Code knows who
+        # is driving the conversation.  Only added on the first turn;
+        # resume turns skip system_prompt entirely so the context persists.
+        if user:
+            user_context = f"Current user: {user}"
+            system_prompt = f"{system_prompt}\n\n{user_context}" if system_prompt else user_context
+
         # Resolve the custom base prompt.  When _custom_base is the sentinel
         # (_UNSET) the caller did not provide a frozen value so we read the
         # current global state (appropriate for stateless / first-turn calls).
@@ -532,6 +541,7 @@ class ClaudeCodeCLI:
                     extra_env=_extra.get("_metadata"),
                     task_budget=task_budget,
                     cwd=Path(cwd) if cwd else None,
+                    user=_extra.get("_user"),
                 )
 
                 async for message in query(prompt=prompt, options=options):
