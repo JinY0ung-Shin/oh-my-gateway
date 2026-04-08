@@ -198,19 +198,17 @@ async def test_run_completion_with_client_error_during_receive():
 
 async def test_hook_allows_other_tools():
     """Non-AskUserQuestion tools get an empty dict (allow and proceed)."""
-    from types import SimpleNamespace
-
     cli = _make_cli()
     session = Session(session_id="sess-other-tool")
 
     hook = cli._make_ask_user_hook(session)
 
-    # PreToolUseHookInput is a dataclass; simulate with SimpleNamespace
-    input_data = SimpleNamespace(
-        tool_name="BashTool",
-        tool_input={"command": "ls"},
-        tool_use_id="tu_123",
-    )
+    # input_data is a plain dict (not a dataclass) per SDK contract
+    input_data = {
+        "tool_name": "BashTool",
+        "tool_input": {"command": "ls"},
+        "tool_use_id": "tu_123",
+    }
     result = await hook(input_data, "tu_123", {})
 
     assert result == {}
@@ -220,19 +218,18 @@ async def test_hook_allows_other_tools():
 
 
 async def test_hook_intercepts_ask_user_question():
-    """AskUserQuestion hook sets pending_tool_call and waits for input_event."""
-    from types import SimpleNamespace
-
+    """AskUserQuestion hook sets pending_tool_call, waits, then returns deny+reason."""
     cli = _make_cli()
     session = Session(session_id="sess-ask")
 
     hook = cli._make_ask_user_hook(session)
 
-    input_data = SimpleNamespace(
-        tool_name="AskUserQuestion",
-        tool_input={"question": "Continue?"},
-        tool_use_id="tu_ask_1",
-    )
+    # input_data is a plain dict per SDK contract
+    input_data = {
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"question": "Continue?"},
+        "tool_use_id": "tu_ask_1",
+    }
 
     # Run hook in a task — it will block on input_event.wait()
     result_holder = []
@@ -262,11 +259,12 @@ async def test_hook_intercepts_ask_user_question():
     # Wait for hook to complete
     await task
 
-    # Hook should have returned a SyncHookJSONOutput with permissionDecision
+    # Hook should have returned deny + reason (user's answer)
     assert len(result_holder) == 1
     result = result_holder[0]
     assert "hookSpecificOutput" in result
-    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "Yes, continue" in result["hookSpecificOutput"]["permissionDecisionReason"]
 
     # After hook completes, input_response and input_event are reset
     assert session.input_response is None

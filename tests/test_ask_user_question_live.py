@@ -53,12 +53,18 @@ async def test_pretooluse_hook_fires_for_ask_user_question():
     callback_event = asyncio.Event()
 
     async def hook(input_data, tool_use_id, context):
-        tool_name = getattr(input_data, "tool_name", "")
-        callback_log.append(
-            {"tool_name": tool_name, "input": getattr(input_data, "tool_input", {})}
-        )
+        tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
+        tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
+        callback_log.append({"tool_name": tool_name, "input": tool_input})
         if tool_name == "AskUserQuestion":
             callback_event.set()
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "User responded: yes",
+                }
+            }
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",
@@ -118,7 +124,7 @@ async def test_pretooluse_hook_receives_tool_permissions():
     callback_log = []
 
     async def hook(input_data, tool_use_id, context):
-        tool_name = getattr(input_data, "tool_name", "")
+        tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
         callback_log.append(tool_name)
         return {
             "hookSpecificOutput": {
@@ -169,12 +175,19 @@ async def test_hook_can_await_for_response():
     hook_completed = asyncio.Event()
 
     async def hook(input_data, tool_use_id, context):
-        tool_name = getattr(input_data, "tool_name", "")
+        tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
         if tool_name == "AskUserQuestion":
             hook_started.set()
             # Simulate waiting for external input
             await external_event.wait()
             hook_completed.set()
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": "User responded: proceed",
+                }
+            }
         return {
             "hookSpecificOutput": {
                 "hookEventName": "PreToolUse",

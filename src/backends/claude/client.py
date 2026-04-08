@@ -497,21 +497,22 @@ class ClaudeCodeCLI:
     def _make_ask_user_hook(self, session):
         """Create a PreToolUse hook that intercepts AskUserQuestion.
 
-        When AskUserQuestion is detected, sets ``session.pending_tool_call``
-        and waits on ``session.input_event`` for the client's response.
-        Returns ``permissionDecision: "allow"`` after the response is received.
-
-        The hook is registered with ``matcher="AskUserQuestion"`` so the CLI
-        only invokes it for that specific tool.
+        When AskUserQuestion is detected, parks the session and waits for
+        client input. Returns deny + user's response as the reason, which
+        the CLI converts to a tool_result that Claude reads as the answer.
         """
 
         async def hook(input_data, tool_use_id, context):
-            tool_name = getattr(input_data, "tool_name", "")
-            tool_input = getattr(input_data, "tool_input", {})
-            actual_tool_use_id = getattr(input_data, "tool_use_id", tool_use_id)
-
+            tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
             if tool_name != "AskUserQuestion":
                 return {}  # Allow other tools to proceed
+
+            tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
+            actual_tool_use_id = (
+                input_data.get("tool_use_id", tool_use_id)
+                if isinstance(input_data, dict)
+                else tool_use_id
+            )
 
             session.pending_tool_call = {
                 "call_id": actual_tool_use_id,
@@ -521,14 +522,18 @@ class ClaudeCodeCLI:
             session.input_event = asyncio.Event()
             await session.input_event.wait()
 
-            # Reset state
+            # Capture response before clearing state
+            user_response = session.input_response or ""
             session.input_response = None
             session.input_event = None
 
+            # Deny with user's response as reason — CLI converts this to
+            # a tool_result that Claude reads as the user's answer.
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
-                    "permissionDecision": "allow",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"User responded: {user_response}",
                 }
             }
 
@@ -598,6 +603,25 @@ class ClaudeCodeCLI:
                 yield self._convert_message(message)
         except Exception as exc:
             logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
+            session.client = None
+            yield {"type": "error", "is_error": True, "error": str(exc)}
+
+    async def receive_response_from_client(
+        self,
+        client: ClaudeSDKClient,
+        session,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield remaining messages from *client* without sending a new query.
+
+        Used after the PreToolUse hook returns (deny + reason) — the SDK
+        continues processing from where it left off.  A new ``query()``
+        call is unnecessary because the original request is still active.
+        """
+        try:
+            async for message in client.receive_response():
+                yield self._convert_message(message)
+        except Exception as exc:
+            logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
             session.client = None
             yield {"type": "error", "is_error": True, "error": str(exc)}
 

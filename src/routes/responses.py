@@ -600,7 +600,13 @@ async def _handle_function_call_output(
             stream_result = {"success": False}
             try:
                 chunks_buffer = []
-                chunk_source = backend.run_completion_with_client(session.client, "", session)
+                # After the hook returns deny+reason, the SDK continues
+                # processing from where it left off.  Use
+                # receive_response_from_client (no new query needed).
+                if hasattr(backend, "receive_response_from_client"):
+                    chunk_source = backend.receive_response_from_client(session.client, session)
+                else:
+                    chunk_source = backend.run_completion_with_client(session.client, "", session)
 
                 sse_source = streaming_utils.stream_response_chunks(
                     chunk_source=chunk_source,
@@ -678,7 +684,13 @@ async def _handle_function_call_output(
     # --- Non-streaming continuation ---
     async with _nonstreaming_lock(session):
         chunks = []
-        async for chunk in backend.run_completion_with_client(session.client, "", session):
+        # After the hook returns deny+reason, the SDK continues
+        # processing from where it left off — no new query needed.
+        if hasattr(backend, "receive_response_from_client"):
+            chunk_source = backend.receive_response_from_client(session.client, session)
+        else:
+            chunk_source = backend.run_completion_with_client(session.client, "", session)
+        async for chunk in chunk_source:
             chunks.append(chunk)
 
         # Check for another pending_tool_call
