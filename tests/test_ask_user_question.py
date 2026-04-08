@@ -6,6 +6,7 @@ Covers:
 - Validation error cases in _handle_function_call_output
 - ResponseCreateRequest accepting function_call_output items
 - Integration tests via FastAPI TestClient
+- Continuation paths (non-streaming and streaming) in _handle_function_call_output
 """
 
 import asyncio
@@ -15,6 +16,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 import src.main as main
@@ -502,3 +504,460 @@ class TestIntegrationFunctionCallOutput:
                 json={"model": "test", "messages": [{"role": "user", "content": "hi"}]},
             )
         assert r.status_code in (404, 405)
+
+
+# ---------------------------------------------------------------------------
+# Continuation path tests for _handle_function_call_output (lines 600-759)
+# ---------------------------------------------------------------------------
+
+
+def _make_continuation_session(session_id: str, turn: int = 1):
+    """Build a session pre-configured for function_call_output continuation.
+
+    The returned session has:
+    - pending_tool_call with call_id 'toolu_abc'
+    - input_event (an unset asyncio.Event)
+    - client set to a truthy MagicMock
+    - turn_counter = turn
+    - lock = asyncio.Lock()
+    """
+    from src.session_manager import Session
+
+    session = Session(session_id=session_id, backend="claude")
+    session.pending_tool_call = {
+        "call_id": "toolu_abc",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Overwrite file?"},
+    }
+    session.input_event = asyncio.Event()
+    session.client = MagicMock(name="mock_sdk_client")
+    session.turn_counter = turn
+    session.workspace = "/tmp/ws/test"
+    return session
+
+
+def _make_body(stream: bool = False, model: str = DEFAULT_MODEL):
+    """Build a ResponseCreateRequest for function_call_output."""
+    return ResponseCreateRequest(
+        model=model,
+        input=[
+            {"type": "function_call_output", "call_id": "toolu_abc", "output": "yes"},
+        ],
+        previous_response_id="resp_00000000-0000-0000-0000-000000000000_1",
+        stream=stream,
+    )
+
+
+def _make_resolved(model: str = DEFAULT_MODEL):
+    """Build a ResolvedModel for tests."""
+    from src.backends import ResolvedModel
+
+    return ResolvedModel(public_model=model, backend="claude", provider_model=None)
+
+
+class TestContinuationNonStreaming:
+    """Test non-streaming continuation paths in _handle_function_call_output."""
+
+    async def test_happy_path_returns_completed_response(self):
+        """Non-streaming continuation returns completed response with assistant text."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        # Mock backend
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            yield {"type": "result", "subtype": "success", "result": "Done!"}
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value="Done!")
+        backend.estimate_token_usage = MagicMock(
+            return_value={"prompt_tokens": 10, "completion_tokens": 5}
+        )
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            result = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+
+        assert result["status"] == "completed"
+        assert result["id"].startswith("resp_")
+        assert any(
+            "Done!" in part.get("text", "")
+            for item in result["output"]
+            for part in item.get("content", [])
+        )
+        assert session.turn_counter == 2
+        assert session.pending_tool_call is None
+        assert session.input_response == "yes"
+
+    async def test_chained_ask_user_question_returns_requires_action(self):
+        """When continuation yields another AskUserQuestion, returns requires_action."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            # Simulate chunks that set up a new pending_tool_call
+            yield {"type": "assistant", "content": [{"type": "text", "text": "partial"}]}
+            # The SDK hook sets pending_tool_call during iteration
+            sess.pending_tool_call = {
+                "call_id": "toolu_second",
+                "name": "AskUserQuestion",
+                "arguments": {"question": "Are you sure?"},
+            }
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value="partial")
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            result = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+
+        assert result["status"] == "requires_action"
+        assert result["output"][0]["type"] == "function_call"
+        assert result["output"][0]["call_id"] == "toolu_second"
+        assert result["output"][0]["name"] == "AskUserQuestion"
+        assert session.turn_counter == 2
+
+    async def test_backend_error_chunk_returns_502(self):
+        """When backend yields an error chunk, returns 502."""
+        from fastapi import HTTPException
+
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            yield {"is_error": True, "error_message": "SDK subprocess crashed"}
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value=None)
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await _handle_function_call_output(
+                    body,
+                    resolved,
+                    backend,
+                    session,
+                    session_id,
+                    "/tmp/ws/test",
+                    {"call_id": "toolu_abc", "output": "yes"},
+                )
+
+        assert exc_info.value.status_code == 502
+        assert "SDK subprocess crashed" in exc_info.value.detail
+
+    async def test_empty_response_returns_502(self):
+        """When backend yields no text, returns 502."""
+        from fastapi import HTTPException
+
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            yield {"type": "assistant", "content": []}
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value=None)
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await _handle_function_call_output(
+                    body,
+                    resolved,
+                    backend,
+                    session,
+                    session_id,
+                    "/tmp/ws/test",
+                    {"call_id": "toolu_abc", "output": "yes"},
+                )
+
+        assert exc_info.value.status_code == 502
+        assert "No response" in exc_info.value.detail
+
+    async def test_fallback_to_run_completion_with_client(self):
+        """Uses run_completion_with_client when receive_response_from_client is absent."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock(
+            spec=["run_completion_with_client", "parse_message", "estimate_token_usage", "name"]
+        )
+
+        async def fake_run(client, prompt, sess):
+            yield {"type": "result", "subtype": "success", "result": "Fallback works!"}
+
+        backend.run_completion_with_client = fake_run
+        backend.parse_message = MagicMock(return_value="Fallback works!")
+        backend.estimate_token_usage = MagicMock(
+            return_value={"prompt_tokens": 5, "completion_tokens": 3}
+        )
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            result = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+
+        assert result["status"] == "completed"
+        assert any(
+            "Fallback works!" in part.get("text", "")
+            for item in result["output"]
+            for part in item.get("content", [])
+        )
+
+
+class TestContinuationStreaming:
+    """Test streaming continuation paths in _handle_function_call_output."""
+
+    async def test_happy_path_emits_sse_events(self):
+        """Streaming continuation emits proper SSE events with content."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=True)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            yield {"type": "result", "subtype": "success", "result": "Streamed reply"}
+
+        backend.receive_response_from_client = fake_receive
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            response = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+
+        # Response should be a StreamingResponse
+        assert isinstance(response, StreamingResponse)
+        assert response.media_type == "text/event-stream"
+
+        # Collect SSE lines
+        lines = []
+        async for chunk in response.body_iterator:
+            lines.append(chunk)
+        all_sse = "".join(lines)
+
+        assert "response.created" in all_sse
+        assert "response.in_progress" in all_sse
+        # Should have either content or completed/failed events
+        has_completed = "response.completed" in all_sse
+        has_failed = "response.failed" in all_sse
+        assert has_completed or has_failed
+
+    async def test_chained_ask_user_question_emits_function_call_sse(self):
+        """Streaming continuation with chained AskUserQuestion emits function_call SSE."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=True)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            yield {"type": "result", "result": "partial"}
+
+        backend.receive_response_from_client = fake_receive
+
+        # bridge_sse_stream yields some SSE content, then sets pending_tool_call
+        # to simulate the SDK hook firing a chained AskUserQuestion.
+        async def fake_bridge(sse_source, chunk_source):
+            async for line in sse_source:
+                yield line
+            # After bridge completes, simulate a chained tool call
+            session.pending_tool_call = {
+                "call_id": "toolu_chained",
+                "name": "AskUserQuestion",
+                "arguments": {"question": "Continue?"},
+            }
+
+        # Patches must remain active while the streaming generator runs,
+        # so consume the body_iterator inside the `with` block.
+        with (
+            patch.object(responses_module, "session_manager") as mock_sm,
+            patch.object(
+                responses_module.streaming_utils,
+                "bridge_sse_stream",
+                side_effect=fake_bridge,
+            ),
+        ):
+            mock_sm.add_assistant_response = MagicMock()
+
+            response = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+            assert isinstance(response, StreamingResponse)
+
+            lines = []
+            async for chunk in response.body_iterator:
+                lines.append(chunk)
+
+        all_sse = "".join(lines)
+        assert "function_call" in all_sse
+        assert "toolu_chained" in all_sse
+        assert "response.completed" in all_sse
+        assert session.turn_counter == 2
+
+    async def test_error_during_streaming_emits_failed_event(self):
+        """Exception during streaming emits response.failed SSE event."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=True)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        # bridge_sse_stream as an async generator that raises during iteration
+        async def fake_bridge(sse_source, chunk_source):
+            raise RuntimeError("Connection lost")
+            yield ""  # noqa: E501 — makes this an async generator
+
+        async def fake_receive(client, sess):
+            yield {"type": "result", "result": "partial"}
+
+        backend.receive_response_from_client = fake_receive
+
+        # Patches must remain active while the streaming generator runs.
+        with patch.object(
+            responses_module.streaming_utils,
+            "bridge_sse_stream",
+            side_effect=fake_bridge,
+        ):
+            response = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+            assert isinstance(response, StreamingResponse)
+
+            lines = []
+            async for chunk in response.body_iterator:
+                lines.append(chunk)
+
+        all_sse = "".join(lines)
+        assert "response.failed" in all_sse
+        assert "server_error" in all_sse
+
+    async def test_streaming_fallback_to_run_completion_with_client(self):
+        """Streaming uses run_completion_with_client when receive_response_from_client is absent."""
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        body = _make_body(stream=True)
+        resolved = _make_resolved()
+
+        # Backend without receive_response_from_client attribute
+        backend = MagicMock(
+            spec=["run_completion_with_client", "parse_message", "estimate_token_usage", "name"]
+        )
+
+        async def fake_run(client, prompt, sess):
+            yield {"type": "result", "subtype": "success", "result": "Streamed fallback!"}
+
+        backend.run_completion_with_client = fake_run
+
+        response = await _handle_function_call_output(
+            body,
+            resolved,
+            backend,
+            session,
+            session_id,
+            "/tmp/ws/test",
+            {"call_id": "toolu_abc", "output": "yes"},
+        )
+        assert isinstance(response, StreamingResponse)
+
+        lines = []
+        async for chunk in response.body_iterator:
+            lines.append(chunk)
+        all_sse = "".join(lines)
+
+        assert "response.created" in all_sse
+        assert "response.in_progress" in all_sse
