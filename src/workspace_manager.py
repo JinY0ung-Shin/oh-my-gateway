@@ -13,7 +13,7 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
-_USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$")
+_USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 
 
 class WorkspaceManager:
@@ -73,7 +73,7 @@ class WorkspaceManager:
             raise ValueError("User identifier must not be empty")
         if not _USER_PATTERN.match(user):
             raise ValueError(
-                f"Invalid user identifier: {user!r}. Must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{{0,62}}$"
+                f"Invalid user identifier: {user!r}. Must match ^[a-zA-Z0-9][a-zA-Z0-9._-]{{0,62}}$"
             )
         return user
 
