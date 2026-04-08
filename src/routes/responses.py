@@ -545,46 +545,54 @@ async def _handle_function_call_output(
     Validates that the session has a pending tool call with a matching
     ``call_id``, unblocks the SDK's PreToolUse hook, and then streams
     the continuation response from the existing :class:`ClaudeSDKClient`.
+
+    The validation and event-unblock are performed atomically under the
+    session lock to prevent races where concurrent requests could read
+    stale ``pending_tool_call`` / ``input_event`` state.
     """
-    # --- Validation ---
-    if session.pending_tool_call is None:
-        raise HTTPException(
-            status_code=400,
-            detail="function_call_output received but no pending tool call in session",
-        )
+    # --- Validate + unblock under session lock ---
+    await session.lock.acquire()
+    try:
+        if session.pending_tool_call is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but no pending tool call in session",
+            )
 
-    if session.pending_tool_call["call_id"] != fc_output["call_id"]:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"call_id mismatch: pending tool call has "
-                f"'{session.pending_tool_call['call_id']}', "
-                f"but received '{fc_output['call_id']}'"
-            ),
-        )
+        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"call_id mismatch: pending tool call has "
+                    f"'{session.pending_tool_call['call_id']}', "
+                    f"but received '{fc_output['call_id']}'"
+                ),
+            )
 
-    if not hasattr(backend, "run_completion_with_client"):
-        raise HTTPException(
-            status_code=400,
-            detail="function_call_output requires a backend that supports persistent clients",
-        )
+        if not hasattr(backend, "run_completion_with_client"):
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output requires a backend that supports persistent clients",
+            )
 
-    if session.client is None:
-        raise HTTPException(
-            status_code=400,
-            detail="function_call_output received but session has no active SDK client",
-        )
+        if session.client is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no active SDK client",
+            )
 
-    # --- Unblock the PreToolUse hook ---
-    session.input_response = fc_output["output"]
-    pending_event = session.input_event
-    if pending_event is None:
-        raise HTTPException(
-            status_code=400,
-            detail="function_call_output received but session has no pending input event",
-        )
-    pending_event.set()  # Unblocks the callback; SDK continues processing
-    session.pending_tool_call = None  # Clear the pending state
+        # --- Unblock the PreToolUse hook ---
+        session.input_response = fc_output["output"]
+        pending_event = session.input_event
+        if pending_event is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no pending input event",
+            )
+        pending_event.set()  # Unblocks the callback; SDK continues processing
+        session.pending_tool_call = None  # Clear the pending state
+    finally:
+        session.lock.release()
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1

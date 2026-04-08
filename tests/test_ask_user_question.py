@@ -8,6 +8,7 @@ Covers:
 - Integration tests via FastAPI TestClient
 """
 
+import asyncio
 import json
 from contextlib import contextmanager
 from pathlib import Path
@@ -235,6 +236,7 @@ class TestHandleFunctionCallOutputValidation:
 
         session = MagicMock()
         session.pending_tool_call = None
+        session.lock = asyncio.Lock()
         body = MagicMock()
         resolved = MagicMock()
         backend = MagicMock()
@@ -263,6 +265,7 @@ class TestHandleFunctionCallOutputValidation:
             "name": "AskUserQuestion",
             "arguments": {},
         }
+        session.lock = asyncio.Lock()
         body = MagicMock()
         resolved = MagicMock()
         backend = MagicMock()
@@ -291,6 +294,7 @@ class TestHandleFunctionCallOutputValidation:
             "name": "AskUserQuestion",
             "arguments": {},
         }
+        session.lock = asyncio.Lock()
         body = MagicMock()
         resolved = MagicMock()
         # Backend without run_completion_with_client
@@ -321,6 +325,7 @@ class TestHandleFunctionCallOutputValidation:
             "arguments": {},
         }
         session.client = None
+        session.lock = asyncio.Lock()
         body = MagicMock()
         resolved = MagicMock()
         backend = MagicMock()
@@ -352,6 +357,7 @@ class TestHandleFunctionCallOutputValidation:
         }
         session.client = MagicMock()
         session.input_event = None
+        session.lock = asyncio.Lock()
         body = MagicMock()
         resolved = MagicMock()
         backend = MagicMock()

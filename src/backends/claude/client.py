@@ -43,7 +43,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
 from src.backends.base import ResolvedModel
-from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
+from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
@@ -520,7 +520,30 @@ class ClaudeCodeCLI:
                 "arguments": tool_input,
             }
             session.input_event = asyncio.Event()
-            await session.input_event.wait()
+
+            try:
+                await asyncio.wait_for(
+                    session.input_event.wait(),
+                    timeout=ASK_USER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "AskUserQuestion hook timed out after %ds for session %s",
+                    ASK_USER_TIMEOUT_SECONDS,
+                    session.session_id,
+                )
+                session.input_response = None
+                session.input_event = None
+                session.pending_tool_call = None
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "User did not respond within the timeout period."
+                        ),
+                    }
+                }
 
             # Capture response before clearing state
             user_response = session.input_response or ""

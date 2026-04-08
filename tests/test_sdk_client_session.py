@@ -191,3 +191,36 @@ async def test_async_shutdown_clears_client_reference(fresh_session_manager: Ses
 
     # The session object itself has client=None after shutdown
     assert session.client is None
+
+
+# ---------------------------------------------------------------------------
+# _purge_all_expired TOCTOU re-check
+# ---------------------------------------------------------------------------
+
+
+async def test_purge_skips_session_refreshed_between_snapshot_and_delete(
+    fresh_session_manager: SessionManager,
+):
+    """A session refreshed (TTL extended) after the expired snapshot is NOT deleted."""
+    session = fresh_session_manager.get_or_create_session("refreshable")
+    # Force expiry so it appears in the snapshot
+    session.expires_at = session.expires_at - timedelta(hours=2)
+
+    # Take the snapshot (the internal method does this under lock)
+    with fresh_session_manager.lock:
+        expired_snapshot = [
+            (sid, fresh_session_manager.sessions[sid])
+            for sid, s in fresh_session_manager.sessions.items()
+            if s.is_expired()
+        ]
+    assert len(expired_snapshot) == 1
+
+    # Simulate a concurrent refresh: touch() extends the TTL
+    session.touch()
+    assert not session.is_expired()
+
+    # Now run the full purge — the re-check should skip this session
+    removed = await fresh_session_manager.cleanup_expired_sessions()
+
+    assert removed == 0
+    assert "refreshable" in fresh_session_manager.sessions

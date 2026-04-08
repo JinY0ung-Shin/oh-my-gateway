@@ -141,7 +141,15 @@ class SessionManager:
         return False
 
     async def _purge_all_expired(self) -> int:
-        """Remove every expired session.  Returns the count removed."""
+        """Remove every expired session.  Returns the count removed.
+
+        Takes a snapshot of expired sessions under the manager lock, then
+        disconnects clients and cleans workspaces outside the lock.  Before
+        deleting each session it re-checks under the lock that the session
+        object is still the same instance **and** still expired — this
+        prevents a TOCTOU race where a session could be refreshed (TTL
+        extended) between the snapshot and the deletion.
+        """
         with self.lock:
             expired = [
                 (sid, self.sessions[sid]) for sid, s in self.sessions.items() if s.is_expired()
@@ -157,9 +165,12 @@ class SessionManager:
             if session.workspace:
                 self._cleanup_workspace(session.workspace)
             with self.lock:
-                self.sessions.pop(sid, None)
-            logger.info(f"Cleaned up expired session: {sid}")
-            count += 1
+                # Re-check: session might have been refreshed since snapshot
+                current = self.sessions.get(sid)
+                if current is session and current.is_expired():
+                    del self.sessions[sid]
+                    logger.info(f"Cleaned up expired session: {sid}")
+                    count += 1
         return count
 
     def _purge_all_expired_sync(self) -> int:

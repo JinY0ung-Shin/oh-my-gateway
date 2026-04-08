@@ -105,6 +105,11 @@ METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
     k.strip() for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",") if k.strip()
 )
 
+# AskUserQuestion hook timeout (seconds).
+# If the client does not respond within this window the hook denies the tool
+# call and the SDK resumes.  Set via ASK_USER_TIMEOUT_SECONDS env var.
+ASK_USER_TIMEOUT_SECONDS = int(os.environ.get("ASK_USER_TIMEOUT_SECONDS", "300"))
+
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")

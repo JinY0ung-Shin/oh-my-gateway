@@ -269,3 +269,31 @@ async def test_hook_intercepts_ask_user_question():
     # After hook completes, input_response and input_event are reset
     assert session.input_response is None
     assert session.input_event is None
+
+
+async def test_hook_times_out_when_client_does_not_respond():
+    """Hook returns deny with timeout message when wait exceeds timeout."""
+    cli = _make_cli()
+    session = Session(session_id="sess-timeout")
+
+    hook = cli._make_ask_user_hook(session)
+
+    input_data = {
+        "tool_name": "AskUserQuestion",
+        "tool_input": {"question": "Respond?"},
+        "tool_use_id": "tu_timeout_1",
+    }
+
+    # Patch timeout to a very short value so the test completes quickly
+    with patch("src.backends.claude.client.ASK_USER_TIMEOUT_SECONDS", 0.05):
+        result = await hook(input_data, None, {})
+
+    # Should have returned a deny with timeout message
+    assert "hookSpecificOutput" in result
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "timeout" in result["hookSpecificOutput"]["permissionDecisionReason"].lower()
+
+    # Session state should be cleaned up
+    assert session.pending_tool_call is None
+    assert session.input_event is None
+    assert session.input_response is None
