@@ -281,12 +281,11 @@ async def create_response(
     # Determine whether to use ClaudeSDKClient (persistent session) or
     # the single-use query() path (run_completion).
     # ------------------------------------------------------------------
-    # Create a persistent ClaudeSDKClient on the second turn if the
-    # backend supports it.  We intentionally omit permission_mode so the
-    # CLI uses its default permission checks — our PreToolUse hook
-    # (registered inside create_client) intercepts AskUserQuestion,
-    # which is required for user-input interception.
-    if not is_new_session and session.client is None and hasattr(backend, "create_client"):
+    # Create a persistent ClaudeSDKClient if the backend supports it.
+    # This enables PreToolUse hook registration for AskUserQuestion
+    # interception on any turn, including the first.  We intentionally
+    # omit permission_mode so the CLI uses its default permission checks.
+    if session.client is None and hasattr(backend, "create_client"):
         try:
             session.client = await backend.create_client(
                 session=session,
@@ -302,8 +301,7 @@ async def create_response(
             session.client = None
 
     use_sdk_client = (
-        not is_new_session
-        and session.client is not None
+        session.client is not None
         and hasattr(backend, "run_completion_with_client")
     )
 

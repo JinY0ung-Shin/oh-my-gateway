@@ -961,3 +961,100 @@ class TestContinuationStreaming:
 
         assert "response.created" in all_sse
         assert "response.in_progress" in all_sse
+
+
+# ---------------------------------------------------------------------------
+# Turn 1 AskUserQuestion support tests
+# ---------------------------------------------------------------------------
+
+
+class TestTurn1PersistentClient:
+    """Verify that Turn 1 (no previous_response_id) creates and uses
+    a persistent ClaudeSDKClient when the backend supports it."""
+
+    def test_turn1_calls_create_client(self, isolated_session_manager):
+        """Turn 1 request should call create_client() on the backend."""
+        create_called = False
+
+        async def fake_create_client(**kwargs):
+            nonlocal create_called
+            create_called = True
+            return MagicMock()  # Return a mock client
+
+        async def fake_run_completion_with_client(client, prompt, session):
+            yield {"subtype": "success", "result": "Hello from SDK client"}
+
+        with _integration_client_context() as (client, mock_cli):
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion_with_client
+            mock_cli.parse_message = MagicMock(return_value="Hello from SDK client")
+
+            r = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hello",
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test"},
+            )
+        assert r.status_code == 200
+        assert create_called, "create_client() should be called on Turn 1"
+
+    def test_turn1_uses_sdk_client_path(self, isolated_session_manager):
+        """Turn 1 should use run_completion_with_client when create_client succeeds."""
+        sdk_path_used = False
+
+        async def fake_create_client(**kwargs):
+            return MagicMock()
+
+        async def fake_run_completion_with_client(client, prompt, session):
+            nonlocal sdk_path_used
+            sdk_path_used = True
+            yield {"subtype": "success", "result": "Hello via SDK"}
+
+        with _integration_client_context() as (client, mock_cli):
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion_with_client
+            mock_cli.parse_message = MagicMock(return_value="Hello via SDK")
+
+            r = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hello",
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test"},
+            )
+        assert r.status_code == 200
+        assert sdk_path_used, "run_completion_with_client() should be used on Turn 1"
+
+    def test_turn1_falls_back_on_create_client_failure(self, isolated_session_manager):
+        """Turn 1 should fall back to run_completion() when create_client() fails."""
+        fallback_used = False
+
+        async def failing_create_client(**kwargs):
+            raise RuntimeError("Client creation failed")
+
+        async def fake_run_completion(**kwargs):
+            nonlocal fallback_used
+            fallback_used = True
+            yield {"subtype": "success", "result": "Hello via fallback"}
+
+        with _integration_client_context() as (client, mock_cli):
+            mock_cli.create_client = failing_create_client
+            mock_cli.run_completion = fake_run_completion
+            mock_cli.parse_message = MagicMock(return_value="Hello via fallback")
+
+            r = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hello",
+                    "stream": False,
+                },
+                headers={"Authorization": "Bearer test"},
+            )
+        assert r.status_code == 200
+        assert fallback_used, "run_completion() fallback should be used when create_client() fails"

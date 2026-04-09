@@ -87,8 +87,8 @@ async def test_create_client_sets_hooks():
     assert callable(matchers[0].hooks[0])
 
 
-async def test_create_client_passes_session_id_to_options():
-    """create_client() passes session.session_id to _build_sdk_options."""
+async def test_create_client_uses_fresh_session_id():
+    """create_client() uses a fresh UUID, not session.session_id."""
     cli = _make_cli()
     session = Session(session_id="my-session-id")
 
@@ -107,7 +107,9 @@ async def test_create_client_passes_session_id_to_options():
 
     options = captured_options.get("options")
     assert options is not None
-    assert options.session_id == "my-session-id"
+    # The persistent client uses its own fresh UUID, not the gateway session_id
+    assert options.session_id != "my-session-id"
+    assert len(options.session_id) == 36  # UUID format
 
 
 # ---------------------------------------------------------------------------

@@ -595,9 +595,8 @@ class ClaudeCodeCLI:
         The client is connected with ``prompt=None`` (interactive mode)
         so subsequent turns can be sent via ``client.query()``.
         """
-        # Use a fresh session_id for the persistent client — the gateway
-        # session_id was already consumed by the Turn-1 query() call, and
-        # the CLI rejects reuse ("Session ID … is already in use").
+        # Use a fresh session_id for the persistent client.  Each
+        # ClaudeSDKClient needs its own CLI session identifier.
         client_session_id = str(uuid.uuid4())
         options = self._build_sdk_options(
             model=model,
