@@ -760,6 +760,7 @@ footer .copyright {{
             <a href="/docs">API Docs</a>
             <a href="/redoc">ReDoc</a>
             <a href="/admin">Admin Terminal</a>
+            <a href="/admin/chat">Chat</a>
         </nav>
         <div class="copyright">CLAUDE CODE GATEWAY // v{version}</div>
     </footer>
