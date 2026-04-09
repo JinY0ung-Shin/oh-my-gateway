@@ -523,9 +523,9 @@ footer .copyright {{
         }});
     }});
 
-    const quickstartCode = `curl -X POST http://localhost:{default_port}/v1/chat/completions \\\\
+    const quickstartCode = `curl -X POST http://localhost:{default_port}/v1/responses \\\\
   -H "Content-Type: application/json" \\\\
-  -d '{{"model": "sonnet", "messages": [{{"role": "user", "content": "Hello!"}}]}}'`;
+  -d '{{"model": "sonnet", "input": "Hello!"}}'`;
 
     async function highlightQuickstart() {{
         try {{
@@ -539,7 +539,7 @@ footer .copyright {{
     highlightQuickstart();
 </script>
 <script>
-    const quickstartText = 'curl -X POST http://localhost:{default_port}/v1/chat/completions -H "Content-Type: application/json" -d \\'{{"model": "sonnet", "messages": [{{"role": "user", "content": "Hello!"}}]}}\\'';
+    const quickstartText = 'curl -X POST http://localhost:{default_port}/v1/responses -H "Content-Type: application/json" -d \\'{{"model": "sonnet", "input": "Hello!"}}\\'';
 
     function copyQuickstart() {{
         const btn = document.getElementById('copy-btn');
@@ -605,9 +605,9 @@ footer .copyright {{
         <div class="quickstart-wrapper">
             <button id="copy-btn" onclick="copyQuickstart()" class="copy-btn" title="Copy">COPY</button>
             <div id="quickstart-code">
-                <pre>curl -X POST http://localhost:{default_port}/v1/chat/completions \\
+                <pre>curl -X POST http://localhost:{default_port}/v1/responses \\
   -H "Content-Type: application/json" \\
-  -d '{{"model": "sonnet", "messages": [{{"role": "user", "content": "Hello!"}}]}}'</pre>
+  -d '{{"model": "sonnet", "input": "Hello!"}}'</pre>
             </div>
         </div>
     </div>
@@ -616,17 +616,7 @@ footer .copyright {{
     <div class="card">
         <div class="card-title">API Endpoints</div>
 
-        <div class="endpoint-group-label">Chat &amp; Completion</div>
-        <div class="endpoint-row">
-            <span class="badge badge-post">POST</span>
-            <span class="endpoint-path">/v1/chat/completions</span>
-            <span class="endpoint-desc">OpenAI-compatible chat</span>
-        </div>
-        <div class="endpoint-row">
-            <span class="badge badge-post">POST</span>
-            <span class="endpoint-path">/v1/messages</span>
-            <span class="endpoint-desc">Anthropic-compatible</span>
-        </div>
+        <div class="endpoint-group-label">Completion</div>
         <div class="endpoint-row">
             <span class="badge badge-post">POST</span>
             <span class="endpoint-path">/v1/responses</span>
@@ -770,6 +760,7 @@ footer .copyright {{
             <a href="/docs">API Docs</a>
             <a href="/redoc">ReDoc</a>
             <a href="/admin">Admin Terminal</a>
+            <a href="/admin/chat">Chat</a>
         </nav>
         <div class="copyright">CLAUDE CODE GATEWAY // v{version}</div>
     </footer>

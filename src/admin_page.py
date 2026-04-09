@@ -842,6 +842,7 @@ input[type="checkbox"] {
         <button role="tab" :aria-selected="tab === 'files'" @click="tab='files'; loadFiles()">FILES</button>
         <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">SKILLS</button>
         <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">CONFIG</button>
+        <a href="/admin/chat" role="tab" style="color:var(--cyan);text-decoration:none;padding:var(--gap-sm) var(--gap-lg);font-size:var(--fs-sm);letter-spacing:0.08em;border-bottom:2px solid transparent;display:flex;align-items:center;gap:4px;white-space:nowrap;">CHAT ↗</a>
       </nav>
 
       <!-- Dashboard Tab -->

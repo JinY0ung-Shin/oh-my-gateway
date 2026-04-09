@@ -13,7 +13,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
-from src.models import ChatCompletionRequest, Message
 from src.streaming_utils import (
     CollabJsonStreamFilter,
     ToolUseAccumulator,
@@ -21,13 +20,11 @@ from src.streaming_utils import (
     _extract_tool_blocks,
     _normalize_tool_result,
     extract_embedded_tool_blocks,
-    extract_stop_reason,
     extract_stream_event_delta,
     extract_user_tool_results,
     make_response_sse,
     make_tool_result_response_sse,
     make_tool_use_response_sse,
-    stream_chunks,
     stream_response_chunks,
     strip_collab_json,
 )
@@ -585,131 +582,8 @@ class TestExtractUserToolResultsEmptyContent:
 # ---------------------------------------------------------------------------
 
 
-class TestStreamChunksTokenStreamingDuplicateFiltering:
-    @pytest.mark.asyncio
-    async def test_stream_event_skipped_after_token_streaming(self):
-        """Line 712: stream_event chunks are skipped in token streaming mode."""
-
-        async def source():
-            # First: a text delta to enable token_streaming
-            yield {
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "Hello"},
-                },
-            }
-            # Then: a stray stream_event that should be skipped
-            yield {
-                "type": "stream_event",
-                "event": {"type": "message_stop"},
-            }
-            # Then: an assistant content chunk that should be skipped
-            yield {"content": [{"type": "text", "text": "duplicate"}]}
-
-        request = ChatCompletionRequest(
-            model="claude-test",
-            messages=[Message(role="user", content="Hi")],
-            stream=True,
-        )
-        lines = [
-            line
-            async for line in stream_chunks(
-                source(), request, "req-dup", [], logging.getLogger("test-dup")
-            )
-        ]
-        all_content = "".join(lines)
-        assert "Hello" in all_content
-        # "duplicate" should NOT appear because it's filtered in token streaming mode
-        assert "duplicate" not in all_content
-
-
 # ---------------------------------------------------------------------------
-# Line 722: Parent tool use ID assignment
-# ---------------------------------------------------------------------------
-
-
-class TestStreamChunksParentToolUseId:
-    @pytest.mark.asyncio
-    async def test_user_chunk_with_parent_tool_use_id(self):
-        """Line 722: parent_tool_use_id is attached to tool_result system_event."""
-
-        async def source():
-            yield {
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "Hi"},
-                },
-            }
-            yield {
-                "type": "user",
-                "parent_tool_use_id": "parent-99",
-                "content": [
-                    {"type": "tool_result", "tool_use_id": "t1", "content": "result"},
-                ],
-            }
-
-        request = ChatCompletionRequest(
-            model="claude-test",
-            messages=[Message(role="user", content="Hi")],
-            stream=True,
-        )
-        lines = [
-            line
-            async for line in stream_chunks(
-                source(), request, "req-parent", [], logging.getLogger("test-parent")
-            )
-        ]
-        system_events = []
-        for line in lines:
-            if line.startswith("data: ") and "system_event" in line:
-                parsed = json.loads(line[len("data: ") :])
-                system_events.append(parsed["system_event"])
-
-        assert len(system_events) == 1
-        assert system_events[0]["parent_tool_use_id"] == "parent-99"
-        assert system_events[0]["tool_use_id"] == "t1"
-
-
-# ---------------------------------------------------------------------------
-# Lines 748-750: Collab filter flush at stream end
-# ---------------------------------------------------------------------------
-
-
-class TestStreamChunksCollabFilterFlush:
-    @pytest.mark.asyncio
-    async def test_collab_filter_flushes_remaining_at_end(self):
-        """Lines 748-750: remaining buffered text is flushed at stream end."""
-
-        async def source():
-            # Start a JSON-like block that never closes
-            yield {
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "Hello {incomplete"},
-                },
-            }
-
-        request = ChatCompletionRequest(
-            model="claude-test",
-            messages=[Message(role="user", content="Hi")],
-            stream=True,
-        )
-        lines = [
-            line
-            async for line in stream_chunks(
-                source(), request, "req-flush", [], logging.getLogger("test-flush")
-            )
-        ]
-        all_content = "".join(lines)
-        assert "Hello" in all_content
-        assert "{incomplete" in all_content
-
-
-# ---------------------------------------------------------------------------
-# Line 807: Task event extraction for system chunks in Responses API
+# Task event extraction for system chunks in Responses API
 # (Line 897 in stream_response_chunks — system chunk with valid task_event)
 # ---------------------------------------------------------------------------
 
@@ -981,74 +855,6 @@ class TestStreamResponseChunksSystemUnmatchedSubtype:
         # Content should still flow through
         deltas = [p.get("delta", "") for et, p in parsed if et == "response.output_text.delta"]
         assert "Content" in "".join(d for d in deltas if isinstance(d, str))
-
-
-# ---------------------------------------------------------------------------
-# Chat Completions: system chunk with unmatched subtype (None return)
-# ---------------------------------------------------------------------------
-
-
-class TestStreamChunksSystemUnmatched:
-    @pytest.mark.asyncio
-    async def test_system_unmatched_subtype_no_event(self):
-        """Lines 356, 682-685: system chunk with None task_event skips emission."""
-
-        async def source():
-            yield {"type": "system", "subtype": "not_a_real_subtype"}
-            yield {
-                "type": "stream_event",
-                "event": {
-                    "type": "content_block_delta",
-                    "delta": {"type": "text_delta", "text": "OK"},
-                },
-            }
-
-        request = ChatCompletionRequest(
-            model="claude-test",
-            messages=[Message(role="user", content="Hi")],
-            stream=True,
-        )
-        lines = [
-            line
-            async for line in stream_chunks(
-                source(), request, "req-sys-skip", [], logging.getLogger("test-sys-skip")
-            )
-        ]
-        all_content = "".join(lines)
-        assert "OK" in all_content
-        # No system_event for unmatched subtype
-        for line in lines:
-            if line.startswith("data: "):
-                parsed = json.loads(line[len("data: ") :])
-                if "system_event" in parsed:
-                    assert parsed["system_event"]["type"] != "not_a_real_subtype"
-
-
-# ---------------------------------------------------------------------------
-# Lines 59-62: extract_stop_reason
-# ---------------------------------------------------------------------------
-
-
-class TestExtractStopReason:
-    def test_returns_stop_reason_from_last_result(self):
-        """Lines 59-61: extracts stop_reason from the last result message."""
-        messages = [
-            {"type": "assistant", "stop_reason": "end_turn"},
-            {"type": "metadata"},
-        ]
-        assert extract_stop_reason(messages) == "end_turn"
-
-    def test_returns_none_when_no_stop_reason(self):
-        """Line 62: returns None when no message has stop_reason."""
-        messages = [{"type": "assistant"}, {"type": "metadata"}]
-        assert extract_stop_reason(messages) is None
-
-    def test_picks_last_message_with_stop_reason(self):
-        messages = [
-            {"stop_reason": "max_tokens"},
-            {"stop_reason": "end_turn"},
-        ]
-        assert extract_stop_reason(messages) == "end_turn"
 
 
 # ---------------------------------------------------------------------------

@@ -16,8 +16,8 @@ from src.request_logger import (
 
 class TestBucketMapping:
     def test_exact_paths(self):
-        assert _bucket_for_path("/v1/chat/completions") == "chat"
-        assert _bucket_for_path("/v1/messages") == "chat"
+        assert _bucket_for_path("/v1/chat/completions") is None
+        assert _bucket_for_path("/v1/messages") is None
         assert _bucket_for_path("/v1/responses") == "responses"
         assert _bucket_for_path("/health") == "health"
         assert _bucket_for_path("/v1/mcp/servers") == "general"
@@ -50,7 +50,7 @@ class TestShouldLog:
 
     def test_includes_api_paths(self):
         logger = RequestLogger()
-        assert logger.should_log("/v1/chat/completions") is True
+        assert logger.should_log("/v1/responses") is True
         assert logger.should_log("/v1/models") is True
         assert logger.should_log("/health") is True
 
@@ -62,7 +62,7 @@ class TestShouldLog:
     def test_custom_exclude_prefixes(self):
         logger = RequestLogger(exclude_prefixes=["/internal/"])
         assert logger.should_log("/internal/metrics") is False
-        assert logger.should_log("/v1/chat/completions") is True
+        assert logger.should_log("/v1/responses") is True
         assert logger.should_log("/admin/api/logs") is True  # not excluded with custom
 
 
@@ -75,7 +75,7 @@ def _make_entry(**overrides):
     defaults = {
         "timestamp": time.time(),
         "method": "POST",
-        "path": "/v1/chat/completions",
+        "path": "/v1/responses",
         "status_code": 200,
         "response_time_ms": 50.0,
         "client_ip": "127.0.0.1",
@@ -104,11 +104,11 @@ class TestLogAndQuery:
 
     def test_filter_by_endpoint(self):
         logger = RequestLogger(maxlen=100)
-        logger.log(_make_entry(path="/v1/chat/completions"))
+        logger.log(_make_entry(path="/v1/responses"))
         logger.log(_make_entry(path="/v1/models"))
-        logger.log(_make_entry(path="/v1/chat/completions"))
+        logger.log(_make_entry(path="/v1/responses"))
 
-        result = logger.query(endpoint="chat")
+        result = logger.query(endpoint="responses")
         assert result["total"] == 2
 
     def test_filter_by_status_exact(self):
@@ -185,9 +185,9 @@ class TestLogAndQuery:
 
     def test_entry_includes_bucket(self):
         logger = RequestLogger(maxlen=10)
-        logger.log(_make_entry(path="/v1/chat/completions"))
+        logger.log(_make_entry(path="/v1/responses"))
         result = logger.query()
-        assert result["items"][0]["bucket"] == "chat"
+        assert result["items"][0]["bucket"] == "responses"
 
     def test_entry_untracked_bucket(self):
         logger = RequestLogger(maxlen=10)
@@ -215,42 +215,42 @@ class TestRateLimitSnapshot:
         logger = RequestLogger(maxlen=100)
         snapshot = logger.get_rate_limit_snapshot()
         # Should have entries for all configured buckets
-        assert "chat" in snapshot
+        assert "responses" in snapshot
         assert "general" in snapshot
-        assert snapshot["chat"]["total_usage"] == 0
-        assert snapshot["chat"]["clients"] == []
+        assert snapshot["responses"]["total_usage"] == 0
+        assert snapshot["responses"]["clients"] == []
 
     def test_snapshot_counts_recent_requests(self):
         logger = RequestLogger(maxlen=100)
         now = time.time()
-        logger.log(_make_entry(timestamp=now, path="/v1/chat/completions", client_ip="1.1.1.1"))
-        logger.log(_make_entry(timestamp=now, path="/v1/chat/completions", client_ip="1.1.1.1"))
-        logger.log(_make_entry(timestamp=now, path="/v1/chat/completions", client_ip="2.2.2.2"))
+        logger.log(_make_entry(timestamp=now, path="/v1/responses", client_ip="1.1.1.1"))
+        logger.log(_make_entry(timestamp=now, path="/v1/responses", client_ip="1.1.1.1"))
+        logger.log(_make_entry(timestamp=now, path="/v1/responses", client_ip="2.2.2.2"))
 
         snapshot = logger.get_rate_limit_snapshot()
-        assert snapshot["chat"]["total_usage"] == 3
-        assert len(snapshot["chat"]["clients"]) == 2
+        assert snapshot["responses"]["total_usage"] == 3
+        assert len(snapshot["responses"]["clients"]) == 2
         # Top consumer should be first
-        assert snapshot["chat"]["clients"][0]["ip"] == "1.1.1.1"
-        assert snapshot["chat"]["clients"][0]["count"] == 2
+        assert snapshot["responses"]["clients"][0]["ip"] == "1.1.1.1"
+        assert snapshot["responses"]["clients"][0]["count"] == 2
 
     def test_snapshot_excludes_old_requests(self):
         logger = RequestLogger(maxlen=100)
         old_ts = time.time() - 120  # 2 minutes ago
-        logger.log(_make_entry(timestamp=old_ts, path="/v1/chat/completions"))
+        logger.log(_make_entry(timestamp=old_ts, path="/v1/responses"))
 
         snapshot = logger.get_rate_limit_snapshot(window_seconds=60)
-        assert snapshot["chat"]["total_usage"] == 0
+        assert snapshot["responses"]["total_usage"] == 0
 
     def test_snapshot_pct_used(self):
         logger = RequestLogger(maxlen=100)
         now = time.time()
-        # Chat limit is 10 req/min by default
+        # Responses limit is 10 req/min by default
         for _ in range(5):
-            logger.log(_make_entry(timestamp=now, path="/v1/chat/completions", client_ip="1.1.1.1"))
+            logger.log(_make_entry(timestamp=now, path="/v1/responses", client_ip="1.1.1.1"))
 
         snapshot = logger.get_rate_limit_snapshot()
-        client = snapshot["chat"]["clients"][0]
+        client = snapshot["responses"]["clients"][0]
         assert client["pct_used"] == 50.0  # 5/10 * 100
 
     def test_snapshot_excludes_untracked_endpoints(self):

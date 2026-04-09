@@ -5,7 +5,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/JinY0ung-Shin/claude-code-gateway)
 [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-FastAPI gateway that exposes the Claude Agent SDK through OpenAI-compatible APIs. Use Claude Code with any OpenAI client library or custom integrations. Some OpenAI parameters (e.g., `temperature`, `top_p`) are accepted for compatibility but silently ignored — see `/v1/compatibility` for details.
+FastAPI gateway that exposes the Claude Agent SDK through the Responses API. Use Claude Code with `previous_response_id` chaining for multi-turn conversations.
 
 ## Quick Start
 
@@ -20,15 +20,13 @@ uv run uvicorn src.main:app --reload --port 8000
 ```
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
-  -d '{"model": "sonnet", "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "sonnet", "input": "Hello"}'
 ```
 
 ## Features
 
-- **OpenAI API Compatible** — `/v1/chat/completions` with streaming
-- **Anthropic API Compatible** — `/v1/messages` endpoint
 - **Responses API** — `/v1/responses` with `previous_response_id` chaining
 - **Session Management** — Multi-turn conversations via `session_id`
 - **Auth Support** — API key or CLI auth
@@ -79,7 +77,6 @@ Key environment variables (see `.env.example` for full list):
 | `MCP_CONFIG` | — | MCP server config (JSON string or file path) |
 | `API_KEY` | — | Optional Bearer token for access control |
 | `SESSION_MAX_AGE_MINUTES` | `60` | Session TTL |
-| `RATE_LIMIT_CHAT_PER_MINUTE` | `10` | Chat endpoint rate limit |
 
 ### Bash Sandbox
 
@@ -110,54 +107,23 @@ See `.env.example` for the full list of sandbox environment variables.
 
 ## Usage
 
-### OpenAI Python SDK
-
-```python
-from openai import OpenAI
-
-client = OpenAI(base_url="http://localhost:8000/v1", api_key="any")
-
-# Basic
-response = client.chat.completions.create(
-    model="sonnet",
-    messages=[{"role": "user", "content": "Explain quantum computing"}]
-)
-print(response.choices[0].message.content)
-
-# Streaming
-for chunk in client.chat.completions.create(
-    model="sonnet",
-    messages=[{"role": "user", "content": "Write a haiku"}],
-    stream=True
-):
-    if chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
-
-# Session continuity
-response = client.chat.completions.create(
-    model="sonnet",
-    messages=[{"role": "user", "content": "My name is Alice"}],
-    extra_body={"session_id": "my-session"}
-)
-```
-
 ### curl
 
 ```bash
+# Basic request
+curl http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model": "sonnet", "input": "Hello"}'
+
 # Streaming
-curl -N http://localhost:8000/v1/chat/completions \
+curl -N http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
-  -d '{"model": "sonnet", "messages": [{"role": "user", "content": "Hello"}], "stream": true}'
+  -d '{"model": "sonnet", "input": "Hello", "stream": true}'
 
-# With session
-curl http://localhost:8000/v1/chat/completions \
+# Multi-turn chaining
+curl http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
-  -d '{"model": "sonnet", "messages": [{"role": "user", "content": "Remember: x=42"}], "session_id": "s1"}'
-
-# Anthropic-style messages
-curl http://localhost:8000/v1/messages \
-  -H "Content-Type: application/json" \
-  -d '{"model": "sonnet", "max_tokens": 512, "messages": [{"role": "user", "content": "Hello"}]}'
+  -d '{"model": "sonnet", "input": "What did I just say?", "previous_response_id": "<response_id_from_previous_turn>"}'
 ```
 
 ### Per-User Workspace Isolation
@@ -185,8 +151,6 @@ Each `/v1/responses` request can include a `user` field to isolate working direc
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `POST` | `/v1/chat/completions` | OpenAI-compatible chat completions |
-| `POST` | `/v1/messages` | Anthropic-style messages |
 | `POST` | `/v1/responses` | Responses API with `previous_response_id` chaining |
 | `GET` | `/v1/models` | Available models |
 | `GET` | `/v1/sessions` | List active sessions |
@@ -201,7 +165,7 @@ Each `/v1/responses` request can include a `user` field to isolate working direc
 | `POST` | `/v1/debug/request` | Debug raw request inspection |
 | `GET` | `/` | Interactive API explorer |
 
-Streaming (`"stream": true`) is supported on `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
+Streaming (`"stream": true`) is supported on `/v1/responses`.
 
 For detailed SSE event formats including tool call rendering, subagent events, and tool name/input schemas, see **[docs/streaming-events.md](docs/streaming-events.md)**.
 

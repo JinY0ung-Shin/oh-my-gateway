@@ -29,8 +29,6 @@ from src.constants import RATE_LIMITS
 # here.  Undecorated endpoints (e.g. ``/v1/models``, ``/v1/compatibility``)
 # are intentionally absent so the monitoring view doesn't overreport.
 _PATH_BUCKET_MAP: Dict[str, str] = {
-    "/v1/chat/completions": "chat",
-    "/v1/messages": "chat",
     "/v1/responses": "responses",
     "/health": "health",
     "/version": "health",

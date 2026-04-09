@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 
-from src.models import ContentPart, Message, AnthropicContentBlock, AnthropicTextBlock
+from src.models import ContentPart, Message
 from src.message_adapter import MessageAdapter
 from src.response_models import ResponseInputItem
 
@@ -70,33 +70,6 @@ class TestMessageNormalization:
         """Plain string content passes through without modification."""
         msg = Message(role="user", content="hello")
         assert msg.content == "hello"
-
-
-class TestAnthropicContentBlock:
-    def test_anthropic_content_block_text(self):
-        block = AnthropicContentBlock(type="text", text="hello")
-        assert block.type == "text"
-        assert block.text == "hello"
-        assert block.source is None
-
-    def test_anthropic_content_block_image(self):
-        block = AnthropicContentBlock(
-            type="image",
-            source={
-                "type": "base64",
-                "media_type": "image/png",
-                "data": TINY_PNG_B64,
-            },
-        )
-        assert block.type == "image"
-        assert block.source["type"] == "base64"
-        assert block.source["media_type"] == "image/png"
-        assert block.source["data"] == TINY_PNG_B64
-        assert block.text is None
-
-    def test_anthropic_text_block_alias(self):
-        """AnthropicTextBlock is an alias for AnthropicContentBlock (backward compat)."""
-        assert AnthropicTextBlock is AnthropicContentBlock
 
 
 # ============================================================================

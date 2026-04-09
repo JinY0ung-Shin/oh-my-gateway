@@ -2,20 +2,17 @@ import asyncio
 import json
 import logging
 import re
-import time
 from typing import Any, AsyncGenerator, Dict, Literal, Optional
 
 from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
 from src.constants import (
     SSE_KEEPALIVE_INTERVAL,
-    STREAM_FINAL_ONLY,
     SUBAGENT_STREAM_TEXT,
     SUBAGENT_STREAM_TOOL_BLOCKS,
     SUBAGENT_STREAM_PROGRESS,
 )
 from src.message_adapter import MessageAdapter
-from src.models import ChatCompletionRequest, ChatCompletionStreamResponse, StreamChoice
 from src.response_models import (
     ResponseContentPart,
     OutputItem,
@@ -28,11 +25,6 @@ from src.response_models import (
 # ---------------------------------------------------------------------------
 # Usage & stop-reason helpers
 # ---------------------------------------------------------------------------
-
-_STOP_REASON_MAP = {
-    "max_tokens": "length",
-    "tool_use": "tool_calls",
-}
 
 
 def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
@@ -121,24 +113,6 @@ def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
 
 
 FinishReason = Literal["stop", "length", "content_filter", "tool_calls"]
-
-
-def map_stop_reason(stop_reason: Optional[str] = None) -> FinishReason:
-    """Map Claude SDK stop_reason to OpenAI finish_reason."""
-    if stop_reason is None:
-        return "stop"
-    mapped = _STOP_REASON_MAP.get(stop_reason, "stop")
-    if mapped in ("length", "tool_calls", "content_filter"):
-        return mapped  # type: ignore[return-value]
-    return "stop"
-
-
-def extract_stop_reason(messages: list) -> Optional[str]:
-    """Extract stop_reason from collected SDK messages (last result message)."""
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("stop_reason") is not None:
-            return msg["stop_reason"]
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -412,23 +386,6 @@ def extract_stream_event_delta(chunk: Dict[str, Any], in_thinking: bool = False)
 # ---------------------------------------------------------------------------
 
 
-def make_sse(
-    request_id: str,
-    model: str,
-    delta: dict,
-    finish_reason=None,
-    usage=None,
-) -> str:
-    """Build a single SSE-formatted line from a delta dict."""
-    chunk = ChatCompletionStreamResponse(
-        id=request_id,
-        model=model,
-        choices=[StreamChoice(index=0, delta=delta, finish_reason=finish_reason)],
-        usage=usage,
-    )
-    return f"data: {chunk.model_dump_json()}\n\n"
-
-
 def make_response_sse(
     event_type: str,
     response_obj: Optional[Any] = None,
@@ -485,19 +442,6 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "usage": chunk.get("usage"),
         }
     return None
-
-
-def make_task_sse(request_id: str, model: str, task_event: Dict[str, Any]) -> str:
-    """Build an SSE line for Chat Completions with a system_event field (empty delta)."""
-    data = {
-        "id": request_id,
-        "object": "chat.completion.chunk",
-        "created": int(time.time()),
-        "model": model,
-        "choices": [{"index": 0, "delta": {}, "finish_reason": None}],
-        "system_event": task_event,
-    }
-    return f"data: {json.dumps(data)}\n\n"
 
 
 def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int = 0) -> str:
@@ -572,6 +516,32 @@ def make_tool_result_response_sse(
     if parent_tool_use_id:
         data["parent_tool_use_id"] = parent_tool_use_id
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+def make_function_call_response_sse(
+    response_id: str,
+    call_id: str,
+    name: str,
+    arguments: str,
+) -> str:
+    """Build SSE events for a function_call output item (e.g. AskUserQuestion).
+
+    Emits response.output_item.added with the function_call data.
+    """
+    item = {
+        "type": "function_call",
+        "id": f"fc_{call_id}",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": "completed",
+    }
+    event_data = {
+        "type": "response.output_item.added",
+        "response_id": response_id,
+        "item": item,
+    }
+    return f"event: response.output_item.added\ndata: {json.dumps(event_data)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -840,184 +810,6 @@ async def _keepalive_wrapper(
 
 
 # ---------------------------------------------------------------------------
-# Chat Completions streaming (/v1/chat/completions)
-# ---------------------------------------------------------------------------
-
-
-async def stream_chunks(
-    chunk_source,
-    request: ChatCompletionRequest,
-    request_id: str,
-    chunks_buffer: list,
-    logger: logging.Logger,
-) -> AsyncGenerator[str, None]:
-    """Shared SSE streaming logic for both stateless and session modes."""
-
-    # STREAM_FINAL_ONLY: collect all chunks, only emit the final result at the end.
-    if STREAM_FINAL_ONLY:
-        final_text = None
-        async for chunk in _keepalive_wrapper(chunk_source, SSE_KEEPALIVE_INTERVAL):
-            if chunk is _SSE_KEEPALIVE:
-                yield _SSE_KEEPALIVE
-                continue
-            if isinstance(chunk, dict):
-                chunks_buffer.append(chunk)
-                if chunk.get("subtype") == "success" and "result" in chunk:
-                    final_text = chunk["result"]
-                elif chunk.get("type") == "assistant" and chunk.get("error"):
-                    final_text = f"[Error: {chunk['error']}]"
-        text = final_text or "No response generated."
-        yield make_sse(request_id, request.model, {"role": "assistant", "content": ""})
-        yield make_sse(request_id, request.model, {"content": text})
-        return
-
-    role_sent = False
-    content_sent = False
-    token_streaming = False
-    in_thinking = False
-    tool_acc = ToolUseAccumulator()
-    collab_filter = CollabJsonStreamFilter()
-
-    def _emit_sse(text: str):
-        nonlocal role_sent
-        if not role_sent:
-            role_sent = True
-            return [
-                make_sse(request_id, request.model, {"role": "assistant", "content": ""}),
-                make_sse(request_id, request.model, {"content": text}),
-            ]
-        return [make_sse(request_id, request.model, {"content": text})]
-
-    async for chunk in _keepalive_wrapper(chunk_source, SSE_KEEPALIVE_INTERVAL):
-        # Keepalive SSE comments — forward directly to the client
-        if chunk is _SSE_KEEPALIVE:
-            yield _SSE_KEEPALIVE
-            continue
-
-        # Handle AssistantMessage.error (auth failures, rate limits, etc.)
-        if chunk.get("type") == "assistant" and chunk.get("error"):
-            chunks_buffer.append(chunk)
-            for sse in _emit_sse(f"\n\n[Error: {chunk['error']}]\n"):
-                yield sse
-            content_sent = True
-            continue
-
-        # Handle SDK rate-limit events (new in SDK 0.1.49)
-        if chunk.get("type") == "rate_limit":
-            status = _extract_rate_limit_status(chunk)
-            logger.warning("SDK rate limit event: status=%s", status)
-            if status == "rejected":
-                for sse in _emit_sse("\n\n[Error: rate_limit_rejected]\n"):
-                    yield sse
-                content_sent = True
-            continue
-
-        # Handle task system messages (structured JSON, not content)
-        if chunk.get("type") == "system":
-            is_subagent_task = chunk.get("parent_tool_use_id") is not None
-            if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
-                task_event = _build_task_event(chunk)
-                if task_event:
-                    yield make_task_sse(request_id, request.model, task_event)
-            continue
-
-        # Token-level streaming (text/thinking deltas)
-        text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
-        if text_delta is not None:
-            token_streaming = True
-            if text_delta:
-                cleaned = collab_filter.feed(text_delta)
-                if cleaned:
-                    for sse in _emit_sse(cleaned):
-                        yield sse
-                    content_sent = True
-            elif not role_sent:
-                yield make_sse(request_id, request.model, {"role": "assistant", "content": ""})
-                role_sent = True
-            continue
-
-        # Accumulate tool_use blocks from stream events
-        handled, tool_block = tool_acc.process_stream_event(chunk)
-        if handled:
-            if tool_block:
-                is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
-                if not is_subagent_tool or SUBAGENT_STREAM_TOOL_BLOCKS:
-                    yield make_task_sse(request_id, request.model, tool_block)
-            continue
-
-        # User chunks with tool_result blocks
-        if chunk.get("type") == "user":
-            tool_results, parent_id = extract_user_tool_results(chunk)
-            is_subagent_result = parent_id is not None
-            if not is_subagent_result or SUBAGENT_STREAM_TOOL_BLOCKS:
-                for tr_block in tool_results:
-                    result_data = _normalize_tool_result(tr_block)
-                    if parent_id:
-                        result_data["parent_tool_use_id"] = parent_id
-                    yield make_task_sse(request_id, request.model, result_data)
-            chunks_buffer.append(chunk)
-            continue
-
-        # Emit tool_use/tool_result blocks embedded in assistant content.
-        # This MUST run before the token-streaming skip below so that tool
-        # blocks inside assistant content chunks are not silently dropped
-        # when token_streaming is True (which suppresses duplicate text but
-        # must not suppress structured tool events).
-        embedded_tools = extract_embedded_tool_blocks(chunk)
-        for tb in embedded_tools:
-            is_subagent_tb = tb.get("parent_tool_use_id") is not None
-            if not is_subagent_tb or SUBAGENT_STREAM_TOOL_BLOCKS:
-                if tb.get("type") == "tool_use":
-                    yield make_task_sse(request_id, request.model, tb)
-                elif tb.get("type") == "tool_result":
-                    result_data = _normalize_tool_result(tb)
-                    yield make_task_sse(request_id, request.model, result_data)
-
-        # Skip duplicate assistant text in token-streaming mode.
-        # Tool blocks were already extracted above, so only text is suppressed.
-        if token_streaming:
-            if chunk.get("type") == "stream_event":
-                continue
-            if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
-                if chunk.get("type") == "assistant" and chunk.get("usage"):
-                    chunks_buffer.append(chunk)
-                continue
-
-        # Content chunks (assistant messages, results)
-        chunks_buffer.append(chunk)
-        text = format_chunk_content(chunk, content_sent)
-        if text:
-            for sse in _emit_sse(text):
-                yield sse
-            content_sent = True
-
-    # Flush remaining buffered chars from collab filter
-    remaining_collab = collab_filter.flush()
-    if remaining_collab:
-        for sse in _emit_sse(remaining_collab):
-            yield sse
-        content_sent = True
-
-    if tool_acc.has_incomplete:
-        logger.warning("Incomplete tool_use blocks at stream end: %s", tool_acc.incomplete_keys)
-
-    if not role_sent:
-        yield make_sse(request_id, request.model, {"role": "assistant", "content": ""})
-        role_sent = True
-
-    if role_sent and not content_sent:
-        logger.warning(
-            "No content received from SDK. Raw chunks: %s",
-            json.dumps(chunks_buffer, default=str),
-        )
-        yield make_sse(
-            request_id,
-            request.model,
-            {"content": "I'm unable to provide a response at the moment."},
-        )
-
-
-# ---------------------------------------------------------------------------
 # Responses API streaming (/v1/responses)
 # ---------------------------------------------------------------------------
 
@@ -1265,7 +1057,14 @@ async def stream_response_chunks(
     # --- Finalization ---
 
     # No content received → emit response.failed (not fake success)
+    # When AskUserQuestion hook fires, streaming ends with no content —
+    # the caller sets allow_empty to suppress the failed event so it can
+    # emit function_call + requires_action instead.
     if not content_sent:
+        if stream_result.get("allow_empty"):
+            logger.info("Responses stream: no content (allow_empty set, hook may have fired)")
+            stream_result["success"] = False
+            return
         logger.warning("Responses stream: no content received from SDK")
         stream_result["success"] = False
         yield _make_failed_event("empty_response", "No response generated")

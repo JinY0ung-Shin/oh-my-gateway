@@ -15,18 +15,8 @@ from src.models import (
     Message,
     StreamOptions,
     ChatCompletionRequest,
-    Choice,
-    Usage,
-    ChatCompletionResponse,
-    StreamChoice,
-    ChatCompletionStreamResponse,
     SessionInfo,
     SessionListResponse,
-    AnthropicTextBlock,
-    AnthropicMessage,
-    AnthropicMessagesRequest,
-    AnthropicUsage,
-    AnthropicMessagesResponse,
 )
 
 
@@ -213,81 +203,10 @@ class TestChatCompletionRequest:
 
     def test_task_budget_rejects_non_positive(self):
         """task_budget rejects zero and negative values."""
-        import pytest
-
         with pytest.raises(Exception):
             ChatCompletionRequest(messages=[Message(role="user", content="Hi")], task_budget=0)
         with pytest.raises(Exception):
             ChatCompletionRequest(messages=[Message(role="user", content="Hi")], task_budget=-100)
-
-
-class TestChatCompletionResponse:
-    """Test ChatCompletionResponse model."""
-
-    def test_response_has_auto_generated_id(self):
-        """Response has auto-generated ID starting with chatcmpl-."""
-        response = ChatCompletionResponse(
-            model="claude-3",
-            choices=[
-                Choice(
-                    index=0,
-                    message=Message(role="assistant", content="Hello"),
-                    finish_reason="stop",
-                )
-            ],
-        )
-        assert response.id.startswith("chatcmpl-")
-
-    def test_response_object_type(self):
-        """Response object is chat.completion."""
-        response = ChatCompletionResponse(
-            model="claude-3",
-            choices=[
-                Choice(
-                    index=0,
-                    message=Message(role="assistant", content="Hello"),
-                    finish_reason="stop",
-                )
-            ],
-        )
-        assert response.object == "chat.completion"
-
-    def test_response_created_timestamp(self):
-        """Response has created timestamp."""
-        before = int(datetime.now().timestamp())
-        response = ChatCompletionResponse(
-            model="claude-3",
-            choices=[
-                Choice(
-                    index=0,
-                    message=Message(role="assistant", content="Hello"),
-                    finish_reason="stop",
-                )
-            ],
-        )
-        after = int(datetime.now().timestamp())
-        assert before <= response.created <= after
-
-
-class TestChatCompletionStreamResponse:
-    """Test ChatCompletionStreamResponse model."""
-
-    def test_stream_response_object_type(self):
-        """Stream response object is chat.completion.chunk."""
-        response = ChatCompletionStreamResponse(
-            model="claude-3",
-            choices=[StreamChoice(index=0, delta={"content": "Hello"})],
-        )
-        assert response.object == "chat.completion.chunk"
-
-    def test_stream_response_with_usage(self):
-        """Stream response can include usage."""
-        response = ChatCompletionStreamResponse(
-            model="claude-3",
-            choices=[StreamChoice(index=0, delta={}, finish_reason="stop")],
-            usage=Usage(prompt_tokens=10, completion_tokens=5, total_tokens=15),
-        )
-        assert response.usage.total_tokens == 15
 
 
 class TestSessionModels:
@@ -322,70 +241,3 @@ class TestSessionModels:
             total=1,
         )
         assert response.total == 1
-
-
-class TestAnthropicModels:
-    """Test Anthropic API compatible models."""
-
-    def test_anthropic_text_block(self):
-        """Can create AnthropicTextBlock."""
-        block = AnthropicTextBlock(text="Hello world")
-        assert block.type == "text"
-        assert block.text == "Hello world"
-
-    def test_anthropic_message(self):
-        """Can create AnthropicMessage."""
-        msg = AnthropicMessage(role="user", content="Hello")
-        assert msg.role == "user"
-
-    def test_anthropic_message_with_blocks(self):
-        """Can create AnthropicMessage with content blocks."""
-        msg = AnthropicMessage(role="assistant", content=[AnthropicTextBlock(text="Hi there")])
-        assert len(msg.content) == 1
-
-    def test_anthropic_messages_request(self):
-        """Can create AnthropicMessagesRequest."""
-        request = AnthropicMessagesRequest(
-            model="claude-3-opus",
-            messages=[AnthropicMessage(role="user", content="Hello")],
-            max_tokens=1000,
-        )
-        assert request.model == "claude-3-opus"
-        assert request.max_tokens == 1000
-
-    def test_anthropic_messages_request_to_openai(self):
-        """to_openai_messages() converts correctly."""
-        request = AnthropicMessagesRequest(
-            model="claude-3",
-            messages=[
-                AnthropicMessage(role="user", content="Hello"),
-                AnthropicMessage(
-                    role="assistant",
-                    content=[
-                        AnthropicTextBlock(text="Part 1"),
-                        AnthropicTextBlock(text="Part 2"),
-                    ],
-                ),
-            ],
-        )
-        openai_msgs = request.to_openai_messages()
-        assert len(openai_msgs) == 2
-        assert openai_msgs[0].content == "Hello"
-        assert openai_msgs[1].content == "Part 1\nPart 2"
-
-    def test_anthropic_usage(self):
-        """Can create AnthropicUsage."""
-        usage = AnthropicUsage(input_tokens=100, output_tokens=50)
-        assert usage.input_tokens == 100
-
-    def test_anthropic_messages_response(self):
-        """Can create AnthropicMessagesResponse."""
-        response = AnthropicMessagesResponse(
-            model="claude-3",
-            content=[AnthropicTextBlock(text="Response text")],
-            usage=AnthropicUsage(input_tokens=10, output_tokens=5),
-        )
-        assert response.type == "message"
-        assert response.role == "assistant"
-        assert response.stop_reason == "end_turn"
-        assert response.id.startswith("msg_")

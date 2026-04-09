@@ -1,7 +1,6 @@
 from typing import List, Optional, Dict, Any, Union, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
-import uuid
 
 
 # Import DEFAULT_MODEL to avoid circular imports
@@ -146,47 +145,6 @@ class ChatCompletionRequest(BaseModel):
         return options
 
 
-class Choice(BaseModel):
-    index: int
-    message: Message
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls"]] = None
-
-
-class Usage(BaseModel):
-    prompt_tokens: int
-    completion_tokens: int
-    total_tokens: int
-
-
-class ChatCompletionResponse(BaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:8]}")
-    object: Literal["chat.completion"] = "chat.completion"
-    created: int = Field(default_factory=lambda: int(datetime.now().timestamp()))
-    model: str
-    choices: List[Choice]
-    usage: Optional[Usage] = None
-    system_fingerprint: Optional[str] = None
-
-
-class StreamChoice(BaseModel):
-    index: int
-    delta: Dict[str, Any]
-    finish_reason: Optional[Literal["stop", "length", "content_filter", "tool_calls"]] = None
-
-
-class ChatCompletionStreamResponse(BaseModel):
-    id: str = Field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex[:8]}")
-    object: Literal["chat.completion.chunk"] = "chat.completion.chunk"
-    created: int = Field(default_factory=lambda: int(datetime.now().timestamp()))
-    model: str
-    choices: List[StreamChoice]
-    usage: Optional[Usage] = Field(
-        default=None,
-        description="Usage information (only in final chunk when stream_options.include_usage=true)",
-    )
-    system_fingerprint: Optional[str] = None
-
-
 class SessionInfo(BaseModel):
     session_id: str
     created_at: datetime
@@ -198,81 +156,3 @@ class SessionInfo(BaseModel):
 class SessionListResponse(BaseModel):
     sessions: List[SessionInfo]
     total: int
-
-
-# ============================================================================
-# Anthropic API Compatible Models (for /v1/messages endpoint)
-# ============================================================================
-
-
-class AnthropicContentBlock(BaseModel):
-    """Anthropic content block (text or image)."""
-
-    type: Literal["text", "image"] = "text"
-    text: Optional[str] = None
-    source: Optional[dict] = None
-
-
-# Backward-compatible alias
-AnthropicTextBlock = AnthropicContentBlock
-
-
-class AnthropicMessage(BaseModel):
-    """Anthropic message format."""
-
-    role: Literal["user", "assistant"]
-    content: Union[str, List[AnthropicContentBlock]]
-
-
-class AnthropicMessagesRequest(BaseModel):
-    """Anthropic Messages API request format."""
-
-    model: str
-    messages: List[AnthropicMessage]
-    max_tokens: int = Field(default=4096, description="Maximum tokens to generate")
-    system: Optional[str] = Field(default=None, description="System prompt")
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=1)
-    top_p: Optional[float] = Field(default=None, ge=0, le=1)
-    top_k: Optional[int] = Field(default=None, ge=0)
-    stop_sequences: Optional[List[str]] = None
-    stream: Optional[bool] = True
-    metadata: Optional[Dict[str, Any]] = None
-
-    def to_openai_messages(self) -> List[Message]:
-        """Convert Anthropic messages to OpenAI format."""
-        result = []
-        for msg in self.messages:
-            content = msg.content
-            if isinstance(content, list):
-                # Extract text from content blocks, skip image blocks
-                # (image blocks are handled separately by the image handler)
-                text_parts = [
-                    block.text
-                    for block in content
-                    if isinstance(block, AnthropicContentBlock)
-                    and block.type == "text"
-                    and block.text is not None
-                ]
-                content = "\n".join(text_parts)
-            result.append(Message(role=msg.role, content=content))
-        return result
-
-
-class AnthropicUsage(BaseModel):
-    """Anthropic usage information."""
-
-    input_tokens: int
-    output_tokens: int
-
-
-class AnthropicMessagesResponse(BaseModel):
-    """Anthropic Messages API response format."""
-
-    id: str = Field(default_factory=lambda: f"msg_{uuid.uuid4().hex[:24]}")
-    type: Literal["message"] = "message"
-    role: Literal["assistant"] = "assistant"
-    content: List[AnthropicContentBlock]
-    model: str
-    stop_reason: Optional[Literal["end_turn", "max_tokens", "stop_sequence"]] = "end_turn"
-    stop_sequence: Optional[str] = None
-    usage: AnthropicUsage

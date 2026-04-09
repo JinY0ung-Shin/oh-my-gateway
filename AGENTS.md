@@ -1,9 +1,7 @@
 # Repository Guidelines
 
 ## Project Scope
-This repository is a FastAPI gateway for the Claude Agent SDK. It exposes three API surfaces:
-- `/v1/chat/completions` for OpenAI-compatible chat completions
-- `/v1/messages` for Anthropic-compatible messages
+This repository is a FastAPI gateway for the Claude Agent SDK. It exposes one primary API surface:
 - `/v1/responses` for Responses API flows with `previous_response_id`
 
 ## Project Structure

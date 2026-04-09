@@ -213,16 +213,16 @@ class TestGetRateLimitForEndpoint:
         importlib.reload(src.constants)
         importlib.reload(src.rate_limiter)
 
-    def test_chat_endpoint_default(self):
-        """Chat endpoint has default rate limit."""
+    def test_responses_endpoint_default(self):
+        """Responses endpoint has default rate limit."""
         with patch.dict(os.environ, {}, clear=False):
-            if "RATE_LIMIT_CHAT_PER_MINUTE" in os.environ:
-                del os.environ["RATE_LIMIT_CHAT_PER_MINUTE"]
+            if "RATE_LIMIT_RESPONSES_PER_MINUTE" in os.environ:
+                del os.environ["RATE_LIMIT_RESPONSES_PER_MINUTE"]
 
             self._reload_modules()
             from src.rate_limiter import get_rate_limit_for_endpoint
 
-            result = get_rate_limit_for_endpoint("chat")
+            result = get_rate_limit_for_endpoint("responses")
             assert result == "10/minute"
 
     def test_debug_endpoint_default(self):
@@ -281,10 +281,10 @@ class TestGetRateLimitForEndpoint:
         import src.constants
         import src.rate_limiter
 
-        with patch.dict(os.environ, {"RATE_LIMIT_CHAT_PER_MINUTE": "50"}):
+        with patch.dict(os.environ, {"RATE_LIMIT_RESPONSES_PER_MINUTE": "50"}):
             importlib.reload(src.constants)
             importlib.reload(src.rate_limiter)
-            result = src.rate_limiter.get_rate_limit_for_endpoint("chat")
+            result = src.rate_limiter.get_rate_limit_for_endpoint("responses")
             assert result == "50/minute"
 
     def test_unknown_endpoint_uses_general_default(self):

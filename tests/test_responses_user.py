@@ -7,8 +7,6 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 import src.main as main
-import src.routes.chat as chat_module
-import src.routes.messages as messages_module
 import src.routes.responses as responses_module
 import src.routes.general as general_module
 from src.backend_registry import BackendRegistry
@@ -36,14 +34,10 @@ def client_context_with_workspace(mock_wm):
 
     with (
         patch.object(main, "discover_backends", _mock_discover),
-        patch.object(chat_module, "verify_api_key", new=AsyncMock(return_value=True)),
-        patch.object(messages_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(responses_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(general_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(main, "validate_claude_code_auth", return_value=(True, {"method": "test"})),
-        patch.object(chat_module, "_validate_backend_auth"),
         patch.object(responses_module, "validate_backend_auth_or_raise"),
-        patch.object(messages_module, "validate_backend_auth_or_raise"),
         patch.object(main.session_manager, "start_cleanup_task"),
         patch.object(main.session_manager, "async_shutdown", new=AsyncMock()),
         patch.object(responses_module, "workspace_manager", mock_wm),

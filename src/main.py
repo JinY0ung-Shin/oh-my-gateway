@@ -178,7 +178,7 @@ async def lifespan(app: FastAPI):
         logger.debug(f"   MAX_TIMEOUT: {DEFAULT_TIMEOUT_MS}")
         logger.debug(f"   CLAUDE_CWD: {os.getenv('CLAUDE_CWD', 'Not set')}")
         logger.debug("🔧 Available endpoints:")
-        logger.debug("   POST /v1/chat/completions - Main chat endpoint")
+        logger.debug("   POST /v1/responses - Responses API endpoint")
         logger.debug("   GET  /v1/models - List available models")
         logger.debug("   POST /v1/debug/request - Debug request validation")
         logger.debug("   GET  /v1/auth/status - Authentication status")
@@ -497,16 +497,12 @@ async def http_exception_handler(request: Request, exc):
 # ==================== Register Routers ====================
 
 from src.routes import (  # noqa: E402
-    chat_router,
-    messages_router,
     responses_router,
     sessions_router,
     general_router,
     admin_router,
 )
 
-app.include_router(chat_router)
-app.include_router(messages_router)
 app.include_router(responses_router)
 app.include_router(sessions_router)
 app.include_router(general_router)
@@ -515,23 +511,9 @@ app.include_router(admin_router)
 
 # ==================== Backward-compat re-exports ====================
 # Tests call these functions directly as main.X() — re-exports are required.
-# Note: patch.object(main, "X", ...) does NOT affect route module behavior
-# because routes bind their own copies at import time. Tests that need mocks
-# must patch the route module directly (e.g., patch.object(chat_module, "X", ...)).
 
 from fastapi import HTTPException  # noqa: E402, F811
 
-from src.routes.chat import (  # noqa: E402, F401, F811
-    generate_streaming_response,
-    _build_backend_options,
-    _validate_backend_auth,
-    _resolve_and_get_backend,
-    _validate_image_request,
-    _request_has_images,
-    _prepare_stateless_completion,
-    _prepare_session_prompt,
-    _streaming_session_preflight,
-)
 from src.routes.responses import (  # noqa: E402, F401, F811
     _generate_msg_id,
     _make_response_id,
@@ -543,15 +525,6 @@ from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS  # noqa: E402, F
 from src.constants import PERMISSION_MODE_BYPASS  # noqa: E402, F401, F811
 from src.backend_registry import ResolvedModel  # noqa: E402, F401, F811
 from src import streaming_utils  # noqa: E402, F401, F811
-from src.streaming_utils import (  # noqa: E402, F401, F811
-    map_stop_reason,
-    extract_stop_reason,
-    is_assistant_content_chunk as _is_assistant_content_chunk,
-    process_chunk_content as _process_chunk_content,
-    extract_stream_event_delta as _extract_stream_event_delta,
-    make_sse as _make_sse,
-    stream_chunks as _stream_chunks,
-)
 
 
 # ==================== Server Startup ====================

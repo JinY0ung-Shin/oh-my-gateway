@@ -4,16 +4,18 @@ Wraps the Claude Agent SDK ``query()`` function into a ``BackendClient``
 implementation registered as the ``claude`` backend.
 """
 
+import asyncio
 import os
 import tempfile
 import atexit
 import shutil
 import contextlib
+import uuid
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 import logging
 
-from claude_agent_sdk import query, ClaudeAgentOptions
+from claude_agent_sdk import query, ClaudeAgentOptions, ClaudeSDKClient
 from claude_agent_sdk.types import (
     StreamEvent,
     AssistantMessage,
@@ -21,6 +23,7 @@ from claude_agent_sdk.types import (
     UserMessage,
     SystemMessage,
     RateLimitEvent,
+    HookMatcher,
 )
 from claude_agent_sdk.types import (
     SandboxSettings,
@@ -41,7 +44,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
 from src.backends.base import ResolvedModel
-from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
+from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
@@ -496,6 +499,213 @@ class ClaudeCodeCLI:
 
     # Backward-compatible alias — existing code calls verify_cli().
     verify_cli = verify
+
+    # ------------------------------------------------------------------
+    # ClaudeSDKClient lifecycle (persistent, bidirectional sessions)
+    # ------------------------------------------------------------------
+
+    def _make_ask_user_hook(self, session):
+        """Create a PreToolUse hook that intercepts AskUserQuestion.
+
+        When AskUserQuestion is detected, parks the session and waits for
+        client input. Returns deny + user's response as the reason, which
+        the CLI converts to a tool_result that Claude reads as the answer.
+        """
+
+        async def hook(input_data, tool_use_id, context):
+            tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
+            if tool_name != "AskUserQuestion":
+                return {}  # Allow other tools to proceed
+
+            tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
+            actual_tool_use_id = (
+                input_data.get("tool_use_id", tool_use_id)
+                if isinstance(input_data, dict)
+                else tool_use_id
+            )
+
+            session.pending_tool_call = {
+                "call_id": actual_tool_use_id,
+                "name": "AskUserQuestion",
+                "arguments": tool_input,
+            }
+            session.input_event = asyncio.Event()
+
+            # Signal the streaming loop to break so the route can
+            # emit function_call + requires_action before the hook
+            # blocks waiting for user input.
+            if session.stream_break_event is not None:
+                session.stream_break_event.set()
+
+            try:
+                await asyncio.wait_for(
+                    session.input_event.wait(),
+                    timeout=ASK_USER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "AskUserQuestion hook timed out after %ds for session %s",
+                    ASK_USER_TIMEOUT_SECONDS,
+                    session.session_id,
+                )
+                session.input_response = None
+                session.input_event = None
+                session.pending_tool_call = None
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "User did not respond within the timeout period."
+                        ),
+                    }
+                }
+
+            # Capture response before clearing state
+            user_response = session.input_response or ""
+            session.input_response = None
+            session.input_event = None
+
+            # Deny with user's response as reason — CLI converts this to
+            # a tool_result that Claude reads as the user's answer.
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": f"User responded: {user_response}",
+                }
+            }
+
+        return hook
+
+    async def create_client(
+        self,
+        session,
+        model: Optional[str] = None,
+        system_prompt: Optional[str] = None,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        permission_mode: Optional[str] = None,
+        mcp_servers: Optional[Dict[str, Any]] = None,
+        task_budget: Optional[int] = None,
+        cwd: Optional[str] = None,
+    ) -> ClaudeSDKClient:
+        """Create and connect a :class:`ClaudeSDKClient` for *session*.
+
+        The client is connected with ``prompt=None`` (interactive mode)
+        so subsequent turns can be sent via ``client.query()``.
+        """
+        # Use a fresh session_id for the persistent client.  Each
+        # ClaudeSDKClient needs its own CLI session identifier.
+        client_session_id = str(uuid.uuid4())
+        options = self._build_sdk_options(
+            model=model,
+            system_prompt=system_prompt,
+            max_turns=10,
+            allowed_tools=allowed_tools,
+            disallowed_tools=disallowed_tools,
+            session_id=client_session_id,
+            resume=None,
+            permission_mode=permission_mode,
+            mcp_servers=mcp_servers,
+            task_budget=task_budget,
+            cwd=Path(cwd) if cwd else None,
+        )
+        options.hooks = {
+            "PreToolUse": [
+                HookMatcher(
+                    matcher="AskUserQuestion",
+                    hooks=[self._make_ask_user_hook(session)],
+                )
+            ]
+        }
+
+        with self._sdk_env():
+            client = ClaudeSDKClient(options=options)
+            await client.connect(prompt=None)
+
+        return client
+
+    async def run_completion_with_client(
+        self,
+        client: ClaudeSDKClient,
+        prompt: str,
+        session,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Run a completion turn on an existing *client*.
+
+        Sends *prompt* via ``client.query()`` then yields converted
+        message dicts from ``client.receive_response()``.  On error the
+        session's client reference is cleared so the caller can detect
+        the broken connection and create a fresh client.
+
+        When a PreToolUse hook fires for AskUserQuestion, it sets
+        ``session.stream_break_event`` to signal this loop to stop
+        yielding so the route can emit function_call + requires_action.
+        """
+        # Provide an event the hook can signal to break streaming
+        break_event = asyncio.Event()
+        session.stream_break_event = break_event
+        try:
+            await client.query(prompt)
+            response_iter = client.receive_response().__aiter__()
+            while True:
+                # Race: next message vs hook-fired break signal
+                get_next = asyncio.ensure_future(response_iter.__anext__())
+                wait_break = asyncio.ensure_future(break_event.wait())
+                done, pending = await asyncio.wait(
+                    [get_next, wait_break],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                    try:
+                        await task
+                    except (asyncio.CancelledError, StopAsyncIteration):
+                        pass
+
+                if wait_break in done:
+                    # Hook fired — yield any message that arrived concurrently,
+                    # then break so the route can emit function_call.
+                    if get_next in done:
+                        try:
+                            yield self._convert_message(get_next.result())
+                        except StopAsyncIteration:
+                            pass
+                    break
+
+                # Normal message arrived
+                if get_next in done:
+                    try:
+                        message = get_next.result()
+                    except StopAsyncIteration:
+                        break  # Stream ended normally (ResultMessage received)
+                    yield self._convert_message(message)
+        except Exception as exc:
+            logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
+            session.client = None
+            yield {"type": "error", "is_error": True, "error": str(exc)}
+        finally:
+            session.stream_break_event = None
+
+    async def receive_response_from_client(
+        self,
+        client: ClaudeSDKClient,
+        session,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield remaining messages from *client* without sending a new query.
+
+        Used after the PreToolUse hook returns (deny + reason) — the SDK
+        continues processing from where it left off.  A new ``query()``
+        call is unnecessary because the original request is still active.
+        """
+        try:
+            async for message in client.receive_response():
+                yield self._convert_message(message)
+        except Exception as exc:
+            logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
+            session.client = None
+            yield {"type": "error", "is_error": True, "error": str(exc)}
 
     async def run_completion(
         self,

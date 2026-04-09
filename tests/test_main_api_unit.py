@@ -9,19 +9,15 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
-import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import src.main as main
-import src.routes.chat as chat_module
-import src.routes.messages as messages_module
 import src.routes.responses as responses_module
 import src.routes.general as general_module
 import src.routes.sessions as sessions_module
 from src.auth import auth_manager
 from src.backend_registry import BackendRegistry
-from src.backends.claude.constants import CLAUDE_TOOLS
 from src.constants import DEFAULT_MODEL
 from src.models import SessionInfo
 
@@ -50,14 +46,10 @@ def client_context():
 
     with (
         patch.object(main, "discover_backends", _mock_discover),
-        patch.object(chat_module, "verify_api_key", new=AsyncMock(return_value=True)),
-        patch.object(messages_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(responses_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(general_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(main, "validate_claude_code_auth", return_value=(True, {"method": "test"})),
-        patch.object(chat_module, "_validate_backend_auth"),
         patch.object(responses_module, "validate_backend_auth_or_raise"),
-        patch.object(messages_module, "validate_backend_auth_or_raise"),
         patch.object(main.session_manager, "start_cleanup_task"),
         patch.object(main.session_manager, "async_shutdown", new=AsyncMock()),
     ):
@@ -91,168 +83,20 @@ def test_request_size_limit_returns_413():
     assert response.json()["error"]["type"] == "request_too_large"
 
 
-def test_validation_exception_handler_includes_debug_request_body():
-    main.DEBUG_MODE = True
-
-    with client_context() as (client, _mock_cli):
-        response = client.post(
-            "/v1/chat/completions",
-            json={"model": DEFAULT_MODEL, "messages": "not-a-list"},
-        )
-
-    body = response.json()
-    assert response.status_code == 422
-    assert body["error"]["type"] == "validation_error"
-    assert body["error"]["details"][0]["field"].startswith("body -> messages")
-    assert "raw_request_body" in body["error"]["debug"]
-
-
-def test_chat_completions_non_streaming_success():
-    run_calls = []
-
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
-        yield {"content": [{"type": "text", "text": "Hello"}]}
-        yield {"subtype": "success", "result": "Hello", "stop_reason": "max_tokens"}
-
-    with (
-        client_context() as (client, mock_cli),
-        patch(
-            "src.backends.claude.client.get_mcp_servers",
-            return_value={"demo": {"type": "stdio", "command": "demo"}},
-        ),
-    ):
-        mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_message.return_value = "Hello"
-
-        response = client.post(
-            "/v1/chat/completions",
-            headers={"x-claude-max-turns": "7"},
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [
-                    {"role": "system", "content": "sys <thinking>ignore</thinking>"},
-                    {"role": "user", "content": "Hi"},
-                ],
-                "stream": False,
-                "enable_tools": False,
-            },
-        )
-
-    body = response.json()
-    assert response.status_code == 200
-    assert body["choices"][0]["message"]["content"] == "Hello"
-    assert body["choices"][0]["finish_reason"] == "length"
-    assert run_calls[0]["stream"] is False
-    assert run_calls[0]["max_turns"] == 1
-    assert run_calls[0]["disallowed_tools"] == CLAUDE_TOOLS
-    assert run_calls[0]["system_prompt"] == "sys"
-    assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio", "command": "demo"}}
-
-
-def test_chat_completions_metadata_forwarded_to_backend():
-    """Metadata from chat completion requests should reach run_completion as _metadata."""
-    run_calls = []
-
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
-        yield {"content": [{"type": "text", "text": "OK"}]}
-        yield {"subtype": "success", "result": "OK", "stop_reason": "end_turn"}
-
-    with client_context() as (client, mock_cli):
-        mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_message.return_value = "OK"
-
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": False,
-                "metadata": {"THREAD_ID": "thread-abc"},
-            },
-        )
-
-    assert response.status_code == 200
-    assert run_calls[0]["_metadata"] == {"THREAD_ID": "thread-abc"}
-
-
-def test_chat_completions_no_metadata_passes_none():
-    """Without metadata field, _metadata should be None."""
-    run_calls = []
-
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
-        yield {"content": [{"type": "text", "text": "OK"}]}
-        yield {"subtype": "success", "result": "OK", "stop_reason": "end_turn"}
-
-    with client_context() as (client, mock_cli):
-        mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_message.return_value = "OK"
-
-        response = client.post(
-            "/v1/chat/completions",
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": False,
-            },
-        )
-
-    assert response.status_code == 200
-    assert run_calls[0]["_metadata"] is None
-
-
-def test_chat_completions_streaming_response_with_usage():
-    async def fake_run_completion(**kwargs):
-        yield {"content": [{"type": "text", "text": "Hello"}]}
-        yield {"subtype": "success", "result": "Hello", "stop_reason": "end_turn"}
-
-    with client_context() as (client, mock_cli):
-        mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_message.return_value = "Hello"
-        mock_cli.estimate_token_usage.return_value = {
-            "prompt_tokens": 1,
-            "completion_tokens": 2,
-            "total_tokens": 3,
-        }
-
-        with client.stream(
-            "POST",
-            "/v1/chat/completions",
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": True,
-                "stream_options": {"include_usage": True},
-            },
-        ) as response:
-            body = "".join(response.iter_text())
-
-    assert response.status_code == 200
-    assert '"prompt_tokens":1' in body
-    assert '"finish_reason":"stop"' in body
-    assert "data: [DONE]" in body
-
-
-@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
-def test_returns_503_when_auth_is_invalid(endpoint):
+def test_returns_503_when_auth_is_invalid():
     _auth_exc = HTTPException(
         status_code=503,
         detail="claude backend authentication failed (missing auth). Check /v1/auth/status for detailed information.",
     )
     with (
         client_context() as (client, _mock_cli),
-        patch.object(main, "_validate_backend_auth", side_effect=_auth_exc),
-        patch.object(chat_module, "_validate_backend_auth", side_effect=_auth_exc),
-        patch.object(messages_module, "validate_backend_auth_or_raise", side_effect=_auth_exc),
+        patch.object(responses_module, "validate_backend_auth_or_raise", side_effect=_auth_exc),
     ):
         response = client.post(
-            endpoint,
+            "/v1/responses",
             json={
                 "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": False,
+                "input": "Hi",
             },
         )
 
@@ -261,67 +105,6 @@ def test_returns_503_when_auth_is_invalid(endpoint):
     assert body["error"]["type"] == "api_error"
     assert body["error"]["code"] == "503"
     assert "authentication failed" in body["error"]["message"]
-
-
-@pytest.mark.parametrize("endpoint", ["/v1/chat/completions", "/v1/messages"])
-def test_returns_500_when_claude_returns_no_message(endpoint):
-    async def fake_run_completion(**kwargs):
-        if False:
-            yield None
-
-    with client_context() as (client, mock_cli):
-        mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_message.return_value = None
-
-        response = client.post(
-            endpoint,
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": False,
-            },
-        )
-
-    assert response.status_code == 500
-    assert "No response from" in response.json()["error"]["message"]
-
-
-def test_anthropic_messages_success():
-    run_calls = []
-
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
-        yield {"subtype": "success", "result": "Anthropic answer", "stop_reason": "end_turn"}
-
-    with (
-        client_context() as (client, mock_cli),
-        patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
-        patch.object(messages_module, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
-    ):
-        mock_cli.run_completion = fake_run_completion
-        mock_cli.parse_message.return_value = "Anthropic answer"
-
-        response = client.post(
-            "/v1/messages",
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [
-                    {"role": "assistant", "content": "Earlier reply"},
-                    {"role": "user", "content": "What now?"},
-                ],
-                "system": "system text",
-                "stream": False,
-            },
-        )
-
-    body = response.json()
-    assert response.status_code == 200
-    assert body["content"][0]["text"] == "Anthropic answer"
-    assert body["stop_reason"] == "end_turn"
-    assert run_calls[0]["prompt"] == "Assistant: Earlier reply\n\nWhat now?"
-    assert run_calls[0]["allowed_tools"] == main.DEFAULT_ALLOWED_TOOLS
-    assert run_calls[0]["permission_mode"] == main.PERMISSION_MODE_BYPASS
-    assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
 
 
 def test_models_compatibility_version_and_root_endpoints():
@@ -608,7 +391,6 @@ def test_create_response_returns_503_when_auth_is_invalid():
     )
     with (
         client_context() as (client, _mock_cli),
-        patch.object(main, "_validate_backend_auth", side_effect=auth_error),
         patch.object(responses_module, "validate_backend_auth_or_raise", side_effect=auth_error),
     ):
         response = client.post(
@@ -811,7 +593,7 @@ def test_create_response_returns_502_when_sdk_returns_no_message():
 
 
 def test_responses_stale_previous_response_id(isolated_session_manager):
-    """Past turn → 409 with latest response ID in message."""
+    """Past turn -> 409 with latest response ID in message."""
     sid = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
     session = isolated_session_manager.get_or_create_session(sid)
     session.turn_counter = 3
@@ -833,7 +615,7 @@ def test_responses_stale_previous_response_id(isolated_session_manager):
 
 
 def test_responses_latest_previous_response_id(isolated_session_manager):
-    """Current turn → success (follow-up works)."""
+    """Current turn -> success (follow-up works)."""
     sid = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
     session = isolated_session_manager.get_or_create_session(sid)
     session.turn_counter = 1
@@ -864,7 +646,7 @@ def test_responses_latest_previous_response_id(isolated_session_manager):
 
 
 def test_responses_claude_unchanged(isolated_session_manager):
-    """Existing Claude behavior regression check — still works after refactor."""
+    """Existing Claude behavior regression check -- still works after refactor."""
     run_calls = []
 
     async def fake_run_completion(**kwargs):
@@ -901,7 +683,7 @@ def test_responses_claude_unchanged(isolated_session_manager):
 
 
 def test_responses_concurrent_stale_id_race(isolated_session_manager):
-    """Two requests with same latest previous_response_id → one succeeds, other gets 409.
+    """Two requests with same latest previous_response_id -> one succeeds, other gets 409.
 
     Proves lock serialization: the first request increments turn_counter,
     making the second request's previous_response_id stale.
@@ -949,7 +731,7 @@ def test_responses_concurrent_stale_id_race(isolated_session_manager):
 
 
 def test_responses_non_streaming_failure_no_commit(isolated_session_manager):
-    """Non-streaming failure → session.messages and turn_counter unchanged."""
+    """Non-streaming failure -> session.messages and turn_counter unchanged."""
     sid = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
     session = isolated_session_manager.get_or_create_session(sid)
     session.turn_counter = 1
@@ -980,13 +762,7 @@ def test_responses_non_streaming_failure_no_commit(isolated_session_manager):
 
 
 def test_responses_streaming_success_commits_with_streamed_text(isolated_session_manager):
-    """Streaming success uses assistant_text from stream_result (not parse_message).
-
-    stream_response_chunks assembles full_text from actual deltas sent to the
-    client and stores it in stream_result["assistant_text"].  The endpoint uses
-    this value to commit the turn, avoiding a parse_message mismatch that would
-    emit an error after response.completed.
-    """
+    """Streaming success uses assistant_text from stream_result (not parse_message)."""
 
     async def fake_run_completion(**kwargs):
         yield {"content": [{"type": "text", "text": "streamed text"}]}
@@ -997,7 +773,7 @@ def test_responses_streaming_success_commits_with_streamed_text(isolated_session
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
         mock_cli.run_completion = fake_run_completion
-        # parse_message returns None — but the endpoint should not call it
+        # parse_message returns None -- but the endpoint should not call it
         mock_cli.parse_message.return_value = None
 
         with client.stream(
@@ -1023,18 +799,7 @@ def test_responses_streaming_success_commits_with_streamed_text(isolated_session
 
 
 async def test_responses_truly_concurrent_lock_serialization(isolated_session_manager):
-    """Two truly concurrent follow-up requests prove per-session lock serialization.
-
-    Unlike test #15 (sequential), this test fires two requests simultaneously
-    via asyncio.gather.  A slow backend holds the lock long enough to guarantee
-    the second request is waiting on session.lock.  When the first completes and
-    increments turn_counter (1 → 2), the second sees a stale previous_response_id
-    (still pointing to turn 1, but turn_counter is now 2) and gets 409.
-
-    Concurrency proof: the backend signals ``inside_backend`` when it starts,
-    and the test records wall-clock ordering via ``entry_order`` to confirm
-    both requests were dispatched before either completed.
-    """
+    """Two truly concurrent follow-up requests prove per-session lock serialization."""
     sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
     session = isolated_session_manager.get_or_create_session(sid)
     session.turn_counter = 1
@@ -1042,13 +807,9 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
 
     prev_id = main._make_response_id(sid, 1)
 
-    # -- Barrier machinery ------------------------------------------------
-    # inside_backend is set when the first request enters the backend,
-    # proving the lock is held.  backend_release lets the test unblock
-    # the backend after the second request has had time to queue on the lock.
     inside_backend = asyncio.Event()
     backend_release = asyncio.Event()
-    entry_order: list[str] = []  # tracks wall-clock ordering of backend calls
+    entry_order: list[str] = []
 
     async def slow_run_completion(**kwargs):
         """Backend that blocks until backend_release is set."""
@@ -1076,10 +837,7 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
 
     with (
         patch.object(responses_module, "verify_api_key", new=AsyncMock(return_value=True)),
-        patch.object(main, "_validate_backend_auth", return_value=None),
-        patch.object(chat_module, "_validate_backend_auth", return_value=None),
         patch.object(responses_module, "validate_backend_auth_or_raise", return_value=None),
-        patch.object(messages_module, "validate_backend_auth_or_raise", return_value=None),
         patch.object(main, "get_mcp_servers", return_value={}),
         patch.object(main.session_manager, "start_cleanup_task"),
         patch.object(main.session_manager, "async_shutdown", new=AsyncMock()),
@@ -1096,37 +854,27 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
                 return await client.post("/v1/responses", json=payload)
 
             async def release_after_overlap():
-                """Wait until the first request is inside the backend, then
-                yield control so the second request queues on session.lock,
-                and finally unblock the backend."""
                 await inside_backend.wait()
-                # Yield a few times to let the event loop schedule the second
-                # request's lock.acquire() coroutine.
                 for _ in range(5):
                     await asyncio.sleep(0)
                 backend_release.set()
 
-            # Fire both requests + the release coordinator concurrently
             r1, r2, _ = await asyncio.gather(
                 send_request("A"),
                 send_request("B"),
                 release_after_overlap(),
             )
 
-    # -- Assertions -------------------------------------------------------
     statuses = sorted([r1.status_code, r2.status_code])
     assert statuses == [200, 409], (
         f"Expected exactly one 200 and one 409, got {r1.status_code} and {r2.status_code}"
     )
 
-    # The 409 response must contain the stale-ID error message
     loser = r1 if r1.status_code == 409 else r2
     assert "Stale previous_response_id" in loser.json()["error"]["message"]
 
-    # turn_counter advanced exactly once (from 1 → 2 by the winning request)
     assert session.turn_counter == 2
 
-    # The backend was entered exactly once (the loser never reached it)
     assert len(entry_order) == 1, (
         f"Backend should have been called exactly once, but was called {len(entry_order)} times"
     )

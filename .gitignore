@@ -65,3 +65,4 @@ working_dir/
 
 # Persisted runtime data
 data/
+.worktrees/

@@ -1,8 +1,10 @@
 """Responses API endpoint (/v1/responses)."""
 
+import json
 import logging
 import secrets
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -19,6 +21,7 @@ from src.response_models import (
     ResponseCreateRequest,
     ResponseContentPart,
     ResponseErrorDetail,
+    FunctionCallOutputItem,
     ResponseObject,
     OutputItem,
     ResponseUsage,
@@ -65,6 +68,24 @@ def _parse_response_id(resp_id: str):
     except ValueError:
         return None
     return parts[1], turn
+
+
+def _detect_function_call_output(input_data) -> Optional[Dict[str, str]]:
+    """Extract function_call_output from input if present.
+
+    Scans the input array for a ``function_call_output`` item and returns
+    its ``call_id`` and ``output`` values.  Returns ``None`` when no such
+    item is found (e.g. when the input is a plain string or only contains
+    regular message items).
+    """
+    if isinstance(input_data, str):
+        return None
+    for item in input_data:
+        if isinstance(item, dict) and item.get("type") == "function_call_output":
+            return {"call_id": item["call_id"], "output": item["output"]}
+        if hasattr(item, "type") and getattr(item, "type", None) == "function_call_output":
+            return {"call_id": item.call_id, "output": item.output}
+    return None
 
 
 async def _responses_streaming_preflight(
@@ -218,12 +239,26 @@ async def create_response(
             session.workspace = str(workspace)
     workspace_str = str(workspace)
 
+    # ------------------------------------------------------------------
+    # Detect function_call_output BEFORE converting input to prompt.
+    # If present, this is a tool-continuation turn: the client is sending
+    # the user's response to an AskUserQuestion function_call.
+    # ------------------------------------------------------------------
+    fc_output = _detect_function_call_output(body.input)
+    if fc_output is not None:
+        return await _handle_function_call_output(
+            body, resolved, backend, session, session_id, workspace_str, fc_output
+        )
+
     # Extract system prompt from array input if present
     system_prompt = body.instructions
     input_for_prompt = body.input
     if isinstance(body.input, list) and not body.instructions:
         user_items = []
         for item in body.input:
+            # FunctionCallOutputInput items don't have role; skip them here
+            if not hasattr(item, "role"):
+                continue
             if item.role in ("system", "developer"):
                 content = item.content
                 if isinstance(content, str):
@@ -241,6 +276,34 @@ async def create_response(
     image_handler = ImageHandler(workspace)
     prompt = MessageAdapter.response_input_to_prompt(input_for_prompt, image_handler=image_handler)
     prompt = MessageAdapter.filter_content(prompt)
+
+    # ------------------------------------------------------------------
+    # Determine whether to use ClaudeSDKClient (persistent session) or
+    # the single-use query() path (run_completion).
+    # ------------------------------------------------------------------
+    # Create a persistent ClaudeSDKClient if the backend supports it.
+    # This enables PreToolUse hook registration for AskUserQuestion
+    # interception on any turn, including the first.  We intentionally
+    # omit permission_mode so the CLI uses its default permission checks.
+    if session.client is None and hasattr(backend, "create_client"):
+        try:
+            session.client = await backend.create_client(
+                session=session,
+                model=resolved.provider_model,
+                system_prompt=system_prompt if len(session.messages) == 0 else None,
+                mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
+                cwd=workspace_str,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to create persistent client, falling back to query()", exc_info=True
+            )
+            session.client = None
+
+    use_sdk_client = (
+        session.client is not None
+        and hasattr(backend, "run_completion_with_client")
+    )
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
@@ -263,10 +326,22 @@ async def create_response(
 
         async def _run_stream():
             lock_acquired = preflight["lock_acquired"]
-            stream_result = {"success": False}
+            stream_result: dict = {"success": False}
+            # When using SDK client, the PreToolUse hook may break the
+            # stream with no text content.  Suppress the empty_response
+            # failed event so we can emit function_call + requires_action.
+            if use_sdk_client:
+                stream_result["allow_empty"] = True
             try:
                 chunks_buffer = []
-                chunk_source = backend.run_completion(**preflight["chunk_kwargs"])
+
+                # Choose chunk source: persistent client or single-use query
+                if use_sdk_client:
+                    chunk_source = backend.run_completion_with_client(
+                        session.client, prompt, session
+                    )
+                else:
+                    chunk_source = backend.run_completion(**preflight["chunk_kwargs"])
 
                 # Bridge SDK iteration through a background task to keep
                 # anyio cancel scopes task-local.
@@ -284,8 +359,42 @@ async def create_response(
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
                     yield line
 
-                # SUCCESS-ONLY: commit turn counter and session messages.
-                if stream_result.get("success"):
+                # Check if the SDK paused on AskUserQuestion (pending_tool_call).
+                # If so, emit function_call SSE and complete with requires_action.
+                if session.pending_tool_call is not None:
+                    tc = session.pending_tool_call
+                    yield streaming_utils.make_function_call_response_sse(
+                        response_id=resp_id,
+                        call_id=tc["call_id"],
+                        name=tc["name"],
+                        arguments=json.dumps(tc.get("arguments", {})),
+                    )
+                    # Emit response.completed with requires_action status
+                    requires_action_resp = ResponseObject(
+                        id=resp_id,
+                        model=body.model,
+                        status="requires_action",
+                        output=[
+                            FunctionCallOutputItem(
+                                id=f"fc_{tc['call_id']}",
+                                call_id=tc["call_id"],
+                                name=tc["name"],
+                                arguments=json.dumps(tc.get("arguments", {})),
+                            )
+                        ],
+                        metadata=body.metadata or {},
+                    )
+                    yield streaming_utils.make_response_sse(
+                        "response.completed",
+                        response_obj=requires_action_resp,
+                        sequence_number=0,
+                    )
+                    # Commit turn even for requires_action so the next
+                    # function_call_output can reference this response_id
+                    session.turn_counter = next_turn
+                    stream_result["success"] = True
+                elif stream_result.get("success"):
+                    # SUCCESS-ONLY: commit turn counter and session messages.
                     assistant_text = stream_result.get("assistant_text") or ""
                     if assistant_text:
                         session.turn_counter = next_turn
@@ -332,28 +441,54 @@ async def create_response(
             is_new=is_new_session,
             turn=_turn,
         ) as pf:
-            # Execute backend
+            # Execute backend — persistent client or single-use query
             chunks = []
-            async for chunk in backend.run_completion(
-                prompt=prompt,
-                model=resolved.provider_model,
-                system_prompt=system_prompt if pf.is_new else None,
-                _custom_base=session.base_system_prompt,
-                _metadata=body.metadata,
-                _user=body.user,
-                permission_mode=PERMISSION_MODE_BYPASS,
-                mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-                session_id=session_id if pf.is_new else None,
-                resume=pf.resume_id,
-                cwd=workspace_str,
-            ):
-                chunks.append(chunk)
+            if use_sdk_client:
+                async for chunk in backend.run_completion_with_client(
+                    session.client, prompt, session
+                ):
+                    chunks.append(chunk)
+            else:
+                async for chunk in backend.run_completion(
+                    prompt=prompt,
+                    model=resolved.provider_model,
+                    system_prompt=system_prompt if pf.is_new else None,
+                    _custom_base=session.base_system_prompt,
+                    _metadata=body.metadata,
+                    _user=body.user,
+                    permission_mode=PERMISSION_MODE_BYPASS,
+                    mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
+                    session_id=session_id if pf.is_new else None,
+                    resume=pf.resume_id,
+                    cwd=workspace_str,
+                ):
+                    chunks.append(chunk)
 
             # Check for backend errors (run_completion wraps exceptions as error chunks)
             for chunk in chunks:
                 if isinstance(chunk, dict) and chunk.get("is_error"):
                     error_msg = chunk.get("error_message", "Unknown backend error")
                     raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
+
+            # Check if the SDK paused on AskUserQuestion
+            if session.pending_tool_call is not None:
+                tc = session.pending_tool_call
+                resp_id = _make_response_id(session_id, pf.next_turn)
+                session.turn_counter = pf.next_turn
+                return ResponseObject(
+                    id=resp_id,
+                    status="requires_action",
+                    model=body.model,
+                    output=[
+                        FunctionCallOutputItem(
+                            id=f"fc_{tc['call_id']}",
+                            call_id=tc["call_id"],
+                            name=tc["name"],
+                            arguments=json.dumps(tc.get("arguments", {})),
+                        )
+                    ],
+                    metadata=body.metadata or {},
+                ).model_dump()
 
             # Extract assistant text
             assistant_text = backend.parse_message(chunks)
@@ -399,3 +534,239 @@ async def create_response(
     )
 
     return response_obj.model_dump()
+
+
+async def _handle_function_call_output(
+    body: ResponseCreateRequest,
+    resolved: ResolvedModel,
+    backend: "BackendClient",
+    session,
+    session_id: str,
+    workspace_str: str,
+    fc_output: Dict[str, str],
+):
+    """Handle a function_call_output continuation request.
+
+    Validates that the session has a pending tool call with a matching
+    ``call_id``, unblocks the SDK's PreToolUse hook, and then streams
+    the continuation response from the existing :class:`ClaudeSDKClient`.
+
+    The validation and event-unblock are performed atomically under the
+    session lock to prevent races where concurrent requests could read
+    stale ``pending_tool_call`` / ``input_event`` state.
+    """
+    # --- Validate + unblock under session lock ---
+    await session.lock.acquire()
+    try:
+        if session.pending_tool_call is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but no pending tool call in session",
+            )
+
+        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"call_id mismatch: pending tool call has "
+                    f"'{session.pending_tool_call['call_id']}', "
+                    f"but received '{fc_output['call_id']}'"
+                ),
+            )
+
+        if not hasattr(backend, "run_completion_with_client"):
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output requires a backend that supports persistent clients",
+            )
+
+        if session.client is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no active SDK client",
+            )
+
+        # --- Unblock the PreToolUse hook ---
+        session.input_response = fc_output["output"]
+        pending_event = session.input_event
+        if pending_event is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no pending input event",
+            )
+        pending_event.set()  # Unblocks the callback; SDK continues processing
+        session.pending_tool_call = None  # Clear the pending state
+    finally:
+        session.lock.release()
+
+    # --- Stream continuation from the client ---
+    next_turn = session.turn_counter + 1
+    resp_id = _make_response_id(session_id, next_turn)
+    output_item_id = _generate_msg_id()
+
+    if body.stream:
+        # Acquire session lock for the streaming duration
+        await session.lock.acquire()
+
+        async def _run_continuation_stream():
+            lock_acquired = True
+            stream_result = {"success": False}
+            try:
+                chunks_buffer = []
+                # After the hook returns deny+reason, the SDK continues
+                # processing from where it left off.  Use
+                # receive_response_from_client (no new query needed).
+                if hasattr(backend, "receive_response_from_client"):
+                    chunk_source = backend.receive_response_from_client(session.client, session)
+                else:
+                    chunk_source = backend.run_completion_with_client(session.client, "", session)
+
+                sse_source = streaming_utils.stream_response_chunks(
+                    chunk_source=chunk_source,
+                    model=body.model,
+                    response_id=resp_id,
+                    output_item_id=output_item_id,
+                    chunks_buffer=chunks_buffer,
+                    logger=logger,
+                    prompt_text="",
+                    metadata=body.metadata or {},
+                    stream_result=stream_result,
+                )
+                async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
+                    yield line
+
+                # Check for another pending_tool_call (chained AskUserQuestion)
+                if session.pending_tool_call is not None:
+                    tc = session.pending_tool_call
+                    yield streaming_utils.make_function_call_response_sse(
+                        response_id=resp_id,
+                        call_id=tc["call_id"],
+                        name=tc["name"],
+                        arguments=json.dumps(tc.get("arguments", {})),
+                    )
+                    requires_action_resp = ResponseObject(
+                        id=resp_id,
+                        model=body.model,
+                        status="requires_action",
+                        output=[
+                            FunctionCallOutputItem(
+                                id=f"fc_{tc['call_id']}",
+                                call_id=tc["call_id"],
+                                name=tc["name"],
+                                arguments=json.dumps(tc.get("arguments", {})),
+                            )
+                        ],
+                        metadata=body.metadata or {},
+                    )
+                    yield streaming_utils.make_response_sse(
+                        "response.completed",
+                        response_obj=requires_action_resp,
+                        sequence_number=0,
+                    )
+                    session.turn_counter = next_turn
+                    stream_result["success"] = True
+                elif stream_result.get("success"):
+                    assistant_text = stream_result.get("assistant_text") or ""
+                    if assistant_text:
+                        session.turn_counter = next_turn
+                        session_manager.add_assistant_response(
+                            session_id,
+                            Message(role="assistant", content=assistant_text),
+                        )
+
+            except Exception as e:
+                logger.error("Responses API Stream: continuation error: %s", e, exc_info=True)
+                failed_resp = ResponseObject(
+                    id=resp_id,
+                    model=body.model,
+                    status="failed",
+                    metadata=body.metadata or {},
+                    error=ResponseErrorDetail(code="server_error", message="Internal server error"),
+                )
+                yield streaming_utils.make_response_sse(
+                    "response.failed",
+                    response_obj=failed_resp,
+                    sequence_number=0,
+                )
+            finally:
+                if lock_acquired:
+                    session.lock.release()
+
+        return StreamingResponse(_run_continuation_stream(), media_type="text/event-stream")
+
+    # --- Non-streaming continuation ---
+    async with _nonstreaming_lock(session):
+        chunks = []
+        # After the hook returns deny+reason, the SDK continues
+        # processing from where it left off — no new query needed.
+        if hasattr(backend, "receive_response_from_client"):
+            chunk_source = backend.receive_response_from_client(session.client, session)
+        else:
+            chunk_source = backend.run_completion_with_client(session.client, "", session)
+        async for chunk in chunk_source:
+            chunks.append(chunk)
+
+        # Check for another pending_tool_call
+        if session.pending_tool_call is not None:
+            tc = session.pending_tool_call
+            session.turn_counter = next_turn
+            return ResponseObject(
+                id=resp_id,
+                status="requires_action",
+                model=body.model,
+                output=[
+                    FunctionCallOutputItem(
+                        id=f"fc_{tc['call_id']}",
+                        call_id=tc["call_id"],
+                        name=tc["name"],
+                        arguments=json.dumps(tc.get("arguments", {})),
+                    )
+                ],
+                metadata=body.metadata or {},
+            ).model_dump()
+
+        for chunk in chunks:
+            if isinstance(chunk, dict) and chunk.get("is_error"):
+                error_msg = chunk.get("error_message", "Unknown backend error")
+                raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
+
+        assistant_text = backend.parse_message(chunks)
+        if not assistant_text:
+            raise HTTPException(status_code=502, detail="No response from backend")
+
+        session.turn_counter = next_turn
+        session_manager.add_assistant_response(
+            session_id, Message(role="assistant", content=assistant_text)
+        )
+
+    prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
+        chunks, "", assistant_text, body.model, backend=backend
+    )
+
+    response_obj = ResponseObject(
+        id=resp_id,
+        status="completed",
+        model=body.model,
+        output=[
+            OutputItem(
+                id=_generate_msg_id(),
+                content=[ResponseContentPart(text=assistant_text)],
+            )
+        ],
+        usage=ResponseUsage(
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+        ),
+        metadata=body.metadata or {},
+    )
+    return response_obj.model_dump()
+
+
+@asynccontextmanager
+async def _nonstreaming_lock(session):
+    """Acquire and release session lock for non-streaming continuation."""
+    await session.lock.acquire()
+    try:
+        yield
+    finally:
+        session.lock.release()

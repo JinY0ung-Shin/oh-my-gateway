@@ -4,7 +4,6 @@ import pytest
 
 import src.main as main
 import src.session_manager as session_manager_module
-import src.routes.chat as chat_module
 import src.routes.responses as responses_module
 from src.auth import auth_manager
 from src.backend_registry import BackendRegistry
@@ -55,7 +54,6 @@ def reset_main_state():
     seen_managers = set()
     for manager in (
         session_manager_module.session_manager,
-        chat_module.session_manager,
         responses_module.session_manager,
     ):
         if id(manager) in seen_managers:
@@ -87,7 +85,6 @@ def isolated_session_manager(monkeypatch):
     """Patch all modules that hold a session_manager reference to use a fresh instance."""
     manager = SessionManager(default_ttl_minutes=60, cleanup_interval_minutes=5)
     monkeypatch.setattr(session_manager_module, "session_manager", manager)
-    monkeypatch.setattr(chat_module, "session_manager", manager)
     monkeypatch.setattr(responses_module, "session_manager", manager)
 
     try:

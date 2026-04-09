@@ -69,15 +69,9 @@ SUBAGENT_STREAM_TEXT = parse_bool_env("SUBAGENT_STREAM_TEXT", "false")
 SUBAGENT_STREAM_TOOL_BLOCKS = parse_bool_env("SUBAGENT_STREAM_TOOL_BLOCKS", "true")
 SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")
 
-# When true, skip all intermediate streaming events (text deltas, tool blocks,
-# progress events) and only emit the final ResultMessage content.
-# Useful for simple integrations that only need the final answer.
-STREAM_FINAL_ONLY = parse_bool_env("STREAM_FINAL_ONLY", "false")
-
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {
-    "chat": int(os.getenv("RATE_LIMIT_CHAT_PER_MINUTE", "10")),
     "debug": int(os.getenv("RATE_LIMIT_DEBUG_PER_MINUTE", "2")),
     "auth": int(os.getenv("RATE_LIMIT_AUTH_PER_MINUTE", "10")),
     "session": int(os.getenv("RATE_LIMIT_SESSION_PER_MINUTE", "15")),
@@ -110,6 +104,11 @@ ALL_MODELS = CLAUDE_MODELS
 METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
     k.strip() for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",") if k.strip()
 )
+
+# AskUserQuestion hook timeout (seconds).
+# If the client does not respond within this window the hook denies the tool
+# call and the SDK resumes.  Set via ASK_USER_TIMEOUT_SECONDS env var.
+ASK_USER_TIMEOUT_SECONDS = int(os.environ.get("ASK_USER_TIMEOUT_SECONDS", "300"))
 
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")

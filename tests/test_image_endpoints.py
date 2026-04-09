@@ -9,9 +9,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import src.main as main
-import src.routes.chat as chat_module
+import src.routes.responses as responses_module
 from src.backend_registry import BackendRegistry
-from src.constants import DEFAULT_MODEL
 from src.routes.deps import (
     request_has_images as _request_has_images,
     validate_image_request as _validate_image_request,
@@ -83,10 +82,9 @@ def client_context():
 
     with (
         patch.object(main, "discover_backends", _mock_discover),
-        patch.object(chat_module, "verify_api_key", new=AsyncMock(return_value=True)),
+        patch.object(responses_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(main, "validate_claude_code_auth", return_value=(True, {"method": "test"})),
-        patch.object(main, "_validate_backend_auth"),
-        patch.object(chat_module, "_validate_backend_auth"),
+        patch.object(responses_module, "validate_backend_auth_or_raise"),
         patch.object(main.session_manager, "start_cleanup_task"),
         patch.object(main.session_manager, "async_shutdown", new=AsyncMock()),
     ):
@@ -269,36 +267,3 @@ class TestTruncateImageData:
         obj = {"source": {"data": long_b64}}
         result = _truncate_image_data(obj)
         assert result["source"]["data"].endswith("...[truncated]")
-
-
-# ===========================================================================
-# Endpoint test for /v1/chat/completions with image + tools disabled
-# ===========================================================================
-
-
-class TestChatCompletionsImageEndpoint:
-    """Endpoint-level test for image validation in /v1/chat/completions."""
-
-    def test_chat_completions_image_tools_disabled(self):
-        """POST to /v1/chat/completions with image + enable_tools=false returns 400."""
-        with client_context() as (client, _mock_cli):
-            response = client.post(
-                "/v1/chat/completions",
-                json={
-                    "model": DEFAULT_MODEL,
-                    "messages": [
-                        {
-                            "role": "user",
-                            "content": [
-                                {"type": "text", "text": "describe this image"},
-                                {"type": "image_url", "image_url": {"url": DATA_URL}},
-                            ],
-                        }
-                    ],
-                    "enable_tools": False,
-                },
-            )
-
-        assert response.status_code == 400
-        body = response.json()
-        assert "enable_tools" in body.get("detail", "") or "enable_tools" in str(body)

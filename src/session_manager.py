@@ -20,7 +20,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from threading import Lock
 
@@ -64,6 +64,13 @@ class Session:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     user: Optional[str] = None
     workspace: Optional[str] = None
+
+    # ClaudeSDKClient integration
+    client: Optional[Any] = None
+    input_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
+    input_response: Optional[str] = None
+    pending_tool_call: Optional[Dict[str, Any]] = None
+    stream_break_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.created_at = _ensure_utc(self.created_at)
@@ -134,8 +141,46 @@ class SessionManager:
             return True
         return False
 
-    def _purge_all_expired(self) -> int:
-        """Remove every expired session.  Returns the count removed."""
+    async def _purge_all_expired(self) -> int:
+        """Remove every expired session.  Returns the count removed.
+
+        Takes a snapshot of expired sessions under the manager lock, then
+        disconnects clients and cleans workspaces outside the lock.  Before
+        deleting each session it re-checks under the lock that the session
+        object is still the same instance **and** still expired — this
+        prevents a TOCTOU race where a session could be refreshed (TTL
+        extended) between the snapshot and the deletion.
+        """
+        with self.lock:
+            expired = [
+                (sid, self.sessions[sid]) for sid, s in self.sessions.items() if s.is_expired()
+            ]
+        count = 0
+        for sid, session in expired:
+            if session.client is not None:
+                try:
+                    await session.client.disconnect()
+                except Exception:
+                    logger.debug("Client disconnect failed for session %s", sid, exc_info=True)
+                session.client = None
+            if session.workspace:
+                self._cleanup_workspace(session.workspace)
+            with self.lock:
+                # Re-check: session might have been refreshed since snapshot
+                current = self.sessions.get(sid)
+                if current is session and current.is_expired():
+                    del self.sessions[sid]
+                    logger.info(f"Cleaned up expired session: {sid}")
+                    count += 1
+        return count
+
+    def _purge_all_expired_sync(self) -> int:
+        """Synchronous variant: remove expired sessions without client disconnect.
+
+        Used by synchronous callers (e.g. ``list_sessions``) that cannot await.
+        Sessions with active clients will have their clients disconnected on the
+        next async cleanup cycle.
+        """
         expired = [sid for sid, s in self.sessions.items() if s.is_expired()]
         for sid in expired:
             session = self.sessions[sid]
@@ -192,8 +237,7 @@ class SessionManager:
 
         Returns the count of sessions removed.
         """
-        with self.lock:
-            removed = self._purge_all_expired()
+        removed = await self._purge_all_expired()
 
         # Clean up stale image files from backends that have an image handler
         try:
@@ -212,9 +256,20 @@ class SessionManager:
     # ------------------------------------------------------------------
 
     async def async_shutdown(self) -> None:
-        """Async shutdown: cancel cleanup task, clean temp workspaces, and clear sessions."""
+        """Async shutdown: cancel cleanup task, disconnect clients, clean workspaces, clear sessions."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
+
+        with self.lock:
+            sessions_snapshot = list(self.sessions.values())
+
+        for session in sessions_snapshot:
+            if session.client is not None:
+                try:
+                    await session.client.disconnect()
+                except Exception:
+                    logger.debug("Client disconnect failed during shutdown", exc_info=True)
+                session.client = None
 
         with self.lock:
             self._cleanup_all_temp_workspaces()
@@ -307,7 +362,7 @@ class SessionManager:
     def list_sessions(self) -> List[SessionInfo]:
         """List all active (non-expired) sessions."""
         with self.lock:
-            self._purge_all_expired()
+            self._purge_all_expired_sync()
             return [session.to_session_info() for session in self.sessions.values()]
 
     # ------------------------------------------------------------------

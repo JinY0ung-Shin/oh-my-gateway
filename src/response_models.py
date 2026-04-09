@@ -13,12 +13,21 @@ class ResponseInputItem(BaseModel):
     content: Union[str, List[Dict[str, Any]]] = ""
 
 
+class FunctionCallOutputInput(BaseModel):
+    """A function_call_output input item from the client."""
+
+    type: Literal["function_call_output"] = "function_call_output"
+    call_id: str
+    output: str
+
+
 class ResponseCreateRequest(BaseModel):
     """POST /v1/responses request body."""
 
     model: str
-    input: Union[str, List[ResponseInputItem]] = Field(
-        description="User input as a plain string or array of input items"
+    input: Union[str, List[Union[ResponseInputItem, FunctionCallOutputInput]]] = Field(
+        description="User input as a plain string, array of input items, "
+        "or function_call_output for tool continuations"
     )
     instructions: Optional[str] = Field(
         default=None, description="System prompt (cannot be used with previous_response_id)"
@@ -69,15 +78,26 @@ class ResponseErrorDetail(BaseModel):
     message: str
 
 
+class FunctionCallOutputItem(BaseModel):
+    """A function_call output item in the response (e.g. AskUserQuestion)."""
+
+    id: str
+    type: Literal["function_call"] = "function_call"
+    call_id: str
+    name: str
+    arguments: str
+    status: str = "completed"
+
+
 class ResponseObject(BaseModel):
     """The response object returned by POST /v1/responses."""
 
     id: str
     object: Literal["response"] = "response"
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    status: Literal["completed", "in_progress", "failed"] = "completed"
+    status: Literal["completed", "in_progress", "failed", "requires_action"] = "completed"
     model: str = ""
-    output: List[OutputItem] = Field(default_factory=list)
+    output: List[Union[OutputItem, FunctionCallOutputItem]] = Field(default_factory=list)
     usage: ResponseUsage = Field(default_factory=ResponseUsage)
     metadata: Dict[str, str] = Field(default_factory=dict)
     error: Optional[ResponseErrorDetail] = None
