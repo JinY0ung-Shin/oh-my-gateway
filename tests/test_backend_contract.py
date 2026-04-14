@@ -149,10 +149,11 @@ class TestProtocolConformance:
 class TestBuildOptions:
     """Test build_options on concrete backends."""
 
-    def _make_request(self, enable_tools=True, model="opus"):
+    def _make_request(self, enable_tools=True, model="opus", allowed_tools=None):
         """Create a minimal mock request."""
         req = MagicMock()
         req.enable_tools = enable_tools
+        req.allowed_tools = allowed_tools
         req.to_claude_options.return_value = {"max_turns": 10}
         req.model = model
         return req
