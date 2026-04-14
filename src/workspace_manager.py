@@ -25,9 +25,15 @@ class WorkspaceManager:
             Typically the ``CLAUDE_CWD`` value.
     """
 
-    def __init__(self, base_path: Path, template_source: Optional[Path] = None):
+    def __init__(
+        self,
+        base_path: Path,
+        template_source: Optional[Path] = None,
+        project_root: Optional[Path] = None,
+    ):
         self.base_path = Path(base_path)
         self.template_source = Path(template_source) if template_source else None
+        self.project_root = Path(project_root) if project_root else None
 
     def resolve(self, user: Optional[str] = None, sync_template: bool = False) -> Path:
         """Return the workspace path for *user*, creating it if necessary.
@@ -47,6 +53,7 @@ class WorkspaceManager:
 
         if sync_template:
             self._sync_template(workspace)
+            self._sync_project_files(workspace)
 
         return workspace
 
@@ -77,6 +84,8 @@ class WorkspaceManager:
             )
         return user
 
+    _PROJECT_FILES = ("pyproject.toml", "uv.lock")
+
     def _sync_template(self, workspace: Path) -> None:
         """Copy ``.claude/`` from template source into *workspace*."""
         if self.template_source is None:
@@ -88,6 +97,24 @@ class WorkspaceManager:
         dst = workspace / ".claude"
         shutil.copytree(src, dst, dirs_exist_ok=True)
         logger.debug("Synced .claude/ template to %s", dst)
+
+    def _sync_project_files(self, workspace: Path) -> None:
+        """Symlink project files (pyproject.toml, uv.lock) into *workspace*.
+
+        This allows ``uv run`` and other project-aware tools to work
+        correctly from isolated workspace directories.
+        """
+        if self.project_root is None:
+            return
+        for name in self._PROJECT_FILES:
+            src = self.project_root / name
+            dst = workspace / name
+            if not src.is_file():
+                continue
+            if dst.exists() or dst.is_symlink():
+                dst.unlink()
+            dst.symlink_to(src)
+        logger.debug("Synced project files from %s to %s", self.project_root, workspace)
 
 
 # ---------------------------------------------------------------------------
@@ -120,7 +147,17 @@ def _resolve_template_source() -> Optional[Path]:
     return None
 
 
+def _find_project_root() -> Optional[Path]:
+    """Walk up from base_path to find the nearest ``pyproject.toml``."""
+    start = _resolve_base_path().resolve()
+    for parent in (start, *start.parents):
+        if (parent / "pyproject.toml").is_file():
+            return parent
+    return None
+
+
 workspace_manager = WorkspaceManager(
     base_path=_resolve_base_path(),
     template_source=_resolve_template_source(),
+    project_root=_find_project_root(),
 )
