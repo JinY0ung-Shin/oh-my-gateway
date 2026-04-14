@@ -283,14 +283,17 @@ async def create_response(
     # ------------------------------------------------------------------
     # Create a persistent ClaudeSDKClient if the backend supports it.
     # This enables PreToolUse hook registration for AskUserQuestion
-    # interception on any turn, including the first.  We intentionally
-    # omit permission_mode so the CLI uses its default permission checks.
+    # interception on any turn, including the first.
+    # bypassPermissions avoids workspace-level settings.local.json checks
+    # (temp workspaces lack shell command allow-lists).  PreToolUse hooks
+    # still fire independently of the permission mode.
     if session.client is None and hasattr(backend, "create_client"):
         try:
             session.client = await backend.create_client(
                 session=session,
                 model=resolved.provider_model,
                 system_prompt=system_prompt if len(session.messages) == 0 else None,
+                permission_mode=PERMISSION_MODE_BYPASS,
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
                 cwd=workspace_str,
             )
