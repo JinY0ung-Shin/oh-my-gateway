@@ -40,6 +40,10 @@ class ResponseCreateRequest(BaseModel):
     store: Optional[bool] = True
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
+    allowed_tools: Optional[List[str]] = Field(
+        default=None,
+        description="Explicit list of allowed tools. Overrides default tool list.",
+    )
     user: Optional[str] = Field(
         default=None,
         description="Unique user identifier for workspace isolation",
