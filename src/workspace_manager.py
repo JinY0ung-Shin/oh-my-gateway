@@ -147,17 +147,19 @@ def _resolve_template_source() -> Optional[Path]:
     return None
 
 
-def _find_project_root() -> Optional[Path]:
-    """Walk up from base_path to find the nearest ``pyproject.toml``."""
-    start = _resolve_base_path().resolve()
+def _find_project_root(base: Path) -> Optional[Path]:
+    """Walk up from *base* to find the nearest ``pyproject.toml``."""
+    start = base.resolve()
     for parent in (start, *start.parents):
         if (parent / "pyproject.toml").is_file():
             return parent
     return None
 
 
+_base_path = _resolve_base_path()
+
 workspace_manager = WorkspaceManager(
-    base_path=_resolve_base_path(),
+    base_path=_base_path,
     template_source=_resolve_template_source(),
-    project_root=_find_project_root(),
+    project_root=_find_project_root(_base_path),
 )
