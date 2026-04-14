@@ -358,34 +358,7 @@ class ClaudeCodeCLI:
         if output_format:
             options.output_format = output_format
         if mcp_servers:
-            if allowed_tools is not None:
-                # Filter MCP servers to only those matching allowed_tools
-                allowed_set = set(allowed_tools)
-                filtered = {}
-                for name, config in mcp_servers.items():
-                    safe_name = "_".join(name.split("-"))
-                    pattern = f"mcp__{safe_name}__*"
-                    if pattern in allowed_set:
-                        filtered[name] = config
-                if filtered:
-                    options.mcp_servers = filtered
-                    # Ensure MCP patterns are in allowed_tools
-                    if options.allowed_tools is not None:
-                        mcp_patterns = get_mcp_tool_patterns(filtered)
-                        for p in mcp_patterns:
-                            if p not in options.allowed_tools:
-                                options.allowed_tools.append(p)
-                    logger.debug(f"MCP servers filtered to: {list(filtered.keys())}")
-                else:
-                    logger.debug("No MCP servers match allowed_tools, skipping MCP")
-            else:
-                options.mcp_servers = mcp_servers
-                # Add all MCP patterns to allowed_tools
-                mcp_patterns = get_mcp_tool_patterns(mcp_servers)
-                if not options.allowed_tools:
-                    options.allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
-                options.allowed_tools.extend(mcp_patterns)
-                logger.debug(f"MCP tools enabled: {mcp_patterns}")
+            options.mcp_servers = mcp_servers
         from src.runtime_config import get_token_streaming
 
         if get_token_streaming():
