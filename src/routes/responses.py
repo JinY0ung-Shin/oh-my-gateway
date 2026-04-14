@@ -294,6 +294,7 @@ async def create_response(
                 model=resolved.provider_model,
                 system_prompt=system_prompt if len(session.messages) == 0 else None,
                 permission_mode=PERMISSION_MODE_BYPASS,
+                allowed_tools=body.allowed_tools,
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
                 cwd=workspace_str,
             )
