@@ -322,7 +322,14 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
                             logger.debug(f"🔍 Request body: {json.dumps(logged_body, indent=2)}")
                             body_logged = True
                         except Exception:
-                            logger.debug(f"🔍 Request body (raw): {body.decode()[:500]}...")
+                            # Do not log raw bytes: a malformed JSON body may
+                            # contain Bearer tokens, API keys, or PII. Log only
+                            # metadata useful for debugging.
+                            logger.debug(
+                                "🔍 Request body: [non-JSON, %d bytes, content-type: %s]",
+                                len(body),
+                                request.headers.get("content-type", "unknown"),
+                            )
                             body_logged = True
             except Exception as e:
                 logger.debug(f"🔍 Could not read request body: {e}")

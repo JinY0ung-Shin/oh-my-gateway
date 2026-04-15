@@ -267,7 +267,9 @@ async def test_debug_logging_middleware_logs_raw_body_when_json_parse_fails(capl
         result = await middleware.dispatch(request, call_next)
 
     assert result is response
-    assert "Request body (raw): not-json..." in caplog.text
+    # Raw body is never echoed to logs; only metadata is logged.
+    assert "not-json" not in caplog.text
+    assert "Request body: [non-JSON, 8 bytes" in caplog.text
     assert "Response: 200 in" in caplog.text
 
 
