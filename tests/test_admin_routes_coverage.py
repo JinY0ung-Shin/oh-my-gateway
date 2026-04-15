@@ -41,7 +41,7 @@ class TestAdminPage:
         r = admin_client.get("/admin")
 
         assert r.status_code == 200
-        assert re.search(r"catch\\s*\\(e\\)\\s*\\{\\s*\\}", r.text) is None
+        assert re.search(r"catch\s*\(e\)\s*\{\s*\}", r.text) is None
 
     def test_admin_page_script_uses_visible_error_handling_for_async_loads(self, admin_client):
         r = admin_client.get("/admin")
