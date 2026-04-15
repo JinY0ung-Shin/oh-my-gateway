@@ -61,26 +61,30 @@ def _save_persisted(text: Optional[str], *, active_name: Optional[str] = None) -
     """Save or delete the persisted admin override.
 
     Raises ``OSError`` on failure so callers can avoid in-memory/disk divergence.
+
+    The lock is held across the file I/O so concurrent callers cannot observe
+    a memory/disk mismatch, and ``_active_prompt_name`` is only updated after
+    the file mutation succeeds (file becomes the source of truth).
     """
     global _active_prompt_name
     if text is None:
         with _lock:
+            if _PERSIST_FILE.is_file():
+                _PERSIST_FILE.unlink()
+                logger.info("System prompt: persisted file removed")
             _active_prompt_name = None
-        if _PERSIST_FILE.is_file():
-            _PERSIST_FILE.unlink()
-            logger.info("System prompt: persisted file removed")
     else:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         payload: dict = {"prompt": text}
         if active_name:
             payload["active_name"] = active_name
         with _lock:
+            _PERSIST_FILE.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
             _active_prompt_name = active_name
-        _PERSIST_FILE.write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        logger.info("System prompt: persisted to %s", _PERSIST_FILE)
+            logger.info("System prompt: persisted to %s", _PERSIST_FILE)
 
 
 def _resolve_placeholders(text: str) -> str:

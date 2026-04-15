@@ -178,17 +178,23 @@ class SessionManager:
         """Synchronous variant: remove expired sessions without client disconnect.
 
         Used by synchronous callers (e.g. ``list_sessions``) that cannot await.
-        Sessions with active clients will have their clients disconnected on the
-        next async cleanup cycle.
+        Sessions with active clients are left in place so the async cleanup
+        cycle can disconnect them safely and then remove them — otherwise the
+        SDK client would be orphaned.
         """
         expired = [sid for sid, s in self.sessions.items() if s.is_expired()]
+        removed = 0
         for sid in expired:
             session = self.sessions[sid]
+            if session.client is not None:
+                # Defer to the async cleanup cycle so the client can be awaited.
+                continue
             if session.workspace:
                 self._cleanup_workspace(session.workspace)
             del self.sessions[sid]
             logger.info(f"Cleaned up expired session: {sid}")
-        return len(expired)
+            removed += 1
+        return removed
 
     def _cleanup_workspace(self, workspace_path: str) -> None:
         """Remove temporary workspace directory on session expiry."""
