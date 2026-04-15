@@ -120,9 +120,13 @@ def get_admin_js() -> str:
       this.loading.sessions = true;
       try {
         const r = await this.api('/admin/api/summary');
-        if (r.ok) this.summary = await r.json();
+        if (r.ok) { this.summary = await r.json(); this._summaryFailCount = 0; }
         else if (r.status === 401) { this.authenticated = false; this.stopPolling(); }
-      } catch(e) { console.error('Failed to load summary', e); this.showToast('Failed to load summary', 'err'); } finally { this.loading.sessions = false; }
+      } catch(e) {
+        console.error('Failed to load summary', e);
+        this._summaryFailCount = (this._summaryFailCount || 0) + 1;
+        if (this._summaryFailCount === 1) this.showToast('Failed to load summary', 'err');
+      } finally { this.loading.sessions = false; }
     },
 
     async loadMetrics() {
@@ -234,8 +238,12 @@ def get_admin_js() -> str:
         if (this.logsFilter.endpoint) url += '&endpoint=' + encodeURIComponent(this.logsFilter.endpoint);
         if (this.logsFilter.status) url += '&status=' + this.logsFilter.status;
         const r = await this.api(url);
-        if (r.ok) this.logs = await r.json();
-      } catch(e) { console.error('Failed to load logs', e); this.showToast('Failed to load logs', 'err'); } finally { this.loading.logs = false; }
+        if (r.ok) { this.logs = await r.json(); this._logsFailCount = 0; }
+      } catch(e) {
+        console.error('Failed to load logs', e);
+        this._logsFailCount = (this._logsFailCount || 0) + 1;
+        if (this._logsFailCount === 1) this.showToast('Failed to load logs', 'err');
+      } finally { this.loading.logs = false; }
     },
     toggleLogsPolling() {
       if (this.logsPollTimer) { clearInterval(this.logsPollTimer); this.logsPollTimer = null; }
