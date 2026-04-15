@@ -65,7 +65,6 @@ def test_health_endpoint_returns_request_id_header():
     assert response.headers["x-request-id"]
 
 
-
 def test_returns_503_when_auth_is_invalid():
     _auth_exc = HTTPException(
         status_code=503,
@@ -137,7 +136,6 @@ def test_list_mcp_servers_filters_safe_fields():
     assert "token" not in body["servers"][1]["config"]
 
 
-
 def test_auth_status_endpoint_uses_runtime_key_source():
     original_main_key = getattr(main, "runtime_api_key", None)
     main.runtime_api_key = "runtime-key"
@@ -160,6 +158,45 @@ def test_auth_status_endpoint_uses_runtime_key_source():
     finally:
         auth_manager.runtime_api_key = original_runtime_key
         main.runtime_api_key = original_main_key
+
+
+def test_validation_error_preserves_field_details_without_echoing_raw_input():
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": [{"content": "Hi"}],
+            },
+        )
+
+    body = response.json()
+    assert response.status_code == 422
+    assert body["error"]["type"] == "validation_error"
+    assert body["error"]["code"] == "invalid_request_error"
+    assert body["error"]["details"]
+    assert body["error"]["details"][0]["field"]
+    assert body["error"]["details"][0]["message"]
+    assert body["error"]["details"][0]["type"]
+    assert "input" not in body["error"]["details"][0]
+    assert "debug" not in body["error"]
+
+
+def test_validation_error_omits_raw_request_body_even_in_debug_mode():
+    main.DEBUG_MODE = True
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": [{"content": "Hi"}],
+            },
+        )
+
+    body = response.json()
+    assert response.status_code == 422
+    assert "debug" not in body["error"]
 
 
 def test_session_endpoints_and_http_exception_handler():

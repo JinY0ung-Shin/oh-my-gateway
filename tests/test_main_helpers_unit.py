@@ -295,6 +295,47 @@ async def test_debug_logging_middleware_handles_body_read_and_downstream_failure
     assert "Request failed after" in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_request_logging_middleware_logs_parse_failures(caplog):
+    middleware = main.RequestLoggingMiddleware(app=main.app)
+    request = MagicMock()
+    request.method = "POST"
+    request.url = SimpleNamespace(path="/v1/responses")
+    request.headers = {"content-length": "8"}
+    request.body = AsyncMock(side_effect=RuntimeError("read failed"))
+    request.client = SimpleNamespace(host="127.0.0.1")
+    response = MagicMock(status_code=200)
+    call_next = AsyncMock(return_value=response)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await middleware.dispatch(request, call_next)
+
+    assert result is response
+    assert "Could not inspect request body for request logging: read failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_logging_middleware_logs_backend_resolution_failures(caplog):
+    middleware = main.RequestLoggingMiddleware(app=main.app)
+    request = MagicMock()
+    request.method = "POST"
+    request.url = SimpleNamespace(path="/v1/responses")
+    request.headers = {"content-length": "32"}
+    request.body = AsyncMock(return_value=b'{"model":"sonnet"}')
+    request.client = SimpleNamespace(host="127.0.0.1")
+    response = MagicMock(status_code=200)
+    call_next = AsyncMock(return_value=response)
+
+    with (
+        patch("src.backends.resolve_model", side_effect=RuntimeError("resolver boom")),
+        caplog.at_level(logging.DEBUG),
+    ):
+        result = await middleware.dispatch(request, call_next)
+
+    assert result is response
+    assert "Could not resolve backend for request logging: resolver boom" in caplog.text
+
+
 def test_response_id_helpers_round_trip():
     session_id = str(uuid.uuid4())
 
