@@ -19,10 +19,6 @@ def client_context_with_workspace(mock_wm):
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
-    from src.backends.claude.client import ClaudeCodeCLI
-
-    mock_cli.build_options = ClaudeCodeCLI.build_options.__get__(mock_cli, type(mock_cli))
-
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 

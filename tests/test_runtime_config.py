@@ -5,8 +5,6 @@ import pytest
 from src.runtime_config import (
     EDITABLE_KEYS,
     get_default_model,
-    get_default_max_turns,
-    get_session_max_age_minutes,
     get_thinking_mode,
     get_token_streaming,
     runtime_config,
@@ -123,20 +121,6 @@ class TestConvenienceGetters:
         assert get_default_model() == DEFAULT_MODEL
         runtime_config.set("default_model", "custom")
         assert get_default_model() == "custom"
-
-    def test_get_default_max_turns(self):
-        from src.constants import DEFAULT_MAX_TURNS
-
-        assert get_default_max_turns() == DEFAULT_MAX_TURNS
-        runtime_config.set("default_max_turns", 5)
-        assert get_default_max_turns() == 5
-
-    def test_get_session_max_age_minutes(self):
-        from src.constants import SESSION_MAX_AGE_MINUTES
-
-        assert get_session_max_age_minutes() == SESSION_MAX_AGE_MINUTES
-        runtime_config.set("session_max_age_minutes", 120)
-        assert get_session_max_age_minutes() == 120
 
     def test_get_thinking_mode(self):
         runtime_config.set("thinking_mode", "disabled")

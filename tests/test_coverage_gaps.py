@@ -350,54 +350,6 @@ class TestPluginSkillContentEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# message_adapter — _content_to_text edge cases
-# ---------------------------------------------------------------------------
-
-
-class TestContentToText:
-    def test_list_with_string_items(self):
-        from src.message_adapter import MessageAdapter
-
-        result = MessageAdapter._content_to_text(["hello", "world"])
-        assert result == "hello\nworld"
-
-    def test_list_with_object_items(self):
-        from src.message_adapter import MessageAdapter
-
-        item = SimpleNamespace(type="text", text="from object")
-        result = MessageAdapter._content_to_text([item])
-        assert result == "from object"
-
-    def test_list_with_dict_items(self):
-        from src.message_adapter import MessageAdapter
-
-        result = MessageAdapter._content_to_text([{"type": "text", "text": "from dict"}])
-        assert result == "from dict"
-
-    def test_list_with_non_text_items(self):
-        from src.message_adapter import MessageAdapter
-
-        item = SimpleNamespace(type="image_url", text=None)
-        result = MessageAdapter._content_to_text([item])
-        assert result == ""
-
-    def test_non_string_non_list(self):
-        from src.message_adapter import MessageAdapter
-
-        assert MessageAdapter._content_to_text(42) == "42"
-
-    def test_none_content(self):
-        from src.message_adapter import MessageAdapter
-
-        assert MessageAdapter._content_to_text(None) == ""
-
-    def test_empty_list(self):
-        from src.message_adapter import MessageAdapter
-
-        assert MessageAdapter._content_to_text([]) == ""
-
-
-# ---------------------------------------------------------------------------
 # streaming_utils — _extract_rate_limit_status
 # ---------------------------------------------------------------------------
 
@@ -482,25 +434,3 @@ class TestKeepaliveWrapper:
         assert items == ["ok"]
 
 
-# ---------------------------------------------------------------------------
-# backends/claude/client — resolve slash syntax
-# ---------------------------------------------------------------------------
-
-
-class TestClaudeClientResolve:
-    def test_resolve_slash_non_claude(self):
-        from src.backends.claude.client import ClaudeCodeCLI
-
-        with patch.object(ClaudeCodeCLI, "__init__", lambda self: None):
-            client = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
-            assert client.resolve("openai/gpt-4") is None
-
-    def test_resolve_slash_claude(self):
-        from src.backends.claude.client import ClaudeCodeCLI
-
-        with patch.object(ClaudeCodeCLI, "__init__", lambda self: None):
-            client = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
-            result = client.resolve("claude/opus")
-            assert result is not None
-            assert result.backend == "claude"
-            assert result.provider_model == "opus"

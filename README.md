@@ -161,8 +161,6 @@ Each `/v1/responses` request can include a `user` field to isolate working direc
 | `GET` | `/v1/mcp/servers` | Loaded MCP servers |
 | `GET` | `/health` | Health check |
 | `GET` | `/version` | Version info |
-| `POST` | `/v1/compatibility` | OpenAI parameter compatibility report |
-| `POST` | `/v1/debug/request` | Debug raw request inspection |
 | `GET` | `/` | Interactive API explorer |
 
 Streaming (`"stream": true`) is supported on `/v1/responses`.

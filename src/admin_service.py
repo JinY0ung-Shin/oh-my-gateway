@@ -693,16 +693,6 @@ def _parse_skill_frontmatter(content: str) -> Dict[str, Any]:
         return {}
 
 
-def _skill_body(content: str) -> str:
-    """Return the markdown body after the frontmatter block."""
-    if not content.startswith("---"):
-        return content
-    parts = content.split("---", 2)
-    if len(parts) < 3:
-        return content
-    return parts[2].lstrip("\n")
-
-
 def list_skills() -> List[Dict[str, Any]]:
     """List all skills in ``.claude/skills/``.
 

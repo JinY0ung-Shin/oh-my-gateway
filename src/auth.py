@@ -259,7 +259,7 @@ def get_all_backends_auth_info() -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Backward-compat lazy re-exports for ClaudeAuthProvider / CodexAuthProvider
+# Backward-compat lazy re-export for ClaudeAuthProvider
 # so that ``from src.auth import ClaudeAuthProvider`` still works.
 # ---------------------------------------------------------------------------
 def __getattr__(name):

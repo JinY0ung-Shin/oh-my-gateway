@@ -1,7 +1,7 @@
 """Backend contract tests — parametrized tests that every backend must pass.
 
 Ensures all backends conform to the BackendClient protocol and that
-descriptors, resolve, and build_options work correctly.
+descriptors work correctly.
 """
 
 import pytest
@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 
 from src.backends.base import (
     BackendRegistry,
-    ResolvedModel,
 )
 from src.backends.claude import CLAUDE_DESCRIPTOR, ClaudeCodeCLI
 
@@ -122,81 +121,11 @@ class TestProtocolConformance:
     def test_claude_has_name_property(self, mock_claude_cli):
         assert mock_claude_cli.name == "claude"
 
-    def test_claude_has_owned_by_property(self, mock_claude_cli):
-        assert mock_claude_cli.owned_by == "anthropic"
-
     def test_claude_supported_models(self, mock_claude_cli):
         models = mock_claude_cli.supported_models()
         assert isinstance(models, list)
         assert "opus" in models
         assert "sonnet" in models
-
-    def test_claude_resolve_known_model(self, mock_claude_cli):
-        resolved = mock_claude_cli.resolve("opus")
-        assert resolved is not None
-        assert resolved.backend == "claude"
-        assert resolved.provider_model == "opus"
-
-    def test_claude_resolve_unknown_returns_none(self, mock_claude_cli):
-        assert mock_claude_cli.resolve("unknown-model") is None
-
-
-# ---------------------------------------------------------------------------
-# build_options tests
-# ---------------------------------------------------------------------------
-
-
-class TestBuildOptions:
-    """Test build_options on concrete backends."""
-
-    def _make_request(self, enable_tools=True, model="opus", allowed_tools=None):
-        """Create a minimal mock request."""
-        req = MagicMock()
-        req.enable_tools = enable_tools
-        req.allowed_tools = allowed_tools
-        req.to_claude_options.return_value = {"max_turns": 10}
-        req.model = model
-        return req
-
-    def test_claude_build_options_tools_enabled(self, mock_claude_cli):
-        req = self._make_request(enable_tools=True)
-        resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
-        options = mock_claude_cli.build_options(req, resolved)
-        assert "allowed_tools" in options
-        assert options["permission_mode"] == "bypassPermissions"
-
-    def test_claude_build_options_tools_disabled(self, mock_claude_cli):
-        req = self._make_request(enable_tools=False)
-        resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
-        options = mock_claude_cli.build_options(req, resolved)
-        assert "disallowed_tools" in options
-        assert options["max_turns"] == 1
-
-    def test_claude_build_options_with_overrides(self, mock_claude_cli):
-        req = self._make_request(enable_tools=True)
-        resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
-        options = mock_claude_cli.build_options(req, resolved, overrides={"max_turns": 5})
-        assert options["max_turns"] == 5
-
-    def test_claude_build_options_mcp_tools_added_when_enabled(self, mock_claude_cli):
-        """MCP tool patterns are added to allowed_tools when tools are enabled."""
-        servers = {"my-router": {"type": "stdio", "command": "echo"}}
-        with patch("src.backends.claude.client.get_mcp_servers", return_value=servers):
-            req = self._make_request(enable_tools=True)
-            resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
-            options = mock_claude_cli.build_options(req, resolved)
-            assert "mcp__my_router__*" in options["allowed_tools"]
-            assert "mcp_servers" in options
-
-    def test_claude_build_options_mcp_tools_not_added_when_disabled(self, mock_claude_cli):
-        """MCP tool patterns are not added when tools are disabled."""
-        servers = {"my-router": {"type": "stdio", "command": "echo"}}
-        with patch("src.backends.claude.client.get_mcp_servers", return_value=servers):
-            req = self._make_request(enable_tools=False)
-            resolved = ResolvedModel(public_model="opus", backend="claude", provider_model="opus")
-            options = mock_claude_cli.build_options(req, resolved)
-            assert "allowed_tools" not in options
-            assert "mcp_servers" in options
 
 
 # ---------------------------------------------------------------------------
@@ -257,15 +186,6 @@ class TestCleanImports:
         mod = importlib.import_module("src.auth")
         assert hasattr(mod, "ClaudeAuthProvider")
 
-    def test_claude_cli_shim_constants(self):
-        """src.claude_cli shim must re-export Claude-specific constants."""
-        import importlib
-
-        mod = importlib.import_module("src.claude_cli")
-        assert hasattr(mod, "THINKING_MODE")
-        assert hasattr(mod, "TOKEN_STREAMING")
-
-
 # ---------------------------------------------------------------------------
 # Subprocess-based clean-process import tests
 # These spawn a fresh Python interpreter to catch circular imports that
@@ -285,7 +205,6 @@ class TestCleanProcessImports:
             "import src.auth",
             "from src.constants import CLAUDE_MODELS, ALL_MODELS",
             "from src.claude_cli import ClaudeCodeCLI",
-            "from src.claude_cli import THINKING_MODE",
             "from src.backend_registry import BackendClient, BackendRegistry, resolve_model",
             "from src.auth import ClaudeAuthProvider",
             "from src.auth import BackendAuthProvider",

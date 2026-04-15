@@ -28,11 +28,6 @@ def client_context():
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
-    # Use real Claude build_options so tests verify actual backend behavior
-    from src.backends.claude.client import ClaudeCodeCLI
-
-    mock_cli.build_options = ClaudeCodeCLI.build_options.__get__(mock_cli, type(mock_cli))
-
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
@@ -70,18 +65,6 @@ def test_health_endpoint_returns_request_id_header():
     assert response.headers["x-request-id"]
 
 
-def test_request_size_limit_returns_413():
-    main.MAX_REQUEST_SIZE = 10
-
-    with client_context() as (client, _mock_cli):
-        response = client.post(
-            "/v1/compatibility",
-            json={"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": "hello"}]},
-        )
-
-    assert response.status_code == 413
-    assert response.json()["error"]["type"] == "request_too_large"
-
 
 def test_returns_503_when_auth_is_invalid():
     _auth_exc = HTTPException(
@@ -107,31 +90,18 @@ def test_returns_503_when_auth_is_invalid():
     assert "authentication failed" in body["error"]["message"]
 
 
-def test_models_compatibility_version_and_root_endpoints():
+def test_models_version_and_root_endpoints():
     auth_info = {"method": "claude_cli", "status": {"valid": True}}
     with (
         client_context() as (client, _mock_cli),
         patch.object(general_module, "get_claude_code_auth_info", return_value=auth_info),
     ):
         models_response = client.get("/v1/models")
-        compatibility_response = client.post(
-            "/v1/compatibility",
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "temperature": 0.5,
-            },
-        )
         version_response = client.get("/version")
         root_response = client.get("/")
 
     assert models_response.status_code == 200
     assert models_response.json()["object"] == "list"
-    assert compatibility_response.status_code == 200
-    assert (
-        "temperature"
-        in compatibility_response.json()["compatibility_report"]["unsupported_parameters"]
-    )
     assert version_response.status_code == 200
     assert version_response.json()["api_version"] == "v1"
     assert version_response.json()["service"] == "claude-code-gateway"
@@ -166,27 +136,6 @@ def test_list_mcp_servers_filters_safe_fields():
     assert "secret" not in body["servers"][0]["config"]
     assert "token" not in body["servers"][1]["config"]
 
-
-def test_debug_request_endpoint_reports_parse_and_validation_results():
-    with client_context() as (client, _mock_cli):
-        invalid_response = client.post(
-            "/v1/debug/request",
-            content='{"model":',
-            headers={"content-type": "application/json"},
-        )
-        valid_response = client.post(
-            "/v1/debug/request",
-            json={
-                "model": DEFAULT_MODEL,
-                "messages": [{"role": "user", "content": "Hi"}],
-                "stream": False,
-            },
-        )
-
-    assert invalid_response.status_code == 200
-    assert invalid_response.json()["debug_info"]["json_parse_error"] is not None
-    assert valid_response.status_code == 200
-    assert valid_response.json()["debug_info"]["validation_result"]["valid"] is True
 
 
 def test_auth_status_endpoint_uses_runtime_key_source():
@@ -824,15 +773,6 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
     mock_cli.verify = AsyncMock(return_value=True)
     mock_cli.run_completion = slow_run_completion
     mock_cli.parse_message.return_value = "Lock holder wins"
-    mock_cli.build_options = MagicMock(
-        side_effect=lambda req, resolved, overrides=None: {
-            **(req.to_claude_options() if hasattr(req, "to_claude_options") else {}),
-            **(overrides or {}),
-            "model": resolved.provider_model,
-            "permission_mode": "bypassPermissions",
-        }
-    )
-
     BackendRegistry.register("claude", mock_cli)
 
     with (

@@ -29,7 +29,6 @@ class TestLoadDefaultPrompt:
     def test_empty_path_uses_preset(self):
         sp.load_default_prompt("")
         assert sp._default_prompt is None
-        assert sp.is_using_preset()
 
     def test_blank_path_uses_preset(self):
         sp.load_default_prompt("   ")
@@ -40,7 +39,6 @@ class TestLoadDefaultPrompt:
         f.write_text("You are a helpful assistant.", encoding="utf-8")
         sp.load_default_prompt(str(f))
         assert sp._default_prompt == "You are a helpful assistant."
-        assert not sp.is_using_preset()
 
     def test_missing_file_raises(self):
         with pytest.raises(FileNotFoundError, match="not found"):
@@ -51,7 +49,6 @@ class TestLoadDefaultPrompt:
         f.write_text("", encoding="utf-8")
         sp.load_default_prompt(str(f))
         assert sp._default_prompt is None
-        assert sp.is_using_preset()
 
     def test_whitespace_only_file_falls_back(self, tmp_path):
         f = tmp_path / "blank.txt"
@@ -63,14 +60,12 @@ class TestLoadDefaultPrompt:
 class TestGetSetReset:
     def test_preset_mode_returns_none(self):
         assert sp.get_system_prompt() is None
-        assert sp.is_using_preset()
         assert sp.get_prompt_mode() == "preset"
 
     def test_file_default(self):
         sp._default_prompt = "from file"
         assert sp.get_system_prompt() == "from file"
         assert sp.get_prompt_mode() == "file"
-        assert not sp.is_using_preset()
 
     def test_runtime_override_takes_priority(self):
         sp._default_prompt = "from file"
@@ -102,11 +97,6 @@ class TestGetSetReset:
     def test_set_strips_whitespace(self):
         sp.set_system_prompt("  hello world  ")
         assert sp.get_system_prompt() == "hello world"
-
-    def test_get_default_prompt_ignores_runtime(self):
-        sp._default_prompt = "from file"
-        sp.set_system_prompt("runtime")
-        assert sp.get_default_prompt() == "from file"
 
 
 class TestGetPromptMode:
@@ -151,13 +141,11 @@ class TestPersistence:
         sp._PERSIST_FILE.write_text("{bad json", encoding="utf-8")
         sp.load_default_prompt("")
         assert sp.get_system_prompt() is None
-        assert sp.is_using_preset()
 
     def test_non_string_prompt_ignored(self):
         sp._PERSIST_FILE.write_text(json.dumps({"prompt": 123}), encoding="utf-8")
         sp.load_default_prompt("")
         assert sp.get_system_prompt() is None
-        assert sp.is_using_preset()
 
     def test_empty_string_prompt_ignored(self):
         sp._PERSIST_FILE.write_text(json.dumps({"prompt": "  "}), encoding="utf-8")
@@ -168,7 +156,6 @@ class TestPersistence:
         sp._PERSIST_FILE.write_text("[]", encoding="utf-8")
         sp.load_default_prompt("")
         assert sp.get_system_prompt() is None
-        assert sp.is_using_preset()
 
     def test_write_failure_prevents_memory_update(self):
         with patch.object(Path, "write_text", side_effect=OSError("disk full")):

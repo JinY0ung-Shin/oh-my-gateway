@@ -299,67 +299,6 @@ class TestMessageAdapterFormatBlocks:
         assert result is None
 
 
-class TestMessageAdapterMessagesToPrompt:
-    """Test MessageAdapter.messages_to_prompt() conversion logic."""
-
-    def setup_method(self):
-        from src.message_adapter import MessageAdapter
-        from src.models import Message
-
-        self.adapter = MessageAdapter
-        self.Message = Message
-
-    def test_single_user_message(self):
-        """Single user message: prompt only, no system."""
-        messages = [self.Message(role="user", content="What is 2+2?")]
-        prompt, system = self.adapter.messages_to_prompt(messages)
-        assert prompt == "What is 2+2?"
-        assert system is None
-
-    def test_system_and_user(self):
-        """System + user: system extracted, user as prompt."""
-        messages = [
-            self.Message(role="system", content="You are a calculator."),
-            self.Message(role="user", content="What is 2+2?"),
-        ]
-        prompt, system = self.adapter.messages_to_prompt(messages)
-        assert prompt == "What is 2+2?"
-        assert system == "You are a calculator."
-
-    def test_multi_turn_conversation(self):
-        """Multi-turn (system, user, assistant, user): all parts joined, system extracted."""
-        messages = [
-            self.Message(role="system", content="Be helpful."),
-            self.Message(role="user", content="Hi"),
-            self.Message(role="assistant", content="Hello! How can I help?"),
-            self.Message(role="user", content="Tell me a joke."),
-        ]
-        prompt, system = self.adapter.messages_to_prompt(messages)
-        assert system == "Be helpful."
-        # All conversation parts joined
-        assert "Hi" in prompt
-        assert "Hello! How can I help?" in prompt
-        assert "Tell me a joke." in prompt
-        # Parts are separated by double newlines
-        assert prompt == "Hi\n\nHello! How can I help?\n\nTell me a joke."
-
-    def test_multiple_system_messages_last_wins(self):
-        """When multiple system messages exist, the last one is used."""
-        messages = [
-            self.Message(role="system", content="First system"),
-            self.Message(role="system", content="Second system"),
-            self.Message(role="user", content="Hello"),
-        ]
-        prompt, system = self.adapter.messages_to_prompt(messages)
-        assert system == "Second system"
-
-    def test_no_messages(self):
-        """Empty message list returns empty prompt and no system."""
-        prompt, system = self.adapter.messages_to_prompt([])
-        assert prompt == ""
-        assert system is None
-
-
 class TestChatCompletionRequestToClaudeOptions:
     """Test ChatCompletionRequest.to_claude_options() method."""
 

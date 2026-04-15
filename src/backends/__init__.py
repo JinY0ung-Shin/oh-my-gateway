@@ -11,7 +11,6 @@ from typing import Optional
 
 from src.backends.base import (  # noqa: F401
     BackendClient,
-    BackendConfigError,
     BackendDescriptor,
     BackendRegistry,
     ResolvedModel,

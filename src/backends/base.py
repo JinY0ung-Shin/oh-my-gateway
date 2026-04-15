@@ -20,23 +20,6 @@ from typing import (
 
 
 # ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-
-class BackendConfigError(Exception):
-    """Raised by backend layer when configuration or validation fails.
-
-    Carries a *status_code* hint so callers can translate to the appropriate
-    HTTP response without importing FastAPI in the backend layer.
-    """
-
-    def __init__(self, message: str, status_code: int = 400):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-# ---------------------------------------------------------------------------
 # Model resolution
 # ---------------------------------------------------------------------------
 
@@ -92,19 +75,7 @@ class BackendClient(Protocol):
     @property
     def name(self) -> str: ...
 
-    @property
-    def owned_by(self) -> str: ...
-
     def supported_models(self) -> List[str]: ...
-
-    def resolve(self, model: str) -> Optional[ResolvedModel]: ...
-
-    def build_options(
-        self,
-        request: Any,
-        resolved: ResolvedModel,
-        overrides: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]: ...
 
     def get_auth_provider(self) -> Any: ...
 

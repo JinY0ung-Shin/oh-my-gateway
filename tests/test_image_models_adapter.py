@@ -84,43 +84,6 @@ def _make_mock_handler():
     return handler
 
 
-class TestExtractImagesToPrompt:
-    def test_extract_images_text_only_string(self):
-        """Plain string passes through unchanged."""
-        handler = _make_mock_handler()
-        result = MessageAdapter.extract_images_to_prompt("hello", handler)
-        assert result == "hello"
-        handler.save_openai_image.assert_not_called()
-
-    def test_extract_images_with_image_parts(self):
-        """ContentPart list with text + image_url extracts images via handler."""
-        handler = _make_mock_handler()
-        data_url = f"data:image/png;base64,{TINY_PNG_B64}"
-        content = [
-            ContentPart(type="text", text="describe this"),
-            ContentPart(type="image_url", image_url={"url": data_url}),
-        ]
-        result = MessageAdapter.extract_images_to_prompt(content, handler)
-        assert "describe this" in result
-        assert '<attached_image path="' in result
-        assert "/tmp/test/img_abc123.png" in result
-        handler.save_openai_image.assert_called_once_with({"url": data_url})
-
-    def test_extract_images_dict_format(self):
-        """Plain dicts (not ContentPart objects) also work."""
-        handler = _make_mock_handler()
-        data_url = f"data:image/png;base64,{TINY_PNG_B64}"
-        content = [
-            {"type": "text", "text": "what is this?"},
-            {"type": "image_url", "image_url": {"url": data_url}},
-        ]
-        result = MessageAdapter.extract_images_to_prompt(content, handler)
-        assert "what is this?" in result
-        assert '<attached_image path="' in result
-        assert "/tmp/test/img_abc123.png" in result
-        handler.save_openai_image.assert_called_once_with({"url": data_url})
-
-
 class TestFilterContent:
     def test_filter_content_preserves_attached_image(self):
         """<attached_image> references are NOT stripped by filter_content."""

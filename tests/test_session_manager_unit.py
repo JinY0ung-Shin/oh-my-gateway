@@ -235,30 +235,6 @@ class TestSessionManager:
         assert len(sessions) == 1
         assert sessions[0].session_id == "active"
 
-    def test_process_messages_stateless_mode(self, manager):
-        """process_messages() in stateless mode returns messages as-is."""
-        messages = [Message(role="user", content="Hello")]
-
-        result_msgs, session_id = manager.process_messages(messages, session_id=None)
-
-        assert result_msgs == messages
-        assert session_id is None
-
-    def test_process_messages_session_mode(self, manager):
-        """process_messages() in session mode accumulates messages."""
-        msg1 = Message(role="user", content="First")
-        msg2 = Message(role="user", content="Second")
-
-        # First call
-        result1, sid1 = manager.process_messages([msg1], session_id="my-session")
-        assert len(result1) == 1
-        assert sid1 == "my-session"
-
-        # Second call - should have both messages
-        result2, sid2 = manager.process_messages([msg2], session_id="my-session")
-        assert len(result2) == 2
-        assert sid2 == "my-session"
-
     def test_add_assistant_response_in_session_mode(self, manager):
         """add_assistant_response() adds response to session."""
         manager.get_or_create_session("my-session")
@@ -293,16 +269,6 @@ class TestSessionManager:
         assert stats["expired_sessions"] == 1
         assert stats["total_messages"] == 1
 
-    def test_shutdown_clears_sessions(self, manager):
-        """shutdown() clears all sessions."""
-        manager.get_or_create_session("session-1")
-        manager.get_or_create_session("session-2")
-        assert len(manager.sessions) == 2
-
-        manager.shutdown()
-
-        assert len(manager.sessions) == 0
-
     async def test_cleanup_expired_sessions(self, manager):
         """cleanup_expired_sessions() removes only expired sessions."""
         manager.get_or_create_session("active")
@@ -332,7 +298,7 @@ class TestSessionManagerAsync:
         assert manager._cleanup_task is not None
 
         # Clean up
-        manager.shutdown()
+        await manager.async_shutdown()
 
     async def test_start_cleanup_task_idempotent(self, manager):
         """start_cleanup_task() only creates one task."""
@@ -345,7 +311,7 @@ class TestSessionManagerAsync:
         assert first_task is second_task
 
         # Clean up
-        manager.shutdown()
+        await manager.async_shutdown()
 
 
 class TestSessionManagerThreadSafety:
@@ -545,65 +511,6 @@ class TestAsyncShutdown:
         assert not tmp_ws.exists(), "Temporary workspace should be removed on shutdown"
         assert permanent_ws.exists(), "Permanent workspace should survive shutdown"
         assert len(manager.sessions) == 0
-
-    def test_shutdown_cleans_temp_workspaces(self, manager, tmp_path):
-        """shutdown() removes _tmp_ workspaces before clearing sessions."""
-        tmp_ws = tmp_path / "_tmp_xyz789"
-        tmp_ws.mkdir()
-
-        s1 = manager.get_or_create_session("s-tmp")
-        s1.workspace = str(tmp_ws)
-
-        manager.shutdown()
-
-        assert not tmp_ws.exists(), "Temporary workspace should be removed on shutdown"
-        assert len(manager.sessions) == 0
-
-
-class TestProcessMessagesEdgeCases:
-    """Test edge cases of process_messages()."""
-
-    @pytest.fixture
-    def manager(self, fresh_session_manager):
-        return fresh_session_manager
-
-    def test_session_mode_with_empty_messages(self, manager):
-        """Session mode with empty messages list creates session but adds nothing."""
-        result_msgs, sid = manager.process_messages([], session_id="empty-session")
-
-        assert sid == "empty-session"
-        assert result_msgs == []
-        assert "empty-session" in manager.sessions
-
-    def test_multiple_rounds_accumulate_correctly(self, manager):
-        """Three or more rounds of messages accumulate correctly."""
-        sid = "multi-round"
-
-        # Round 1
-        r1, _ = manager.process_messages([Message(role="user", content="Round 1")], session_id=sid)
-        assert len(r1) == 1
-
-        # Add assistant response
-        manager.add_assistant_response(sid, Message(role="assistant", content="Reply 1"))
-
-        # Round 2
-        r2, _ = manager.process_messages([Message(role="user", content="Round 2")], session_id=sid)
-        assert len(r2) == 3  # user1 + assistant1 + user2
-
-        # Add assistant response
-        manager.add_assistant_response(sid, Message(role="assistant", content="Reply 2"))
-
-        # Round 3
-        r3, _ = manager.process_messages([Message(role="user", content="Round 3")], session_id=sid)
-        assert len(r3) == 5  # user1 + assistant1 + user2 + assistant2 + user3
-
-        # Verify order
-        assert r3[0].content == "Round 1"
-        assert r3[1].content == "Reply 1"
-        assert r3[2].content == "Round 2"
-        assert r3[3].content == "Reply 2"
-        assert r3[4].content == "Round 3"
-
 
 class TestGetStatsAllExpired:
     """Test get_stats() when all sessions are expired."""

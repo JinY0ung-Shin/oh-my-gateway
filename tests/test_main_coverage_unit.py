@@ -7,10 +7,8 @@ Targets specific line groups that were previously uncovered:
 - Raw request body capture in DEBUG mode
 - HTTPException for unavailable backend
 - HTTPException when backend auth fails
-- BackendConfigError catching
 - _is_assistant_content_chunk() wrapper
 - Pydantic ValidationError extraction
-- Debug endpoint exception handling
 - Responses API session validation guards
 - Responses API preflight lock release on error
 - find_available_port socket exception
@@ -46,10 +44,6 @@ def client_context(**extra_patches):
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
-    from src.backends.claude.client import ClaudeCodeCLI
-
-    mock_cli.build_options = ClaudeCodeCLI.build_options.__get__(mock_cli, type(mock_cli))
-
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
@@ -166,68 +160,6 @@ class TestVerifyBackends:
                 await main._verify_backends()
 
         assert "test backend verification failed: init failed" in caplog.text
-
-
-# ===========================================================================
-# Pydantic ValidationError extraction in debug endpoint
-# ===========================================================================
-
-
-class TestDebugEndpointValidationError:
-    """Cover debug endpoint's Pydantic ValidationError branch."""
-
-    def test_debug_endpoint_validation_error(self):
-        """Invalid body triggers Pydantic ValidationError."""
-        with client_context() as (client, _mock_cli):
-            response = client.post(
-                "/v1/debug/request",
-                json={
-                    "model": DEFAULT_MODEL,
-                    "messages": "not-a-list",
-                },
-            )
-
-        body = response.json()
-        assert body["debug_info"]["validation_result"]["valid"] is False
-        assert len(body["debug_info"]["validation_result"]["errors"]) > 0
-
-
-# ===========================================================================
-# Debug endpoint exception handling
-# ===========================================================================
-
-
-class TestDebugEndpointException:
-    """Cover the top-level exception handler in debug endpoint."""
-
-    def test_debug_endpoint_returns_error_on_exception(self):
-        """request.body() fails -- error in debug_info."""
-        with client_context() as (client, _mock_cli):
-            # Send a request with no body at all to the debug endpoint
-            # (the endpoint tries to decode body)
-            response = client.post(
-                "/v1/debug/request",
-                content=b"",
-                headers={"content-type": "application/json"},
-            )
-
-        body = response.json()
-        # It should still return a response (empty body parse results in {})
-        assert "debug_info" in body
-
-    def test_debug_endpoint_valid_request(self):
-        """Debug endpoint should report valid for a correct request."""
-        with client_context() as (client, _mock_cli):
-            response = client.post(
-                "/v1/debug/request",
-                json={
-                    "model": DEFAULT_MODEL,
-                    "messages": [{"role": "user", "content": "Hi"}],
-                },
-            )
-
-        body = response.json()
-        assert body["debug_info"]["validation_result"]["valid"] is True
 
 
 # ===========================================================================
@@ -602,32 +534,3 @@ class TestValidationHandlerBodyReadException:
         assert body["error"]["debug"]["raw_request_body"] == "Could not read request body"
 
 
-# ===========================================================================
-# Debug endpoint top-level exception
-# ===========================================================================
-
-
-class TestDebugEndpointTopLevelException:
-    """Cover the debug endpoint when an exception occurs during processing."""
-
-    def test_exception_in_body_parsing_returns_error(self):
-        """Exception during processing returns error dict."""
-        import src.routes.general as general_module
-
-        with client_context() as (client, _mock_cli):
-            with patch.object(
-                general_module,
-                "ChatCompletionRequest",
-                side_effect=Exception("model import error"),
-            ):
-                response = client.post(
-                    "/v1/debug/request",
-                    json={
-                        "model": DEFAULT_MODEL,
-                        "messages": [{"role": "user", "content": "Hi"}],
-                    },
-                )
-
-        body = response.json()
-        # Either succeeds normally or returns error info
-        assert "debug_info" in body

@@ -10,8 +10,6 @@ import os
 
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
-_BOOL_FALSE = {"false", "0", "no", "off"}
-_BOOL_ALL = _BOOL_TRUE | _BOOL_FALSE
 
 
 def parse_bool_env(name: str, default: str = "false") -> bool:

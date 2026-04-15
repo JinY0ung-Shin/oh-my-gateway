@@ -18,16 +18,4 @@ def __getattr__(name):
 
         return ClaudeCodeCLI
 
-    # Re-export constants that used to live at module level in the old claude_cli.py
-    _CONST_NAMES = {
-        "THINKING_MODE",
-        "THINKING_BUDGET_TOKENS",
-        "TOKEN_STREAMING",
-        "DISALLOWED_SUBAGENT_TYPES",
-    }
-    if name in _CONST_NAMES:
-        from src.backends.claude import constants as _c
-
-        return getattr(_c, name)
-
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

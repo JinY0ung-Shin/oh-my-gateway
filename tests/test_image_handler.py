@@ -107,25 +107,6 @@ def test_save_openai_missing_url(tmp_path):
         handler.save_openai_image({})
 
 
-def test_save_anthropic_format(tmp_path):
-    """Anthropic base64 source object is saved correctly."""
-    handler = ImageHandler(tmp_path)
-    path = handler.save_anthropic_image(
-        {"type": "base64", "media_type": "image/png", "data": TINY_PNG}
-    )
-    assert path.exists()
-    assert path.suffix == ".png"
-
-
-def test_save_anthropic_non_base64(tmp_path):
-    """Anthropic source with non-base64 type raises ValueError."""
-    handler = ImageHandler(tmp_path)
-    with pytest.raises(ValueError, match="Only base64 image source supported"):
-        handler.save_anthropic_image(
-            {"type": "url", "media_type": "image/png", "data": "https://example.com/img.png"}
-        )
-
-
 def test_save_responses_format(tmp_path):
     """Responses API data URL string is saved correctly."""
     handler = ImageHandler(tmp_path)

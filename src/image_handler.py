@@ -102,20 +102,6 @@ class ImageHandler:
         media_type, b64data = self.parse_data_url(url)
         return self.save_base64_image(b64data, media_type)
 
-    def save_anthropic_image(self, source: dict) -> Path:
-        """Anthropic format: ``{"type": "base64", "media_type": "image/png", "data": "..."}``."""
-        src_type = source.get("type")
-        if src_type != "base64":
-            raise ValueError(
-                f"Only base64 image source supported, got: {src_type!r}. "
-                f"Remote URL and file sources are not supported."
-            )
-        media_type = source.get("media_type", "")
-        data = source.get("data", "")
-        if not media_type or not data:
-            raise ValueError("Anthropic image source missing 'media_type' or 'data'")
-        return self.save_base64_image(data, media_type)
-
     def save_responses_image(self, image_url: str) -> Path:
         """Responses API format: *image_url* is a ``data:`` URL string."""
         media_type, b64data = self.parse_data_url(image_url)

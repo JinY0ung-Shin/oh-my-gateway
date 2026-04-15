@@ -180,7 +180,6 @@ async def lifespan(app: FastAPI):
         logger.debug("🔧 Available endpoints:")
         logger.debug("   POST /v1/responses - Responses API endpoint")
         logger.debug("   GET  /v1/models - List available models")
-        logger.debug("   POST /v1/debug/request - Debug request validation")
         logger.debug("   GET  /v1/auth/status - Authentication status")
         logger.debug("   GET  /health - Health check")
         logger.debug(
@@ -307,13 +306,11 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
                     body = await request.body()
                     if body:
                         try:
-                            import json as json_lib
-
-                            parsed_body = json_lib.loads(body.decode())
+                            parsed_body = json.loads(body.decode())
                             # Truncate base64 image data in logged body
                             logged_body = truncate_image_data(parsed_body)
                             logger.debug(
-                                f"🔍 Request body: {json_lib.dumps(logged_body, indent=2)}"
+                                f"🔍 Request body: {json.dumps(logged_body, indent=2)}"
                             )
                             body_logged = True
                         except Exception:
@@ -399,7 +396,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             client_ip = request.client.host if request.client else "unknown"
             entry = RequestLogEntry(
-                timestamp=__import__("time").time(),
+                timestamp=time.time(),
                 method=request.method,
                 path=path,
                 status_code=status_code,
@@ -511,8 +508,6 @@ app.include_router(admin_router)
 
 # ==================== Backward-compat re-exports ====================
 # Tests call these functions directly as main.X() — re-exports are required.
-
-from fastapi import HTTPException  # noqa: E402, F811
 
 from src.routes.responses import (  # noqa: E402, F401, F811
     _generate_msg_id,

@@ -31,7 +31,6 @@ from claude_agent_sdk.types import (
 )
 from src.backends.claude.constants import (
     CLAUDE_MODELS,
-    CLAUDE_TOOLS,
     DEFAULT_ALLOWED_TOOLS,
     DEFAULT_TASK_BUDGET,
     THINKING_BUDGET_TOKENS,
@@ -43,11 +42,10 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
-from src.backends.base import ResolvedModel
-from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
+from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
-from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
+from src.mcp_config import get_mcp_tool_patterns
 
 logger = logging.getLogger(__name__)
 
@@ -66,8 +64,6 @@ class ClaudeCodeCLI:
     fresh call.  For multi-turn conversations use the ``resume``
     parameter instead of attempting to reuse a previous query.
     """
-
-    backend_name: str = "claude"
 
     def __init__(self, timeout: int = None, cwd: Optional[str] = None):
         if timeout is None:
@@ -122,88 +118,8 @@ class ClaudeCodeCLI:
     def name(self) -> str:
         return "claude"
 
-    @property
-    def owned_by(self) -> str:
-        return "anthropic"
-
     def supported_models(self) -> List[str]:
         return list(CLAUDE_MODELS)
-
-    def resolve(self, model: str) -> Optional[ResolvedModel]:
-        """Check if this backend handles the given model string.
-
-        Handles:
-        - Direct matches in CLAUDE_MODELS (e.g. "opus", "sonnet", "haiku")
-        - ``claude/<sub>`` slash syntax (e.g. "claude/opus")
-
-        Returns None if this backend does not handle the model.
-        """
-        if "/" in model:
-            prefix, sub_model = model.split("/", 1)
-            if prefix == "claude":
-                return ResolvedModel(public_model=model, backend="claude", provider_model=sub_model)
-            return None
-
-        if model in CLAUDE_MODELS:
-            return ResolvedModel(public_model=model, backend="claude", provider_model=model)
-
-        return None
-
-    def build_options(
-        self,
-        request: Any,
-        resolved: ResolvedModel,
-        overrides: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Build backend options from request, resolved model, and header overrides.
-
-        Raises BackendConfigError instead of HTTPException.
-        """
-        from src.parameter_validator import ParameterValidator
-
-        options = request.to_claude_options()
-
-        if overrides:
-            options.update(overrides)
-
-        # Use the provider model from resolution (may differ from request.model)
-        if resolved.provider_model:
-            options["model"] = resolved.provider_model
-
-        if options.get("model"):
-            ParameterValidator.validate_model(options["model"])
-
-        # Claude-specific tool configuration
-        if not request.enable_tools:
-            options["disallowed_tools"] = CLAUDE_TOOLS
-            options["max_turns"] = 1
-            logger.debug("Tools disabled (default behavior for OpenAI compatibility)")
-        elif request.allowed_tools is not None:
-            # Caller provided explicit tool list — use it directly
-            options["allowed_tools"] = list(request.allowed_tools)
-            options["permission_mode"] = PERMISSION_MODE_BYPASS
-            logger.debug(f"Tools enabled (caller-specified): {request.allowed_tools}")
-        else:
-            options["allowed_tools"] = DEFAULT_ALLOWED_TOOLS
-            options["permission_mode"] = PERMISSION_MODE_BYPASS
-            logger.debug(f"Tools enabled by user request: {DEFAULT_ALLOWED_TOOLS}")
-
-        # Add MCP servers if configured (Claude only).
-        # The SDK connects to the servers and resolves tool schemas internally.
-        # We add symbolic tool patterns (mcp__<server>__*) to allowed_tools
-        # so the SDK knows which MCP tools to enable without serializing full
-        # JSON schemas into the API request payload.
-        mcp_servers = get_mcp_servers()
-        if mcp_servers:
-            options["mcp_servers"] = mcp_servers
-            if request.enable_tools and request.allowed_tools is None:
-                # Only add all MCP patterns when no explicit list was given
-                mcp_patterns = get_mcp_tool_patterns(mcp_servers)
-                options.setdefault("allowed_tools", []).extend(mcp_patterns)
-                logger.debug(f"MCP tools enabled symbolically: {mcp_patterns}")
-            logger.debug(f"MCP servers enabled: {list(mcp_servers.keys())}")
-
-        return options
 
     def get_auth_provider(self):
         """Return a ClaudeAuthProvider instance."""

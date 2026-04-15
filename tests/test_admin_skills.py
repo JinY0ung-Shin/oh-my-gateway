@@ -7,7 +7,6 @@ import pytest
 
 from src.admin_service import (
     _parse_skill_frontmatter,
-    _skill_body,
     _validate_skill_name,
     create_or_update_skill,
     delete_skill,
@@ -84,16 +83,6 @@ class TestParseFrontmatter:
         meta = _parse_skill_frontmatter(content)
         assert meta["metadata"]["author"] == "alice"
         assert meta["metadata"]["version"] == "1.0.0"
-
-
-class TestSkillBody:
-    def test_with_frontmatter(self):
-        content = "---\nname: test\n---\n\nBody text"
-        assert _skill_body(content) == "Body text"
-
-    def test_without_frontmatter(self):
-        content = "# Just markdown"
-        assert _skill_body(content) == "# Just markdown"
 
 
 # ---------------------------------------------------------------------------

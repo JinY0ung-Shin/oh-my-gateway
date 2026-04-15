@@ -8,7 +8,6 @@ continues to work without triggering circular imports.
 def __getattr__(name):
     _BASE_NAMES = {
         "BackendClient",
-        "BackendConfigError",
         "BackendDescriptor",
         "BackendRegistry",
         "ResolvedModel",

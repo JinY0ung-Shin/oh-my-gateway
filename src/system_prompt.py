@@ -151,11 +151,6 @@ def get_system_prompt() -> Optional[str]:
     return _default_prompt
 
 
-def get_default_prompt() -> Optional[str]:
-    """Return the file-loaded default prompt (ignoring runtime override)."""
-    return _default_prompt
-
-
 def get_raw_system_prompt() -> Optional[str]:
     """Return the active prompt with original ``{{PLACEHOLDER}}`` tokens intact.
 
@@ -198,11 +193,6 @@ def reset_system_prompt() -> None:
         _runtime_prompt = None
         _runtime_prompt_raw = None
     logger.info("System prompt: runtime override cleared")
-
-
-def is_using_preset() -> bool:
-    """Return ``True`` when no custom prompt is active (preset mode)."""
-    return get_system_prompt() is None
 
 
 def get_prompt_mode() -> str:

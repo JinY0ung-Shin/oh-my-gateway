@@ -2,7 +2,7 @@ import asyncio
 import json
 import logging
 import re
-from typing import Any, AsyncGenerator, Dict, Literal, Optional
+from typing import Any, AsyncGenerator, Dict, Optional
 
 from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
 
@@ -111,8 +111,6 @@ def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
         return info.get("status", "unknown")
     return getattr(info, "status", "unknown")
 
-
-FinishReason = Literal["stop", "length", "content_filter", "tool_calls"]
 
 
 # ---------------------------------------------------------------------------

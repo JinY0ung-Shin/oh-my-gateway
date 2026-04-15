@@ -23,7 +23,6 @@ class TestBucketMapping:
         assert _bucket_for_path("/v1/mcp/servers") == "general"
         assert _bucket_for_path("/v1/auth/status") == "auth"
         assert _bucket_for_path("/v1/sessions") == "session"
-        assert _bucket_for_path("/v1/debug/request") == "debug"
 
     def test_parameterised_paths(self):
         assert _bucket_for_path("/v1/sessions/abc-123") == "session"

@@ -20,7 +20,7 @@ import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from threading import Lock
 
@@ -276,16 +276,6 @@ class SessionManager:
             self.sessions.clear()
             logger.info("Session manager async shutdown complete")
 
-    def shutdown(self) -> None:
-        """Synchronous shutdown: cancel cleanup task, clean temp workspaces, and clear sessions."""
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-
-        with self.lock:
-            self._cleanup_all_temp_workspaces()
-            self.sessions.clear()
-            logger.info("Session manager shutdown complete")
-
     def _cleanup_all_temp_workspaces(self) -> None:
         """Remove temporary workspaces for all active sessions.
 
@@ -364,34 +354,6 @@ class SessionManager:
         with self.lock:
             self._purge_all_expired_sync()
             return [session.to_session_info() for session in self.sessions.values()]
-
-    # ------------------------------------------------------------------
-    # Message handling
-    # ------------------------------------------------------------------
-
-    def process_messages(
-        self, messages: List[Message], session_id: Optional[str] = None
-    ) -> Tuple[List[Message], Optional[str]]:
-        """Process messages for a request.
-
-        In stateless mode (*session_id* is ``None``) the messages are returned
-        as-is.  In session mode the messages are appended to the session's
-        history and the full history is returned.
-
-        Returns ``(all_messages, actual_session_id)``.
-        """
-        if session_id is None:
-            return messages, None
-
-        session = self.get_or_create_session(session_id)
-        session.add_messages(messages)
-        all_messages = session.get_all_messages()
-
-        logger.info(
-            f"Session {session_id}: processing {len(messages)} new messages, "
-            f"{len(all_messages)} total"
-        )
-        return all_messages, session_id
 
     def add_assistant_response(self, session_id: Optional[str], assistant_message: Message) -> None:
         """Add assistant response to session if session mode is active."""

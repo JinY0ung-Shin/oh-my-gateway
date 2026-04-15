@@ -1,5 +1,4 @@
-from typing import List, Optional
-from src.models import Message
+from typing import Optional
 import os
 import re
 import json
@@ -110,88 +109,6 @@ class MessageAdapter:
         return "".join(parts) if parts else None
 
     @staticmethod
-    def extract_images_to_prompt(content, image_handler) -> str:
-        """Convert multimodal content (list with images) to string prompt.
-
-        Saves images to disk via image_handler and inserts file path references.
-        Pure text strings pass through unchanged.
-        """
-        if isinstance(content, str):
-            return content
-
-        parts = []
-        for item in content:
-            # Handle ContentPart objects
-            if hasattr(item, "type"):
-                if item.type == "text":
-                    text = (
-                        item.text
-                        if hasattr(item, "text")
-                        else (item.get("text", "") if isinstance(item, dict) else "")
-                    )
-                    if text:
-                        parts.append(text)
-                elif item.type == "image_url":
-                    image_url = (
-                        item.image_url
-                        if hasattr(item, "image_url")
-                        else (item.get("image_url", {}) if isinstance(item, dict) else {})
-                    )
-                    if image_url:
-                        path = image_handler.save_openai_image(image_url)
-                        parts.append(f'<attached_image path="{path}" />')
-            # Handle plain dicts
-            elif isinstance(item, dict):
-                if item.get("type") == "text":
-                    if item.get("text"):
-                        parts.append(item["text"])
-                elif item.get("type") == "image_url":
-                    if item.get("image_url"):
-                        path = image_handler.save_openai_image(item["image_url"])
-                        parts.append(f'<attached_image path="{path}" />')
-
-        return "\n".join(parts) if parts else ""
-
-    @staticmethod
-    def _content_to_text(content) -> str:
-        """Extract plain text from message content (string or multimodal list)."""
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, str):
-                    parts.append(item)
-                elif hasattr(item, "type") and item.type == "text" and hasattr(item, "text"):
-                    parts.append(item.text)
-                elif isinstance(item, dict) and item.get("type") == "text" and item.get("text"):
-                    parts.append(item["text"])
-            return "\n".join(parts) if parts else ""
-        return str(content) if content else ""
-
-    @staticmethod
-    def messages_to_prompt(messages: List[Message]) -> tuple[str, Optional[str]]:
-        """
-        Convert OpenAI messages to Claude Code prompt format.
-        Returns (prompt, system_prompt)
-        """
-        system_prompt = None
-        conversation_parts = []
-
-        for message in messages:
-            if message.role == "system":
-                system_prompt = MessageAdapter._content_to_text(message.content)
-            elif message.role == "user":
-                conversation_parts.append(MessageAdapter._content_to_text(message.content))
-            elif message.role == "assistant":
-                conversation_parts.append(MessageAdapter._content_to_text(message.content))
-
-        # Join conversation parts
-        prompt = "\n\n".join(conversation_parts)
-
-        return prompt, system_prompt
-
-    @staticmethod
     def filter_content(content: str) -> str:
         """
         Filter content for unsupported features and tool usage.
@@ -200,43 +117,9 @@ class MessageAdapter:
         if not content:
             return content
 
-        # Remove thinking blocks (common when tools are disabled but Claude tries to think)
+        # Remove thinking blocks
         thinking_pattern = r"<thinking>.*?</thinking>"
         content = re.sub(thinking_pattern, "", content, flags=re.DOTALL)
-
-        # Extract content from attempt_completion blocks (these contain the actual user response)
-        attempt_completion_pattern = r"<attempt_completion>(.*?)</attempt_completion>"
-        attempt_matches = re.findall(attempt_completion_pattern, content, flags=re.DOTALL)
-        if attempt_matches:
-            # Use the content from the attempt_completion block
-            extracted_content = attempt_matches[0].strip()
-
-            # If there's a <result> tag inside, extract from that
-            result_pattern = r"<result>(.*?)</result>"
-            result_matches = re.findall(result_pattern, extracted_content, flags=re.DOTALL)
-            if result_matches:
-                extracted_content = result_matches[0].strip()
-
-            if extracted_content:
-                content = extracted_content
-        else:
-            # Remove other tool usage blocks (when tools are disabled but Claude tries to use them)
-            tool_patterns = [
-                r"<read_file>.*?</read_file>",
-                r"<write_file>.*?</write_file>",
-                r"<bash>.*?</bash>",
-                r"<search_files>.*?</search_files>",
-                r"<str_replace_editor>.*?</str_replace_editor>",
-                r"<args>.*?</args>",
-                r"<ask_followup_question>.*?</ask_followup_question>",
-                r"<attempt_completion>.*?</attempt_completion>",
-                r"<question>.*?</question>",
-                r"<follow_up>.*?</follow_up>",
-                r"<suggest>.*?</suggest>",
-            ]
-
-            for pattern in tool_patterns:
-                content = re.sub(pattern, "", content, flags=re.DOTALL)
 
         # Strip raw base64 data URIs but preserve <attached_image> file references
         image_pattern = r"data:image/.*?;base64,.*?(?=\s|$)"

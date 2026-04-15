@@ -1,4 +1,4 @@
-"""General utility endpoints (models, health, version, root, compatibility, debug, auth, MCP)."""
+"""General utility endpoints (models, health, version, root, auth, MCP)."""
 
 import os
 import logging
@@ -7,9 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse
-from pydantic import ValidationError
 
-from src.models import ChatCompletionRequest
 from src.landing_page import build_root_page
 from src.auth import (
     verify_api_key,
@@ -19,10 +17,10 @@ from src.auth import (
     get_all_backends_auth_info,
     validate_backend_auth,
 )
-from src.parameter_validator import CompatibilityReporter
+from src import __version__
 from src.backends import BackendRegistry
 from src.rate_limiter import rate_limit_endpoint
-from src.constants import DEFAULT_PORT, DEBUG_MODE, VERBOSE
+from src.constants import DEFAULT_PORT
 from src.mcp_config import get_mcp_servers
 
 logger = logging.getLogger(__name__)
@@ -64,39 +62,6 @@ async def list_mcp_servers(
         servers.append({"name": name, "config": safe_config})
 
     return {"servers": servers, "total": len(servers)}
-
-
-@router.post("/v1/compatibility")
-async def check_compatibility(
-    request_body: ChatCompletionRequest,
-    request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-):
-    """Check OpenAI API compatibility for a request."""
-    await verify_api_key(request, credentials)
-    report = CompatibilityReporter.generate_compatibility_report(request_body)
-    return {
-        "compatibility_report": report,
-        "claude_agent_sdk_options": {
-            "supported": [
-                "model",
-                "system_prompt",
-                "max_turns",
-                "allowed_tools",
-                "disallowed_tools",
-                "permission_mode",
-                "continue_conversation",
-                "resume",
-                "cwd",
-            ],
-            "custom_headers": [
-                "X-Claude-Max-Turns",
-                "X-Claude-Allowed-Tools",
-                "X-Claude-Disallowed-Tools",
-                "X-Claude-Permission-Mode",
-            ],
-        },
-    }
 
 
 @router.get("/health")
@@ -148,79 +113,6 @@ async def root():
     return HTMLResponse(content=build_root_page(__version__, auth_info, DEFAULT_PORT))
 
 
-@router.post("/v1/debug/request")
-@rate_limit_endpoint("debug")
-async def debug_request_validation(
-    request: Request,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-):
-    """Debug endpoint to test request validation and see what's being sent."""
-    await verify_api_key(request, credentials)
-
-    try:
-        # Get the raw request body
-        body = await request.body()
-        raw_body = body.decode() if body else ""
-
-        # Try to parse as JSON
-        parsed_body = None
-        json_error = None
-        try:
-            import json as json_lib
-
-            parsed_body = json_lib.loads(raw_body) if raw_body else {}
-        except Exception as e:
-            json_error = str(e)
-
-        # Try to validate against our model
-        validation_result = {"valid": False, "errors": []}
-        if parsed_body:
-            try:
-                chat_request = ChatCompletionRequest(**parsed_body)
-                validation_result = {"valid": True, "validated_data": chat_request.model_dump()}
-            except ValidationError as e:
-                validation_result = {
-                    "valid": False,
-                    "errors": [
-                        {
-                            "field": " -> ".join(str(loc) for loc in error.get("loc", [])),
-                            "message": error.get("msg", "Unknown error"),
-                            "type": error.get("type", "validation_error"),
-                            "input": error.get("input"),
-                        }
-                        for error in e.errors()
-                    ],
-                }
-
-        return {
-            "debug_info": {
-                "headers": dict(request.headers),
-                "method": request.method,
-                "url": str(request.url),
-                "raw_body": raw_body,
-                "json_parse_error": json_error,
-                "parsed_body": parsed_body,
-                "validation_result": validation_result,
-                "debug_mode_enabled": DEBUG_MODE or VERBOSE,
-                "example_valid_request": {
-                    "model": "claude-3-sonnet-20240229",
-                    "messages": [{"role": "user", "content": "Hello, world!"}],
-                    "stream": False,
-                },
-            }
-        }
-
-    except Exception as e:
-        return {
-            "debug_info": {
-                "error": f"Debug endpoint error: {str(e)}",
-                "headers": dict(request.headers),
-                "method": request.method,
-                "url": str(request.url),
-            }
-        }
-
-
 @router.get("/v1/auth/status")
 @rate_limit_endpoint("auth")
 async def get_auth_status(request: Request):
@@ -244,6 +136,6 @@ async def get_auth_status(request: Request):
                 else ("runtime" if auth_manager.runtime_api_key else "none")
             ),
             "registered_backends": registered_backends,
-            "version": "1.0.0",
+            "version": __version__,
         },
     }

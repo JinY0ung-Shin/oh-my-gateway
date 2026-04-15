@@ -722,11 +722,6 @@ footer .copyright {{
             </div>
         </details>
 
-        <div class="endpoint-row">
-            <span class="badge badge-post">POST</span>
-            <span class="endpoint-path">/v1/compatibility</span>
-            <span class="endpoint-desc">Request compat check</span>
-        </div>
     </div>
 
     <!-- Configuration -->

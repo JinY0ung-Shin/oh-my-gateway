@@ -156,27 +156,6 @@ class TestParameterValidatorDoubleException:
                 assert models == set()
 
 
-class TestCompatibilityReporterNGreaterThan1:
-    """Cover lines 136-137: Suggestion for unsupported n parameter (n > 1)."""
-
-    def test_n_greater_than_1_suggestion(self):
-        """CompatibilityReporter generates suggestion when n > 1."""
-        from src.parameter_validator import CompatibilityReporter
-
-        # Create request with n=1 (the only valid value) but manually override for report
-        request = ChatCompletionRequest(
-            model="claude-sonnet-4-20250514",
-            messages=[Message(role="user", content="Hello")],
-            n=1,
-        )
-        # Manually set n > 1 to bypass validation for testing the reporter
-        object.__setattr__(request, "n", 2)
-
-        report = CompatibilityReporter.generate_compatibility_report(request)
-        assert "n" in report["unsupported_parameters"]
-        assert any("single responses" in s for s in report["suggestions"])
-
-
 # ============================================================================
 # src/session_manager.py coverage gaps
 # ============================================================================
