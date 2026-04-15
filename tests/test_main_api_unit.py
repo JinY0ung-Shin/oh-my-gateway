@@ -535,7 +535,10 @@ def test_create_response_returns_502_when_claude_sdk_raises():
         )
 
     assert response.status_code == 502
-    assert response.json()["error"]["message"] == "Backend error: boom"
+    body = response.json()
+    assert body["error"]["message"] == "Backend error"
+    # Raw exception text must not leak to clients
+    assert "boom" not in body["error"]["message"]
 
 
 def test_create_response_returns_502_when_sdk_emits_error_chunk():
@@ -554,6 +557,8 @@ def test_create_response_returns_502_when_sdk_emits_error_chunk():
         )
 
     assert response.status_code == 502
+    # SDK-emitted error_message is structured (e.g., rate_limit) and
+    # intentionally surfaced to clients, unlike raw Python exceptions.
     assert response.json()["error"]["message"] == "Backend error: sdk failed"
 
 

@@ -527,8 +527,11 @@ async def create_response(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Responses API: Backend error: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Backend error: {e}")
+        # Do not echo raw exception strings to clients — they can contain
+        # file paths, subprocess commands, or other backend internals.
+        # Full details go to logs for operators; response stays generic.
+        logger.error("Responses API: Backend error: %s", e, exc_info=True)
+        raise HTTPException(status_code=502, detail="Backend error") from e
 
     # Token usage (prefer real SDK values)
     prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
