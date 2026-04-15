@@ -46,7 +46,9 @@ asyncio_mode = "auto"
 markers = [
     "integration: Integration tests (real subprocess with mock binary)",
     "slow: Tests taking more than 5 seconds",
+    "e2e: End-to-end tests (requires live server and SDK credentials)",
 ]
+addopts = "-m 'not e2e'"
 
 [tool.coverage.run]
 source = ["src"]

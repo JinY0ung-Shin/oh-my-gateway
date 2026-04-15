@@ -297,6 +297,7 @@ async def create_response(
                 allowed_tools=body.allowed_tools,
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
                 cwd=workspace_str,
+                extra_env=body.metadata,
             )
         except Exception:
             logger.warning(

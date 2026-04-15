@@ -532,6 +532,7 @@ class ClaudeCodeCLI:
         mcp_servers: Optional[Dict[str, Any]] = None,
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
+        extra_env: Optional[Dict[str, str]] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
@@ -553,6 +554,7 @@ class ClaudeCodeCLI:
             mcp_servers=mcp_servers,
             task_budget=task_budget,
             cwd=Path(cwd) if cwd else None,
+            extra_env=extra_env,
         )
         options.hooks = {
             "PreToolUse": [
