@@ -1,16 +1,37 @@
 """Pydantic models for OpenAI Responses API compatibility."""
 
 import time
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field
+
+
+class ResponseInputTextPart(BaseModel):
+    """A text content part within a Responses API input item."""
+
+    type: Literal["input_text"] = "input_text"
+    text: str = ""
+
+
+class ResponseInputImagePart(BaseModel):
+    """An image content part within a Responses API input item."""
+
+    type: Literal["input_image"] = "input_image"
+    image_url: str
+    detail: Optional[str] = None
+
+
+ResponseInputContentPart = Annotated[
+    Union[ResponseInputTextPart, ResponseInputImagePart],
+    Field(discriminator="type"),
+]
 
 
 class ResponseInputItem(BaseModel):
     """A single item in the input array (message format)."""
 
     role: str
-    content: Union[str, List[Dict[str, Any]]] = ""
+    content: Union[str, List[ResponseInputContentPart]] = ""
 
 
 class FunctionCallOutputInput(BaseModel):

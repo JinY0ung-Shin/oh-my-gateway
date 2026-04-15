@@ -152,14 +152,21 @@ class MessageAdapter:
                 # content is list of content parts, e.g. [{"type": "input_text", "text": "..."}]
                 text_parts = []
                 for part in content:
-                    if isinstance(part, dict) and part.get("text"):
-                        text_parts.append(part["text"])
-                    elif (
-                        isinstance(part, dict)
-                        and part.get("type") == "input_image"
-                        and image_handler
-                    ):
-                        image_url = part.get("image_url", "")
+                    ptype = (
+                        part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                    )
+                    text_part = (
+                        part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+                    )
+
+                    if text_part:
+                        text_parts.append(text_part)
+                    elif ptype == "input_image" and image_handler:
+                        image_url = (
+                            part.get("image_url", "")
+                            if isinstance(part, dict)
+                            else getattr(part, "image_url", "")
+                        )
                         if image_url:
                             path = image_handler.save_responses_image(image_url)
                             text_parts.append(f'<attached_image path="{path}" />')
