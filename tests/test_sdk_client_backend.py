@@ -163,7 +163,7 @@ async def test_run_completion_with_client_error_clears_session_client():
     assert len(messages) == 1
     assert messages[0]["type"] == "error"
     assert messages[0]["is_error"] is True
-    assert "connection lost" in messages[0]["error"]
+    assert "connection lost" in messages[0]["error_message"]
     # session.client cleared
     assert session.client is None
 

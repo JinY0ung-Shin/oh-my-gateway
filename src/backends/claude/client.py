@@ -629,7 +629,7 @@ class ClaudeCodeCLI:
         except Exception as exc:
             logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
             session.client = None
-            yield {"type": "error", "is_error": True, "error": str(exc)}
+            yield {"type": "error", "is_error": True, "error_message": str(exc)}
         finally:
             session.stream_break_event = None
 
@@ -650,7 +650,7 @@ class ClaudeCodeCLI:
         except Exception as exc:
             logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
             session.client = None
-            yield {"type": "error", "is_error": True, "error": str(exc)}
+            yield {"type": "error", "is_error": True, "error_message": str(exc)}
 
     async def run_completion(
         self,
