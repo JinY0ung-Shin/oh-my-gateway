@@ -306,7 +306,9 @@ async def create_response(
                     system_prompt = content
                 elif isinstance(content, list):
                     system_prompt = "\n".join(
-                        p["text"] for p in content if isinstance(p, dict) and p.get("text")
+                        p.get("text") if isinstance(p, dict) else getattr(p, "text", "")
+                        for p in content
+                        if (p.get("text") if isinstance(p, dict) else getattr(p, "text", ""))
                     )
             else:
                 user_items.append(item)
@@ -315,7 +317,12 @@ async def create_response(
     # Convert input to prompt
     # Per-request ImageHandler pointing to user workspace
     image_handler = ImageHandler(workspace)
-    prompt = MessageAdapter.response_input_to_prompt(input_for_prompt, image_handler=image_handler)
+    try:
+        prompt = MessageAdapter.response_input_to_prompt(
+            input_for_prompt, image_handler=image_handler
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
     prompt = MessageAdapter.filter_content(prompt)
 
     # ------------------------------------------------------------------
@@ -346,10 +353,7 @@ async def create_response(
             )
             session.client = None
 
-    use_sdk_client = (
-        session.client is not None
-        and hasattr(backend, "run_completion_with_client")
-    )
+    use_sdk_client = session.client is not None and hasattr(backend, "run_completion_with_client")
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
@@ -496,6 +500,10 @@ async def create_response(
             # Check for backend errors (run_completion wraps exceptions as error chunks)
             for chunk in chunks:
                 if isinstance(chunk, dict) and chunk.get("is_error"):
+                    # ``error_message`` here is SDK-curated (rate-limit, auth,
+                    # etc.) — not a raw Python exception string — so it is
+                    # safe to surface to clients. Raw ``except Exception``
+                    # leaks are redacted at the catch-all below.
                     error_msg = chunk.get("error_message", "Unknown backend error")
                     raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
 
@@ -523,8 +531,11 @@ async def create_response(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Responses API: Backend error: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail=f"Backend error: {e}")
+        # Do not echo raw exception strings to clients — they can contain
+        # file paths, subprocess commands, or other backend internals.
+        # Full details go to logs for operators; response stays generic.
+        logger.error("Responses API: Backend error: %s", e, exc_info=True)
+        raise HTTPException(status_code=502, detail="Backend error") from e
 
     # Token usage (prefer real SDK values)
     prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
@@ -717,6 +728,9 @@ async def _handle_function_call_output(
 
         for chunk in chunks:
             if isinstance(chunk, dict) and chunk.get("is_error"):
+                # ``error_message`` here is SDK-curated (rate-limit, auth,
+                # etc.) — not a raw Python exception string — so it is safe
+                # to surface to clients.
                 error_msg = chunk.get("error_message", "Unknown backend error")
                 raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
 

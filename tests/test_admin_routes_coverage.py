@@ -1,6 +1,7 @@
 """Coverage tests for admin routes — fills gaps in endpoint testing."""
 
 import os
+import re
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +27,29 @@ class TestAdminPage:
         assert r.status_code == 200
         assert "text/html" in r.headers["content-type"]
         assert "CLAUDE CODE GATEWAY" in r.text
+
+    def test_get_admin_page_includes_integrity_and_crossorigin_for_cdn_assets(self, admin_client):
+        r = admin_client.get("/admin")
+
+        assert r.status_code == 200
+        assert r.text.count('integrity="sha384-') >= 7
+        assert r.text.count('crossorigin="anonymous"') >= 7
+        assert "https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" in r.text
+        assert "https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.js" in r.text
+
+    def test_admin_page_script_has_no_empty_catch_blocks(self, admin_client):
+        r = admin_client.get("/admin")
+
+        assert r.status_code == 200
+        assert re.search(r"catch\s*\(e\)\s*\{\s*\}", r.text) is None
+
+    def test_admin_page_script_uses_visible_error_handling_for_async_loads(self, admin_client):
+        r = admin_client.get("/admin")
+
+        assert r.status_code == 200
+        assert "Failed to load summary" in r.text
+        assert "Failed to load metrics" in r.text
+        assert "Failed to load full message" in r.text
 
 
 class TestAdminAuth:

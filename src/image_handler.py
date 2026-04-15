@@ -8,6 +8,7 @@ Only synchronous operations — no remote URL fetching (SSRF-free).
 """
 
 import base64
+import binascii
 import hashlib
 import logging
 import tempfile
@@ -55,7 +56,11 @@ class ImageHandler:
                 f"Supported: {', '.join(sorted(SUPPORTED_MEDIA_TYPES))}"
             )
 
-        image_bytes = base64.b64decode(data)
+        try:
+            image_bytes = base64.b64decode(data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Malformed image base64 payload") from exc
+
         if len(image_bytes) > MAX_IMAGE_SIZE:
             raise ValueError(
                 f"Image size {len(image_bytes)} bytes exceeds {MAX_IMAGE_SIZE} byte limit"

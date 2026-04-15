@@ -1,8 +1,12 @@
 """Tests for function_call output models in response_models.py."""
 
+import pytest
+from pydantic import ValidationError
+
 from src.response_models import (
     FunctionCallOutputItem,
     FunctionCallOutputInput,
+    ResponseCreateRequest,
     ResponseObject,
     OutputItem,
     ResponseContentPart,
@@ -47,3 +51,64 @@ def test_response_object_accepts_function_call_output():
 def test_response_object_requires_action_status():
     resp = ResponseObject(id="resp_test", model="sonnet", status="requires_action")
     assert resp.status == "requires_action"
+
+
+def test_response_create_request_accepts_input_image_part():
+    req = ResponseCreateRequest(
+        model="sonnet",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "describe"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc123"},
+                ],
+            }
+        ],
+    )
+
+    part = req.input[0].content[1]
+    assert part.type == "input_image"
+    assert part.image_url == "data:image/png;base64,abc123"
+
+
+def test_response_create_request_rejects_non_string_input_image_url():
+    with pytest.raises(ValidationError):
+        ResponseCreateRequest(
+            model="sonnet",
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "input_image",
+                            "image_url": {"url": "data:image/png;base64,abc123"},
+                        }
+                    ],
+                }
+            ],
+        )
+
+
+def test_response_create_request_accepts_unknown_part_type_as_dict():
+    """Forward-compat: unknown part types (e.g., input_file) are kept as dicts."""
+    req = ResponseCreateRequest(
+        model="sonnet",
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "see file"},
+                    {"type": "input_file", "file_id": "file_abc123"},
+                ],
+            }
+        ],
+    )
+
+    text_part = req.input[0].content[0]
+    unknown_part = req.input[0].content[1]
+    assert text_part.type == "input_text"
+    assert text_part.text == "see file"
+    assert isinstance(unknown_part, dict)
+    assert unknown_part["type"] == "input_file"
+    assert unknown_part["file_id"] == "file_abc123"

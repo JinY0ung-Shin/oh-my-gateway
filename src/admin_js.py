@@ -69,7 +69,7 @@ def get_admin_js() -> str:
         this.loading.dashboard = true;
         const r = await this.api('/admin/api/summary');
         if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpServers(); this.loadMetrics(); this.startPolling(); }
-      } catch(e) {} finally { this.loading.dashboard = false; }
+      } catch(e) { console.error('Failed to load summary', e); this.loginError = 'Failed to load summary'; this.showToast('Failed to load summary', 'err'); } finally { this.loading.dashboard = false; }
     },
 
     getFileIcon(path) {
@@ -120,42 +120,46 @@ def get_admin_js() -> str:
       this.loading.sessions = true;
       try {
         const r = await this.api('/admin/api/summary');
-        if (r.ok) this.summary = await r.json();
+        if (r.ok) { this.summary = await r.json(); this._summaryFailCount = 0; }
         else if (r.status === 401) { this.authenticated = false; this.stopPolling(); }
-      } catch(e) {} finally { this.loading.sessions = false; }
+      } catch(e) {
+        console.error('Failed to load summary', e);
+        this._summaryFailCount = (this._summaryFailCount || 0) + 1;
+        if (this._summaryFailCount === 1) this.showToast('Failed to load summary', 'err');
+      } finally { this.loading.sessions = false; }
     },
 
     async loadMetrics() {
       try {
         const r = await this.api('/admin/api/metrics');
         if (r.ok) this.metrics = await r.json();
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load metrics', e); this.showToast('Failed to load metrics', 'err'); }
     },
     async loadBackends() {
       try {
         const r = await this.api('/admin/api/backends');
         if (r.ok) { const d = await r.json(); this.backendsDetail = d.backends || []; }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load backends', e); this.showToast('Failed to load backends', 'err'); }
     },
     async loadMcpServers() {
       try {
         const r = await this.api('/admin/api/mcp-servers');
         if (r.ok) { const d = await r.json(); this.mcpServers = d.servers || []; }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load MCP servers', e); this.showToast('Failed to load MCP servers', 'err'); }
     },
 
     async loadFiles() {
       try {
         const r = await this.api('/admin/api/files');
         if (r.ok) { const d = await r.json(); this.files = d.files || []; }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load files', e); this.showToast('Failed to load files', 'err'); }
     },
 
     async loadConfig() {
       try {
         const r = await this.api('/admin/api/config');
         if (r.ok) this.config = await r.json();
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load config', e); this.showToast('Failed to load config', 'err'); }
     },
 
     async openFile(path) {
@@ -234,8 +238,12 @@ def get_admin_js() -> str:
         if (this.logsFilter.endpoint) url += '&endpoint=' + encodeURIComponent(this.logsFilter.endpoint);
         if (this.logsFilter.status) url += '&status=' + this.logsFilter.status;
         const r = await this.api(url);
-        if (r.ok) this.logs = await r.json();
-      } catch(e) {} finally { this.loading.logs = false; }
+        if (r.ok) { this.logs = await r.json(); this._logsFailCount = 0; }
+      } catch(e) {
+        console.error('Failed to load logs', e);
+        this._logsFailCount = (this._logsFailCount || 0) + 1;
+        if (this._logsFailCount === 1) this.showToast('Failed to load logs', 'err');
+      } finally { this.loading.logs = false; }
     },
     toggleLogsPolling() {
       if (this.logsPollTimer) { clearInterval(this.logsPollTimer); this.logsPollTimer = null; }
@@ -246,28 +254,28 @@ def get_admin_js() -> str:
       try {
         const r = await this.api('/admin/api/rate-limits');
         if (r.ok) this.rateLimits = await r.json();
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load rate limits', e); this.showToast('Failed to load rate limits', 'err'); }
     },
 
     async loadSandbox() {
       try {
         const r = await this.api('/admin/api/sandbox');
         if (r.ok) this.sandboxConfig = await r.json();
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load sandbox config', e); this.showToast('Failed to load sandbox config', 'err'); }
     },
 
     async loadTools() {
       try {
         const r = await this.api('/admin/api/tools');
         if (r.ok) this.toolsRegistry = await r.json();
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load tools', e); this.showToast('Failed to load tools', 'err'); }
     },
 
     async loadRuntimeConfig() {
       try {
         const r = await this.api('/admin/api/runtime-config');
         if (r.ok) { const d = await r.json(); this.runtimeConfig = d.settings || {}; }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load runtime config', e); this.showToast('Failed to load runtime config', 'err'); }
     },
     async updateRuntimeConfig(key, value) {
       try {
@@ -283,14 +291,14 @@ def get_admin_js() -> str:
       try {
         const r = await this.api('/admin/api/runtime-config/reset?key=' + encodeURIComponent(key), { method: 'POST' });
         if (r.ok) { this.showToast('RESET: ' + key, 'ok'); await this.loadRuntimeConfig(); }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to reset setting', e); this.showToast('Failed to reset setting', 'err'); }
     },
     async resetAllRuntimeConfig() {
       if (!confirm('Reset all runtime settings to startup defaults?')) return;
       try {
         const r = await this.api('/admin/api/runtime-config/reset', { method: 'POST' });
         if (r.ok) { this.showToast('ALL SETTINGS RESET', 'ok'); await this.loadRuntimeConfig(); }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to reset all settings', e); this.showToast('Failed to reset all settings', 'err'); }
     },
 
     async loadSystemPrompt() {
@@ -440,7 +448,7 @@ def get_admin_js() -> str:
       try {
         const r = await this.api('/admin/api/system-prompt', { method: 'DELETE' });
         if (r.ok) { this.showToast('PRESET ACTIVATED', 'ok'); await this.loadSystemPrompt(); }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to activate preset', e); this.showToast('Failed to activate preset', 'err'); }
     },
     forkFromPreset() {
       this.promptView = 'new';
@@ -662,7 +670,7 @@ Skill description here.
             if (idx >= 0) { this.sessionMessages.messages[idx] = full; }
           }
         }
-      } catch(e) {}
+      } catch(e) { console.error('Failed to load full message', e); this.showToast('Failed to load full message', 'err'); }
     },
 
     startPolling() { this.pollTimer = setInterval(() => this.loadSummary(), 15000); },

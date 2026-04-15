@@ -30,13 +30,13 @@ def build_admin_page() -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GATEWAY CTRL // Admin Terminal</title>
-<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.css">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/theme/material-darker.min.css">
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/markdown/markdown.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/javascript/javascript.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/yaml/yaml.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.css" integrity="sha384-EAMaqTIrSR3wOlf2EQj7Kkx5ZCHPjHmlYJsFof5IB8dzXMASyR8eIwXgp+IGz/rs" crossorigin="anonymous">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/theme/material-darker.min.css" integrity="sha384-/7IRGUZjrVsGRxRmWYycW70x8/46N5NLfEElIMgl+k0aOfmvzAMSg6Or2NG3a6tp" crossorigin="anonymous">
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.js" integrity="sha384-t/C99Ss9npjVCqOGZhNjaRnafXAhKyPyhSP+cSSP0CWoFTfMXG4+impqZ6WfgO0a" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/markdown/markdown.min.js" integrity="sha384-n04h9Gi6L8HyI+Xs9bOsNBdP9/Oo6HtQ6x+a7KFxgoZ267JCOoEZzP2YEAanxMTX" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/javascript/javascript.min.js" integrity="sha384-9WXBgfPaWP2zA74XYJo/qmYSaQuy6wy1FyptaVjcRrEdBZagvms/3mIBuPWPqsgg" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/yaml/yaml.min.js" integrity="sha384-131Ong53rCgUDHHluJOESiyk8FRC3j7cL7INdfB2n4SVkOoI87gNHb0B23LKlrMp" crossorigin="anonymous"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>

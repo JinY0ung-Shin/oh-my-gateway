@@ -172,14 +172,97 @@ class TestValidateImageRequest:
 
     def test_validate_image_request_no_images_always_passes(self):
         """No error when request contains no images, regardless of backend support."""
-        text_input = [
-            {"role": "user", "content": [{"type": "input_text", "text": "no image"}]}
-        ]
+        text_input = [{"role": "user", "content": [{"type": "input_text", "text": "no image"}]}]
         req = _FakeRequest(input=text_input)
         backend = MagicMock(spec=[])  # no image_handler
 
         # Should not raise because there are no images
         _validate_image_request(req, backend)
+
+
+class TestResponsesImageErrors:
+    def test_create_response_returns_400_for_remote_image_url(self):
+        with client_context() as (client, _mock_cli):
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "sonnet",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_image",
+                                    "image_url": "https://example.com/image.png",
+                                }
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 400
+        assert "Only data: URLs are supported" in response.json()["error"]["message"]
+
+    def test_create_response_returns_400_for_malformed_image_data_url(self):
+        with client_context() as (client, _mock_cli):
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "sonnet",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": "data:image/png;base64"}
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 400
+        assert "Malformed data URL" in response.json()["error"]["message"]
+
+    def test_create_response_returns_400_for_unsupported_image_media_type(self):
+        bad_data_url = "data:image/bmp;base64,Qk0="
+
+        with client_context() as (client, _mock_cli):
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "sonnet",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_image", "image_url": bad_data_url}],
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 400
+        assert "Unsupported image type" in response.json()["error"]["message"]
+
+    def test_create_response_returns_400_for_invalid_image_base64(self):
+        with client_context() as (client, _mock_cli):
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "sonnet",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [
+                                {"type": "input_image", "image_url": "data:image/png;base64,!!!!"}
+                            ],
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 400
+        assert "Malformed image base64 payload" in response.json()["error"]["message"]
 
 
 # ===========================================================================

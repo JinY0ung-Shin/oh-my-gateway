@@ -55,6 +55,20 @@ logger = logging.getLogger(__name__)
 runtime_api_key = None
 
 
+def _sanitize_validation_errors(errors: list[dict]) -> list[dict[str, str]]:
+    """Strip raw input payloads from validation errors for logging and responses."""
+    sanitized = []
+    for error in errors:
+        sanitized.append(
+            {
+                "field": " -> ".join(str(loc) for loc in error.get("loc", [])),
+                "message": error.get("msg", "Unknown validation error"),
+                "type": error.get("type", "validation_error"),
+            }
+        )
+    return sanitized
+
+
 def generate_secure_token(length: int = 32) -> str:
     """Generate a secure random token for API authentication."""
     alphabet = string.ascii_letters + string.digits + "-_"
@@ -305,12 +319,17 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
                             parsed_body = json.loads(body.decode())
                             # Truncate base64 image data in logged body
                             logged_body = truncate_image_data(parsed_body)
-                            logger.debug(
-                                f"🔍 Request body: {json.dumps(logged_body, indent=2)}"
-                            )
+                            logger.debug(f"🔍 Request body: {json.dumps(logged_body, indent=2)}")
                             body_logged = True
                         except Exception:
-                            logger.debug(f"🔍 Request body (raw): {body.decode()[:500]}...")
+                            # Do not log raw bytes: a malformed JSON body may
+                            # contain Bearer tokens, API keys, or PII. Log only
+                            # metadata useful for debugging.
+                            logger.debug(
+                                "🔍 Request body: [non-JSON, %d bytes, content-type: %s]",
+                                len(body),
+                                request.headers.get("content-type", "unknown"),
+                            )
                             body_logged = True
             except Exception as e:
                 logger.debug(f"🔍 Could not read request body: {e}")
@@ -376,10 +395,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                                 resolved = resolve_model(model)
                                 if resolved:
                                     backend = resolved.backend
-                            except Exception:
-                                pass
-            except Exception:
-                pass
+                            except Exception as exc:
+                                logger.debug(
+                                    "Could not resolve backend for request logging: %s", exc
+                                )
+            except Exception as exc:
+                logger.debug("Could not inspect request body for request logging: %s", exc)
 
         status_code = 500
         try:
@@ -422,41 +443,20 @@ app.add_middleware(RequestLoggingMiddleware)
 # Custom exception handler for 422 validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """Handle request validation errors with detailed debugging information."""
+    """Handle request validation errors with sanitized field-level details."""
+
+    sanitized_errors = _sanitize_validation_errors(exc.errors())
 
     # Log the validation error details
     logger.error(f"❌ Request validation failed for {request.method} {request.url}")
-    logger.error(f"❌ Validation errors: {exc.errors()}")
-
-    # Create detailed error response
-    error_details = []
-    for error in exc.errors():
-        location = " -> ".join(str(loc) for loc in error.get("loc", []))
-        error_details.append(
-            {
-                "field": location,
-                "message": error.get("msg", "Unknown validation error"),
-                "type": error.get("type", "validation_error"),
-                "input": error.get("input"),
-            }
-        )
-
-    # If debug mode is enabled, include the raw request body
-    debug_info = {}
-    if DEBUG_MODE or VERBOSE:
-        try:
-            body = await request.body()
-            if body:
-                debug_info["raw_request_body"] = body.decode()
-        except Exception:
-            debug_info["raw_request_body"] = "Could not read request body"
+    logger.error("❌ Validation errors: %s", sanitized_errors)
 
     error_response = {
         "error": {
             "message": "Request validation failed - the request body doesn't match the expected format",
             "type": "validation_error",
             "code": "invalid_request_error",
-            "details": error_details,
+            "details": sanitized_errors,
             "help": {
                 "common_issues": [
                     "Missing required fields (model, input)",
@@ -468,10 +468,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             },
         }
     }
-
-    # Add debug info if available
-    if debug_info:
-        error_response["error"]["debug"] = debug_info
 
     return JSONResponse(status_code=422, content=error_response)
 

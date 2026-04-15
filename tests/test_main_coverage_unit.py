@@ -531,6 +531,40 @@ class TestValidationHandlerBodyReadException:
             loop.close()
 
         body = json.loads(result.body)
-        assert body["error"]["debug"]["raw_request_body"] == "Could not read request body"
+        assert body["error"]["details"][0]["field"] == "body -> messages"
+        assert "debug" not in body["error"]
 
+    def test_validation_handler_logs_sanitized_errors(self, caplog):
+        from fastapi.exceptions import RequestValidationError
 
+        mock_request = MagicMock()
+        mock_request.method = "POST"
+        mock_request.url = "http://localhost/v1/responses"
+
+        exc = RequestValidationError(
+            errors=[
+                {
+                    "loc": ("body", "input", 0, "content", 0, "image_url"),
+                    "msg": "Input should be a valid string",
+                    "type": "string_type",
+                    "input": {"secret": "top-secret"},
+                }
+            ]
+        )
+
+        import asyncio
+        import logging
+
+        loop = asyncio.new_event_loop()
+        try:
+            with caplog.at_level(logging.ERROR):
+                result = loop.run_until_complete(
+                    main.validation_exception_handler(mock_request, exc)
+                )
+        finally:
+            loop.close()
+
+        body = json.loads(result.body)
+        assert body["error"]["details"][0]["type"] == "string_type"
+        assert "top-secret" not in caplog.text
+        assert "string_type" in caplog.text

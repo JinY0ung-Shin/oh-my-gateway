@@ -248,13 +248,13 @@ def test_run_server_reraises_unrelated_oserror():
 
 
 @pytest.mark.asyncio
-async def test_debug_logging_middleware_logs_raw_body_when_json_parse_fails(caplog):
+async def test_debug_logging_middleware_redacts_body_when_json_parse_fails(caplog):
     middleware = main.DebugLoggingMiddleware(app=main.app)
     request = MagicMock()
     request.state = SimpleNamespace(request_id="req-debug-raw")
     request.method = "POST"
     request.url = SimpleNamespace(path="/v1/responses")
-    request.headers = {"content-length": "8"}
+    request.headers = {"content-length": "8", "content-type": "application/octet-stream"}
     request.body = AsyncMock(return_value=b"not-json")
     response = MagicMock(status_code=200)
     call_next = AsyncMock(return_value=response)
@@ -267,7 +267,10 @@ async def test_debug_logging_middleware_logs_raw_body_when_json_parse_fails(capl
         result = await middleware.dispatch(request, call_next)
 
     assert result is response
-    assert "Request body (raw): not-json..." in caplog.text
+    # Raw body is never echoed to logs; only metadata is logged.
+    assert "not-json" not in caplog.text
+    assert "Request body: [non-JSON, 8 bytes" in caplog.text
+    assert "application/octet-stream" in caplog.text
     assert "Response: 200 in" in caplog.text
 
 
@@ -293,6 +296,47 @@ async def test_debug_logging_middleware_handles_body_read_and_downstream_failure
     assert "Could not read request body: read failed" in caplog.text
     assert "Request body: [not logged - streaming or large payload]" in caplog.text
     assert "Request failed after" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_logging_middleware_logs_parse_failures(caplog):
+    middleware = main.RequestLoggingMiddleware(app=main.app)
+    request = MagicMock()
+    request.method = "POST"
+    request.url = SimpleNamespace(path="/v1/responses")
+    request.headers = {"content-length": "8"}
+    request.body = AsyncMock(side_effect=RuntimeError("read failed"))
+    request.client = SimpleNamespace(host="127.0.0.1")
+    response = MagicMock(status_code=200)
+    call_next = AsyncMock(return_value=response)
+
+    with caplog.at_level(logging.DEBUG):
+        result = await middleware.dispatch(request, call_next)
+
+    assert result is response
+    assert "Could not inspect request body for request logging: read failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_request_logging_middleware_logs_backend_resolution_failures(caplog):
+    middleware = main.RequestLoggingMiddleware(app=main.app)
+    request = MagicMock()
+    request.method = "POST"
+    request.url = SimpleNamespace(path="/v1/responses")
+    request.headers = {"content-length": "32"}
+    request.body = AsyncMock(return_value=b'{"model":"sonnet"}')
+    request.client = SimpleNamespace(host="127.0.0.1")
+    response = MagicMock(status_code=200)
+    call_next = AsyncMock(return_value=response)
+
+    with (
+        patch("src.backends.resolve_model", side_effect=RuntimeError("resolver boom")),
+        caplog.at_level(logging.DEBUG),
+    ):
+        result = await middleware.dispatch(request, call_next)
+
+    assert result is response
+    assert "Could not resolve backend for request logging: resolver boom" in caplog.text
 
 
 def test_response_id_helpers_round_trip():

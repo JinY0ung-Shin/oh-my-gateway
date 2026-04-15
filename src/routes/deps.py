@@ -68,11 +68,9 @@ def request_has_images(request: Any) -> bool:
             if isinstance(content, list):
                 for part in content:
                     ptype = (
-                        part.get("type")
-                        if isinstance(part, dict)
-                        else getattr(part, "type", None)
+                        part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
                     )
-                    if ptype in ("image_url", "input_image", "image"):
+                    if ptype == "input_image":
                         return True
     return False
 

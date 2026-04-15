@@ -1,16 +1,61 @@
 """Pydantic models for OpenAI Responses API compatibility."""
 
 import time
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Discriminator, Field, Tag
+
+
+class ResponseInputTextPart(BaseModel):
+    """A text content part within a Responses API input item."""
+
+    type: Literal["input_text"] = "input_text"
+    text: str = ""
+
+
+class ResponseInputImagePart(BaseModel):
+    """An image content part within a Responses API input item."""
+
+    type: Literal["input_image"] = "input_image"
+    image_url: str
+    detail: Optional[str] = None
+
+
+def _response_input_part_discriminator(v: Any) -> str:
+    """Route content parts by ``type``; unknown types fall through to ``unknown``.
+
+    Known types (``input_text`` / ``input_image``) get strict pydantic validation.
+    Unknown types are accepted as raw dicts so the Responses API surface stays
+    forward-compatible with evolving OpenAI part types (e.g., ``input_file``,
+    ``input_audio``). Downstream code already tolerates both pydantic models
+    and dicts via ``isinstance`` / ``getattr`` forks.
+    """
+    if isinstance(v, dict):
+        t = v.get("type")
+    else:
+        t = getattr(v, "type", None)
+    if t == "input_text":
+        return "input_text"
+    if t == "input_image":
+        return "input_image"
+    return "unknown"
+
+
+ResponseInputContentPart = Annotated[
+    Union[
+        Annotated[ResponseInputTextPart, Tag("input_text")],
+        Annotated[ResponseInputImagePart, Tag("input_image")],
+        Annotated[Dict[str, Any], Tag("unknown")],
+    ],
+    Discriminator(_response_input_part_discriminator),
+]
 
 
 class ResponseInputItem(BaseModel):
     """A single item in the input array (message format)."""
 
-    role: str
-    content: Union[str, List[Dict[str, Any]]] = ""
+    role: Literal["user", "assistant", "system", "developer"]
+    content: Union[str, List[ResponseInputContentPart]] = ""
 
 
 class FunctionCallOutputInput(BaseModel):
