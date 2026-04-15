@@ -27,6 +27,15 @@ class TestAdminPage:
         assert "text/html" in r.headers["content-type"]
         assert "CLAUDE CODE GATEWAY" in r.text
 
+    def test_get_admin_page_includes_integrity_and_crossorigin_for_cdn_assets(self, admin_client):
+        r = admin_client.get("/admin")
+
+        assert r.status_code == 200
+        assert r.text.count('integrity="sha384-') >= 7
+        assert r.text.count('crossorigin="anonymous"') >= 7
+        assert "https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" in r.text
+        assert "https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.js" in r.text
+
 
 class TestAdminAuth:
     def test_logout(self, admin_client):
