@@ -500,6 +500,10 @@ async def create_response(
             # Check for backend errors (run_completion wraps exceptions as error chunks)
             for chunk in chunks:
                 if isinstance(chunk, dict) and chunk.get("is_error"):
+                    # ``error_message`` here is SDK-curated (rate-limit, auth,
+                    # etc.) — not a raw Python exception string — so it is
+                    # safe to surface to clients. Raw ``except Exception``
+                    # leaks are redacted at the catch-all below.
                     error_msg = chunk.get("error_message", "Unknown backend error")
                     raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
 
@@ -724,6 +728,9 @@ async def _handle_function_call_output(
 
         for chunk in chunks:
             if isinstance(chunk, dict) and chunk.get("is_error"):
+                # ``error_message`` here is SDK-curated (rate-limit, auth,
+                # etc.) — not a raw Python exception string — so it is safe
+                # to surface to clients.
                 error_msg = chunk.get("error_message", "Unknown backend error")
                 raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
 

@@ -248,13 +248,13 @@ def test_run_server_reraises_unrelated_oserror():
 
 
 @pytest.mark.asyncio
-async def test_debug_logging_middleware_logs_raw_body_when_json_parse_fails(caplog):
+async def test_debug_logging_middleware_redacts_body_when_json_parse_fails(caplog):
     middleware = main.DebugLoggingMiddleware(app=main.app)
     request = MagicMock()
     request.state = SimpleNamespace(request_id="req-debug-raw")
     request.method = "POST"
     request.url = SimpleNamespace(path="/v1/responses")
-    request.headers = {"content-length": "8"}
+    request.headers = {"content-length": "8", "content-type": "application/octet-stream"}
     request.body = AsyncMock(return_value=b"not-json")
     response = MagicMock(status_code=200)
     call_next = AsyncMock(return_value=response)
@@ -270,6 +270,7 @@ async def test_debug_logging_middleware_logs_raw_body_when_json_parse_fails(capl
     # Raw body is never echoed to logs; only metadata is logged.
     assert "not-json" not in caplog.text
     assert "Request body: [non-JSON, 8 bytes" in caplog.text
+    assert "application/octet-stream" in caplog.text
     assert "Response: 200 in" in caplog.text
 
 
