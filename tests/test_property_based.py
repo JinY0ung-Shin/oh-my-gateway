@@ -8,8 +8,6 @@ These tests generate random inputs to find edge cases that manual testing might 
 from hypothesis import given, strategies as st, settings, assume
 
 from src.message_adapter import MessageAdapter
-from src.parameter_validator import ParameterValidator
-from src.constants import CLAUDE_MODELS
 
 
 class TestMessageAdapterProperties:
@@ -32,31 +30,6 @@ class TestMessageAdapterProperties:
         result = MessageAdapter.estimate_tokens(text)
         assert isinstance(result, int)
         assert result >= 0
-
-
-class TestParameterValidatorProperties:
-    """Property-based tests for ParameterValidator."""
-
-    @given(model=st.sampled_from(CLAUDE_MODELS))
-    @settings(max_examples=20)
-    def test_valid_model_names_accepted(self, model: str):
-        """Valid Claude model names should be accepted."""
-        result = ParameterValidator.validate_model(model)
-        assert result is True
-
-    @given(model=st.text(min_size=1, max_size=50))
-    @settings(max_examples=30)
-    def test_unknown_model_rejected(self, model: str):
-        """Unknown model names are rejected."""
-        assume(model.strip())  # Non-empty
-        supported = ParameterValidator._get_supported_models()
-        base = model.split("/")[0] if "/" in model else model
-
-        result = ParameterValidator.validate_model(model)
-        if base in supported:
-            assert result is True
-        else:
-            assert result is False
 
 
 class TestTokenEstimation:

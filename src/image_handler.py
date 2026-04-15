@@ -94,14 +94,6 @@ class ImageHandler:
     # Format-specific entry points
     # ------------------------------------------------------------------
 
-    def save_openai_image(self, image_url_obj: dict) -> Path:
-        """OpenAI format: ``{"url": "data:image/png;base64,...", "detail": "auto"}``."""
-        url = image_url_obj.get("url", "")
-        if not url:
-            raise ValueError("image_url object missing 'url' field")
-        media_type, b64data = self.parse_data_url(url)
-        return self.save_base64_image(b64data, media_type)
-
     def save_responses_image(self, image_url: str) -> Path:
         """Responses API format: *image_url* is a ``data:`` URL string."""
         media_type, b64data = self.parse_data_url(image_url)

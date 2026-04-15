@@ -1,14 +1,6 @@
-from typing import List, Optional, Dict, Any, Union, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import List, Optional, Union, Literal
+from pydantic import BaseModel, model_validator
 from datetime import datetime
-
-
-# Import DEFAULT_MODEL to avoid circular imports
-def get_default_model():
-    """Get default model — checks runtime overrides first, then startup constant."""
-    from src.runtime_config import get_default_model as _get
-
-    return _get()
 
 
 class ContentPart(BaseModel):
@@ -56,93 +48,6 @@ class Message(BaseModel):
             self.content = "\n".join(text_parts) if text_parts else ""
 
         return self
-
-
-class StreamOptions(BaseModel):
-    """Options for streaming responses."""
-
-    include_usage: bool = Field(
-        default=False, description="Include usage information in the final streaming chunk"
-    )
-
-
-class ChatCompletionRequest(BaseModel):
-    model: str = Field(default_factory=get_default_model)
-    messages: List[Message]
-    temperature: Optional[float] = Field(default=1.0, ge=0, le=2)
-    top_p: Optional[float] = Field(default=1.0, ge=0, le=1)
-    n: Optional[int] = Field(default=1, ge=1)
-    stream: Optional[bool] = True
-    stop: Optional[Union[str, List[str]]] = None
-    max_tokens: Optional[int] = None
-    max_completion_tokens: Optional[int] = Field(
-        default=None, description="Maximum tokens to generate in the completion (OpenAI standard)"
-    )
-    presence_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
-    frequency_penalty: Optional[float] = Field(default=0, ge=-2, le=2)
-    logit_bias: Optional[Dict[str, float]] = None
-    user: Optional[str] = None
-    session_id: Optional[str] = Field(
-        default=None, description="Optional session ID for conversation continuity"
-    )
-    enable_tools: Optional[bool] = Field(
-        default=True,
-        description="Enable Claude Code tools (Read, Write, Bash, etc.)",
-    )
-    allowed_tools: Optional[List[str]] = Field(
-        default=None,
-        description="Explicit list of allowed tools. When set, overrides the default tool list. "
-        "Supports exact names (Read, Bash) and MCP patterns (mcp__server__*).",
-    )
-    stream_options: Optional[StreamOptions] = Field(
-        default=None, description="Options for streaming responses"
-    )
-    response_format: Optional[Dict[str, Any]] = Field(
-        default=None, description="Response format (supports json_schema type)"
-    )
-    task_budget: Optional[int] = Field(
-        default=None,
-        gt=0,
-        description="Token budget for the task — the model paces tool use and wraps up before exceeding this limit",
-    )
-    metadata: Optional[Dict[str, str]] = Field(
-        default=None,
-        description="Key-value metadata forwarded as env vars to the backend subprocess (filtered by METADATA_ENV_ALLOWLIST)",
-    )
-
-    @field_validator("n")
-    @classmethod
-    def validate_n(cls, v):
-        if v > 1:
-            raise ValueError(
-                "Claude Code SDK does not support multiple choices (n > 1). Only single response generation is supported."
-            )
-        return v
-
-    def to_claude_options(self) -> Dict[str, Any]:
-        """Convert OpenAI request parameters to Claude Code SDK options.
-
-        Unsupported parameters (temperature, top_p, max_tokens, penalties, etc.)
-        are accepted for OpenAI compatibility but not passed to the SDK.
-        """
-        options = {}
-
-        if self.model:
-            options["model"] = self.model
-
-        # Map response_format json_schema to output_format
-        if self.response_format:
-            fmt_type = self.response_format.get("type")
-            if fmt_type == "json_schema":
-                json_schema = self.response_format.get("json_schema", {})
-                schema = json_schema.get("schema") if isinstance(json_schema, dict) else None
-                if schema:
-                    options["output_format"] = {"type": "json_schema", "schema": schema}
-
-        if self.task_budget is not None:
-            options["task_budget"] = self.task_budget
-
-        return options
 
 
 class SessionInfo(BaseModel):

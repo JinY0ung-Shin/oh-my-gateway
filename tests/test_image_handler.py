@@ -92,21 +92,6 @@ def test_parse_data_url_malformed(tmp_path):
         ImageHandler.parse_data_url("data:image/png;base64")
 
 
-def test_save_openai_format(tmp_path):
-    """OpenAI image_url object with data URL is saved correctly."""
-    handler = ImageHandler(tmp_path)
-    path = handler.save_openai_image({"url": f"data:image/png;base64,{TINY_PNG}"})
-    assert path.exists()
-    assert path.suffix == ".png"
-
-
-def test_save_openai_missing_url(tmp_path):
-    """OpenAI image_url object missing 'url' raises ValueError."""
-    handler = ImageHandler(tmp_path)
-    with pytest.raises(ValueError, match="missing 'url' field"):
-        handler.save_openai_image({})
-
-
 def test_save_responses_format(tmp_path):
     """Responses API data URL string is saved correctly."""
     handler = ImageHandler(tmp_path)

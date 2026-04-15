@@ -186,15 +186,11 @@ async def lifespan(app: FastAPI):
             f"🔧 API Key protection: {'Enabled' if auth_manager.get_api_key() else 'Disabled'}"
         )
 
-    # Log OpenAI API parameter compatibility notice
-    logger.info("OpenAI API parameter compatibility:")
+    # Log Responses API parameter notice
+    logger.info("Responses API parameters:")
     logger.info(
-        "  Supported: model, messages, stream, system (via role), session_id, enable_tools, response_format (json_schema)"
+        "  Supported: model, input, instructions, previous_response_id, stream, allowed_tools, tools, metadata"
     )
-    logger.info(
-        "  Ignored: temperature, top_p, max_tokens, max_completion_tokens, presence_penalty, frequency_penalty, logit_bias, stop"
-    )
-    logger.info("  Rejected: n > 1 (returns validation error)")
     logger.info("  See README.md for details")
 
     # Log MCP configuration
@@ -463,10 +459,10 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "details": error_details,
             "help": {
                 "common_issues": [
-                    "Missing required fields (model, messages)",
-                    "Invalid field types (e.g. messages should be an array)",
+                    "Missing required fields (model, input)",
+                    "Invalid field types (e.g. input should be an array or string)",
                     "Invalid role values (must be 'system', 'user', or 'assistant')",
-                    "Invalid parameter ranges (e.g. temperature must be 0-2)",
+                    "Invalid previous_response_id format",
                 ],
                 "debug_tip": "Set DEBUG_MODE=true or VERBOSE=true environment variable for more detailed logging",
             },

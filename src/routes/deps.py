@@ -58,56 +58,32 @@ def validate_backend_auth_or_raise(backend_name: str) -> None:
 
 
 def request_has_images(request: Any) -> bool:
-    """Check if any message in the request contains image content parts."""
-    messages = getattr(request, "messages", None)
-    if not messages:
-        # Check for Responses API input
-        input_data = getattr(request, "input", None)
-        if isinstance(input_data, list):
-            for item in input_data:
-                content = getattr(item, "content", None) or (
-                    item.get("content") if isinstance(item, dict) else None
-                )
-                if isinstance(content, list):
-                    for part in content:
-                        ptype = (
-                            part.get("type")
-                            if isinstance(part, dict)
-                            else getattr(part, "type", None)
-                        )
-                        if ptype in ("image_url", "input_image", "image"):
-                            return True
-        return False
-    for msg in messages:
-        content = msg.content if hasattr(msg, "content") else None
-        if isinstance(content, list):
-            for part in content:
-                ptype = (
-                    part.type
-                    if hasattr(part, "type")
-                    else (part.get("type") if isinstance(part, dict) else None)
-                )
-                if ptype in ("image_url", "input_image", "image"):
-                    return True
+    """Check if the Responses API request contains image content parts."""
+    input_data = getattr(request, "input", None)
+    if isinstance(input_data, list):
+        for item in input_data:
+            content = getattr(item, "content", None) or (
+                item.get("content") if isinstance(item, dict) else None
+            )
+            if isinstance(content, list):
+                for part in content:
+                    ptype = (
+                        part.get("type")
+                        if isinstance(part, dict)
+                        else getattr(part, "type", None)
+                    )
+                    if ptype in ("image_url", "input_image", "image"):
+                        return True
     return False
 
 
 def validate_image_request(request: Any, backend: BackendClient) -> None:
-    """Validate image requests: tools must be enabled, backend must support images.
+    """Validate image requests: backend must support images.
 
     Raises HTTPException(400) on failure.
     """
     if not request_has_images(request):
         return
-
-    # Check tools enabled (chat completions only has enable_tools)
-    enable_tools = getattr(request, "enable_tools", True)
-    if not enable_tools:
-        raise HTTPException(
-            status_code=400,
-            detail="Image input requires tools to be enabled (enable_tools=true) "
-            "because Claude Code uses the Read tool to process images.",
-        )
 
     # Check backend supports images
     if not hasattr(backend, "image_handler"):

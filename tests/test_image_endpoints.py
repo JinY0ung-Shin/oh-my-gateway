@@ -47,12 +47,10 @@ class _FakeMessage:
 
 
 class _FakeRequest:
-    """Mimics ChatCompletionRequest shape for helper function tests."""
+    """Mimics ResponseCreateRequest shape for helper function tests."""
 
-    def __init__(self, messages=None, input=None, enable_tools=True):
-        self.messages = messages
+    def __init__(self, input=None):
         self.input = input
-        self.enable_tools = enable_tools
 
 
 # ---------------------------------------------------------------------------
@@ -99,33 +97,6 @@ def client_context():
 class TestRequestHasImages:
     """Tests for _request_has_images() helper."""
 
-    def test_request_has_images_with_image(self):
-        """Returns True when a message contains an image_url content part."""
-        msg = _FakeMessage(
-            "user",
-            [
-                _FakeContentPart("text", text="describe this"),
-                _FakeContentPart("image_url", image_url={"url": DATA_URL}),
-            ],
-        )
-        req = _FakeRequest(messages=[msg])
-        assert _request_has_images(req) is True
-
-    def test_request_has_images_text_only(self):
-        """Returns False when all content parts are text."""
-        msg = _FakeMessage(
-            "user",
-            [_FakeContentPart("text", text="just text")],
-        )
-        req = _FakeRequest(messages=[msg])
-        assert _request_has_images(req) is False
-
-    def test_request_has_images_string_content(self):
-        """Returns False for plain string content."""
-        msg = _FakeMessage("user", "plain string")
-        req = _FakeRequest(messages=[msg])
-        assert _request_has_images(req) is False
-
     def test_request_has_images_responses_input(self):
         """Returns True for Responses API input containing input_image."""
         input_data = [
@@ -136,7 +107,7 @@ class TestRequestHasImages:
                 ],
             }
         ]
-        req = _FakeRequest(messages=None, input=input_data)
+        req = _FakeRequest(input=input_data)
         assert _request_has_images(req) is True
 
     def test_request_has_images_responses_input_text_only(self):
@@ -149,7 +120,12 @@ class TestRequestHasImages:
                 ],
             }
         ]
-        req = _FakeRequest(messages=None, input=input_data)
+        req = _FakeRequest(input=input_data)
+        assert _request_has_images(req) is False
+
+    def test_request_has_images_no_input(self):
+        """Returns False when the request has no input attribute value."""
+        req = _FakeRequest(input=None)
         assert _request_has_images(req) is False
 
 
@@ -161,29 +137,21 @@ class TestRequestHasImages:
 class TestValidateImageRequest:
     """Tests for _validate_image_request() helper."""
 
-    def _make_image_request(self, enable_tools=True):
-        """Create a fake request that contains an image."""
-        msg = _FakeMessage(
-            "user",
-            [_FakeContentPart("image_url", image_url={"url": DATA_URL})],
-        )
-        return _FakeRequest(messages=[msg], enable_tools=enable_tools)
-
-    def test_validate_image_request_tools_disabled(self):
-        """Raises HTTPException(400) when enable_tools=False and images present."""
-        req = self._make_image_request(enable_tools=False)
-        backend = MagicMock()
-        backend.image_handler = MagicMock()
-
-        with pytest.raises(HTTPException) as exc_info:
-            _validate_image_request(req, backend)
-
-        assert exc_info.value.status_code == 400
-        assert "enable_tools" in str(exc_info.value.detail)
+    def _make_image_request(self):
+        """Create a fake Responses API request that contains an image."""
+        input_data = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": DATA_URL},
+                ],
+            }
+        ]
+        return _FakeRequest(input=input_data)
 
     def test_validate_image_request_no_image_handler(self):
         """Raises HTTPException(400) when backend has no image_handler attribute."""
-        req = self._make_image_request(enable_tools=True)
+        req = self._make_image_request()
         backend = MagicMock(spec=[])  # spec=[] -> no attributes at all
         backend.name = "test-backend"
 
@@ -194,8 +162,8 @@ class TestValidateImageRequest:
         assert "not supported" in str(exc_info.value.detail)
 
     def test_validate_image_request_passes(self):
-        """No error when tools are enabled and backend has image_handler."""
-        req = self._make_image_request(enable_tools=True)
+        """No error when backend has image_handler."""
+        req = self._make_image_request()
         backend = MagicMock()
         backend.image_handler = MagicMock()
 
@@ -204,11 +172,13 @@ class TestValidateImageRequest:
 
     def test_validate_image_request_no_images_always_passes(self):
         """No error when request contains no images, regardless of backend support."""
-        msg = _FakeMessage("user", [_FakeContentPart("text", text="no image")])
-        req = _FakeRequest(messages=[msg], enable_tools=False)
+        text_input = [
+            {"role": "user", "content": [{"type": "input_text", "text": "no image"}]}
+        ]
+        req = _FakeRequest(input=text_input)
         backend = MagicMock(spec=[])  # no image_handler
 
-        # Should not raise even with tools disabled and no image_handler
+        # Should not raise because there are no images
         _validate_image_request(req, backend)
 
 

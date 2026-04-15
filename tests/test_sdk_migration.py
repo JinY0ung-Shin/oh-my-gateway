@@ -128,23 +128,6 @@ class TestMessageHandling:
 class TestAPIModels:
     """Test API models and validation."""
 
-    def test_chat_completion_request_import(self):
-        """Test that ChatCompletionRequest can be imported."""
-        from src.models import ChatCompletionRequest
-
-        assert ChatCompletionRequest is not None
-
-    def test_chat_completion_request_creation(self):
-        """Test creating a ChatCompletionRequest."""
-        from src.models import ChatCompletionRequest
-
-        request = ChatCompletionRequest(
-            model=DEFAULT_MODEL, messages=[{"role": "user", "content": "Hello"}]
-        )
-
-        assert request.model == DEFAULT_MODEL
-        assert len(request.messages) == 1
-
 
 class TestClaudeAgentOptionsAllParameters:
     """Test ClaudeAgentOptions with all parameters set at once."""
@@ -297,78 +280,6 @@ class TestMessageAdapterFormatBlocks:
         """Test format_blocks with all unrecognized blocks returns None."""
         result = self.adapter.format_blocks([42, 3.14, object()])
         assert result is None
-
-
-class TestChatCompletionRequestToClaudeOptions:
-    """Test ChatCompletionRequest.to_claude_options() method."""
-
-    def setup_method(self):
-        from src.models import ChatCompletionRequest
-
-        self.Request = ChatCompletionRequest
-
-    def test_basic_model_passthrough(self):
-        """Test that model is included in options."""
-        req = self.Request(
-            model="opus",
-            messages=[{"role": "user", "content": "hi"}],
-        )
-        opts = req.to_claude_options()
-        assert opts["model"] == "opus"
-
-    def test_no_response_format(self):
-        """Test options without response_format only has model."""
-        req = self.Request(
-            model="sonnet",
-            messages=[{"role": "user", "content": "hi"}],
-        )
-        opts = req.to_claude_options()
-        assert "output_format" not in opts
-        assert opts["model"] == "sonnet"
-
-    def test_response_format_json_schema(self):
-        """Test that json_schema response_format maps to output_format."""
-        schema = {"type": "object", "properties": {"answer": {"type": "string"}}}
-        req = self.Request(
-            model="opus",
-            messages=[{"role": "user", "content": "hi"}],
-            response_format={
-                "type": "json_schema",
-                "json_schema": {"name": "answer_schema", "schema": schema},
-            },
-        )
-        opts = req.to_claude_options()
-        assert "output_format" in opts
-        assert opts["output_format"]["type"] == "json_schema"
-        assert opts["output_format"]["schema"] == schema
-
-    def test_response_format_non_json_schema_ignored(self):
-        """Test that non-json_schema response_format types don't produce output_format."""
-        req = self.Request(
-            model="opus",
-            messages=[{"role": "user", "content": "hi"}],
-            response_format={"type": "text"},
-        )
-        opts = req.to_claude_options()
-        assert "output_format" not in opts
-
-    def test_unsupported_params_not_passed(self):
-        """Test that temperature, top_p, max_tokens etc. are NOT in options."""
-        req = self.Request(
-            model="opus",
-            messages=[{"role": "user", "content": "hi"}],
-            temperature=0.5,
-            top_p=0.9,
-            max_tokens=1000,
-            presence_penalty=0.5,
-            frequency_penalty=0.5,
-        )
-        opts = req.to_claude_options()
-        assert "temperature" not in opts
-        assert "top_p" not in opts
-        assert "max_tokens" not in opts
-        assert "presence_penalty" not in opts
-        assert "frequency_penalty" not in opts
 
 
 if __name__ == "__main__":

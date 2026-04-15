@@ -3,7 +3,6 @@ Coverage gap tests for small modules.
 
 Targets uncovered lines in:
 - src/auth.py (lines 114-115, 139-140, 242, 279-280)
-- src/parameter_validator.py (lines 24-25, 31-32, 136-137)
 - src/session_manager.py (lines 154-156, 165-166)
 - src/models.py (lines 36-37, 90)
 - src/mcp_config.py (lines 64-65)
@@ -18,9 +17,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
-from pydantic import ValidationError
 
-from src.models import ChatCompletionRequest, ContentPart, Message
+from src.models import ContentPart, Message
 
 
 # ============================================================================
@@ -112,48 +110,6 @@ class TestAuthGetAllBackendsAuthInfoException:
         assert "claude" in result
         assert result["claude"]["status"]["valid"] is False
         assert "claude provider exploded" in result["claude"]["status"]["errors"][0]
-
-
-# ============================================================================
-# src/parameter_validator.py coverage gaps
-# ============================================================================
-
-
-class TestParameterValidatorRegistryException:
-    """Cover lines 24-25: Exception when BackendRegistry.all_model_ids() fails."""
-
-    def test_get_supported_models_falls_back_when_registry_raises(self):
-        """When BackendRegistry.all_model_ids() raises, fall back to constants."""
-        from src.parameter_validator import ParameterValidator
-
-        # Patch at the source module so the local `from src.backends.base import ...` picks it up
-        mock_registry = MagicMock()
-        mock_registry.all_model_ids.side_effect = Exception("registry broken")
-
-        with patch("src.backends.base.BackendRegistry", mock_registry):
-            models = ParameterValidator._get_supported_models()
-            # Should fall back to ALL_MODELS from constants
-            assert isinstance(models, set)
-            assert len(models) > 0
-
-
-class TestParameterValidatorDoubleException:
-    """Cover lines 31-32: Fallback exception when importing ALL_MODELS fails."""
-
-    def test_get_supported_models_returns_empty_when_all_fail(self):
-        """When both BackendRegistry and ALL_MODELS import fail, return empty set."""
-        from src.parameter_validator import ParameterValidator
-
-        mock_registry = MagicMock()
-        mock_registry.all_model_ids.side_effect = Exception("registry broken")
-
-        # Make the constants module not have ALL_MODELS
-        mock_constants = MagicMock(spec=[])  # spec=[] means no attributes
-
-        with patch("src.backends.base.BackendRegistry", mock_registry):
-            with patch.dict("sys.modules", {"src.constants": mock_constants}):
-                models = ParameterValidator._get_supported_models()
-                assert models == set()
 
 
 # ============================================================================
@@ -268,27 +224,6 @@ class TestMessageTextParsingErrorRecovery:
         )
         msg = msg.normalize_content()
         assert msg.content == "From object\nFrom dict"
-
-
-class TestModelValidateNGreaterThan1:
-    """Cover line 90: Validator for n > 1 (raises ValueError)."""
-
-    def test_n_greater_than_1_raises_value_error(self):
-        """ChatCompletionRequest with n > 1 raises ValidationError."""
-        with pytest.raises(ValidationError) as exc_info:
-            ChatCompletionRequest(
-                messages=[Message(role="user", content="Hi")],
-                n=5,
-            )
-        assert "multiple choices" in str(exc_info.value).lower()
-
-    def test_n_equal_to_2_raises_value_error(self):
-        """ChatCompletionRequest with n=2 raises ValidationError."""
-        with pytest.raises(ValidationError):
-            ChatCompletionRequest(
-                messages=[Message(role="user", content="Hi")],
-                n=2,
-            )
 
 
 # ============================================================================
