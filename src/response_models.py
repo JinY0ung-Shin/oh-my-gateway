@@ -3,7 +3,7 @@
 import time
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Discriminator, Field, Tag
 
 
 class ResponseInputTextPart(BaseModel):
@@ -21,9 +21,33 @@ class ResponseInputImagePart(BaseModel):
     detail: Optional[str] = None
 
 
+def _response_input_part_discriminator(v: Any) -> str:
+    """Route content parts by ``type``; unknown types fall through to ``unknown``.
+
+    Known types (``input_text`` / ``input_image``) get strict pydantic validation.
+    Unknown types are accepted as raw dicts so the Responses API surface stays
+    forward-compatible with evolving OpenAI part types (e.g., ``input_file``,
+    ``input_audio``). Downstream code already tolerates both pydantic models
+    and dicts via ``isinstance`` / ``getattr`` forks.
+    """
+    if isinstance(v, dict):
+        t = v.get("type")
+    else:
+        t = getattr(v, "type", None)
+    if t == "input_text":
+        return "input_text"
+    if t == "input_image":
+        return "input_image"
+    return "unknown"
+
+
 ResponseInputContentPart = Annotated[
-    Union[ResponseInputTextPart, ResponseInputImagePart],
-    Field(discriminator="type"),
+    Union[
+        Annotated[ResponseInputTextPart, Tag("input_text")],
+        Annotated[ResponseInputImagePart, Tag("input_image")],
+        Annotated[Dict[str, Any], Tag("unknown")],
+    ],
+    Discriminator(_response_input_part_discriminator),
 ]
 
 
