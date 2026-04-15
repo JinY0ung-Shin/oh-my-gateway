@@ -88,6 +88,47 @@ def _detect_function_call_output(input_data) -> Optional[Dict[str, str]]:
     return None
 
 
+def _build_requires_action_response(
+    resp_id: str,
+    model: str,
+    tc: dict,
+    metadata: Optional[dict],
+) -> ResponseObject:
+    """Construct the `requires_action` ResponseObject for an AskUserQuestion pause."""
+    return ResponseObject(
+        id=resp_id,
+        model=model,
+        status="requires_action",
+        output=[
+            FunctionCallOutputItem(
+                id=f"fc_{tc['call_id']}",
+                call_id=tc["call_id"],
+                name=tc["name"],
+                arguments=json.dumps(tc.get("arguments", {})),
+            )
+        ],
+        metadata=metadata or {},
+    )
+
+
+def _build_failed_response(
+    resp_id: str,
+    model: str,
+    metadata: Optional[dict],
+    *,
+    code: str = "server_error",
+    message: str = "Internal server error",
+) -> ResponseObject:
+    """Construct a failed ResponseObject for stream error fallback."""
+    return ResponseObject(
+        id=resp_id,
+        model=model,
+        status="failed",
+        metadata=metadata or {},
+        error=ResponseErrorDetail(code=code, message=message),
+    )
+
+
 async def _responses_streaming_preflight(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
@@ -375,19 +416,8 @@ async def create_response(
                         arguments=json.dumps(tc.get("arguments", {})),
                     )
                     # Emit response.completed with requires_action status
-                    requires_action_resp = ResponseObject(
-                        id=resp_id,
-                        model=body.model,
-                        status="requires_action",
-                        output=[
-                            FunctionCallOutputItem(
-                                id=f"fc_{tc['call_id']}",
-                                call_id=tc["call_id"],
-                                name=tc["name"],
-                                arguments=json.dumps(tc.get("arguments", {})),
-                            )
-                        ],
-                        metadata=body.metadata or {},
+                    requires_action_resp = _build_requires_action_response(
+                        resp_id, body.model, tc, body.metadata
                     )
                     yield streaming_utils.make_response_sse(
                         "response.completed",
@@ -410,13 +440,7 @@ async def create_response(
 
             except Exception as e:
                 logger.error("Responses API Stream: setup error: %s", e, exc_info=True)
-                failed_resp = ResponseObject(
-                    id=resp_id,
-                    model=body.model,
-                    status="failed",
-                    metadata=body.metadata or {},
-                    error=ResponseErrorDetail(code="server_error", message="Internal server error"),
-                )
+                failed_resp = _build_failed_response(resp_id, body.model, body.metadata)
                 yield streaming_utils.make_response_sse(
                     "response.failed",
                     response_obj=failed_resp,
@@ -480,19 +504,8 @@ async def create_response(
                 tc = session.pending_tool_call
                 resp_id = _make_response_id(session_id, pf.next_turn)
                 session.turn_counter = pf.next_turn
-                return ResponseObject(
-                    id=resp_id,
-                    status="requires_action",
-                    model=body.model,
-                    output=[
-                        FunctionCallOutputItem(
-                            id=f"fc_{tc['call_id']}",
-                            call_id=tc["call_id"],
-                            name=tc["name"],
-                            arguments=json.dumps(tc.get("arguments", {})),
-                        )
-                    ],
-                    metadata=body.metadata or {},
+                return _build_requires_action_response(
+                    resp_id, body.model, tc, body.metadata
                 ).model_dump()
 
             # Extract assistant text
@@ -649,19 +662,8 @@ async def _handle_function_call_output(
                         name=tc["name"],
                         arguments=json.dumps(tc.get("arguments", {})),
                     )
-                    requires_action_resp = ResponseObject(
-                        id=resp_id,
-                        model=body.model,
-                        status="requires_action",
-                        output=[
-                            FunctionCallOutputItem(
-                                id=f"fc_{tc['call_id']}",
-                                call_id=tc["call_id"],
-                                name=tc["name"],
-                                arguments=json.dumps(tc.get("arguments", {})),
-                            )
-                        ],
-                        metadata=body.metadata or {},
+                    requires_action_resp = _build_requires_action_response(
+                        resp_id, body.model, tc, body.metadata
                     )
                     yield streaming_utils.make_response_sse(
                         "response.completed",
@@ -681,13 +683,7 @@ async def _handle_function_call_output(
 
             except Exception as e:
                 logger.error("Responses API Stream: continuation error: %s", e, exc_info=True)
-                failed_resp = ResponseObject(
-                    id=resp_id,
-                    model=body.model,
-                    status="failed",
-                    metadata=body.metadata or {},
-                    error=ResponseErrorDetail(code="server_error", message="Internal server error"),
-                )
+                failed_resp = _build_failed_response(resp_id, body.model, body.metadata)
                 yield streaming_utils.make_response_sse(
                     "response.failed",
                     response_obj=failed_resp,
@@ -715,19 +711,8 @@ async def _handle_function_call_output(
         if session.pending_tool_call is not None:
             tc = session.pending_tool_call
             session.turn_counter = next_turn
-            return ResponseObject(
-                id=resp_id,
-                status="requires_action",
-                model=body.model,
-                output=[
-                    FunctionCallOutputItem(
-                        id=f"fc_{tc['call_id']}",
-                        call_id=tc["call_id"],
-                        name=tc["name"],
-                        arguments=json.dumps(tc.get("arguments", {})),
-                    )
-                ],
-                metadata=body.metadata or {},
+            return _build_requires_action_response(
+                resp_id, body.model, tc, body.metadata
             ).model_dump()
 
         for chunk in chunks:
