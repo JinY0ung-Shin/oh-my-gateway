@@ -54,7 +54,7 @@ ResponseInputContentPart = Annotated[
 class ResponseInputItem(BaseModel):
     """A single item in the input array (message format)."""
 
-    role: str
+    role: Literal["user", "assistant", "system", "developer"]
     content: Union[str, List[ResponseInputContentPart]] = ""
 
 
