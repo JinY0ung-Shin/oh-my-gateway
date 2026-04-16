@@ -108,6 +108,31 @@ METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
 # call and the SDK resumes.  Set via ASK_USER_TIMEOUT_SECONDS env var.
 ASK_USER_TIMEOUT_SECONDS = int(os.environ.get("ASK_USER_TIMEOUT_SECONDS", "300"))
 
+# ---------------------------------------------------------------------------
+# Docker Per-User Sandbox
+# ---------------------------------------------------------------------------
+# When enabled, the gateway spawns a dedicated Docker container for each user.
+# This provides complete filesystem, process, and network isolation between
+# users — one user cannot access another user's files or processes.
+# Requires Docker socket access (/var/run/docker.sock) on the orchestrator.
+DOCKER_SANDBOX_ENABLED = parse_bool_env("DOCKER_SANDBOX_ENABLED", "false")
+# Role: "orchestrator" (main gateway that manages containers) or
+#       "worker" (inside a sandbox container, single-user mode).
+DOCKER_SANDBOX_ROLE = os.getenv("DOCKER_SANDBOX_ROLE", "orchestrator")
+# Docker image used for sandbox containers (must be pre-built).
+DOCKER_SANDBOX_IMAGE = os.getenv("DOCKER_SANDBOX_IMAGE", "claude-code-gateway:latest")
+# Docker network for gateway ↔ sandbox communication.
+DOCKER_SANDBOX_NETWORK = os.getenv("DOCKER_SANDBOX_NETWORK", "claude-sandbox-net")
+# Per-container resource limits.
+DOCKER_SANDBOX_CPU_LIMIT = os.getenv("DOCKER_SANDBOX_CPU_LIMIT", "1.0")
+DOCKER_SANDBOX_MEMORY_LIMIT = os.getenv("DOCKER_SANDBOX_MEMORY_LIMIT", "2g")
+# Idle timeout (seconds) before a sandbox container is removed.
+DOCKER_SANDBOX_IDLE_TIMEOUT = int(os.getenv("DOCKER_SANDBOX_IDLE_TIMEOUT", "3600"))
+# Maximum number of concurrent sandbox containers.
+DOCKER_SANDBOX_MAX_CONTAINERS = int(os.getenv("DOCKER_SANDBOX_MAX_CONTAINERS", "50"))
+# Host path for persistent user workspace volumes.
+DOCKER_SANDBOX_WORKSPACE_BASE = os.getenv("DOCKER_SANDBOX_WORKSPACE_BASE", "/data/sandboxes")
+
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")
