@@ -53,6 +53,7 @@ def get_admin_js() -> str:
     promptDirty: false,
     newPromptName: '',
     newPromptNameError: '',
+    newPromptNameWarning: '',
     newPromptContent: '',
     loading: { dashboard: false, logs: false, sessions: false },
 
@@ -348,21 +349,22 @@ def get_admin_js() -> str:
       this.promptViewName = null;
       this.newPromptName = '';
       this.newPromptNameError = '';
+      this.newPromptNameWarning = '';
       this.newPromptContent = '';
       this.promptDirty = false;
     },
 
     validateNewPromptName() {
       const n = this.newPromptName.trim();
-      if (!n) { this.newPromptNameError = ''; return; }
+      this.newPromptNameError = '';
+      this.newPromptNameWarning = '';
+      if (!n) return;
       if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(n)) {
         this.newPromptNameError = 'letters, digits, hyphens, underscores only (max 64 chars)';
         return;
       }
       if (this.namedPrompts.some(p => p.name === n)) {
-        this.newPromptNameError = 'prompt already exists (will overwrite on create)';
-      } else {
-        this.newPromptNameError = '';
+        this.newPromptNameWarning = 'prompt already exists (will overwrite on create)';
       }
     },
 
@@ -454,6 +456,7 @@ def get_admin_js() -> str:
       this.promptView = 'new';
       this.newPromptName = '';
       this.newPromptNameError = '';
+      this.newPromptNameWarning = '';
       this.newPromptContent = this.systemPrompt.preset_text || '';
       this.promptDirty = false;
     },
@@ -461,8 +464,10 @@ def get_admin_js() -> str:
       this.promptView = 'new';
       this.newPromptName = this.promptViewName ? this.promptViewName.replace(/-reference$/, '') : '';
       this.newPromptNameError = '';
+      this.newPromptNameWarning = '';
       this.newPromptContent = this.promptEditorContent || '';
       this.promptDirty = false;
+      this.validateNewPromptName();
     },
 
     async loadSkills() {

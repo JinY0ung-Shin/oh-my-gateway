@@ -137,6 +137,7 @@ def get_config_html() -> str:
                 <input type="text" x-model="newPromptName" placeholder="my-prompt-name"
                   style="width:100%; margin-bottom:0.5rem; margin-top:4px" @input="validateNewPromptName()">
                 <p x-show="newPromptNameError" class="text-sm text-danger" style="margin:0 0 0.5rem 0" x-text="'! ' + newPromptNameError"></p>
+                <p x-show="newPromptNameWarning && !newPromptNameError" class="text-sm" style="margin:0 0 0.5rem 0; color:var(--amber)" x-text="'? ' + newPromptNameWarning"></p>
                 <label class="text-xs text-muted">CONTENT:</label>
                 <textarea x-model="newPromptContent"
                   style="width:100%; min-height:300px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
@@ -145,7 +146,7 @@ def get_config_html() -> str:
                   placeholder="// enter system prompt content..."></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
                   <button class="btn btn-sm btn-primary" @click="createNamedPrompt()"
-                    :disabled="!newPromptName.trim() || !newPromptContent.trim() || newPromptNameError">[CREATE]</button>
+                    :disabled="!newPromptName.trim() || !newPromptContent.trim() || !!newPromptNameError">[CREATE]</button>
                   <button class="btn btn-sm btn-ghost" @click="promptView = null">[CANCEL]</button>
                   <span class="text-xs text-muted" x-show="newPromptContent.trim()" x-text="newPromptContent.trim().length + ' chars'"></span>
                 </div>
