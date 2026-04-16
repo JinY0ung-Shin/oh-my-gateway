@@ -16,6 +16,7 @@ from pathlib import Path
 import logging
 
 from claude_agent_sdk import query, ClaudeAgentOptions, ClaudeSDKClient
+from src.constants import DEFAULT_MAX_TURNS
 from claude_agent_sdk.types import (
     StreamEvent,
     AssistantMessage,
@@ -212,7 +213,7 @@ class ClaudeCodeCLI:
         self,
         model: Optional[str] = None,
         system_prompt: Optional[str] = None,
-        max_turns: int = 10,
+        max_turns: int = DEFAULT_MAX_TURNS,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
         permission_mode: Optional[str] = None,
@@ -553,7 +554,7 @@ class ClaudeCodeCLI:
         options = self._build_sdk_options(
             model=model,
             system_prompt=system_prompt,
-            max_turns=10,
+            max_turns=DEFAULT_MAX_TURNS,
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             session_id=client_session_id,
@@ -666,7 +667,7 @@ class ClaudeCodeCLI:
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         stream: bool = True,  # Accepted for caller compatibility; always yields chunks.
-        max_turns: int = 10,
+        max_turns: int = DEFAULT_MAX_TURNS,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
         session_id: Optional[str] = None,
