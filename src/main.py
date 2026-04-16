@@ -35,6 +35,8 @@ from src.constants import (
     DEFAULT_PORT,
     DEFAULT_HOST,
     MAX_REQUEST_SIZE,
+    DOCKER_SANDBOX_ENABLED,
+    DOCKER_SANDBOX_ROLE,
 )
 from src import __version__
 from src.mcp_config import get_mcp_servers
@@ -109,7 +111,7 @@ def prompt_for_api_protection() -> Optional[str]:
                 print("=" * 60)
                 print("📋 IMPORTANT: Save this key - you'll need it for API calls!")
                 print("   Example usage:")
-                print(f'   curl -H "Authorization: Bearer {token}" \\')
+                print(f'   curl -H "Authorization: Bearer {token}" \\\')
                 print(f"        http://localhost:{DEFAULT_PORT}/v1/models")
                 print("=" * 60)
                 return token
@@ -217,10 +219,28 @@ async def lifespan(app: FastAPI):
     # Start session cleanup task
     session_manager.start_cleanup_task()
 
+    # --- Docker per-user sandbox ---
+    if DOCKER_SANDBOX_ENABLED and DOCKER_SANDBOX_ROLE != "worker":
+        from src import docker_sandbox as _dsb
+
+        _dsb.init_sandbox()
+        if _dsb.sandbox_manager:
+            _dsb.sandbox_manager.start_cleanup_task()
+        logger.info("📦 Docker per-user sandbox enabled (orchestrator mode)")
+    elif DOCKER_SANDBOX_ENABLED:
+        logger.info("📦 Docker sandbox worker mode (single-user container)")
+
     # Record server start time for uptime tracking
     app.state.started_at = time.time()
 
     yield
+
+    # --- Shutdown Docker sandbox containers ---
+    if DOCKER_SANDBOX_ENABLED and DOCKER_SANDBOX_ROLE != "worker":
+        from src.docker_sandbox import shutdown_sandbox
+
+        logger.info("Shutting down Docker sandbox containers...")
+        await shutdown_sandbox()
 
     # Cleanup on shutdown (async to disconnect SDK clients)
     logger.info("Shutting down session manager...")
@@ -322,9 +342,6 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
                             logger.debug(f"🔍 Request body: {json.dumps(logged_body, indent=2)}")
                             body_logged = True
                         except Exception:
-                            # Do not log raw bytes: a malformed JSON body may
-                            # contain Bearer tokens, API keys, or PII. Log only
-                            # metadata useful for debugging.
                             logger.debug(
                                 "🔍 Request body: [non-JSON, %d bytes, content-type: %s]",
                                 len(body),
@@ -358,12 +375,7 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
-    """Log request metadata to the in-memory request logger for admin observability.
-
-    Excludes ``/admin/api/*`` and other non-API paths by default (configured
-    via ``request_logger.should_log``).  Latency measures handler creation
-    time only — streaming completion time is **not** included.
-    """
+    """Log request metadata to the in-memory request logger for admin observability."""
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -375,9 +387,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         session_id: Optional[str] = None
         backend: Optional[str] = None
 
-        # Extract model/session_id from request body for /v1/ POST endpoints.
-        # Follow the same safety pattern as the existing debug middleware:
-        # small payloads only, tolerate parse failure.
         if request.method == "POST" and path.startswith("/v1/"):
             try:
                 content_length = request.headers.get("content-length")
@@ -387,7 +396,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                         parsed = json.loads(body.decode())
                         model = parsed.get("model")
                         session_id = parsed.get("session_id")
-                        # Resolve backend from model name
                         if model:
                             try:
                                 from src.backends import resolve_model
@@ -492,7 +500,17 @@ from src.routes import (  # noqa: E402
     admin_router,
 )
 
-app.include_router(responses_router)
+# When Docker sandbox is enabled in orchestrator mode, replace the
+# responses router with the sandbox-aware one that proxies requests
+# to per-user Docker containers.
+if DOCKER_SANDBOX_ENABLED and DOCKER_SANDBOX_ROLE != "worker":
+    from src.sandbox_route import router as sandbox_responses_router  # noqa: E402
+
+    app.include_router(sandbox_responses_router)
+    logger.info("Registered sandbox responses router (orchestrator mode)")
+else:
+    app.include_router(responses_router)
+
 app.include_router(sessions_router)
 app.include_router(general_router)
 app.include_router(admin_router)
