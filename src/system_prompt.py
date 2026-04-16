@@ -88,12 +88,16 @@ def _save_persisted(text: Optional[str], *, active_name: Optional[str] = None) -
 
 
 def _resolve_placeholders(text: str) -> str:
-    """Replace ``{{PLACEHOLDER}}`` tokens with runtime values."""
+    """Replace ``{{PLACEHOLDER}}`` tokens with runtime values.
+
+    ``{{WORKING_DIRECTORY}}`` is intentionally left unresolved here because
+    the actual working directory varies per-user workspace.  Use
+    :func:`resolve_cwd_placeholder` at request time to fill it in.
+    """
     from src.constants import PROMPT_LANGUAGE, PROMPT_MEMORY_PATH
 
     replacements = {
         "LANGUAGE": PROMPT_LANGUAGE,
-        "WORKING_DIRECTORY": os.getenv("CLAUDE_CWD", os.getcwd()),
         "PLATFORM": platform.system().lower(),
         "SHELL": os.environ.get("SHELL", ""),
         "OS_VERSION": platform.platform(),
@@ -102,6 +106,16 @@ def _resolve_placeholders(text: str) -> str:
     for key, value in replacements.items():
         text = text.replace("{{" + key + "}}", value)
     return text
+
+
+def resolve_cwd_placeholder(text: Optional[str], cwd: str) -> Optional[str]:
+    """Replace ``{{WORKING_DIRECTORY}}`` with the actual per-user *cwd*.
+
+    Safe to call with ``None`` — returns ``None`` unchanged.
+    """
+    if text is None or "{{WORKING_DIRECTORY}}" not in text:
+        return text
+    return text.replace("{{WORKING_DIRECTORY}}", cwd)
 
 
 def load_default_prompt(file_path: str = "") -> None:

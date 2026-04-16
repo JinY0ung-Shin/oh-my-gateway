@@ -37,6 +37,7 @@ async def acquire_session_preflight(
     is_new: Optional[bool] = None,
     turn: Optional[int] = None,
     messages: Optional[List[Message]] = None,
+    workspace: Optional[str] = None,
 ) -> SessionPreflight:
     """Acquire the session lock and run all validation guards.
 
@@ -115,9 +116,12 @@ async def acquire_session_preflight(
         # --- First-turn tagging ---
         if is_new:
             session.backend = resolved.backend
-            from src.system_prompt import get_system_prompt
+            from src.system_prompt import get_system_prompt, resolve_cwd_placeholder
 
-            session.base_system_prompt = get_system_prompt()
+            base = get_system_prompt()
+            if workspace:
+                base = resolve_cwd_placeholder(base, workspace)
+            session.base_system_prompt = base
 
         # --- Commit messages (chat flow) ---
         if messages is not None:
@@ -145,6 +149,7 @@ async def session_preflight_scope(
     is_new: Optional[bool] = None,
     turn: Optional[int] = None,
     messages: Optional[List[Message]] = None,
+    workspace: Optional[str] = None,
 ) -> AsyncGenerator[SessionPreflight, None]:
     """Context manager wrapper around :func:`acquire_session_preflight`.
 
@@ -158,6 +163,7 @@ async def session_preflight_scope(
         is_new=is_new,
         turn=turn,
         messages=messages,
+        workspace=workspace,
     )
     try:
         yield preflight

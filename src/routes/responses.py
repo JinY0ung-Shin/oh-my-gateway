@@ -164,6 +164,7 @@ async def _responses_streaming_preflight(
         session_id,
         is_new=is_new_session,
         turn=turn,
+        workspace=workspace_str,
     )
 
     return {
@@ -473,6 +474,7 @@ async def create_response(
             session_id,
             is_new=is_new_session,
             turn=_turn,
+            workspace=workspace_str,
         ) as pf:
             # Execute backend — persistent client or single-use query
             chunks = []
