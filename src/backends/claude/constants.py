@@ -40,6 +40,7 @@ DEFAULT_ALLOWED_TOOLS = [
     "Write",
     "Edit",
     "Skill",
+    "TodoWrite",
 ]
 
 # Claude Models
