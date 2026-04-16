@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 
-from src.models import ContentPart, Message
+from src.models import Message
 from src.message_adapter import MessageAdapter
 from src.response_models import ResponseInputItem
 
@@ -23,48 +23,18 @@ TINY_PNG_B64 = base64.b64encode(
 # ============================================================================
 
 
-class TestContentPart:
-    def test_content_part_text(self):
-        part = ContentPart(type="text", text="hello")
-        assert part.type == "text"
-        assert part.text == "hello"
-        assert part.image_url is None
-
-    def test_content_part_image_url(self):
-        data_url = f"data:image/png;base64,{TINY_PNG_B64}"
-        part = ContentPart(type="image_url", image_url={"url": data_url})
-        assert part.type == "image_url"
-        assert part.image_url["url"] == data_url
-        assert part.text is None
-
-
 class TestMessageNormalization:
     def test_message_text_only_list_normalized(self):
         """Text-only content list is collapsed to a single string."""
         msg = Message(
             role="user",
             content=[
-                ContentPart(type="text", text="a"),
-                ContentPart(type="text", text="b"),
+                {"type": "text", "text": "a"},
+                {"type": "text", "text": "b"},
             ],
         )
         assert isinstance(msg.content, str)
         assert msg.content == "a\nb"
-
-    def test_message_with_images_kept_as_list(self):
-        """Content list with image_url parts is preserved as a list."""
-        data_url = f"data:image/png;base64,{TINY_PNG_B64}"
-        msg = Message(
-            role="user",
-            content=[
-                ContentPart(type="text", text="describe this"),
-                ContentPart(type="image_url", image_url={"url": data_url}),
-            ],
-        )
-        assert isinstance(msg.content, list)
-        assert len(msg.content) == 2
-        assert msg.content[0].type == "text"
-        assert msg.content[1].type == "image_url"
 
     def test_message_string_content_unchanged(self):
         """Plain string content passes through without modification."""

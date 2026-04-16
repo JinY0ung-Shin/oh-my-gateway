@@ -114,33 +114,6 @@ class TestListWorkspaceFilesEdgeCases:
 
 
 # ---------------------------------------------------------------------------
-# admin_service — get_session_messages: dict content parts
-# ---------------------------------------------------------------------------
-
-
-class TestGetSessionMessagesDictParts:
-    def test_dict_image_url_part(self, isolated_session_manager):
-        """Message content with dict image_url parts renders as [Image]."""
-        from src.admin_service import get_session_messages
-
-        session = isolated_session_manager.get_or_create_session("test-dict-parts")
-        session.messages.append(
-            SimpleNamespace(
-                role="user",
-                content=[
-                    {"type": "text", "text": "Check this image"},
-                    {"type": "image_url", "url": "data:image/png;base64,abc"},
-                ],
-                name=None,
-            )
-        )
-        result = get_session_messages("test-dict-parts")
-        assert result is not None
-        assert "[Image]" in result[0]["content"]
-        assert "Check this image" in result[0]["content"]
-
-
-# ---------------------------------------------------------------------------
 # admin_service — get_redacted_config edge cases
 # ---------------------------------------------------------------------------
 
@@ -192,34 +165,6 @@ class TestGetToolsRegistryMcp:
         with patch("src.mcp_config.get_mcp_servers", return_value=None):
             result = get_tools_registry()
             assert result["mcp_tools"] == []
-
-
-# ---------------------------------------------------------------------------
-# admin_service — export_session_json multimodal content
-# ---------------------------------------------------------------------------
-
-
-class TestExportSessionJsonMultimodal:
-    def test_export_multimodal_message(self, isolated_session_manager):
-        from src.admin_service import export_session_json
-
-        session = isolated_session_manager.get_or_create_session("test-export-mm")
-        session.messages.append(
-            SimpleNamespace(
-                role="user",
-                content=[
-                    SimpleNamespace(type="text", text="Look at this"),
-                    SimpleNamespace(type="image_url", text=None),
-                ],
-                name=None,
-            )
-        )
-        result = export_session_json("test-export-mm")
-        assert result is not None
-        assert len(result["messages"]) == 1
-        # Verify image_url part is handled (redacted in export)
-        content_parts = result["messages"][0]["content"]
-        assert isinstance(content_parts, list)
 
 
 # ---------------------------------------------------------------------------

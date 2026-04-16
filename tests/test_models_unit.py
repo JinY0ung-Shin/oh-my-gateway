@@ -9,21 +9,10 @@ These are pure unit tests that don't require a running server.
 from datetime import datetime, timezone
 
 from src.models import (
-    ContentPart,
     Message,
     SessionInfo,
     SessionListResponse,
 )
-
-
-class TestContentPart:
-    """Test ContentPart model."""
-
-    def test_create_text_content_part(self):
-        """Can create a text content part."""
-        part = ContentPart(type="text", text="Hello world")
-        assert part.type == "text"
-        assert part.text == "Hello world"
 
 
 class TestMessage:
@@ -55,8 +44,8 @@ class TestMessage:
     def test_message_normalizes_array_content(self):
         """Array content is normalized to string."""
         content_parts = [
-            ContentPart(type="text", text="Part 1"),
-            ContentPart(type="text", text="Part 2"),
+            {"type": "text", "text": "Part 1"},
+            {"type": "text", "text": "Part 2"},
         ]
         msg = Message(role="user", content=content_parts)
         assert msg.content == "Part 1\nPart 2"

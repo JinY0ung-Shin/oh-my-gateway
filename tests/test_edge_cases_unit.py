@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.models import ContentPart, Message
+from src.models import Message
 
 
 # ============================================================================
@@ -179,12 +179,11 @@ class TestSessionManagerNoEventLoop:
 
 
 class TestMessageTextParsingErrorRecovery:
-    """Cover lines 36-37: Text parsing error recovery (empty content from dicts).
+    """Cover text parsing error recovery (empty content from dicts).
 
-    Lines 36-37 handle dicts in the content list. Since Pydantic coerces valid
-    text-dicts to ContentPart, we construct a Message with model_construct()
-    to bypass validation and put raw dicts in the content list, then invoke
-    the normalize_content validator manually.
+    We construct a Message with model_construct() to bypass validation and put
+    raw dicts in the content list, then invoke the normalize_content validator
+    manually.
     """
 
     def test_message_normalizes_dict_content_with_missing_text(self):
@@ -202,7 +201,7 @@ class TestMessageTextParsingErrorRecovery:
         assert msg.content == "\nValid"
 
     def test_message_normalizes_non_text_content_parts_to_empty(self):
-        """Content parts that are neither ContentPart nor text-dicts are skipped."""
+        """Content parts that are not text-dicts are skipped."""
         msg = Message.model_construct(
             role="user",
             content=[
@@ -213,17 +212,17 @@ class TestMessageTextParsingErrorRecovery:
         assert msg.content == ""
 
     def test_message_normalizes_mixed_content_parts(self):
-        """Mix of ContentPart objects and raw dicts processes correctly."""
+        """Mix of text and non-text dicts processes correctly."""
         msg = Message.model_construct(
             role="user",
             content=[
-                ContentPart(type="text", text="From object"),
-                {"type": "text", "text": "From dict"},
+                {"type": "text", "text": "From dict 1"},
+                {"type": "text", "text": "From dict 2"},
                 {"type": "image"},  # Skipped — not text type
             ],
         )
         msg = msg.normalize_content()
-        assert msg.content == "From object\nFrom dict"
+        assert msg.content == "From dict 1\nFrom dict 2"
 
 
 # ============================================================================

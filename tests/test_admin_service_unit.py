@@ -429,31 +429,20 @@ class TestGetSessionMessages:
         finally:
             session_manager.delete_session(sid)
 
-    def test_multimodal_content(self):
-        """Image content parts are displayed as [Image] placeholder."""
+    def test_string_content(self):
+        """String content is displayed correctly."""
         from src.session_manager import session_manager
-        from src.models import Message, ContentPart
+        from src.models import Message
 
         sid = "test-admin-history-004"
         try:
             session = session_manager.get_or_create_session(sid)
-            # Create a multimodal message with image — note: Message validator
-            # only keeps list form when images are present
             session.messages.append(
-                Message(
-                    role="user",
-                    content=[
-                        ContentPart(type="text", text="Look at this:"),
-                        ContentPart(
-                            type="image_url", image_url={"url": "data:image/png;base64,abc"}
-                        ),
-                    ],
-                )
+                Message(role="user", content="Look at this image description")
             )
 
             result = get_session_messages(sid)
             assert result is not None
-            assert "[Image]" in result[0]["content"]
-            assert "Look at this:" in result[0]["content"]
+            assert "Look at this image description" in result[0]["content"]
         finally:
             session_manager.delete_session(sid)

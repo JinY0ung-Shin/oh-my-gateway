@@ -348,8 +348,7 @@ def get_session_messages(
     Returns ``None`` when the session does not exist.  Content is truncated
     to *truncate* characters in the response; set to ``0`` for full content.
 
-    Multimodal content (``image_url`` parts) is represented as ``[Image]``
-    placeholder text.
+    Content is truncated to *truncate* characters for display.
     """
     from src.session_manager import session_manager
 
@@ -362,23 +361,7 @@ def get_session_messages(
 
     for idx, msg in enumerate(messages):
         content = msg.content
-        # Handle multimodal content (list of ContentPart)
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if hasattr(part, "type"):
-                    if part.type == "image_url":
-                        parts.append("[Image]")
-                    elif part.type == "text" and part.text:
-                        parts.append(part.text)
-                elif isinstance(part, dict):
-                    if part.get("type") == "image_url":
-                        parts.append("[Image]")
-                    elif part.get("type") == "text":
-                        parts.append(part.get("text", ""))
-            display = "\n".join(parts)
-        else:
-            display = str(content) if content else ""
+        display = str(content) if content else ""
 
         truncated = False
         if truncate > 0 and len(display) > truncate:
@@ -640,19 +623,7 @@ def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
     messages = []
     for msg in session.get_all_messages():
         content = msg.content
-        if isinstance(content, list):
-            parts = []
-            for part in content:
-                if hasattr(part, "type"):
-                    if part.type == "image_url":
-                        parts.append({"type": "image_url", "url": "[redacted]"})
-                    elif part.type == "text" and part.text:
-                        parts.append({"type": "text", "text": part.text})
-                elif isinstance(part, dict):
-                    parts.append(part)
-            display = parts
-        else:
-            display = str(content) if content else ""
+        display = str(content) if content else ""
 
         messages.append({"role": msg.role, "content": display, "name": msg.name})
 
