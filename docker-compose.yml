@@ -12,6 +12,16 @@ services:
       - ./data:/app/data
       # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
+
+      # ── Docker Per-User Sandbox ──────────────────────────────────────
+      # Required when DOCKER_SANDBOX_ENABLED=true.
+      # The gateway needs Docker socket access to spawn per-user containers.
+      # WARNING: Docker socket access grants effective root on the host.
+      # - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent user workspace volumes (each user gets {base}/{user}/)
+      # - /data/sandboxes:/data/sandboxes
+    networks:
+      - claude-net
     environment:
       # ── Server ───────────────────────────────────────────────────────
       - PORT=8000
@@ -39,12 +49,9 @@ services:
       # - MAX_TIMEOUT=600000
 
       # ── System Prompt ────────────────────────────────────────────────
-      # Path to a custom system prompt file; leave unset to use preset.
-      # Can also be changed at runtime via the Admin UI Config tab.
       # - SYSTEM_PROMPT_FILE=/app/docs/claude-code-system-prompt-reference.md
 
       # ── Thinking ─────────────────────────────────────────────────────
-      # adaptive (default), enabled (fixed budget), disabled
       # - THINKING_MODE=adaptive
       # - THINKING_BUDGET_TOKENS=10000
 
@@ -67,7 +74,6 @@ services:
       # - CORS_ORIGINS=["*"]
 
       # ── MCP Servers ──────────────────────────────────────────────────
-      # Inline JSON or path to a JSON file
       # - MCP_CONFIG={"mcpServers": {}}
 
       # ── Sandbox ──────────────────────────────────────────────────────
@@ -75,9 +81,25 @@ services:
       # - CLAUDE_SANDBOX_AUTO_ALLOW_BASH=true
       # - CLAUDE_SANDBOX_WEAKER_NESTED=false
 
+      # ── Docker Per-User Sandbox ──────────────────────────────────────
+      # Spawns a dedicated Docker container per user for complete
+      # filesystem/process/network isolation. Requires Docker socket mount.
+      # - DOCKER_SANDBOX_ENABLED=true
+      # - DOCKER_SANDBOX_IMAGE=claude-code-gateway:latest
+      # - DOCKER_SANDBOX_NETWORK=claude-net
+      # - DOCKER_SANDBOX_CPU_LIMIT=1.0
+      # - DOCKER_SANDBOX_MEMORY_LIMIT=2g
+      # - DOCKER_SANDBOX_IDLE_TIMEOUT=3600
+      # - DOCKER_SANDBOX_MAX_CONTAINERS=50
+      # - DOCKER_SANDBOX_WORKSPACE_BASE=/data/sandboxes
+
       # ── Subagent Control ─────────────────────────────────────────────
       # - DISALLOWED_SUBAGENT_TYPES=statusline-setup
 
       # ── Debugging ────────────────────────────────────────────────────
       # - DEBUG_MODE=false
       # - VERBOSE=false
+
+networks:
+  claude-net:
+    driver: bridge
