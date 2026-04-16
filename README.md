@@ -35,6 +35,7 @@ curl http://localhost:8000/v1/responses \
 - **Adaptive Thinking** — Configurable thinking modes and budget
 - **Token-Level Streaming** — Real-time token delivery via SDK partial messages
 - **Rate Limiting** — Per-endpoint configurable limits
+- **Docker Per-User Sandbox** — Complete user isolation via dedicated containers
 - **Docker Ready** — Dockerfile and docker-compose included
 
 ## Installation
@@ -146,6 +147,84 @@ Each `/v1/responses` request can include a `user` field to isolate working direc
 **Configuration:**
 - `USER_WORKSPACES_DIR`: Base directory for workspaces (defaults to `CLAUDE_CWD`)
 - User identifiers must match `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`
+
+### Docker Per-User Sandbox
+
+For multi-user deployments (e.g., Open WebUI), directory-level workspace isolation may not be sufficient — users sharing the same container can potentially access each other's files via path traversal. **Docker Per-User Sandbox** solves this by spawning a **dedicated Docker container per user**, providing complete OS-level isolation.
+
+#### Architecture
+
+```
+Open WebUI ─► Gateway (orchestrator) ─┬─► [alice container] ─► Claude SDK
+                                     ├─► [bob container]   ─► Claude SDK
+                                     └─► [carol container] ─► Claude SDK
+```
+
+The gateway runs in **orchestrator** mode and routes each user's request to their dedicated container. Each container runs the same gateway image in **worker** mode (single-user, no nested sandbox management).
+
+#### Isolation Guarantees
+
+| Layer | Isolation |
+|-------|----------|
+| **Filesystem** | Each container only mounts its own workspace volume (`/data/sandboxes/{user}/`) |
+| **Process** | Separate PID namespace — users cannot see each other's processes |
+| **Network** | Separate network namespace per container |
+| **Resources** | Per-container CPU, memory, and PID limits |
+| **Security** | `--cap-drop ALL`, `--security-opt no-new-privileges`, `--pids-limit 256` |
+
+#### Quick Setup
+
+```bash
+# 1. Build the gateway image
+docker build -t claude-code-gateway:latest .
+
+# 2. Create persistent workspace directory
+mkdir -p /data/sandboxes
+
+# 3. Enable sandbox in .env
+DOCKER_SANDBOX_ENABLED=true
+DOCKER_SANDBOX_IMAGE=claude-code-gateway:latest
+DOCKER_SANDBOX_NETWORK=claude-sandbox-net
+DOCKER_SANDBOX_WORKSPACE_BASE=/data/sandboxes
+
+# 4. Uncomment Docker socket mount in docker-compose.yml
+#    - /var/run/docker.sock:/var/run/docker.sock
+#    - /data/sandboxes:/data/sandboxes
+
+# 5. Start
+docker compose up -d
+```
+
+#### Configuration
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `DOCKER_SANDBOX_ENABLED` | `false` | Enable per-user Docker sandbox |
+| `DOCKER_SANDBOX_IMAGE` | `claude-code-gateway:latest` | Docker image for sandbox containers |
+| `DOCKER_SANDBOX_NETWORK` | `claude-sandbox-net` | Docker network for communication |
+| `DOCKER_SANDBOX_CPU_LIMIT` | `1.0` | CPU cores per container |
+| `DOCKER_SANDBOX_MEMORY_LIMIT` | `2g` | Memory limit per container |
+| `DOCKER_SANDBOX_IDLE_TIMEOUT` | `3600` | Seconds before idle container is removed |
+| `DOCKER_SANDBOX_MAX_CONTAINERS` | `50` | Max concurrent containers |
+| `DOCKER_SANDBOX_WORKSPACE_BASE` | `/data/sandboxes` | Host path for user workspace volumes |
+
+#### How It Works
+
+1. A request arrives at `/v1/responses` with `"user": "alice"`
+2. The orchestrator checks if a container `claude-sandbox-alice` exists
+3. If not, it creates one on the `claude-sandbox-net` Docker network with:
+   - Only `/data/sandboxes/alice/` mounted as `/workspace`
+   - Resource limits and security hardening applied
+   - Auth credentials passed through (read-only `~/.claude` mount)
+4. The request is proxied to the container (including SSE streams)
+5. Idle containers are automatically cleaned up after `DOCKER_SANDBOX_IDLE_TIMEOUT`
+
+#### Security Notes
+
+- **Docker socket access** (`/var/run/docker.sock`) grants effective root on the host. For production, consider using a [Docker socket proxy](https://github.com/Tecnativa/docker-socket-proxy) to restrict which Docker API calls are allowed.
+- **`user` field is required** when sandbox mode is enabled. Requests without a `user` field return `400`.
+- Sandbox containers inherit `ANTHROPIC_AUTH_TOKEN` but **not** `ADMIN_API_KEY` or `API_KEY`.
+- Each container's `~/.claude` is mounted read-only to prevent auth credential modification.
 
 ## API Reference
 
