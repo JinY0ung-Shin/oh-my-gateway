@@ -971,6 +971,41 @@ class TestConvertMessageEdgeCases:
         result = cli._convert_message(original)
         assert result is original
 
+    def test_is_error_injects_error_message_from_result(self, cli_class):
+        """ResultMessage with is_error=True gets error_message from result field."""
+        cli = _make_cli(cli_class)
+        obj = SimpleNamespace(is_error=True, result="Rate limit exceeded", errors=None, subtype="error")
+        result = cli._convert_message(obj)
+        assert result["error_message"] == "Rate limit exceeded"
+
+    def test_is_error_injects_error_message_from_errors_list(self, cli_class):
+        """When result is empty, error_message falls back to errors list."""
+        cli = _make_cli(cli_class)
+        obj = SimpleNamespace(is_error=True, result=None, errors=["err1", "err2"], subtype="error")
+        result = cli._convert_message(obj)
+        assert result["error_message"] == "err1; err2"
+
+    def test_is_error_no_error_message_when_both_empty(self, cli_class):
+        """When result and errors are both empty, error_message is not injected."""
+        cli = _make_cli(cli_class)
+        obj = SimpleNamespace(is_error=True, result=None, errors=None, subtype="error")
+        result = cli._convert_message(obj)
+        assert "error_message" not in result
+
+    def test_is_error_false_does_not_inject_error_message(self, cli_class):
+        """is_error=False does not trigger error_message injection."""
+        cli = _make_cli(cli_class)
+        obj = SimpleNamespace(is_error=False, result="success", subtype="success")
+        result = cli._convert_message(obj)
+        assert "error_message" not in result
+
+    def test_dict_with_error_message_already_set_not_overwritten(self, cli_class):
+        """Dict chunks that already have error_message are passed through."""
+        cli = _make_cli(cli_class)
+        original = {"is_error": True, "error_message": "custom error"}
+        result = cli._convert_message(original)
+        assert result["error_message"] == "custom error"
+
 
 class TestSdkEnvContextManager:
     """Test ClaudeCodeCLI._sdk_env() environment variable management."""

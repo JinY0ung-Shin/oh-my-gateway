@@ -352,6 +352,14 @@ class ClaudeCodeCLI:
                     if isinstance(message, cls):
                         result["type"] = type_name
                         break
+            # SDK ResultMessage uses ``result``/``errors`` for error details,
+            # but downstream consumers expect ``error_message``.
+            if result.get("is_error") and "error_message" not in result:
+                error_msg = result.get("result") or ""
+                if not error_msg and result.get("errors"):
+                    error_msg = "; ".join(result["errors"])
+                if error_msg:
+                    result["error_message"] = error_msg
             return result
         return message
 
