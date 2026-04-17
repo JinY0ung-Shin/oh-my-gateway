@@ -1,20 +1,4 @@
-"""Per-user Docker container sandbox for complete user isolation.
-
-Spawns isolated Docker containers per user so each user's Claude SDK
-session runs in a separate filesystem, process, and network namespace.
-This prevents cross-user file access, process visibility, and resource
-interference.
-
-Architecture::
-
-    Gateway (orchestrator) ──► Per-user sandbox container ──► Claude SDK
-                           ──► Per-user sandbox container ──► Claude SDK
-                           ──► Per-user sandbox container ──► Claude SDK
-
-The gateway acts as a reverse proxy, routing requests to the appropriate
-user's container.  Each container runs the same gateway image in "worker"
-mode (single-user, no nested sandbox management).
-"""
+"""Per-user Docker container sandbox for complete user isolation."""
 
 import asyncio
 import logging
@@ -32,7 +16,6 @@ logger = logging.getLogger(__name__)
 
 
 def _safe_container_name(user: str) -> str:
-    """Derive a Docker-safe container name from a user identifier."""
     safe = re.sub(r"[.@]+", "-", user)
     return "claude-sandbox-" + safe
 
@@ -73,7 +56,6 @@ class DockerSandboxManager:
         self.containers: Dict[str, SandboxContainer] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
-        self._network_ready = False
 
     async def get_or_create(self, user: str) -> SandboxContainer:
         async with self._lock:
@@ -170,10 +152,7 @@ class DockerSandboxManager:
         workspace_dir = os.path.join(self.workspace_base, user)
         os.makedirs(workspace_dir, exist_ok=True)
 
-        internal_url = "http://%s:8000" % container_name
-
         await self._ensure_network()
-
         await _run_cmd(["docker", "rm", "-f", container_name], check=False)
 
         env_vars = self._build_env_vars()
@@ -205,10 +184,17 @@ class DockerSandboxManager:
         try:
             result = await _run_cmd(cmd)
             container_id = result.strip()[:12]
+
+            # Get the container's IP address on the sandbox network.
+            # This avoids DNS resolution issues in proxy environments.
+            container_ip = await self._get_container_ip(container_name)
+            internal_url = "http://%s:8000" % container_ip
+
             await self._wait_for_healthy(internal_url, timeout=60)
+
             logger.info(
-                "Created sandbox container user=%s name=%s url=%s",
-                user, container_name, internal_url,
+                "Created sandbox container user=%s name=%s ip=%s",
+                user, container_name, container_ip,
             )
             return SandboxContainer(
                 user=user,
@@ -256,11 +242,6 @@ class DockerSandboxManager:
     # ------------------------------------------------------------------
 
     async def _ensure_network(self) -> None:
-        """Create the sandbox Docker network and connect the orchestrator to it."""
-        if self._network_ready:
-            return
-
-        # Create network if it doesn't exist
         result = await _run_cmd(
             ["docker", "network", "ls", "--format", "{{.Name}}"], check=False
         )
@@ -270,20 +251,22 @@ class DockerSandboxManager:
             )
             logger.info("Created Docker network: %s", self.network)
 
-        # Connect the orchestrator container to the sandbox network
-        # so it can resolve sandbox container hostnames via Docker DNS.
-        # HOSTNAME is set to the container ID by Docker.
-        my_id = os.getenv("HOSTNAME", "")
-        if my_id:
-            await _run_cmd(
-                ["docker", "network", "connect", self.network, my_id],
-                check=False,  # may already be connected
+    async def _get_container_ip(self, container_name: str) -> str:
+        """Get a container's IP address on the sandbox network."""
+        # {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}} returns
+        # the IP from whichever network is first; for a single-network
+        # container this is always the sandbox network.
+        result = await _run_cmd([
+            "docker", "inspect", "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
+            container_name,
+        ])
+        ip = result.strip()
+        if not ip:
+            raise RuntimeError(
+                "Could not determine IP for container %s" % container_name
             )
-            logger.info(
-                "Connected orchestrator (%s) to network %s", my_id, self.network
-            )
-
-        self._network_ready = True
+        return ip
 
     async def _is_running(self, container_id: str) -> bool:
         try:
