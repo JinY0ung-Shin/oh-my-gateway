@@ -4,105 +4,67 @@ services:
     build: .
     ports:
       - "8000:8000"
-    # Grant access to the host Docker group so the orchestrator can
-    # communicate with the Docker daemon via the mounted socket.
-    # Find your GID: stat -c '%g' /var/run/docker.sock
     group_add:
       - "997"
     volumes:
       - ~/.claude:/root/.claude
-      # Shared image directory for VQA — must match the Open WebUI container mount
       - /home/webui_data/serving_images:/app/shared_images
-      # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
-      # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
-
-      # ── Docker Per-User Sandbox ──────────────────────────────────────
-      # Required when DOCKER_SANDBOX_ENABLED=true.
-      # The gateway needs Docker socket access to spawn per-user containers.
-      # WARNING: Docker socket access grants effective root on the host.
+      # Docker Per-User Sandbox: uncomment when DOCKER_SANDBOX_ENABLED=true
       # - /var/run/docker.sock:/var/run/docker.sock
-      # Host docker CLI binary (mount instead of installing in image)
       # - /usr/bin/docker:/usr/bin/docker:ro
-      # Persistent user workspace volumes (each user gets {base}/{user}/)
-      # - /data/sandboxes:/data/sandboxes
     networks:
       - claude-net
     environment:
-      # ── Server ───────────────────────────────────────────────────────
       - PORT=8000
-      # - CLAUDE_WRAPPER_HOST=0.0.0.0
-      # - MAX_REQUEST_SIZE=10485760
-
-      # ── Authentication ───────────────────────────────────────────────
       # - API_KEY=your-gateway-api-key
       # - ANTHROPIC_AUTH_TOKEN=your-auth-token
       # - ANTHROPIC_BASE_URL=https://api.anthropic.com
-
-      # ── Admin Panel (accessible at /admin) ───────────────────────────
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
       # - ADMIN_SESSION_TTL=3600
       # - ADMIN_COOKIE_SECURE=false
-
-      # ── Claude SDK ───────────────────────────────────────────────────
-      # - CLAUDE_CWD=/workspace
       - DEFAULT_MODEL=sonnet
+      # - CLAUDE_CWD=/workspace
       # - DEFAULT_MAX_TURNS=10
       # - MAX_TIMEOUT=600000
-
-      # ── System Prompt ────────────────────────────────────────────────
       # - SYSTEM_PROMPT_FILE=/app/docs/claude-code-system-prompt-reference.md
-
-      # ── Thinking ─────────────────────────────────────────────────────
       # - THINKING_MODE=adaptive
       # - THINKING_BUDGET_TOKENS=10000
-
-      # ── Streaming ────────────────────────────────────────────────────
       # - TOKEN_STREAMING=true
       # - TOOL_RESULT_MAX_LENGTH=2000
       # - SSE_KEEPALIVE_INTERVAL=15
-
-      # ── Session Management ───────────────────────────────────────────
       # - SESSION_CLEANUP_INTERVAL_MINUTES=5
       # - SESSION_MAX_AGE_MINUTES=60
-
-      # ── Rate Limiting ────────────────────────────────────────────────
       # - RATE_LIMIT_ENABLED=true
       # - RATE_LIMIT_PER_MINUTE=30
-      # - RATE_LIMIT_CHAT_PER_MINUTE=10
       # - RATE_LIMIT_RESPONSES_PER_MINUTE=10
-
-      # ── CORS ─────────────────────────────────────────────────────────
       # - CORS_ORIGINS=["*"]
-
-      # ── MCP Servers ──────────────────────────────────────────────────
       # - MCP_CONFIG={"mcpServers": {}}
-
-      # ── Sandbox ──────────────────────────────────────────────────────
       # - CLAUDE_SANDBOX_ENABLED=true
       # - CLAUDE_SANDBOX_AUTO_ALLOW_BASH=true
       # - CLAUDE_SANDBOX_WEAKER_NESTED=false
 
       # ── Docker Per-User Sandbox ──────────────────────────────────────
-      # Spawns a dedicated Docker container per user for complete
-      # filesystem/process/network isolation. Requires Docker socket mount.
+      # Spawns a dedicated Docker container per user.
+      # Requires: docker socket mount + docker CLI mount + external network
       # - DOCKER_SANDBOX_ENABLED=true
       # - DOCKER_SANDBOX_IMAGE=claude-code-gateway:latest
-      # - DOCKER_SANDBOX_NETWORK=claude-net
+      # - DOCKER_SANDBOX_NETWORK=claude-sandbox-net
       # - DOCKER_SANDBOX_CPU_LIMIT=1.0
       # - DOCKER_SANDBOX_MEMORY_LIMIT=2g
       # - DOCKER_SANDBOX_IDLE_TIMEOUT=3600
       # - DOCKER_SANDBOX_MAX_CONTAINERS=50
       # - DOCKER_SANDBOX_WORKSPACE_BASE=/app/data/sandboxes
 
-      # ── Subagent Control ─────────────────────────────────────────────
       # - DISALLOWED_SUBAGENT_TYPES=statusline-setup
-
-      # ── Debugging ────────────────────────────────────────────────────
       # - DEBUG_MODE=false
       # - VERBOSE=false
 
+# Use an external network so sandbox containers (created via docker run)
+# can join the same network as the orchestrator.
+# Create it first: docker network create claude-sandbox-net
 networks:
   claude-net:
-    driver: bridge
+    external: true
+    name: claude-sandbox-net
