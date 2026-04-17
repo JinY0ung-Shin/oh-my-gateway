@@ -6,7 +6,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, Optional
+from typing import AsyncIterator, Dict, List, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -39,7 +39,7 @@ class DockerSandboxManager:
         self,
         *,
         image: str = "claude-code-gateway:latest",
-        network: str = "claude-sandbox-net",
+        network: str = "",
         cpu_limit: str = "1.0",
         memory_limit: str = "2g",
         idle_timeout: int = 3600,
@@ -47,7 +47,8 @@ class DockerSandboxManager:
         workspace_base: str = "/data/sandboxes",
     ) -> None:
         self.image = image
-        self.network = network
+        self._configured_network = network
+        self._resolved_network: Optional[str] = None
         self.cpu_limit = cpu_limit
         self.memory_limit = memory_limit
         self.idle_timeout = idle_timeout
@@ -56,6 +57,10 @@ class DockerSandboxManager:
         self.containers: Dict[str, SandboxContainer] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
+
+    @property
+    def network(self) -> str:
+        return self._resolved_network or self._configured_network or "bridge"
 
     async def get_or_create(self, user: str) -> SandboxContainer:
         async with self._lock:
@@ -152,7 +157,9 @@ class DockerSandboxManager:
         workspace_dir = os.path.join(self.workspace_base, user)
         os.makedirs(workspace_dir, exist_ok=True)
 
-        await self._ensure_network()
+        # Auto-detect the orchestrator's Docker network on first call
+        await self._resolve_network()
+
         await _run_cmd(["docker", "rm", "-f", container_name], check=False)
 
         env_vars = self._build_env_vars()
@@ -161,15 +168,11 @@ class DockerSandboxManager:
             "docker", "run", "-d",
             "--name", container_name,
             "--network", self.network,
-            # Resource limits
             "--cpus", self.cpu_limit,
             "--memory", self.memory_limit,
             "--memory-swap", self.memory_limit,
             "--pids-limit", "512",
-            # Security: prevent privilege escalation but keep basic caps
-            # for Node.js (Claude SDK) subprocess execution.
             "--security-opt", "no-new-privileges",
-            # User workspace
             "-v", "%s:/workspace" % workspace_dir,
         ]
 
@@ -189,11 +192,11 @@ class DockerSandboxManager:
             container_ip = await self._get_container_ip(container_name)
             internal_url = "http://%s:8000" % container_ip
 
-            await self._wait_for_healthy(internal_url, timeout=60)
+            await self._wait_for_healthy(internal_url, timeout=120)
 
             logger.info(
-                "Created sandbox container user=%s name=%s ip=%s",
-                user, container_name, container_ip,
+                "Created sandbox container user=%s name=%s ip=%s network=%s",
+                user, container_name, container_ip, self.network,
             )
             return SandboxContainer(
                 user=user,
@@ -259,15 +262,51 @@ class DockerSandboxManager:
     # Internal helpers
     # ------------------------------------------------------------------
 
-    async def _ensure_network(self) -> None:
-        result = await _run_cmd(
-            ["docker", "network", "ls", "--format", "{{.Name}}"], check=False
-        )
-        if self.network not in result.split():
-            await _run_cmd(
-                ["docker", "network", "create", self.network], check=False
-            )
-            logger.info("Created Docker network: %s", self.network)
+    async def _resolve_network(self) -> None:
+        """Auto-detect the orchestrator's Docker network.
+
+        Uses the same network the orchestrator container is on so that
+        sandbox containers inherit the same DNS, proxy, and internet
+        access configuration.
+        """
+        if self._resolved_network:
+            return
+
+        # If user explicitly configured a network, use it
+        if self._configured_network:
+            self._resolved_network = self._configured_network
+            logger.info("Using configured sandbox network: %s", self._resolved_network)
+            return
+
+        # Auto-detect from orchestrator container
+        my_id = os.getenv("HOSTNAME", "")
+        if my_id:
+            try:
+                result = await _run_cmd([
+                    "docker", "inspect", "-f",
+                    "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}",
+                    my_id,
+                ])
+                networks = result.strip().split()
+                # Pick the first non-default network
+                for net in networks:
+                    if net not in ("bridge", "host", "none"):
+                        self._resolved_network = net
+                        logger.info(
+                            "Auto-detected orchestrator network: %s", net
+                        )
+                        return
+                if networks:
+                    self._resolved_network = networks[0]
+                    logger.info(
+                        "Using orchestrator network: %s", self._resolved_network
+                    )
+                    return
+            except Exception as e:
+                logger.warning("Could not auto-detect network: %s", e)
+
+        self._resolved_network = "bridge"
+        logger.info("Falling back to default bridge network")
 
     async def _get_container_ip(self, container_name: str) -> str:
         result = await _run_cmd([
@@ -292,7 +331,7 @@ class DockerSandboxManager:
         except Exception:
             return False
 
-    async def _wait_for_healthy(self, base_url: str, timeout: int = 60) -> None:
+    async def _wait_for_healthy(self, base_url: str, timeout: int = 120) -> None:
         deadline = time.time() + timeout
         url = "%s/health" % base_url
         async with httpx.AsyncClient(trust_env=False) as client:
@@ -303,7 +342,7 @@ class DockerSandboxManager:
                         return
                 except Exception:
                     pass
-                await asyncio.sleep(1)
+                await asyncio.sleep(2)
         raise TimeoutError(
             "Sandbox container at %s not healthy after %ds" % (base_url, timeout)
         )
@@ -432,9 +471,8 @@ def init_sandbox() -> None:
     )
     sandbox_proxy = SandboxProxy()
     logger.info(
-        "Docker sandbox initialised (image=%s, network=%s, max=%d)",
+        "Docker sandbox initialised (image=%s, max=%d)",
         DOCKER_SANDBOX_IMAGE,
-        DOCKER_SANDBOX_NETWORK,
         DOCKER_SANDBOX_MAX_CONTAINERS,
     )
 
