@@ -161,14 +161,15 @@ class DockerSandboxManager:
             "docker", "run", "-d",
             "--name", container_name,
             "--network", self.network,
+            # Resource limits
             "--cpus", self.cpu_limit,
             "--memory", self.memory_limit,
             "--memory-swap", self.memory_limit,
-            "--pids-limit", "256",
+            "--pids-limit", "512",
+            # Security: prevent privilege escalation but keep basic caps
+            # for Node.js (Claude SDK) subprocess execution.
             "--security-opt", "no-new-privileges",
-            "--cap-drop", "ALL",
-            "--tmpfs", "/tmp:rw,noexec,nosuid,size=512m",
-            "--tmpfs", "/run:rw,noexec,nosuid,size=64m",
+            # User workspace
             "-v", "%s:/workspace" % workspace_dir,
         ]
 
@@ -229,7 +230,7 @@ class DockerSandboxManager:
             # Bash sandbox
             "CLAUDE_SANDBOX_ENABLED",
             "CLAUDE_SANDBOX_AUTO_ALLOW_BASH",
-            # Proxy settings (required in corporate environments)
+            # Proxy settings
             "http_proxy",
             "https_proxy",
             "no_proxy",
