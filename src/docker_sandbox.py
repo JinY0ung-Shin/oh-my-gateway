@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 import re
-import shutil
 import time
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Dict, Optional
@@ -36,17 +35,9 @@ class SandboxContainer:
 
 class DockerSandboxManager:
 
-    def __init__(
-        self,
-        *,
-        image: str = "claude-code-gateway:latest",
-        network: str = "",
-        cpu_limit: str = "1.0",
-        memory_limit: str = "2g",
-        idle_timeout: int = 3600,
-        max_containers: int = 50,
-        workspace_base: str = "/data/sandboxes",
-    ) -> None:
+    def __init__(self, *, image="claude-code-gateway:latest", network="",
+                 cpu_limit="1.0", memory_limit="2g", idle_timeout=3600,
+                 max_containers=50, workspace_base="/data/sandboxes"):
         self.image = image
         self._configured_network = network
         self._resolved_network: Optional[str] = None
@@ -66,20 +57,15 @@ class DockerSandboxManager:
     async def get_or_create(self, user: str) -> SandboxContainer:
         async with self._lock:
             if user in self.containers:
-                container = self.containers[user]
-                if await self._is_running(container.container_id):
-                    container.touch()
-                    return container
+                c = self.containers[user]
+                if await self._is_running(c.container_id):
+                    c.touch()
+                    return c
                 del self.containers[user]
-                logger.warning("Container for user %s died, recreating", user)
-
             if len(self.containers) >= self.max_containers:
                 await self._evict_idle_unlocked()
                 if len(self.containers) >= self.max_containers:
-                    raise RuntimeError(
-                        "Maximum sandbox containers (%d) reached" % self.max_containers
-                    )
-
+                    raise RuntimeError("Max sandbox containers (%d) reached" % self.max_containers)
             container = await self._create_container(user)
             self.containers[user] = container
             return container
@@ -88,243 +74,129 @@ class DockerSandboxManager:
         async with self._lock:
             container = self.containers.pop(user, None)
         if container:
-            await _run_cmd(
-                ["docker", "rm", "-f", container.container_name], check=False
-            )
-            logger.info("Removed sandbox container for user=%s", user)
+            await _run_cmd(["docker", "rm", "-f", container.container_name], check=False)
+            logger.info("Removed sandbox for user=%s", user)
 
     async def cleanup_idle(self) -> int:
         now = time.time()
-        to_remove: list[str] = []
-        async with self._lock:
-            for user, container in self.containers.items():
-                if now - container.last_accessed > self.idle_timeout:
-                    to_remove.append(user)
+        to_remove = [u for u, c in self.containers.items() if now - c.last_accessed > self.idle_timeout]
         for user in to_remove:
             await self.remove_container(user)
-        if to_remove:
-            logger.info("Cleaned up %d idle sandbox containers", len(to_remove))
         return len(to_remove)
 
     async def shutdown(self) -> None:
         if self._cleanup_task:
             self._cleanup_task.cancel()
-        for user in list(self.containers.keys()):
+        for user in list(self.containers):
             await self.remove_container(user)
-        logger.info("Docker sandbox manager shutdown complete")
 
-    def start_cleanup_task(self, interval_minutes: int = 5) -> None:
-        async def _loop() -> None:
+    def start_cleanup_task(self, interval_minutes=5):
+        async def _loop():
             while True:
                 await asyncio.sleep(interval_minutes * 60)
-                try:
-                    await self.cleanup_idle()
-                except asyncio.CancelledError:
-                    raise
-                except Exception:
-                    logger.exception("Sandbox cleanup cycle failed")
+                try: await self.cleanup_idle()
+                except asyncio.CancelledError: raise
+                except Exception: logger.exception("Sandbox cleanup failed")
         try:
-            loop = asyncio.get_running_loop()
-            self._cleanup_task = loop.create_task(_loop())
-            logger.info("Started sandbox cleanup task (interval: %d min)", interval_minutes)
+            asyncio.get_running_loop().create_task(_loop())
         except RuntimeError:
-            logger.warning("No event loop, sandbox cleanup disabled")
+            pass
 
     def get_stats(self) -> dict:
         now = time.time()
-        return {
-            "active_containers": len(self.containers),
-            "max_containers": self.max_containers,
-            "image": self.image,
-            "network": self.network,
-            "containers": {
-                user: {
-                    "container_id": c.container_id,
-                    "container_name": c.container_name,
-                    "url": c.internal_url,
-                    "idle_seconds": int(now - c.last_accessed),
-                    "uptime_seconds": int(now - c.created_at),
-                }
-                for user, c in self.containers.items()
-            },
-        }
-
-    # ------------------------------------------------------------------
-    # Container lifecycle
-    # ------------------------------------------------------------------
+        return {"active": len(self.containers), "max": self.max_containers,
+                "containers": {u: {"id": c.container_id, "name": c.container_name,
+                    "url": c.internal_url, "idle": int(now - c.last_accessed)}
+                    for u, c in self.containers.items()}}
 
     async def _create_container(self, user: str) -> SandboxContainer:
-        container_name = _safe_container_name(user)
-        workspace_dir = os.path.join(self.workspace_base, user)
-        os.makedirs(workspace_dir, exist_ok=True)
-
-        # Copy .claude config into user workspace so each container
-        # has its own writable copy (CLI needs write access).
-        self._sync_claude_config(workspace_dir)
+        name = _safe_container_name(user)
+        wdir = os.path.join(self.workspace_base, user)
+        os.makedirs(wdir, exist_ok=True)
 
         await self._resolve_network()
-        await _run_cmd(["docker", "rm", "-f", container_name], check=False)
-
-        env_vars = self._build_env_vars()
+        await _run_cmd(["docker", "rm", "-f", name], check=False)
 
         cmd = [
             "docker", "run", "-d",
-            "--name", container_name,
-            "--network", self.network,
-            "--cpus", self.cpu_limit,
-            "--memory", self.memory_limit,
-            "--memory-swap", self.memory_limit,
-            "--pids-limit", "512",
+            "--name", name, "--network", self.network,
+            "--cpus", self.cpu_limit, "--memory", self.memory_limit,
+            "--memory-swap", self.memory_limit, "--pids-limit", "512",
             "--security-opt", "no-new-privileges",
-            # Mount user workspace (includes .claude copy)
-            "-v", "%s:/workspace" % workspace_dir,
-            # Mount the .claude copy as /root/.claude (writable)
-            "-v", "%s/.claude:/root/.claude" % workspace_dir,
+            "-v", "%s:/workspace" % wdir,
         ]
+        # Mount .claude read-write so CLI can update tokens/config
+        claude_home = os.path.expanduser("~/.claude")
+        if os.path.isdir(claude_home):
+            cmd.extend(["-v", "%s:/root/.claude" % claude_home])
 
-        for key, value in env_vars.items():
-            cmd.extend(["-e", "%s=%s" % (key, value)])
-
+        for k, v in self._build_env_vars().items():
+            cmd.extend(["-e", "%s=%s" % (k, v)])
         cmd.append(self.image)
 
         try:
             result = await _run_cmd(cmd)
-            container_id = result.strip()[:12]
-
-            container_ip = await self._get_container_ip(container_name)
-            internal_url = "http://%s:8000" % container_ip
-
-            await self._wait_for_healthy(internal_url, timeout=120)
-
-            logger.info(
-                "Created sandbox container user=%s name=%s ip=%s network=%s",
-                user, container_name, container_ip, self.network,
-            )
-            return SandboxContainer(
-                user=user,
-                container_name=container_name,
-                container_id=container_id,
-                internal_url=internal_url,
-            )
+            cid = result.strip()[:12]
+            ip = await self._get_container_ip(name)
+            url = "http://%s:8000" % ip
+            await self._wait_for_healthy(url, timeout=120)
+            logger.info("Created sandbox user=%s name=%s ip=%s net=%s", user, name, ip, self.network)
+            return SandboxContainer(user=user, container_name=name, container_id=cid, internal_url=url)
         except Exception as e:
-            await _run_cmd(["docker", "rm", "-f", container_name], check=False)
-            raise RuntimeError(
-                "Failed to create sandbox for user %r: %s" % (user, e)
-            ) from e
-
-    @staticmethod
-    def _sync_claude_config(workspace_dir: str) -> None:
-        """Copy ~/.claude into the user workspace for writable container access."""
-        claude_home = os.path.expanduser("~/.claude")
-        if not os.path.isdir(claude_home):
-            return
-        dst = os.path.join(workspace_dir, ".claude")
-        # Copy fresh each time to pick up token refreshes
-        shutil.copytree(claude_home, dst, dirs_exist_ok=True)
-        logger.debug("Synced .claude config to %s", dst)
+            await _run_cmd(["docker", "rm", "-f", name], check=False)
+            raise RuntimeError("Failed to create sandbox for %r: %s" % (user, e)) from e
 
     def _build_env_vars(self) -> Dict[str, str]:
-        env: Dict[str, str] = {
-            "DOCKER_SANDBOX_ROLE": "worker",
-            "CLAUDE_CWD": "/workspace",
-            "PORT": "8000",
-            "ADMIN_API_KEY": "sandbox-internal-key",
-            "RATE_LIMIT_ENABLED": "false",
-        }
-
-        _passthrough = [
-            # Authentication
-            "ANTHROPIC_AUTH_TOKEN",
-            "ANTHROPIC_BASE_URL",
-            # Model configuration
-            "DEFAULT_MODEL",
-            "THINKING_MODE",
-            "THINKING_BUDGET_TOKENS",
-            "TOKEN_STREAMING",
-            "DEFAULT_MAX_TURNS",
-            "MAX_TIMEOUT",
-            # Bash sandbox
-            "CLAUDE_SANDBOX_ENABLED",
-            "CLAUDE_SANDBOX_AUTO_ALLOW_BASH",
-            # Proxy settings
-            "http_proxy",
-            "https_proxy",
-            "no_proxy",
-            "HTTP_PROXY",
-            "HTTPS_PROXY",
-            "NO_PROXY",
-            "ALL_PROXY",
-            "all_proxy",
-            # SSL/TLS
-            "REQUESTS_CA_BUNDLE",
-            "SSL_CERT_FILE",
-            "CURL_CA_BUNDLE",
-            "NODE_EXTRA_CA_CERTS",
-        ]
-        for key in _passthrough:
+        env = {"DOCKER_SANDBOX_ROLE": "worker", "CLAUDE_CWD": "/workspace",
+               "PORT": "8000", "ADMIN_API_KEY": "sandbox-internal-key",
+               "RATE_LIMIT_ENABLED": "false"}
+        for key in ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
+                    "DEFAULT_MODEL", "THINKING_MODE", "THINKING_BUDGET_TOKENS",
+                    "TOKEN_STREAMING", "DEFAULT_MAX_TURNS", "MAX_TIMEOUT",
+                    "CLAUDE_SANDBOX_ENABLED", "CLAUDE_SANDBOX_AUTO_ALLOW_BASH",
+                    "http_proxy", "https_proxy", "no_proxy",
+                    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+                    "ALL_PROXY", "all_proxy",
+                    "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE",
+                    "CURL_CA_BUNDLE", "NODE_EXTRA_CA_CERTS"]:
             val = os.getenv(key, "")
             if val:
                 env[key] = val
-
-        env["CLAUDE_SANDBOX_WEAKER_NESTED"] = os.getenv(
-            "CLAUDE_SANDBOX_WEAKER_NESTED", "true"
-        )
+        env["CLAUDE_SANDBOX_WEAKER_NESTED"] = os.getenv("CLAUDE_SANDBOX_WEAKER_NESTED", "true")
         return env
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
 
     async def _resolve_network(self) -> None:
         if self._resolved_network:
             return
         if self._configured_network:
             self._resolved_network = self._configured_network
-            logger.info("Using configured sandbox network: %s", self._resolved_network)
             return
         my_id = os.getenv("HOSTNAME", "")
         if my_id:
             try:
-                result = await _run_cmd([
-                    "docker", "inspect", "-f",
-                    "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}",
-                    my_id,
-                ])
-                networks = result.strip().split()
-                for net in networks:
+                result = await _run_cmd(["docker", "inspect", "-f",
+                    "{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}", my_id])
+                for net in result.strip().split():
                     if net not in ("bridge", "host", "none"):
                         self._resolved_network = net
-                        logger.info("Auto-detected orchestrator network: %s", net)
+                        logger.info("Auto-detected network: %s", net)
                         return
-                if networks:
-                    self._resolved_network = networks[0]
-                    logger.info("Using orchestrator network: %s", self._resolved_network)
-                    return
             except Exception as e:
-                logger.warning("Could not auto-detect network: %s", e)
+                logger.warning("Network auto-detect failed: %s", e)
         self._resolved_network = "bridge"
-        logger.info("Falling back to default bridge network")
 
-    async def _get_container_ip(self, container_name: str) -> str:
-        result = await _run_cmd([
-            "docker", "inspect", "-f",
-            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
-            container_name,
-        ])
+    async def _get_container_ip(self, name: str) -> str:
+        result = await _run_cmd(["docker", "inspect", "-f",
+            "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name])
         ip = result.strip()
         if not ip:
-            raise RuntimeError(
-                "Could not determine IP for container %s" % container_name
-            )
+            raise RuntimeError("No IP for container %s" % name)
         return ip
 
-    async def _is_running(self, container_id: str) -> bool:
+    async def _is_running(self, cid: str) -> bool:
         try:
-            result = await _run_cmd(
-                ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
-                check=False,
-            )
-            return result.strip() == "true"
+            r = await _run_cmd(["docker", "inspect", "-f", "{{.State.Running}}", cid], check=False)
+            return r.strip() == "true"
         except Exception:
             return False
 
@@ -334,149 +206,90 @@ class DockerSandboxManager:
         async with httpx.AsyncClient(trust_env=False) as client:
             while time.time() < deadline:
                 try:
-                    resp = await client.get(url, timeout=3)
-                    if resp.status_code == 200:
+                    if (await client.get(url, timeout=3)).status_code == 200:
                         return
                 except Exception:
                     pass
                 await asyncio.sleep(2)
-        raise TimeoutError(
-            "Sandbox container at %s not healthy after %ds" % (base_url, timeout)
-        )
+        raise TimeoutError("Container at %s not healthy after %ds" % (base_url, timeout))
 
     async def _evict_idle_unlocked(self) -> None:
         if not self.containers:
             return
-        oldest_user = min(
-            self.containers, key=lambda u: self.containers[u].last_accessed
-        )
-        container = self.containers.pop(oldest_user)
-        await _run_cmd(
-            ["docker", "rm", "-f", container.container_name], check=False
-        )
-        logger.info("Evicted idle sandbox for user=%s", oldest_user)
+        u = min(self.containers, key=lambda u: self.containers[u].last_accessed)
+        c = self.containers.pop(u)
+        await _run_cmd(["docker", "rm", "-f", c.container_name], check=False)
 
 
 class SandboxProxy:
-    def __init__(self) -> None:
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(600.0, connect=10.0),
-            trust_env=False,
-        )
+    def __init__(self):
+        self._client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0), trust_env=False)
 
-    async def forward_json(
-        self, base_url: str, body: dict, api_key: Optional[str] = None
-    ) -> dict:
+    async def forward_json(self, base_url, body, api_key=None):
         url = "%s/v1/responses" % base_url
-        headers = self._headers(api_key)
         try:
-            resp = await self._client.post(url, json=body, headers=headers)
+            resp = await self._client.post(url, json=body, headers=self._headers(api_key))
             if resp.status_code != 200:
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail="Sandbox error: %s" % resp.text[:500],
-                )
+                raise HTTPException(status_code=resp.status_code, detail="Sandbox: %s" % resp.text[:500])
             return resp.json()
         except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Sandbox container timed out")
+            raise HTTPException(status_code=504, detail="Sandbox timed out")
         except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Sandbox container unavailable")
+            raise HTTPException(status_code=503, detail="Sandbox unavailable")
 
-    async def forward_stream(
-        self, base_url: str, body: dict, api_key: Optional[str] = None
-    ) -> StreamingResponse:
+    async def forward_stream(self, base_url, body, api_key=None):
         url = "%s/v1/responses" % base_url
         headers = self._headers(api_key)
-
-        async def _generate() -> AsyncIterator[bytes]:
+        async def _gen():
             try:
-                async with self._client.stream(
-                    "POST", url, json=body, headers=headers
-                ) as resp:
+                async with self._client.stream("POST", url, json=body, headers=headers) as resp:
                     if resp.status_code != 200:
-                        error_body = await resp.aread()
-                        logger.error(
-                            "Sandbox stream error %d: %s",
-                            resp.status_code,
-                            error_body.decode()[:500],
-                        )
-                        yield (
-                            b'data: {"error": "Sandbox error '
-                            + str(resp.status_code).encode()
-                            + b'"}\n\n'
-                        )
+                        err = await resp.aread()
+                        yield b'data: {"error": "Sandbox %d"}\n\n' % resp.status_code
                         return
                     async for chunk in resp.aiter_bytes():
                         yield chunk
             except httpx.TimeoutException:
-                yield b'data: {"error": "Sandbox container timed out"}\n\n'
+                yield b'data: {"error": "Sandbox timed out"}\n\n'
             except httpx.ConnectError:
-                yield b'data: {"error": "Sandbox container unavailable"}\n\n'
-
-        return StreamingResponse(_generate(), media_type="text/event-stream")
+                yield b'data: {"error": "Sandbox unavailable"}\n\n'
+        return StreamingResponse(_gen(), media_type="text/event-stream")
 
     @staticmethod
-    def _headers(api_key: Optional[str]) -> dict:
-        headers = {"Content-Type": "application/json"}
+    def _headers(api_key):
+        h = {"Content-Type": "application/json"}
         if api_key:
-            headers["Authorization"] = "Bearer %s" % api_key
-        return headers
+            h["Authorization"] = "Bearer %s" % api_key
+        return h
 
-    async def close(self) -> None:
+    async def close(self):
         await self._client.aclose()
 
 
-async def _run_cmd(cmd: list, *, check: bool = True) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+async def _run_cmd(cmd, *, check=True):
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     stdout, stderr = await proc.communicate()
     if check and proc.returncode != 0:
-        raise RuntimeError(
-            "Command %s failed (rc=%d): %s"
-            % (cmd[0], proc.returncode, stderr.decode().strip())
-        )
+        raise RuntimeError("%s failed (rc=%d): %s" % (cmd[0], proc.returncode, stderr.decode().strip()))
     return stdout.decode()
 
 
 sandbox_manager: Optional[DockerSandboxManager] = None
 sandbox_proxy: Optional[SandboxProxy] = None
 
-
-def init_sandbox() -> None:
-    from src.constants import (
-        DOCKER_SANDBOX_CPU_LIMIT,
-        DOCKER_SANDBOX_IDLE_TIMEOUT,
-        DOCKER_SANDBOX_IMAGE,
-        DOCKER_SANDBOX_MAX_CONTAINERS,
-        DOCKER_SANDBOX_MEMORY_LIMIT,
-        DOCKER_SANDBOX_NETWORK,
-        DOCKER_SANDBOX_WORKSPACE_BASE,
-    )
-
+def init_sandbox():
+    from src.constants import (DOCKER_SANDBOX_CPU_LIMIT, DOCKER_SANDBOX_IDLE_TIMEOUT,
+        DOCKER_SANDBOX_IMAGE, DOCKER_SANDBOX_MAX_CONTAINERS, DOCKER_SANDBOX_MEMORY_LIMIT,
+        DOCKER_SANDBOX_NETWORK, DOCKER_SANDBOX_WORKSPACE_BASE)
     global sandbox_manager, sandbox_proxy
-    sandbox_manager = DockerSandboxManager(
-        image=DOCKER_SANDBOX_IMAGE,
-        network=DOCKER_SANDBOX_NETWORK,
-        cpu_limit=DOCKER_SANDBOX_CPU_LIMIT,
-        memory_limit=DOCKER_SANDBOX_MEMORY_LIMIT,
-        idle_timeout=DOCKER_SANDBOX_IDLE_TIMEOUT,
-        max_containers=DOCKER_SANDBOX_MAX_CONTAINERS,
-        workspace_base=DOCKER_SANDBOX_WORKSPACE_BASE,
-    )
+    sandbox_manager = DockerSandboxManager(image=DOCKER_SANDBOX_IMAGE, network=DOCKER_SANDBOX_NETWORK,
+        cpu_limit=DOCKER_SANDBOX_CPU_LIMIT, memory_limit=DOCKER_SANDBOX_MEMORY_LIMIT,
+        idle_timeout=DOCKER_SANDBOX_IDLE_TIMEOUT, max_containers=DOCKER_SANDBOX_MAX_CONTAINERS,
+        workspace_base=DOCKER_SANDBOX_WORKSPACE_BASE)
     sandbox_proxy = SandboxProxy()
-    logger.info(
-        "Docker sandbox initialised (image=%s, max=%d)",
-        DOCKER_SANDBOX_IMAGE,
-        DOCKER_SANDBOX_MAX_CONTAINERS,
-    )
+    logger.info("Docker sandbox initialised (image=%s, max=%d)", DOCKER_SANDBOX_IMAGE, DOCKER_SANDBOX_MAX_CONTAINERS)
 
-
-async def shutdown_sandbox() -> None:
+async def shutdown_sandbox():
     global sandbox_manager, sandbox_proxy
-    if sandbox_manager:
-        await sandbox_manager.shutdown()
-    if sandbox_proxy:
-        await sandbox_proxy.close()
+    if sandbox_manager: await sandbox_manager.shutdown()
+    if sandbox_proxy: await sandbox_proxy.close()
