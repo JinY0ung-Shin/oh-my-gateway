@@ -2,6 +2,18 @@
 
 Spawns isolated Docker containers per user so each user's Claude SDK
 session runs in a separate filesystem, process, and network namespace.
+This prevents cross-user file access, process visibility, and resource
+interference.
+
+Architecture::
+
+    Gateway (orchestrator) ──► Per-user sandbox container ──► Claude SDK
+                           ──► Per-user sandbox container ──► Claude SDK
+                           ──► Per-user sandbox container ──► Claude SDK
+
+The gateway acts as a reverse proxy, routing requests to the appropriate
+user's container.  Each container runs the same gateway image in "worker"
+mode (single-user, no nested sandbox management).
 """
 
 import asyncio
@@ -19,19 +31,21 @@ from fastapi.responses import StreamingResponse
 logger = logging.getLogger(__name__)
 
 
-def _safe_name(user: str) -> str:
+def _safe_container_name(user: str) -> str:
     """Derive a Docker-safe container name from a user identifier.
 
-    Replaces dots, @, and other non-alphanumeric chars (except -_) with
-    hyphens so the name works as a DNS hostname on the Docker network
-    and does not get routed through HTTP proxies.
+    Replaces characters that cause DNS/proxy issues (dots, @) with
+    hyphens so the container hostname resolves correctly on Docker's
+    internal network without being intercepted by HTTP proxies.
     """
-    safe = re.sub(r"[^a-zA-Z0-9_-]", "-", user)
-    return f"claude-sandbox-{safe}"
+    safe = re.sub(r"[.@]+", "-", user)
+    return "claude-sandbox-" + safe
 
 
 @dataclass
 class SandboxContainer:
+    """Tracks a running sandbox container for a user."""
+
     user: str
     container_name: str
     container_id: str
@@ -44,6 +58,16 @@ class SandboxContainer:
 
 
 class DockerSandboxManager:
+    """Manages per-user Docker sandbox containers.
+
+    Each user gets a dedicated container with:
+
+    * Isolated filesystem (only their workspace volume mounted)
+    * Process namespace isolation
+    * Resource limits (CPU, memory, PIDs)
+    * Read-only root filesystem with tmpfs for /tmp and /run
+    * Dropped capabilities and no-new-privileges
+    """
 
     def __init__(
         self,
@@ -54,7 +78,7 @@ class DockerSandboxManager:
         memory_limit: str = "2g",
         idle_timeout: int = 3600,
         max_containers: int = 50,
-        workspace_base: str = "/app/data/sandboxes",
+        workspace_base: str = "/data/sandboxes",
     ) -> None:
         self.image = image
         self.network = network
@@ -67,7 +91,12 @@ class DockerSandboxManager:
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
 
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
     async def get_or_create(self, user: str) -> SandboxContainer:
+        """Get an existing container or create a new one for *user*."""
         async with self._lock:
             if user in self.containers:
                 container = self.containers[user]
@@ -89,6 +118,7 @@ class DockerSandboxManager:
             return container
 
     async def remove_container(self, user: str) -> None:
+        """Stop and remove a user's sandbox container."""
         async with self._lock:
             container = self.containers.pop(user, None)
         if container:
@@ -98,19 +128,23 @@ class DockerSandboxManager:
             logger.info("Removed sandbox container for user=%s", user)
 
     async def cleanup_idle(self) -> int:
+        """Remove containers that have been idle beyond *idle_timeout*."""
         now = time.time()
         to_remove: list[str] = []
         async with self._lock:
             for user, container in self.containers.items():
                 if now - container.last_accessed > self.idle_timeout:
                     to_remove.append(user)
+
         for user in to_remove:
             await self.remove_container(user)
+
         if to_remove:
             logger.info("Cleaned up %d idle sandbox containers", len(to_remove))
         return len(to_remove)
 
     async def shutdown(self) -> None:
+        """Stop and remove **all** sandbox containers."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
         for user in list(self.containers.keys()):
@@ -118,6 +152,8 @@ class DockerSandboxManager:
         logger.info("Docker sandbox manager shutdown complete")
 
     def start_cleanup_task(self, interval_minutes: int = 5) -> None:
+        """Start a periodic background task that cleans up idle containers."""
+
         async def _loop() -> None:
             while True:
                 await asyncio.sleep(interval_minutes * 60)
@@ -131,11 +167,14 @@ class DockerSandboxManager:
         try:
             loop = asyncio.get_running_loop()
             self._cleanup_task = loop.create_task(_loop())
-            logger.info("Started sandbox cleanup task (interval: %d min)", interval_minutes)
+            logger.info(
+                "Started sandbox cleanup task (interval: %d min)", interval_minutes
+            )
         except RuntimeError:
             logger.warning("No event loop, sandbox cleanup disabled")
 
     def get_stats(self) -> dict:
+        """Return sandbox manager statistics for admin endpoints."""
         now = time.time()
         return {
             "active_containers": len(self.containers),
@@ -155,17 +194,20 @@ class DockerSandboxManager:
         }
 
     # ------------------------------------------------------------------
-    # Container lifecycle
+    # Container lifecycle (private)
     # ------------------------------------------------------------------
 
     async def _create_container(self, user: str) -> SandboxContainer:
-        container_name = _safe_name(user)
+        """Create a new Docker container for *user*."""
+        container_name = _safe_container_name(user)
         workspace_dir = os.path.join(self.workspace_base, user)
         os.makedirs(workspace_dir, exist_ok=True)
 
         internal_url = "http://%s:8000" % container_name
 
         await self._ensure_network()
+
+        # Remove stale container with the same name
         await _run_cmd(["docker", "rm", "-f", container_name], check=False)
 
         env_vars = self._build_env_vars()
@@ -197,7 +239,9 @@ class DockerSandboxManager:
         try:
             result = await _run_cmd(cmd)
             container_id = result.strip()[:12]
+
             await self._wait_for_healthy(internal_url, timeout=60)
+
             logger.info(
                 "Created sandbox container user=%s name=%s url=%s",
                 user, container_name, internal_url,
@@ -215,6 +259,7 @@ class DockerSandboxManager:
             ) from e
 
     def _build_env_vars(self) -> Dict[str, str]:
+        """Build environment variables to pass to the sandbox container."""
         env: Dict[str, str] = {
             "DOCKER_SANDBOX_ROLE": "worker",
             "CLAUDE_CWD": "/workspace",
@@ -222,6 +267,7 @@ class DockerSandboxManager:
             "ADMIN_API_KEY": "sandbox-internal-key",
             "RATE_LIMIT_ENABLED": "false",
         }
+
         _passthrough = [
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
@@ -238,9 +284,11 @@ class DockerSandboxManager:
             val = os.getenv(key, "")
             if val:
                 env[key] = val
+
         env["CLAUDE_SANDBOX_WEAKER_NESTED"] = os.getenv(
             "CLAUDE_SANDBOX_WEAKER_NESTED", "true"
         )
+
         return env
 
     # ------------------------------------------------------------------
@@ -248,6 +296,7 @@ class DockerSandboxManager:
     # ------------------------------------------------------------------
 
     async def _ensure_network(self) -> None:
+        """Create the Docker network if it does not exist."""
         result = await _run_cmd(
             ["docker", "network", "ls", "--format", "{{.Name}}"], check=False
         )
@@ -258,6 +307,7 @@ class DockerSandboxManager:
             logger.info("Created Docker network: %s", self.network)
 
     async def _is_running(self, container_id: str) -> bool:
+        """Check if a container is still running."""
         try:
             result = await _run_cmd(
                 ["docker", "inspect", "-f", "{{.State.Running}}", container_id],
@@ -268,6 +318,7 @@ class DockerSandboxManager:
             return False
 
     async def _wait_for_healthy(self, base_url: str, timeout: int = 60) -> None:
+        """Wait until the container's ``/health`` endpoint responds 200."""
         deadline = time.time() + timeout
         url = "%s/health" % base_url
         # trust_env=False: bypass http_proxy/https_proxy so requests
@@ -286,6 +337,7 @@ class DockerSandboxManager:
         )
 
     async def _evict_idle_unlocked(self) -> None:
+        """Evict the most idle container.  Caller must hold ``self._lock``."""
         if not self.containers:
             return
         oldest_user = min(
@@ -298,10 +350,23 @@ class DockerSandboxManager:
         logger.info("Evicted idle sandbox for user=%s", oldest_user)
 
 
+# ======================================================================
+# Sandbox Proxy
+# ======================================================================
+
+
 class SandboxProxy:
+    """HTTP proxy for forwarding requests to sandbox containers.
+
+    Uses ``httpx.AsyncClient`` with a long timeout (10 min) to support
+    long-running Claude SDK operations.  SSE streams are proxied
+    chunk-by-chunk.
+
+    ``trust_env=False`` ensures requests go directly over the Docker
+    network and are not routed through corporate HTTP proxies.
+    """
+
     def __init__(self) -> None:
-        # trust_env=False: bypass http_proxy/https_proxy so requests
-        # go directly over the Docker network.
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(600.0, connect=10.0),
             trust_env=False,
@@ -310,6 +375,7 @@ class SandboxProxy:
     async def forward_json(
         self, base_url: str, body: dict, api_key: Optional[str] = None
     ) -> dict:
+        """Forward a non-streaming request and return the JSON response."""
         url = "%s/v1/responses" % base_url
         headers = self._headers(api_key)
         try:
@@ -321,13 +387,18 @@ class SandboxProxy:
                 )
             return resp.json()
         except httpx.TimeoutException:
-            raise HTTPException(status_code=504, detail="Sandbox container timed out")
+            raise HTTPException(
+                status_code=504, detail="Sandbox container timed out"
+            )
         except httpx.ConnectError:
-            raise HTTPException(status_code=503, detail="Sandbox container unavailable")
+            raise HTTPException(
+                status_code=503, detail="Sandbox container unavailable"
+            )
 
     async def forward_stream(
         self, base_url: str, body: dict, api_key: Optional[str] = None
     ) -> StreamingResponse:
+        """Forward a streaming request, proxying SSE events."""
         url = "%s/v1/responses" % base_url
         headers = self._headers(api_key)
 
@@ -366,10 +437,17 @@ class SandboxProxy:
         return headers
 
     async def close(self) -> None:
+        """Close the underlying HTTP client."""
         await self._client.aclose()
 
 
+# ======================================================================
+# Subprocess helper
+# ======================================================================
+
+
 async def _run_cmd(cmd: list, *, check: bool = True) -> str:
+    """Run a shell command asynchronously and return stdout."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -378,16 +456,22 @@ async def _run_cmd(cmd: list, *, check: bool = True) -> str:
     stdout, stderr = await proc.communicate()
     if check and proc.returncode != 0:
         raise RuntimeError(
-            "Command %s failed (rc=%d): %s" % (cmd[0], proc.returncode, stderr.decode().strip())
+            "Command %s failed (rc=%d): %s"
+            % (cmd[0], proc.returncode, stderr.decode().strip())
         )
     return stdout.decode()
 
+
+# ======================================================================
+# Module-level singletons
+# ======================================================================
 
 sandbox_manager: Optional[DockerSandboxManager] = None
 sandbox_proxy: Optional[SandboxProxy] = None
 
 
 def init_sandbox() -> None:
+    """Initialise the sandbox manager and proxy singletons."""
     from src.constants import (
         DOCKER_SANDBOX_CPU_LIMIT,
         DOCKER_SANDBOX_IDLE_TIMEOUT,
@@ -418,6 +502,7 @@ def init_sandbox() -> None:
 
 
 async def shutdown_sandbox() -> None:
+    """Shut down sandbox manager and proxy.  Called during app shutdown."""
     global sandbox_manager, sandbox_proxy
     if sandbox_manager:
         await sandbox_manager.shutdown()
