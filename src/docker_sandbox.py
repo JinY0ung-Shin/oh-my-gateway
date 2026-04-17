@@ -185,8 +185,6 @@ class DockerSandboxManager:
             result = await _run_cmd(cmd)
             container_id = result.strip()[:12]
 
-            # Get the container's IP address on the sandbox network.
-            # This avoids DNS resolution issues in proxy environments.
             container_ip = await self._get_container_ip(container_name)
             internal_url = "http://%s:8000" % container_ip
 
@@ -216,22 +214,41 @@ class DockerSandboxManager:
             "ADMIN_API_KEY": "sandbox-internal-key",
             "RATE_LIMIT_ENABLED": "false",
         }
+
         _passthrough = [
+            # Authentication
             "ANTHROPIC_AUTH_TOKEN",
             "ANTHROPIC_BASE_URL",
+            # Model configuration
             "DEFAULT_MODEL",
             "THINKING_MODE",
             "THINKING_BUDGET_TOKENS",
             "TOKEN_STREAMING",
             "DEFAULT_MAX_TURNS",
             "MAX_TIMEOUT",
+            # Bash sandbox
             "CLAUDE_SANDBOX_ENABLED",
             "CLAUDE_SANDBOX_AUTO_ALLOW_BASH",
+            # Proxy settings (required in corporate environments)
+            "http_proxy",
+            "https_proxy",
+            "no_proxy",
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "NO_PROXY",
+            "ALL_PROXY",
+            "all_proxy",
+            # SSL/TLS
+            "REQUESTS_CA_BUNDLE",
+            "SSL_CERT_FILE",
+            "CURL_CA_BUNDLE",
+            "NODE_EXTRA_CA_CERTS",
         ]
         for key in _passthrough:
             val = os.getenv(key, "")
             if val:
                 env[key] = val
+
         env["CLAUDE_SANDBOX_WEAKER_NESTED"] = os.getenv(
             "CLAUDE_SANDBOX_WEAKER_NESTED", "true"
         )
@@ -252,10 +269,6 @@ class DockerSandboxManager:
             logger.info("Created Docker network: %s", self.network)
 
     async def _get_container_ip(self, container_name: str) -> str:
-        """Get a container's IP address on the sandbox network."""
-        # {{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}} returns
-        # the IP from whichever network is first; for a single-network
-        # container this is always the sandbox network.
         result = await _run_cmd([
             "docker", "inspect", "-f",
             "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}",
