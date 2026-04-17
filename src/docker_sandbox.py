@@ -4,9 +4,10 @@ import asyncio
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Dict, List, Optional
+from typing import AsyncIterator, Dict, Optional
 
 import httpx
 from fastapi import HTTPException
@@ -157,9 +158,11 @@ class DockerSandboxManager:
         workspace_dir = os.path.join(self.workspace_base, user)
         os.makedirs(workspace_dir, exist_ok=True)
 
-        # Auto-detect the orchestrator's Docker network on first call
-        await self._resolve_network()
+        # Copy .claude config into user workspace so each container
+        # has its own writable copy (CLI needs write access).
+        self._sync_claude_config(workspace_dir)
 
+        await self._resolve_network()
         await _run_cmd(["docker", "rm", "-f", container_name], check=False)
 
         env_vars = self._build_env_vars()
@@ -173,12 +176,11 @@ class DockerSandboxManager:
             "--memory-swap", self.memory_limit,
             "--pids-limit", "512",
             "--security-opt", "no-new-privileges",
+            # Mount user workspace (includes .claude copy)
             "-v", "%s:/workspace" % workspace_dir,
+            # Mount the .claude copy as /root/.claude (writable)
+            "-v", "%s/.claude:/root/.claude" % workspace_dir,
         ]
-
-        claude_home = os.path.expanduser("~/.claude")
-        if os.path.isdir(claude_home):
-            cmd.extend(["-v", "%s:/root/.claude:ro" % claude_home])
 
         for key, value in env_vars.items():
             cmd.extend(["-e", "%s=%s" % (key, value)])
@@ -209,6 +211,17 @@ class DockerSandboxManager:
             raise RuntimeError(
                 "Failed to create sandbox for user %r: %s" % (user, e)
             ) from e
+
+    @staticmethod
+    def _sync_claude_config(workspace_dir: str) -> None:
+        """Copy ~/.claude into the user workspace for writable container access."""
+        claude_home = os.path.expanduser("~/.claude")
+        if not os.path.isdir(claude_home):
+            return
+        dst = os.path.join(workspace_dir, ".claude")
+        # Copy fresh each time to pick up token refreshes
+        shutil.copytree(claude_home, dst, dirs_exist_ok=True)
+        logger.debug("Synced .claude config to %s", dst)
 
     def _build_env_vars(self) -> Dict[str, str]:
         env: Dict[str, str] = {
@@ -263,22 +276,12 @@ class DockerSandboxManager:
     # ------------------------------------------------------------------
 
     async def _resolve_network(self) -> None:
-        """Auto-detect the orchestrator's Docker network.
-
-        Uses the same network the orchestrator container is on so that
-        sandbox containers inherit the same DNS, proxy, and internet
-        access configuration.
-        """
         if self._resolved_network:
             return
-
-        # If user explicitly configured a network, use it
         if self._configured_network:
             self._resolved_network = self._configured_network
             logger.info("Using configured sandbox network: %s", self._resolved_network)
             return
-
-        # Auto-detect from orchestrator container
         my_id = os.getenv("HOSTNAME", "")
         if my_id:
             try:
@@ -288,23 +291,17 @@ class DockerSandboxManager:
                     my_id,
                 ])
                 networks = result.strip().split()
-                # Pick the first non-default network
                 for net in networks:
                     if net not in ("bridge", "host", "none"):
                         self._resolved_network = net
-                        logger.info(
-                            "Auto-detected orchestrator network: %s", net
-                        )
+                        logger.info("Auto-detected orchestrator network: %s", net)
                         return
                 if networks:
                     self._resolved_network = networks[0]
-                    logger.info(
-                        "Using orchestrator network: %s", self._resolved_network
-                    )
+                    logger.info("Using orchestrator network: %s", self._resolved_network)
                     return
             except Exception as e:
                 logger.warning("Could not auto-detect network: %s", e)
-
         self._resolved_network = "bridge"
         logger.info("Falling back to default bridge network")
 
