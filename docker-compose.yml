@@ -6,8 +6,6 @@ services:
       - "8000:8000"
     volumes:
       - ~/.claude:/root/.claude
-      # Shared image directory for VQA — must match the Open WebUI container mount
-      - /home/webui_data/serving_images:/app/shared_images
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
       # Optional: Mount a specific workspace directory
