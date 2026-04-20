@@ -1,6 +1,10 @@
 services:
   claude-wrapper:
     build: .
+    # ${PORT} is interpolated by Compose at parse-time from the shell env and
+    # the ./.env file next to this compose file. It is NOT read from the service's
+    # env_file. If you move PORT into a non-default env file, pin the host side
+    # explicitly (e.g. "8000:${PORT}") instead of relying on auto-interpolation.
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     volumes:

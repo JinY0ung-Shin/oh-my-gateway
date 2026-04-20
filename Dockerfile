@@ -21,5 +21,6 @@ RUN uv sync
 # Expose the port (default 8000; overridable via PORT env var at runtime)
 EXPOSE 8000
 
-# Run the app with Uvicorn — honor PORT env var if set
-CMD ["sh", "-c", "uv run uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+# Run the app with Uvicorn — honor PORT env var if set.
+# `exec` ensures SIGTERM from `docker stop` reaches uvicorn (dash as PID 1 does not forward signals otherwise).
+CMD ["sh", "-c", "exec uv run uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
