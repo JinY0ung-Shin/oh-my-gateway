@@ -1,4 +1,3 @@
-version: '3'
 services:
   claude-wrapper:
     build: .
@@ -10,72 +9,9 @@ services:
       - ./data:/app/data
       # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
+    # All runtime configuration comes from .env (see .env.example for the full list).
+    env_file:
+      - .env
     environment:
-      # ── Server ───────────────────────────────────────────────────────
-      - PORT=8000
-      # - CLAUDE_WRAPPER_HOST=0.0.0.0
-      # - MAX_REQUEST_SIZE=10485760
-
-      # ── Authentication ───────────────────────────────────────────────
-      # Gateway API key — if unset, server prompts interactively (won't work in Docker)
-      # - API_KEY=your-gateway-api-key
-      # Claude auth — only needed if NOT mounting ~/.claude above
-      # - ANTHROPIC_AUTH_TOKEN=your-auth-token
-      # - ANTHROPIC_BASE_URL=https://api.anthropic.com
-
-      # ── Admin Panel (accessible at /admin) ───────────────────────────
-      # REQUIRED — server will not start without this
+      # Fail fast if ADMIN_API_KEY is missing — the server refuses to start without it.
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
-      # - ADMIN_SESSION_TTL=3600
-      # - ADMIN_COOKIE_SECURE=false
-
-      # ── Claude SDK ───────────────────────────────────────────────────
-      # Working directory (defaults to isolated temp dir)
-      # - CLAUDE_CWD=/workspace
-      - DEFAULT_MODEL=sonnet
-      # - DEFAULT_MAX_TURNS=10
-      # - MAX_TIMEOUT=600000
-
-      # ── System Prompt ────────────────────────────────────────────────
-      # Path to a custom system prompt file; leave unset to use preset.
-      # Can also be changed at runtime via the Admin UI Config tab.
-      # - SYSTEM_PROMPT_FILE=/app/docs/claude-code-system-prompt-reference.md
-
-      # ── Thinking ─────────────────────────────────────────────────────
-      # adaptive (default), enabled (fixed budget), disabled
-      # - THINKING_MODE=adaptive
-      # - THINKING_BUDGET_TOKENS=10000
-
-      # ── Streaming ────────────────────────────────────────────────────
-      # - TOKEN_STREAMING=true
-      # - TOOL_RESULT_MAX_LENGTH=2000
-      # - SSE_KEEPALIVE_INTERVAL=15
-
-      # ── Session Management ───────────────────────────────────────────
-      # - SESSION_CLEANUP_INTERVAL_MINUTES=5
-      # - SESSION_MAX_AGE_MINUTES=60
-
-      # ── Rate Limiting ────────────────────────────────────────────────
-      # - RATE_LIMIT_ENABLED=true
-      # - RATE_LIMIT_PER_MINUTE=30
-      # - RATE_LIMIT_CHAT_PER_MINUTE=10
-      # - RATE_LIMIT_RESPONSES_PER_MINUTE=10
-
-      # ── CORS ─────────────────────────────────────────────────────────
-      # - CORS_ORIGINS=["*"]
-
-      # ── MCP Servers ──────────────────────────────────────────────────
-      # Inline JSON or path to a JSON file
-      # - MCP_CONFIG={"mcpServers": {}}
-
-      # ── Sandbox ──────────────────────────────────────────────────────
-      # - CLAUDE_SANDBOX_ENABLED=true
-      # - CLAUDE_SANDBOX_AUTO_ALLOW_BASH=true
-      # - CLAUDE_SANDBOX_WEAKER_NESTED=false
-
-      # ── Subagent Control ─────────────────────────────────────────────
-      # - DISALLOWED_SUBAGENT_TYPES=statusline-setup
-
-      # ── Debugging ────────────────────────────────────────────────────
-      # - DEBUG_MODE=false
-      # - VERBOSE=false
