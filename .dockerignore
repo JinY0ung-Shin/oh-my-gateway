@@ -1,0 +1,39 @@
+# Secrets — never bake into image
+.env
+.env.*
+!.env.example
+
+# VCS
+.git
+.gitignore
+
+# Host-side Claude config (mounted at runtime)
+.claude
+
+# Runtime state & working dirs (mounted at runtime)
+working_dir
+data
+
+# Python build / cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+dist
+build
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.hypothesis
+.coverage
+htmlcov
+
+# Editor / OS
+.vscode
+.idea
+.DS_Store
+
+# Project-local tooling
+.omc
+.ccb

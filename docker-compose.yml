@@ -2,11 +2,13 @@ services:
   claude-wrapper:
     build: .
     ports:
-      - "8000:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     volumes:
       - ~/.claude:/root/.claude
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
+      # Claude working directory (shared with host for inspection/editing)
+      - ./working_dir:/app/working_dir
       # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
     # All runtime configuration comes from .env (see .env.example for the full list).
@@ -15,3 +17,5 @@ services:
     environment:
       # Fail fast if ADMIN_API_KEY is missing — the server refuses to start without it.
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
+      # Override .env CLAUDE_CWD (host path) with the in-container mount target.
+      - CLAUDE_CWD=/app/working_dir
