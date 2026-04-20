@@ -1,6 +1,19 @@
 services:
   claude-wrapper:
-    build: .
+    build:
+      context: .
+      # Inherit proxy settings from the host shell at build time.
+      # Listed without values so Compose reads them from the host environment;
+      # unset ones are simply not forwarded. HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+      # (and lowercase) are predefined build ARGs in Docker — no Dockerfile ARG
+      # declaration needed, and they are not persisted in image history.
+      args:
+        - HTTP_PROXY
+        - HTTPS_PROXY
+        - NO_PROXY
+        - http_proxy
+        - https_proxy
+        - no_proxy
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
