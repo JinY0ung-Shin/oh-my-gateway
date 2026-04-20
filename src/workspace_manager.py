@@ -147,8 +147,17 @@ def _resolve_template_source() -> Optional[Path]:
     return None
 
 
-def _find_project_root(base: Path) -> Optional[Path]:
-    """Walk up from *base* to find the nearest ``pyproject.toml``."""
+def _resolve_project_root(base: Path) -> Optional[Path]:
+    """Return the project root used to source ``pyproject.toml``/``uv.lock``.
+
+    Prefers ``CLAUDE_CWD`` so isolated workspaces (e.g. ``/tmp/$USER``) still
+    pick up project files. Falls back to walking up from *base*.
+    """
+    claude_cwd = os.getenv("CLAUDE_CWD", "")
+    if claude_cwd:
+        p = Path(claude_cwd)
+        if (p / "pyproject.toml").is_file():
+            return p
     start = base.resolve()
     for parent in (start, *start.parents):
         if (parent / "pyproject.toml").is_file():
@@ -161,5 +170,5 @@ _base_path = _resolve_base_path()
 workspace_manager = WorkspaceManager(
     base_path=_base_path,
     template_source=_resolve_template_source(),
-    project_root=_find_project_root(_base_path),
+    project_root=_resolve_project_root(_base_path),
 )

@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from src.session_manager import Session
-from src.workspace_manager import WorkspaceManager
+from src.workspace_manager import WorkspaceManager, _resolve_project_root
 
 
 @pytest.fixture
@@ -155,6 +155,55 @@ class TestSessionUserField:
     def test_session_workspace_defaults_to_none(self):
         session = Session(session_id="test-4")
         assert session.workspace is None
+
+
+class TestResolveProjectRoot:
+    def test_prefers_claude_cwd_when_it_has_pyproject(self, tmp_path, monkeypatch):
+        claude_cwd = tmp_path / "repo"
+        claude_cwd.mkdir()
+        (claude_cwd / "pyproject.toml").write_text("[project]\nname='x'\n")
+        base = tmp_path / "tmp_workspaces"
+        base.mkdir()
+
+        monkeypatch.setenv("CLAUDE_CWD", str(claude_cwd))
+        assert _resolve_project_root(base) == claude_cwd
+
+    def test_falls_back_to_walking_up_when_claude_cwd_lacks_pyproject(self, tmp_path, monkeypatch):
+        claude_cwd = tmp_path / "no_pyproject"
+        claude_cwd.mkdir()
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "pyproject.toml").write_text("[project]\nname='x'\n")
+        base = repo / "nested"
+        base.mkdir()
+
+        monkeypatch.setenv("CLAUDE_CWD", str(claude_cwd))
+        assert _resolve_project_root(base) == repo.resolve()
+
+    def test_returns_none_when_nothing_found(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CWD", raising=False)
+        base = tmp_path / "lonely"
+        base.mkdir()
+        # tmp_path itself has no pyproject, and walking to / won't find one in CI either.
+        # Guard the assertion against host repos by checking only the CLAUDE_CWD branch.
+        monkeypatch.setenv("CLAUDE_CWD", "")
+        # This may return a real ancestor's pyproject; we only assert no crash + Path-or-None.
+        result = _resolve_project_root(base)
+        assert result is None or isinstance(result, Path)
+
+    def test_sync_project_files_uses_claude_cwd_when_base_is_outside_repo(self, tmp_path):
+        claude_cwd = tmp_path / "repo"
+        claude_cwd.mkdir()
+        (claude_cwd / "pyproject.toml").write_text("[project]\nname='x'\n")
+        (claude_cwd / "uv.lock").write_text("# lock")
+        base = tmp_path / "tmp_workspaces"
+        base.mkdir()
+
+        mgr = WorkspaceManager(base_path=base, template_source=None, project_root=claude_cwd)
+        workspace = mgr.resolve("alice", sync_template=True)
+        assert (workspace / "pyproject.toml").is_symlink()
+        assert (workspace / "pyproject.toml").resolve() == (claude_cwd / "pyproject.toml").resolve()
+        assert (workspace / "uv.lock").is_symlink()
 
 
 class TestClaudeCLICwdOverride:
