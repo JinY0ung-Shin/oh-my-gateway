@@ -406,6 +406,16 @@ async def create_response(
                     prompt_text=prompt,
                     metadata=body.metadata or {},
                     stream_result=stream_result,
+                    request_context={
+                        "session_id": session_id,
+                        "user": body.user,
+                        "workdir": workspace_str,
+                        "backend": resolved.backend,
+                        "provider_model": resolved.provider_model,
+                        "previous_response_id": body.previous_response_id,
+                        "turn": next_turn,
+                        "use_sdk_client": use_sdk_client,
+                    },
                 )
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
                     yield line
@@ -662,6 +672,16 @@ async def _handle_function_call_output(
                     prompt_text="",
                     metadata=body.metadata or {},
                     stream_result=stream_result,
+                    request_context={
+                        "session_id": session_id,
+                        "user": body.user,
+                        "workdir": workspace_str,
+                        "backend": resolved.backend,
+                        "provider_model": resolved.provider_model,
+                        "previous_response_id": body.previous_response_id,
+                        "turn": next_turn,
+                        "continuation": True,
+                    },
                 )
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
                     yield line

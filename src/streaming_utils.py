@@ -272,6 +272,7 @@ async def stream_response_chunks(
     prompt_text: str = "",
     metadata: Optional[Dict[str, str]] = None,
     stream_result: Optional[Dict[str, Any]] = None,
+    request_context: Optional[Dict[str, Any]] = None,
 ) -> AsyncGenerator[str, None]:
     """SSE streaming logic for /v1/responses (OpenAI Responses API).
 
@@ -300,6 +301,12 @@ async def stream_response_chunks(
         current = seq
         seq += 1
         return current
+
+    def _error_context() -> str:
+        ctx = dict(request_context or {})
+        ctx.setdefault("response_id", response_id)
+        ctx["prompt_preview"] = (prompt_text or "")[:200]
+        return " ".join(f"{k}={v!r}" for k, v in ctx.items() if v is not None)
 
     def _make_failed_event(error_code: str, error_msg: str) -> str:
         failed_resp = ResponseObject(
@@ -371,7 +378,9 @@ async def stream_response_chunks(
             # Detect SDK in-band error chunks
             if isinstance(chunk, dict) and chunk.get("is_error"):
                 error_msg = chunk.get("error_message", "Unknown SDK error")
-                logger.error("Responses stream: SDK error chunk: %s", error_msg)
+                logger.error(
+                    "Responses stream: SDK error chunk: %s | %s", error_msg, _error_context()
+                )
                 stream_result["success"] = False
                 yield _make_failed_event("sdk_error", error_msg)
                 return
@@ -380,7 +389,9 @@ async def stream_response_chunks(
             if chunk.get("type") == "assistant" and chunk.get("error"):
                 chunks_buffer.append(chunk)
                 error_type = chunk["error"]
-                logger.error("Responses stream: assistant error: %s", error_type)
+                logger.error(
+                    "Responses stream: assistant error: %s | %s", error_type, _error_context()
+                )
                 stream_result["success"] = False
                 yield _make_failed_event(error_type, f"Claude error: {error_type}")
                 return
@@ -487,7 +498,9 @@ async def stream_response_chunks(
                 content_sent = True
 
     except Exception as e:
-        logger.error("Responses stream: unexpected error: %s", e, exc_info=True)
+        logger.error(
+            "Responses stream: unexpected error: %s | %s", e, _error_context(), exc_info=True
+        )
         stream_result["success"] = False
         yield _make_failed_event("server_error", "Internal server error")
         return
