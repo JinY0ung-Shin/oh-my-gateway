@@ -15,8 +15,20 @@ COPY . /app
 # Set working directory
 WORKDIR /app
 
-# Install Python dependencies with uv
-RUN uv sync
+# Optional: point uv at a private/internal index (e.g. a Nexus PyPI mirror).
+# Pass via: docker compose build (values inherited from host shell env).
+# UV_INDEX_STRATEGY=unsafe-best-match lets uv.lock entries (pypi.org URLs)
+# resolve against the mirror when the mirror serves identical wheels.
+ARG UV_INDEX_URL=
+ARG UV_EXTRA_INDEX_URL=
+ARG UV_INDEX_STRATEGY=
+
+# Install Python dependencies with uv.
+# Scope the UV_* env vars to this RUN so they do not persist into the runtime image.
+RUN UV_INDEX_URL="$UV_INDEX_URL" \
+    UV_EXTRA_INDEX_URL="$UV_EXTRA_INDEX_URL" \
+    UV_INDEX_STRATEGY="$UV_INDEX_STRATEGY" \
+    uv sync
 
 # Expose the port (default 8000; overridable via PORT env var at runtime)
 EXPOSE 8000

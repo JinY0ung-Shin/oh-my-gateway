@@ -14,6 +14,11 @@ services:
         - http_proxy
         - https_proxy
         - no_proxy
+        # Optional uv index overrides for private/corporate PyPI mirrors.
+        # Export these in the shell before 'docker compose build' on corp networks.
+        - UV_INDEX_URL
+        - UV_EXTRA_INDEX_URL
+        - UV_INDEX_STRATEGY
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
