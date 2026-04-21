@@ -17,6 +17,7 @@ Concurrency model
 """
 
 import asyncio
+import contextlib
 import logging
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -265,17 +266,29 @@ class SessionManager:
         """Async shutdown: cancel cleanup task, disconnect clients, clean workspaces, clear sessions."""
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._cleanup_task
 
         with self.lock:
             sessions_snapshot = list(self.sessions.values())
 
-        for session in sessions_snapshot:
-            if session.client is not None:
-                try:
-                    await session.client.disconnect()
-                except Exception:
-                    logger.debug("Client disconnect failed during shutdown", exc_info=True)
-                session.client = None
+        # Disconnect in parallel with a per-client timeout — ClaudeSDKClient.disconnect()
+        # can hang if its internal anyio channel is already dead (common after long-running
+        # servers accumulate stale sessions).
+        async def _disconnect(session: "Session") -> None:
+            if session.client is None:
+                return
+            try:
+                await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+            except (asyncio.TimeoutError, Exception):
+                logger.debug("Client disconnect timed out or failed", exc_info=True)
+            session.client = None
+
+        if sessions_snapshot:
+            await asyncio.gather(
+                *(_disconnect(s) for s in sessions_snapshot),
+                return_exceptions=True,
+            )
 
         with self.lock:
             self._cleanup_all_temp_workspaces()
