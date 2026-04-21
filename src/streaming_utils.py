@@ -46,22 +46,59 @@ from src.chunk_processing import (  # noqa: F401
 # ---------------------------------------------------------------------------
 
 
+def _block_field(b: Any, key: str) -> Any:
+    """Read a field from either a dict block or an SDK dataclass block."""
+    if isinstance(b, dict):
+        return b.get(key)
+    return getattr(b, key, None)
+
+
+def _block_summary(b: Any) -> Dict[str, Any]:
+    """Compact summary of a single content block (text/tool_use/tool_result/thinking)."""
+    btype = _block_field(b, "type") or type(b).__name__
+    out: Dict[str, Any] = {"type": btype}
+
+    text = _block_field(b, "text")
+    if text is not None:
+        out["text"] = str(text)[:200]
+
+    name = _block_field(b, "name")
+    if name:
+        out["name"] = name
+
+    tool_use_id = _block_field(b, "tool_use_id")
+    if tool_use_id:
+        out["tool_use_id"] = tool_use_id
+        is_err = _block_field(b, "is_error")
+        if is_err is not None:
+            out["is_error"] = is_err
+        content = _block_field(b, "content")
+        if isinstance(content, str):
+            out["content"] = content[:200]
+        elif isinstance(content, list):
+            out["content_blocks"] = len(content)
+
+    thinking = _block_field(b, "thinking")
+    if thinking:
+        out["thinking"] = str(thinking)[:120]
+
+    return out
+
+
 def _chunk_summary(chunk: Any) -> Dict[str, Any]:
     """Compact, debug-friendly snapshot of an SDK chunk for error logs.
 
     Captures fields that help diagnose `error="unknown"` and similar opaque
-    failures: model, stop_reason, usage, session/message ids, content shape,
-    and any embedded error/result text. Values are truncated so a single log
-    line stays readable.
+    failures: model, stop_reason, usage, session/message ids, content blocks
+    (including text/tool_use/tool_result details), and any embedded error
+    or result text. Values are truncated so a single log line stays readable.
     """
     if not isinstance(chunk, dict):
         return {"repr": repr(chunk)[:200]}
 
     content = chunk.get("content")
     if isinstance(content, list):
-        content_summary: Any = [
-            b.get("type") if isinstance(b, dict) else type(b).__name__ for b in content
-        ]
+        content_summary: Any = [_block_summary(b) for b in content]
     elif isinstance(content, str):
         content_summary = f"str(len={len(content)})"
     else:
@@ -95,24 +132,37 @@ def _chunk_summary(chunk: Any) -> Dict[str, Any]:
 
 
 def _buffer_summary(buf: list, limit: int = 5) -> list:
-    """Compact summary of the last N chunks seen before a failure."""
+    """Compact summary of the last N chunks seen before a failure.
+
+    Includes each chunk's content-block shape (up to 3 blocks with
+    type/name/is_error) so tool-use loops are legible at a glance.
+    """
     summary = []
     for c in buf[-limit:]:
-        if isinstance(c, dict):
-            summary.append(
+        if not isinstance(c, dict):
+            summary.append({"repr": type(c).__name__})
+            continue
+        entry = {
+            k: v
+            for k, v in {
+                "type": c.get("type"),
+                "subtype": c.get("subtype"),
+                "error": c.get("error"),
+                "is_error": c.get("is_error"),
+            }.items()
+            if v is not None
+        }
+        content = c.get("content")
+        if isinstance(content, list) and content:
+            entry["blocks"] = [
                 {
                     k: v
-                    for k, v in {
-                        "type": c.get("type"),
-                        "subtype": c.get("subtype"),
-                        "error": c.get("error"),
-                        "is_error": c.get("is_error"),
-                    }.items()
-                    if v is not None
+                    for k, v in _block_summary(b).items()
+                    if k in ("type", "name", "is_error")
                 }
-            )
-        else:
-            summary.append({"repr": type(c).__name__})
+                for b in content[:3]
+            ]
+        summary.append(entry)
     return summary
 
 
@@ -466,7 +516,6 @@ async def stream_response_chunks(
 
             # Handle AssistantMessage.error (auth failures, rate limits, etc.)
             if chunk.get("type") == "assistant" and chunk.get("error"):
-                chunks_buffer.append(chunk)
                 error_type = chunk["error"]
                 logger.error(
                     "Responses stream: assistant error: %s | chunk=%r | prior_chunks=%r | %s",
@@ -475,6 +524,7 @@ async def stream_response_chunks(
                     _buffer_summary(chunks_buffer),
                     _error_context(),
                 )
+                chunks_buffer.append(chunk)
                 stream_result["success"] = False
                 yield _make_failed_event(error_type, f"Claude error: {error_type}")
                 return
