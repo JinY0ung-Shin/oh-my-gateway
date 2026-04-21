@@ -717,12 +717,20 @@ class ClaudeCodeCLI:
                     yield converted
 
         except Exception as e:
-            logger.error(f"Claude Agent SDK error: {e}")
+            logger.error(
+                "Claude Agent SDK error: %s (type=%s) | session_id=%r resume=%r cwd=%r",
+                e,
+                type(e).__name__,
+                session_id,
+                resume,
+                cwd,
+                exc_info=True,
+            )
             yield {
                 "type": "result",
                 "subtype": "error_during_execution",
                 "is_error": True,
-                "error_message": str(e),
+                "error_message": f"{type(e).__name__}: {e}",
             }
 
     # ------------------------------------------------------------------

@@ -42,6 +42,81 @@ from src.chunk_processing import (  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
+# Error-logging helpers
+# ---------------------------------------------------------------------------
+
+
+def _chunk_summary(chunk: Any) -> Dict[str, Any]:
+    """Compact, debug-friendly snapshot of an SDK chunk for error logs.
+
+    Captures fields that help diagnose `error="unknown"` and similar opaque
+    failures: model, stop_reason, usage, session/message ids, content shape,
+    and any embedded error/result text. Values are truncated so a single log
+    line stays readable.
+    """
+    if not isinstance(chunk, dict):
+        return {"repr": repr(chunk)[:200]}
+
+    content = chunk.get("content")
+    if isinstance(content, list):
+        content_summary: Any = [
+            b.get("type") if isinstance(b, dict) else type(b).__name__ for b in content
+        ]
+    elif isinstance(content, str):
+        content_summary = f"str(len={len(content)})"
+    else:
+        content_summary = None
+
+    result = chunk.get("result")
+    if isinstance(result, str) and result:
+        result = result[:200]
+
+    return {
+        k: v
+        for k, v in {
+            "type": chunk.get("type"),
+            "subtype": chunk.get("subtype"),
+            "error": chunk.get("error"),
+            "is_error": chunk.get("is_error"),
+            "error_message": chunk.get("error_message"),
+            "errors": chunk.get("errors"),
+            "model": chunk.get("model"),
+            "message_id": chunk.get("message_id"),
+            "stop_reason": chunk.get("stop_reason"),
+            "usage": chunk.get("usage"),
+            "session_id": chunk.get("session_id"),
+            "uuid": chunk.get("uuid"),
+            "parent_tool_use_id": chunk.get("parent_tool_use_id"),
+            "content": content_summary,
+            "result": result,
+        }.items()
+        if v is not None
+    }
+
+
+def _buffer_summary(buf: list, limit: int = 5) -> list:
+    """Compact summary of the last N chunks seen before a failure."""
+    summary = []
+    for c in buf[-limit:]:
+        if isinstance(c, dict):
+            summary.append(
+                {
+                    k: v
+                    for k, v in {
+                        "type": c.get("type"),
+                        "subtype": c.get("subtype"),
+                        "error": c.get("error"),
+                        "is_error": c.get("is_error"),
+                    }.items()
+                    if v is not None
+                }
+            )
+        else:
+            summary.append({"repr": type(c).__name__})
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Usage & stop-reason helpers
 # ---------------------------------------------------------------------------
 
@@ -379,7 +454,11 @@ async def stream_response_chunks(
             if isinstance(chunk, dict) and chunk.get("is_error"):
                 error_msg = chunk.get("error_message", "Unknown SDK error")
                 logger.error(
-                    "Responses stream: SDK error chunk: %s | %s", error_msg, _error_context()
+                    "Responses stream: SDK error chunk: %s | chunk=%r | prior_chunks=%r | %s",
+                    error_msg,
+                    _chunk_summary(chunk),
+                    _buffer_summary(chunks_buffer),
+                    _error_context(),
                 )
                 stream_result["success"] = False
                 yield _make_failed_event("sdk_error", error_msg)
@@ -390,7 +469,11 @@ async def stream_response_chunks(
                 chunks_buffer.append(chunk)
                 error_type = chunk["error"]
                 logger.error(
-                    "Responses stream: assistant error: %s | %s", error_type, _error_context()
+                    "Responses stream: assistant error: %s | chunk=%r | prior_chunks=%r | %s",
+                    error_type,
+                    _chunk_summary(chunk),
+                    _buffer_summary(chunks_buffer),
+                    _error_context(),
                 )
                 stream_result["success"] = False
                 yield _make_failed_event(error_type, f"Claude error: {error_type}")
@@ -499,7 +582,11 @@ async def stream_response_chunks(
 
     except Exception as e:
         logger.error(
-            "Responses stream: unexpected error: %s | %s", e, _error_context(), exc_info=True
+            "Responses stream: unexpected error: %s | prior_chunks=%r | %s",
+            e,
+            _buffer_summary(chunks_buffer),
+            _error_context(),
+            exc_info=True,
         )
         stream_result["success"] = False
         yield _make_failed_event("server_error", "Internal server error")
