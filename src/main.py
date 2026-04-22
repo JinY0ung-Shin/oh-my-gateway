@@ -475,10 +475,15 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc):
     """Format HTTP exceptions as OpenAI-style errors."""
+    detail = exc.detail
+    if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
+        # Caller already produced an OpenAI-style {"error": {...}} payload;
+        # pass it through unchanged to avoid double-nesting.
+        return JSONResponse(status_code=exc.status_code, content=detail)
     return JSONResponse(
         status_code=exc.status_code,
         content={
-            "error": {"message": exc.detail, "type": "api_error", "code": str(exc.status_code)}
+            "error": {"message": detail, "type": "api_error", "code": str(exc.status_code)}
         },
     )
 

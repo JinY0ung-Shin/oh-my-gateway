@@ -17,6 +17,10 @@ from src.message_adapter import MessageAdapter
 from src.auth import verify_api_key, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, ResolvedModel
+from src.backends.claude.slash_commands import (
+    SlashCommandError,
+    validate_prompt as validate_slash_prompt,
+)
 from src.response_models import (
     ResponseCreateRequest,
     ResponseContentPart,
@@ -325,6 +329,27 @@ async def create_response(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     prompt = MessageAdapter.filter_content(prompt)
+
+    # Reject slash-prefixed prompts that would be intercepted by the SDK as
+    # unknown skills or run destructive built-ins.  Only applies to the Claude
+    # backend; other backends pass through unchanged.
+    if resolved.backend == "claude":
+        try:
+            await validate_slash_prompt(
+                prompt,
+                cwd=Path(workspace_str) if workspace_str else None,
+            )
+        except SlashCommandError as e:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": {
+                        "type": "invalid_request_error",
+                        "code": e.code,
+                        "message": e.message,
+                    }
+                },
+            ) from e
 
     # ------------------------------------------------------------------
     # Determine whether to use ClaudeSDKClient (persistent session) or
