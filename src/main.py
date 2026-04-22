@@ -236,7 +236,7 @@ async def lifespan(app: FastAPI):
     # Log Responses API parameter notice
     logger.info("Responses API parameters:")
     logger.info(
-        "  Supported: model, input, instructions, previous_response_id, stream, allowed_tools, tools, metadata"
+        "  Supported: model, input, instructions, previous_response_id, stream, allowed_tools, metadata"
     )
     logger.info("  See README.md for details")
 

@@ -145,7 +145,7 @@ Each `/v1/responses` request can include a `user` field to isolate working direc
 
 **Configuration:**
 - `USER_WORKSPACES_DIR`: Base directory for workspaces (defaults to `CLAUDE_CWD`)
-- User identifiers must match `^[a-zA-Z0-9][a-zA-Z0-9_-]{0,62}$`
+- User identifiers must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`
 
 ## API Reference
 
@@ -171,29 +171,93 @@ For detailed SSE event formats including tool call rendering, subagent events, a
 
 The gateway includes a built-in admin dashboard at `/admin` (requires `ADMIN_API_KEY`).
 
+**UI**
+
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/admin` | Admin dashboard HTML |
+| `GET` | `/admin/chat` | Admin chat interface HTML |
+
+**Auth**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `POST` | `/admin/api/login` | Authenticate with admin API key |
+| `POST` | `/admin/api/logout` | Invalidate admin session |
+| `GET` | `/admin/api/status` | Admin auth/session status |
+
+**Summary & diagnostics**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
 | `GET` | `/admin/api/summary` | Dashboard summary (models, sessions, backends) |
+| `GET` | `/admin/api/server-info` | Server version and runtime info |
 | `GET` | `/admin/api/backends` | Backend health, auth status, model availability |
 | `GET` | `/admin/api/mcp-servers` | MCP server config and tool patterns |
-| `GET` | `/admin/api/metrics` | Performance metrics (latency percentiles, error rate) |
 | `GET` | `/admin/api/tools` | Tool registry per backend and MCP patterns |
 | `GET` | `/admin/api/sandbox` | Sandbox and permission mode config |
-| `GET` | `/admin/api/skills` | List skills with metadata |
-| `GET/PUT/DELETE` | `/admin/api/skills/{name}` | Skill CRUD with ETag concurrency |
-| `GET` | `/admin/api/files` | List workspace files |
-| `GET/PUT` | `/admin/api/files/{path}` | Read/write workspace files |
+| `GET` | `/admin/api/metrics` | Performance metrics (latency percentiles, error rate) |
+| `GET` | `/admin/api/rate-limits` | Rate limit usage snapshot |
+| `GET` | `/admin/api/logs` | Request logs with filtering |
+| `GET` | `/admin/api/config` | Redacted runtime configuration |
+
+**Runtime config**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET/PATCH` | `/admin/api/runtime-config` | Hot-reloadable settings |
+| `POST` | `/admin/api/runtime-config/reset` | Reset runtime config to defaults |
+
+**Sessions**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin/api/sessions/stats` | Aggregate session stats |
+| `POST` | `/admin/api/sessions/cleanup` | Purge expired sessions |
+| `POST` | `/admin/api/sessions/bulk-delete` | Delete multiple sessions by ID |
 | `GET` | `/admin/api/sessions/{id}/detail` | Session metadata (backend, turns, TTL) |
 | `GET` | `/admin/api/sessions/{id}/export` | Export session as JSON |
 | `GET` | `/admin/api/sessions/{id}/messages` | Session message history |
 | `DELETE` | `/admin/api/sessions/{id}` | Delete session |
-| `GET` | `/admin/api/config` | Redacted runtime configuration |
-| `GET/PATCH` | `/admin/api/runtime-config` | Hot-reloadable settings |
+
+**Workspace files**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin/api/files` | List workspace files |
+| `GET/PUT` | `/admin/api/files/{path}` | Read/write workspace files |
+
+**Skills**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin/api/skills` | List skills with metadata |
+| `GET/PUT/DELETE` | `/admin/api/skills/{name}` | Skill CRUD with ETag concurrency |
+
+**System prompt**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin/api/system-prompt/templates` | Built-in system prompt templates |
 | `GET/PUT/DELETE` | `/admin/api/system-prompt` | System prompt management |
-| `GET` | `/admin/api/logs` | Request logs with filtering |
-| `GET` | `/admin/api/rate-limits` | Rate limit usage snapshot |
+
+**Prompts (named)**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin/api/prompts` | List saved prompts |
+| `GET/PUT/DELETE` | `/admin/api/prompts/{name}` | Prompt CRUD |
+| `POST` | `/admin/api/prompts/{name}/activate` | Activate a saved prompt |
+
+**Plugins & marketplaces**
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/admin/api/plugins` | List installed plugins |
+| `GET` | `/admin/api/plugins/blocklist` | Plugin blocklist config |
+| `GET` | `/admin/api/plugins/{id}` | Plugin details |
+| `GET` | `/admin/api/plugins/{id}/skills/{name}` | Plugin skill details |
+| `GET` | `/admin/api/marketplaces` | Available plugin marketplaces |
 
 ### Responses API Deviations
 
