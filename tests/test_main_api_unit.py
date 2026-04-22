@@ -506,6 +506,10 @@ def test_create_response_streaming_empty_result_emits_failed_event(isolated_sess
 
     assert response.status_code == 200
     assert "event: response.failed" in body
+    # Error payload should use the empty_response code, not the default
+    # "Internal server error".
+    assert '"code": "empty_response"' in body
+    assert "No response generated" in body
     session = next(iter(isolated_session_manager.sessions.values()))
     # No commit — no assistant text, no pending tool call
     assert session.turn_counter == 0

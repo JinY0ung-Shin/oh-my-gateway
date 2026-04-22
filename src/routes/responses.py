@@ -471,7 +471,13 @@ async def create_response(
                     logger.warning(
                         "Responses stream: no content and no pending tool call; emitting failed"
                     )
-                    failed_resp = _build_failed_response(resp_id, body.model, body.metadata)
+                    failed_resp = _build_failed_response(
+                        resp_id,
+                        body.model,
+                        body.metadata,
+                        code="empty_response",
+                        message="No response generated",
+                    )
                     yield streaming_utils.make_response_sse(
                         "response.failed",
                         response_obj=failed_resp,
