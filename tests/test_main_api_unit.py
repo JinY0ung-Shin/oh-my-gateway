@@ -473,6 +473,45 @@ def test_create_response_streaming_success_commits_session_state(isolated_sessio
     ]
 
 
+def test_create_response_streaming_empty_result_emits_failed_event(isolated_session_manager):
+    """When the inner stream ends with no text and no pending tool call
+    (stream_result['empty'] = True), the route must emit response.failed so
+    the client sees a definite outcome — matching non-stream's 502 path."""
+    def fake_run_completion(**kwargs):
+        async def empty_source():
+            if False:
+                yield None
+        return empty_source()
+
+    async def fake_stream_response_chunks(**kwargs):
+        kwargs["stream_result"]["success"] = False
+        kwargs["stream_result"]["empty"] = True
+        # Yield only setup-ish SSE to prove they don't confuse the post-bridge branch
+        yield 'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(
+            main.streaming_utils, "stream_response_chunks", new=fake_stream_response_chunks
+        ),
+    ):
+        mock_cli.run_completion = fake_run_completion
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "trigger empty", "stream": True},
+        ) as response:
+            body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "event: response.failed" in body
+    session = next(iter(isolated_session_manager.sessions.values()))
+    # No commit — no assistant text, no pending tool call
+    assert session.turn_counter == 0
+    assert session.messages == []
+
+
 def test_create_response_streaming_setup_error_returns_error_event_without_commit(
     isolated_session_manager,
 ):

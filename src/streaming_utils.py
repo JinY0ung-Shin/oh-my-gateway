@@ -654,18 +654,13 @@ async def stream_response_chunks(
 
     # --- Finalization ---
 
-    # No content received → emit response.failed (not fake success)
-    # When AskUserQuestion hook fires, streaming ends with no content —
-    # the caller sets allow_empty to suppress the failed event so it can
-    # emit function_call + requires_action instead.
+    # No content received.  Don't yield a failed event here: the caller may
+    # still need to emit function_call + requires_action (AskUserQuestion hook
+    # path).  Signal "empty" via stream_result and let the route decide.
     if not content_sent:
-        if stream_result.get("allow_empty"):
-            logger.info("Responses stream: no content (allow_empty set, hook may have fired)")
-            stream_result["success"] = False
-            return
-        logger.warning("Responses stream: no content received from SDK")
+        logger.info("Responses stream: no text content yielded")
         stream_result["success"] = False
-        yield _make_failed_event("empty_response", "No response generated")
+        stream_result["empty"] = True
         return
 
     # Emit closing events for successful stream

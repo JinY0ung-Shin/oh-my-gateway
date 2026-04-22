@@ -237,7 +237,10 @@ async def test_stream_response_chunks_emits_failed_event_for_sdk_error_chunk():
 
 
 @pytest.mark.asyncio
-async def test_stream_response_chunks_emits_failed_event_for_empty_response():
+async def test_stream_response_chunks_signals_empty_without_yielding_failed():
+    """When no content is produced, signal via stream_result["empty"] rather
+    than yielding response.failed directly. The route decides whether to emit
+    a failed event or a function_call (AskUserQuestion hook path)."""
     async def empty_source():
         yield {"type": "metadata"}
 
@@ -257,10 +260,12 @@ async def test_stream_response_chunks_emits_failed_event_for_empty_response():
     ]
     parsed = [_parse_response_sse(line) for line in lines]
 
-    assert parsed[-1][0] == "response.failed"
-    assert parsed[-1][1]["response"]["error"]["code"] == "empty_response"
-    assert chunks_buffer == [{"type": "metadata"}]
+    # The final setup events (created/in_progress/output_item_added/content_part_added)
+    # may still be yielded, but no response.failed should be emitted here.
+    assert not any(event == "response.failed" for event, _ in parsed)
     assert stream_result["success"] is False
+    assert stream_result["empty"] is True
+    assert chunks_buffer == [{"type": "metadata"}]
 
 
 @pytest.mark.asyncio
@@ -499,10 +504,12 @@ async def test_stream_response_chunks_task_events_as_custom_sse():
     assert task_done["type"] == "response.task_notification"
     assert task_done["status"] == "completed"
 
-    # Task-only stream should still fail (no real content)
-    assert parsed[-1][0] == "response.failed"
-    assert parsed[-1][1]["response"]["error"]["code"] == "empty_response"
+    # Task-only stream has no assistant text → signals empty via stream_result.
+    # The route converts that into a response.failed event (see
+    # src/routes/responses.py), so this inner helper no longer yields it.
+    assert not any(et == "response.failed" for et, _ in parsed)
     assert stream_result["success"] is False
+    assert stream_result["empty"] is True
 
 
 # ==================== Tests for refactored helpers ====================

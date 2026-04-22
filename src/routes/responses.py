@@ -403,11 +403,6 @@ async def create_response(
         async def _run_stream():
             lock_acquired = preflight["lock_acquired"]
             stream_result: dict = {"success": False}
-            # When using SDK client, the PreToolUse hook may break the
-            # stream with no text content.  Suppress the empty_response
-            # failed event so we can emit function_call + requires_action.
-            if use_sdk_client:
-                stream_result["allow_empty"] = True
             try:
                 chunks_buffer = []
 
@@ -468,6 +463,20 @@ async def create_response(
                     # function_call_output can reference this response_id
                     session.turn_counter = next_turn
                     stream_result["success"] = True
+                elif stream_result.get("empty"):
+                    # Stream ended with no text and no pending tool call —
+                    # same empty-response condition the non-stream path
+                    # surfaces as HTTP 502.  Emit response.failed so the
+                    # client doesn't hang on a silent success.
+                    logger.warning(
+                        "Responses stream: no content and no pending tool call; emitting failed"
+                    )
+                    failed_resp = _build_failed_response(resp_id, body.model, body.metadata)
+                    yield streaming_utils.make_response_sse(
+                        "response.failed",
+                        response_obj=failed_resp,
+                        sequence_number=0,
+                    )
                 elif stream_result.get("success"):
                     # SUCCESS-ONLY: commit turn counter and session messages.
                     assistant_text = stream_result.get("assistant_text") or ""
