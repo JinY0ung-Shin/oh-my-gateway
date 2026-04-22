@@ -126,6 +126,35 @@ def prompt_for_api_protection() -> Optional[str]:
 # in the BackendRegistry. Access it via BackendRegistry.get("claude").
 
 
+async def _log_slash_commands() -> None:
+    """Fetch the slash-command allowlist from the Claude backend and log it."""
+    if not BackendRegistry.is_registered("claude"):
+        return
+    try:
+        from src.backends.claude import slash_commands
+
+        claude_backend = BackendRegistry.get("claude")
+        cwd = getattr(claude_backend, "cwd", None)
+        commands = await slash_commands.get_available_commands(cwd=cwd)
+    except Exception as e:
+        logger.warning(f"Could not fetch slash-command list: {e}")
+        return
+
+    blocked_present = sorted(commands & slash_commands.BLOCKED_COMMANDS)
+    allowed = sorted(commands - slash_commands.BLOCKED_COMMANDS)
+    if allowed:
+        logger.info(
+            f"Slash commands available ({len(allowed)}): {', '.join('/' + n for n in allowed)}"
+        )
+    else:
+        logger.info("Slash commands available: (none)")
+    if blocked_present:
+        logger.info(
+            f"Slash commands blocked by server ({len(blocked_present)}): "
+            f"{', '.join('/' + n for n in blocked_present)}"
+        )
+
+
 async def _verify_backends() -> None:
     """Verify all registered backends at startup with timeout."""
     for name, backend in BackendRegistry.all_backends().items():
@@ -179,6 +208,10 @@ async def lifespan(app: FastAPI):
 
     # Verify all registered backends
     await _verify_backends()
+
+    # Warm up slash-command allowlist so the first /v1/responses request
+    # doesn't pay the round-trip, and surface the list in startup logs.
+    await _log_slash_commands()
 
     # Log debug information if debug mode is enabled
     if DEBUG_MODE or VERBOSE:
