@@ -17,10 +17,11 @@ def get_usage_html() -> str:
           <div>
             <div class="flex-between mb-md" style="flex-wrap:wrap; gap:0.5rem">
               <h3 style="margin:0">Usage</h3>
-              <div class="flex-gap-sm" style="flex-wrap:wrap">
+              <div class="flex-gap-sm" style="flex-wrap:wrap; align-items:center">
                 <label class="text-xs text-dim" style="display:flex; gap:4px; align-items:center">
                   WINDOW
-                  <select x-model.number="usageWindow" @change="loadUsage()"
+                  <select x-model.number="usageWindow"
+                    @change="usageStart=''; usageEnd=''; loadUsage()"
                     style="padding:4px 8px; font-size:0.75rem">
                     <option value="1">1d</option>
                     <option value="7">7d</option>
@@ -28,47 +29,72 @@ def get_usage_html() -> str:
                     <option value="90">90d</option>
                   </select>
                 </label>
+                <span class="text-xs text-dim">or</span>
+                <label class="text-xs text-dim" style="display:flex; gap:4px; align-items:center">
+                  FROM
+                  <input type="date" x-model="usageStart"
+                    style="padding:4px 8px; font-size:0.75rem; color-scheme:dark">
+                </label>
+                <label class="text-xs text-dim" style="display:flex; gap:4px; align-items:center">
+                  TO
+                  <input type="date" x-model="usageEnd"
+                    style="padding:4px 8px; font-size:0.75rem; color-scheme:dark">
+                </label>
+                <button class="btn btn-sm" :class="(usageStart && usageEnd) ? 'btn-primary' : 'btn-ghost'"
+                  @click="loadUsage()" :disabled="(usageStart || usageEnd) && !(usageStart && usageEnd)">[APPLY]</button>
+                <button class="btn btn-sm btn-ghost" x-show="usageStart || usageEnd"
+                  @click="usageStart=''; usageEnd=''; loadUsage()">[CLEAR]</button>
                 <button class="btn btn-sm btn-ghost" @click="loadUsage()">[RELOAD]</button>
               </div>
+            </div>
+            <div x-show="usageStart && usageEnd" class="text-xs text-dim" style="margin-top:-0.5rem; margin-bottom:0.75rem">
+              showing <span style="color:var(--cyan)" x-text="usageStart"></span> → <span style="color:var(--cyan)" x-text="usageEnd"></span> (inclusive)
             </div>
 
             <div class="card mb-lg">
               <div class="flex-between mb-md">
                 <h3 style="margin:0">Trends</h3>
-                <div class="flex-gap-sm">
-                  <template x-for="g in ['day','week','month']" :key="g">
-                    <button class="btn btn-sm"
-                      :class="usageGran === g ? 'btn-primary' : 'btn-ghost'"
-                      @click="usageGran = g; loadUsageSeries()"
-                      x-text="g.toUpperCase()"></button>
-                  </template>
-                </div>
+                <span class="text-xs text-dim">last 5 · day / week / month</span>
               </div>
-              <div x-show="(usage.series ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO DATA ]</div>
-              <div x-show="(usage.series ?? []).length > 0"
-                style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:1rem">
+              <div x-show="usageSeriesEmpty()" class="text-muted" style="padding:1rem; text-align:center">[ NO DATA ]</div>
+              <div x-show="!usageSeriesEmpty()"
+                style="display:grid; grid-template-columns:auto repeat(3, 1fr); gap:0.75rem 1rem; align-items:stretch">
+                <div></div>
+                <template x-for="g in ['day','week','month']" :key="'hdr-' + g">
+                  <div class="text-xs text-dim" style="text-align:center; letter-spacing:0.08em" x-text="g.toUpperCase()"></div>
+                </template>
                 <template x-for="chart in [
                   {key:'turns', label:'QUERIES', color:'var(--green)'},
                   {key:'users', label:'USERS', color:'var(--cyan)'},
                   {key:'tool_calls', label:'TOOL CALLS', color:'var(--amber)'},
-                  {key:'tokens', label:'TOKENS (IN+OUT)', color:'var(--red)'}
+                  {key:'tokens', label:'TOKENS', color:'var(--red)'}
                 ]" :key="chart.key">
-                  <div>
-                    <div class="text-xs text-dim" style="margin-bottom:4px" x-text="chart.label"></div>
-                    <div style="display:flex; gap:6px; align-items:flex-end; height:140px; padding:4px 4px 0; border-bottom:1px solid var(--border-dim)">
-                      <template x-for="b in seriesForChart(chart.key)" :key="b.label + chart.key">
-                        <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; min-width:0">
-                          <div class="text-xs" style="color:var(--text-bright); white-space:nowrap" x-text="formatNum(b.value)"></div>
-                          <div :style="'width:80%; background:' + chart.color + '; height:' + (b.pct*100) + '%; min-height:2px; transition:height 0.3s'"></div>
+                  <template x-for="cell in [
+                    {row: chart, gran: 'day'},
+                    {row: chart, gran: 'week'},
+                    {row: chart, gran: 'month'}
+                  ]" :key="chart.key + '-' + cell.gran">
+                    <div style="display:contents">
+                      <template x-if="cell.gran === 'day'">
+                        <div class="text-xs text-dim" style="align-self:center; white-space:nowrap" x-text="chart.label"></div>
+                      </template>
+                      <div>
+                        <div style="display:flex; gap:4px; align-items:flex-end; height:100px; padding:4px 4px 0; border-bottom:1px solid var(--border-dim)">
+                          <template x-for="b in seriesForChart(cell.gran, chart.key)" :key="cell.gran + chart.key + b.label">
+                            <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; min-width:0">
+                              <div class="text-xs" style="color:var(--text-bright); white-space:nowrap; font-size:0.65rem" x-text="formatNum(b.value)"></div>
+                              <div :style="'width:78%; background:' + chart.color + '; height:' + (b.pct*100) + '%; min-height:2px; transition:height 0.3s'"></div>
+                            </div>
+                          </template>
                         </div>
-                      </template>
+                        <div style="display:flex; gap:4px; padding:4px 4px 0">
+                          <template x-for="b in seriesForChart(cell.gran, chart.key)" :key="cell.gran + chart.key + b.label + '-lbl'">
+                            <div class="text-xs text-dim" style="flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.6rem" x-text="b.label"></div>
+                          </template>
+                        </div>
+                      </div>
                     </div>
-                    <div style="display:flex; gap:6px; padding:6px 4px 0">
-                      <template x-for="b in seriesForChart(chart.key)" :key="b.label + chart.key + '-lbl'">
-                        <div class="text-xs text-dim" style="flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis" x-text="b.label"></div>
-                      </template>
-                    </div>
-                  </div>
+                  </template>
                 </template>
               </div>
             </div>

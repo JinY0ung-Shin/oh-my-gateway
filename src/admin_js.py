@@ -56,9 +56,13 @@ def get_admin_js() -> str:
     newPromptNameWarning: '',
     newPromptContent: '',
     loading: { dashboard: false, logs: false, sessions: false, usage: false },
-    usage: { enabled: null, summary: null, users: [], tools: [], turns: [], series: [] },
+    usage: {
+      enabled: null, summary: null, users: [], tools: [], turns: [],
+      series: { day: [], week: [], month: [] },
+    },
     usageWindow: 7,
-    usageGran: 'day',
+    usageStart: '',
+    usageEnd: '',
     usageTurnsFilter: '',
     usageTurnsOffset: 0,
 
@@ -256,14 +260,22 @@ def get_admin_js() -> str:
       if (this.logsAutoRefresh) { this.logsPollTimer = setInterval(() => this.loadLogs(), 5000); }
     },
 
+    _usageWindowQs() {
+      if (this.usageStart && this.usageEnd) {
+        return 'start_date=' + encodeURIComponent(this.usageStart) +
+               '&end_date=' + encodeURIComponent(this.usageEnd);
+      }
+      return 'window_days=' + this.usageWindow;
+    },
+
     async loadUsage() {
       this.loading.usage = true;
       try {
-        const w = 'window_days=' + this.usageWindow;
+        const q = this._usageWindowQs();
         const [sumR, userR, toolR] = await Promise.all([
-          this.api('/admin/api/usage/summary?' + w),
-          this.api('/admin/api/usage/users?' + w + '&limit=20'),
-          this.api('/admin/api/usage/tools?' + w + '&limit=30'),
+          this.api('/admin/api/usage/summary?' + q),
+          this.api('/admin/api/usage/users?' + q + '&limit=20'),
+          this.api('/admin/api/usage/tools?' + q + '&limit=30'),
         ]);
         if (sumR.ok) {
           const s = await sumR.json();
@@ -287,21 +299,33 @@ def get_admin_js() -> str:
     },
 
     async loadUsageSeries() {
+      // Always fetch all three granularities for the fixed 4x3 Trends grid.
       try {
-        const r = await this.api('/admin/api/usage/series?granularity=' + this.usageGran + '&buckets=5');
-        if (r.ok) {
-          const j = await r.json();
-          // backend returns DESC (newest first); reverse for left-to-right chronology
-          this.usage.series = (j.buckets || []).slice().reverse();
-          if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+        const grans = ['day', 'week', 'month'];
+        const results = await Promise.all(grans.map(g =>
+          this.api('/admin/api/usage/series?granularity=' + g + '&buckets=5')
+        ));
+        for (let i = 0; i < grans.length; i++) {
+          const r = results[i];
+          if (r.ok) {
+            const j = await r.json();
+            // backend returns DESC; reverse for left-to-right chronology
+            this.usage.series[grans[i]] = (j.buckets || []).slice().reverse();
+            if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+          }
         }
       } catch(e) {
         console.error('Failed to load usage series', e);
       }
     },
 
-    seriesForChart(field) {
-      const rows = this.usage.series || [];
+    usageSeriesEmpty() {
+      const s = this.usage.series || {};
+      return (s.day || []).length === 0 && (s.week || []).length === 0 && (s.month || []).length === 0;
+    },
+
+    seriesForChart(gran, field) {
+      const rows = (this.usage.series || {})[gran] || [];
       if (rows.length === 0) return [];
       const vals = rows.map(r => {
         if (field === 'tokens') return Number(r.input_tokens || 0) + Number(r.output_tokens || 0);
