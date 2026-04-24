@@ -250,6 +250,13 @@ async def lifespan(app: FastAPI):
     # Start session cleanup task
     session_manager.start_cleanup_task()
 
+    # Bring up the optional usage-log MySQL pool (no-op when the env var is
+    # unset).  Kept late in startup so a flaky logging DB cannot block the
+    # gateway from becoming healthy.
+    from src.usage_logger import usage_logger
+
+    await usage_logger.start()
+
     # Record server start time for uptime tracking
     app.state.started_at = time.time()
 
@@ -258,6 +265,7 @@ async def lifespan(app: FastAPI):
     # Cleanup on shutdown (async to disconnect SDK clients)
     logger.info("Shutting down session manager...")
     await session_manager.async_shutdown()
+    await usage_logger.close()
 
 
 # Create FastAPI app

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any, AsyncGenerator, Dict, Optional
 
 from src.constants import (
@@ -15,6 +16,8 @@ from src.response_models import (
     ResponseObject,
     ResponseUsage,
 )
+from src.tool_stats import ToolStatsCollector
+from src.usage_logger import usage_logger
 
 # Backward-compat re-exports from split modules.
 # External callers continue to use `from src.streaming_utils import X`.
@@ -421,6 +424,11 @@ async def stream_response_chunks(
     if stream_result is None:
         stream_result = {}
 
+    # Usage-log state.  ``usage_start`` measures wall duration; ``tool_stats``
+    # aggregates tool-call name/count/errors/latency for the usage_tool table.
+    usage_start = time.monotonic()
+    tool_stats = ToolStatsCollector()
+
     def _next_seq() -> int:
         nonlocal seq
         current = seq
@@ -444,6 +452,22 @@ async def stream_response_chunks(
         return make_response_sse(
             "response.failed", response_obj=failed_resp, sequence_number=_next_seq()
         )
+
+    async def _log_usage(status: str, error_code: Optional[str] = None) -> None:
+        """Best-effort usage-log write.  Never raises."""
+        try:
+            await usage_logger.log_turn_from_context(
+                request_context=request_context,
+                response_id=response_id,
+                model=model,
+                chunks=chunks_buffer,
+                tool_stats=tool_stats.snapshot(),
+                started_monotonic=usage_start,
+                status=status,
+                error_code=error_code,
+            )
+        except Exception:
+            logger.warning("usage-log emit failed", exc_info=True)
 
     # --- Preamble: emit opening events ---
 
@@ -512,6 +536,7 @@ async def stream_response_chunks(
                 )
                 stream_result["success"] = False
                 yield _make_failed_event("sdk_error", error_msg)
+                await _log_usage("failed", "sdk_error")
                 return
 
             # Handle AssistantMessage.error (auth failures, rate limits, etc.)
@@ -527,6 +552,7 @@ async def stream_response_chunks(
                 chunks_buffer.append(chunk)
                 stream_result["success"] = False
                 yield _make_failed_event(error_type, f"Claude error: {error_type}")
+                await _log_usage("failed", error_type)
                 return
 
             # Handle SDK rate-limit events (new in SDK 0.1.49)
@@ -536,6 +562,7 @@ async def stream_response_chunks(
                 if status == "rejected":
                     stream_result["success"] = False
                     yield _make_failed_event("rate_limit", "Rate limit rejected")
+                    await _log_usage("failed", "rate_limit")
                     return
                 continue
 
@@ -568,6 +595,11 @@ async def stream_response_chunks(
             handled, tool_block = tool_acc.process_stream_event(chunk)
             if handled:
                 if tool_block:
+                    tool_stats.record_use(
+                        _block_field(tool_block, "id")
+                        or _block_field(tool_block, "tool_use_id"),
+                        _block_field(tool_block, "name") or "",
+                    )
                     is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
                     if not is_subagent_tool or SUBAGENT_STREAM_TOOL_BLOCKS:
                         yield make_tool_use_response_sse(
@@ -580,6 +612,11 @@ async def stream_response_chunks(
             # User chunks with tool_result blocks
             if chunk.get("type") == "user":
                 tool_results, parent_id = extract_user_tool_results(chunk)
+                for tr_block in tool_results:
+                    tool_stats.record_result(
+                        _block_field(tr_block, "tool_use_id"),
+                        bool(_block_field(tr_block, "is_error") or False),
+                    )
                 is_subagent_result = parent_id is not None
                 if not is_subagent_result or SUBAGENT_STREAM_TOOL_BLOCKS:
                     for tr_block in tool_results:
@@ -597,6 +634,17 @@ async def stream_response_chunks(
             # when token_streaming is True.
             embedded_tools = extract_embedded_tool_blocks(chunk)
             for tb in embedded_tools:
+                tb_type = _block_field(tb, "type")
+                if tb_type == "tool_use":
+                    tool_stats.record_use(
+                        _block_field(tb, "id") or _block_field(tb, "tool_use_id"),
+                        _block_field(tb, "name") or "",
+                    )
+                elif tb_type == "tool_result":
+                    tool_stats.record_result(
+                        _block_field(tb, "tool_use_id"),
+                        bool(_block_field(tb, "is_error") or False),
+                    )
                 is_subagent_tb = tb.get("parent_tool_use_id") is not None
                 if not is_subagent_tb or SUBAGENT_STREAM_TOOL_BLOCKS:
                     if tb.get("type") == "tool_use":
@@ -640,6 +688,7 @@ async def stream_response_chunks(
         )
         stream_result["success"] = False
         yield _make_failed_event("server_error", "Internal server error")
+        await _log_usage("failed", "server_error")
         return
 
     # Flush remaining buffered chars from collab filter
@@ -725,3 +774,4 @@ async def stream_response_chunks(
     yield make_response_sse(
         "response.completed", response_obj=final_resp, sequence_number=_next_seq()
     )
+    await _log_usage("completed")

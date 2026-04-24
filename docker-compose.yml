@@ -19,6 +19,14 @@ services:
         - UV_INDEX_URL
         - UV_EXTRA_INDEX_URL
         - UV_INDEX_STRATEGY
+    # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
+    # before starting the wrapper, so the usage-log pool can connect on first
+    # try.  ``required: false`` (Compose v2.20+) keeps the wrapper runnable
+    # when the ``logging`` profile is off and gateway-log isn't created.
+    depends_on:
+      gateway-log:
+        condition: service_healthy
+        required: false
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
@@ -41,3 +49,31 @@ services:
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
       # Override .env CLAUDE_CWD (host path) with the in-container mount target.
       - CLAUDE_CWD=/app/working_dir
+
+  # Optional MySQL sidecar that persists per-turn usage logs (token counts,
+  # tool-call stats).  Activated only when the `logging` compose profile is
+  # enabled (e.g. `docker compose --profile logging up`).  When the profile
+  # is off the gateway runs standalone and no MySQL image is pulled.
+  gateway-log:
+    profiles: ["logging"]
+    image: mysql:8.0
+    container_name: gateway-log
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${GATEWAY_LOG_PORT:-3306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GATEWAY_LOG_MYSQL_ROOT_PASSWORD:-gateway_root}
+      MYSQL_DATABASE: ${GATEWAY_LOG_MYSQL_DATABASE:-gateway_log}
+      MYSQL_USER: ${GATEWAY_LOG_MYSQL_USER:-gateway}
+      MYSQL_PASSWORD: ${GATEWAY_LOG_MYSQL_PASSWORD:-gateway}
+    volumes:
+      - ./data/mysql_data:/var/lib/mysql
+      - ./docker/mysql_init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${GATEWAY_LOG_MYSQL_ROOT_PASSWORD:-gateway_root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
