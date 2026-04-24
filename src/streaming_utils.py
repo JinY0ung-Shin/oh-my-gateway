@@ -596,8 +596,9 @@ async def stream_response_chunks(
             if handled:
                 if tool_block:
                     tool_stats.record_use(
-                        tool_block.get("id") or tool_block.get("tool_use_id"),
-                        tool_block.get("name", "") or "",
+                        _block_field(tool_block, "id")
+                        or _block_field(tool_block, "tool_use_id"),
+                        _block_field(tool_block, "name") or "",
                     )
                     is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
                     if not is_subagent_tool or SUBAGENT_STREAM_TOOL_BLOCKS:
@@ -613,8 +614,8 @@ async def stream_response_chunks(
                 tool_results, parent_id = extract_user_tool_results(chunk)
                 for tr_block in tool_results:
                     tool_stats.record_result(
-                        tr_block.get("tool_use_id"),
-                        bool(tr_block.get("is_error", False)),
+                        _block_field(tr_block, "tool_use_id"),
+                        bool(_block_field(tr_block, "is_error") or False),
                     )
                 is_subagent_result = parent_id is not None
                 if not is_subagent_result or SUBAGENT_STREAM_TOOL_BLOCKS:
@@ -633,15 +634,16 @@ async def stream_response_chunks(
             # when token_streaming is True.
             embedded_tools = extract_embedded_tool_blocks(chunk)
             for tb in embedded_tools:
-                if tb.get("type") == "tool_use":
+                tb_type = _block_field(tb, "type")
+                if tb_type == "tool_use":
                     tool_stats.record_use(
-                        tb.get("id") or tb.get("tool_use_id"),
-                        tb.get("name", "") or "",
+                        _block_field(tb, "id") or _block_field(tb, "tool_use_id"),
+                        _block_field(tb, "name") or "",
                     )
-                elif tb.get("type") == "tool_result":
+                elif tb_type == "tool_result":
                     tool_stats.record_result(
-                        tb.get("tool_use_id"),
-                        bool(tb.get("is_error", False)),
+                        _block_field(tb, "tool_use_id"),
+                        bool(_block_field(tb, "is_error") or False),
                     )
                 is_subagent_tb = tb.get("parent_tool_use_id") is not None
                 if not is_subagent_tb or SUBAGENT_STREAM_TOOL_BLOCKS:
