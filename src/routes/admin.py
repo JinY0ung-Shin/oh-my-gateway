@@ -815,3 +815,78 @@ async def list_marketplaces_endpoint(_=Depends(require_admin)):
     from src.plugin_service import list_marketplaces
 
     return {"marketplaces": list_marketplaces()}
+
+
+# ---------------------------------------------------------------------------
+# Usage-log dashboard (MySQL-backed analytics)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/usage/summary")
+async def usage_summary_endpoint(
+    window_days: int = 7,
+    _=Depends(require_admin),
+):
+    """Overview counters for the usage tab."""
+    from src.usage_queries import get_summary
+
+    data = await get_summary(window_days=max(1, min(window_days, 90)))
+    if data is None:
+        return {"enabled": False}
+    return {"enabled": True, "window_days": window_days, "summary": data}
+
+
+@router.get("/api/usage/users")
+async def usage_users_endpoint(
+    window_days: int = 7,
+    limit: int = 20,
+    _=Depends(require_admin),
+):
+    """Top users by token usage in the rolling window."""
+    from src.usage_queries import get_top_users
+
+    rows = await get_top_users(
+        window_days=max(1, min(window_days, 90)),
+        limit=max(1, min(limit, 500)),
+    )
+    if rows is None:
+        return {"enabled": False, "items": []}
+    return {"enabled": True, "items": rows}
+
+
+@router.get("/api/usage/tools")
+async def usage_tools_endpoint(
+    window_days: int = 7,
+    limit: int = 30,
+    _=Depends(require_admin),
+):
+    """Top tools by call count in the rolling window."""
+    from src.usage_queries import get_top_tools
+
+    rows = await get_top_tools(
+        window_days=max(1, min(window_days, 90)),
+        limit=max(1, min(limit, 500)),
+    )
+    if rows is None:
+        return {"enabled": False, "items": []}
+    return {"enabled": True, "items": rows}
+
+
+@router.get("/api/usage/turns")
+async def usage_turns_endpoint(
+    user: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    _=Depends(require_admin),
+):
+    """Recent turns (newest first), optionally filtered by user."""
+    from src.usage_queries import get_recent_turns
+
+    rows = await get_recent_turns(
+        user=user,
+        limit=max(1, min(limit, 500)),
+        offset=max(0, offset),
+    )
+    if rows is None:
+        return {"enabled": False, "items": []}
+    return {"enabled": True, "items": rows}
