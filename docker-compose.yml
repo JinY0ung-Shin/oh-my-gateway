@@ -19,6 +19,14 @@ services:
         - UV_INDEX_URL
         - UV_EXTRA_INDEX_URL
         - UV_INDEX_STRATEGY
+    # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
+    # before starting the wrapper, so the usage-log pool can connect on first
+    # try.  ``required: false`` (Compose v2.20+) keeps the wrapper runnable
+    # when the ``logging`` profile is off and gateway-log isn't created.
+    depends_on:
+      gateway-log:
+        condition: service_healthy
+        required: false
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
