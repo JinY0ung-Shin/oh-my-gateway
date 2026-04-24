@@ -55,7 +55,11 @@ def get_admin_js() -> str:
     newPromptNameError: '',
     newPromptNameWarning: '',
     newPromptContent: '',
-    loading: { dashboard: false, logs: false, sessions: false },
+    loading: { dashboard: false, logs: false, sessions: false, usage: false },
+    usage: { enabled: null, summary: null, users: [], tools: [], turns: [] },
+    usageWindow: 7,
+    usageTurnsFilter: '',
+    usageTurnsOffset: 0,
 
     async init() {
       document.addEventListener('keydown', (e) => {
@@ -249,6 +253,50 @@ def get_admin_js() -> str:
     toggleLogsPolling() {
       if (this.logsPollTimer) { clearInterval(this.logsPollTimer); this.logsPollTimer = null; }
       if (this.logsAutoRefresh) { this.logsPollTimer = setInterval(() => this.loadLogs(), 5000); }
+    },
+
+    async loadUsage() {
+      this.loading.usage = true;
+      try {
+        const w = 'window_days=' + this.usageWindow;
+        const [sumR, userR, toolR] = await Promise.all([
+          this.api('/admin/api/usage/summary?' + w),
+          this.api('/admin/api/usage/users?' + w + '&limit=20'),
+          this.api('/admin/api/usage/tools?' + w + '&limit=30'),
+        ]);
+        if (sumR.ok) {
+          const s = await sumR.json();
+          this.usage.enabled = s.enabled;
+          this.usage.summary = s.summary || null;
+        }
+        if (userR.ok) {
+          const u = await userR.json();
+          this.usage.users = u.items || [];
+        }
+        if (toolR.ok) {
+          const t = await toolR.json();
+          this.usage.tools = t.items || [];
+        }
+        await this.loadUsageTurns();
+      } catch(e) {
+        console.error('Failed to load usage', e);
+        this.showToast('Failed to load usage', 'err');
+      } finally { this.loading.usage = false; }
+    },
+
+    async loadUsageTurns() {
+      try {
+        let url = '/admin/api/usage/turns?limit=50&offset=' + this.usageTurnsOffset;
+        if (this.usageTurnsFilter) url += '&user=' + encodeURIComponent(this.usageTurnsFilter);
+        const r = await this.api(url);
+        if (r.ok) {
+          const j = await r.json();
+          this.usage.turns = j.items || [];
+          if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+        }
+      } catch(e) {
+        console.error('Failed to load usage turns', e);
+      }
     },
 
     async loadRateLimits() {
@@ -694,6 +742,15 @@ Skill description here.
       if (!t) return '-';
       try { return new Date(t).toLocaleString('ko-KR', { hour12: false }); }
       catch(e) { return t; }
+    },
+
+    formatNum(n) {
+      if (n === null || n === undefined) return '-';
+      const v = Number(n);
+      if (!isFinite(v)) return String(n);
+      if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+      if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+      return String(v);
     }
   };
 }"""

@@ -13,6 +13,7 @@ from src.admin_html_logs import get_logs_html
 from src.admin_html_ratelimits import get_ratelimits_html
 from src.admin_html_sessions import get_sessions_html
 from src.admin_html_skills import get_skills_html
+from src.admin_html_usage import get_usage_html
 from src.admin_js import get_admin_js
 from src.admin_styles import get_admin_css
 
@@ -116,6 +117,7 @@ def build_admin_page() -> str:
         <button role="tab" :aria-selected="tab === 'dashboard'" @click="tab='dashboard'">DASH</button>
         <button role="tab" :aria-selected="tab === 'sessions'" @click="tab='sessions'; loadSummary()">SESSIONS</button>
         <button role="tab" :aria-selected="tab === 'logs'" @click="tab='logs'; loadLogs()">LOGS</button>
+        <button role="tab" :aria-selected="tab === 'usage'" @click="tab='usage'; loadUsage()">USAGE</button>
         <button role="tab" :aria-selected="tab === 'ratelimits'" @click="tab='ratelimits'; loadRateLimits()">LIMITS</button>
         <button role="tab" :aria-selected="tab === 'files'" @click="tab='files'; loadFiles()">FILES</button>
         <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">SKILLS</button>
@@ -127,6 +129,8 @@ def build_admin_page() -> str:
         + get_dashboard_html()
         + "\n\n"
         + get_logs_html()
+        + "\n\n"
+        + get_usage_html()
         + "\n\n"
         + get_ratelimits_html()
         + "\n\n"
