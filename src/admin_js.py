@@ -56,8 +56,9 @@ def get_admin_js() -> str:
     newPromptNameWarning: '',
     newPromptContent: '',
     loading: { dashboard: false, logs: false, sessions: false, usage: false },
-    usage: { enabled: null, summary: null, users: [], tools: [], turns: [] },
+    usage: { enabled: null, summary: null, users: [], tools: [], turns: [], series: [] },
     usageWindow: 7,
+    usageGran: 'day',
     usageTurnsFilter: '',
     usageTurnsOffset: 0,
 
@@ -278,10 +279,40 @@ def get_admin_js() -> str:
           this.usage.tools = t.items || [];
         }
         await this.loadUsageTurns();
+        await this.loadUsageSeries();
       } catch(e) {
         console.error('Failed to load usage', e);
         this.showToast('Failed to load usage', 'err');
       } finally { this.loading.usage = false; }
+    },
+
+    async loadUsageSeries() {
+      try {
+        const r = await this.api('/admin/api/usage/series?granularity=' + this.usageGran + '&buckets=5');
+        if (r.ok) {
+          const j = await r.json();
+          // backend returns DESC (newest first); reverse for left-to-right chronology
+          this.usage.series = (j.buckets || []).slice().reverse();
+          if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+        }
+      } catch(e) {
+        console.error('Failed to load usage series', e);
+      }
+    },
+
+    seriesForChart(field) {
+      const rows = this.usage.series || [];
+      if (rows.length === 0) return [];
+      const vals = rows.map(r => {
+        if (field === 'tokens') return Number(r.input_tokens || 0) + Number(r.output_tokens || 0);
+        return Number(r[field] || 0);
+      });
+      const max = Math.max(1, ...vals);
+      return rows.map((r, i) => ({
+        label: String(r.bucket || ''),
+        value: vals[i],
+        pct: vals[i] / max,
+      }));
     },
 
     async loadUsageTurns() {

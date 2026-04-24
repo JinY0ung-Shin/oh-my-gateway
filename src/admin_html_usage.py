@@ -32,6 +32,47 @@ def get_usage_html() -> str:
               </div>
             </div>
 
+            <div class="card mb-lg">
+              <div class="flex-between mb-md">
+                <h3 style="margin:0">Trends</h3>
+                <div class="flex-gap-sm">
+                  <template x-for="g in ['day','week','month']" :key="g">
+                    <button class="btn btn-sm"
+                      :class="usageGran === g ? 'btn-primary' : 'btn-ghost'"
+                      @click="usageGran = g; loadUsageSeries()"
+                      x-text="g.toUpperCase()"></button>
+                  </template>
+                </div>
+              </div>
+              <div x-show="(usage.series ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO DATA ]</div>
+              <div x-show="(usage.series ?? []).length > 0"
+                style="display:grid; grid-template-columns:repeat(auto-fit, minmax(260px, 1fr)); gap:1rem">
+                <template x-for="chart in [
+                  {key:'turns', label:'QUERIES', color:'var(--green)'},
+                  {key:'users', label:'USERS', color:'var(--cyan)'},
+                  {key:'tool_calls', label:'TOOL CALLS', color:'var(--amber)'},
+                  {key:'tokens', label:'TOKENS (IN+OUT)', color:'var(--red)'}
+                ]" :key="chart.key">
+                  <div>
+                    <div class="text-xs text-dim" style="margin-bottom:4px" x-text="chart.label"></div>
+                    <div style="display:flex; gap:6px; align-items:flex-end; height:140px; padding:4px 4px 0; border-bottom:1px solid var(--border-dim)">
+                      <template x-for="b in seriesForChart(chart.key)" :key="b.label + chart.key">
+                        <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:4px; min-width:0">
+                          <div class="text-xs" style="color:var(--text-bright); white-space:nowrap" x-text="formatNum(b.value)"></div>
+                          <div :style="'width:80%; background:' + chart.color + '; height:' + (b.pct*100) + '%; min-height:2px; transition:height 0.3s'"></div>
+                        </div>
+                      </template>
+                    </div>
+                    <div style="display:flex; gap:6px; padding:6px 4px 0">
+                      <template x-for="b in seriesForChart(chart.key)" :key="b.label + chart.key + '-lbl'">
+                        <div class="text-xs text-dim" style="flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis" x-text="b.label"></div>
+                      </template>
+                    </div>
+                  </div>
+                </template>
+              </div>
+            </div>
+
             <div class="grid-3 mb-lg">
               <div class="card stat">
                 <div class="value" x-text="usage.summary?.turns_today ?? '-'"></div>
