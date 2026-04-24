@@ -872,6 +872,22 @@ async def usage_tools_endpoint(
     return {"enabled": True, "items": rows}
 
 
+@router.get("/api/usage/series")
+async def usage_series_endpoint(
+    granularity: str = "day",
+    buckets: int = 5,
+    _=Depends(require_admin),
+):
+    """Recent bucket aggregates for USAGE time-series charts."""
+    from src.usage_queries import get_time_series
+
+    gran = granularity if granularity in ("day", "week", "month") else "day"
+    rows = await get_time_series(granularity=gran, buckets=max(1, min(buckets, 60)))
+    if rows is None:
+        return {"enabled": False, "granularity": gran, "buckets": []}
+    return {"enabled": True, "granularity": gran, "buckets": rows}
+
+
 @router.get("/api/usage/turns")
 async def usage_turns_endpoint(
     user: Optional[str] = None,

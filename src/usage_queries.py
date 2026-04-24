@@ -98,6 +98,72 @@ async def get_top_tools(window_days: int = 7, limit: int = 30) -> Optional[List[
     return rows
 
 
+_GRANULARITY_SQL: Dict[str, str] = {
+    # MySQL expressions that bucket ``ts`` for the requested granularity.
+    # ``%v`` (ISO week) paired with ``%x`` (ISO week year) so boundaries
+    # line up with the Monday-first ISO week definition.
+    "day": "DATE(ts)",
+    "week": "DATE_FORMAT(ts, '%x-W%v')",
+    "month": "DATE_FORMAT(ts, '%Y-%m')",
+}
+
+
+async def get_time_series(
+    granularity: str = "day",
+    buckets: int = 5,
+) -> Optional[List[Dict[str, Any]]]:
+    """Recent bucket totals for the USAGE time-series charts.
+
+    Returns up to ``buckets`` rows ordered newest-first with fields:
+      - ``bucket`` (string label)
+      - ``turns``, ``users``, ``tool_calls``, ``input_tokens``,
+        ``output_tokens``
+
+    Returns ``None`` when usage logging is disabled or the granularity is
+    unknown (caller surfaces that as "logging off").
+    """
+    bucket_expr = _GRANULARITY_SQL.get(granularity)
+    if bucket_expr is None or not usage_logger.enabled:
+        return None
+    n = max(1, min(int(buckets), 60))
+
+    # Turn aggregates - SUM(input_tokens) etc. must be computed BEFORE the
+    # join with usage_tool so tool rows don't duplicate turn tokens.
+    rows = await usage_logger.fetch_rows(
+        f"""
+        SELECT
+          turn_agg.bucket AS bucket,
+          turn_agg.turns AS turns,
+          turn_agg.users AS users,
+          turn_agg.input_tokens AS input_tokens,
+          turn_agg.output_tokens AS output_tokens,
+          COALESCE(tool_agg.tool_calls, 0) AS tool_calls
+        FROM (
+          SELECT
+            {bucket_expr} AS bucket,
+            COUNT(*) AS turns,
+            COUNT(DISTINCT user) AS users,
+            COALESCE(SUM(input_tokens), 0) AS input_tokens,
+            COALESCE(SUM(output_tokens), 0) AS output_tokens
+          FROM usage_turn
+          GROUP BY {bucket_expr}
+        ) turn_agg
+        LEFT JOIN (
+          SELECT
+            {bucket_expr.replace('ts', 'u.ts')} AS bucket,
+            SUM(t.call_count) AS tool_calls
+          FROM usage_tool t
+          JOIN usage_turn u ON u.id = t.turn_id
+          GROUP BY {bucket_expr.replace('ts', 'u.ts')}
+        ) tool_agg ON tool_agg.bucket = turn_agg.bucket
+        ORDER BY turn_agg.bucket DESC
+        LIMIT %s
+        """,
+        (n,),
+    )
+    return rows
+
+
 async def get_recent_turns(
     user: Optional[str] = None,
     limit: int = 50,
