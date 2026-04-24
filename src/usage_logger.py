@@ -32,6 +32,17 @@ def extract_sdk_usage_detail(chunks: list) -> Dict[str, int]:
     for msg in reversed(chunks):
         if isinstance(msg, dict) and msg.get("type") == "result" and msg.get("usage"):
             u = msg["usage"]
+            # TEMP DEBUG: dump raw usage keys once per turn so we can confirm
+            # which field names the claude-agent-sdk actually uses for cache
+            # tokens.  Remove this log once the mapping is confirmed.
+            try:
+                logger.info(
+                    "[usage-debug] ResultMessage.usage keys=%s values=%s",
+                    list(u.keys()) if hasattr(u, "keys") else type(u).__name__,
+                    dict(u) if hasattr(u, "keys") else repr(u)[:500],
+                )
+            except Exception:
+                logger.info("[usage-debug] ResultMessage.usage repr=%s", repr(u)[:500])
             return {
                 "input_tokens": int(u.get("input_tokens", 0) or 0),
                 "output_tokens": int(u.get("output_tokens", 0) or 0),
