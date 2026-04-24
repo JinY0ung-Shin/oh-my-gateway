@@ -825,12 +825,18 @@ async def list_marketplaces_endpoint(_=Depends(require_admin)):
 @router.get("/api/usage/summary")
 async def usage_summary_endpoint(
     window_days: int = 7,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     _=Depends(require_admin),
 ):
     """Overview counters for the usage tab."""
     from src.usage_queries import get_summary
 
-    data = await get_summary(window_days=max(1, min(window_days, 90)))
+    data = await get_summary(
+        window_days=max(1, min(window_days, 365)),
+        start_date=start_date,
+        end_date=end_date,
+    )
     if data is None:
         return {"enabled": False}
     return {"enabled": True, "window_days": window_days, "summary": data}
@@ -840,14 +846,18 @@ async def usage_summary_endpoint(
 async def usage_users_endpoint(
     window_days: int = 7,
     limit: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     _=Depends(require_admin),
 ):
-    """Top users by token usage in the rolling window."""
+    """Top users by token usage in the selected range."""
     from src.usage_queries import get_top_users
 
     rows = await get_top_users(
-        window_days=max(1, min(window_days, 90)),
+        window_days=max(1, min(window_days, 365)),
         limit=max(1, min(limit, 500)),
+        start_date=start_date,
+        end_date=end_date,
     )
     if rows is None:
         return {"enabled": False, "items": []}
@@ -858,14 +868,18 @@ async def usage_users_endpoint(
 async def usage_tools_endpoint(
     window_days: int = 7,
     limit: int = 30,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
     _=Depends(require_admin),
 ):
-    """Top tools by call count in the rolling window."""
+    """Top tools by call count in the selected range."""
     from src.usage_queries import get_top_tools
 
     rows = await get_top_tools(
-        window_days=max(1, min(window_days, 90)),
+        window_days=max(1, min(window_days, 365)),
         limit=max(1, min(limit, 500)),
+        start_date=start_date,
+        end_date=end_date,
     )
     if rows is None:
         return {"enabled": False, "items": []}

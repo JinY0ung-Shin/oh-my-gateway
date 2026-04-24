@@ -8,17 +8,60 @@ render a "usage logging off" hint without treating it as an error.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import datetime as _dt
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.usage_logger import usage_logger
 
 
-async def get_summary(window_days: int = 7) -> Optional[Dict[str, Any]]:
-    """Overview counters for the given rolling window and today (00:00 KST-ish)."""
+def _parse_date(value: Optional[str]) -> Optional[_dt.date]:
+    """Return ``date`` from an ``YYYY-MM-DD`` string, or ``None``."""
+    if not value:
+        return None
+    try:
+        return _dt.date.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def _window_clause(
+    start_date: Optional[str],
+    end_date: Optional[str],
+    window_days: int,
+    *,
+    column: str = "ts",
+) -> Tuple[str, tuple]:
+    """Build the WHERE clause fragment for the requested range.
+
+    When both ``start_date`` and ``end_date`` are valid ``YYYY-MM-DD``
+    strings, filters the inclusive calendar range.  Otherwise falls back
+    to the rolling ``window_days`` window ending now.
+    """
+    s, e = _parse_date(start_date), _parse_date(end_date)
+    if s and e:
+        if e < s:
+            s, e = e, s
+        return (
+            f"{column} >= %s AND {column} < DATE_ADD(%s, INTERVAL 1 DAY)",
+            (s.isoformat(), e.isoformat()),
+        )
+    return (
+        f"{column} >= NOW() - INTERVAL %s DAY",
+        (max(1, int(window_days)),),
+    )
+
+
+async def get_summary(
+    window_days: int = 7,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Overview counters for the given range plus today's totals."""
     if not usage_logger.enabled:
         return None
+    where, params = _window_clause(start_date, end_date, window_days)
     rows = await usage_logger.fetch_rows(
-        """
+        f"""
         SELECT
           COUNT(*) AS turns_window,
           COUNT(DISTINCT user) AS users_window,
@@ -29,9 +72,9 @@ async def get_summary(window_days: int = 7) -> Optional[Dict[str, Any]]:
           COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens_window,
           SUM(status <> 'completed') AS errors_window
         FROM usage_turn
-        WHERE ts >= NOW() - INTERVAL %s DAY
+        WHERE {where}
         """,
-        (int(window_days),),
+        params,
     )
     today_rows = await usage_logger.fetch_rows(
         """
@@ -49,11 +92,17 @@ async def get_summary(window_days: int = 7) -> Optional[Dict[str, Any]]:
     return out
 
 
-async def get_top_users(window_days: int = 7, limit: int = 20) -> Optional[List[Dict[str, Any]]]:
+async def get_top_users(
+    window_days: int = 7,
+    limit: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
     if not usage_logger.enabled:
         return None
+    where, params = _window_clause(start_date, end_date, window_days, column="u.ts")
     rows = await usage_logger.fetch_rows(
-        """
+        f"""
         SELECT
           u.user,
           COUNT(DISTINCT u.session_id) AS chats,
@@ -65,21 +114,27 @@ async def get_top_users(window_days: int = 7, limit: int = 20) -> Optional[List[
           SUM(u.status <> 'completed') AS turn_errors
         FROM usage_turn u
         LEFT JOIN usage_tool t ON t.turn_id = u.id
-        WHERE u.ts >= NOW() - INTERVAL %s DAY
+        WHERE {where}
         GROUP BY u.user
         ORDER BY tokens DESC
         LIMIT %s
         """,
-        (int(window_days), int(limit)),
+        params + (int(limit),),
     )
     return rows
 
 
-async def get_top_tools(window_days: int = 7, limit: int = 30) -> Optional[List[Dict[str, Any]]]:
+async def get_top_tools(
+    window_days: int = 7,
+    limit: int = 30,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+) -> Optional[List[Dict[str, Any]]]:
     if not usage_logger.enabled:
         return None
+    where, params = _window_clause(start_date, end_date, window_days, column="u.ts")
     rows = await usage_logger.fetch_rows(
-        """
+        f"""
         SELECT
           t.tool_name,
           SUM(t.call_count) AS calls,
@@ -88,12 +143,12 @@ async def get_top_tools(window_days: int = 7, limit: int = 30) -> Optional[List[
           COUNT(DISTINCT u.user) AS users
         FROM usage_tool t
         JOIN usage_turn u ON u.id = t.turn_id
-        WHERE u.ts >= NOW() - INTERVAL %s DAY
+        WHERE {where}
         GROUP BY t.tool_name
         ORDER BY calls DESC
         LIMIT %s
         """,
-        (int(window_days), int(limit)),
+        params + (int(limit),),
     )
     return rows
 
