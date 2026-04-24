@@ -161,6 +161,29 @@ class UsageLogger:
     def enabled(self) -> bool:
         return self._pool is not None
 
+    async def fetch_rows(self, sql: str, params: tuple = ()) -> Optional[list]:
+        """Execute a read-only SELECT and return ``list[dict]`` (DictCursor).
+
+        Returns ``None`` when the pool is not configured or the query fails -
+        callers should treat that as "usage logging is not available".
+        Intended only for admin-side analytics queries; callers must supply
+        the full parameterised SQL (no automatic quoting).
+        """
+        if self._pool is None:
+            return None
+        try:
+            import aiomysql  # local import - optional dep
+        except ImportError:
+            return None
+        try:
+            async with self._pool.acquire() as conn:
+                async with conn.cursor(aiomysql.DictCursor) as cur:
+                    await cur.execute(sql, params)
+                    return list(await cur.fetchall())
+        except Exception:
+            logger.warning("usage-log read failed: %s", sql[:120], exc_info=True)
+            return None
+
     # ------------------------------------------------------------------
     # Write path
     # ------------------------------------------------------------------
