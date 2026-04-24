@@ -102,9 +102,13 @@ _GRANULARITY_SQL: Dict[str, str] = {
     # MySQL expressions that bucket ``ts`` for the requested granularity.
     # ``%v`` (ISO week) paired with ``%x`` (ISO week year) so boundaries
     # line up with the Monday-first ISO week definition.
+    #
+    # ``%`` is doubled because aiomysql.Cursor.execute uses printf-style
+    # parameter interpolation on the SQL string; any bare ``%`` would be
+    # eaten as a format directive and raise a binding error.
     "day": "DATE(ts)",
-    "week": "DATE_FORMAT(ts, '%x-W%v')",
-    "month": "DATE_FORMAT(ts, '%Y-%m')",
+    "week": "DATE_FORMAT(ts, '%%x-W%%v')",
+    "month": "DATE_FORMAT(ts, '%%Y-%%m')",
 }
 
 
