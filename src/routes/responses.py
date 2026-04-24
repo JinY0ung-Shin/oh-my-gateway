@@ -34,6 +34,7 @@ from src.rate_limiter import rate_limit_endpoint
 from src.constants import PERMISSION_MODE_BYPASS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
+from src.usage_logger import usage_logger
 from src.workspace_manager import workspace_manager
 from src.image_handler import ImageHandler
 from src.routes.deps import (
@@ -508,6 +509,9 @@ async def create_response(
         return StreamingResponse(_run_stream(), media_type="text/event-stream")
 
     # --- Non-streaming path ---
+    import time as _time
+
+    _usage_start = _time.monotonic()
     try:
         from src.session_guard import session_preflight_scope
 
@@ -614,6 +618,26 @@ async def create_response(
         metadata=body.metadata or {},
     )
 
+    try:
+        await usage_logger.log_turn_from_context(
+            request_context={
+                "session_id": session_id,
+                "user": body.user,
+                "backend": resolved.backend,
+                "provider_model": resolved.provider_model,
+                "previous_response_id": body.previous_response_id,
+                "turn": session.turn_counter,
+            },
+            response_id=resp_id,
+            model=body.model,
+            chunks=chunks,
+            tool_stats=None,
+            started_monotonic=_usage_start,
+            status="completed",
+        )
+    except Exception:
+        logger.warning("usage-log emit failed (non-stream)", exc_info=True)
+
     return response_obj.model_dump()
 
 
@@ -636,6 +660,9 @@ async def _handle_function_call_output(
     session lock to prevent races where concurrent requests could read
     stale ``pending_tool_call`` / ``input_event`` state.
     """
+    import time as _time
+
+    _usage_start = _time.monotonic()
     # --- Validate + unblock under session lock ---
     await session.lock.acquire()
     try:
@@ -825,6 +852,27 @@ async def _handle_function_call_output(
         ),
         metadata=body.metadata or {},
     )
+
+    try:
+        await usage_logger.log_turn_from_context(
+            request_context={
+                "session_id": session_id,
+                "user": body.user,
+                "backend": resolved.backend,
+                "provider_model": resolved.provider_model,
+                "previous_response_id": body.previous_response_id,
+                "turn": session.turn_counter,
+            },
+            response_id=resp_id,
+            model=body.model,
+            chunks=chunks,
+            tool_stats=None,
+            started_monotonic=_usage_start,
+            status="completed",
+        )
+    except Exception:
+        logger.warning("usage-log emit failed (non-stream continuation)", exc_info=True)
+
     return response_obj.model_dump()
 
 
