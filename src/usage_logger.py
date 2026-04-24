@@ -12,13 +12,47 @@ flaky database never impacts user-visible chat behaviour.
 from __future__ import annotations
 
 import asyncio
+import datetime as _dt
 import logging
 import os
+import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 from urllib.parse import unquote, urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def extract_sdk_usage_detail(chunks: list) -> Dict[str, int]:
+    """Return the per-token breakdown used by the usage-log schema.
+
+    Prefers the final ``ResultMessage.usage`` totals.  Falls back to
+    summing per-turn ``AssistantMessage.usage`` entries.
+    """
+    for msg in reversed(chunks):
+        if isinstance(msg, dict) and msg.get("type") == "result" and msg.get("usage"):
+            u = msg["usage"]
+            return {
+                "input_tokens": int(u.get("input_tokens", 0) or 0),
+                "output_tokens": int(u.get("output_tokens", 0) or 0),
+                "cache_read_tokens": int(u.get("cache_read_input_tokens", 0) or 0),
+                "cache_creation_tokens": int(u.get("cache_creation_input_tokens", 0) or 0),
+            }
+
+    total = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+    }
+    for msg in chunks:
+        if isinstance(msg, dict) and msg.get("type") == "assistant" and msg.get("usage"):
+            u = msg["usage"]
+            total["input_tokens"] += int(u.get("input_tokens", 0) or 0)
+            total["output_tokens"] += int(u.get("output_tokens", 0) or 0)
+            total["cache_read_tokens"] += int(u.get("cache_read_input_tokens", 0) or 0)
+            total["cache_creation_tokens"] += int(u.get("cache_creation_input_tokens", 0) or 0)
+    return total
 
 
 @dataclass(frozen=True)
@@ -199,6 +233,61 @@ class UsageLogger:
                     await conn.commit()
         except Exception:
             logger.warning("usage-log write failed", exc_info=True)
+
+
+    async def log_turn_from_context(
+        self,
+        *,
+        request_context: Optional[Dict[str, Any]],
+        response_id: str,
+        model: str,
+        chunks: list,
+        tool_stats: Optional[Dict[str, Dict[str, int]]],
+        started_monotonic: float,
+        status: str,
+        error_code: Optional[str] = None,
+    ) -> None:
+        """Build and write a usage_turn record from streaming-loop context.
+
+        Returns silently when the logger is disabled, when the request has
+        no ``user`` identifier, or when the turn metadata is incomplete -
+        the caller doesn't need to pre-check.
+        """
+        if self._pool is None:
+            return
+        ctx = request_context or {}
+        user = ctx.get("user") or ""
+        if not user:
+            return
+        session_id = ctx.get("session_id") or ""
+        turn = ctx.get("turn")
+        if not session_id or turn is None or not response_id:
+            return
+
+        usage = extract_sdk_usage_detail(chunks)
+        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        duration_ms = int((time.monotonic() - started_monotonic) * 1000)
+
+        await self.log_turn(
+            turn={
+                "ts": ts,
+                "user": user,
+                "session_id": session_id,
+                "response_id": response_id,
+                "previous_response_id": ctx.get("previous_response_id"),
+                "turn": int(turn),
+                "model": model or ctx.get("provider_model"),
+                "backend": ctx.get("backend"),
+                "input_tokens": usage["input_tokens"],
+                "output_tokens": usage["output_tokens"],
+                "cache_read_tokens": usage["cache_read_tokens"],
+                "cache_creation_tokens": usage["cache_creation_tokens"],
+                "duration_ms": duration_ms,
+                "status": status,
+                "error_code": error_code,
+            },
+            tool_stats=tool_stats,
+        )
 
 
 # Module-level singleton used by the streaming/non-streaming paths.
