@@ -1,12 +1,12 @@
-from typing import List, Optional, Union, Literal
+from typing import Literal
 from pydantic import BaseModel, model_validator
 from datetime import datetime
 
 
 class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
-    content: Union[str, List]
-    name: Optional[str] = None
+    content: str | list
+    name: str | None = None
 
     @model_validator(mode="after")
     def normalize_content(self):
@@ -33,5 +33,5 @@ class SessionInfo(BaseModel):
 
 
 class SessionListResponse(BaseModel):
-    sessions: List[SessionInfo]
+    sessions: list[SessionInfo]
     total: int
