@@ -276,6 +276,11 @@ The `/v1/responses` endpoint intentionally deviates from the OpenAI Responses AP
 ```bash
 docker build -t claude-code-gateway .
 
+# With a private PyPI mirror
+docker build \
+  --build-arg PIP_INDEX_URL=https://pypi.example.com/simple \
+  -t claude-code-gateway .
+
 # With API key auth
 docker run -d -p 8000:8000 \
   -e ANTHROPIC_AUTH_TOKEN=your-key \
@@ -300,6 +305,7 @@ Or with docker-compose: `docker compose up -d`
 
 ```bash
 uv sync --group dev
+uv export --format requirements.txt --no-dev --no-hashes --no-emit-project --locked -o requirements.txt  # Refresh Docker deps
 uv run pytest tests/                                # Run tests
 uv run pytest --cov=src --cov-report=term-missing    # With coverage
 uv run ruff check --fix . && uv run ruff format .   # Lint & format
