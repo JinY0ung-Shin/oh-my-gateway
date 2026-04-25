@@ -600,6 +600,61 @@ class TestContinuationNonStreaming:
         assert session.pending_tool_call is None
         assert session.input_response == "yes"
 
+    async def test_continuation_keeps_session_lock_until_backend_receives_response(self):
+        """The pending-tool unblock and continuation read stay in one lock section."""
+        from src.routes.responses import _handle_function_call_output
+
+        class TrackingLock:
+            def __init__(self):
+                self._lock = asyncio.Lock()
+                self.backend_started = False
+                self.releases_before_backend = 0
+
+            async def acquire(self):
+                await self._lock.acquire()
+
+            def release(self):
+                if not self.backend_started:
+                    self.releases_before_backend += 1
+                self._lock.release()
+
+            def locked(self):
+                return self._lock.locked()
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        tracking_lock = TrackingLock()
+        session.lock = tracking_lock
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            tracking_lock.backend_started = True
+            assert tracking_lock.locked()
+            yield {"type": "result", "subtype": "success", "result": "Done!"}
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value="Done!")
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            result = await _handle_function_call_output(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                "/tmp/ws/test",
+                {"call_id": "toolu_abc", "output": "yes"},
+            )
+
+        assert result["status"] == "completed"
+        assert tracking_lock.releases_before_backend == 0
+
     async def test_chained_ask_user_question_returns_requires_action(self):
         """When continuation yields another AskUserQuestion, returns requires_action."""
         from src.routes.responses import _handle_function_call_output
@@ -680,6 +735,47 @@ class TestContinuationNonStreaming:
 
         assert exc_info.value.status_code == 502
         assert "SDK subprocess crashed" in exc_info.value.detail
+
+    async def test_backend_error_disconnects_cleared_persistent_client(self):
+        """Non-streaming continuation disconnects even if backend clears session.client."""
+        from fastapi import HTTPException
+
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        sdk_client = AsyncMock()
+        sdk_client.disconnect = AsyncMock()
+        session.client = sdk_client
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            sess.client = None
+            yield {"is_error": True, "error_message": "SDK subprocess crashed"}
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value=None)
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await _handle_function_call_output(
+                    body,
+                    resolved,
+                    backend,
+                    session,
+                    session_id,
+                    "/tmp/ws/test",
+                    {"call_id": "toolu_abc", "output": "yes"},
+                )
+
+        assert exc_info.value.status_code == 502
+        sdk_client.disconnect.assert_awaited_once()
 
     async def test_empty_response_returns_502(self):
         """When backend yields no text, returns 502."""
@@ -879,6 +975,9 @@ class TestContinuationStreaming:
 
         session_id = "00000000-0000-0000-0000-000000000000"
         session = _make_continuation_session(session_id, turn=1)
+        sdk_client = AsyncMock()
+        sdk_client.disconnect = AsyncMock()
+        session.client = sdk_client
         body = _make_body(stream=True)
         resolved = _make_resolved()
 
@@ -919,6 +1018,8 @@ class TestContinuationStreaming:
         all_sse = "".join(lines)
         assert "response.failed" in all_sse
         assert "server_error" in all_sse
+        sdk_client.disconnect.assert_awaited_once()
+        assert session.client is None
 
     async def test_streaming_fallback_to_run_completion_with_client(self):
         """Streaming uses run_completion_with_client when receive_response_from_client is absent."""

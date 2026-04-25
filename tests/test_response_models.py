@@ -72,6 +72,18 @@ def test_response_create_request_accepts_input_image_part():
     assert part.image_url == "data:image/png;base64,abc123"
 
 
+def test_response_create_request_uses_runtime_default_model_when_omitted():
+    from src.runtime_config import runtime_config
+
+    runtime_config.reset_all()
+    try:
+        runtime_config.set("default_model", "runtime-default-model")
+        req = ResponseCreateRequest(input="hello")
+        assert req.model == "runtime-default-model"
+    finally:
+        runtime_config.reset_all()
+
+
 def test_response_create_request_rejects_non_string_input_image_url():
     with pytest.raises(ValidationError):
         ResponseCreateRequest(

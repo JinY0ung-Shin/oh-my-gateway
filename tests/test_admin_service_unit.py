@@ -339,6 +339,13 @@ class TestRedactedConfig:
             assert env["ANTHROPIC_AUTH_TOKEN"] == "***REDACTED***"
             assert env["API_KEY"] == "***REDACTED***"
 
+    def test_mcp_config_redacted(self):
+        mcp_config = '{"servers":{"demo":{"headers":{"Authorization":"Bearer secret-token"}}}}'
+        with patch.dict(os.environ, {"MCP_CONFIG": mcp_config}):
+            config = get_redacted_config()
+            env = config["environment"]
+            assert env["MCP_CONFIG"] == "***REDACTED***"
+
     def test_non_secrets_visible(self):
         config = get_redacted_config()
         assert "runtime" in config

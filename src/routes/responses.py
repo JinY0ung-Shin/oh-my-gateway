@@ -1,10 +1,10 @@
 """Responses API endpoint (/v1/responses)."""
 
+import asyncio
 import json
 import logging
 import secrets
 import uuid
-from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -134,6 +134,23 @@ def _build_failed_response(
     )
 
 
+async def _disconnect_session_client(session, reason: str, client=None) -> None:
+    """Drop and disconnect a persistent SDK client after stream failure/cancel."""
+    if client is None:
+        client = getattr(session, "client", None)
+    if client is None:
+        return
+    if getattr(session, "client", None) is client:
+        session.client = None
+    disconnect = getattr(client, "disconnect", None)
+    if disconnect is None:
+        return
+    try:
+        await asyncio.wait_for(disconnect(), timeout=2.0)
+    except Exception:
+        logger.debug("SDK client disconnect failed after %s", reason, exc_info=True)
+
+
 async def _responses_streaming_preflight(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
@@ -159,8 +176,17 @@ async def _responses_streaming_preflight(
     # Pre-parse turn for validation inside the lock
     turn: Optional[int] = None
     if not is_new_session:
-        assert body.previous_response_id is not None
+        if body.previous_response_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="previous_response_id is required for an existing session",
+            )
         parsed = _parse_response_id(body.previous_response_id)
+        if parsed is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"previous_response_id '{body.previous_response_id}' is invalid",
+            )
         _, turn = parsed  # guaranteed valid at this point
 
     pf = await acquire_session_preflight(
@@ -189,6 +215,7 @@ async def _responses_streaming_preflight(
             session_id=session_id if pf.is_new else None,
             resume=pf.resume_id,
             cwd=workspace_str,
+            allowed_tools=body.allowed_tools,
         ),
     }
 
@@ -271,6 +298,7 @@ async def create_response(
         try:
             workspace = workspace_manager.resolve(body.user, sync_template=True)
         except ValueError as e:
+            await session_manager.delete_session_async(session_id)
             raise HTTPException(status_code=400, detail=str(e))
         session.user = body.user
         session.workspace = str(workspace)
@@ -404,6 +432,7 @@ async def create_response(
         async def _run_stream():
             lock_acquired = preflight["lock_acquired"]
             stream_result: dict = {"success": False}
+            active_client = session.client if use_sdk_client else None
             try:
                 chunks_buffer = []
 
@@ -503,6 +532,10 @@ async def create_response(
                     sequence_number=0,
                 )
             finally:
+                if use_sdk_client and not stream_result.get("success"):
+                    await _disconnect_session_client(
+                        session, "responses stream failure", client=active_client
+                    )
                 if lock_acquired:
                     session.lock.release()
 
@@ -512,14 +545,24 @@ async def create_response(
     import time as _time
 
     _usage_start = _time.monotonic()
+    active_client = None
     try:
         from src.session_guard import session_preflight_scope
 
         # Pre-parse turn for validation inside the lock
         _turn: Optional[int] = None
         if not is_new_session:
-            assert body.previous_response_id is not None
+            if body.previous_response_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="previous_response_id is required for an existing session",
+                )
             _parsed = _parse_response_id(body.previous_response_id)
+            if _parsed is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"previous_response_id '{body.previous_response_id}' is invalid",
+                )
             _, _turn = _parsed
 
         async with session_preflight_scope(
@@ -533,8 +576,9 @@ async def create_response(
             # Execute backend — persistent client or single-use query
             chunks = []
             if use_sdk_client:
+                active_client = session.client
                 async for chunk in backend.run_completion_with_client(
-                    session.client, prompt, session
+                    active_client, prompt, session
                 ):
                     chunks.append(chunk)
             else:
@@ -550,6 +594,7 @@ async def create_response(
                     session_id=session_id if pf.is_new else None,
                     resume=pf.resume_id,
                     cwd=workspace_str,
+                    allowed_tools=body.allowed_tools,
                 ):
                     chunks.append(chunk)
 
@@ -585,8 +630,16 @@ async def create_response(
             )
 
     except HTTPException:
+        if active_client is not None:
+            await _disconnect_session_client(
+                session, "responses non-stream failure", client=active_client
+            )
         raise
     except Exception as e:
+        if active_client is not None:
+            await _disconnect_session_client(
+                session, "responses non-stream failure", client=active_client
+            )
         # Do not echo raw exception strings to clients — they can contain
         # file paths, subprocess commands, or other backend internals.
         # Full details go to logs for operators; response stays generic.
@@ -663,7 +716,9 @@ async def _handle_function_call_output(
     import time as _time
 
     _usage_start = _time.monotonic()
-    # --- Validate + unblock under session lock ---
+    # --- Validate + unblock under session lock, then keep the lock through
+    # the continuation read so no concurrent request can mutate session state
+    # between the tool output and SDK resume.
     await session.lock.acquire()
     try:
         if session.pending_tool_call is None:
@@ -704,20 +759,18 @@ async def _handle_function_call_output(
             )
         pending_event.set()  # Unblocks the callback; SDK continues processing
         session.pending_tool_call = None  # Clear the pending state
-    finally:
+    except Exception:
         session.lock.release()
+        raise
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1
     resp_id = _make_response_id(session_id, next_turn)
     output_item_id = _generate_msg_id()
+    active_client = session.client
 
     if body.stream:
-        # Acquire session lock for the streaming duration
-        await session.lock.acquire()
-
         async def _run_continuation_stream():
-            lock_acquired = True
             stream_result = {"success": False}
             try:
                 chunks_buffer = []
@@ -725,9 +778,9 @@ async def _handle_function_call_output(
                 # processing from where it left off.  Use
                 # receive_response_from_client (no new query needed).
                 if hasattr(backend, "receive_response_from_client"):
-                    chunk_source = backend.receive_response_from_client(session.client, session)
+                    chunk_source = backend.receive_response_from_client(active_client, session)
                 else:
-                    chunk_source = backend.run_completion_with_client(session.client, "", session)
+                    chunk_source = backend.run_completion_with_client(active_client, "", session)
 
                 sse_source = streaming_utils.stream_response_chunks(
                     chunk_source=chunk_source,
@@ -790,20 +843,26 @@ async def _handle_function_call_output(
                     sequence_number=0,
                 )
             finally:
-                if lock_acquired:
-                    session.lock.release()
+                if not stream_result.get("success"):
+                    await _disconnect_session_client(
+                        session,
+                        "responses continuation stream failure",
+                        client=active_client,
+                    )
+                session.lock.release()
 
         return StreamingResponse(_run_continuation_stream(), media_type="text/event-stream")
 
     # --- Non-streaming continuation ---
-    async with _nonstreaming_lock(session):
+    continuation_success = False
+    try:
         chunks = []
         # After the hook returns deny+reason, the SDK continues
         # processing from where it left off — no new query needed.
         if hasattr(backend, "receive_response_from_client"):
-            chunk_source = backend.receive_response_from_client(session.client, session)
+            chunk_source = backend.receive_response_from_client(active_client, session)
         else:
-            chunk_source = backend.run_completion_with_client(session.client, "", session)
+            chunk_source = backend.run_completion_with_client(active_client, "", session)
         async for chunk in chunk_source:
             chunks.append(chunk)
 
@@ -811,6 +870,7 @@ async def _handle_function_call_output(
         if session.pending_tool_call is not None:
             tc = session.pending_tool_call
             session.turn_counter = next_turn
+            continuation_success = True
             return _build_requires_action_response(
                 resp_id, body.model, tc, body.metadata
             ).model_dump()
@@ -831,6 +891,13 @@ async def _handle_function_call_output(
         session_manager.add_assistant_response(
             session_id, Message(role="assistant", content=assistant_text)
         )
+        continuation_success = True
+    finally:
+        if not continuation_success:
+            await _disconnect_session_client(
+                session, "responses continuation non-stream failure", client=active_client
+            )
+        session.lock.release()
 
     prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
         chunks, "", assistant_text, body.model, backend=backend
@@ -874,13 +941,3 @@ async def _handle_function_call_output(
         logger.warning("usage-log emit failed (non-stream continuation)", exc_info=True)
 
     return response_obj.model_dump()
-
-
-@asynccontextmanager
-async def _nonstreaming_lock(session):
-    """Acquire and release session lock for non-streaming continuation."""
-    await session.lock.acquire()
-    try:
-        yield
-    finally:
-        session.lock.release()

@@ -47,6 +47,7 @@ from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns
+from src.runtime_config import get_default_max_turns
 
 logger = logging.getLogger(__name__)
 
@@ -554,7 +555,7 @@ class ClaudeCodeCLI:
         options = self._build_sdk_options(
             model=model,
             system_prompt=system_prompt,
-            max_turns=DEFAULT_MAX_TURNS,
+            max_turns=get_default_max_turns(),
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
             session_id=client_session_id,
@@ -667,7 +668,7 @@ class ClaudeCodeCLI:
         system_prompt: Optional[str] = None,
         model: Optional[str] = None,
         stream: bool = True,  # Accepted for caller compatibility; always yields chunks.
-        max_turns: int = DEFAULT_MAX_TURNS,
+        max_turns: Optional[int] = None,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
         session_id: Optional[str] = None,
@@ -693,7 +694,7 @@ class ClaudeCodeCLI:
                 options = self._build_sdk_options(
                     model=model,
                     system_prompt=system_prompt,
-                    max_turns=max_turns,
+                    max_turns=max_turns if max_turns is not None else get_default_max_turns(),
                     allowed_tools=allowed_tools,
                     _custom_base=_extra.get("_custom_base", self._UNSET),
                     disallowed_tools=disallowed_tools,

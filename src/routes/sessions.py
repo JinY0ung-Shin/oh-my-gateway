@@ -60,7 +60,7 @@ async def delete_session(
 ):
     """Delete a specific session."""
     await verify_api_key(request, credentials)
-    deleted = session_manager.delete_session(session_id)
+    deleted = await session_manager.delete_session_async(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
 

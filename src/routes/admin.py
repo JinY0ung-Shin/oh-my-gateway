@@ -293,7 +293,7 @@ async def bulk_delete_sessions(body: BulkDeleteRequest, _=Depends(require_admin)
 
     if body.session_ids:
         for sid in body.session_ids:
-            if session_manager.delete_session(sid):
+            if await session_manager.delete_session_async(sid):
                 deleted_ids.append(sid)
         return {
             "deleted_count": len(deleted_ids),
@@ -387,7 +387,7 @@ async def delete_session(session_id: str, _=Depends(require_admin)):
     """Delete a session. Proxied from admin so it stays within admin auth."""
     from src.session_manager import session_manager
 
-    deleted = session_manager.delete_session(session_id)
+    deleted = await session_manager.delete_session_async(session_id)
     if not deleted:
         return JSONResponse(status_code=404, content={"error": "Session not found"})
     return {"status": "deleted", "session_id": session_id}

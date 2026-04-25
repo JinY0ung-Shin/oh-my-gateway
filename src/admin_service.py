@@ -398,7 +398,7 @@ def get_redacted_config() -> Dict[str, Any]:
     )
 
     def _redact(key: str, value: Any) -> Any:
-        if _SECRET_PATTERNS.search(key):
+        if key == "MCP_CONFIG" or _SECRET_PATTERNS.search(key):
             if value and str(value).strip():
                 return "***REDACTED***"
             return "(not set)"

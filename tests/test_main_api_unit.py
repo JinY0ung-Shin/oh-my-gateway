@@ -216,7 +216,7 @@ def test_session_endpoints_and_http_exception_handler():
             return session_obj
         return None
 
-    def fake_delete_session(session_id):
+    async def fake_delete_session_async(session_id):
         return session_id == "demo-session"
 
     with (
@@ -229,7 +229,11 @@ def test_session_endpoints_and_http_exception_handler():
         ),
         patch.object(main.session_manager, "list_sessions", return_value=[session_info]),
         patch.object(main.session_manager, "get_session", side_effect=fake_get_session),
-        patch.object(main.session_manager, "delete_session", side_effect=fake_delete_session),
+        patch.object(
+            main.session_manager,
+            "delete_session_async",
+            side_effect=fake_delete_session_async,
+        ),
     ):
         stats_response = client.get("/v1/sessions/stats")
         list_response = client.get("/v1/sessions")
@@ -714,6 +718,98 @@ def test_responses_claude_unchanged(isolated_session_manager):
     assert run_calls[0]["system_prompt"] == "Be helpful"
     assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
     assert session.backend == "claude"
+
+
+def test_responses_fallback_forwards_allowed_tools(isolated_session_manager):
+    """Fallback query path preserves explicit tool restrictions."""
+    run_calls = []
+
+    async def fake_run_completion(**kwargs):
+        run_calls.append(kwargs)
+        yield {"subtype": "success", "result": "Claude says hi"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = AsyncMock(side_effect=RuntimeError("no client"))
+        mock_cli.run_completion = fake_run_completion
+        mock_cli.parse_message.return_value = "Claude says hi"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello Claude",
+                "allowed_tools": ["Read"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert run_calls[0]["allowed_tools"] == ["Read"]
+
+
+def test_responses_streaming_error_disconnects_persistent_client(isolated_session_manager):
+    """Streaming failures discard the session SDK client."""
+    sdk_client = AsyncMock()
+    sdk_client.disconnect = AsyncMock()
+
+    async def fake_run_with_client(client, prompt, session):
+        raise RuntimeError("stream exploded")
+        yield {}  # pragma: no cover - marks this as an async generator
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = AsyncMock(return_value=sdk_client)
+        mock_cli.run_completion_with_client = fake_run_with_client
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello Claude",
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert "response.failed" in response.text
+    sdk_client.disconnect.assert_awaited_once()
+
+
+def test_responses_nonstreaming_error_disconnects_cleared_persistent_client(
+    isolated_session_manager,
+):
+    """Non-streaming failures disconnect even if backend cleared session.client first."""
+    sdk_client = AsyncMock()
+    sdk_client.disconnect = AsyncMock()
+
+    async def fake_run_with_client(client, prompt, session):
+        session.client = None
+        yield {"is_error": True, "error_message": "SDK receive failed"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = AsyncMock(return_value=sdk_client)
+        mock_cli.run_completion_with_client = fake_run_with_client
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello Claude",
+            },
+        )
+
+    assert response.status_code == 502
+    sdk_client.disconnect.assert_awaited_once()
 
 
 def test_responses_concurrent_stale_id_race(isolated_session_manager):

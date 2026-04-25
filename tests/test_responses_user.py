@@ -115,6 +115,7 @@ class TestUserParam:
 
         assert resp.status_code == 400
         assert "Invalid user" in resp.json()["error"]["message"]
+        assert isolated_session_manager.sessions == {}
 
 
 class TestUserSessionBinding:

@@ -280,7 +280,7 @@ class SessionManager:
                 return
             try:
                 await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
-            except (asyncio.TimeoutError, Exception):
+            except Exception:
                 logger.debug("Client disconnect timed out or failed", exc_info=True)
             session.client = None
 
@@ -360,13 +360,46 @@ class SessionManager:
             return self.sessions.get(session_id)
 
     def delete_session(self, session_id: str) -> bool:
-        """Delete a session.  Returns ``True`` if it was found and removed."""
+        """Delete a session.  Returns ``True`` if it was found and removed.
+
+        Synchronous callers cannot await SDK client shutdown. Async request
+        handlers should use ``delete_session_async`` so active clients are
+        disconnected before the session disappears.
+        """
         with self.lock:
-            if session_id not in self.sessions:
+            session = self.sessions.pop(session_id, None)
+            if session is None:
                 return False
-            del self.sessions[session_id]
-            logger.info(f"Deleted session: {session_id}")
-            return True
+        if session.client is not None:
+            logger.warning(
+                "Deleted session %s with an active client; use delete_session_async "
+                "from async callers",
+                session_id,
+            )
+        if session.workspace:
+            self._cleanup_workspace(session.workspace)
+        logger.info(f"Deleted session: {session_id}")
+        return True
+
+    async def delete_session_async(self, session_id: str) -> bool:
+        """Delete a session, disconnecting its client and cleaning temp workspace."""
+        with self.lock:
+            session = self.sessions.pop(session_id, None)
+        if session is None:
+            return False
+
+        if session.client is not None:
+            try:
+                await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+            except Exception:
+                logger.debug("Client disconnect timed out or failed", exc_info=True)
+            session.client = None
+
+        if session.workspace:
+            self._cleanup_workspace(session.workspace)
+
+        logger.info(f"Deleted session: {session_id}")
+        return True
 
     def list_sessions(self) -> List[SessionInfo]:
         """List all active (non-expired) sessions."""

@@ -4,6 +4,7 @@ import pytest
 
 from src.runtime_config import (
     EDITABLE_KEYS,
+    get_default_max_turns,
     get_default_model,
     get_thinking_mode,
     get_token_streaming,
@@ -121,6 +122,10 @@ class TestConvenienceGetters:
         assert get_default_model() == DEFAULT_MODEL
         runtime_config.set("default_model", "custom")
         assert get_default_model() == "custom"
+
+    def test_get_default_max_turns(self):
+        runtime_config.set("default_max_turns", 7)
+        assert get_default_max_turns() == 7
 
     def test_get_thinking_mode(self):
         runtime_config.set("thinking_mode", "disabled")

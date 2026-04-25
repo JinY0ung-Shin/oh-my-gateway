@@ -5,6 +5,8 @@ from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Discriminator, Field, Tag
 
+from src.runtime_config import get_default_model
+
 
 class ResponseInputTextPart(BaseModel):
     """A text content part within a Responses API input item."""
@@ -69,7 +71,7 @@ class FunctionCallOutputInput(BaseModel):
 class ResponseCreateRequest(BaseModel):
     """POST /v1/responses request body."""
 
-    model: str
+    model: str = Field(default_factory=get_default_model)
     input: Union[str, List[Union[ResponseInputItem, FunctionCallOutputInput]]] = Field(
         description="User input as a plain string, array of input items, "
         "or function_call_output for tool continuations"

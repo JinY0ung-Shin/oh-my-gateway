@@ -316,3 +316,10 @@ class TestTruncateImageData:
         obj = {"source": {"data": long_b64}}
         result = _truncate_image_data(obj)
         assert result["source"]["data"].endswith("...[truncated]")
+
+    def test_truncate_image_data_image_url_field(self):
+        """Truncates Responses API input_image image_url fields."""
+        long_b64 = "data:image/png;base64," + "C" * 300
+        obj = {"content": [{"type": "input_image", "image_url": long_b64}]}
+        result = _truncate_image_data(obj)
+        assert result["content"][0]["image_url"].endswith("...[truncated]")

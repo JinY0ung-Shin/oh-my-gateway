@@ -9,6 +9,7 @@ These are pure unit tests that don't require a running server.
 import pytest
 from datetime import datetime, timedelta, timezone
 import asyncio
+from unittest.mock import AsyncMock
 
 from src.session_manager import Session, SessionManager
 from src.models import Message
@@ -211,6 +212,27 @@ class TestSessionManager:
         """delete_session() returns False for non-existent session."""
         result = manager.delete_session("nonexistent")
         assert result is False
+
+    async def test_delete_session_async_disconnects_client_and_cleans_workspace(
+        self, manager, tmp_path
+    ):
+        """delete_session_async() tears down resources before forgetting a session."""
+        workspace = tmp_path / "_tmp_delete_async"
+        workspace.mkdir()
+        (workspace / "scratch.txt").write_text("temporary")
+
+        session = manager.get_or_create_session("async-delete")
+        client = AsyncMock()
+        client.disconnect = AsyncMock()
+        session.client = client
+        session.workspace = str(workspace)
+
+        result = await manager.delete_session_async("async-delete")
+
+        assert result is True
+        assert "async-delete" not in manager.sessions
+        client.disconnect.assert_awaited_once()
+        assert not workspace.exists()
 
     def test_list_sessions_returns_active_sessions(self, manager):
         """list_sessions() returns list of active sessions."""

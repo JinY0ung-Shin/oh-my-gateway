@@ -179,6 +179,10 @@ def get_default_model() -> str:
     return runtime_config.get("default_model")
 
 
+def get_default_max_turns() -> int:
+    return runtime_config.get("default_max_turns")
+
+
 def get_thinking_mode() -> str:
     return runtime_config.get("thinking_mode")
 

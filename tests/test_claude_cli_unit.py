@@ -487,6 +487,29 @@ class TestClaudeCodeCLIRunCompletion:
             assert captured_options[0].model == "claude-3-opus"
 
     @pytest.mark.asyncio
+    async def test_run_completion_uses_runtime_default_max_turns(self, cli_instance):
+        """run_completion uses the editable default_max_turns when omitted."""
+        from src.runtime_config import runtime_config
+
+        mock_message = {"type": "assistant"}
+        captured_options = []
+
+        async def mock_query(prompt, options):
+            captured_options.append(options)
+            yield mock_message
+
+        runtime_config.reset_all()
+        try:
+            runtime_config.set("default_max_turns", 7)
+            with patch("src.backends.claude.client.query", mock_query):
+                async for _ in cli_instance.run_completion("Hello"):
+                    pass
+        finally:
+            runtime_config.reset_all()
+
+        assert captured_options[0].max_turns == 7
+
+    @pytest.mark.asyncio
     async def test_run_completion_with_tool_restrictions(self, cli_instance):
         """run_completion sets allowed/disallowed tools."""
         mock_message = {"type": "assistant"}

@@ -96,7 +96,7 @@ def truncate_image_data(obj: Any) -> Any:
     if isinstance(obj, dict):
         result = {}
         for k, v in obj.items():
-            if k in ("data", "url") and isinstance(v, str) and len(v) > 200:
+            if k in ("data", "url", "image_url") and isinstance(v, str) and len(v) > 200:
                 if "base64" in v[:50] or v.startswith("data:image"):
                     result[k] = v[:50] + "...[truncated]"
                     continue
