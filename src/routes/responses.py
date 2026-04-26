@@ -400,12 +400,12 @@ async def create_response(
             # (e.g. SDK error/disconnect), prefer the prompt frozen at session
             # start so admin-side prompt changes mid-conversation don't leak
             # into in-flight sessions.
-            from src.system_prompt import get_system_prompt, resolve_cwd_placeholder
+            from src.system_prompt import get_system_prompt, resolve_request_placeholders
 
             if session.base_system_prompt is not None:
                 resolved_base = session.base_system_prompt
             else:
-                resolved_base = resolve_cwd_placeholder(get_system_prompt(), workspace_str)
+                resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
             session.client = await backend.create_client(
                 session=session,
                 model=resolved.provider_model,

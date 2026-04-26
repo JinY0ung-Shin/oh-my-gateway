@@ -21,7 +21,6 @@ SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "")
 
 # System prompt placeholder values (resolved in {{PLACEHOLDER}} tokens)
 PROMPT_LANGUAGE = os.getenv("PROMPT_LANGUAGE", "English")
-PROMPT_MEMORY_PATH = os.getenv("PROMPT_MEMORY_PATH", "")
 
 # API Configuration
 DEFAULT_MAX_TURNS = int(os.getenv("DEFAULT_MAX_TURNS", "10"))

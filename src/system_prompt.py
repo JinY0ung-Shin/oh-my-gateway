@@ -90,32 +90,41 @@ def _save_persisted(text: Optional[str], *, active_name: Optional[str] = None) -
 def _resolve_placeholders(text: str) -> str:
     """Replace ``{{PLACEHOLDER}}`` tokens with runtime values.
 
-    ``{{WORKING_DIRECTORY}}`` is intentionally left unresolved here because
-    the actual working directory varies per-user workspace.  Use
-    :func:`resolve_cwd_placeholder` at request time to fill it in.
+    ``{{WORKING_DIRECTORY}}`` and ``{{MEMORY_PATH}}`` are intentionally left
+    unresolved here because they vary per-user workspace.  Use
+    :func:`resolve_request_placeholders` at request time to fill them in.
     """
-    from src.constants import PROMPT_LANGUAGE, PROMPT_MEMORY_PATH
+    from src.constants import PROMPT_LANGUAGE
 
     replacements = {
         "LANGUAGE": PROMPT_LANGUAGE,
         "PLATFORM": platform.system().lower(),
         "SHELL": os.environ.get("SHELL", ""),
         "OS_VERSION": platform.platform(),
-        "MEMORY_PATH": PROMPT_MEMORY_PATH,
     }
     for key, value in replacements.items():
         text = text.replace("{{" + key + "}}", value)
     return text
 
 
-def resolve_cwd_placeholder(text: Optional[str], cwd: str) -> Optional[str]:
-    """Replace ``{{WORKING_DIRECTORY}}`` with the actual per-user *cwd*.
+def resolve_request_placeholders(text: Optional[str], cwd: str) -> Optional[str]:
+    """Replace per-request ``{{PLACEHOLDER}}`` tokens against *cwd*.
+
+    Resolves ``{{WORKING_DIRECTORY}}`` to *cwd* and ``{{MEMORY_PATH}}`` to
+    ``<cwd>/.memory`` (creating the directory so the prompt's "directory
+    already exists" assurance holds).
 
     Safe to call with ``None`` — returns ``None`` unchanged.
     """
-    if text is None or "{{WORKING_DIRECTORY}}" not in text:
+    if text is None:
         return text
-    return text.replace("{{WORKING_DIRECTORY}}", cwd)
+    if "{{MEMORY_PATH}}" in text:
+        memory_dir = Path(cwd) / ".memory"
+        memory_dir.mkdir(exist_ok=True)
+        text = text.replace("{{MEMORY_PATH}}", str(memory_dir))
+    if "{{WORKING_DIRECTORY}}" in text:
+        text = text.replace("{{WORKING_DIRECTORY}}", cwd)
+    return text
 
 
 def load_default_prompt(file_path: str = "") -> None:

@@ -256,11 +256,11 @@ class ClaudeCodeCLI:
         # when it is a string the caller is responsible for having pre-resolved
         # all request-time placeholders.
         if _custom_base is self._UNSET:
-            from src.system_prompt import get_system_prompt, resolve_cwd_placeholder
+            from src.system_prompt import get_system_prompt, resolve_request_placeholders
 
             custom_base = get_system_prompt()
             if custom_base and effective_cwd:
-                custom_base = resolve_cwd_placeholder(custom_base, str(effective_cwd))
+                custom_base = resolve_request_placeholders(custom_base, str(effective_cwd))
         else:
             custom_base = _custom_base
 
