@@ -1155,3 +1155,67 @@ class TestTurn1PersistentClient:
             )
         assert r.status_code == 200
         assert fallback_used, "run_completion() fallback should be used when create_client() fails"
+
+    def test_reconnect_uses_session_base_system_prompt(self, isolated_session_manager):
+        """When the persistent client was lost (session.client=None) but the
+        session already has a frozen base_system_prompt from prior preflight,
+        create_client must receive that frozen value as _custom_base — not
+        whatever the global system prompt currently returns. This protects
+        in-flight sessions from admin prompt changes mid-conversation.
+        """
+        captured: dict = {}
+
+        async def fake_create_client(**kwargs):
+            captured.update(kwargs)
+            return MagicMock()
+
+        async def fake_run_completion_with_client(client, prompt, session):
+            yield {"subtype": "success", "result": "OK"}
+
+        import uuid as _uuid
+        from src import system_prompt as sp
+
+        session_id = str(_uuid.uuid4())
+
+        # Simulate admin changing the global prompt mid-conversation.
+        original_runtime = sp._runtime_prompt
+        original_runtime_raw = sp._runtime_prompt_raw
+        sp._runtime_prompt = "NEW_GLOBAL_AFTER_ADMIN_CHANGE: {{WORKING_DIRECTORY}}"
+        sp._runtime_prompt_raw = "NEW_GLOBAL_AFTER_ADMIN_CHANGE: {{WORKING_DIRECTORY}}"
+
+        try:
+            with _integration_client_context() as (test_client, mock_cli):
+                mock_cli.create_client = fake_create_client
+                mock_cli.run_completion_with_client = fake_run_completion_with_client
+                mock_cli.parse_message = MagicMock(return_value="OK")
+
+                # Pre-create a session that has already gone through one turn:
+                # base_system_prompt is frozen, client was lost. Created inside
+                # the TestClient context so it survives any startup state mgmt.
+                session = isolated_session_manager.get_or_create_session(session_id)
+                session.base_system_prompt = "FROZEN_AT_SESSION_START"
+                session.workspace = "/tmp/ws/test"
+                session.turn_counter = 1
+                session.backend = "claude"
+                session.client = None  # client was lost
+                session.user = None
+
+                r = test_client.post(
+                    "/v1/responses",
+                    json={
+                        "model": DEFAULT_MODEL,
+                        "input": "next turn",
+                        "previous_response_id": f"resp_{session_id}_1",
+                        "stream": False,
+                    },
+                    headers={"Authorization": "Bearer test"},
+                )
+        finally:
+            sp._runtime_prompt = original_runtime
+            sp._runtime_prompt_raw = original_runtime_raw
+
+        assert r.status_code == 200, r.text
+        assert captured.get("_custom_base") == "FROZEN_AT_SESSION_START", (
+            f"Expected frozen session base_system_prompt to win, got "
+            f"{captured.get('_custom_base')!r}"
+        )

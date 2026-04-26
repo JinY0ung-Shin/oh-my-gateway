@@ -112,6 +112,73 @@ async def test_create_client_uses_fresh_session_id():
     assert len(options.session_id) == 36  # UUID format
 
 
+async def test_create_client_accepts_custom_base_with_resolved_cwd():
+    """create_client() must use _custom_base verbatim — caller is responsible
+    for resolving {{WORKING_DIRECTORY}} before passing it.
+
+    Regression: previously the persistent-client path bypassed _custom_base
+    and fell back to ``get_system_prompt()`` which returns the unresolved
+    template, leaking ``{{WORKING_DIRECTORY}}`` into options.system_prompt.
+    """
+    cli = _make_cli()
+    session = Session(session_id="sess-cwd")
+
+    captured_options = {}
+
+    with patch("src.backends.claude.client.ClaudeSDKClient") as MockSDKClient:
+        mock_instance = AsyncMock()
+
+        def capture_init(**kwargs):
+            captured_options.update(kwargs)
+            return mock_instance
+
+        MockSDKClient.side_effect = capture_init
+
+        # Caller pre-resolves the placeholder to the user workspace path.
+        await cli.create_client(
+            session,
+            cwd="/var/workspaces/alice",
+            _custom_base="Primary working directory: /var/workspaces/alice",
+        )
+
+    options = captured_options.get("options")
+    assert options is not None
+    # No unresolved placeholder in the system prompt sent to the SDK.
+    assert "{{WORKING_DIRECTORY}}" not in options.system_prompt
+    assert "/var/workspaces/alice" in options.system_prompt
+
+
+async def test_create_client_unset_fallback_does_not_leak_placeholder(monkeypatch):
+    """When _custom_base is omitted, fallback to get_system_prompt() must still
+    resolve {{WORKING_DIRECTORY}} using the per-call cwd. This guards against
+    callers that forget to pre-resolve."""
+    cli = _make_cli()
+    session = Session(session_id="sess-fallback")
+
+    # Install an unresolved custom prompt as the global runtime override.
+    from src import system_prompt as sp
+
+    monkeypatch.setattr(sp, "_runtime_prompt", "cwd={{WORKING_DIRECTORY}}")
+    monkeypatch.setattr(sp, "_runtime_prompt_raw", "cwd={{WORKING_DIRECTORY}}")
+
+    captured_options = {}
+
+    with patch("src.backends.claude.client.ClaudeSDKClient") as MockSDKClient:
+        mock_instance = AsyncMock()
+
+        def capture_init(**kwargs):
+            captured_options.update(kwargs)
+            return mock_instance
+
+        MockSDKClient.side_effect = capture_init
+        await cli.create_client(session, cwd="/ws/bob")
+
+    options = captured_options.get("options")
+    assert options is not None
+    assert "{{WORKING_DIRECTORY}}" not in options.system_prompt
+    assert "/ws/bob" in options.system_prompt
+
+
 # ---------------------------------------------------------------------------
 # run_completion_with_client
 # ---------------------------------------------------------------------------

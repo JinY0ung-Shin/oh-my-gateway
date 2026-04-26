@@ -250,13 +250,17 @@ class ClaudeCodeCLI:
 
         # Resolve the custom base prompt.  When _custom_base is the sentinel
         # (_UNSET) the caller did not provide a frozen value so we read the
-        # current global state (appropriate for stateless / first-turn calls).
+        # current global state and resolve {{WORKING_DIRECTORY}} against the
+        # effective cwd (appropriate for stateless / first-turn calls).
         # When it is explicitly ``None`` the session was created in preset mode;
-        # when it is a string the session was created in custom-base mode.
+        # when it is a string the caller is responsible for having pre-resolved
+        # all request-time placeholders.
         if _custom_base is self._UNSET:
-            from src.system_prompt import get_system_prompt
+            from src.system_prompt import get_system_prompt, resolve_cwd_placeholder
 
             custom_base = get_system_prompt()
+            if custom_base and effective_cwd:
+                custom_base = resolve_cwd_placeholder(custom_base, str(effective_cwd))
         else:
             custom_base = _custom_base
 
@@ -543,11 +547,16 @@ class ClaudeCodeCLI:
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        _custom_base: object = _UNSET,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
         The client is connected with ``prompt=None`` (interactive mode)
         so subsequent turns can be sent via ``client.query()``.
+
+        ``_custom_base`` follows the same contract as ``run_completion``:
+        when provided, the caller is responsible for having already resolved
+        ``{{WORKING_DIRECTORY}}`` (and any other request-time placeholders).
         """
         # Use a fresh session_id for the persistent client.  Each
         # ClaudeSDKClient needs its own CLI session identifier.
@@ -565,6 +574,7 @@ class ClaudeCodeCLI:
             task_budget=task_budget,
             cwd=Path(cwd) if cwd else None,
             extra_env=extra_env,
+            _custom_base=_custom_base,
         )
         options.hooks = {
             "PreToolUse": [

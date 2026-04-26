@@ -392,6 +392,20 @@ async def create_response(
     # still fire independently of the permission mode.
     if session.client is None and hasattr(backend, "create_client"):
         try:
+            # Pre-resolve {{WORKING_DIRECTORY}} so the persistent client's
+            # frozen system_prompt matches the cwd the SDK will actually use.
+            # Mirrors the run_completion path which passes session.base_system_prompt.
+            #
+            # Reconnect case: when an existing session lost its persistent client
+            # (e.g. SDK error/disconnect), prefer the prompt frozen at session
+            # start so admin-side prompt changes mid-conversation don't leak
+            # into in-flight sessions.
+            from src.system_prompt import get_system_prompt, resolve_cwd_placeholder
+
+            if session.base_system_prompt is not None:
+                resolved_base = session.base_system_prompt
+            else:
+                resolved_base = resolve_cwd_placeholder(get_system_prompt(), workspace_str)
             session.client = await backend.create_client(
                 session=session,
                 model=resolved.provider_model,
@@ -401,6 +415,7 @@ async def create_response(
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
                 cwd=workspace_str,
                 extra_env=body.metadata,
+                _custom_base=resolved_base,
             )
         except Exception:
             logger.warning(
