@@ -10,7 +10,7 @@ import tempfile
 import atexit
 import shutil
 import contextlib
-from typing import AsyncGenerator, Dict, Any, Optional, List
+from typing import AsyncGenerator, Dict, Any, Optional, List, cast
 from pathlib import Path
 import logging
 
@@ -58,15 +58,13 @@ class ClaudeCodeCLI:
     ``src/backends/base.py`` so it can be registered as the ``claude``
     backend.
 
-    Each call to ``run_completion`` / ``verify`` invokes the SDK's
-    ``query()`` function which is **single-use**: the underlying anyio
-    channel closes after the first response completes.  Never cache or
-    reuse the async generator returned by ``query()``; always create a
-    fresh call.  For multi-turn conversations use the ``resume``
-    parameter instead of attempting to reuse a previous query.
+    First-turn and follow-up Responses API requests use a persistent
+    ``ClaudeSDKClient`` stored on the gateway session.  Reconnect paths use
+    the gateway session id to resume the SDK transcript from disk when the
+    in-memory client is missing.
     """
 
-    def __init__(self, timeout: int = None, cwd: Optional[str] = None):
+    def __init__(self, timeout: Optional[int] = None, cwd: Optional[str] = None):
         if timeout is None:
             timeout = DEFAULT_TIMEOUT_MS
         self.timeout = timeout / 1000  # Convert ms to seconds
@@ -192,6 +190,108 @@ class ClaudeCodeCLI:
 
     _UNSET = object()  # sentinel for _custom_base default
 
+    def _resolve_custom_base_prompt(
+        self,
+        custom_base_arg: object,
+        effective_cwd: Path,
+    ) -> Optional[str]:
+        if custom_base_arg is self._UNSET:
+            from src.system_prompt import get_system_prompt, resolve_request_placeholders
+
+            custom_base = get_system_prompt()
+            if custom_base and effective_cwd:
+                custom_base = resolve_request_placeholders(custom_base, str(effective_cwd))
+            return custom_base
+        if custom_base_arg is None or isinstance(custom_base_arg, str):
+            return custom_base_arg
+        raise TypeError("_custom_base must be a string, None, or omitted")
+
+    def _configure_system_prompt(
+        self,
+        options: ClaudeAgentOptions,
+        custom_base: Optional[str],
+        system_prompt: Optional[str],
+    ) -> None:
+        if custom_base:
+            options.system_prompt = custom_base + ("\n\n" + system_prompt if system_prompt else "")
+        elif system_prompt:
+            options.system_prompt = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": system_prompt,
+            }
+        else:
+            options.system_prompt = {"type": "preset", "preset": "claude_code"}
+
+    def _configure_mcp_servers(
+        self,
+        options: ClaudeAgentOptions,
+        mcp_servers: Optional[Dict[str, Any]],
+        allowed_tools: Optional[List[str]],
+    ) -> None:
+        if not mcp_servers:
+            return
+
+        if allowed_tools is not None:
+            allowed_set = set(allowed_tools)
+            filtered = {}
+            for name, config in mcp_servers.items():
+                safe_name = "_".join(name.split("-"))
+                pattern = f"mcp__{safe_name}__*"
+                if pattern in allowed_set:
+                    filtered[name] = config
+            if not filtered:
+                logger.debug("No MCP servers match allowed_tools, skipping MCP")
+                return
+
+            options.mcp_servers = filtered
+            if options.allowed_tools is not None:
+                for pattern in get_mcp_tool_patterns(filtered):
+                    if pattern not in options.allowed_tools:
+                        options.allowed_tools.append(pattern)
+            logger.debug(f"MCP servers filtered to: {list(filtered.keys())}")
+            return
+
+        options.mcp_servers = mcp_servers
+        mcp_patterns = get_mcp_tool_patterns(mcp_servers)
+        if not options.allowed_tools:
+            options.allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
+        options.allowed_tools.extend(mcp_patterns)
+        logger.debug(f"MCP tools enabled: {mcp_patterns}")
+
+    def _configure_session_identity(
+        self,
+        options: ClaudeAgentOptions,
+        session_id: Optional[str],
+        resume: Optional[str],
+    ) -> None:
+        if resume:
+            options.resume = resume
+        elif session_id:
+            options.session_id = session_id
+
+    def _configure_task_budget(
+        self,
+        options: ClaudeAgentOptions,
+        task_budget: Optional[int],
+    ) -> None:
+        effective_budget = task_budget if task_budget is not None else DEFAULT_TASK_BUDGET
+        if effective_budget is not None:
+            options.task_budget = {"total": effective_budget}
+
+    def _configure_metadata_env(
+        self,
+        options: ClaudeAgentOptions,
+        extra_env: Optional[Dict[str, str]],
+    ) -> None:
+        if not extra_env:
+            return
+        from src.constants import METADATA_ENV_ALLOWLIST
+
+        env_map = {k: v for k, v in extra_env.items() if k in METADATA_ENV_ALLOWLIST}
+        if env_map:
+            options.env = env_map
+
     def _build_sdk_options(
         self,
         model: Optional[str] = None,
@@ -230,89 +330,21 @@ class ClaudeCodeCLI:
             user_context = f"Current user: {user}"
             system_prompt = f"{system_prompt}\n\n{user_context}" if system_prompt else user_context
 
-        # Resolve the custom base prompt.  When _custom_base is the sentinel
-        # (_UNSET) the caller did not provide a frozen value so we read the
-        # current global state and resolve {{WORKING_DIRECTORY}} against the
-        # effective cwd (appropriate for stateless / first-turn calls).
-        # When it is explicitly ``None`` the session was created in preset mode;
-        # when it is a string the caller is responsible for having pre-resolved
-        # all request-time placeholders.
-        if _custom_base is self._UNSET:
-            from src.system_prompt import get_system_prompt, resolve_request_placeholders
-
-            custom_base = get_system_prompt()
-            if custom_base and effective_cwd:
-                custom_base = resolve_request_placeholders(custom_base, str(effective_cwd))
-        else:
-            custom_base = _custom_base
-
-        if custom_base:
-            full = custom_base + ("\n\n" + system_prompt if system_prompt else "")
-            options.system_prompt = full
-        elif system_prompt:
-            options.system_prompt = {
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt,
-            }
-        else:
-            options.system_prompt = {"type": "preset", "preset": "claude_code"}
+        custom_base = self._resolve_custom_base_prompt(_custom_base, effective_cwd)
+        self._configure_system_prompt(options, custom_base, system_prompt)
         if permission_mode:
-            options.permission_mode = permission_mode
+            options.permission_mode = cast(Any, permission_mode)
         if output_format:
             options.output_format = output_format
-        if mcp_servers:
-            if allowed_tools is not None:
-                # Filter MCP servers to only those matching allowed_tools
-                allowed_set = set(allowed_tools)
-                filtered = {}
-                for name, config in mcp_servers.items():
-                    safe_name = "_".join(name.split("-"))
-                    pattern = f"mcp__{safe_name}__*"
-                    if pattern in allowed_set:
-                        filtered[name] = config
-                if filtered:
-                    options.mcp_servers = filtered
-                    # Ensure MCP patterns are in allowed_tools
-                    if options.allowed_tools is not None:
-                        mcp_patterns = get_mcp_tool_patterns(filtered)
-                        for p in mcp_patterns:
-                            if p not in options.allowed_tools:
-                                options.allowed_tools.append(p)
-                    logger.debug(f"MCP servers filtered to: {list(filtered.keys())}")
-                else:
-                    logger.debug("No MCP servers match allowed_tools, skipping MCP")
-            else:
-                options.mcp_servers = mcp_servers
-                # Add all MCP patterns to allowed_tools
-                mcp_patterns = get_mcp_tool_patterns(mcp_servers)
-                if not options.allowed_tools:
-                    options.allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
-                options.allowed_tools.extend(mcp_patterns)
-                logger.debug(f"MCP tools enabled: {mcp_patterns}")
+        self._configure_mcp_servers(options, mcp_servers, allowed_tools)
         from src.runtime_config import get_token_streaming
 
         if get_token_streaming():
             options.include_partial_messages = True
 
-        if resume:
-            options.resume = resume
-        elif session_id:
-            options.session_id = session_id
-
-        # Task budget: per-request value overrides the global default.
-        effective_budget = task_budget if task_budget is not None else DEFAULT_TASK_BUDGET
-        if effective_budget is not None:
-            options.task_budget = {"total": effective_budget}
-
-        # Pass allowlisted metadata keys as subprocess env vars.
-        # Allowlist is configured via METADATA_ENV_ALLOWLIST in .env.
-        if extra_env:
-            from src.constants import METADATA_ENV_ALLOWLIST
-
-            env_map = {k: v for k, v in extra_env.items() if k in METADATA_ENV_ALLOWLIST}
-            if env_map:
-                options.env = env_map
+        self._configure_session_identity(options, session_id, resume)
+        self._configure_task_budget(options, task_budget)
+        self._configure_metadata_env(options, extra_env)
 
         return options
 
@@ -454,7 +486,7 @@ class ClaudeCodeCLI:
         the CLI converts to a tool_result that Claude reads as the answer.
         """
 
-        async def hook(input_data, tool_use_id, context):
+        async def hook(input_data, tool_use_id, _context):
             tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
             if tool_name != "AskUserQuestion":
                 return {}  # Allow other tools to proceed
@@ -714,7 +746,7 @@ class ClaudeCodeCLI:
     parse_claude_message = parse_message
 
     def estimate_token_usage(
-        self, prompt: str, completion: str, model: Optional[str] = None
+        self, prompt: str, completion: str, _model: Optional[str] = None
     ) -> Dict[str, int]:
         """Estimate token usage (~4 characters per token)."""
         prompt_tokens = max(1, len(prompt) // 4)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Unit tests for src/claude_cli.py
+Unit tests for src/backends/claude/client.py
 
 Tests the ClaudeCodeCLI class methods.
 These are pure unit tests that don't require a running server or Claude SDK.
@@ -429,7 +429,6 @@ class TestClaudeCodeCLIVerifyCLI:
             assert result is False
 
 
-
 class TestClaudeCodeCLICleanupException:
     """Test ClaudeCodeCLI._cleanup_temp_dir() exception handling."""
 
@@ -728,7 +727,9 @@ class TestConvertMessageEdgeCases:
     def test_is_error_injects_error_message_from_result(self, cli_class):
         """ResultMessage with is_error=True gets error_message from result field."""
         cli = _make_cli(cli_class)
-        obj = SimpleNamespace(is_error=True, result="Rate limit exceeded", errors=None, subtype="error")
+        obj = SimpleNamespace(
+            is_error=True, result="Rate limit exceeded", errors=None, subtype="error"
+        )
         result = cli._convert_message(obj)
         assert result["error_message"] == "Rate limit exceeded"
 
