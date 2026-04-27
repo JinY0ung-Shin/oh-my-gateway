@@ -199,7 +199,8 @@ class TestUserSessionBinding:
             )
 
         assert resp.status_code == 200
-        # workspace_manager.resolve should NOT be called for follow-ups with stored workspace
-        mock_wm.resolve.assert_not_called()
-        # cwd should be the stored workspace path
+        # workspace_manager.resolve is called once with sync_template=False for the
+        # early cwd lookup used by get_session rehydrate-on-miss; never with sync_template=True.
+        mock_wm.resolve.assert_called_once_with("alice", sync_template=False)
+        # cwd should be the stored workspace path (from session.workspace, not the early resolve)
         assert run_calls[0]["cwd"] == "/tmp/ws/alice"

@@ -265,7 +265,17 @@ async def create_response(
                 detail=f"previous_response_id '{body.previous_response_id}' is invalid",
             )
         session_id, turn = parsed
-        session = session_manager.get_session(session_id)
+        # Lightweight workspace resolve (no template sync) so we can supply
+        # cwd to get_session and enable rehydrate-on-miss from jsonl.
+        _early_cwd: Optional[str] = None
+        if body.user:
+            try:
+                _early_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+            except (ValueError, OSError):
+                pass
+        session = session_manager.get_session(
+            session_id, user=body.user, cwd=_early_cwd,
+        )
         if not session:
             raise HTTPException(
                 status_code=404,
