@@ -6,6 +6,7 @@ implementation registered as the ``claude`` backend.
 
 import asyncio
 import os
+import re
 import tempfile
 import atexit
 import shutil
@@ -478,6 +479,192 @@ class ClaudeCodeCLI:
     # ClaudeSDKClient lifecycle (persistent, bidirectional sessions)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Sensitive-file permission detection
+    # ------------------------------------------------------------------
+    # SDK 0.1.57 added internal guardrails that auto-deny edits to files
+    # the SDK considers sensitive (``.claude/``, ``.env``, ssh keys, …)
+    # even when ``permission_mode="bypassPermissions"`` is set, returning
+    # a synthetic tool_result with the text *"Claude requested permissions
+    # to edit … which is a sensitive file"*.  The model reads this as a
+    # refusal and gives up.  We intercept the relevant file-write tools
+    # *before* the SDK's internal check via PreToolUse and surface the
+    # decision to the user as a regular AskUserQuestion-shaped pause —
+    # the same UI the existing client already renders.
+    _SENSITIVE_FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+    _SENSITIVE_FILE_TOOLS_MATCHER = "|".join(_SENSITIVE_FILE_TOOLS)
+    _SENSITIVE_PATH_RE = re.compile(
+        r"(?:"
+        r"(?:^|/)\.claude(?:/|$)"
+        r"|(?:^|/)\.env(?:$|\.|/)"
+        r"|(?:^|/)\.ssh(?:/|$)"
+        r"|(?:^|/)id_(?:rsa|ed25519|ecdsa|dsa)(?:\.|$)"
+        r"|\.(?:pem|key)$"
+        r"|(?:^|/)credentials\b"
+        r"|(?:^|/)secrets?\."
+        r")",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _is_sensitive_path(cls, path: str) -> bool:
+        if not path:
+            return False
+        return cls._SENSITIVE_PATH_RE.search(path) is not None
+
+    @classmethod
+    def _extract_sensitive_paths(cls, tool_input: Any) -> List[str]:
+        if not isinstance(tool_input, dict):
+            return []
+        candidates: List[str] = []
+        for key in ("file_path", "notebook_path", "path"):
+            value = tool_input.get(key)
+            if isinstance(value, str) and cls._is_sensitive_path(value):
+                candidates.append(value)
+        return candidates
+
+    def _make_sensitive_file_hook(self, session):
+        """Create a PreToolUse hook that surfaces sensitive-file edits as
+        a permission prompt.
+
+        Reuses the AskUserQuestion shape (and ``session.pending_tool_call``
+        + ``session.input_event`` plumbing) so the existing client UI
+        renders the prompt with no extra wiring.  Returning
+        ``permissionDecision: "allow"`` overrides the SDK's internal
+        sensitive-file guardrail; ``"deny"`` propagates the refusal with
+        the user's text as the reason.
+        """
+
+        async def hook(input_data, tool_use_id, context):
+            tool_name = (
+                input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
+            )
+            if tool_name not in self._SENSITIVE_FILE_TOOLS:
+                return {}
+
+            tool_input = (
+                input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
+            )
+            sensitive_paths = self._extract_sensitive_paths(tool_input)
+            if not sensitive_paths:
+                return {}  # Not a sensitive path — let the SDK proceed.
+
+            primary_path = sensitive_paths[0]
+            actual_call_id = (
+                input_data.get("tool_use_id", tool_use_id)
+                if isinstance(input_data, dict)
+                else tool_use_id
+            ) or f"perm_{uuid.uuid4().hex[:12]}"
+
+            # Build an AskUserQuestion-shaped prompt. ``name`` stays as
+            # ``AskUserQuestion`` so the existing card renders it without
+            # any special-casing — the question text itself communicates
+            # the security context.
+            question_text = (
+                f"민감한 파일 편집 권한을 요청합니다.\n\n"
+                f"**Tool:** `{tool_name}`\n"
+                f"**Path:** `{primary_path}`\n\n"
+                f"이 작업을 허용할까요?"
+            )
+            questions = [
+                {
+                    "question": question_text,
+                    "options": [
+                        {
+                            "label": "Allow",
+                            "description": "이번 한 번만 허용",
+                        },
+                        {
+                            "label": "Deny",
+                            "description": "거부 (모델이 다른 방법을 찾도록)",
+                        },
+                    ],
+                    "multiSelect": False,
+                }
+            ]
+
+            session.pending_tool_call = {
+                "call_id": actual_call_id,
+                "name": "AskUserQuestion",
+                "arguments": {"questions": questions},
+            }
+            session.input_event = asyncio.Event()
+            if session.stream_break_event is not None:
+                session.stream_break_event.set()
+
+            try:
+                await asyncio.wait_for(
+                    session.input_event.wait(),
+                    timeout=ASK_USER_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Sensitive-file permission timed out after %ds for "
+                    "session %s tool=%s path=%s",
+                    ASK_USER_TIMEOUT_SECONDS,
+                    session.session_id,
+                    tool_name,
+                    primary_path,
+                )
+                session.input_response = None
+                session.input_event = None
+                session.pending_tool_call = None
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Permission request timed out before the user responded."
+                        ),
+                    }
+                }
+
+            user_response = (session.input_response or "").strip()
+            session.input_response = None
+            session.input_event = None
+
+            # Allow only on an explicit "Allow" choice (case-insensitive).
+            # Any other reply — including custom typed text — is treated
+            # as deny so the model can read the user's reasoning as the
+            # tool_result's reason field.
+            if user_response.lower() == "allow":
+                logger.info(
+                    "Sensitive-file permission ALLOWED by user "
+                    "(session=%s tool=%s path=%s)",
+                    session.session_id,
+                    tool_name,
+                    primary_path,
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                    }
+                }
+
+            logger.info(
+                "Sensitive-file permission DENIED by user "
+                "(session=%s tool=%s path=%s reason=%r)",
+                session.session_id,
+                tool_name,
+                primary_path,
+                user_response[:80],
+            )
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"User denied permission for {tool_name} on "
+                        f"{primary_path}. User said: {user_response}"
+                        if user_response
+                        else f"User denied permission for {tool_name} on {primary_path}."
+                    ),
+                }
+            }
+
+        return hook
+
     def _make_ask_user_hook(self, session):
         """Create a PreToolUse hook that intercepts AskUserQuestion.
 
@@ -603,7 +790,11 @@ class ClaudeCodeCLI:
                 HookMatcher(
                     matcher="AskUserQuestion",
                     hooks=[self._make_ask_user_hook(session)],
-                )
+                ),
+                HookMatcher(
+                    matcher=self._SENSITIVE_FILE_TOOLS_MATCHER,
+                    hooks=[self._make_sensitive_file_hook(session)],
+                ),
             ]
         }
 
