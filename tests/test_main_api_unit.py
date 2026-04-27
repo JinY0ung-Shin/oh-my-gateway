@@ -17,7 +17,7 @@ import src.routes.responses as responses_module
 import src.routes.general as general_module
 import src.routes.sessions as sessions_module
 from src.auth import auth_manager
-from src.backend_registry import BackendRegistry
+from src.backend_registry import BackendDescriptor, BackendRegistry, ResolvedModel
 from src.constants import DEFAULT_MODEL
 from src.models import SessionInfo
 
@@ -121,6 +121,84 @@ def test_models_version_and_root_endpoints():
     assert version_response.json()["service"] == "claude-code-gateway"
     assert root_response.status_code == 200
     assert "Claude Code Gateway" in root_response.text
+
+
+def test_models_endpoint_lists_opencode_models_when_registered():
+    """The model list includes registered OpenCode descriptor models."""
+
+    def resolve(model):
+        if model == "opencode/anthropic/claude-sonnet-4-5":
+            return ResolvedModel(model, "opencode", "anthropic/claude-sonnet-4-5")
+        return None
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="opencode",
+            owned_by="opencode",
+            models=["opencode/anthropic/claude-sonnet-4-5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.get("/v1/models")
+
+    assert response.status_code == 200
+    ids = [item["id"] for item in response.json()["data"]]
+    assert "opencode/anthropic/claude-sonnet-4-5" in ids
+
+
+def test_responses_dispatches_to_opencode_backend_without_mcp():
+    """Responses requests for opencode/... models dispatch to OpenCode backend."""
+    calls = {}
+
+    def resolve(model):
+        if model == "opencode/anthropic/claude-sonnet-4-5":
+            return ResolvedModel(model, "opencode", "anthropic/claude-sonnet-4-5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"content": [{"type": "text", "text": "OpenCode response"}]}
+        yield {"type": "result", "subtype": "success", "result": "OpenCode response"}
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "OpenCode response"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 2,
+        "completion_tokens": 4,
+        "total_tokens": 6,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="opencode",
+            owned_by="opencode",
+            models=["opencode/anthropic/claude-sonnet-4-5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "opencode/anthropic/claude-sonnet-4-5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert calls["create_client"]["model"] == "anthropic/claude-sonnet-4-5"
+    assert calls["create_client"]["mcp_servers"] is None
+    assert calls["prompt"] == "hi"
 
 
 def test_list_mcp_servers_filters_safe_fields():

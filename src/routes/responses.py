@@ -545,7 +545,7 @@ async def create_response(
             await session_manager.delete_session_async(session_id)
             raise HTTPException(
                 status_code=503,
-                detail="Claude Code SDK unavailable; retry shortly",
+                detail=f"{resolved.backend} backend unavailable; retry shortly",
             )
 
     if body.stream:
