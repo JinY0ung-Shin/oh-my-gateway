@@ -667,7 +667,7 @@ class TestStreamResponseChunksIncompleteToolWarning:
         logger = logging.getLogger("test-incomplete-tool-resp")
 
         with caplog.at_level(logging.WARNING):
-            [  # noqa: F841
+            [
                 line
                 async for line in stream_response_chunks(
                     chunk_source=source(),

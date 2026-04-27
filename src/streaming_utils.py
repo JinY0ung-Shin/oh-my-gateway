@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 from src.constants import (
     SSE_KEEPALIVE_INTERVAL,
@@ -158,11 +158,7 @@ def _buffer_summary(buf: list, limit: int = 5) -> list:
         content = c.get("content")
         if isinstance(content, list) and content:
             entry["blocks"] = [
-                {
-                    k: v
-                    for k, v in _block_summary(b).items()
-                    if k in ("type", "name", "is_error")
-                }
+                {k: v for k, v in _block_summary(b).items() if k in ("type", "name", "is_error")}
                 for b in content[:3]
             ]
         summary.append(entry)
@@ -257,7 +253,6 @@ def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
     if isinstance(info, dict):
         return info.get("status", "unknown")
     return getattr(info, "status", "unknown")
-
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +383,95 @@ async def _keepalive_wrapper(
 # ---------------------------------------------------------------------------
 # Responses API streaming (/v1/responses)
 # ---------------------------------------------------------------------------
+
+
+def _record_tool_use(tool_stats: ToolStatsCollector, tool_block: Dict[str, Any]) -> None:
+    tool_stats.record_use(
+        _block_field(tool_block, "id") or _block_field(tool_block, "tool_use_id"),
+        _block_field(tool_block, "name") or "",
+    )
+
+
+def _record_tool_result(tool_stats: ToolStatsCollector, tool_block: Dict[str, Any]) -> None:
+    tool_stats.record_result(
+        _block_field(tool_block, "tool_use_id"),
+        bool(_block_field(tool_block, "is_error") or False),
+    )
+
+
+def _tool_use_events(
+    tool_block: Dict[str, Any],
+    tool_stats: ToolStatsCollector,
+    next_seq: Callable[[], int],
+) -> list[str]:
+    _record_tool_use(tool_stats, tool_block)
+    is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
+    if is_subagent_tool and not SUBAGENT_STREAM_TOOL_BLOCKS:
+        return []
+    return [
+        make_tool_use_response_sse(
+            tool_block,
+            sequence_number=next_seq(),
+            parent_tool_use_id=tool_block.get("parent_tool_use_id"),
+        )
+    ]
+
+
+def _user_tool_result_events(
+    chunk: Dict[str, Any],
+    tool_stats: ToolStatsCollector,
+    next_seq: Callable[[], int],
+) -> list[str]:
+    tool_results, parent_id = extract_user_tool_results(chunk)
+    for tr_block in tool_results:
+        _record_tool_result(tool_stats, tr_block)
+
+    is_subagent_result = parent_id is not None
+    if is_subagent_result and not SUBAGENT_STREAM_TOOL_BLOCKS:
+        return []
+    return [
+        make_tool_result_response_sse(
+            tr_block,
+            sequence_number=next_seq(),
+            parent_tool_use_id=parent_id,
+        )
+        for tr_block in tool_results
+    ]
+
+
+def _embedded_tool_events(
+    chunk: Dict[str, Any],
+    tool_stats: ToolStatsCollector,
+    next_seq: Callable[[], int],
+) -> list[str]:
+    events = []
+    for tool_block in extract_embedded_tool_blocks(chunk):
+        block_type = _block_field(tool_block, "type")
+        if block_type == "tool_use":
+            _record_tool_use(tool_stats, tool_block)
+        elif block_type == "tool_result":
+            _record_tool_result(tool_stats, tool_block)
+
+        is_subagent_block = tool_block.get("parent_tool_use_id") is not None
+        if is_subagent_block and not SUBAGENT_STREAM_TOOL_BLOCKS:
+            continue
+        if block_type == "tool_use":
+            events.append(
+                make_tool_use_response_sse(
+                    tool_block,
+                    sequence_number=next_seq(),
+                    parent_tool_use_id=tool_block.get("parent_tool_use_id"),
+                )
+            )
+        elif block_type == "tool_result":
+            events.append(
+                make_tool_result_response_sse(
+                    tool_block,
+                    sequence_number=next_seq(),
+                    parent_tool_use_id=tool_block.get("parent_tool_use_id"),
+                )
+            )
+    return events
 
 
 async def stream_response_chunks(
@@ -595,36 +679,14 @@ async def stream_response_chunks(
             handled, tool_block = tool_acc.process_stream_event(chunk)
             if handled:
                 if tool_block:
-                    tool_stats.record_use(
-                        _block_field(tool_block, "id")
-                        or _block_field(tool_block, "tool_use_id"),
-                        _block_field(tool_block, "name") or "",
-                    )
-                    is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
-                    if not is_subagent_tool or SUBAGENT_STREAM_TOOL_BLOCKS:
-                        yield make_tool_use_response_sse(
-                            tool_block,
-                            sequence_number=_next_seq(),
-                            parent_tool_use_id=tool_block.get("parent_tool_use_id"),
-                        )
+                    for event in _tool_use_events(tool_block, tool_stats, _next_seq):
+                        yield event
                 continue
 
             # User chunks with tool_result blocks
             if chunk.get("type") == "user":
-                tool_results, parent_id = extract_user_tool_results(chunk)
-                for tr_block in tool_results:
-                    tool_stats.record_result(
-                        _block_field(tr_block, "tool_use_id"),
-                        bool(_block_field(tr_block, "is_error") or False),
-                    )
-                is_subagent_result = parent_id is not None
-                if not is_subagent_result or SUBAGENT_STREAM_TOOL_BLOCKS:
-                    for tr_block in tool_results:
-                        yield make_tool_result_response_sse(
-                            tr_block,
-                            sequence_number=_next_seq(),
-                            parent_tool_use_id=parent_id,
-                        )
+                for event in _user_tool_result_events(chunk, tool_stats, _next_seq):
+                    yield event
                 chunks_buffer.append(chunk)
                 continue
 
@@ -632,33 +694,8 @@ async def stream_response_chunks(
             # This MUST run before the token-streaming skip below so that tool
             # blocks inside assistant content chunks are not silently dropped
             # when token_streaming is True.
-            embedded_tools = extract_embedded_tool_blocks(chunk)
-            for tb in embedded_tools:
-                tb_type = _block_field(tb, "type")
-                if tb_type == "tool_use":
-                    tool_stats.record_use(
-                        _block_field(tb, "id") or _block_field(tb, "tool_use_id"),
-                        _block_field(tb, "name") or "",
-                    )
-                elif tb_type == "tool_result":
-                    tool_stats.record_result(
-                        _block_field(tb, "tool_use_id"),
-                        bool(_block_field(tb, "is_error") or False),
-                    )
-                is_subagent_tb = tb.get("parent_tool_use_id") is not None
-                if not is_subagent_tb or SUBAGENT_STREAM_TOOL_BLOCKS:
-                    if tb.get("type") == "tool_use":
-                        yield make_tool_use_response_sse(
-                            tb,
-                            sequence_number=_next_seq(),
-                            parent_tool_use_id=tb.get("parent_tool_use_id"),
-                        )
-                    elif tb.get("type") == "tool_result":
-                        yield make_tool_result_response_sse(
-                            tb,
-                            sequence_number=_next_seq(),
-                            parent_tool_use_id=tb.get("parent_tool_use_id"),
-                        )
+            for event in _embedded_tool_events(chunk, tool_stats, _next_seq):
+                yield event
 
             # Skip duplicate assistant text in token-streaming mode.
             # Tool blocks were already extracted above, so only text is suppressed.
