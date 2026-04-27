@@ -389,6 +389,15 @@ def _integration_client_context():
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
+
+    async def _default_create_client(**kwargs):
+        return object()
+
+    async def _default_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "Hi"}
+
+    mock_cli.create_client = _default_create_client
+    mock_cli.run_completion_with_client = _default_run_with_client
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
@@ -444,11 +453,11 @@ class TestIntegrationFunctionCallOutput:
     def test_function_call_output_no_pending_tool_call_returns_400(self, isolated_session_manager):
         """function_call_output with a real session but no pending tool call returns 400."""
 
-        async def fake_run_completion(**kwargs):
+        async def fake_run_completion(client, prompt, session):
             yield {"subtype": "success", "result": "Hello"}
 
         with _integration_client_context() as (client, mock_cli):
-            mock_cli.run_completion = fake_run_completion
+            mock_cli.run_completion_with_client = fake_run_completion
             mock_cli.parse_message = MagicMock(return_value="Hello")
 
             # Step 1: Create a session via a normal request
@@ -1127,22 +1136,14 @@ class TestTurn1PersistentClient:
         assert r.status_code == 200
         assert sdk_path_used, "run_completion_with_client() should be used on Turn 1"
 
-    def test_turn1_falls_back_on_create_client_failure(self, isolated_session_manager):
-        """Turn 1 should fall back to run_completion() when create_client() fails."""
-        fallback_used = False
+    def test_turn1_create_client_failure_returns_503(self, isolated_session_manager):
+        """Turn 1: create_client() failure surfaces as HTTP 503; no run_completion fallback."""
 
         async def failing_create_client(**kwargs):
             raise RuntimeError("Client creation failed")
 
-        async def fake_run_completion(**kwargs):
-            nonlocal fallback_used
-            fallback_used = True
-            yield {"subtype": "success", "result": "Hello via fallback"}
-
         with _integration_client_context() as (client, mock_cli):
             mock_cli.create_client = failing_create_client
-            mock_cli.run_completion = fake_run_completion
-            mock_cli.parse_message = MagicMock(return_value="Hello via fallback")
 
             r = client.post(
                 "/v1/responses",
@@ -1153,8 +1154,7 @@ class TestTurn1PersistentClient:
                 },
                 headers={"Authorization": "Bearer test"},
             )
-        assert r.status_code == 200
-        assert fallback_used, "run_completion() fallback should be used when create_client() fails"
+        assert r.status_code == 503
 
     def test_reconnect_uses_session_base_system_prompt(self, isolated_session_manager):
         """When the persistent client was lost (session.client=None) but the

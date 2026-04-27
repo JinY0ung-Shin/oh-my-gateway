@@ -87,8 +87,8 @@ async def test_create_client_sets_hooks():
     assert callable(matchers[0].hooks[0])
 
 
-async def test_create_client_uses_fresh_session_id():
-    """create_client() uses a fresh UUID, not session.session_id."""
+async def test_create_client_uses_gateway_session_id():
+    """create_client() reuses session.session_id so the SDK transcript filename matches."""
     cli = _make_cli()
     session = Session(session_id="my-session-id")
 
@@ -107,9 +107,9 @@ async def test_create_client_uses_fresh_session_id():
 
     options = captured_options.get("options")
     assert options is not None
-    # The persistent client uses its own fresh UUID, not the gateway session_id
-    assert options.session_id != "my-session-id"
-    assert len(options.session_id) == 36  # UUID format
+    # No transcript on disk → use options.session_id (not resume).
+    assert options.session_id == "my-session-id"
+    assert options.resume is None
 
 
 async def test_create_client_accepts_custom_base_with_resolved_cwd():
