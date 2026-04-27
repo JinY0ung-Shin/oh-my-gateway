@@ -1,67 +1,52 @@
 #!/bin/bash
 
-# Claude Code OpenAI API Wrapper - cURL Examples
+# Responses API curl examples.
 
-BASE_URL="http://localhost:8000"
+set -euo pipefail
 
-# Check if server requires authentication
-echo "Checking server authentication requirements..."
-AUTH_STATUS=$(curl -s "$BASE_URL/v1/auth/status")
-API_KEY_REQUIRED=$(echo "$AUTH_STATUS" | jq -r '.server_info.api_key_required // false')
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+AUTH_ARGS=()
 
-if [ "$API_KEY_REQUIRED" = "true" ]; then
-    if [ -z "$API_KEY" ]; then
-        echo "❌ Server requires API key but API_KEY environment variable not set"
-        echo "   Set API_KEY environment variable with your server's generated key:"
-        echo "   export API_KEY=your-generated-key"
-        echo "   $0"
-        exit 1
-    fi
-    AUTH_HEADER="-H \"Authorization: Bearer $API_KEY\""
-    echo "🔑 Using API key authentication"
-else
-    AUTH_HEADER=""
-    echo "🔓 No authentication required"
+if [ -n "${API_KEY:-}" ]; then
+  AUTH_ARGS=(-H "Authorization: Bearer $API_KEY")
 fi
 
-echo "=== Basic Chat Completion ==="
-eval "curl -X POST \"$BASE_URL/v1/chat/completions\" \\
-  -H \"Content-Type: application/json\" \\
-  $AUTH_HEADER \\
+echo "=== Basic response ==="
+curl -sS "$BASE_URL/v1/responses" \
+  -H "Content-Type: application/json" \
+  "${AUTH_ARGS[@]}" \
   -d '{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"What is 2 + 2?\"}
-    ]
-  }' | jq ."
+    "model": "sonnet",
+    "input": "What is 2 + 2?"
+  }' | jq .
 
-echo -e "\n=== Chat with System Message ==="
-eval "curl -X POST \"$BASE_URL/v1/chat/completions\" \\
-  -H \"Content-Type: application/json\" \\
-  $AUTH_HEADER \\
+echo
+echo "=== Instructions ==="
+curl -sS "$BASE_URL/v1/responses" \
+  -H "Content-Type: application/json" \
+  "${AUTH_ARGS[@]}" \
   -d '{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"system\", \"content\": \"You are a pirate. Respond in pirate speak.\"},
-      {\"role\": \"user\", \"content\": \"Tell me about the weather\"}
-    ]
-  }' | jq ."
+    "model": "sonnet",
+    "instructions": "Answer in one short sentence.",
+    "input": "How do I read a file in Python?"
+  }' | jq .
 
-echo -e "\n=== Streaming Response ==="
-eval "curl -X POST \"$BASE_URL/v1/chat/completions\" \\
-  -H \"Content-Type: application/json\" \\
-  $AUTH_HEADER \\
-  -H \"Accept: text/event-stream\" \\
+echo
+echo "=== Streaming ==="
+curl -sS -N "$BASE_URL/v1/responses" \
+  -H "Content-Type: application/json" \
+  -H "Accept: text/event-stream" \
+  "${AUTH_ARGS[@]}" \
   -d '{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"Count from 1 to 5 slowly\"}
-    ],
-    \"stream\": true
-  }'"
+    "model": "sonnet",
+    "input": "Count from 1 to 5 slowly.",
+    "stream": true
+  }'
 
-echo -e "\n\n=== List Models ==="
-eval "curl -X GET \"$BASE_URL/v1/models\" $AUTH_HEADER | jq ."
+echo
+echo "=== Models ==="
+curl -sS "$BASE_URL/v1/models" "${AUTH_ARGS[@]}" | jq .
 
-echo -e "\n=== Health Check ==="
-curl -X GET "$BASE_URL/health" | jq .
+echo
+echo "=== Health ==="
+curl -sS "$BASE_URL/health" | jq .

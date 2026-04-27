@@ -11,7 +11,7 @@
 ## Scope
 
 - `/v1/responses` 엔드포인트만 적용
-- `/v1/chat/completions`, `/v1/messages`는 deprecated 예정이므로 제외
+- 제거된 레거시 엔드포인트(`/v1/chat/completions`, `/v1/messages`)는 제외
 
 ## Design
 

@@ -1,106 +1,54 @@
 #!/bin/bash
 
-# Session Continuity Example with curl
-# This script demonstrates how to use session continuity with the Claude Code OpenAI API Wrapper
+# Multi-turn Responses API example with curl.
 
-echo "🚀 Claude Code Session Continuity - curl Example"
-echo "================================================="
+set -euo pipefail
 
-BASE_URL="http://localhost:8000"
-SESSION_ID="curl-demo-session"
+BASE_URL="${BASE_URL:-http://localhost:8000}"
+AUTH_ARGS=()
 
-# Check server health
-echo "📋 Checking server health..."
-curl -s "$BASE_URL/health" | jq .
-echo ""
+if [ -n "${API_KEY:-}" ]; then
+  AUTH_ARGS=(-H "Authorization: Bearer $API_KEY")
+fi
 
-# First message - introduce context
-echo "1️⃣ First message (introducing context):"
-echo "Request: Hello! I'm Sarah and I'm learning React."
-curl -s -X POST "$BASE_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"Hello! I'm Sarah and I'm learning React.\"}
-    ],
-    \"session_id\": \"$SESSION_ID\"
-  }" | jq -r '.choices[0].message.content'
-echo ""
+echo "=== Turn 1 ==="
+FIRST_RESPONSE=$(
+  curl -sS "$BASE_URL/v1/responses" \
+    -H "Content-Type: application/json" \
+    "${AUTH_ARGS[@]}" \
+    -d '{
+      "model": "sonnet",
+      "input": "Hello. My name is Sarah and I am learning React."
+    }'
+)
+echo "$FIRST_RESPONSE" | jq -r '.output[0].content[0].text'
+FIRST_ID=$(echo "$FIRST_RESPONSE" | jq -r '.id')
 
-# Second message - test memory
-echo "2️⃣ Second message (testing memory):"
-echo "Request: What's my name and what am I learning?"
-curl -s -X POST "$BASE_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"What's my name and what am I learning?\"}
-    ],
-    \"session_id\": \"$SESSION_ID\"
-  }" | jq -r '.choices[0].message.content'
-echo ""
+echo
+echo "=== Turn 2 ==="
+SECOND_RESPONSE=$(
+  curl -sS "$BASE_URL/v1/responses" \
+    -H "Content-Type: application/json" \
+    "${AUTH_ARGS[@]}" \
+    -d "{
+      \"model\": \"sonnet\",
+      \"input\": \"What is my name and what am I learning?\",
+      \"previous_response_id\": \"$FIRST_ID\"
+    }"
+)
+echo "$SECOND_RESPONSE" | jq -r '.output[0].content[0].text'
+SECOND_ID=$(echo "$SECOND_RESPONSE" | jq -r '.id')
 
-# Third message - continue conversation
-echo "3️⃣ Third message (building on context):"
-echo "Request: Can you suggest a simple React project for me?"
-curl -s -X POST "$BASE_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"Can you suggest a simple React project for me?\"}
-    ],
-    \"session_id\": \"$SESSION_ID\"
-  }" | jq -r '.choices[0].message.content'
-echo ""
+SESSION_ID=$(echo "$SECOND_ID" | cut -d_ -f2)
 
-# Session management examples
-echo "🛠  Session Management Examples"
-echo "================================"
+echo
+echo "=== Session info ==="
+curl -sS "$BASE_URL/v1/sessions/$SESSION_ID" "${AUTH_ARGS[@]}" | jq .
 
-# List sessions
-echo "📋 List all sessions:"
-curl -s "$BASE_URL/v1/sessions" | jq .
-echo ""
+echo
+echo "=== Session stats ==="
+curl -sS "$BASE_URL/v1/sessions/stats" "${AUTH_ARGS[@]}" | jq .
 
-# Get specific session info
-echo "🔍 Get session info:"
-curl -s "$BASE_URL/v1/sessions/$SESSION_ID" | jq .
-echo ""
-
-# Get session stats
-echo "📊 Session statistics:"
-curl -s "$BASE_URL/v1/sessions/stats" | jq .
-echo ""
-
-# Streaming example with session
-echo "🌊 Streaming with session continuity:"
-echo "Request: Thanks for your help!"
-curl -s -X POST "$BASE_URL/v1/chat/completions" \
-  -H "Content-Type: application/json" \
-  -d "{
-    \"model\": \"claude-3-5-sonnet-20241022\",
-    \"messages\": [
-      {\"role\": \"user\", \"content\": \"Thanks for your help!\"}
-    ],
-    \"session_id\": \"$SESSION_ID\",
-    \"stream\": true
-  }" | grep '^data: ' | head -5 | jq -r '.choices[0].delta.content // empty' 2>/dev/null | tr -d '\n'
-echo ""
-echo ""
-
-# Delete session
-echo "🧹 Cleaning up session:"
-curl -s -X DELETE "$BASE_URL/v1/sessions/$SESSION_ID" | jq .
-echo ""
-
-echo "✨ curl session example complete!"
-echo ""
-echo "💡 Key Points:"
-echo "   • Include \"session_id\": \"your-session-id\" in request body"
-echo "   • Same session_id maintains conversation context"
-echo "   • Works with both streaming and non-streaming requests"
-echo "   • Use session management endpoints to monitor and control sessions"
-echo "   • Sessions auto-expire after 1 hour of inactivity"
+echo
+echo "=== Cleanup ==="
+curl -sS -X DELETE "$BASE_URL/v1/sessions/$SESSION_ID" "${AUTH_ARGS[@]}" | jq .

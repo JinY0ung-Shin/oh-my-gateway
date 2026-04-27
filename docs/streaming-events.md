@@ -1,222 +1,86 @@
 # Streaming Events Reference
 
-This document describes all SSE (Server-Sent Events) emitted by the gateway during streaming responses. It is intended for UI developers who want to render tool calls, subagent activity, and other structured events.
+This document describes the SSE events emitted by `POST /v1/responses` when
+`"stream": true` is set. It is intended for UI clients that need to render text,
+tool calls, subagent progress, AskUserQuestion pauses, and terminal failures.
 
-## Table of Contents
+## Wire Format
 
-- [Event Delivery by Endpoint](#event-delivery-by-endpoint)
-- [Chat Completions Events (`/v1/chat/completions`)](#chat-completions-events)
-  - [Text Delta](#cc-text-delta)
-  - [system_event: tool_use](#cc-tool-use)
-  - [system_event: tool_result](#cc-tool-result)
-  - [system_event: task_started](#cc-task-started)
-  - [system_event: task_progress](#cc-task-progress)
-  - [system_event: task_notification](#cc-task-notification)
-  - [Final Chunk (finish_reason + usage)](#cc-final)
-- [Responses API Events (`/v1/responses`)](#responses-api-events)
-  - [Lifecycle Events](#ra-lifecycle)
-  - [response.output_text.delta](#ra-text-delta)
-  - [response.tool_use](#ra-tool-use)
-  - [response.tool_result](#ra-tool-result)
-  - [response.task_started](#ra-task-started)
-  - [response.task_progress](#ra-task-progress)
-  - [response.task_notification](#ra-task-notification)
-  - [Closing Events](#ra-closing)
-- [Tool Names](#tool-names)
-  - [Claude Backend Tools](#claude-tools)
-  - [MCP Tools](#mcp-tools)
-- [Tool Input Schemas](#tool-input-schemas)
-- [Subagent (Nested) Tool Calls](#subagent-tool-calls)
-- [Non-Streaming Responses](#non-streaming-responses)
-- [Usage & Stop Reason](#usage-and-stop-reason)
+Each event uses standard Server-Sent Events framing:
 
----
+```text
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","delta":"Hello","sequence_number":5}
+```
 
-## Event Delivery by Endpoint
+The `sequence_number` field is monotonically increasing within a response stream
+for events produced by the main streaming loop. AskUserQuestion function-call
+events are emitted by the route after the SDK hook pauses and may omit it.
 
-| Feature | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
-|---------|----------------------|----------------|----------------|
-| Text streaming | `delta.content` in chunk | `response.output_text.delta` event | Not streamed |
-| Tool calls | `system_event` field (custom) | Separate SSE event types | N/A (text only) |
-| Subagent events | `system_event` field | Separate SSE event types | N/A |
-| Usage reporting | Final chunk with `usage` | `response.completed` event | Response body |
+Keepalive comments may appear during long tool execution:
 
----
+```text
+: keepalive
+```
 
-## Chat Completions Events
+SSE clients should ignore comment lines.
 
-Wire format: `data: <json>\n\n`
+## Event Order
 
-All chunks share this base shape:
+Successful text responses are framed like this:
 
-```jsonc
+```text
+response.created
+response.in_progress
+response.output_item.added
+response.content_part.added
+response.output_text.delta      # zero or more
+response.tool_use               # zero or more
+response.tool_result            # zero or more
+response.task_started           # zero or more
+response.task_progress          # zero or more
+response.task_notification      # zero or more
+response.output_text.done
+response.content_part.done
+response.output_item.done
+response.completed
+```
+
+Failures emit `response.failed`. Empty SDK output is also surfaced as
+`response.failed` so clients receive a definite terminal event.
+
+## Lifecycle Events
+
+`response.created` and `response.in_progress` include a `response` object with
+`status: "in_progress"`.
+
+```json
 {
-  "id": "chatcmpl-a1b2c3d4",
-  "object": "chat.completion.chunk",
-  "created": 1741654800,
-  "model": "sonnet",
-  "choices": [{ "index": 0, "delta": { ... }, "finish_reason": null }]
-  // optional: "system_event": { ... }
-  // optional: "usage": { ... }
+  "type": "response.created",
+  "response": {
+    "id": "resp_00000000-0000-0000-0000-000000000000_1",
+    "object": "response",
+    "status": "in_progress",
+    "model": "sonnet",
+    "output": [],
+    "usage": { "input_tokens": 0, "output_tokens": 0 },
+    "metadata": {}
+  },
+  "sequence_number": 0
 }
 ```
 
-<a id="cc-text-delta"></a>
-### Text Delta
+`response.output_item.added` and `response.content_part.added` open the assistant
+message and its first text part.
 
-Standard OpenAI-compatible text streaming.
+## Text Events
 
-```jsonc
-// First chunk (role announcement)
-{ "choices": [{ "delta": { "role": "assistant", "content": "" }, "finish_reason": null }] }
+`response.output_text.delta` carries visible text increments:
 
-// Subsequent chunks
-{ "choices": [{ "delta": { "content": "Hello, " }, "finish_reason": null }] }
-{ "choices": [{ "delta": { "content": "world!" }, "finish_reason": null }] }
-```
-
-<a id="cc-tool-use"></a>
-### system_event: tool_use
-
-Emitted when the agent invokes a tool. The `delta` is empty `{}`.
-
-```jsonc
-{
-  "choices": [{ "delta": {}, "finish_reason": null }],
-  "system_event": {
-    "type": "tool_use",
-    "id": "toolu_01ABC123",          // unique tool invocation ID
-    "name": "Read",                  // tool name (see Tool Names section)
-    "input": {                       // tool-specific parameters
-      "file_path": "/home/user/project/src/main.py"
-    }
-    // optional:
-    // "parent_tool_use_id": "toolu_01XYZ789"  // present if called by a subagent
-  }
-}
-```
-
-<a id="cc-tool-result"></a>
-### system_event: tool_result
-
-Emitted when a tool execution completes. The `delta` is empty `{}`.
-
-```jsonc
-{
-  "choices": [{ "delta": {}, "finish_reason": null }],
-  "system_event": {
-    "type": "tool_result",
-    "tool_use_id": "toolu_01ABC123", // references the tool_use.id
-    "content": "file contents here...",
-    "is_error": false
-    // optional:
-    // "parent_tool_use_id": "toolu_01XYZ789"  // present if result from a subagent
-  }
-}
-```
-
-<a id="cc-task-started"></a>
-### system_event: task_started
-
-Emitted when a subagent task begins.
-
-```jsonc
-{
-  "choices": [{ "delta": {}, "finish_reason": null }],
-  "system_event": {
-    "type": "task_started",
-    "task_id": "task_abc123",
-    "description": "Research API patterns",
-    "session_id": "sess_xyz"
-  }
-}
-```
-
-<a id="cc-task-progress"></a>
-### system_event: task_progress
-
-Periodic progress updates from a running subagent.
-
-```jsonc
-{
-  "choices": [{ "delta": {}, "finish_reason": null }],
-  "system_event": {
-    "type": "task_progress",
-    "task_id": "task_abc123",
-    "description": "Reading source files...",
-    "last_tool_name": "Read",        // last tool the subagent used (nullable)
-    "usage": { ... }                 // token usage so far (nullable)
-  }
-}
-```
-
-<a id="cc-task-notification"></a>
-### system_event: task_notification
-
-Emitted when a subagent task completes or fails.
-
-```jsonc
-{
-  "choices": [{ "delta": {}, "finish_reason": null }],
-  "system_event": {
-    "type": "task_notification",
-    "task_id": "task_abc123",
-    "status": "completed",           // "completed" or "failed"
-    "summary": "Found 3 relevant patterns in the codebase",
-    "usage": { ... }                 // final token usage (nullable)
-  }
-}
-```
-
-<a id="cc-final"></a>
-### Final Chunk
-
-```jsonc
-{
-  "choices": [{ "delta": {}, "finish_reason": "stop" }],
-  // present when request had stream_options.include_usage = true:
-  "usage": {
-    "prompt_tokens": 150,
-    "completion_tokens": 42,
-    "total_tokens": 192
-  }
-}
-```
-
-Terminated by `data: [DONE]\n\n`.
-
----
-
-## Responses API Events
-
-Wire format: `event: <type>\ndata: <json>\n\n`
-
-Each event has a monotonically increasing `sequence_number` for ordering.
-
-<a id="ra-lifecycle"></a>
-### Lifecycle Events
-
-These events frame the response. Emitted in this order:
-
-```
-event: response.created
-event: response.in_progress
-event: response.output_item.added
-event: response.content_part.added
-  ... content / tool events ...
-event: response.output_text.done
-event: response.content_part.done
-event: response.output_item.done
-event: response.completed          (or response.failed)
-```
-
-<a id="ra-text-delta"></a>
-### response.output_text.delta
-
-```jsonc
+```json
 {
   "type": "response.output_text.delta",
-  "item_id": "item_abc123",
+  "item_id": "msg_abc123",
   "output_index": 0,
   "content_index": 0,
   "delta": "Hello, world!",
@@ -225,326 +89,195 @@ event: response.completed          (or response.failed)
 }
 ```
 
-<a id="ra-tool-use"></a>
-### response.tool_use
+Final text is repeated in `response.output_text.done`,
+`response.content_part.done`, and `response.output_item.done` so clients can
+reconcile their buffered content.
 
-```jsonc
+## Tool Events
+
+`response.tool_use` is emitted when Claude invokes a tool:
+
+```json
 {
   "type": "response.tool_use",
   "tool_use_id": "toolu_01ABC123",
   "name": "Bash",
-  "input": {
-    "command": "ls -la"
-  },
+  "input": { "command": "ls -la" },
   "sequence_number": 6
-  // optional:
-  // "parent_tool_use_id": "toolu_01XYZ789"
 }
 ```
 
-<a id="ra-tool-result"></a>
-### response.tool_result
+`response.tool_result` is emitted when a tool result returns:
 
-```jsonc
+```json
 {
   "type": "response.tool_result",
   "tool_use_id": "toolu_01ABC123",
-  "content": "total 42\ndrwxr-xr-x ...",
+  "content": "total 42\n-rw-r--r-- ...",
   "is_error": false,
   "sequence_number": 7
-  // optional:
-  // "parent_tool_use_id": "toolu_01XYZ789"
 }
 ```
 
-<a id="ra-task-started"></a>
-### response.task_started
+If the tool call/result comes from a subagent, the event includes
+`parent_tool_use_id`.
 
-```jsonc
+## Subagent Events
+
+Subagent task system messages are forwarded as structured progress events:
+
+```json
 {
   "type": "response.task_started",
   "task_id": "task_abc123",
   "description": "Research API patterns",
-  "session_id": "sess_xyz",
+  "session_id": "sdk-session-id",
   "sequence_number": 8
 }
 ```
 
-<a id="ra-task-progress"></a>
-### response.task_progress
-
-```jsonc
+```json
 {
   "type": "response.task_progress",
   "task_id": "task_abc123",
   "description": "Reading source files...",
   "last_tool_name": "Read",
-  "usage": { ... },
+  "usage": null,
   "sequence_number": 9
 }
 ```
 
-<a id="ra-task-notification"></a>
-### response.task_notification
-
-```jsonc
+```json
 {
   "type": "response.task_notification",
   "task_id": "task_abc123",
   "status": "completed",
-  "summary": "Found 3 relevant patterns",
-  "usage": { ... },
+  "summary": "Found relevant patterns",
+  "usage": null,
   "sequence_number": 10
 }
 ```
 
-<a id="ra-closing"></a>
-### Closing Events
+Subagent visibility is controlled by:
 
-On success: `response.output_text.done` → `response.content_part.done` → `response.output_item.done` → `response.completed`
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `SUBAGENT_STREAM_TEXT` | `false` | Forward subagent text deltas |
+| `SUBAGENT_STREAM_TOOL_BLOCKS` | `true` | Forward subagent tool events |
+| `SUBAGENT_STREAM_PROGRESS` | `true` | Forward subagent task progress |
 
-On failure: `response.failed`
+## AskUserQuestion Pauses
 
-```jsonc
-// response.completed
+When the Claude SDK hook intercepts `AskUserQuestion`, the stream ends with a
+function-call output item and a `response.completed` event whose response status
+is `requires_action`.
+
+```json
+{
+  "type": "response.output_item.added",
+  "response_id": "resp_00000000-0000-0000-0000-000000000000_1",
+  "item": {
+    "type": "function_call",
+    "id": "fc_toolu_question",
+    "call_id": "toolu_question",
+    "name": "AskUserQuestion",
+    "arguments": "{\"question\":\"Continue?\"}",
+    "status": "completed"
+  }
+}
+```
+
+The client continues by sending a new `POST /v1/responses` request with the
+latest response id and a `function_call_output` input item:
+
+```json
+{
+  "model": "sonnet",
+  "previous_response_id": "resp_00000000-0000-0000-0000-000000000000_1",
+  "input": [
+    {
+      "type": "function_call_output",
+      "call_id": "toolu_question",
+      "output": "Yes, continue."
+    }
+  ]
+}
+```
+
+## Terminal Events
+
+`response.completed` contains the final `response` object and token usage:
+
+```json
 {
   "type": "response.completed",
   "response": {
-    "id": "resp_session1_3",
+    "id": "resp_00000000-0000-0000-0000-000000000000_1",
     "object": "response",
     "status": "completed",
     "model": "sonnet",
-    "output": [{ "id": "item_abc", "type": "message", "status": "completed", "content": [...] }],
-    "usage": { "input_tokens": 150, "output_tokens": 42 }
+    "output": [
+      {
+        "id": "msg_abc123",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          { "type": "output_text", "text": "The answer is 42.", "annotations": [] }
+        ]
+      }
+    ],
+    "usage": { "input_tokens": 50, "output_tokens": 10 },
+    "metadata": {}
   },
   "sequence_number": 15
 }
+```
 
-// response.failed
+`response.failed` contains a compact error detail:
+
+```json
 {
   "type": "response.failed",
   "response": {
-    "id": "resp_session1_3",
+    "id": "resp_00000000-0000-0000-0000-000000000000_1",
+    "object": "response",
     "status": "failed",
+    "model": "sonnet",
+    "output": [],
+    "usage": { "input_tokens": 0, "output_tokens": 0 },
+    "metadata": {},
     "error": { "code": "sdk_error", "message": "Authentication failed" }
   },
   "sequence_number": 8
 }
 ```
 
----
-
 ## Tool Names
 
-Tool names come directly from the Claude Agent SDK. The `name` field in `tool_use` events will be one of the following.
+Tool names come from the Claude Agent SDK. Common built-in tools include:
 
-### Claude Backend Tools
+| Name | Description |
+|------|-------------|
+| `Read` | Read files |
+| `Write` | Create or overwrite files |
+| `Edit` | Apply targeted string replacements |
+| `Bash` | Execute shell commands |
+| `Glob` | Find files by glob pattern |
+| `Grep` | Search file contents |
+| `Task` | Launch a subagent |
+| `WebFetch` | Fetch web content |
+| `WebSearch` | Search the web |
+| `NotebookEdit` | Edit notebook cells |
+| `TodoWrite` | Update task lists |
 
-These are the built-in tools available to the Claude agent:
+MCP tool names use `mcp__<server>__<tool>`. The available MCP servers are exposed
+through `GET /v1/mcp/servers`.
 
-| Name | Description | Key Input Fields |
-|------|-------------|------------------|
-| `Read` | Read a file from disk | `file_path`, `offset?`, `limit?` |
-| `Write` | Create or overwrite a file | `file_path`, `content` |
-| `Edit` | Apply targeted string replacements | `file_path`, `old_string`, `new_string` |
-| `Bash` | Execute a shell command | `command`, `timeout?` |
-| `Glob` | Find files by glob pattern | `pattern`, `path?` |
-| `Grep` | Search file contents with regex | `pattern`, `path?`, `glob?` |
-| `Agent` | Spawn a subagent for a subtask | `prompt`, `description?` |
-| `WebFetch` | Fetch a URL | `url` |
-| `WebSearch` | Search the web | `query` |
-| `NotebookEdit` | Edit Jupyter notebook cells | `notebook_path`, `cell_number`, `new_source` |
-| `TodoRead` | Read the task list | _(no params)_ |
-| `TodoWrite` | Update the task list | `todos` |
+## Client Tips
 
-### MCP Tools
-
-MCP (Model Context Protocol) server tools use a namespaced format:
-
-| Pattern | Example |
-|---------|---------|
-| `mcp__<server>__<tool>` | `mcp__github__create_issue` |
-| `mcp__<server>__<tool>` | `mcp__docs__search` |
-
-The available MCP tools depend on what servers are configured via `MCP_CONFIG`. Check `GET /v1/mcp/servers` for loaded servers.
-
----
-
-## Tool Input Schemas
-
-### Read
-
-```jsonc
-{
-  "file_path": "/absolute/path/to/file.py",
-  "offset": 10,    // optional: start line
-  "limit": 50      // optional: number of lines
-}
-```
-
-### Write
-
-```jsonc
-{
-  "file_path": "/absolute/path/to/file.py",
-  "content": "file content here..."
-}
-```
-
-### Edit
-
-```jsonc
-{
-  "file_path": "/absolute/path/to/file.py",
-  "old_string": "text to find",
-  "new_string": "replacement text",
-  "replace_all": false  // optional
-}
-```
-
-### Bash
-
-```jsonc
-{
-  "command": "npm test",
-  "timeout": 30000  // optional: ms
-}
-```
-
-### Glob
-
-```jsonc
-{
-  "pattern": "**/*.ts",
-  "path": "/project/src"  // optional: search root
-}
-```
-
-### Grep
-
-```jsonc
-{
-  "pattern": "function\\s+\\w+",
-  "path": "/project/src",     // optional
-  "glob": "*.py"              // optional: file filter
-}
-```
-
-### Agent
-
-```jsonc
-{
-  "prompt": "Find all API endpoints in the codebase and list them",
-  "description": "API endpoint discovery"  // optional
-}
-```
-
----
-
-## Subagent (Nested) Tool Calls
-
-When the agent spawns a subagent (via the `Agent` tool), subsequent tool calls and results from that subagent include a `parent_tool_use_id` field that references the original `Agent` tool_use ID. This enables UI nesting.
-
-**Event flow for a subagent call:**
-
-```
-1. tool_use   { name: "Agent", id: "toolu_parent" }
-   └─ 2. task_started   { task_id: "task_1" }
-   └─ 3. task_progress  { task_id: "task_1", last_tool_name: "Read" }
-   └─ 4. task_notification { task_id: "task_1", status: "completed" }
-5. tool_result { tool_use_id: "toolu_parent", content: "subagent output..." }
-```
-
-Tool calls made *by* the subagent will have `parent_tool_use_id: "toolu_parent"`. Use this to render nested tool activity under the parent Agent call.
-
----
-
-## Non-Streaming Responses
-
-### `/v1/chat/completions` (stream=false)
-
-Tool calls are **not** returned as structured objects. They are flattened into the text content. The response is a standard OpenAI `chat.completion` object:
-
-```jsonc
-{
-  "id": "chatcmpl-a1b2c3d4",
-  "object": "chat.completion",
-  "model": "sonnet",
-  "choices": [{
-    "index": 0,
-    "message": { "role": "assistant", "content": "The answer is 42." },
-    "finish_reason": "stop"
-  }],
-  "usage": { "prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60 }
-}
-```
-
-### `/v1/responses` (stream=false)
-
-```jsonc
-{
-  "id": "resp_session1_3",
-  "object": "response",
-  "status": "completed",
-  "model": "sonnet",
-  "output": [{
-    "id": "item_abc",
-    "type": "message",
-    "role": "assistant",
-    "status": "completed",
-    "content": [{ "type": "output_text", "text": "The answer is 42.", "annotations": [] }]
-  }],
-  "usage": { "input_tokens": 50, "output_tokens": 10 }
-}
-```
-
-### `/v1/messages` (non-streaming only)
-
-```jsonc
-{
-  "id": "msg_abc123def456",
-  "type": "message",
-  "role": "assistant",
-  "content": [{ "type": "text", "text": "The answer is 42." }],
-  "model": "sonnet",
-  "stop_reason": "end_turn",
-  "usage": { "input_tokens": 50, "output_tokens": 10 }
-}
-```
-
----
-
-## Usage & Stop Reason
-
-### Token Usage
-
-Usage values prefer real SDK-reported tokens. If unavailable, they are estimated (~4 characters per token).
-
-**Chat Completions format:**
-```jsonc
-{ "prompt_tokens": 150, "completion_tokens": 42, "total_tokens": 192 }
-```
-
-**Responses API / Messages format:**
-```jsonc
-{ "input_tokens": 150, "output_tokens": 42 }
-```
-
-### finish_reason / stop_reason Mapping
-
-| Agent SDK Value | Chat Completions `finish_reason` | Messages `stop_reason` |
-|-----------------|--------------------------------|----------------------|
-| `"max_tokens"` | `"length"` | `"max_tokens"` |
-| `"tool_use"` | `"tool_calls"` | _(not exposed)_ |
-| `null` / other | `"stop"` | `"end_turn"` |
-
----
-
-## UI Implementation Tips
-
-1. **Detect tool events**: In Chat Completions, check for `system_event` field on every chunk. In Responses API, dispatch on the SSE event type.
-2. **Match tool_use → tool_result**: Use `tool_use.id` and `tool_result.tool_use_id` to pair invocations with their results.
-3. **Render nesting**: Use `parent_tool_use_id` to show subagent tool calls as children of the parent `Agent` call.
-4. **Show progress**: `task_started` → `task_progress` → `task_notification` events let you show a subagent activity indicator with live tool names.
-5. **Handle errors**: `tool_result.is_error = true` indicates the tool failed. Display the `content` as an error message.
-6. **Thinking blocks**: Claude's thinking/reasoning is wrapped in `<think>...</think>` tags within text deltas (Chat Completions only; suppressed in Responses API).
+1. Dispatch on the SSE `event:` value or the JSON `type`.
+2. Pair tool results by `tool_use_id`.
+3. Use `parent_tool_use_id` to render nested subagent tool activity.
+4. Treat `response.completed` and `response.failed` as terminal events.
+5. Ignore keepalive comments.

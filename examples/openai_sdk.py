@@ -1,216 +1,88 @@
 #!/usr/bin/env python3
-"""
-Claude Code OpenAI API Wrapper - OpenAI SDK Example
+"""Responses API examples using only the Python standard library.
 
-This example demonstrates how to use the OpenAI Python SDK
-with the Claude Code wrapper.
+Run the gateway locally, then:
+
+    python examples/openai_sdk.py
+
+Set API_KEY when the gateway is protected by a bearer token.
 """
 
-from openai import OpenAI
+from __future__ import annotations
+
+import json
 import os
-import requests
-from typing import Optional
-
-# Configuration
-BASE_URL = "http://localhost:8000/v1"
+import urllib.error
+import urllib.request
+from typing import Any
 
 
-def get_api_key(base_url: str = "http://localhost:8000") -> Optional[str]:
-    """Get the appropriate API key based on server configuration."""
-    # Check if user provided API key via environment
-    if os.getenv("API_KEY"):
-        return os.getenv("API_KEY")
-
-    # Check server auth status
-    try:
-        response = requests.get(f"{base_url}/v1/auth/status")
-        if response.status_code == 200:
-            auth_data = response.json()
-            server_info = auth_data.get("server_info", {})
-
-            if not server_info.get("api_key_required", False):
-                # No auth required
-                return "no-auth-required"
-            else:
-                # Auth required but no key provided
-                print("⚠️  Server requires API key but none provided.")
-                print("   Set API_KEY environment variable with your server's API key")
-                print("   Example: API_KEY=your-server-key python openai_sdk.py")
-                return None
-    except Exception as e:
-        print(f"⚠️  Could not check server auth status: {e}")
-        print("   Assuming no authentication required")
-
-    return "fallback-key"
+BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
 
 
-def create_client(base_url: str = BASE_URL, api_key: Optional[str] = None) -> OpenAI:
-    """Create OpenAI client configured for Claude Code wrapper."""
-    if api_key is None:
-        # Auto-detect API key based on server configuration
-        server_base = base_url.replace("/v1", "")
-        api_key = get_api_key(server_base)
-
-        if api_key is None:
-            raise ValueError(
-                "Server requires API key but none was provided. Set the API_KEY environment variable."
-            )
-
-    return OpenAI(base_url=base_url, api_key=api_key)
-
-
-def basic_chat_example(client: OpenAI):
-    """Basic chat completion example."""
-    print("=== Basic Chat Completion ===")
-
-    response = client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
-        messages=[{"role": "user", "content": "What is the capital of France?"}],
-    )
-
-    print(f"Response: {response.choices[0].message.content}")
-    print(f"Model: {response.model}")
-    print(f"Usage: {response.usage}")
-    print()
-
-
-def system_message_example(client: OpenAI):
-    """Chat with system message example."""
-    print("=== Chat with System Message ===")
-
-    response = client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
-        messages=[
-            {"role": "system", "content": "You are a helpful coding assistant. Be concise."},
-            {"role": "user", "content": "How do I read a file in Python?"},
-        ],
-    )
-
-    print(f"Response: {response.choices[0].message.content}")
-    print()
-
-
-def conversation_example(client: OpenAI):
-    """Multi-turn conversation example."""
-    print("=== Multi-turn Conversation ===")
-
-    messages = [
-        {"role": "user", "content": "My name is Alice."},
-        {"role": "assistant", "content": "Nice to meet you, Alice! How can I help you today?"},
-        {"role": "user", "content": "What's my name?"},
-    ]
-
-    response = client.chat.completions.create(model="claude-3-5-sonnet-20241022", messages=messages)
-
-    print(f"Response: {response.choices[0].message.content}")
-    print()
-
-
-def streaming_example(client: OpenAI):
-    """Streaming response example."""
-    print("=== Streaming Response ===")
-
-    stream = client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
-        messages=[{"role": "user", "content": "Write a haiku about programming"}],
-        stream=True,
-    )
-
-    print("Response: ", end="", flush=True)
-    for chunk in stream:
-        if chunk.choices[0].delta.content:
-            print(chunk.choices[0].delta.content, end="", flush=True)
-    print("\n")
-
-
-def file_operation_example(client: OpenAI):
-    """Example using Claude Code's file capabilities."""
-    print("=== File Operation Example ===")
-
-    response = client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
-        messages=[{"role": "user", "content": "List the files in the current directory"}],
-    )
-
-    print(f"Response: {response.choices[0].message.content}")
-    print()
-
-
-def code_generation_example(client: OpenAI):
-    """Code generation example."""
-    print("=== Code Generation Example ===")
-
-    response = client.chat.completions.create(
-        model="claude-3-5-sonnet-20241022",
-        messages=[
-            {"role": "user", "content": "Write a Python function that calculates fibonacci numbers"}
-        ],
-        temperature=0.7,
-    )
-
-    print(f"Response:\n{response.choices[0].message.content}")
-    print()
-
-
-def list_models_example(client: OpenAI):
-    """List available models."""
-    print("=== Available Models ===")
-
-    models = client.models.list()
-    for model in models.data:
-        print(f"- {model.id} (owned by: {model.owned_by})")
-    print()
-
-
-def error_handling_example(client: OpenAI):
-    """Error handling example."""
-    print("=== Error Handling Example ===")
-
-    try:
-        # This might fail if Claude Code has issues
-        client.chat.completions.create(
-            model="invalid-model", messages=[{"role": "user", "content": "Test"}]
-        )
-    except Exception as e:
-        print(f"Error occurred: {type(e).__name__}: {e}")
-    print()
-
-
-def main():
-    """Run all examples."""
-    print("Claude Code OpenAI SDK Examples")
-    print("=" * 50)
-
-    # Check authentication status
-    api_key = get_api_key()
+def _headers() -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    api_key = os.getenv("API_KEY")
     if api_key:
-        if api_key == "no-auth-required":
-            print("🔓 Server authentication: Not required")
-        else:
-            print("🔑 Server authentication: Required (using provided key)")
-    else:
-        print("❌ Server authentication: Required but no key available")
-        return
+        headers["Authorization"] = f"Bearer {api_key}"
+    return headers
 
-    print("=" * 50)
 
-    # Create client
-    client = create_client()
+def _request(method: str, path: str, payload: dict[str, Any] | None = None) -> Any:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        f"{BASE_URL}{path}",
+        data=data,
+        headers=_headers(),
+        method=method,
+    )
+    with urllib.request.urlopen(request, timeout=120) as response:
+        return json.loads(response.read().decode("utf-8"))
 
-    # Run examples
+
+def create_response(**payload: Any) -> dict[str, Any]:
+    return _request("POST", "/v1/responses", payload)
+
+
+def print_output(label: str, response: dict[str, Any]) -> None:
+    text = response["output"][0]["content"][0]["text"]
+    print(f"\n=== {label} ===")
+    print(text)
+    print(f"response_id: {response['id']}")
+
+
+def main() -> None:
     try:
-        basic_chat_example(client)
-        system_message_example(client)
-        conversation_example(client)
-        streaming_example(client)
-        file_operation_example(client)
-        code_generation_example(client)
-        list_models_example(client)
-        error_handling_example(client)
+        health = _request("GET", "/health")
+        print(f"Gateway status: {health['status']}")
 
-    except Exception as e:
-        print(f"Failed to run examples: {e}")
-        print("Make sure the Claude Code wrapper server is running on port 8000")
+        basic = create_response(model="sonnet", input="What is 2 + 2?")
+        print_output("Basic Response", basic)
+
+        instructed = create_response(
+            model="sonnet",
+            instructions="Answer in one short sentence.",
+            input="How do I read a file in Python?",
+        )
+        print_output("Instructions", instructed)
+
+        first = create_response(model="sonnet", input="My name is Alice.")
+        follow_up = create_response(
+            model="sonnet",
+            input="What is my name?",
+            previous_response_id=first["id"],
+        )
+        print_output("Multi-turn", follow_up)
+
+        models = _request("GET", "/v1/models")
+        print("\n=== Models ===")
+        for model in models["data"]:
+            print(f"- {model['id']} ({model['owned_by']})")
+
+    except urllib.error.HTTPError as exc:
+        print(f"HTTP {exc.code}: {exc.read().decode('utf-8')}")
+    except urllib.error.URLError as exc:
+        print(f"Could not reach gateway at {BASE_URL}: {exc}")
 
 
 if __name__ == "__main__":
