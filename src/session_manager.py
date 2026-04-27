@@ -180,6 +180,8 @@ class SessionManager:
         self.default_ttl_minutes: int = default_ttl_minutes
         self.cleanup_interval_minutes: int = cleanup_interval_minutes
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._rehydrate_hits: int = 0
+        self._rehydrate_misses: int = 0
 
     # ------------------------------------------------------------------
     # Internal helpers (caller must hold self.lock)
@@ -508,6 +510,15 @@ class SessionManager:
                 "active_sessions": active,
                 "expired_sessions": expired,
                 "total_messages": total_messages,
+            }
+
+    def stats(self) -> dict:
+        """Return a summary dict including rehydrate hit/miss counters."""
+        with self.lock:
+            return {
+                "active_sessions": len(self.sessions),
+                "rehydrate_hits": self._rehydrate_hits,
+                "rehydrate_misses": self._rehydrate_misses,
             }
 
 
