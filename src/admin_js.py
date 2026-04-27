@@ -55,7 +55,22 @@ def get_admin_js() -> str:
     newPromptNameError: '',
     newPromptNameWarning: '',
     newPromptContent: '',
-    loading: { dashboard: false, logs: false, sessions: false },
+    loading: { dashboard: false, logs: false, sessions: false, usage: false },
+    usage: {
+      enabled: null, summary: null, users: [], tools: [], turns: [],
+      series: { day: [], week: [], month: [] },
+      toolsByGran: { day: [], week: [], month: [] },
+      toolsSeries: {
+        day: { tools: [], buckets: [] },
+        week: { tools: [], buckets: [] },
+        month: { tools: [], buckets: [] },
+      },
+    },
+    usageWindow: 7,
+    usageStart: '',
+    usageEnd: '',
+    usageTurnsFilter: '',
+    usageTurnsOffset: 0,
 
     async init() {
       document.addEventListener('keydown', (e) => {
@@ -249,6 +264,142 @@ def get_admin_js() -> str:
     toggleLogsPolling() {
       if (this.logsPollTimer) { clearInterval(this.logsPollTimer); this.logsPollTimer = null; }
       if (this.logsAutoRefresh) { this.logsPollTimer = setInterval(() => this.loadLogs(), 5000); }
+    },
+
+    _usageWindowQs() {
+      if (this.usageStart && this.usageEnd) {
+        return 'start_date=' + encodeURIComponent(this.usageStart) +
+               '&end_date=' + encodeURIComponent(this.usageEnd);
+      }
+      return 'window_days=' + this.usageWindow;
+    },
+
+    async loadUsage() {
+      this.loading.usage = true;
+      try {
+        const q = this._usageWindowQs();
+        const [sumR, userR, toolR] = await Promise.all([
+          this.api('/admin/api/usage/summary?' + q),
+          this.api('/admin/api/usage/users?' + q + '&limit=20'),
+          this.api('/admin/api/usage/tools?' + q + '&limit=30'),
+        ]);
+        if (sumR.ok) {
+          const s = await sumR.json();
+          this.usage.enabled = s.enabled;
+          this.usage.summary = s.summary || null;
+        }
+        if (userR.ok) {
+          const u = await userR.json();
+          this.usage.users = u.items || [];
+        }
+        if (toolR.ok) {
+          const t = await toolR.json();
+          this.usage.tools = t.items || [];
+        }
+        await this.loadUsageTurns();
+        await this.loadUsageSeries();
+      } catch(e) {
+        console.error('Failed to load usage', e);
+        this.showToast('Failed to load usage', 'err');
+      } finally { this.loading.usage = false; }
+    },
+
+    async loadUsageSeries() {
+      // Always fetch all three granularities for the fixed 4x3 Trends grid.
+      try {
+        const grans = ['day', 'week', 'month'];
+        // Approximate "last 5 of granularity" as a rolling-day window for
+        // the per-cell top-tools list.
+        const toolWindow = { day: 5, week: 35, month: 150 };
+        const seriesPromises = grans.map(g =>
+          this.api('/admin/api/usage/series?granularity=' + g + '&buckets=5'));
+        const toolPromises = grans.map(g =>
+          this.api('/admin/api/usage/tools?window_days=' + toolWindow[g] + '&limit=10'));
+        const toolSeriesPromises = grans.map(g =>
+          this.api('/admin/api/usage/tools-series?granularity=' + g + '&buckets=5&top=5'));
+        const [seriesRes, toolRes, toolSeriesRes] = await Promise.all([
+          Promise.all(seriesPromises),
+          Promise.all(toolPromises),
+          Promise.all(toolSeriesPromises),
+        ]);
+        for (let i = 0; i < grans.length; i++) {
+          if (seriesRes[i].ok) {
+            const j = await seriesRes[i].json();
+            this.usage.series[grans[i]] = (j.buckets || []).slice().reverse();
+            if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+          }
+          if (toolRes[i].ok) {
+            const j = await toolRes[i].json();
+            this.usage.toolsByGran[grans[i]] = j.items || [];
+          }
+          if (toolSeriesRes[i].ok) {
+            const j = await toolSeriesRes[i].json();
+            // backend buckets are DESC; reverse so chart reads left = older
+            this.usage.toolsSeries[grans[i]] = {
+              tools: j.tools || [],
+              buckets: (j.buckets || []).slice().reverse(),
+            };
+          }
+        }
+      } catch(e) {
+        console.error('Failed to load usage series', e);
+      }
+    },
+
+    usageSeriesEmpty() {
+      const s = this.usage.series || {};
+      return (s.day || []).length === 0 && (s.week || []).length === 0 && (s.month || []).length === 0;
+    },
+
+    toolColor(idx) {
+      const palette = [
+        'var(--green)', 'var(--cyan)', 'var(--amber)',
+        'var(--red)', '#a855f7', '#3b82f6'
+      ];
+      return palette[((idx % palette.length) + palette.length) % palette.length];
+    },
+
+    toolSeriesMax(gran) {
+      const ts = (this.usage.toolsSeries || {})[gran];
+      if (!ts) return 1;
+      let max = 1;
+      for (const b of (ts.buckets || [])) {
+        for (const t of (ts.tools || [])) {
+          const v = Number((b.values || {})[t] || 0);
+          if (v > max) max = v;
+        }
+      }
+      return max;
+    },
+
+    seriesForChart(gran, field) {
+      const rows = (this.usage.series || {})[gran] || [];
+      if (rows.length === 0) return [];
+      const vals = rows.map(r => {
+        if (field === 'tokens') return Number(r.input_tokens || 0) + Number(r.output_tokens || 0);
+        return Number(r[field] || 0);
+      });
+      const max = Math.max(1, ...vals);
+      return rows.map((r, i) => ({
+        label: String(r.bucket || ''),
+        value: vals[i],
+        pct: vals[i] / max,
+      }));
+    },
+
+    async loadUsageTurns() {
+      try {
+        let url = '/admin/api/usage/turns?limit=50&offset=' + this.usageTurnsOffset;
+        if (this.usageTurnsFilter) url += '&user=' + encodeURIComponent(this.usageTurnsFilter);
+        const r = await this.api(url);
+        if (r.ok) {
+          const j = await r.json();
+          this.usage.turns = j.items || [];
+          if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+        }
+      } catch(e) {
+        console.error('Failed to load usage turns', e);
+      }
     },
 
     async loadRateLimits() {
@@ -694,6 +845,15 @@ Skill description here.
       if (!t) return '-';
       try { return new Date(t).toLocaleString('ko-KR', { hour12: false }); }
       catch(e) { return t; }
+    },
+
+    formatNum(n) {
+      if (n === null || n === undefined) return '-';
+      const v = Number(n);
+      if (!isFinite(v)) return String(n);
+      if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+      if (v >= 1e3) return (v / 1e3).toFixed(1) + 'k';
+      return String(v);
     }
   };
 }"""

@@ -815,3 +815,129 @@ async def list_marketplaces_endpoint(_=Depends(require_admin)):
     from src.plugin_service import list_marketplaces
 
     return {"marketplaces": list_marketplaces()}
+
+
+# ---------------------------------------------------------------------------
+# Usage-log dashboard (MySQL-backed analytics)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/api/usage/summary")
+async def usage_summary_endpoint(
+    window_days: int = 7,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    """Overview counters for the usage tab."""
+    from src.usage_queries import get_summary
+
+    data = await get_summary(
+        window_days=max(1, min(window_days, 365)),
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if data is None:
+        return {"enabled": False}
+    return {"enabled": True, "window_days": window_days, "summary": data}
+
+
+@router.get("/api/usage/users")
+async def usage_users_endpoint(
+    window_days: int = 7,
+    limit: int = 20,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    """Top users by token usage in the selected range."""
+    from src.usage_queries import get_top_users
+
+    rows = await get_top_users(
+        window_days=max(1, min(window_days, 365)),
+        limit=max(1, min(limit, 500)),
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if rows is None:
+        return {"enabled": False, "items": []}
+    return {"enabled": True, "items": rows}
+
+
+@router.get("/api/usage/tools")
+async def usage_tools_endpoint(
+    window_days: int = 7,
+    limit: int = 30,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    _=Depends(require_admin),
+):
+    """Top tools by call count in the selected range."""
+    from src.usage_queries import get_top_tools
+
+    rows = await get_top_tools(
+        window_days=max(1, min(window_days, 365)),
+        limit=max(1, min(limit, 500)),
+        start_date=start_date,
+        end_date=end_date,
+    )
+    if rows is None:
+        return {"enabled": False, "items": []}
+    return {"enabled": True, "items": rows}
+
+
+@router.get("/api/usage/series")
+async def usage_series_endpoint(
+    granularity: str = "day",
+    buckets: int = 5,
+    _=Depends(require_admin),
+):
+    """Recent bucket aggregates for USAGE time-series charts."""
+    from src.usage_queries import get_time_series
+
+    gran = granularity if granularity in ("day", "week", "month") else "day"
+    rows = await get_time_series(granularity=gran, buckets=max(1, min(buckets, 60)))
+    if rows is None:
+        return {"enabled": False, "granularity": gran, "buckets": []}
+    return {"enabled": True, "granularity": gran, "buckets": rows}
+
+
+@router.get("/api/usage/tools-series")
+async def usage_tools_series_endpoint(
+    granularity: str = "day",
+    buckets: int = 5,
+    top: int = 5,
+    _=Depends(require_admin),
+):
+    """Per-bucket tool-call breakdown for the grouped TOOL CALLS chart."""
+    from src.usage_queries import get_tool_breakdown_series
+
+    gran = granularity if granularity in ("day", "week", "month") else "day"
+    data = await get_tool_breakdown_series(
+        granularity=gran,
+        buckets=max(1, min(buckets, 60)),
+        top_n=max(1, min(top, 20)),
+    )
+    if data is None:
+        return {"enabled": False, "granularity": gran, "tools": [], "buckets": []}
+    return {"enabled": True, "granularity": gran, **data}
+
+
+@router.get("/api/usage/turns")
+async def usage_turns_endpoint(
+    user: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    _=Depends(require_admin),
+):
+    """Recent turns (newest first), optionally filtered by user."""
+    from src.usage_queries import get_recent_turns
+
+    rows = await get_recent_turns(
+        user=user,
+        limit=max(1, min(limit, 500)),
+        offset=max(0, offset),
+    )
+    if rows is None:
+        return {"enabled": False, "items": []}
+    return {"enabled": True, "items": rows}
