@@ -75,8 +75,7 @@ def _try_rehydrate_from_jsonl(
     if not user or not cwd:
         return None
     try:
-        encoded = _encode_cwd(cwd)
-        jsonl_path = _PROJECTS_ROOT / encoded / f"{session_id}.jsonl"
+        jsonl_path = _session_jsonl_path(session_id, cwd)
         if not jsonl_path.is_file():
             return None
         user_msg_count = 0
