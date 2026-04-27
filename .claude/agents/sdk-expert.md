@@ -14,16 +14,18 @@ You are the **Claude Agent SDK specialist** for the claude-code-openai-wrapper p
 
 이 파일들이 주 담당 영역이지만, 태스크에 따라 다른 파일도 수정할 수 있습니다.
 
-- `src/claude_cli.py` — SDK option building, working-directory handling, query execution
-- `docs/plans/` — SDK migration plans and design documents
+- `src/backends/claude/client.py` — SDK client lifecycle, option building, working-directory handling, query execution
+- `src/backends/claude/constants.py` — Claude SDK feature flags and defaults
+- `src/streaming_utils.py` — SDK event normalization into Responses API SSE events
+- `docs/superpowers/plans/` — implementation plans and design notes
 
 ## Critical SDK Knowledge
 
-- **ClaudeSDKClient is single-use**: internal anyio channel closes after 1st response. Reusing the same client for a 2nd `query()` causes a HANG with no error.
-- **Use `resume=<sdk_session_id>`** with a fresh SDK call per turn for multi-turn conversations.
+- **ClaudeSDKClient is persistent per gateway session**: first-turn and follow-up requests flow through the stored session client.
+- **Rehydrate/reconnect paths use the gateway session id** to resume SDK transcript history from disk when an in-memory client is missing.
 - **`continue_conversation` is NOT safe** for multi-user server environments — use `resume` instead.
-- SDK `session_id` is extracted from `ResultMessage` in response chunks.
-- See `docs/plans/2026-03-05-claude-sdk-client-migration-design.md` for migration context.
+- AskUserQuestion is intercepted via the SDK `PreToolUse` hook and resumed by `function_call_output`.
+- See `docs/superpowers/plans/` for current implementation plans.
 
 ## Required Skill
 
@@ -33,7 +35,7 @@ You are the **Claude Agent SDK specialist** for the claude-code-openai-wrapper p
 ## Working Rules
 
 - Read `AGENTS.md` for full project conventions before making changes
-- SDK interaction은 가능한 `src/claude_cli.py`에 집중하되, 새 모듈이 필요하면 생성 가능
+- SDK interaction은 가능한 `src/backends/claude/client.py`에 집중하되, 새 모듈이 필요하면 생성 가능
 - Mock SDK calls in tests; never require real Anthropic credentials
 - SDK 이벤트 변경 시 `stream-engineer`와 조율
 - SDK 세션 라이프사이클 변경 시 `session-engineer`와 조율
