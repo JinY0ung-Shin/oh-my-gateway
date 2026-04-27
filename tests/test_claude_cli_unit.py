@@ -1218,3 +1218,82 @@ class TestConfigureHelpers:
                                 opts = cli_instance._build_sdk_options()
         assert opts.sandbox is not None
         assert opts.sandbox["enabled"] is True
+
+
+class TestCreateClientSessionId:
+    """create_client uses session.session_id; disk presence chooses session_id vs resume."""
+
+    @pytest.fixture
+    def gateway_session(self):
+        from src.session_manager import Session
+
+        return Session(
+            session_id="gw-uuid-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            workspace="/tmp/ws",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_jsonl_passes_session_id(
+        self, monkeypatch, tmp_path, gateway_session, cli_instance
+    ):
+        """When no transcript exists, create_client passes session_id (not resume)."""
+        from src import session_manager
+        from src.backends.claude import client as claude_client_mod
+
+        monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+
+        captured: dict = {}
+
+        class FakeSDKClient:
+            def __init__(self, *, options):
+                captured["session_id"] = options.session_id
+                captured["resume"] = options.resume
+
+            async def connect(self, prompt=None):
+                return None
+
+        monkeypatch.setattr(claude_client_mod, "ClaudeSDKClient", FakeSDKClient)
+
+        await cli_instance.create_client(
+            session=gateway_session,
+            cwd="/tmp/ws",
+        )
+
+        assert captured["session_id"] == gateway_session.session_id
+        assert captured["resume"] is None
+
+    @pytest.mark.asyncio
+    async def test_existing_jsonl_passes_resume(
+        self, monkeypatch, tmp_path, gateway_session, cli_instance
+    ):
+        """When a transcript exists, create_client passes resume (not session_id)."""
+        from src import session_manager
+        from src.backends.claude import client as claude_client_mod
+
+        monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+
+        target = session_manager._session_jsonl_path(
+            gateway_session.session_id, gateway_session.workspace
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n")
+
+        captured: dict = {}
+
+        class FakeSDKClient:
+            def __init__(self, *, options):
+                captured["session_id"] = options.session_id
+                captured["resume"] = options.resume
+
+            async def connect(self, prompt=None):
+                return None
+
+        monkeypatch.setattr(claude_client_mod, "ClaudeSDKClient", FakeSDKClient)
+
+        await cli_instance.create_client(
+            session=gateway_session,
+            cwd="/tmp/ws",
+        )
+
+        assert captured["session_id"] is None
+        assert captured["resume"] == gateway_session.session_id

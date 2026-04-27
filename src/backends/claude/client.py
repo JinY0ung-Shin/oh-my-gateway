@@ -10,7 +10,6 @@ import tempfile
 import atexit
 import shutil
 import contextlib
-import uuid
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 import logging
@@ -558,17 +557,22 @@ class ClaudeCodeCLI:
         when provided, the caller is responsible for having already resolved
         ``{{WORKING_DIRECTORY}}`` (and any other request-time placeholders).
         """
-        # Use a fresh session_id for the persistent client.  Each
-        # ClaudeSDKClient needs its own CLI session identifier.
-        client_session_id = str(uuid.uuid4())
+        # Reuse the gateway's session_id so logs, OpenAI response IDs,
+        # and the on-disk SDK transcript all agree.  Disk presence chooses
+        # between starting a new SDK session and resuming an existing one
+        # (the latter applies after rehydrate or after an in-memory client
+        # crash).
+        from src.session_manager import _session_jsonl_exists
+
+        has_history = _session_jsonl_exists(session)
         options = self._build_sdk_options(
             model=model,
             system_prompt=system_prompt,
             max_turns=get_default_max_turns(),
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
-            session_id=client_session_id,
-            resume=None,
+            session_id=None if has_history else session.session_id,
+            resume=session.session_id if has_history else None,
             permission_mode=permission_mode,
             mcp_servers=mcp_servers,
             task_budget=task_budget,
