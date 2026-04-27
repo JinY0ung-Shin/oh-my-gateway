@@ -223,6 +223,74 @@ async def get_time_series(
     return rows
 
 
+async def get_tool_breakdown_series(
+    granularity: str = "day",
+    buckets: int = 5,
+    top_n: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """Per-bucket tool-call breakdown for the grouped TOOL CALLS bar chart.
+
+    Returns ``{tools: [...], buckets: [{bucket, values: {tool: calls}}]}``
+    with ``tools`` ordered by total calls (descending) so the frontend
+    can map each tool to a stable colour.
+
+    Approximates the time window per granularity as 5d / 35d / 150d for
+    day / week / month so the same backend can serve all three columns.
+    """
+    bucket_expr = _GRANULARITY_SQL.get(granularity)
+    if bucket_expr is None or not usage_logger.enabled:
+        return None
+    bucket_expr_uts = bucket_expr.replace("ts", "u.ts")
+    days_window = {"day": 5, "week": 35, "month": 150}.get(granularity, 30)
+
+    rows = await usage_logger.fetch_rows(
+        f"""
+        SELECT
+          {bucket_expr_uts} AS bucket,
+          t.tool_name AS tool_name,
+          SUM(t.call_count) AS calls
+        FROM usage_tool t
+        JOIN usage_turn u ON u.id = t.turn_id
+        WHERE u.ts >= NOW() - INTERVAL %s DAY
+        GROUP BY {bucket_expr_uts}, t.tool_name
+        ORDER BY {bucket_expr_uts} DESC, calls DESC
+        """,
+        (days_window,),
+    )
+    if not rows:
+        return {"tools": [], "buckets": []}
+
+    # Distinct buckets in DESC order, take the most recent N
+    seen: List[str] = []
+    for r in rows:
+        b = str(r["bucket"])
+        if b not in seen:
+            seen.append(b)
+        if len(seen) >= int(buckets):
+            break
+    keep_buckets = seen[: int(buckets)]
+    keep_set = set(keep_buckets)
+
+    # Sum tool totals over the kept buckets to pick the top N
+    tool_totals: Dict[str, int] = {}
+    for r in rows:
+        if str(r["bucket"]) in keep_set:
+            tool_totals[r["tool_name"]] = tool_totals.get(r["tool_name"], 0) + int(r["calls"])
+    top_tools = [t for t, _ in sorted(tool_totals.items(), key=lambda x: -x[1])[: int(top_n)]]
+    top_set = set(top_tools)
+
+    # Pivot: bucket -> {tool: calls}
+    by_bucket: Dict[str, Dict[str, int]] = {b: {} for b in keep_buckets}
+    for r in rows:
+        b = str(r["bucket"])
+        if b in keep_set and r["tool_name"] in top_set:
+            by_bucket[b][r["tool_name"]] = int(r["calls"])
+    return {
+        "tools": top_tools,
+        "buckets": [{"bucket": b, "values": by_bucket[b]} for b in keep_buckets],
+    }
+
+
 async def get_recent_turns(
     user: Optional[str] = None,
     limit: int = 50,
