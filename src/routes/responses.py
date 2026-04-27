@@ -202,7 +202,6 @@ async def _responses_streaming_preflight(
         "session": pf.session,
         "lock_acquired": pf.lock_acquired,
         "next_turn": pf.next_turn,
-        "resume_id": pf.resume_id,
     }
 
 
