@@ -75,7 +75,6 @@ def get_usage_html() -> str:
                     <template x-for="chart in [
                       {key:'turns', label:'QUERIES', color:'var(--green)'},
                       {key:'users', label:'USERS', color:'var(--cyan)'},
-                      {key:'tool_calls', label:'TOOL CALLS', color:'var(--amber)'},
                       {key:'tokens', label:'TOKENS', color:'var(--red)'}
                     ]" :key="'row-' + chart.key">
                       <tr>
@@ -99,6 +98,45 @@ def get_usage_html() -> str:
                         </template>
                       </tr>
                     </template>
+                    <tr>
+                      <td class="text-xs text-dim" style="vertical-align:middle; letter-spacing:0.08em">TOOL CALLS</td>
+                      <template x-for="g in ['day','week','month']" :key="'tool-cell-' + g">
+                        <td style="vertical-align:middle; padding:8px">
+                          <template x-if="(usage.toolsSeries?.[g]?.buckets ?? []).length === 0">
+                            <div class="text-muted text-xs" style="padding:1rem; text-align:center">-</div>
+                          </template>
+                          <template x-if="(usage.toolsSeries?.[g]?.buckets ?? []).length > 0">
+                            <div>
+                              <div style="display:flex; gap:6px; align-items:flex-end; height:90px; border-bottom:1px solid var(--border-dim)">
+                                <template x-for="bucket in (usage.toolsSeries?.[g]?.buckets ?? [])" :key="g + 'b-' + bucket.bucket">
+                                  <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; min-width:0">
+                                    <div style="display:flex; gap:1px; align-items:flex-end; width:100%; height:80px; justify-content:center">
+                                      <template x-for="(tool, idx) in (usage.toolsSeries?.[g]?.tools ?? [])" :key="g + bucket.bucket + tool">
+                                        <div :style="'flex:1; min-width:3px; max-width:14px; background:' + toolColor(idx) + '; height:' + ((Number((bucket.values || {})[tool] || 0) / toolSeriesMax(g)) * 100) + '%; min-height:2px; transition:height 0.3s'"
+                                          :title="tool + ': ' + ((bucket.values || {})[tool] || 0) + '회'"></div>
+                                      </template>
+                                    </div>
+                                  </div>
+                                </template>
+                              </div>
+                              <div style="display:flex; gap:6px; padding-top:4px">
+                                <template x-for="bucket in (usage.toolsSeries?.[g]?.buckets ?? [])" :key="g + bucket.bucket + '-lbl'">
+                                  <div class="text-xs text-dim" style="flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.6rem" x-text="bucket.bucket"></div>
+                                </template>
+                              </div>
+                              <div style="display:flex; flex-wrap:wrap; gap:4px 8px; padding-top:6px">
+                                <template x-for="(tool, idx) in (usage.toolsSeries?.[g]?.tools ?? [])" :key="g + 'leg-' + tool">
+                                  <div style="display:flex; gap:3px; align-items:center; font-size:0.6rem; color:var(--text-dim)">
+                                    <span :style="'width:8px; height:8px; background:' + toolColor(idx) + '; display:inline-block'"></span>
+                                    <span class="text-mono" style="max-width:120px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap" x-text="tool"></span>
+                                  </div>
+                                </template>
+                              </div>
+                            </div>
+                          </template>
+                        </td>
+                      </template>
+                    </tr>
                     <tr>
                       <td class="text-xs text-dim" style="vertical-align:top; letter-spacing:0.08em; padding-top:12px">TOP TOOLS</td>
                       <template x-for="g in ['day','week','month']" :key="'tools-' + g">

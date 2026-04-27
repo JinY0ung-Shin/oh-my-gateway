@@ -60,6 +60,11 @@ def get_admin_js() -> str:
       enabled: null, summary: null, users: [], tools: [], turns: [],
       series: { day: [], week: [], month: [] },
       toolsByGran: { day: [], week: [], month: [] },
+      toolsSeries: {
+        day: { tools: [], buckets: [] },
+        week: { tools: [], buckets: [] },
+        month: { tools: [], buckets: [] },
+      },
     },
     usageWindow: 7,
     usageStart: '',
@@ -310,9 +315,12 @@ def get_admin_js() -> str:
           this.api('/admin/api/usage/series?granularity=' + g + '&buckets=5'));
         const toolPromises = grans.map(g =>
           this.api('/admin/api/usage/tools?window_days=' + toolWindow[g] + '&limit=10'));
-        const [seriesRes, toolRes] = await Promise.all([
+        const toolSeriesPromises = grans.map(g =>
+          this.api('/admin/api/usage/tools-series?granularity=' + g + '&buckets=5&top=5'));
+        const [seriesRes, toolRes, toolSeriesRes] = await Promise.all([
           Promise.all(seriesPromises),
           Promise.all(toolPromises),
+          Promise.all(toolSeriesPromises),
         ]);
         for (let i = 0; i < grans.length; i++) {
           if (seriesRes[i].ok) {
@@ -324,6 +332,14 @@ def get_admin_js() -> str:
             const j = await toolRes[i].json();
             this.usage.toolsByGran[grans[i]] = j.items || [];
           }
+          if (toolSeriesRes[i].ok) {
+            const j = await toolSeriesRes[i].json();
+            // backend buckets are DESC; reverse so chart reads left = older
+            this.usage.toolsSeries[grans[i]] = {
+              tools: j.tools || [],
+              buckets: (j.buckets || []).slice().reverse(),
+            };
+          }
         }
       } catch(e) {
         console.error('Failed to load usage series', e);
@@ -333,6 +349,27 @@ def get_admin_js() -> str:
     usageSeriesEmpty() {
       const s = this.usage.series || {};
       return (s.day || []).length === 0 && (s.week || []).length === 0 && (s.month || []).length === 0;
+    },
+
+    toolColor(idx) {
+      const palette = [
+        'var(--green)', 'var(--cyan)', 'var(--amber)',
+        'var(--red)', '#a855f7', '#3b82f6'
+      ];
+      return palette[((idx % palette.length) + palette.length) % palette.length];
+    },
+
+    toolSeriesMax(gran) {
+      const ts = (this.usage.toolsSeries || {})[gran];
+      if (!ts) return 1;
+      let max = 1;
+      for (const b of (ts.buckets || [])) {
+        for (const t of (ts.tools || [])) {
+          const v = Number((b.values || {})[t] || 0);
+          if (v > max) max = v;
+        }
+      }
+      return max;
     },
 
     seriesForChart(gran, field) {
