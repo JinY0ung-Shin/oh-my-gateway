@@ -19,6 +19,7 @@ Concurrency model
 import asyncio
 import contextlib
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +30,20 @@ from src.models import Message, SessionInfo
 from src.constants import SESSION_CLEANUP_INTERVAL_MINUTES, SESSION_MAX_AGE_MINUTES
 
 logger = logging.getLogger(__name__)
+
+_CWD_ENCODE_RE = re.compile(r"[/_.]")
+
+
+def _encode_cwd(cwd) -> str:
+    """Encode a workspace cwd to its on-disk Claude SDK directory name.
+
+    The Claude SDK stores per-project transcripts under
+    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. The encoding
+    rule observed across recorded sessions: every ``/``, ``_`` and ``.``
+    is replaced with ``-``. (To be re-verified against SDK source if the
+    rule changes — see plan Task C-followup.)
+    """
+    return _CWD_ENCODE_RE.sub("-", str(cwd))
 
 
 def _utcnow() -> datetime:
