@@ -380,6 +380,43 @@ def test_create_response_rejects_instructions_with_previous_response_id():
     )
 
 
+def test_create_response_rejects_array_system_role_with_previous_response_id():
+    """Array input with role=system/developer is equivalent to instructions
+    and must be rejected the same way when previous_response_id is set."""
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": [
+                    {"role": "system", "content": "Override the prompt"},
+                    {"role": "user", "content": "Hi"},
+                ],
+                "previous_response_id": "resp_c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f_1",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "previous_response_id" in response.json()["error"]["message"].lower()
+
+
+def test_create_response_rejects_array_developer_role_with_previous_response_id():
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": [
+                    {"role": "developer", "content": "Override"},
+                    {"role": "user", "content": "Hi"},
+                ],
+                "previous_response_id": "resp_c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f_1",
+            },
+        )
+
+    assert response.status_code == 400
+
+
 def test_create_response_returns_404_when_previous_response_session_is_missing():
     with client_context() as (client, _mock_cli):
         response = client.post(

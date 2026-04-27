@@ -85,8 +85,23 @@ def _try_rehydrate_from_jsonl(
                     line = json.loads(raw)
                 except (ValueError, json.JSONDecodeError):
                     return None  # corrupt — refuse to guess
-                if line.get("type") == "user":
-                    user_msg_count += 1
+                if line.get("type") != "user":
+                    continue
+                # Claude jsonl reuses type="user" for two distinct things:
+                # (1) external prompts the gateway exposed as turns, and
+                # (2) tool_result blocks plus isMeta system reminders that
+                # the SDK injects internally. Only (1) corresponds to a
+                # gateway-issued response_id, so only (1) advances the
+                # turn counter.
+                if line.get("isMeta"):
+                    continue
+                content = line.get("message", {}).get("content")
+                if isinstance(content, list) and content and all(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                ):
+                    continue
+                user_msg_count += 1
         return Session(
             session_id=session_id,
             backend="claude",
@@ -423,7 +438,12 @@ class SessionManager:
             if session is not None:
                 session.touch()
                 return session
-            # Cache miss path — try rehydrate
+            # Cache miss path — only count rehydrate hit/miss when the
+            # caller supplied enough context for a jsonl lookup to be
+            # attempted. Generic cache misses (e.g., simple existence
+            # checks without user/cwd) must not pollute the metric.
+            if not user or not cwd:
+                return None
             session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
             if session is not None:
                 self.sessions[session_id] = session

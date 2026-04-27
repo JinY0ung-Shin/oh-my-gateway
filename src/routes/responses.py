@@ -241,6 +241,23 @@ async def create_response(
             "The system prompt is fixed to the original session.",
         )
 
+    # Same restriction for array-form system/developer items: a follow-up
+    # request must not redefine the system prompt of an existing session.
+    if body.previous_response_id and isinstance(body.input, list):
+        for item in body.input:
+            role = getattr(item, "role", None) or (
+                item.get("role") if isinstance(item, dict) else None
+            )
+            if role in ("system", "developer"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "system/developer input items cannot be used with "
+                        "previous_response_id. The system prompt is fixed "
+                        "to the original session."
+                    ),
+                )
+
     # Resolve session from previous_response_id or create new
     if body.previous_response_id:
         parsed = _parse_response_id(body.previous_response_id)
@@ -402,7 +419,7 @@ async def create_response(
             session.client = await backend.create_client(
                 session=session,
                 model=resolved.provider_model,
-                system_prompt=system_prompt if len(session.messages) == 0 else None,
+                system_prompt=system_prompt if is_new_session else None,
                 permission_mode=PERMISSION_MODE_BYPASS,
                 allowed_tools=body.allowed_tools,
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,

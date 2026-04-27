@@ -129,6 +129,33 @@ def test_get_session_returns_none_when_neither_memory_nor_disk(tmp_path, monkeyp
     assert sm.get_session("nope", user="u", cwd="/x") is None
 
 
+def test_rehydrate_misses_only_counts_real_attempts(tmp_path, monkeypatch):
+    """The miss counter should reflect rehydrate failures, not generic
+    cache misses. A get_session call without user/cwd cannot rehydrate at
+    all, so it must not bump the miss counter."""
+    from src import session_manager
+    from src.session_manager import SessionManager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    sm = SessionManager()
+
+    # No user/cwd → rehydrate not even attempted.
+    assert sm.get_session("absent") is None
+    assert sm._rehydrate_misses == 0
+
+    # Only user provided → still cannot attempt.
+    assert sm.get_session("absent", user="u") is None
+    assert sm._rehydrate_misses == 0
+
+    # Only cwd provided → still cannot attempt.
+    assert sm.get_session("absent", cwd="/x") is None
+    assert sm._rehydrate_misses == 0
+
+    # Both provided AND no jsonl on disk → real miss.
+    assert sm.get_session("absent", user="u", cwd="/x") is None
+    assert sm._rehydrate_misses == 1
+
+
 def test_session_jsonl_path_constructs_expected_path(tmp_path, monkeypatch):
     from src import session_manager
 
@@ -144,6 +171,66 @@ def test_session_jsonl_exists_returns_false_when_workspace_missing():
 
     sess = Session(session_id="sid", workspace=None)
     assert session_manager._session_jsonl_exists(sess) is False
+
+
+def test_try_rehydrate_skips_tool_result_user_entries(tmp_path, monkeypatch):
+    """Claude jsonl records tool_results as top-level type=user with
+    content=[{"type":"tool_result", ...}]. Those must not bump turn_counter
+    or the gateway will stamp follow-ups with a future turn id."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/x/y"
+    encoded = session_manager._encode_cwd(cwd)
+    sid = "tool-1"
+    jsonl = tmp_path / encoded / f"{sid}.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            # One real external user prompt
+            {"type": "user", "message": {"role": "user", "content": "Use the tool"}},
+            # Assistant decides to call a tool
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use"}]}},
+            # Tool result — recorded as type=user but should NOT count as a turn
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "abc", "content": "ok"}],
+                },
+            },
+            # Final assistant answer
+            {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "done"}]}},
+        ],
+    )
+
+    sess = session_manager._try_rehydrate_from_jsonl(sid, user="u", cwd=cwd)
+    assert sess is not None
+    assert sess.turn_counter == 1, (
+        f"expected 1 user turn, got {sess.turn_counter} (tool_result counted)"
+    )
+
+
+def test_try_rehydrate_skips_isMeta_user_entries(tmp_path, monkeypatch):
+    """Meta user entries (system reminders etc.) are not real turns."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/x/y"
+    encoded = session_manager._encode_cwd(cwd)
+    sid = "meta-1"
+    jsonl = tmp_path / encoded / f"{sid}.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {"type": "user", "isMeta": True, "message": {"role": "user", "content": "<system>"}},
+            {"type": "user", "message": {"role": "user", "content": "real prompt"}},
+        ],
+    )
+
+    sess = session_manager._try_rehydrate_from_jsonl(sid, user="u", cwd=cwd)
+    assert sess is not None
+    assert sess.turn_counter == 1
 
 
 def test_session_jsonl_exists_reflects_filesystem(tmp_path, monkeypatch):
