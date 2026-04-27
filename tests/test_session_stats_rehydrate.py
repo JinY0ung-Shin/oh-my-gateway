@@ -2,7 +2,6 @@
 
 from unittest.mock import AsyncMock, patch
 
-import src.main as main
 import src.routes.sessions as sessions_module
 from src.session_manager import session_manager as global_sm
 from tests.test_main_api_unit import client_context

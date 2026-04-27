@@ -996,7 +996,7 @@ class TestContinuationStreaming:
         # bridge_sse_stream as an async generator that raises during iteration
         async def fake_bridge(sse_source, chunk_source):
             raise RuntimeError("Connection lost")
-            yield ""  # noqa: E501 — makes this an async generator
+            yield ""
 
         async def fake_receive(client, sess):
             yield {"type": "result", "result": "partial"}

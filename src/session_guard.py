@@ -47,7 +47,7 @@ async def acquire_session_preflight(
     resolved : ResolvedModel
         The resolved model/backend from the request.
     session_id : str
-        The session identifier (used for resume_id fallback).
+        The gateway session identifier used for stale/future-turn validation.
     is_new : bool, optional
         Whether this is a new session.  When ``None`` (default), computed
         as ``len(session.messages) == 0`` inside the lock.

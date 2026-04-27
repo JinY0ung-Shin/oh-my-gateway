@@ -11,7 +11,7 @@ it loops back to ``src.auth`` → ``src.backends.claude.auth`` (circular).
 import logging
 from typing import Optional
 
-from src.backends.claude.constants import CLAUDE_MODELS  # noqa: F401
+from src.backends.claude.constants import CLAUDE_MODELS
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
 
 logger = logging.getLogger(__name__)

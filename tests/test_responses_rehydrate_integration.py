@@ -1,8 +1,6 @@
 """Smoke test: a previous_response_id targeting a memory-evicted but on-disk
 session resolves successfully via rehydration."""
 
-from pathlib import Path
-
 from src import session_manager
 from src.session_manager import session_manager as global_sm
 

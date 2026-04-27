@@ -65,9 +65,10 @@ _sandbox_logger = _logging.getLogger(__name__)
 # When set, the model is made aware of its remaining token budget so it can
 # pace tool use and wrap up before the limit.  Unset (None) means no limit.
 _task_budget_raw = os.getenv("TASK_BUDGET")
+DEFAULT_TASK_BUDGET: int | None
 if _task_budget_raw:
     try:
-        DEFAULT_TASK_BUDGET: int | None = int(_task_budget_raw)
+        DEFAULT_TASK_BUDGET = int(_task_budget_raw)
     except ValueError:
         _sandbox_logger.warning(
             "Invalid TASK_BUDGET=%r (expected integer), treating as unset",
@@ -75,7 +76,7 @@ if _task_budget_raw:
         )
         DEFAULT_TASK_BUDGET = None
 else:
-    DEFAULT_TASK_BUDGET: int | None = None
+    DEFAULT_TASK_BUDGET = None
 
 # Token-Level Streaming
 # When enabled, uses SDK's include_partial_messages to stream individual tokens

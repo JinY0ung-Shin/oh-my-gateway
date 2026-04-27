@@ -63,9 +63,7 @@ def _session_jsonl_exists(session: "Session") -> bool:
     return _session_jsonl_path(session.session_id, session.workspace).is_file()
 
 
-def _try_rehydrate_from_jsonl(
-    session_id: str, *, user: Optional[str], cwd
-) -> Optional["Session"]:
+def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> Optional["Session"]:
     """Reconstruct a Session from the Claude SDK on-disk jsonl, if present.
 
     Returns None when the jsonl file is missing, unreadable, or malformed
@@ -96,9 +94,10 @@ def _try_rehydrate_from_jsonl(
                 if line.get("isMeta"):
                     continue
                 content = line.get("message", {}).get("content")
-                if isinstance(content, list) and content and all(
-                    isinstance(b, dict) and b.get("type") == "tool_result"
-                    for b in content
+                if (
+                    isinstance(content, list)
+                    and content
+                    and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
                 ):
                     continue
                 user_msg_count += 1
@@ -180,10 +179,12 @@ class Session:
 
     def is_expired(self) -> bool:
         """Check if the session has expired."""
+        assert self.expires_at is not None
         return _utcnow() > self.expires_at
 
     def to_session_info(self) -> SessionInfo:
         """Convert to SessionInfo model for API responses."""
+        assert self.expires_at is not None
         return SessionInfo(
             session_id=self.session_id,
             created_at=self.created_at,

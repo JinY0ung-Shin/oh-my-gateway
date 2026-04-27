@@ -6,7 +6,7 @@ import secrets
 import string
 import time
 import uuid
-from typing import Optional
+from typing import Any, Optional, Sequence, cast
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Request
@@ -55,10 +55,19 @@ logger = logging.getLogger(__name__)
 runtime_api_key = None
 
 
-def _sanitize_validation_errors(errors: list[dict]) -> list[dict[str, str]]:
+def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict[str, str]]:
     """Strip raw input payloads from validation errors for logging and responses."""
     sanitized = []
     for error in errors:
+        if not isinstance(error, dict):
+            sanitized.append(
+                {
+                    "field": "",
+                    "message": str(error),
+                    "type": "validation_error",
+                }
+            )
+            continue
         sanitized.append(
             {
                 "field": " -> ".join(str(loc) for loc in error.get("loc", [])),
@@ -250,7 +259,7 @@ async def lifespan(app: FastAPI):
     # Start session cleanup task
     session_manager.start_cleanup_task()
 
-    # Bring up the optional usage-log MySQL pool (no-op when the env var is
+    # Bring up the optional usage-log SQLAlchemy engine (no-op when the env var is
     # unset).  Kept late in startup so a flaky logging DB cannot block the
     # gateway from becoming healthy.
     from src.usage_logger import usage_logger
@@ -289,7 +298,7 @@ app.add_middleware(
 # Add rate limiting error handler
 if limiter:
     app.state.limiter = limiter
-    app.add_exception_handler(429, rate_limit_exceeded_handler)
+    app.add_exception_handler(429, cast(Any, rate_limit_exceeded_handler))
 
 
 # ==================== Middleware ====================
@@ -514,7 +523,7 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc):
+async def http_exception_handler(_request: Request, exc: HTTPException):
     """Format HTTP exceptions as OpenAI-style errors."""
     detail = exc.detail
     if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
@@ -523,9 +532,7 @@ async def http_exception_handler(request: Request, exc):
         return JSONResponse(status_code=exc.status_code, content=detail)
     return JSONResponse(
         status_code=exc.status_code,
-        content={
-            "error": {"message": detail, "type": "api_error", "code": str(exc.status_code)}
-        },
+        content={"error": {"message": detail, "type": "api_error", "code": str(exc.status_code)}},
     )
 
 
@@ -547,17 +554,16 @@ app.include_router(admin_router)
 # ==================== Backward-compat re-exports ====================
 # Tests call these functions directly as main.X() — re-exports are required.
 
-from src.routes.responses import (  # noqa: E402, F401, F811
+from src.routes.responses import (  # noqa: E402, F401
     _generate_msg_id,
     _make_response_id,
     _parse_response_id,
     _responses_streaming_preflight,
 )
-from src.session_manager import session_manager  # noqa: E402, F401, F811
-from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS  # noqa: E402, F401, F811
-from src.constants import PERMISSION_MODE_BYPASS  # noqa: E402, F401, F811
-from src.backend_registry import ResolvedModel  # noqa: E402, F401, F811
-from src import streaming_utils  # noqa: E402, F401, F811
+from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS  # noqa: E402, F401
+from src.constants import PERMISSION_MODE_BYPASS  # noqa: E402, F401
+from src.backend_registry import ResolvedModel  # noqa: E402, F401
+from src import streaming_utils  # noqa: E402, F401
 
 
 # ==================== Server Startup ====================
@@ -584,7 +590,7 @@ def find_available_port(start_port: int = 8000, max_attempts: int = 10) -> int:
     )
 
 
-def run_server(port: int = None, host: str = None):
+def run_server(port: Optional[int] = None, host: Optional[str] = None) -> None:
     """Run the server - used as script entry point."""
     import uvicorn
 
@@ -627,7 +633,7 @@ if __name__ == "__main__":
     import sys
 
     # Simple CLI argument parsing for port
-    port = None
+    port: Optional[int] = None
     if len(sys.argv) > 1:
         try:
             port = int(sys.argv[1])

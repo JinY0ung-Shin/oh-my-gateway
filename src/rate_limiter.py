@@ -31,7 +31,7 @@ def create_rate_limiter() -> Optional[Limiter]:
     return limiter
 
 
-def rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+def rate_limit_exceeded_handler(_request: Request, exc: RateLimitExceeded) -> JSONResponse:
     """Custom rate limit exceeded handler that returns JSON error response."""
     # Try to extract actual retry_after from the exception detail
     retry_after = 60

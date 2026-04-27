@@ -68,6 +68,7 @@ async def list_mcp_servers(
 @rate_limit_endpoint("health")
 async def health_check(request: Request):
     """Health check endpoint."""
+    _ = request  # slowapi requires a request parameter in decorated handlers.
     return {
         "status": "healthy",
         "service": "claude-code-gateway",
@@ -79,6 +80,7 @@ async def health_check(request: Request):
 @rate_limit_endpoint("health")
 async def version_info(request: Request):
     """Version information endpoint."""
+    _ = request  # slowapi requires a request parameter in decorated handlers.
     from src import __version__
 
     return {
@@ -117,6 +119,7 @@ async def root():
 @rate_limit_endpoint("auth")
 async def get_auth_status(request: Request):
     """Get authentication status for all backends."""
+    _ = request  # slowapi requires a request parameter in decorated handlers.
     active_api_key = auth_manager.get_api_key()
 
     backends_auth = get_all_backends_auth_info()
