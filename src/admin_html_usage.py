@@ -75,6 +75,7 @@ def get_usage_html() -> str:
                     <template x-for="chart in [
                       {key:'turns', label:'QUERIES', color:'var(--green)'},
                       {key:'users', label:'USERS', color:'var(--cyan)'},
+                      {key:'tool_calls', label:'TOOL CALLS', color:'var(--amber)'},
                       {key:'tokens', label:'TOKENS', color:'var(--red)'}
                     ]" :key="'row-' + chart.key">
                       <tr>
@@ -99,7 +100,7 @@ def get_usage_html() -> str:
                       </tr>
                     </template>
                     <tr>
-                      <td class="text-xs text-dim" style="vertical-align:top; letter-spacing:0.08em; padding-top:12px">TOOL CALLS</td>
+                      <td class="text-xs text-dim" style="vertical-align:top; letter-spacing:0.08em; padding-top:12px">TOP TOOLS</td>
                       <template x-for="g in ['day','week','month']" :key="'tools-' + g">
                         <td style="vertical-align:top; padding:8px">
                           <div x-show="(usage.toolsByGran?.[g] ?? []).length === 0" class="text-muted text-xs">-</div>
