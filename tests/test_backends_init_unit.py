@@ -83,6 +83,70 @@ class TestDiscoverBackends:
             assert "claude" in FakeRegistry.descriptors
             assert "claude" in FakeRegistry.clients
 
+    def test_discover_backends_respects_backends_env(self, monkeypatch):
+        """BACKENDS=claude,opencode registers both backends in order."""
+        import src.backends.claude as claude_pkg
+        import src.backends.opencode as opencode_pkg
+
+        calls = []
+
+        def fake_claude_register(registry_cls=None):
+            calls.append(("claude", registry_cls))
+
+        def fake_opencode_register(registry_cls=None):
+            calls.append(("opencode", registry_cls))
+
+        monkeypatch.setenv("BACKENDS", "claude,opencode")
+        monkeypatch.setattr(claude_pkg, "register", fake_claude_register)
+        monkeypatch.setattr(opencode_pkg, "register", fake_opencode_register)
+
+        from src.backends import discover_backends
+
+        discover_backends(registry_cls="registry")
+
+        assert calls == [("claude", "registry"), ("opencode", "registry")]
+
+    def test_discover_backends_defaults_to_claude_only(self, monkeypatch):
+        """Unset BACKENDS preserves current Claude-only startup behavior."""
+        import src.backends.claude as claude_pkg
+        import src.backends.opencode as opencode_pkg
+
+        calls = []
+
+        monkeypatch.delenv("BACKENDS", raising=False)
+        monkeypatch.setattr(claude_pkg, "register", lambda registry_cls=None: calls.append("claude"))
+        monkeypatch.setattr(
+            opencode_pkg, "register", lambda registry_cls=None: calls.append("opencode")
+        )
+
+        from src.backends import discover_backends
+
+        discover_backends()
+
+        assert calls == ["claude"]
+
+    def test_discover_backends_skips_unknown_backend(self, monkeypatch, caplog):
+        """Unknown BACKENDS entries are warned and skipped."""
+        import logging
+        import src.backends.claude as claude_pkg
+        import src.backends.opencode as opencode_pkg
+
+        calls = []
+
+        monkeypatch.setenv("BACKENDS", "unknown,opencode")
+        monkeypatch.setattr(claude_pkg, "register", lambda registry_cls=None: calls.append("claude"))
+        monkeypatch.setattr(
+            opencode_pkg, "register", lambda registry_cls=None: calls.append("opencode")
+        )
+
+        from src.backends import discover_backends
+
+        with caplog.at_level(logging.WARNING, logger="src.backends"):
+            discover_backends()
+
+        assert calls == ["opencode"]
+        assert any("Unknown backend in BACKENDS" in record.message for record in caplog.records)
+
 
 # ===========================================================================
 # src/backends/claude/__init__.py — __getattr__ lazy imports
