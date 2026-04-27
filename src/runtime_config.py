@@ -43,7 +43,8 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
     "thinking_mode": {
         "label": "Thinking Mode",
         "type": "string",
-        "description": "Claude thinking mode (disabled / adaptive)",
+        "options": ["disabled", "adaptive", "enabled"],
+        "description": "Claude thinking mode. enabled = fixed budget (THINKING_BUDGET_TOKENS)",
     },
     "token_streaming": {
         "label": "Token Streaming",
@@ -165,7 +166,11 @@ class RuntimeConfig:
             if isinstance(value, (int, float)):
                 return bool(value)
             raise ValueError(f"{key} must be a boolean, got {type(value).__name__}")
-        return str(value)
+        s = str(value)
+        options = meta.get("options")
+        if options and s not in options:
+            raise ValueError(f"{key} must be one of {options}, got {s!r}")
+        return s
 
 
 # ---------------------------------------------------------------------------

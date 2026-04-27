@@ -40,7 +40,16 @@ def get_config_html() -> str:
                           @change="updateRuntimeConfig(key, parseInt($event.target.value))"
                           style="padding:4px 8px; font-size:0.75rem; width:100px">
                       </template>
-                      <template x-if="meta.type === 'string'">
+                      <template x-if="meta.type === 'string' && Array.isArray(meta.options)">
+                        <select :value="meta.value"
+                          @change="updateRuntimeConfig(key, $event.target.value)"
+                          style="padding:4px 8px; font-size:0.75rem">
+                          <template x-for="opt in meta.options" :key="opt">
+                            <option :value="opt" x-text="opt" :selected="opt === meta.value"></option>
+                          </template>
+                        </select>
+                      </template>
+                      <template x-if="meta.type === 'string' && !Array.isArray(meta.options)">
                         <input type="text" :value="meta.value"
                           @change="updateRuntimeConfig(key, $event.target.value)"
                           style="padding:4px 8px; font-size:0.75rem; width:160px">
