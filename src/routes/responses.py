@@ -203,20 +203,6 @@ async def _responses_streaming_preflight(
         "lock_acquired": pf.lock_acquired,
         "next_turn": pf.next_turn,
         "resume_id": pf.resume_id,
-        "chunk_kwargs": dict(
-            prompt=prompt,
-            model=resolved.provider_model,
-            system_prompt=system_prompt if pf.is_new else None,
-            _custom_base=session.base_system_prompt,
-            _metadata=body.metadata,
-            _user=body.user,
-            permission_mode=PERMISSION_MODE_BYPASS,
-            mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-            session_id=session_id if pf.is_new else None,
-            resume=pf.resume_id,
-            cwd=workspace_str,
-            allowed_tools=body.allowed_tools,
-        ),
     }
 
 
