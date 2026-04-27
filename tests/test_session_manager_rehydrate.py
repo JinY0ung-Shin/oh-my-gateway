@@ -66,7 +66,6 @@ def test_try_rehydrate_reconstructs_session(tmp_path, monkeypatch):
     sess = session_manager._try_rehydrate_from_jsonl(sid, user="u", cwd=cwd)
     assert sess is not None
     assert sess.session_id == sid
-    assert sess.provider_session_id == sid
     assert sess.workspace == cwd
     assert sess.user == "u"
     assert sess.turn_counter == 2  # 2 user-role lines

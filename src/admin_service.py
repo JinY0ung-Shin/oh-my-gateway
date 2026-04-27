@@ -601,7 +601,6 @@ def get_session_detail(session_id: str) -> Optional[Dict[str, Any]]:
     return {
         "session_id": session.session_id,
         "backend": session.backend,
-        "provider_session_id": session.provider_session_id,
         "turn_counter": session.turn_counter,
         "ttl_minutes": session.ttl_minutes,
         "created_at": session.created_at.isoformat() if session.created_at else None,
@@ -630,7 +629,6 @@ def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
     return {
         "session_id": session.session_id,
         "backend": session.backend,
-        "provider_session_id": session.provider_session_id,
         "turn_counter": session.turn_counter,
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "messages": messages,

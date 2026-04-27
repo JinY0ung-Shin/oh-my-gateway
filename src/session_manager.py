@@ -90,7 +90,6 @@ def _try_rehydrate_from_jsonl(
         return Session(
             session_id=session_id,
             backend="claude",
-            provider_session_id=session_id,
             messages=[],
             turn_counter=user_msg_count,
             workspace=str(cwd),
@@ -123,7 +122,6 @@ class Session:
 
     session_id: str
     backend: str = "claude"
-    provider_session_id: Optional[str] = None
     ttl_minutes: int = 60
     messages: List[Message] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)

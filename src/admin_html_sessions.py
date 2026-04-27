@@ -56,7 +56,6 @@ def get_sessions_html() -> str:
               <span>backend=<span style="color:var(--text-bright)" x-text="sessionDetail?.backend || '-'"></span></span>
               <span>turns=<span style="color:var(--amber)" x-text="sessionDetail?.turn_counter ?? '-'"></span></span>
               <span>ttl=<span style="color:var(--text-bright)" x-text="(sessionDetail?.ttl_minutes ?? '-') + 'min'"></span></span>
-              <span x-show="sessionDetail?.provider_session_id">provider=<span style="color:var(--cyan)" x-text="(sessionDetail?.provider_session_id?.substring(0,16) || '') + '...'"></span></span>
               <span>created=<span style="color:var(--text-bright)" x-text="formatTime(sessionDetail?.created_at)"></span></span>
             </div>
             <div class="flex-between mb-md">
