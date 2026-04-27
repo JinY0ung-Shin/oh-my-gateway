@@ -310,18 +310,14 @@ class TestResponsesStreamingPreflightLockRelease:
             previous_response_id=f"resp_{session_id}_2",
         )
         resolved = _make_resolved()
-        mock_backend = MagicMock()
 
         with pytest.raises(HTTPException) as exc_info:
             await main._responses_streaming_preflight(
                 body,
                 resolved,
-                mock_backend,
                 session,
                 session_id,
                 False,
-                "Hi",
-                None,
             )
 
         assert exc_info.value.status_code == 409
@@ -342,18 +338,14 @@ class TestResponsesStreamingPreflightLockRelease:
             previous_response_id=f"resp_{session_id}_5",
         )
         resolved = _make_resolved()
-        mock_backend = MagicMock()
 
         with pytest.raises(HTTPException) as exc_info:
             await main._responses_streaming_preflight(
                 body,
                 resolved,
-                mock_backend,
                 session,
                 session_id,
                 False,
-                "Hi",
-                None,
             )
 
         assert exc_info.value.status_code == 404
@@ -374,18 +366,14 @@ class TestResponsesStreamingPreflightLockRelease:
             previous_response_id=f"resp_{session_id}_1",
         )
         resolved = _make_resolved("claude")
-        mock_backend = MagicMock()
 
         with pytest.raises(HTTPException) as exc_info:
             await main._responses_streaming_preflight(
                 body,
                 resolved,
-                mock_backend,
                 session,
                 session_id,
                 False,
-                "Hi",
-                None,
             )
 
         assert exc_info.value.status_code == 400

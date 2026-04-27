@@ -25,6 +25,8 @@ from src.response_models import (
     ResponseCreateRequest,
     ResponseContentPart,
     ResponseErrorDetail,
+    ResponseInputItem,
+    FunctionCallOutputInput,
     FunctionCallOutputItem,
     ResponseObject,
     OutputItem,
@@ -93,6 +95,49 @@ def _detect_function_call_output(input_data) -> Optional[Dict[str, str]]:
     return None
 
 
+def _content_part_text(part: object) -> str:
+    if isinstance(part, dict):
+        value = part.get("text")
+    else:
+        value = getattr(part, "text", "")
+    return value if isinstance(value, str) else ""
+
+
+def _input_content_to_text(content: str | list[Any]) -> str:
+    if isinstance(content, str):
+        return content
+    return "\n".join(text for part in content if (text := _content_part_text(part)))
+
+
+def _split_response_input(
+    body: ResponseCreateRequest,
+) -> tuple[Optional[str], str | list[ResponseInputItem | FunctionCallOutputInput]]:
+    """Return ``(system_prompt, input_for_prompt)`` for prompt conversion.
+
+    Explicit ``instructions`` wins: when present, array input is passed through
+    unchanged so the adapter sees exactly what the client sent.  Without
+    ``instructions``, array-form ``system`` / ``developer`` items become the
+    per-request system prompt and are removed from user prompt input.  If the
+    array only contains system/developer or function_call_output items, the
+    original input is preserved so downstream validation/continuation handling
+    still sees the complete request shape.
+    """
+    if not isinstance(body.input, list) or body.instructions:
+        return body.instructions, body.input
+
+    system_prompt: Optional[str] = body.instructions
+    user_items: list[ResponseInputItem | FunctionCallOutputInput] = []
+    for item in body.input:
+        if not isinstance(item, ResponseInputItem):
+            continue
+        if item.role in ("system", "developer"):
+            system_prompt = _input_content_to_text(item.content)
+        else:
+            user_items.append(item)
+
+    return system_prompt, user_items if user_items else body.input
+
+
 def _build_requires_action_response(
     resp_id: str,
     model: str,
@@ -134,6 +179,33 @@ def _build_failed_response(
     )
 
 
+def _build_completed_response(
+    resp_id: str,
+    model: str,
+    assistant_text: str,
+    metadata: Optional[dict],
+    *,
+    input_tokens: int,
+    output_tokens: int,
+) -> ResponseObject:
+    return ResponseObject(
+        id=resp_id,
+        status="completed",
+        model=model,
+        output=[
+            OutputItem(
+                id=_generate_msg_id(),
+                content=[ResponseContentPart(text=assistant_text)],
+            )
+        ],
+        usage=ResponseUsage(
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+        ),
+        metadata=metadata or {},
+    )
+
+
 async def _disconnect_session_client(session, reason: str, client=None) -> None:
     """Drop and disconnect a persistent SDK client after stream failure/cancel."""
     if client is None:
@@ -154,12 +226,9 @@ async def _disconnect_session_client(session, reason: str, client=None) -> None:
 async def _responses_streaming_preflight(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
-    backend: "BackendClient",
     session,
     session_id: str,
     is_new_session: bool,
-    prompt: str,
-    system_prompt: Optional[str],
     workspace_str: str = "",
 ) -> Dict[str, Any]:
     """Run session guards BEFORE StreamingResponse is created for /v1/responses.
@@ -205,6 +274,186 @@ async def _responses_streaming_preflight(
     }
 
 
+def _validate_response_continuation(body: ResponseCreateRequest) -> None:
+    if body.previous_response_id and body.instructions:
+        raise HTTPException(
+            status_code=400,
+            detail="instructions cannot be used with previous_response_id. "
+            "The system prompt is fixed to the original session.",
+        )
+
+    if body.previous_response_id and isinstance(body.input, list):
+        for item in body.input:
+            role = getattr(item, "role", None) or (
+                item.get("role") if isinstance(item, dict) else None
+            )
+            if role in ("system", "developer"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "system/developer input items cannot be used with "
+                        "previous_response_id. The system prompt is fixed "
+                        "to the original session."
+                    ),
+                )
+
+
+def _resolve_response_session(body: ResponseCreateRequest) -> tuple[str, Any]:
+    if not body.previous_response_id:
+        session_id = str(uuid.uuid4())
+        return session_id, session_manager.get_or_create_session(session_id)
+
+    parsed = _parse_response_id(body.previous_response_id)
+    if not parsed:
+        raise HTTPException(
+            status_code=404,
+            detail=f"previous_response_id '{body.previous_response_id}' is invalid",
+        )
+    session_id, turn = parsed
+    _early_cwd: Optional[str] = None
+    if body.user:
+        try:
+            _early_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+        except (ValueError, OSError):
+            pass
+    session = session_manager.get_session(session_id, user=body.user, cwd=_early_cwd)
+    if not session:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Session for previous_response_id "
+                f"'{body.previous_response_id}' not found or expired"
+            ),
+        )
+    if turn > session.turn_counter:
+        raise HTTPException(
+            status_code=404,
+            detail=f"previous_response_id '{body.previous_response_id}' references a future turn",
+        )
+    return session_id, session
+
+
+async def _resolve_response_workspace(
+    body: ResponseCreateRequest,
+    session,
+    session_id: str,
+    is_new_session: bool,
+) -> Path:
+    if not is_new_session and session.user != body.user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User mismatch: session belongs to {session.user!r}, "
+            f"but request specifies {body.user!r}",
+        )
+
+    if is_new_session:
+        try:
+            workspace = workspace_manager.resolve(body.user, sync_template=True)
+        except ValueError as e:
+            await session_manager.delete_session_async(session_id)
+            raise HTTPException(status_code=400, detail=str(e)) from e
+        session.user = body.user
+        session.workspace = str(workspace)
+        return workspace
+
+    if session.workspace:
+        return Path(session.workspace)
+
+    try:
+        workspace = workspace_manager.resolve(body.user, sync_template=False)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    session.workspace = str(workspace)
+    return workspace
+
+
+def _response_prompt_and_system(
+    body: ResponseCreateRequest,
+    workspace: Path,
+) -> tuple[str, Optional[str]]:
+    system_prompt, input_for_prompt = _split_response_input(body)
+    image_handler = ImageHandler(workspace)
+    try:
+        prompt = MessageAdapter.response_input_to_prompt(
+            input_for_prompt, image_handler=image_handler
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return MessageAdapter.filter_content(prompt), system_prompt
+
+
+async def _validate_backend_prompt(
+    resolved: ResolvedModel,
+    prompt: str,
+    workspace_str: str,
+) -> None:
+    if resolved.backend != "claude":
+        return
+    try:
+        await validate_slash_prompt(
+            prompt,
+            cwd=Path(workspace_str) if workspace_str else None,
+        )
+    except SlashCommandError as e:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": e.code,
+                    "message": e.message,
+                }
+            },
+        ) from e
+
+
+async def _unblock_pending_tool_call(
+    session, backend: "BackendClient", fc_output: Dict[str, str]
+) -> None:
+    await session.lock.acquire()
+    try:
+        if session.pending_tool_call is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but no pending tool call in session",
+            )
+
+        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"call_id mismatch: pending tool call has "
+                    f"'{session.pending_tool_call['call_id']}', "
+                    f"but received '{fc_output['call_id']}'"
+                ),
+            )
+
+        if not hasattr(backend, "run_completion_with_client"):
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output requires a backend that supports persistent clients",
+            )
+
+        if session.client is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no active SDK client",
+            )
+
+        session.input_response = fc_output["output"]
+        pending_event = session.input_event
+        if pending_event is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no pending input event",
+            )
+        pending_event.set()
+        session.pending_tool_call = None
+    except Exception:
+        session.lock.release()
+        raise
+
+
 @router.post("/v1/responses")
 @rate_limit_endpoint("responses")
 async def create_response(
@@ -232,98 +481,9 @@ async def create_response(
 
     # Moved earlier — needed for workspace sync_template decision
     is_new_session = body.previous_response_id is None
-
-    # Validate: instructions + previous_response_id is not allowed
-    if body.previous_response_id and body.instructions:
-        raise HTTPException(
-            status_code=400,
-            detail="instructions cannot be used with previous_response_id. "
-            "The system prompt is fixed to the original session.",
-        )
-
-    # Same restriction for array-form system/developer items: a follow-up
-    # request must not redefine the system prompt of an existing session.
-    if body.previous_response_id and isinstance(body.input, list):
-        for item in body.input:
-            role = getattr(item, "role", None) or (
-                item.get("role") if isinstance(item, dict) else None
-            )
-            if role in ("system", "developer"):
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "system/developer input items cannot be used with "
-                        "previous_response_id. The system prompt is fixed "
-                        "to the original session."
-                    ),
-                )
-
-    # Resolve session from previous_response_id or create new
-    if body.previous_response_id:
-        parsed = _parse_response_id(body.previous_response_id)
-        if not parsed:
-            raise HTTPException(
-                status_code=404,
-                detail=f"previous_response_id '{body.previous_response_id}' is invalid",
-            )
-        session_id, turn = parsed
-        # Lightweight workspace resolve (no template sync) so we can supply
-        # cwd to get_session and enable rehydrate-on-miss from jsonl.
-        _early_cwd: Optional[str] = None
-        if body.user:
-            try:
-                _early_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
-            except (ValueError, OSError):
-                pass
-        session = session_manager.get_session(
-            session_id, user=body.user, cwd=_early_cwd,
-        )
-        if not session:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"Session for previous_response_id "
-                    f"'{body.previous_response_id}' not found or expired"
-                ),
-            )
-        # Future turn check (outside lock -- safe because turn_counter only grows)
-        if turn > session.turn_counter:
-            raise HTTPException(
-                status_code=404,
-                detail=(
-                    f"previous_response_id '{body.previous_response_id}' references a future turn"
-                ),
-            )
-    else:
-        session_id = str(uuid.uuid4())
-        session = session_manager.get_or_create_session(session_id)
-
-    # --- Per-user workspace isolation ---
-    if not is_new_session and session.user != body.user:
-        raise HTTPException(
-            status_code=400,
-            detail=f"User mismatch: session belongs to {session.user!r}, "
-            f"but request specifies {body.user!r}",
-        )
-
-    if is_new_session:
-        try:
-            workspace = workspace_manager.resolve(body.user, sync_template=True)
-        except ValueError as e:
-            await session_manager.delete_session_async(session_id)
-            raise HTTPException(status_code=400, detail=str(e))
-        session.user = body.user
-        session.workspace = str(workspace)
-    else:
-        # Follow-up: reuse stored workspace, no template sync
-        if session.workspace:
-            workspace = Path(session.workspace)
-        else:
-            try:
-                workspace = workspace_manager.resolve(body.user, sync_template=False)
-            except ValueError as e:
-                raise HTTPException(status_code=400, detail=str(e))
-            session.workspace = str(workspace)
+    _validate_response_continuation(body)
+    session_id, session = _resolve_response_session(body)
+    workspace = await _resolve_response_workspace(body, session, session_id, is_new_session)
     workspace_str = str(workspace)
 
     # ------------------------------------------------------------------
@@ -337,60 +497,12 @@ async def create_response(
             body, resolved, backend, session, session_id, workspace_str, fc_output
         )
 
-    # Extract system prompt from array input if present
-    system_prompt = body.instructions
-    input_for_prompt = body.input
-    if isinstance(body.input, list) and not body.instructions:
-        user_items = []
-        for item in body.input:
-            # FunctionCallOutputInput items don't have role; skip them here
-            if not hasattr(item, "role"):
-                continue
-            if item.role in ("system", "developer"):
-                content = item.content
-                if isinstance(content, str):
-                    system_prompt = content
-                elif isinstance(content, list):
-                    system_prompt = "\n".join(
-                        p.get("text") if isinstance(p, dict) else getattr(p, "text", "")
-                        for p in content
-                        if (p.get("text") if isinstance(p, dict) else getattr(p, "text", ""))
-                    )
-            else:
-                user_items.append(item)
-        input_for_prompt = user_items if user_items else body.input
-
-    # Convert input to prompt
-    # Per-request ImageHandler pointing to user workspace
-    image_handler = ImageHandler(workspace)
-    try:
-        prompt = MessageAdapter.response_input_to_prompt(
-            input_for_prompt, image_handler=image_handler
-        )
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    prompt = MessageAdapter.filter_content(prompt)
+    prompt, system_prompt = _response_prompt_and_system(body, workspace)
 
     # Reject slash-prefixed prompts that would be intercepted by the SDK as
     # unknown skills or run destructive built-ins.  Only applies to the Claude
     # backend; other backends pass through unchanged.
-    if resolved.backend == "claude":
-        try:
-            await validate_slash_prompt(
-                prompt,
-                cwd=Path(workspace_str) if workspace_str else None,
-            )
-        except SlashCommandError as e:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": {
-                        "type": "invalid_request_error",
-                        "code": e.code,
-                        "message": e.message,
-                    }
-                },
-            ) from e
+    await _validate_backend_prompt(resolved, prompt, workspace_str)
 
     # ------------------------------------------------------------------
     # Create the persistent ClaudeSDKClient.  Every turn flows through it
@@ -411,6 +523,7 @@ async def create_response(
         # into in-flight sessions.
         from src.system_prompt import get_system_prompt, resolve_request_placeholders
 
+        resolved_base: Optional[str]
         if session.base_system_prompt is not None:
             resolved_base = session.base_system_prompt
         else:
@@ -441,12 +554,9 @@ async def create_response(
         preflight = await _responses_streaming_preflight(
             body,
             resolved,
-            backend,
             session,
             session_id,
             is_new_session,
-            prompt,
-            system_prompt,
             workspace_str=workspace_str,
         )
 
@@ -461,9 +571,7 @@ async def create_response(
             try:
                 chunks_buffer = []
 
-                chunk_source = backend.run_completion_with_client(
-                    session.client, prompt, session
-                )
+                chunk_source = backend.run_completion_with_client(session.client, prompt, session)
 
                 # Bridge SDK iteration through a background task to keep
                 # anyio cancel scopes task-local.
@@ -597,9 +705,7 @@ async def create_response(
             # Execute backend through the persistent client.
             chunks = []
             active_client = session.client
-            async for chunk in backend.run_completion_with_client(
-                active_client, prompt, session
-            ):
+            async for chunk in backend.run_completion_with_client(active_client, prompt, session):
                 chunks.append(chunk)
 
             # Check for backend errors (run_completion wraps exceptions as error chunks)
@@ -658,21 +764,13 @@ async def create_response(
     # Build response object
     resp_id = _make_response_id(session_id, session.turn_counter)
 
-    response_obj = ResponseObject(
-        id=resp_id,
-        status="completed",
-        model=body.model,
-        output=[
-            OutputItem(
-                id=_generate_msg_id(),
-                content=[ResponseContentPart(text=assistant_text)],
-            )
-        ],
-        usage=ResponseUsage(
-            input_tokens=prompt_tokens,
-            output_tokens=completion_tokens,
-        ),
-        metadata=body.metadata or {},
+    response_obj = _build_completed_response(
+        resp_id,
+        body.model,
+        assistant_text,
+        body.metadata,
+        input_tokens=prompt_tokens,
+        output_tokens=completion_tokens,
     )
 
     try:
@@ -723,49 +821,7 @@ async def _handle_function_call_output(
     # --- Validate + unblock under session lock, then keep the lock through
     # the continuation read so no concurrent request can mutate session state
     # between the tool output and SDK resume.
-    await session.lock.acquire()
-    try:
-        if session.pending_tool_call is None:
-            raise HTTPException(
-                status_code=400,
-                detail="function_call_output received but no pending tool call in session",
-            )
-
-        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"call_id mismatch: pending tool call has "
-                    f"'{session.pending_tool_call['call_id']}', "
-                    f"but received '{fc_output['call_id']}'"
-                ),
-            )
-
-        if not hasattr(backend, "run_completion_with_client"):
-            raise HTTPException(
-                status_code=400,
-                detail="function_call_output requires a backend that supports persistent clients",
-            )
-
-        if session.client is None:
-            raise HTTPException(
-                status_code=400,
-                detail="function_call_output received but session has no active SDK client",
-            )
-
-        # --- Unblock the PreToolUse hook ---
-        session.input_response = fc_output["output"]
-        pending_event = session.input_event
-        if pending_event is None:
-            raise HTTPException(
-                status_code=400,
-                detail="function_call_output received but session has no pending input event",
-            )
-        pending_event.set()  # Unblocks the callback; SDK continues processing
-        session.pending_tool_call = None  # Clear the pending state
-    except Exception:
-        session.lock.release()
-        raise
+    await _unblock_pending_tool_call(session, backend, fc_output)
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1
@@ -774,15 +830,17 @@ async def _handle_function_call_output(
     active_client = session.client
 
     if body.stream:
+
         async def _run_continuation_stream():
             stream_result = {"success": False}
             try:
                 chunks_buffer = []
                 # After the hook returns deny+reason, the SDK continues
-                # processing from where it left off.  Use
-                # receive_response_from_client (no new query needed).
-                if hasattr(backend, "receive_response_from_client"):
-                    chunk_source = backend.receive_response_from_client(active_client, session)
+                # processing from where it left off.  Use receive_response_from_client
+                # when available; do not start a new prompt.
+                receiver = getattr(backend, "receive_response_from_client", None)
+                if receiver is not None:
+                    chunk_source = receiver(active_client, session)
                 else:
                     chunk_source = backend.run_completion_with_client(active_client, "", session)
 
@@ -863,8 +921,9 @@ async def _handle_function_call_output(
         chunks = []
         # After the hook returns deny+reason, the SDK continues
         # processing from where it left off — no new query needed.
-        if hasattr(backend, "receive_response_from_client"):
-            chunk_source = backend.receive_response_from_client(active_client, session)
+        receiver = getattr(backend, "receive_response_from_client", None)
+        if receiver is not None:
+            chunk_source = receiver(active_client, session)
         else:
             chunk_source = backend.run_completion_with_client(active_client, "", session)
         async for chunk in chunk_source:
@@ -907,21 +966,13 @@ async def _handle_function_call_output(
         chunks, "", assistant_text, body.model, backend=backend
     )
 
-    response_obj = ResponseObject(
-        id=resp_id,
-        status="completed",
-        model=body.model,
-        output=[
-            OutputItem(
-                id=_generate_msg_id(),
-                content=[ResponseContentPart(text=assistant_text)],
-            )
-        ],
-        usage=ResponseUsage(
-            input_tokens=prompt_tokens,
-            output_tokens=completion_tokens,
-        ),
-        metadata=body.metadata or {},
+    response_obj = _build_completed_response(
+        resp_id,
+        body.model,
+        assistant_text,
+        body.metadata,
+        input_tokens=prompt_tokens,
+        output_tokens=completion_tokens,
     )
 
     try:

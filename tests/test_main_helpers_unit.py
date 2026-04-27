@@ -12,6 +12,8 @@ import pytest
 
 import src.main as main
 from src.constants import DEFAULT_HOST, DEFAULT_PORT
+from src.response_models import ResponseCreateRequest
+from src.routes.responses import _split_response_input
 from src.streaming_utils import (
     is_assistant_content_chunk,
     extract_stream_event_delta,
@@ -363,6 +365,42 @@ def test_response_id_helpers_round_trip():
 )
 def test_parse_response_id_rejects_invalid_formats(response_id):
     assert main._parse_response_id(response_id) is None
+
+
+def test_split_response_input_extracts_array_system_prompt():
+    body = ResponseCreateRequest(
+        input=[
+            {
+                "role": "developer",
+                "content": [
+                    {"type": "input_text", "text": "Line 1"},
+                    {"type": "input_text", "text": "Line 2"},
+                ],
+            },
+            {"role": "user", "content": "Hello"},
+        ]
+    )
+
+    system_prompt, input_for_prompt = _split_response_input(body)
+
+    assert system_prompt == "Line 1\nLine 2"
+    assert len(input_for_prompt) == 1
+    assert input_for_prompt[0].role == "user"
+
+
+def test_split_response_input_keeps_body_input_when_instructions_are_explicit():
+    body = ResponseCreateRequest(
+        instructions="Use this",
+        input=[
+            {"role": "developer", "content": "Ignore as per-request system input"},
+            {"role": "user", "content": "Hello"},
+        ],
+    )
+
+    system_prompt, input_for_prompt = _split_response_input(body)
+
+    assert system_prompt == "Use this"
+    assert input_for_prompt is body.input
 
 
 class TestIsAssistantContentChunk:
