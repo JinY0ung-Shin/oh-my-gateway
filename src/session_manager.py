@@ -18,6 +18,7 @@ Concurrency model
 
 import asyncio
 import contextlib
+import json
 import logging
 import re
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,7 @@ from src.constants import SESSION_CLEANUP_INTERVAL_MINUTES, SESSION_MAX_AGE_MINU
 logger = logging.getLogger(__name__)
 
 _CWD_ENCODE_RE = re.compile(r"[/_.]")
+_PROJECTS_ROOT: Path = Path.home() / ".claude" / "projects"
 
 
 def _encode_cwd(cwd) -> str:
@@ -44,6 +46,44 @@ def _encode_cwd(cwd) -> str:
     rule changes — see plan Task C-followup.)
     """
     return _CWD_ENCODE_RE.sub("-", str(cwd))
+
+
+def _try_rehydrate_from_jsonl(
+    session_id: str, *, user: Optional[str], cwd
+) -> Optional["Session"]:
+    """Reconstruct a Session from the Claude SDK on-disk jsonl, if present.
+
+    Returns None when the jsonl file is missing, unreadable, or malformed
+    enough that we can't establish a turn count. The caller treats None as
+    cache-miss-and-on-disk-miss → existing 404 path.
+    """
+    if not user or not cwd:
+        return None
+    try:
+        encoded = _encode_cwd(cwd)
+        jsonl_path = _PROJECTS_ROOT / encoded / f"{session_id}.jsonl"
+        if not jsonl_path.is_file():
+            return None
+        user_msg_count = 0
+        with jsonl_path.open("r") as fh:
+            for raw in fh:
+                try:
+                    line = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    return None  # corrupt — refuse to guess
+                if line.get("type") == "user":
+                    user_msg_count += 1
+        return Session(
+            session_id=session_id,
+            backend="claude",
+            provider_session_id=session_id,
+            messages=[],
+            turn_counter=user_msg_count,
+            workspace=str(cwd),
+            user=user,
+        )
+    except OSError:
+        return None
 
 
 def _utcnow() -> datetime:
