@@ -202,21 +202,6 @@ async def _responses_streaming_preflight(
         "session": pf.session,
         "lock_acquired": pf.lock_acquired,
         "next_turn": pf.next_turn,
-        "resume_id": pf.resume_id,
-        "chunk_kwargs": dict(
-            prompt=prompt,
-            model=resolved.provider_model,
-            system_prompt=system_prompt if pf.is_new else None,
-            _custom_base=session.base_system_prompt,
-            _metadata=body.metadata,
-            _user=body.user,
-            permission_mode=PERMISSION_MODE_BYPASS,
-            mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-            session_id=session_id if pf.is_new else None,
-            resume=pf.resume_id,
-            cwd=workspace_str,
-            allowed_tools=body.allowed_tools,
-        ),
     }
 
 
@@ -256,6 +241,23 @@ async def create_response(
             "The system prompt is fixed to the original session.",
         )
 
+    # Same restriction for array-form system/developer items: a follow-up
+    # request must not redefine the system prompt of an existing session.
+    if body.previous_response_id and isinstance(body.input, list):
+        for item in body.input:
+            role = getattr(item, "role", None) or (
+                item.get("role") if isinstance(item, dict) else None
+            )
+            if role in ("system", "developer"):
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "system/developer input items cannot be used with "
+                        "previous_response_id. The system prompt is fixed "
+                        "to the original session."
+                    ),
+                )
+
     # Resolve session from previous_response_id or create new
     if body.previous_response_id:
         parsed = _parse_response_id(body.previous_response_id)
@@ -265,7 +267,17 @@ async def create_response(
                 detail=f"previous_response_id '{body.previous_response_id}' is invalid",
             )
         session_id, turn = parsed
-        session = session_manager.get_session(session_id)
+        # Lightweight workspace resolve (no template sync) so we can supply
+        # cwd to get_session and enable rehydrate-on-miss from jsonl.
+        _early_cwd: Optional[str] = None
+        if body.user:
+            try:
+                _early_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+            except (ValueError, OSError):
+                pass
+        session = session_manager.get_session(
+            session_id, user=body.user, cwd=_early_cwd,
+        )
         if not session:
             raise HTTPException(
                 status_code=404,
@@ -381,35 +393,33 @@ async def create_response(
             ) from e
 
     # ------------------------------------------------------------------
-    # Determine whether to use ClaudeSDKClient (persistent session) or
-    # the single-use query() path (run_completion).
-    # ------------------------------------------------------------------
-    # Create a persistent ClaudeSDKClient if the backend supports it.
-    # This enables PreToolUse hook registration for AskUserQuestion
-    # interception on any turn, including the first.
+    # Create the persistent ClaudeSDKClient.  Every turn flows through it
+    # so PreToolUse hooks (AskUserQuestion) fire reliably and the on-disk
+    # transcript stays in lockstep with session.session_id.  If creation
+    # fails the request returns 503 — there is no longer a degraded
+    # query() fallback.
     # bypassPermissions avoids workspace-level settings.local.json checks
-    # (temp workspaces lack shell command allow-lists).  PreToolUse hooks
-    # still fire independently of the permission mode.
-    if session.client is None and hasattr(backend, "create_client"):
-        try:
-            # Pre-resolve {{WORKING_DIRECTORY}} so the persistent client's
-            # frozen system_prompt matches the cwd the SDK will actually use.
-            # Mirrors the run_completion path which passes session.base_system_prompt.
-            #
-            # Reconnect case: when an existing session lost its persistent client
-            # (e.g. SDK error/disconnect), prefer the prompt frozen at session
-            # start so admin-side prompt changes mid-conversation don't leak
-            # into in-flight sessions.
-            from src.system_prompt import get_system_prompt, resolve_request_placeholders
+    # (temp workspaces lack shell command allow-lists).
+    # ------------------------------------------------------------------
+    if session.client is None:
+        # Pre-resolve {{WORKING_DIRECTORY}} so the persistent client's
+        # frozen system_prompt matches the cwd the SDK will actually use.
+        #
+        # Reconnect case: when an existing session lost its persistent client
+        # (e.g. SDK error/disconnect), prefer the prompt frozen at session
+        # start so admin-side prompt changes mid-conversation don't leak
+        # into in-flight sessions.
+        from src.system_prompt import get_system_prompt, resolve_request_placeholders
 
-            if session.base_system_prompt is not None:
-                resolved_base = session.base_system_prompt
-            else:
-                resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
+        if session.base_system_prompt is not None:
+            resolved_base = session.base_system_prompt
+        else:
+            resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
+        try:
             session.client = await backend.create_client(
                 session=session,
                 model=resolved.provider_model,
-                system_prompt=system_prompt if len(session.messages) == 0 else None,
+                system_prompt=system_prompt if is_new_session else None,
                 permission_mode=PERMISSION_MODE_BYPASS,
                 allowed_tools=body.allowed_tools,
                 mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
@@ -418,12 +428,12 @@ async def create_response(
                 _custom_base=resolved_base,
             )
         except Exception:
-            logger.warning(
-                "Failed to create persistent client, falling back to query()", exc_info=True
+            logger.error("create_client failed", exc_info=True)
+            await session_manager.delete_session_async(session_id)
+            raise HTTPException(
+                status_code=503,
+                detail="Claude Code SDK unavailable; retry shortly",
             )
-            session.client = None
-
-    use_sdk_client = session.client is not None and hasattr(backend, "run_completion_with_client")
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
@@ -447,17 +457,13 @@ async def create_response(
         async def _run_stream():
             lock_acquired = preflight["lock_acquired"]
             stream_result: dict = {"success": False}
-            active_client = session.client if use_sdk_client else None
+            active_client = session.client
             try:
                 chunks_buffer = []
 
-                # Choose chunk source: persistent client or single-use query
-                if use_sdk_client:
-                    chunk_source = backend.run_completion_with_client(
-                        session.client, prompt, session
-                    )
-                else:
-                    chunk_source = backend.run_completion(**preflight["chunk_kwargs"])
+                chunk_source = backend.run_completion_with_client(
+                    session.client, prompt, session
+                )
 
                 # Bridge SDK iteration through a background task to keep
                 # anyio cancel scopes task-local.
@@ -479,7 +485,7 @@ async def create_response(
                         "provider_model": resolved.provider_model,
                         "previous_response_id": body.previous_response_id,
                         "turn": next_turn,
-                        "use_sdk_client": use_sdk_client,
+                        "use_sdk_client": True,
                     },
                 )
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
@@ -547,7 +553,7 @@ async def create_response(
                     sequence_number=0,
                 )
             finally:
-                if use_sdk_client and not stream_result.get("success"):
+                if not stream_result.get("success"):
                     await _disconnect_session_client(
                         session, "responses stream failure", client=active_client
                     )
@@ -588,30 +594,13 @@ async def create_response(
             turn=_turn,
             workspace=workspace_str,
         ) as pf:
-            # Execute backend — persistent client or single-use query
+            # Execute backend through the persistent client.
             chunks = []
-            if use_sdk_client:
-                active_client = session.client
-                async for chunk in backend.run_completion_with_client(
-                    active_client, prompt, session
-                ):
-                    chunks.append(chunk)
-            else:
-                async for chunk in backend.run_completion(
-                    prompt=prompt,
-                    model=resolved.provider_model,
-                    system_prompt=system_prompt if pf.is_new else None,
-                    _custom_base=session.base_system_prompt,
-                    _metadata=body.metadata,
-                    _user=body.user,
-                    permission_mode=PERMISSION_MODE_BYPASS,
-                    mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-                    session_id=session_id if pf.is_new else None,
-                    resume=pf.resume_id,
-                    cwd=workspace_str,
-                    allowed_tools=body.allowed_tools,
-                ):
-                    chunks.append(chunk)
+            active_client = session.client
+            async for chunk in backend.run_completion_with_client(
+                active_client, prompt, session
+            ):
+                chunks.append(chunk)
 
             # Check for backend errors (run_completion wraps exceptions as error chunks)
             for chunk in chunks:

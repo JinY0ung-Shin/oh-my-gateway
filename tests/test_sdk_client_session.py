@@ -51,7 +51,6 @@ def test_session_input_event_excluded_from_compare():
     s2 = Session(
         session_id=s1.session_id,
         backend=s1.backend,
-        provider_session_id=s1.provider_session_id,
         ttl_minutes=s1.ttl_minutes,
         messages=s1.messages,
         created_at=s1.created_at,

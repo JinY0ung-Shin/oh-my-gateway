@@ -10,7 +10,6 @@ import tempfile
 import atexit
 import shutil
 import contextlib
-import uuid
 from typing import AsyncGenerator, Dict, Any, Optional, List
 from pathlib import Path
 import logging
@@ -191,23 +190,6 @@ class ClaudeCodeCLI:
             enableWeakerNestedSandbox=CLAUDE_SANDBOX_WEAKER_NESTED,
         )
 
-    def _configure_session(
-        self,
-        options: ClaudeAgentOptions,
-        session_id: Optional[str],
-        resume: Optional[str],
-    ) -> None:
-        """Apply session / resume configuration to *options*.
-
-        ``resume`` takes priority: when set, the SDK picks up the existing
-        conversation by its session ID.  ``session_id`` is only used for
-        brand-new sessions via the native ``session_id`` option.
-        """
-        if resume:
-            options.resume = resume
-        elif session_id:
-            options.session_id = session_id
-
     _UNSET = object()  # sentinel for _custom_base default
 
     def _build_sdk_options(
@@ -313,7 +295,10 @@ class ClaudeCodeCLI:
         if get_token_streaming():
             options.include_partial_messages = True
 
-        self._configure_session(options, session_id, resume)
+        if resume:
+            options.resume = resume
+        elif session_id:
+            options.session_id = session_id
 
         # Task budget: per-request value overrides the global default.
         effective_budget = task_budget if task_budget is not None else DEFAULT_TASK_BUDGET
@@ -558,17 +543,22 @@ class ClaudeCodeCLI:
         when provided, the caller is responsible for having already resolved
         ``{{WORKING_DIRECTORY}}`` (and any other request-time placeholders).
         """
-        # Use a fresh session_id for the persistent client.  Each
-        # ClaudeSDKClient needs its own CLI session identifier.
-        client_session_id = str(uuid.uuid4())
+        # Reuse the gateway's session_id so logs, OpenAI response IDs,
+        # and the on-disk SDK transcript all agree.  Disk presence chooses
+        # between starting a new SDK session and resuming an existing one
+        # (the latter applies after rehydrate or after an in-memory client
+        # crash).
+        from src.session_manager import _session_jsonl_exists
+
+        has_history = _session_jsonl_exists(session)
         options = self._build_sdk_options(
             model=model,
             system_prompt=system_prompt,
             max_turns=get_default_max_turns(),
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
-            session_id=client_session_id,
-            resume=None,
+            session_id=None if has_history else session.session_id,
+            resume=session.session_id if has_history else None,
             permission_mode=permission_mode,
             mcp_servers=mcp_servers,
             task_budget=task_budget,
@@ -671,78 +661,6 @@ class ClaudeCodeCLI:
             logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
             session.client = None
             yield {"type": "error", "is_error": True, "error_message": str(exc)}
-
-    async def run_completion(
-        self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
-        model: Optional[str] = None,
-        stream: bool = True,  # Accepted for caller compatibility; always yields chunks.
-        max_turns: Optional[int] = None,
-        allowed_tools: Optional[List[str]] = None,
-        disallowed_tools: Optional[List[str]] = None,
-        session_id: Optional[str] = None,
-        resume: Optional[str] = None,
-        permission_mode: Optional[str] = None,
-        output_format: Optional[Dict[str, Any]] = None,
-        mcp_servers: Optional[Dict[str, Any]] = None,
-        task_budget: Optional[int] = None,
-        cwd: Optional[str] = None,
-        **_extra,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Run a single-use SDK query and yield converted message dicts.
-
-        For multi-turn conversations:
-        - First turn: pass ``session_id`` (native SDK option)
-        - Follow-up turns: pass ``resume=<session_id>`` (uses ``--resume``)
-
-        The SDK ``query()`` function is always invoked fresh per call — see
-        the class docstring for why reuse is unsafe.
-        """
-        try:
-            with self._sdk_env():
-                options = self._build_sdk_options(
-                    model=model,
-                    system_prompt=system_prompt,
-                    max_turns=max_turns if max_turns is not None else get_default_max_turns(),
-                    allowed_tools=allowed_tools,
-                    _custom_base=_extra.get("_custom_base", self._UNSET),
-                    disallowed_tools=disallowed_tools,
-                    permission_mode=permission_mode,
-                    output_format=output_format,
-                    mcp_servers=mcp_servers,
-                    session_id=session_id,
-                    resume=resume,
-                    extra_env=_extra.get("_metadata"),
-                    task_budget=task_budget,
-                    cwd=Path(cwd) if cwd else None,
-                    user=_extra.get("_user"),
-                )
-
-                async for message in query(prompt=prompt, options=options):
-                    logger.debug(f"Raw SDK message type: {type(message)}")
-                    logger.debug(f"Raw SDK message: {message}")
-
-                    converted = self._convert_message(message)
-                    logger.debug(f"Converted message: {converted}")
-                    yield converted
-
-        except Exception as e:
-            logger.error(
-                "Claude Agent SDK error: %s (type=%s) | session_id=%r resume=%r cwd=%r",
-                e,
-                type(e).__name__,
-                session_id,
-                resume,
-                cwd,
-                exc_info=True,
-            )
-            yield {
-                "type": "result",
-                "subtype": "error_during_execution",
-                "is_error": True,
-                "error_message": f"{type(e).__name__}: {e}",
-            }
 
     # ------------------------------------------------------------------
     # Response parsing helpers

@@ -18,7 +18,9 @@ Concurrency model
 
 import asyncio
 import contextlib
+import json
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -29,6 +31,87 @@ from src.models import Message, SessionInfo
 from src.constants import SESSION_CLEANUP_INTERVAL_MINUTES, SESSION_MAX_AGE_MINUTES
 
 logger = logging.getLogger(__name__)
+
+_CWD_ENCODE_RE = re.compile(r"[/_.]")
+_PROJECTS_ROOT: Path = Path.home() / ".claude" / "projects"
+
+
+def _encode_cwd(cwd) -> str:
+    """Encode a workspace cwd to its on-disk Claude SDK directory name.
+
+    The Claude SDK stores per-project transcripts under
+    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. The encoding
+    rule observed across recorded sessions: every ``/``, ``_`` and ``.``
+    is replaced with ``-``. (To be re-verified against SDK source if the
+    rule changes — see plan Task C-followup.)
+    """
+    return _CWD_ENCODE_RE.sub("-", str(cwd))
+
+
+def _session_jsonl_path(session_id: str, workspace) -> Path:
+    """Return the on-disk path the SDK uses for this session's transcript.
+
+    Path layout: ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``.
+    """
+    return _PROJECTS_ROOT / _encode_cwd(workspace) / f"{session_id}.jsonl"
+
+
+def _session_jsonl_exists(session: "Session") -> bool:
+    """True when the SDK has already written a transcript for *session*."""
+    if not session.workspace:
+        return False
+    return _session_jsonl_path(session.session_id, session.workspace).is_file()
+
+
+def _try_rehydrate_from_jsonl(
+    session_id: str, *, user: Optional[str], cwd
+) -> Optional["Session"]:
+    """Reconstruct a Session from the Claude SDK on-disk jsonl, if present.
+
+    Returns None when the jsonl file is missing, unreadable, or malformed
+    enough that we can't establish a turn count. The caller treats None as
+    cache-miss-and-on-disk-miss → existing 404 path.
+    """
+    if not user or not cwd:
+        return None
+    try:
+        jsonl_path = _session_jsonl_path(session_id, cwd)
+        if not jsonl_path.is_file():
+            return None
+        user_msg_count = 0
+        with jsonl_path.open("r") as fh:
+            for raw in fh:
+                try:
+                    line = json.loads(raw)
+                except (ValueError, json.JSONDecodeError):
+                    return None  # corrupt — refuse to guess
+                if line.get("type") != "user":
+                    continue
+                # Claude jsonl reuses type="user" for two distinct things:
+                # (1) external prompts the gateway exposed as turns, and
+                # (2) tool_result blocks plus isMeta system reminders that
+                # the SDK injects internally. Only (1) corresponds to a
+                # gateway-issued response_id, so only (1) advances the
+                # turn counter.
+                if line.get("isMeta"):
+                    continue
+                content = line.get("message", {}).get("content")
+                if isinstance(content, list) and content and all(
+                    isinstance(b, dict) and b.get("type") == "tool_result"
+                    for b in content
+                ):
+                    continue
+                user_msg_count += 1
+        return Session(
+            session_id=session_id,
+            backend="claude",
+            messages=[],
+            turn_counter=user_msg_count,
+            workspace=str(cwd),
+            user=user,
+        )
+    except OSError:
+        return None
 
 
 def _utcnow() -> datetime:
@@ -54,7 +137,6 @@ class Session:
 
     session_id: str
     backend: str = "claude"
-    provider_session_id: Optional[str] = None
     ttl_minutes: int = 60
     messages: List[Message] = field(default_factory=list)
     created_at: datetime = field(default_factory=_utcnow)
@@ -125,6 +207,8 @@ class SessionManager:
         self.default_ttl_minutes: int = default_ttl_minutes
         self.cleanup_interval_minutes: int = cleanup_interval_minutes
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        self._rehydrate_hits: int = 0
+        self._rehydrate_misses: int = 0
 
     # ------------------------------------------------------------------
     # Internal helpers (caller must hold self.lock)
@@ -336,17 +420,37 @@ class SessionManager:
             logger.info(f"Created new session: {session_id}")
             return session
 
-    def get_session(self, session_id: str) -> Optional[Session]:
-        """Get existing session without creating a new one.
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        user: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Optional[Session]:
+        """Return a session by id; rehydrate from jsonl on cache miss when context permits.
 
-        Returns ``None`` when the session does not exist or is expired.
+        Returns ``None`` when the session does not exist, is expired, and
+        cannot be rehydrated from disk.
         """
         with self.lock:
             self._remove_if_expired(session_id)
             session = self.sessions.get(session_id)
             if session is not None:
                 session.touch()
-            return session
+                return session
+            # Cache miss path — only count rehydrate hit/miss when the
+            # caller supplied enough context for a jsonl lookup to be
+            # attempted. Generic cache misses (e.g., simple existence
+            # checks without user/cwd) must not pollute the metric.
+            if not user or not cwd:
+                return None
+            session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
+            if session is not None:
+                self.sessions[session_id] = session
+                self._rehydrate_hits = getattr(self, "_rehydrate_hits", 0) + 1
+                return session
+            self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
+            return None
 
     def peek_session(self, session_id: str) -> Optional[Session]:
         """Read-only session access — does **not** refresh TTL.
@@ -438,6 +542,15 @@ class SessionManager:
                 "active_sessions": active,
                 "expired_sessions": expired,
                 "total_messages": total_messages,
+            }
+
+    def stats(self) -> dict:
+        """Return a summary dict including rehydrate hit/miss counters."""
+        with self.lock:
+            return {
+                "active_sessions": len(self.sessions),
+                "rehydrate_hits": self._rehydrate_hits,
+                "rehydrate_misses": self._rehydrate_misses,
             }
 
 

@@ -139,17 +139,16 @@ class TestParseClaudeMessage:
 class TestClaudeCliPermissionMode:
     """Test that ClaudeCodeCLI passes permission_mode correctly."""
 
-    def test_run_completion_accepts_permission_mode(self):
-        """Test that run_completion method accepts permission_mode parameter."""
+    def test_create_client_accepts_permission_mode(self):
+        """Persistent-client API takes permission_mode."""
         from src.claude_cli import ClaudeCodeCLI
         import inspect
 
-        # Check that permission_mode is in the method signature
-        sig = inspect.signature(ClaudeCodeCLI.run_completion)
+        sig = inspect.signature(ClaudeCodeCLI.create_client)
         param_names = list(sig.parameters.keys())
 
         assert "permission_mode" in param_names, (
-            "run_completion should accept permission_mode parameter"
+            "create_client should accept permission_mode parameter"
         )
 
 

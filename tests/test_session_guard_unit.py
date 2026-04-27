@@ -38,7 +38,6 @@ class TestNewSession:
         pf = await acquire_session_preflight(session, _claude_resolved(), "sid-1")
         try:
             assert pf.is_new is True
-            assert pf.resume_id is None
             assert session.backend == "claude"
             assert pf.lock_acquired is True
         finally:
@@ -82,24 +81,16 @@ class TestNewSession:
 
 
 class TestExistingSession:
-    async def test_resume_populates_resume_id(self):
-        session = _make_session(backend="claude", provider_session_id="sdk-123")
-        session.messages.append(Message(role="user", content="prev"))
-
-        pf = await acquire_session_preflight(session, _claude_resolved(), "sid-1")
-        try:
-            assert pf.is_new is False
-            assert pf.resume_id == "sdk-123"
-        finally:
-            session.lock.release()
-
-    async def test_resume_falls_back_to_session_id(self):
+    async def test_resume_marks_session_as_existing(self):
+        # provider_session_id has been removed; create_client now owns the
+        # session_id-vs-resume decision via on-disk transcript presence.
         session = _make_session(backend="claude")
         session.messages.append(Message(role="user", content="prev"))
 
         pf = await acquire_session_preflight(session, _claude_resolved(), "sid-1")
         try:
-            assert pf.resume_id == "sid-1"
+            assert pf.is_new is False
+            assert not hasattr(pf, "resume_id")
         finally:
             session.lock.release()
 

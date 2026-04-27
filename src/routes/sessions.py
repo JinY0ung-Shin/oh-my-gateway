@@ -20,10 +20,13 @@ async def get_session_stats(
     """Get session manager statistics."""
     await verify_api_key(request, credentials)
     stats = session_manager.get_stats()
+    rehydrate_stats = session_manager.stats()
     return {
         "session_stats": stats,
         "cleanup_interval_minutes": session_manager.cleanup_interval_minutes,
         "default_ttl_minutes": session_manager.default_ttl_minutes,
+        "rehydrate_hits": rehydrate_stats["rehydrate_hits"],
+        "rehydrate_misses": rehydrate_stats["rehydrate_misses"],
     }
 
 

@@ -429,275 +429,6 @@ class TestClaudeCodeCLIVerifyCLI:
             assert result is False
 
 
-class TestClaudeCodeCLIRunCompletion:
-    """Test ClaudeCodeCLI.run_completion()"""
-
-    @pytest.mark.asyncio
-    async def test_run_completion_basic(self, cli_instance):
-        """run_completion yields messages from SDK."""
-        mock_message = {"type": "assistant", "content": [{"type": "text", "text": "Hello"}]}
-
-        async def mock_query(*args, **kwargs):
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            messages = []
-            async for msg in cli_instance.run_completion("Hello"):
-                messages.append(msg)
-
-            assert len(messages) == 1
-            assert messages[0] == mock_message
-
-    @pytest.mark.asyncio
-    async def test_run_completion_with_system_prompt(self, cli_instance):
-        """run_completion sets system_prompt option."""
-        mock_message = {"type": "assistant", "content": "Response"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", system_prompt="You are helpful"):
-                pass
-
-            assert len(captured_options) == 1
-            opts = captured_options[0]
-            assert opts.system_prompt == {
-                "type": "preset",
-                "preset": "claude_code",
-                "append": "You are helpful",
-            }
-
-    @pytest.mark.asyncio
-    async def test_run_completion_with_model(self, cli_instance):
-        """run_completion sets model option."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", model="claude-3-opus"):
-                pass
-
-            assert captured_options[0].model == "claude-3-opus"
-
-    @pytest.mark.asyncio
-    async def test_run_completion_uses_runtime_default_max_turns(self, cli_instance):
-        """run_completion uses the editable default_max_turns when omitted."""
-        from src.runtime_config import runtime_config
-
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        runtime_config.reset_all()
-        try:
-            runtime_config.set("default_max_turns", 7)
-            with patch("src.backends.claude.client.query", mock_query):
-                async for _ in cli_instance.run_completion("Hello"):
-                    pass
-        finally:
-            runtime_config.reset_all()
-
-        assert captured_options[0].max_turns == 7
-
-    @pytest.mark.asyncio
-    async def test_run_completion_with_tool_restrictions(self, cli_instance):
-        """run_completion sets allowed/disallowed tools."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion(
-                "Hello",
-                allowed_tools=["Bash", "Read"],
-                disallowed_tools=["Task"],
-            ):
-                pass
-
-            assert captured_options[0].allowed_tools == ["Bash", "Read"]
-            assert "Task" in captured_options[0].disallowed_tools
-
-    @pytest.mark.asyncio
-    async def test_run_completion_with_permission_mode(self, cli_instance):
-        """run_completion sets permission_mode."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", permission_mode="acceptEdits"):
-                pass
-
-            assert captured_options[0].permission_mode == "acceptEdits"
-
-    @pytest.mark.asyncio
-    async def test_run_completion_with_session_id(self, cli_instance):
-        """run_completion sets native session_id option for new sessions."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", session_id="sess-123"):
-                pass
-
-            assert captured_options[0].session_id == "sess-123"
-
-    @pytest.mark.asyncio
-    async def test_run_completion_resume_session(self, cli_instance):
-        """run_completion sets resume option for follow-up turns."""
-        mock_message = {"type": "assistant"}
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello", resume="sess-123"):
-                pass
-
-            assert captured_options[0].resume == "sess-123"
-
-    @pytest.mark.asyncio
-    async def test_run_completion_with_task_budget(self, cli_instance):
-        """run_completion forwards task_budget to SDK options."""
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield {"type": "assistant"}
-
-        with (
-            patch("src.backends.claude.client.query", mock_query),
-            patch("src.backends.claude.client.DEFAULT_TASK_BUDGET", None),
-        ):
-            async for _ in cli_instance.run_completion("Hello", task_budget=75000):
-                pass
-
-            assert captured_options[0].task_budget == {"total": 75000}
-
-    @pytest.mark.asyncio
-    async def test_run_completion_converts_objects_to_dicts(self, cli_instance):
-        """run_completion converts message objects to dicts."""
-        # Create a mock object with attributes
-        mock_obj = MagicMock()
-        mock_obj.type = "assistant"
-        mock_obj.content = "Hello"
-
-        async def mock_query(*args, **kwargs):
-            yield mock_obj
-
-        with patch("src.backends.claude.client.query", mock_query):
-            messages = []
-            async for msg in cli_instance.run_completion("Hello"):
-                messages.append(msg)
-
-            assert len(messages) == 1
-            # Should be converted to dict
-            assert isinstance(messages[0], dict)
-            assert "type" in messages[0]
-
-    @pytest.mark.asyncio
-    async def test_run_completion_exception_yields_error(self, cli_instance):
-        """run_completion yields error message on exception."""
-
-        async def mock_query(*args, **kwargs):
-            raise RuntimeError("SDK failed")
-            yield  # Make it a generator
-
-        with patch("src.backends.claude.client.query", mock_query):
-            messages = []
-            async for msg in cli_instance.run_completion("Hello"):
-                messages.append(msg)
-
-            assert len(messages) == 1
-            assert messages[0]["type"] == "result"
-            assert messages[0]["subtype"] == "error_during_execution"
-            assert messages[0]["is_error"] is True
-            assert "SDK failed" in messages[0]["error_message"]
-
-    @pytest.mark.asyncio
-    async def test_run_completion_restores_env_vars(self, cli_instance):
-        """run_completion restores environment variables after execution."""
-        # Set an env var that will be modified
-        original_key = os.environ.get("ANTHROPIC_AUTH_TOKEN")
-
-        mock_message = {"type": "assistant"}
-
-        async def mock_query(*args, **kwargs):
-            yield mock_message
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello"):
-                pass
-
-        # Env should be restored
-        if original_key is None:
-            assert (
-                "ANTHROPIC_AUTH_TOKEN" not in os.environ
-                or os.environ.get("ANTHROPIC_AUTH_TOKEN") == original_key
-            )
-        else:
-            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original_key
-
-    @pytest.mark.asyncio
-    async def test_run_completion_metadata_sets_options_env(self, cli_instance):
-        """Allowlisted metadata keys should be passed as options.env."""
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield {"type": "assistant"}
-
-        allowlist = frozenset({"THREAD_ID"})
-        with (
-            patch("src.backends.claude.client.query", mock_query),
-            patch("src.constants.METADATA_ENV_ALLOWLIST", allowlist),
-        ):
-            async for _ in cli_instance.run_completion(
-                "Hello", _metadata={"THREAD_ID": "thread-123", "IGNORED": "nope"}
-            ):
-                pass
-
-            assert len(captured_options) == 1
-            assert captured_options[0].env == {"THREAD_ID": "thread-123"}
-
-    @pytest.mark.asyncio
-    async def test_run_completion_no_metadata_empty_env(self, cli_instance):
-        """Without metadata, options.env should remain default (empty dict)."""
-        captured_options = []
-
-        async def mock_query(prompt, options):
-            captured_options.append(options)
-            yield {"type": "assistant"}
-
-        with patch("src.backends.claude.client.query", mock_query):
-            async for _ in cli_instance.run_completion("Hello"):
-                pass
-
-            assert len(captured_options) == 1
-            assert captured_options[0].env == {}
-
 
 class TestClaudeCodeCLICleanupException:
     """Test ClaudeCodeCLI._cleanup_temp_dir() exception handling."""
@@ -1133,33 +864,6 @@ class TestConfigureHelpers:
         assert opts.allowed_tools == [] or opts.allowed_tools is None
         assert "Agent(statusline-setup)" in opts.disallowed_tools
 
-    def test_configure_session_resume(self, cli_instance):
-        """_configure_session sets resume when provided."""
-        from claude_agent_sdk import ClaudeAgentOptions
-
-        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
-        cli_instance._configure_session(opts, session_id="sess-1", resume="resume-1")
-        assert opts.resume == "resume-1"
-        assert opts.session_id is None
-
-    def test_configure_session_id_only(self, cli_instance):
-        """_configure_session sets native session_id when no resume."""
-        from claude_agent_sdk import ClaudeAgentOptions
-
-        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
-        cli_instance._configure_session(opts, session_id="sess-1", resume=None)
-        assert opts.session_id == "sess-1"
-        assert not getattr(opts, "resume", None)
-
-    def test_configure_session_neither(self, cli_instance):
-        """_configure_session does nothing when both are None."""
-        from claude_agent_sdk import ClaudeAgentOptions
-
-        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
-        cli_instance._configure_session(opts, session_id=None, resume=None)
-        assert not getattr(opts, "resume", None)
-        assert opts.session_id is None
-
     def test_configure_sandbox_enabled(self, cli_instance):
         """_configure_sandbox sets sandbox when CLAUDE_SANDBOX_ENABLED=True."""
         from claude_agent_sdk import ClaudeAgentOptions
@@ -1218,3 +922,82 @@ class TestConfigureHelpers:
                                 opts = cli_instance._build_sdk_options()
         assert opts.sandbox is not None
         assert opts.sandbox["enabled"] is True
+
+
+class TestCreateClientSessionId:
+    """create_client uses session.session_id; disk presence chooses session_id vs resume."""
+
+    @pytest.fixture
+    def gateway_session(self):
+        from src.session_manager import Session
+
+        return Session(
+            session_id="gw-uuid-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            workspace="/tmp/ws",
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_jsonl_passes_session_id(
+        self, monkeypatch, tmp_path, gateway_session, cli_instance
+    ):
+        """When no transcript exists, create_client passes session_id (not resume)."""
+        from src import session_manager
+        from src.backends.claude import client as claude_client_mod
+
+        monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+
+        captured: dict = {}
+
+        class FakeSDKClient:
+            def __init__(self, *, options):
+                captured["session_id"] = options.session_id
+                captured["resume"] = options.resume
+
+            async def connect(self, prompt=None):
+                return None
+
+        monkeypatch.setattr(claude_client_mod, "ClaudeSDKClient", FakeSDKClient)
+
+        await cli_instance.create_client(
+            session=gateway_session,
+            cwd="/tmp/ws",
+        )
+
+        assert captured["session_id"] == gateway_session.session_id
+        assert captured["resume"] is None
+
+    @pytest.mark.asyncio
+    async def test_existing_jsonl_passes_resume(
+        self, monkeypatch, tmp_path, gateway_session, cli_instance
+    ):
+        """When a transcript exists, create_client passes resume (not session_id)."""
+        from src import session_manager
+        from src.backends.claude import client as claude_client_mod
+
+        monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+
+        target = session_manager._session_jsonl_path(
+            gateway_session.session_id, gateway_session.workspace
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{}\n")
+
+        captured: dict = {}
+
+        class FakeSDKClient:
+            def __init__(self, *, options):
+                captured["session_id"] = options.session_id
+                captured["resume"] = options.resume
+
+            async def connect(self, prompt=None):
+                return None
+
+        monkeypatch.setattr(claude_client_mod, "ClaudeSDKClient", FakeSDKClient)
+
+        await cli_instance.create_client(
+            session=gateway_session,
+            cwd="/tmp/ws",
+        )
+
+        assert captured["session_id"] is None
+        assert captured["resume"] == gateway_session.session_id

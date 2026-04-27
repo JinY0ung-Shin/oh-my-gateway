@@ -19,6 +19,15 @@ def client_context_with_workspace(mock_wm):
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
+
+    async def _default_create_client(**kwargs):
+        return object()
+
+    async def _default_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "Hi"}
+
+    mock_cli.create_client = _default_create_client
+    mock_cli.run_completion_with_client = _default_run_with_client
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
@@ -50,11 +59,11 @@ class TestUserParam:
         mock_wm = MagicMock()
         mock_wm.resolve.return_value = Path("/tmp/ws/alice")
 
-        async def fake_run_completion(**kwargs):
+        async def fake_run_completion(client, prompt, session):
             yield {"subtype": "success", "result": "Hello"}
 
         with client_context_with_workspace(mock_wm) as (client, mock_cli):
-            mock_cli.run_completion = fake_run_completion
+            mock_cli.run_completion_with_client = fake_run_completion
             mock_cli.parse_message = MagicMock(return_value="Hello")
             resp = client.post(
                 "/v1/responses",
@@ -68,11 +77,11 @@ class TestUserParam:
         mock_wm = MagicMock()
         mock_wm.resolve.return_value = Path("/tmp/ws/_tmp_abc123")
 
-        async def fake_run_completion(**kwargs):
+        async def fake_run_completion(client, prompt, session):
             yield {"subtype": "success", "result": "Hello"}
 
         with client_context_with_workspace(mock_wm) as (client, mock_cli):
-            mock_cli.run_completion = fake_run_completion
+            mock_cli.run_completion_with_client = fake_run_completion
             mock_cli.parse_message = MagicMock(return_value="Hello")
             resp = client.post(
                 "/v1/responses",
@@ -83,16 +92,21 @@ class TestUserParam:
         mock_wm.resolve.assert_called_once_with(None, sync_template=True)
 
     def test_cwd_passed_to_run_completion(self, isolated_session_manager):
+        """cwd is forwarded to create_client (which spawns the persistent SDK session)."""
         mock_wm = MagicMock()
         mock_wm.resolve.return_value = Path("/tmp/ws/alice")
-        run_calls = []
+        create_calls = []
 
-        async def fake_run_completion(**kwargs):
-            run_calls.append(kwargs)
+        async def fake_create_client(**kwargs):
+            create_calls.append(kwargs)
+            return object()
+
+        async def fake_run_completion(client, prompt, session):
             yield {"subtype": "success", "result": "Hello"}
 
         with client_context_with_workspace(mock_wm) as (client, mock_cli):
-            mock_cli.run_completion = fake_run_completion
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion
             mock_cli.parse_message = MagicMock(return_value="Hello")
             resp = client.post(
                 "/v1/responses",
@@ -100,8 +114,8 @@ class TestUserParam:
             )
 
         assert resp.status_code == 200
-        assert len(run_calls) == 1
-        assert run_calls[0]["cwd"] == "/tmp/ws/alice"
+        assert len(create_calls) == 1
+        assert create_calls[0]["cwd"] == "/tmp/ws/alice"
 
     def test_invalid_user_returns_400(self, isolated_session_manager):
         mock_wm = MagicMock()
@@ -129,11 +143,11 @@ class TestUserSessionBinding:
         mock_wm = MagicMock()
         mock_wm.resolve.return_value = Path("/tmp/ws/alice")
 
-        async def fake_run_completion(**kwargs):
+        async def fake_run_completion(client, prompt, session):
             yield {"subtype": "success", "result": "Follow-up answer"}
 
         with client_context_with_workspace(mock_wm) as (client, mock_cli):
-            mock_cli.run_completion = fake_run_completion
+            mock_cli.run_completion_with_client = fake_run_completion
             mock_cli.parse_message = MagicMock(return_value="Follow-up answer")
             resp = client.post(
                 "/v1/responses",
@@ -179,14 +193,18 @@ class TestUserSessionBinding:
         session.turn_counter = 1
 
         mock_wm = MagicMock()
-        run_calls = []
+        create_calls = []
 
-        async def fake_run_completion(**kwargs):
-            run_calls.append(kwargs)
+        async def fake_create_client(**kwargs):
+            create_calls.append(kwargs)
+            return object()
+
+        async def fake_run_completion(client, prompt, session):
             yield {"subtype": "success", "result": "Follow-up answer"}
 
         with client_context_with_workspace(mock_wm) as (client, mock_cli):
-            mock_cli.run_completion = fake_run_completion
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion
             mock_cli.parse_message = MagicMock(return_value="Follow-up answer")
             resp = client.post(
                 "/v1/responses",
@@ -199,7 +217,8 @@ class TestUserSessionBinding:
             )
 
         assert resp.status_code == 200
-        # workspace_manager.resolve should NOT be called for follow-ups with stored workspace
-        mock_wm.resolve.assert_not_called()
-        # cwd should be the stored workspace path
-        assert run_calls[0]["cwd"] == "/tmp/ws/alice"
+        # workspace_manager.resolve is called once with sync_template=False for the
+        # early cwd lookup used by get_session rehydrate-on-miss; never with sync_template=True.
+        mock_wm.resolve.assert_called_once_with("alice", sync_template=False)
+        # cwd should be the stored workspace path (from session.workspace, not the early resolve)
+        assert create_calls[0]["cwd"] == "/tmp/ws/alice"

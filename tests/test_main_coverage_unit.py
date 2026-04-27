@@ -44,6 +44,21 @@ def client_context(**extra_patches):
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
+
+    # Default persistent-client behaviour: create_client succeeds with a
+    # sentinel client; run_completion_with_client yields a minimal success
+    # chunk pair.  Tests override either attribute to exercise other paths.
+    _fake_client = object()
+
+    async def _default_create_client(**kwargs):
+        return _fake_client
+
+    async def _default_run_with_client(client, prompt, session):
+        yield {"content": [{"type": "text", "text": "Hi"}]}
+        yield {"subtype": "success", "result": "Hi"}
+
+    mock_cli.create_client = _default_create_client
+    mock_cli.run_completion_with_client = _default_run_with_client
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
@@ -107,12 +122,16 @@ def _make_mock_backend(response_text="Hello", sdk_usage=None):
         chunks.append({"content": [{"type": "text", "text": response_text}]})
         chunks.append({"subtype": "success", "result": response_text})
 
-    async def fake_run_completion(**kwargs):
+    async def fake_run_with_client(client, prompt, session):
         for c in chunks:
             yield c
 
+    async def fake_create_client(**kwargs):
+        return object()
+
     mock_backend = MagicMock()
-    mock_backend.run_completion = fake_run_completion
+    mock_backend.create_client = fake_create_client
+    mock_backend.run_completion_with_client = fake_run_with_client
     mock_backend.parse_message = MagicMock(return_value=response_text)
     mock_backend.estimate_token_usage = MagicMock(
         return_value={"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8}
@@ -179,12 +198,12 @@ class TestResponsesApiSessionValidation:
 
         stale_resp_id = f"resp_{session_id}_2"
 
-        async def fake_run(**kwargs):
+        async def fake_run(client, prompt, session):
             yield {"content": [{"type": "text", "text": "Hi"}]}
             yield {"subtype": "success", "result": "Hi"}
 
         with client_context() as (client, mock_cli):
-            mock_cli.run_completion = fake_run
+            mock_cli.run_completion_with_client = fake_run
             mock_cli.parse_message.return_value = "Hi"
 
             response = client.post(
@@ -246,6 +265,26 @@ class TestResponsesApiSessionValidation:
 
         assert response.status_code == 400
         assert "Cannot mix backends" in response.json()["error"]["message"]
+
+    def test_create_client_failure_returns_503_and_deletes_session(self):
+        """When backend.create_client raises, the route returns 503 and clears the session."""
+
+        async def failing_create_client(**kwargs):
+            raise RuntimeError("simulated SDK boot failure")
+
+        active_before = session_manager.get_stats()["active_sessions"]
+
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = failing_create_client
+
+            response = client.post(
+                "/v1/responses",
+                json={"model": DEFAULT_MODEL, "input": "hi", "user": "u1"},
+            )
+
+        assert response.status_code == 503
+        # Session was created then cleaned up by the failing path.
+        assert session_manager.get_stats()["active_sessions"] == active_before
 
 
 # ===========================================================================
@@ -364,12 +403,12 @@ class TestResponsesStreamingExceptionPartialCapture:
     def test_streaming_responses_captures_session_id_on_failure(self):
         """chunks_buffer has content when exception occurs."""
 
-        async def failing_run(**kwargs):
+        async def failing_run(client, prompt, session):
             yield {"content": [{"type": "text", "text": "partial"}]}
             raise RuntimeError("mid-stream failure")
 
         with client_context() as (client, mock_cli):
-            mock_cli.run_completion = failing_run
+            mock_cli.run_completion_with_client = failing_run
             mock_cli.parse_message.return_value = None
 
             with client.stream(

@@ -28,6 +28,21 @@ def client_context():
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
+
+    # Default persistent-client behaviour: create_client succeeds, and
+    # run_completion_with_client yields a single success chunk.  Tests
+    # override either attribute to exercise other paths.
+    _default_client_obj = object()
+
+    async def _default_create_client(**kwargs):
+        return _default_client_obj
+
+    async def _default_run_with_client(client, prompt, session):
+        yield {"content": [{"type": "text", "text": "Hi"}]}
+        yield {"subtype": "success", "result": "Hi"}
+
+    mock_cli.create_client = _default_create_client
+    mock_cli.run_completion_with_client = _default_run_with_client
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
@@ -261,10 +276,15 @@ def test_session_endpoints_and_http_exception_handler():
 
 
 def test_create_response_non_streaming_success_uses_array_system_prompt(isolated_session_manager):
+    create_calls = []
     run_calls = []
 
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        run_calls.append({"prompt": prompt, "session_id": session.session_id})
         yield {"subtype": "success", "result": "Responses answer"}
 
     with (
@@ -272,7 +292,8 @@ def test_create_response_non_streaming_success_uses_array_system_prompt(isolated
         patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
         patch.object(responses_module, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
         mock_cli.parse_message.return_value = "Responses answer"
 
         response = client.post(
@@ -303,10 +324,10 @@ def test_create_response_non_streaming_success_uses_array_system_prompt(isolated
     assert body["output"][0]["content"][0]["text"] == "Responses answer"
     assert body["metadata"] == {"ticket": "123"}
     assert run_calls[0]["prompt"] == "Hi"
-    assert run_calls[0]["system_prompt"] == "System line 1\nSystem line 2"
     assert run_calls[0]["session_id"] == session_id
-    assert run_calls[0]["resume"] is None
-    assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
+    # System prompt and mcp_servers are configured at create_client time.
+    assert create_calls[0]["system_prompt"] == "System line 1\nSystem line 2"
+    assert create_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
     assert session.turn_counter == 1
     assert [message.content for message in session.messages] == ["Hi", "Responses answer"]
 
@@ -359,6 +380,43 @@ def test_create_response_rejects_instructions_with_previous_response_id():
     )
 
 
+def test_create_response_rejects_array_system_role_with_previous_response_id():
+    """Array input with role=system/developer is equivalent to instructions
+    and must be rejected the same way when previous_response_id is set."""
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": [
+                    {"role": "system", "content": "Override the prompt"},
+                    {"role": "user", "content": "Hi"},
+                ],
+                "previous_response_id": "resp_c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f_1",
+            },
+        )
+
+    assert response.status_code == 400
+    assert "previous_response_id" in response.json()["error"]["message"].lower()
+
+
+def test_create_response_rejects_array_developer_role_with_previous_response_id():
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": [
+                    {"role": "developer", "content": "Override"},
+                    {"role": "user", "content": "Hi"},
+                ],
+                "previous_response_id": "resp_c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f_1",
+            },
+        )
+
+    assert response.status_code == 400
+
+
 def test_create_response_returns_404_when_previous_response_session_is_missing():
     with client_context() as (client, _mock_cli):
         response = client.post(
@@ -393,17 +451,23 @@ def test_create_response_returns_503_when_auth_is_invalid():
 
 
 def test_create_response_uses_string_system_prompt_from_array_input(isolated_session_manager):
+    create_calls = []
     run_calls = []
 
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        run_calls.append({"prompt": prompt})
         yield {"subtype": "success", "result": "String system prompt answer"}
 
     with (
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
         mock_cli.parse_message.return_value = "String system prompt answer"
 
         response = client.post(
@@ -422,7 +486,7 @@ def test_create_response_uses_string_system_prompt_from_array_input(isolated_ses
 
     assert response.status_code == 200
     assert turn == 1
-    assert run_calls[0]["system_prompt"] == "You are terse."
+    assert create_calls[0]["system_prompt"] == "You are terse."
     assert run_calls[0]["prompt"] == "Hi"
     assert session.turn_counter == 1
 
@@ -430,8 +494,8 @@ def test_create_response_uses_string_system_prompt_from_array_input(isolated_ses
 def test_create_response_streaming_success_commits_session_state(isolated_session_manager):
     run_calls = []
 
-    def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
+    def fake_run_with_client(client, prompt, session):
+        run_calls.append({"prompt": prompt, "session_id": session.session_id})
 
         async def empty_source():
             if False:
@@ -454,7 +518,7 @@ def test_create_response_streaming_success_commits_session_state(isolated_sessio
             main.streaming_utils, "stream_response_chunks", new=fake_stream_response_chunks
         ),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.run_completion_with_client = fake_run_with_client
 
         with client.stream(
             "POST",
@@ -469,7 +533,6 @@ def test_create_response_streaming_success_commits_session_state(isolated_sessio
     assert "response.created" in body
     assert run_calls[0]["prompt"] == "Stream this"
     assert run_calls[0]["session_id"] == session.session_id
-    assert run_calls[0]["resume"] is None
     assert session.turn_counter == 1
     assert [message.content for message in session.messages] == [
         "Stream this",
@@ -481,7 +544,7 @@ def test_create_response_streaming_empty_result_emits_failed_event(isolated_sess
     """When the inner stream ends with no text and no pending tool call
     (stream_result['empty'] = True), the route must emit response.failed so
     the client sees a definite outcome — matching non-stream's 502 path."""
-    def fake_run_completion(**kwargs):
+    def fake_run_completion(client, prompt, session, **kwargs):
         async def empty_source():
             if False:
                 yield None
@@ -500,7 +563,7 @@ def test_create_response_streaming_empty_result_emits_failed_event(isolated_sess
             main.streaming_utils, "stream_response_chunks", new=fake_stream_response_chunks
         ),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.run_completion_with_client = fake_run_completion
         with client.stream(
             "POST",
             "/v1/responses",
@@ -525,8 +588,8 @@ def test_create_response_streaming_setup_error_returns_error_event_without_commi
 ):
     run_calls = []
 
-    def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
+    def fake_run_with_client(client, prompt, session):
+        run_calls.append({"prompt": prompt})
 
         async def empty_source():
             if False:
@@ -545,7 +608,7 @@ def test_create_response_streaming_setup_error_returns_error_event_without_commi
             main.streaming_utils, "stream_response_chunks", new=exploding_stream_response_chunks
         ),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.run_completion_with_client = fake_run_with_client
 
         with client.stream(
             "POST",
@@ -566,7 +629,7 @@ def test_create_response_streaming_setup_error_returns_error_event_without_commi
 
 
 def test_create_response_returns_502_when_claude_sdk_raises():
-    async def raising_run_completion(**kwargs):
+    async def raising_run_completion(client, prompt, session, **kwargs):
         raise RuntimeError("boom")
         yield  # pragma: no cover
 
@@ -574,7 +637,7 @@ def test_create_response_returns_502_when_claude_sdk_raises():
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = raising_run_completion
+        mock_cli.run_completion_with_client = raising_run_completion
 
         response = client.post(
             "/v1/responses",
@@ -589,14 +652,14 @@ def test_create_response_returns_502_when_claude_sdk_raises():
 
 
 def test_create_response_returns_502_when_sdk_emits_error_chunk():
-    async def error_chunk_run_completion(**kwargs):
+    async def error_chunk_run_completion(client, prompt, session, **kwargs):
         yield {"is_error": True, "error_message": "sdk failed"}
 
     with (
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = error_chunk_run_completion
+        mock_cli.run_completion_with_client = error_chunk_run_completion
 
         response = client.post(
             "/v1/responses",
@@ -610,7 +673,7 @@ def test_create_response_returns_502_when_sdk_emits_error_chunk():
 
 
 def test_create_response_returns_502_when_sdk_returns_no_message():
-    async def empty_run_completion(**kwargs):
+    async def empty_run_completion(client, prompt, session, **kwargs):
         if False:
             yield None
 
@@ -618,7 +681,7 @@ def test_create_response_returns_502_when_sdk_returns_no_message():
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = empty_run_completion
+        mock_cli.run_completion_with_client = empty_run_completion
         mock_cli.parse_message.return_value = None
 
         response = client.post(
@@ -658,14 +721,14 @@ def test_responses_latest_previous_response_id(isolated_session_manager):
     session = isolated_session_manager.get_or_create_session(sid)
     session.turn_counter = 1
 
-    async def fake_run_completion(**kwargs):
+    async def fake_run_completion(client, prompt, session, **kwargs):
         yield {"subtype": "success", "result": "Follow-up answer"}
 
     with (
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.run_completion_with_client = fake_run_completion
         mock_cli.parse_message.return_value = "Follow-up answer"
 
         response = client.post(
@@ -685,10 +748,13 @@ def test_responses_latest_previous_response_id(isolated_session_manager):
 
 def test_responses_claude_unchanged(isolated_session_manager):
     """Existing Claude behavior regression check -- still works after refactor."""
-    run_calls = []
+    create_calls = []
 
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
         yield {"subtype": "success", "result": "Claude says hi"}
 
     with (
@@ -696,7 +762,8 @@ def test_responses_claude_unchanged(isolated_session_manager):
         patch.object(main, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
         patch.object(responses_module, "get_mcp_servers", return_value={"demo": {"type": "stdio"}}),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
         mock_cli.parse_message.return_value = "Claude says hi"
 
         response = client.post(
@@ -715,17 +782,20 @@ def test_responses_claude_unchanged(isolated_session_manager):
     assert response.status_code == 200
     assert body["output"][0]["content"][0]["text"] == "Claude says hi"
     assert turn == 1
-    assert run_calls[0]["system_prompt"] == "Be helpful"
-    assert run_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
+    assert create_calls[0]["system_prompt"] == "Be helpful"
+    assert create_calls[0]["mcp_servers"] == {"demo": {"type": "stdio"}}
     assert session.backend == "claude"
 
 
-def test_responses_fallback_forwards_allowed_tools(isolated_session_manager):
-    """Fallback query path preserves explicit tool restrictions."""
-    run_calls = []
+def test_responses_create_client_forwards_allowed_tools(isolated_session_manager):
+    """allowed_tools flows through to create_client (no run_completion fallback)."""
+    create_calls = []
 
-    async def fake_run_completion(**kwargs):
-        run_calls.append(kwargs)
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
         yield {"subtype": "success", "result": "Claude says hi"}
 
     with (
@@ -733,8 +803,8 @@ def test_responses_fallback_forwards_allowed_tools(isolated_session_manager):
         patch.object(main, "get_mcp_servers", return_value={}),
         patch.object(responses_module, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.create_client = AsyncMock(side_effect=RuntimeError("no client"))
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
         mock_cli.parse_message.return_value = "Claude says hi"
 
         response = client.post(
@@ -747,7 +817,7 @@ def test_responses_fallback_forwards_allowed_tools(isolated_session_manager):
         )
 
     assert response.status_code == 200
-    assert run_calls[0]["allowed_tools"] == ["Read"]
+    assert create_calls[0]["allowed_tools"] == ["Read"]
 
 
 def test_responses_streaming_error_disconnects_persistent_client(isolated_session_manager):
@@ -822,14 +892,14 @@ def test_responses_concurrent_stale_id_race(isolated_session_manager):
     session = isolated_session_manager.get_or_create_session(sid)
     session.turn_counter = 1
 
-    async def fake_run_completion(**kwargs):
+    async def fake_run_completion(client, prompt, session, **kwargs):
         yield {"subtype": "success", "result": "First wins"}
 
     with (
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.run_completion_with_client = fake_run_completion
         mock_cli.parse_message.return_value = "First wins"
 
         prev_id = main._make_response_id(sid, 1)
@@ -868,14 +938,14 @@ def test_responses_non_streaming_failure_no_commit(isolated_session_manager):
     session.backend = "claude"
     original_messages = list(session.messages)
 
-    async def failing_run_completion(**kwargs):
+    async def failing_run_completion(client, prompt, session):
         yield {"is_error": True, "error_message": "backend exploded"}
 
     with (
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = failing_run_completion
+        mock_cli.run_completion_with_client = failing_run_completion
 
         response = client.post(
             "/v1/responses",
@@ -894,7 +964,7 @@ def test_responses_non_streaming_failure_no_commit(isolated_session_manager):
 def test_responses_streaming_success_commits_with_streamed_text(isolated_session_manager):
     """Streaming success uses assistant_text from stream_result (not parse_message)."""
 
-    async def fake_run_completion(**kwargs):
+    async def fake_run_completion(client, prompt, session, **kwargs):
         yield {"content": [{"type": "text", "text": "streamed text"}]}
         yield {"subtype": "success", "result": "streamed text"}
 
@@ -902,7 +972,7 @@ def test_responses_streaming_success_commits_with_streamed_text(isolated_session
         client_context() as (client, mock_cli),
         patch.object(main, "get_mcp_servers", return_value={}),
     ):
-        mock_cli.run_completion = fake_run_completion
+        mock_cli.run_completion_with_client = fake_run_completion
         # parse_message returns None -- but the endpoint should not call it
         mock_cli.parse_message.return_value = None
 
@@ -941,7 +1011,7 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
     backend_release = asyncio.Event()
     entry_order: list[str] = []
 
-    async def slow_run_completion(**kwargs):
+    async def slow_run_with_client(client, prompt, session):
         """Backend that blocks until backend_release is set."""
         tag = f"call-{len(entry_order) + 1}"
         entry_order.append(tag)
@@ -949,10 +1019,14 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
         await backend_release.wait()
         yield {"subtype": "success", "result": "Lock holder wins"}
 
+    async def fake_create_client(**kwargs):
+        return object()
+
     mock_cli = MagicMock()
     mock_cli.verify_cli = AsyncMock(return_value=True)
     mock_cli.verify = AsyncMock(return_value=True)
-    mock_cli.run_completion = slow_run_completion
+    mock_cli.create_client = fake_create_client
+    mock_cli.run_completion_with_client = slow_run_with_client
     mock_cli.parse_message.return_value = "Lock holder wins"
     BackendRegistry.register("claude", mock_cli)
 

@@ -24,7 +24,6 @@ class SessionPreflight:
 
     session: Session
     is_new: bool
-    resume_id: Optional[str]
     next_turn: int  # session.turn_counter + 1
     lock_acquired: bool  # True → caller must release
 
@@ -104,11 +103,6 @@ async def acquire_session_preflight(
                 ),
             )
 
-        # --- Compute resume_id ---
-        resume_id: Optional[str] = None
-        if not is_new:
-            resume_id = session.provider_session_id or session_id
-
         # --- Compute next_turn ---
         # Always computed so callers (e.g. responses flow) can use it.
         next_turn: int = session.turn_counter + 1
@@ -134,7 +128,6 @@ async def acquire_session_preflight(
     return SessionPreflight(
         session=session,
         is_new=is_new,
-        resume_id=resume_id,
         next_turn=next_turn,
         lock_acquired=True,
     )
