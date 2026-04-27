@@ -48,6 +48,21 @@ def _encode_cwd(cwd) -> str:
     return _CWD_ENCODE_RE.sub("-", str(cwd))
 
 
+def _session_jsonl_path(session_id: str, workspace) -> Path:
+    """Return the on-disk path the SDK uses for this session's transcript.
+
+    Path layout: ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``.
+    """
+    return _PROJECTS_ROOT / _encode_cwd(workspace) / f"{session_id}.jsonl"
+
+
+def _session_jsonl_exists(session: "Session") -> bool:
+    """True when the SDK has already written a transcript for *session*."""
+    if not session.workspace:
+        return False
+    return _session_jsonl_path(session.session_id, session.workspace).is_file()
+
+
 def _try_rehydrate_from_jsonl(
     session_id: str, *, user: Optional[str], cwd
 ) -> Optional["Session"]:

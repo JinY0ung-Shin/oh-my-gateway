@@ -128,3 +128,38 @@ def test_get_session_returns_none_when_neither_memory_nor_disk(tmp_path, monkeyp
     monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
     sm = SessionManager()
     assert sm.get_session("nope", user="u", cwd="/x") is None
+
+
+def test_session_jsonl_path_constructs_expected_path(tmp_path, monkeypatch):
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    p = session_manager._session_jsonl_path("abc", "/x/y_z")
+    encoded = session_manager._encode_cwd("/x/y_z")
+    assert p == tmp_path / encoded / "abc.jsonl"
+
+
+def test_session_jsonl_exists_returns_false_when_workspace_missing():
+    from src import session_manager
+    from src.session_manager import Session
+
+    sess = Session(session_id="sid", workspace=None)
+    assert session_manager._session_jsonl_exists(sess) is False
+
+
+def test_session_jsonl_exists_reflects_filesystem(tmp_path, monkeypatch):
+    from src import session_manager
+    from src.session_manager import Session
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/x/y"
+    encoded = session_manager._encode_cwd(cwd)
+    sid = "sid-1"
+
+    sess = Session(session_id=sid, workspace=cwd)
+    assert session_manager._session_jsonl_exists(sess) is False
+
+    target = tmp_path / encoded / f"{sid}.jsonl"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("{}\n")
+    assert session_manager._session_jsonl_exists(sess) is True
