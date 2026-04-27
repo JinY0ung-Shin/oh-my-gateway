@@ -59,6 +59,7 @@ def get_admin_js() -> str:
     usage: {
       enabled: null, summary: null, users: [], tools: [], turns: [],
       series: { day: [], week: [], month: [] },
+      toolsByGran: { day: [], week: [], month: [] },
     },
     usageWindow: 7,
     usageStart: '',
@@ -302,16 +303,26 @@ def get_admin_js() -> str:
       // Always fetch all three granularities for the fixed 4x3 Trends grid.
       try {
         const grans = ['day', 'week', 'month'];
-        const results = await Promise.all(grans.map(g =>
-          this.api('/admin/api/usage/series?granularity=' + g + '&buckets=5')
-        ));
+        // Approximate "last 5 of granularity" as a rolling-day window for
+        // the per-cell top-tools list.
+        const toolWindow = { day: 5, week: 35, month: 150 };
+        const seriesPromises = grans.map(g =>
+          this.api('/admin/api/usage/series?granularity=' + g + '&buckets=5'));
+        const toolPromises = grans.map(g =>
+          this.api('/admin/api/usage/tools?window_days=' + toolWindow[g] + '&limit=10'));
+        const [seriesRes, toolRes] = await Promise.all([
+          Promise.all(seriesPromises),
+          Promise.all(toolPromises),
+        ]);
         for (let i = 0; i < grans.length; i++) {
-          const r = results[i];
-          if (r.ok) {
-            const j = await r.json();
-            // backend returns DESC; reverse for left-to-right chronology
+          if (seriesRes[i].ok) {
+            const j = await seriesRes[i].json();
             this.usage.series[grans[i]] = (j.buckets || []).slice().reverse();
             if (this.usage.enabled === null) this.usage.enabled = j.enabled;
+          }
+          if (toolRes[i].ok) {
+            const j = await toolRes[i].json();
+            this.usage.toolsByGran[grans[i]] = j.items || [];
           }
         }
       } catch(e) {

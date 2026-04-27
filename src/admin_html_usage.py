@@ -57,45 +57,65 @@ def get_usage_html() -> str:
                 <span class="text-xs text-dim">last 5 · day / week / month</span>
               </div>
               <div x-show="usageSeriesEmpty()" class="text-muted" style="padding:1rem; text-align:center">[ NO DATA ]</div>
-              <div x-show="!usageSeriesEmpty()"
-                style="display:grid; grid-template-columns:auto repeat(3, 1fr); gap:0.75rem 1rem; align-items:stretch">
-                <div></div>
-                <template x-for="g in ['day','week','month']" :key="'hdr-' + g">
-                  <div class="text-xs text-dim" style="text-align:center; letter-spacing:0.08em" x-text="g.toUpperCase()"></div>
-                </template>
-                <template x-for="chart in [
-                  {key:'turns', label:'QUERIES', color:'var(--green)'},
-                  {key:'users', label:'USERS', color:'var(--cyan)'},
-                  {key:'tool_calls', label:'TOOL CALLS', color:'var(--amber)'},
-                  {key:'tokens', label:'TOKENS', color:'var(--red)'}
-                ]" :key="chart.key">
-                  <template x-for="cell in [
-                    {row: chart, gran: 'day'},
-                    {row: chart, gran: 'week'},
-                    {row: chart, gran: 'month'}
-                  ]" :key="chart.key + '-' + cell.gran">
-                    <div style="display:contents">
-                      <template x-if="cell.gran === 'day'">
-                        <div class="text-xs text-dim" style="align-self:center; white-space:nowrap" x-text="chart.label"></div>
-                      </template>
-                      <div>
-                        <div style="display:flex; gap:4px; align-items:flex-end; height:100px; padding:4px 4px 0; border-bottom:1px solid var(--border-dim)">
-                          <template x-for="b in seriesForChart(cell.gran, chart.key)" :key="cell.gran + chart.key + b.label">
-                            <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; min-width:0">
-                              <div class="text-xs" style="color:var(--text-bright); white-space:nowrap; font-size:0.65rem" x-text="formatNum(b.value)"></div>
-                              <div :style="'width:78%; background:' + chart.color + '; height:' + (b.pct*100) + '%; min-height:2px; transition:height 0.3s'"></div>
+              <div x-show="!usageSeriesEmpty()" class="table-wrapper">
+                <table style="table-layout:fixed; width:100%">
+                  <colgroup>
+                    <col style="width:110px">
+                    <col><col><col>
+                  </colgroup>
+                  <thead>
+                    <tr>
+                      <th></th>
+                      <th style="text-align:center">DAY</th>
+                      <th style="text-align:center">WEEK</th>
+                      <th style="text-align:center">MONTH</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <template x-for="chart in [
+                      {key:'turns', label:'QUERIES', color:'var(--green)'},
+                      {key:'users', label:'USERS', color:'var(--cyan)'},
+                      {key:'tokens', label:'TOKENS', color:'var(--red)'}
+                    ]" :key="'row-' + chart.key">
+                      <tr>
+                        <td class="text-xs text-dim" style="vertical-align:middle; letter-spacing:0.08em" x-text="chart.label"></td>
+                        <template x-for="g in ['day','week','month']" :key="'cell-' + chart.key + '-' + g">
+                          <td style="vertical-align:middle; padding:8px">
+                            <div style="display:flex; gap:4px; align-items:flex-end; height:90px; border-bottom:1px solid var(--border-dim)">
+                              <template x-for="b in seriesForChart(g, chart.key)" :key="g + chart.key + b.label">
+                                <div style="flex:1; display:flex; flex-direction:column; align-items:center; gap:2px; min-width:0">
+                                  <div class="text-xs" style="color:var(--text-bright); white-space:nowrap; font-size:0.65rem" x-text="formatNum(b.value)"></div>
+                                  <div :style="'width:78%; background:' + chart.color + '; height:' + (b.pct*100) + '%; min-height:2px; transition:height 0.3s'"></div>
+                                </div>
+                              </template>
                             </div>
-                          </template>
-                        </div>
-                        <div style="display:flex; gap:4px; padding:4px 4px 0">
-                          <template x-for="b in seriesForChart(cell.gran, chart.key)" :key="cell.gran + chart.key + b.label + '-lbl'">
-                            <div class="text-xs text-dim" style="flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.6rem" x-text="b.label"></div>
-                          </template>
-                        </div>
-                      </div>
-                    </div>
-                  </template>
-                </template>
+                            <div style="display:flex; gap:4px; padding-top:4px">
+                              <template x-for="b in seriesForChart(g, chart.key)" :key="g + chart.key + b.label + '-lbl'">
+                                <div class="text-xs text-dim" style="flex:1; text-align:center; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:0.6rem" x-text="b.label"></div>
+                              </template>
+                            </div>
+                          </td>
+                        </template>
+                      </tr>
+                    </template>
+                    <tr>
+                      <td class="text-xs text-dim" style="vertical-align:top; letter-spacing:0.08em; padding-top:12px">TOOL CALLS</td>
+                      <template x-for="g in ['day','week','month']" :key="'tools-' + g">
+                        <td style="vertical-align:top; padding:8px">
+                          <div x-show="(usage.toolsByGran?.[g] ?? []).length === 0" class="text-muted text-xs">-</div>
+                          <ul style="margin:0; padding:0; list-style:none">
+                            <template x-for="t in (usage.toolsByGran?.[g] ?? []).slice(0, 6)" :key="g + t.tool_name">
+                              <li class="text-xs" style="padding:2px 0; display:flex; justify-content:space-between; gap:8px">
+                                <span class="text-mono" style="color:var(--cyan); overflow:hidden; text-overflow:ellipsis; white-space:nowrap" x-text="t.tool_name"></span>
+                                <span style="color:var(--amber); white-space:nowrap" x-text="formatNum(t.calls) + '회'"></span>
+                              </li>
+                            </template>
+                          </ul>
+                        </td>
+                      </template>
+                    </tr>
+                  </tbody>
+                </table>
               </div>
             </div>
 
