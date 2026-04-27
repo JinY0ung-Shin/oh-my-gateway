@@ -7,11 +7,28 @@ All configurable values can be overridden via environment variables.
 """
 
 import os
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 from src.env_utils import parse_bool_env, parse_int_env
 
 load_dotenv()
+
+# Selected Anthropic-related keys: .env wins over pre-existing shell env.
+# Why: shell-injected values (e.g. corp defaults) silently override .env,
+# making local routing/model overrides ineffective without this opt-in.
+_DOTENV_OVERRIDE_KEYS = (
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_CUSTOM_HEADERS",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+)
+_dotenv_file_values = dotenv_values()
+for _k in _DOTENV_OVERRIDE_KEYS:
+    _v = _dotenv_file_values.get(_k)
+    if _v is not None:
+        os.environ[_k] = _v
 
 # Default model (recommended for most use cases)
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "sonnet")
