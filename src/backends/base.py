@@ -80,23 +80,27 @@ class BackendClient(Protocol):
 
     def get_auth_provider(self) -> Any: ...
 
-    def run_completion(
+    async def create_client(
         self,
-        prompt: str,
-        system_prompt: Optional[str] = None,
+        *,
+        session: Any,
         model: Optional[str] = None,
-        stream: bool = True,
-        max_turns: int = 10,
+        system_prompt: Optional[str] = None,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
-        session_id: Optional[str] = None,
-        resume: Optional[str] = None,
         permission_mode: Optional[str] = None,
-        output_format: Optional[Dict[str, Any]] = None,
         mcp_servers: Optional[Dict[str, Any]] = None,
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
-        **_extra: Any,
+        extra_env: Optional[Dict[str, str]] = None,
+        _custom_base: Any = None,
+    ) -> Any: ...
+
+    def run_completion_with_client(
+        self,
+        client: Any,
+        prompt: str,
+        session: Any,
     ) -> AsyncIterator[Dict[str, Any]]: ...
 
     def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]: ...
@@ -126,7 +130,8 @@ class BackendRegistry:
 
         resolved = resolve_model(request.model)
         backend  = BackendRegistry.get(resolved.backend)
-        async for chunk in backend.run_completion(...):
+        client   = await backend.create_client(session=session, ...)
+        async for chunk in backend.run_completion_with_client(client, prompt, session):
             ...
     """
 
