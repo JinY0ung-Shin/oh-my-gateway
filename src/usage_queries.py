@@ -1,7 +1,7 @@
 """Read-side analytics queries for the admin usage dashboard.
 
 All functions return plain Python values (lists of dicts / dicts) or ``None``
-when the usage-log pool is disabled / unavailable.  The calling endpoints in
+when the usage-log engine is disabled / unavailable.  The calling endpoints in
 ``src.routes.admin`` translate ``None`` into an empty response so the UI can
 render a "usage logging off" hint without treating it as an error.
 """
@@ -158,12 +158,9 @@ _GRANULARITY_SQL: Dict[str, str] = {
     # ``%v`` (ISO week) paired with ``%x`` (ISO week year) so boundaries
     # line up with the Monday-first ISO week definition.
     #
-    # ``%`` is doubled because aiomysql.Cursor.execute uses printf-style
-    # parameter interpolation on the SQL string; any bare ``%`` would be
-    # eaten as a format directive and raise a binding error.
     "day": "DATE(ts)",
-    "week": "DATE_FORMAT(ts, '%%x-W%%v')",
-    "month": "DATE_FORMAT(ts, '%%Y-%%m')",
+    "week": "DATE_FORMAT(ts, '%x-W%v')",
+    "month": "DATE_FORMAT(ts, '%Y-%m')",
 }
 
 
@@ -209,11 +206,11 @@ async def get_time_series(
         ) turn_agg
         LEFT JOIN (
           SELECT
-            {bucket_expr.replace('ts', 'u.ts')} AS bucket,
+            {bucket_expr.replace("ts", "u.ts")} AS bucket,
             SUM(t.call_count) AS tool_calls
           FROM usage_tool t
           JOIN usage_turn u ON u.id = t.turn_id
-          GROUP BY {bucket_expr.replace('ts', 'u.ts')}
+          GROUP BY {bucket_expr.replace("ts", "u.ts")}
         ) tool_agg ON tool_agg.bucket = turn_agg.bucket
         ORDER BY turn_agg.bucket DESC
         LIMIT %s

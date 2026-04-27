@@ -53,6 +53,21 @@ VALUES
 """
 
 
+def _bind_positional_params(sql: str, params: tuple) -> tuple[str, Dict[str, Any]]:
+    """Convert ``%s`` placeholders to SQLAlchemy named bind parameters."""
+    bound: Dict[str, Any] = {}
+    converted = sql
+    for idx, value in enumerate(params):
+        marker = f"p{idx}"
+        if "%s" not in converted:
+            raise ValueError("Too many SQL parameters supplied")
+        converted = converted.replace("%s", f":{marker}", 1)
+        bound[marker] = value
+    if "%s" in converted:
+        raise ValueError("Not enough SQL parameters supplied")
+    return converted, bound
+
+
 def _normalize_db_url(url: str) -> str:
     """Map shorthand schemes to their async-driver counterparts."""
     aliases = {
@@ -62,7 +77,7 @@ def _normalize_db_url(url: str) -> str:
     }
     for prefix, replacement in aliases.items():
         if url.startswith(prefix) and "+" not in url.split("://", 1)[0]:
-            return replacement + url[len(prefix):]
+            return replacement + url[len(prefix) :]
     return url
 
 
@@ -184,24 +199,23 @@ class UsageLogger:
         return self._engine is not None
 
     async def fetch_rows(self, sql: str, params: tuple = ()) -> Optional[list]:
-        """Execute a read-only SELECT and return ``list[dict]`` (DictCursor).
+        """Execute a read-only SELECT and return ``list[dict]``.
 
-        Returns ``None`` when the pool is not configured or the query fails -
+        Returns ``None`` when the engine is not configured or the query fails -
         callers should treat that as "usage logging is not available".
         Intended only for admin-side analytics queries; callers must supply
         the full parameterised SQL (no automatic quoting).
         """
-        if self._pool is None:
+        engine = self._engine
+        if engine is None:
             return None
         try:
-            import aiomysql  # local import - optional dep
-        except ImportError:
-            return None
-        try:
-            async with self._pool.acquire() as conn:
-                async with conn.cursor(aiomysql.DictCursor) as cur:
-                    await cur.execute(sql, params)
-                    return list(await cur.fetchall())
+            from sqlalchemy import text
+
+            query, bound_params = _bind_positional_params(sql, params)
+            async with engine.connect() as conn:
+                result = await conn.execute(text(query), bound_params)
+                return [dict(row) for row in result.mappings().all()]
         except Exception:
             logger.warning("usage-log read failed: %s", sql[:120], exc_info=True)
             return None
@@ -269,7 +283,6 @@ class UsageLogger:
                         )
         except Exception:
             logger.warning("usage-log write failed", exc_info=True)
-
 
     async def log_turn_from_context(
         self,
