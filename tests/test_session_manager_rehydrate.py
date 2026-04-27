@@ -86,3 +86,45 @@ def test_try_rehydrate_returns_none_on_corrupt_file(tmp_path, monkeypatch):
 
     sess = session_manager._try_rehydrate_from_jsonl(sid, user="u", cwd=cwd)
     assert sess is None
+
+
+def test_get_session_returns_in_memory_hit_unchanged(tmp_path, monkeypatch):
+    from src.session_manager import SessionManager, Session
+
+    sm = SessionManager()
+    sm.sessions["sid-1"] = Session(
+        session_id="sid-1", user="u", workspace="/x"
+    )
+    got = sm.get_session("sid-1")
+    assert got is not None
+    assert got.session_id == "sid-1"
+
+
+def test_get_session_rehydrates_when_disk_only(tmp_path, monkeypatch):
+    from src import session_manager
+    from src.session_manager import SessionManager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/x/y"
+    sid = "disk-1"
+    jsonl = tmp_path / session_manager._encode_cwd(cwd) / f"{sid}.jsonl"
+    jsonl.parent.mkdir(parents=True, exist_ok=True)
+    jsonl.write_text(
+        '{"type":"user","message":{"role":"user","content":"hi"}}\n'
+    )
+
+    sm = SessionManager()
+    got = sm.get_session(sid, user="u", cwd=cwd)
+    assert got is not None
+    assert got.session_id == sid
+    assert got.turn_counter == 1
+    assert sid in sm.sessions  # cached now
+
+
+def test_get_session_returns_none_when_neither_memory_nor_disk(tmp_path, monkeypatch):
+    from src import session_manager
+    from src.session_manager import SessionManager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    sm = SessionManager()
+    assert sm.get_session("nope", user="u", cwd="/x") is None

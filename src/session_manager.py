@@ -391,17 +391,32 @@ class SessionManager:
             logger.info(f"Created new session: {session_id}")
             return session
 
-    def get_session(self, session_id: str) -> Optional[Session]:
-        """Get existing session without creating a new one.
+    def get_session(
+        self,
+        session_id: str,
+        *,
+        user: Optional[str] = None,
+        cwd: Optional[str] = None,
+    ) -> Optional[Session]:
+        """Return a session by id; rehydrate from jsonl on cache miss when context permits.
 
-        Returns ``None`` when the session does not exist or is expired.
+        Returns ``None`` when the session does not exist, is expired, and
+        cannot be rehydrated from disk.
         """
         with self.lock:
             self._remove_if_expired(session_id)
             session = self.sessions.get(session_id)
             if session is not None:
                 session.touch()
-            return session
+                return session
+            # Cache miss path — try rehydrate
+            session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
+            if session is not None:
+                self.sessions[session_id] = session
+                self._rehydrate_hits = getattr(self, "_rehydrate_hits", 0) + 1
+                return session
+            self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
+            return None
 
     def peek_session(self, session_id: str) -> Optional[Session]:
         """Read-only session access — does **not** refresh TTL.
