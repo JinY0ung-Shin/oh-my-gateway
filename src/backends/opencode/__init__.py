@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
-from src.backends.opencode.constants import OPENCODE_MODELS
+from src.backends.opencode.constants import configured_public_models
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +29,7 @@ def _opencode_resolve(model: str) -> Optional[ResolvedModel]:
 OPENCODE_DESCRIPTOR = BackendDescriptor(
     name="opencode",
     owned_by="opencode",
-    models=list(OPENCODE_MODELS),
+    models=configured_public_models(),
     resolve_fn=_opencode_resolve,
 )
 
