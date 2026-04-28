@@ -46,6 +46,7 @@ class OpenCodeAuthProvider(BackendAuthProvider):
             "OPENCODE_SERVER_USERNAME",
             "OPENCODE_SERVER_PASSWORD",
             "OPENCODE_CONFIG_CONTENT",
+            "OPENCODE_QUESTION_PERMISSION",
         ):
             value = os.getenv(key)
             if value:

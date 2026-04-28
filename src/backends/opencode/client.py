@@ -7,7 +7,6 @@ to the same server API directly with httpx.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -94,7 +93,7 @@ class OpenCodeClient:
             return existing
 
         config: Dict[str, Any] = {
-            "permission": {"question": "deny"},
+            "permission": {"question": os.getenv("OPENCODE_QUESTION_PERMISSION", "ask")},
             "share": "disabled",
         }
         default_model = os.getenv("OPENCODE_DEFAULT_MODEL")

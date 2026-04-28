@@ -43,6 +43,36 @@ def test_opencode_runtime_metadata_treats_explicit_base_url_as_external(monkeypa
     assert client.runtime_metadata()["managed_process"] is False
 
 
+def test_opencode_managed_config_enables_question_tool_by_default(monkeypatch):
+    """Managed OpenCode config exposes the question tool by default."""
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.delenv("OPENCODE_QUESTION_PERMISSION", raising=False)
+    monkeypatch.delenv("OPENCODE_DEFAULT_MODEL", raising=False)
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    client = OpenCodeClient(base_url="http://127.0.0.1:4096")
+
+    config = json.loads(client._managed_config_content())
+
+    assert config["permission"]["question"] == "ask"
+    assert config["share"] == "disabled"
+
+
+def test_opencode_managed_config_allows_question_permission_override(monkeypatch):
+    """Operators can override the managed OpenCode question permission."""
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.setenv("OPENCODE_QUESTION_PERMISSION", "allow")
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    client = OpenCodeClient(base_url="http://127.0.0.1:4096")
+
+    config = json.loads(client._managed_config_content())
+
+    assert config["permission"]["question"] == "allow"
+
+
 def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
     """OpenCode descriptor resolves opencode/<provider>/<model> IDs."""
     monkeypatch.setenv("OPENCODE_MODELS", "anthropic/claude-sonnet-4-5")

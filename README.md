@@ -97,9 +97,9 @@ opencode serve --hostname 127.0.0.1 --port 4096
 export OPENCODE_BASE_URL=http://127.0.0.1:4096
 ```
 
-Managed server mode starts `opencode serve` automatically when `OPENCODE_BASE_URL` is unset. Managed mode requires the `opencode` binary on `PATH`.
+Managed server mode starts `opencode serve` automatically when `OPENCODE_BASE_URL` is unset. Managed mode requires the `opencode` binary on `PATH`. Managed mode exposes OpenCode's `question` tool by default with `OPENCODE_QUESTION_PERMISSION=ask`; set it to `deny` to hide the tool.
 
-Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, and server authentication variables are documented in `.env.example`.
+Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, and server authentication variables are documented in `.env.example`.
 
 ### Bash Sandbox
 

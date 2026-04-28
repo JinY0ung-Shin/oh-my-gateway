@@ -130,10 +130,9 @@ session idle completion.
 The MVP does not map Claude tool names to OpenCode tool names. OpenCode tools
 are controlled through OpenCode config and permissions.
 
-The OpenCode `question` tool is disabled by default in managed config for the
-MVP. The current wrapper `function_call_output` path is Claude hook-specific;
-supporting OpenCode question continuation requires a separate design around
-OpenCode events or TUI control APIs.
+The OpenCode `question` tool is enabled by default in managed config so the
+Responses `function_call_output` continuation path can surface OpenCode
+questions. External OpenCode servers keep their own agent/config settings.
 
 Wrapper `MCP_CONFIG` is not converted in the MVP. Operators can configure
 OpenCode MCP servers through `opencode.json` or `OPENCODE_CONFIG_CONTENT`.
@@ -147,7 +146,7 @@ keys remain OpenCode's responsibility through its normal auth/config system.
 The backend passes selected config to managed OpenCode through
 `OPENCODE_CONFIG_CONTENT`. MVP managed config sets safe defaults:
 
-- `permission.question = "deny"`
+- `permission.question = "ask"`
 - `share = "disabled"`
 - optional `model` if `OPENCODE_DEFAULT_MODEL` is set
 
