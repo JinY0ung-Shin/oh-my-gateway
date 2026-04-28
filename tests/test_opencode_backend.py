@@ -151,6 +151,186 @@ def test_opencode_event_converter_ignores_other_sessions():
     assert converter.final_text() == ""
 
 
+def test_opencode_event_converter_emits_tool_use_and_result_once():
+    """OpenCode event converter emits a tool_use and a completed tool_result."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    running_chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {"status": "running", "input": {"command": "pwd"}},
+                },
+            },
+        }
+    )
+    completed_chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "pwd"},
+                        "output": "/tmp/work\n",
+                    },
+                },
+            },
+        }
+    )
+
+    assert running_chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "bash",
+                    "input": {"command": "pwd"},
+                }
+            ],
+        }
+    ]
+    assert completed_chunks == [
+        {
+            "type": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "/tmp/work\n",
+                    "is_error": False,
+                }
+            ],
+        }
+    ]
+
+
+def test_opencode_event_converter_emits_error_tool_result():
+    """OpenCode event converter emits error tool results from failed tool updates."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "error",
+                        "input": {"command": "exit 1"},
+                        "error": "failed",
+                    },
+                },
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "bash",
+                    "input": {"command": "exit 1"},
+                }
+            ],
+        },
+        {
+            "type": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "failed",
+                    "is_error": True,
+                }
+            ],
+        },
+    ]
+
+
+def test_opencode_event_converter_accumulates_step_finish_usage():
+    """OpenCode event converter accumulates usage from step-finish parts."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 11,
+                        "output": 5,
+                        "reasoning": 2,
+                        "cache": {"read": 3, "write": 7},
+                    },
+                },
+            },
+        }
+    )
+
+    assert chunks == []
+    assert converter.usage == {
+        "input_tokens": 21,
+        "output_tokens": 5,
+        "total_tokens": 28,
+    }
+    assert converter.saw_activity is True
+
+
+def test_opencode_event_converter_finishes_only_after_activity():
+    """OpenCode event converter requires session activity before idle finishes."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    idle_event = {"type": "session.idle", "properties": {"sessionID": "oc-session"}}
+
+    assert converter.finished(idle_event) is False
+
+    converter.convert(
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "ok",
+            },
+        }
+    )
+
+    assert converter.finished(
+        {"type": "session.idle", "properties": {"sessionID": "other-session"}}
+    ) is False
+    assert converter.finished(idle_event) is True
+
+
 async def test_opencode_client_sends_prompt_to_existing_server(monkeypatch):
     """OpenCode client creates a session and sends prompt bodies over HTTP."""
     calls = []

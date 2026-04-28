@@ -19,7 +19,7 @@ class OpenCodeEventConverter:
     saw_activity: bool = False
 
     def convert(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Convert one OpenCode event into zero or more backend chunks."""
+        """Convert one OpenCode event and update accumulated stream state."""
         if self._event_session_id(event) != self.session_id:
             return []
 
