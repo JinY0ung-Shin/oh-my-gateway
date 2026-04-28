@@ -43,7 +43,11 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
-from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
+from src.constants import (
+    ASK_USER_TIMEOUT_SECONDS,
+    DEFAULT_TIMEOUT_MS,
+    SENSITIVE_FILE_AUTO_ALLOW_EXTS,
+)
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns
@@ -548,6 +552,33 @@ class ClaudeCodeCLI:
             sensitive_paths = self._extract_sensitive_paths(tool_input)
             if not sensitive_paths:
                 return {}  # Not a sensitive path — let the SDK proceed.
+
+            # Auto-allow extensions the operator has marked as safe.
+            # ``.md`` is the default: markdown files can't carry the
+            # kind of executable / credential payload that motivates
+            # the prompt (settings.json, .env, ssh keys, …) and the
+            # most common case — repeated ``.claude/MEMORY.md``
+            # updates the user explicitly asked for — would otherwise
+            # surface a card on every edit.  Operators can tighten by
+            # setting ``SENSITIVE_FILE_AUTO_ALLOW_EXTS=`` to an empty
+            # string, or widen to e.g. ``.md,.txt``.
+            if SENSITIVE_FILE_AUTO_ALLOW_EXTS and all(
+                p.lower().endswith(SENSITIVE_FILE_AUTO_ALLOW_EXTS)
+                for p in sensitive_paths
+            ):
+                logger.info(
+                    "Sensitive-file permission AUTO-ALLOWED (matched ext) "
+                    "(session=%s tool=%s path=%s)",
+                    session.session_id,
+                    tool_name,
+                    sensitive_paths[0],
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "allow",
+                    }
+                }
 
             primary_path = sensitive_paths[0]
             actual_call_id = (

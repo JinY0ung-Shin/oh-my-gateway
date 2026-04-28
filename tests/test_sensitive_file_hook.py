@@ -128,6 +128,104 @@ async def test_hook_passes_through_for_non_sensitive_path():
     assert not session.stream_break_event.is_set()
 
 
+async def test_hook_auto_allows_when_extension_in_whitelist(monkeypatch):
+    """Operator opts in via SENSITIVE_FILE_AUTO_ALLOW_EXTS=.md so a
+    .claude/MEMORY.md edit skips the prompt entirely."""
+    import src.backends.claude.client as client_mod
+
+    monkeypatch.setattr(client_mod, "SENSITIVE_FILE_AUTO_ALLOW_EXTS", (".md",))
+
+    hook, session = _make_hook()
+    result = await hook(
+        {
+            "tool_name": "Edit",
+            "tool_input": {
+                "file_path": "/tmp/workspaces/foo/.claude/MEMORY.md",
+                "old_string": "a",
+                "new_string": "b",
+            },
+            "tool_use_id": "tu_md",
+        },
+        "tu_md",
+        None,
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+    # No card was surfaced.
+    assert session.pending_tool_call is None
+    assert not session.stream_break_event.is_set()
+
+
+async def test_hook_does_not_auto_allow_when_one_path_outside_whitelist(monkeypatch):
+    """Mixed extensions with at least one non-whitelisted path still
+    falls through to the prompt — auto-allow is all-or-nothing per call."""
+    import src.backends.claude.client as client_mod
+
+    monkeypatch.setattr(client_mod, "SENSITIVE_FILE_AUTO_ALLOW_EXTS", (".md",))
+
+    hook, session = _make_hook()
+
+    async def respond_deny():
+        for _ in range(100):
+            if session.input_event is not None:
+                break
+            await asyncio.sleep(0.001)
+        session.input_response = "Deny"
+        session.input_event.set()
+
+    # NotebookEdit on a non-whitelisted sensitive path forces the prompt
+    # even though the file_path looks like .md.
+    result, _ = await asyncio.gather(
+        hook(
+            {
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": "/home/u/.env",
+                },
+                "tool_use_id": "tu_env",
+            },
+            "tu_env",
+            None,
+        ),
+        respond_deny(),
+    )
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+async def test_hook_default_strict_no_auto_allow_for_md(monkeypatch):
+    """With the env var unset (default), even .md edits still prompt —
+    the strictest behaviour, matching the historical default."""
+    import src.backends.claude.client as client_mod
+
+    monkeypatch.setattr(client_mod, "SENSITIVE_FILE_AUTO_ALLOW_EXTS", ())
+
+    hook, session = _make_hook()
+
+    async def respond_allow():
+        for _ in range(100):
+            if session.input_event is not None:
+                break
+            await asyncio.sleep(0.001)
+        session.input_response = "Allow"
+        session.input_event.set()
+
+    result, _ = await asyncio.gather(
+        hook(
+            {
+                "tool_name": "Edit",
+                "tool_input": {
+                    "file_path": "/tmp/workspaces/foo/.claude/MEMORY.md",
+                },
+                "tool_use_id": "tu_md_strict",
+            },
+            "tu_md_strict",
+            None,
+        ),
+        respond_allow(),
+    )
+    # Even though it's .md, no whitelist => prompt fired and we got Allow.
+    assert result["hookSpecificOutput"]["permissionDecision"] == "allow"
+
+
 async def test_hook_parks_session_for_sensitive_path_and_allows():
     hook, session = _make_hook()
 

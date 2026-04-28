@@ -124,6 +124,25 @@ METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
 # call and the SDK resumes.  Set via ASK_USER_TIMEOUT_SECONDS env var.
 ASK_USER_TIMEOUT_SECONDS = int(os.environ.get("ASK_USER_TIMEOUT_SECONDS", "300"))
 
+# Comma-separated list of file extensions that the sensitive-file PreToolUse
+# hook should auto-allow without prompting the user.  Opt-in via env: by
+# default the hook prompts for every sensitive-file edit, matching the
+# strictest possible behaviour.  Set in ``.env`` to relax for safe types,
+# e.g.::
+#
+#     SENSITIVE_FILE_AUTO_ALLOW_EXTS=.md
+#
+# Markdown files can't carry the kind of executable / credential payload
+# that motivates the prompt (``settings.json``, ``.env``, ssh keys, …),
+# and the most common case — repeated ``.claude/MEMORY.md`` updates the
+# user explicitly asked for — would otherwise surface a card on every
+# edit.  Extend with e.g. ``.md,.txt,.log`` for more types.
+SENSITIVE_FILE_AUTO_ALLOW_EXTS = tuple(
+    (ext.strip().lower() if ext.strip().startswith(".") else "." + ext.strip().lower())
+    for ext in os.environ.get("SENSITIVE_FILE_AUTO_ALLOW_EXTS", "").split(",")
+    if ext.strip()
+)
+
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")
