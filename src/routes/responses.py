@@ -460,6 +460,85 @@ async def _unblock_pending_tool_call(
         raise
 
 
+async def _prepare_opencode_question_continuation(
+    session, backend: "BackendClient", fc_output: Dict[str, str]
+) -> None:
+    """Validate and reserve an OpenCode pending question continuation."""
+    await session.lock.acquire()
+    try:
+        if session.pending_tool_call is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but no pending tool call in session",
+            )
+
+        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"call_id mismatch: pending tool call has "
+                    f"'{session.pending_tool_call['call_id']}', "
+                    f"but received '{fc_output['call_id']}'"
+                ),
+            )
+
+        resume = getattr(backend, "resume_question_with_client", None)
+        if not callable(resume):
+            raise HTTPException(
+                status_code=400,
+                detail="OpenCode question continuation is not supported by this backend",
+            )
+
+        if session.client is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no active SDK client",
+            )
+
+        session.pending_tool_call = None
+    except Exception:
+        session.lock.release()
+        raise
+
+
+def _store_opencode_pending_question(
+    resolved: ResolvedModel,
+    session,
+    chunk: Dict[str, Any],
+) -> None:
+    """Capture OpenCode question tool_use chunks as pending Responses actions."""
+    if resolved.backend != "opencode" or not isinstance(chunk, dict):
+        return
+    content = chunk.get("content")
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use" or block.get("name") != "question":
+            continue
+        input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
+        question = input_value.get("question")
+        call_id = block.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        if not isinstance(question, str) or not question:
+            continue
+        session.pending_tool_call = {
+            "call_id": call_id,
+            "name": "question",
+            "arguments": input_value,
+            "backend": "opencode",
+        }
+        return
+
+
+async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
+    async for chunk in chunk_source:
+        _store_opencode_pending_question(resolved, session, chunk)
+        yield chunk
+
+
 @router.post("/v1/responses")
 @rate_limit_endpoint("responses")
 async def create_response(
@@ -578,7 +657,12 @@ async def create_response(
                 chunks_buffer = []
 
                 _configure_client_streaming(session.client, True)
-                chunk_source = backend.run_completion_with_client(session.client, prompt, session)
+                backend_source = backend.run_completion_with_client(
+                    session.client, prompt, session
+                )
+                chunk_source = _capture_opencode_pending_questions(
+                    backend_source, resolved, session
+                )
 
                 # Bridge SDK iteration through a background task to keep
                 # anyio cancel scopes task-local.
@@ -713,7 +797,10 @@ async def create_response(
             chunks = []
             active_client = session.client
             _configure_client_streaming(active_client, False)
-            async for chunk in backend.run_completion_with_client(active_client, prompt, session):
+            backend_source = backend.run_completion_with_client(active_client, prompt, session)
+            async for chunk in _capture_opencode_pending_questions(
+                backend_source, resolved, session
+            ):
                 chunks.append(chunk)
 
             # Check for backend errors (run_completion wraps exceptions as error chunks)
@@ -829,7 +916,10 @@ async def _handle_function_call_output(
     # --- Validate + unblock under session lock, then keep the lock through
     # the continuation read so no concurrent request can mutate session state
     # between the tool output and SDK resume.
-    await _unblock_pending_tool_call(session, backend, fc_output)
+    if resolved.backend == "opencode":
+        await _prepare_opencode_question_continuation(session, backend, fc_output)
+    else:
+        await _unblock_pending_tool_call(session, backend, fc_output)
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1
@@ -847,11 +937,25 @@ async def _handle_function_call_output(
                 # After the hook returns deny+reason, the SDK continues
                 # processing from where it left off.  Use receive_response_from_client
                 # when available; do not start a new prompt.
-                receiver = getattr(backend, "receive_response_from_client", None)
-                if receiver is not None:
-                    chunk_source = receiver(active_client, session)
+                if resolved.backend == "opencode":
+                    resume = getattr(backend, "resume_question_with_client")
+                    backend_source = resume(
+                        active_client,
+                        fc_output["call_id"],
+                        fc_output["output"],
+                        session,
+                    )
                 else:
-                    chunk_source = backend.run_completion_with_client(active_client, "", session)
+                    receiver = getattr(backend, "receive_response_from_client", None)
+                    if receiver is not None:
+                        backend_source = receiver(active_client, session)
+                    else:
+                        backend_source = backend.run_completion_with_client(
+                            active_client, "", session
+                        )
+                chunk_source = _capture_opencode_pending_questions(
+                    backend_source, resolved, session
+                )
 
                 sse_source = streaming_utils.stream_response_chunks(
                     chunk_source=chunk_source,
@@ -930,13 +1034,22 @@ async def _handle_function_call_output(
         chunks = []
         # After the hook returns deny+reason, the SDK continues
         # processing from where it left off — no new query needed.
-        receiver = getattr(backend, "receive_response_from_client", None)
         _configure_client_streaming(active_client, False)
-        if receiver is not None:
-            chunk_source = receiver(active_client, session)
+        if resolved.backend == "opencode":
+            resume = getattr(backend, "resume_question_with_client")
+            backend_source = resume(
+                active_client,
+                fc_output["call_id"],
+                fc_output["output"],
+                session,
+            )
         else:
-            chunk_source = backend.run_completion_with_client(active_client, "", session)
-        async for chunk in chunk_source:
+            receiver = getattr(backend, "receive_response_from_client", None)
+            if receiver is not None:
+                backend_source = receiver(active_client, session)
+            else:
+                backend_source = backend.run_completion_with_client(active_client, "", session)
+        async for chunk in _capture_opencode_pending_questions(backend_source, resolved, session):
             chunks.append(chunk)
 
         # Check for another pending_tool_call

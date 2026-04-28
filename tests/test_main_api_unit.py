@@ -4,6 +4,8 @@ Integration-style unit tests for FastAPI endpoints in src.main.
 """
 
 import asyncio
+import json
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -327,6 +329,138 @@ def test_opencode_streaming_disconnects_client_on_error(isolated_session_manager
     assert response.status_code == 200
     assert "response.failed" in response.text
     assert created_client.disconnected is True
+
+
+def test_opencode_function_call_output_resumes_question(isolated_session_manager):
+    """OpenCode function_call_output resumes a pending question via the backend API."""
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "opencode"
+    session.turn_counter = 1
+    session.client = object()
+    session.pending_tool_call = {
+        "call_id": "q1",
+        "name": "question",
+        "arguments": {"question": "Continue?"},
+        "backend": "opencode",
+    }
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    async def resume_question_with_client(client, call_id, output, session):
+        assert call_id == "q1"
+        assert output == "yes"
+        yield {"type": "assistant", "content": [{"type": "text", "text": "continued"}]}
+        yield {"type": "result", "subtype": "success", "result": "continued"}
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.resume_question_with_client = resume_question_with_client
+    backend.parse_message.return_value = "continued"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "opencode/openai/gpt-5.5",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "input": [
+                    {"type": "function_call_output", "call_id": "q1", "output": "yes"}
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "completed"
+    assert response.json()["output"][0]["content"][0]["text"] == "continued"
+    assert session.pending_tool_call is None
+    assert session.turn_counter == 2
+
+
+def test_opencode_question_tool_use_returns_requires_action(isolated_session_manager):
+    """OpenCode question tool_use chunks become Responses requires_action output."""
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "q1",
+                    "name": "question",
+                    "input": {
+                        "question": "Continue?",
+                        "options": [{"label": "Yes"}, {"label": "No"}],
+                    },
+                }
+            ],
+        }
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = None
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "opencode/openai/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "requires_action"
+    assert data["output"][0]["call_id"] == "q1"
+    assert data["output"][0]["name"] == "question"
+    assert json.loads(data["output"][0]["arguments"]) == {
+        "question": "Continue?",
+        "options": [{"label": "Yes"}, {"label": "No"}],
+    }
+    session = next(iter(isolated_session_manager.sessions.values()))
+    assert session.pending_tool_call == {
+        "call_id": "q1",
+        "name": "question",
+        "arguments": {
+            "question": "Continue?",
+            "options": [{"label": "Yes"}, {"label": "No"}],
+        },
+        "backend": "opencode",
+    }
+    assert session.turn_counter == 1
 
 
 def test_list_mcp_servers_filters_safe_fields():

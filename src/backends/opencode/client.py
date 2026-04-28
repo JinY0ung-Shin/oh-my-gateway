@@ -466,6 +466,48 @@ class OpenCodeClient:
         yield assistant
         yield result
 
+    async def resume_question_with_client(
+        self,
+        client: OpenCodeSessionClient,
+        call_id: str,
+        output: str,
+        session: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Resume an OpenCode question tool call with the user's answer."""
+        _ = session
+        body: Dict[str, Any] = {
+            "agent": self._agent,
+            "parts": [
+                {
+                    "type": "tool",
+                    "callID": call_id,
+                    "tool": "question",
+                    "state": {"status": "completed", "output": output},
+                }
+            ],
+        }
+        model = self._split_provider_model(client.model)
+        if model:
+            body["model"] = model
+
+        try:
+            async with httpx.AsyncClient(**self._client_kwargs()) as http_client:
+                response = await http_client.post(
+                    f"/session/{client.session_id}/message",
+                    json=body,
+                    params=self._directory_params(client.cwd),
+                )
+                response.raise_for_status()
+                payload = response.json()
+        except Exception as exc:
+            logger.error("OpenCode question continuation failed: %s", exc, exc_info=True)
+            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+            return
+
+        text = self._extract_text(payload)
+        yield {"type": "assistant", "content": [{"type": "text", "text": text}]}
+        yield {"type": "result", "subtype": "success", "result": text}
+
     def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         for message in reversed(messages):
             if message.get("type") == "result" and message.get("result"):

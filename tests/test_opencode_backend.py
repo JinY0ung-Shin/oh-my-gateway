@@ -271,6 +271,58 @@ def test_opencode_event_converter_emits_error_tool_result():
     ]
 
 
+def test_opencode_event_converter_emits_question_tool_use():
+    """Question tool updates are exposed as Responses-compatible tool_use chunks."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "sessionID": "oc-session",
+                    "type": "tool",
+                    "tool": "question",
+                    "callID": "q1",
+                    "state": {
+                        "status": "running",
+                        "input": {
+                            "question": "Continue?",
+                            "options": [{"label": "Yes"}, {"label": "No"}],
+                        },
+                    },
+                }
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "q1",
+                    "name": "question",
+                    "input": {
+                        "question": "Continue?",
+                        "options": [{"label": "Yes"}, {"label": "No"}],
+                    },
+                }
+            ],
+        }
+    ]
+    assert converter.pending_question == {
+        "call_id": "q1",
+        "name": "question",
+        "arguments": {
+            "question": "Continue?",
+            "options": [{"label": "Yes"}, {"label": "No"}],
+        },
+    }
+
+
 def test_opencode_event_converter_accumulates_step_finish_usage():
     """OpenCode event converter accumulates usage from step-finish parts."""
     from src.backends.opencode.events import OpenCodeEventConverter
@@ -468,6 +520,84 @@ async def test_opencode_client_uses_configured_agent(monkeypatch):
 
     assert calls[1][1]["json"]["agent"] == "plan"
     assert chunks[-1]["result"] == "ok"
+
+
+async def test_opencode_client_resumes_question_with_tool_output(monkeypatch):
+    """OpenCode question continuation sends a completed question tool part."""
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "info": {"role": "assistant"},
+                "parts": [{"type": "text", "text": "continued"}],
+            }
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, path, **kwargs):
+            calls.append((path, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setenv("OPENCODE_AGENT", "plan")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+    chunks = [
+        chunk
+        async for chunk in backend.resume_question_with_client(
+            client,
+            "q1",
+            "yes",
+            Session(session_id="gw-session"),
+        )
+    ]
+
+    assert calls == [
+        (
+            "/session/oc-session/message",
+            {
+                "json": {
+                    "agent": "plan",
+                    "parts": [
+                        {
+                            "type": "tool",
+                            "callID": "q1",
+                            "tool": "question",
+                            "state": {"status": "completed", "output": "yes"},
+                        }
+                    ],
+                    "model": {"providerID": "openai", "modelID": "gpt-5.5"},
+                },
+                "params": {"directory": "/tmp/work"},
+            },
+        )
+    ]
+    assert chunks == [
+        {"type": "assistant", "content": [{"type": "text", "text": "continued"}]},
+        {"type": "result", "subtype": "success", "result": "continued"},
+    ]
 
 
 async def test_opencode_client_reports_empty_json_response(monkeypatch):
