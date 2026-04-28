@@ -201,6 +201,81 @@ def test_responses_dispatches_to_opencode_backend_without_mcp():
     assert calls["prompt"] == "hi"
 
 
+def test_responses_streaming_enables_opencode_event_streaming():
+    """Streaming OpenCode responses ask the OpenCode client to use /event."""
+    calls = {}
+
+    class FakeOpenCodeSessionClient:
+        stream_events = False
+
+    def resolve(model):
+        if model == "opencode/anthropic/claude-sonnet-4-5":
+            return ResolvedModel(model, "opencode", "anthropic/claude-sonnet-4-5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return FakeOpenCodeSessionClient()
+
+    def run_completion_with_client(client, prompt, session):
+        calls["stream_events_at_call"] = client.stream_events
+
+        async def empty_source():
+            if False:
+                yield None
+
+        return empty_source()
+
+    async def fake_stream_response_chunks(**kwargs):
+        kwargs["stream_result"]["success"] = True
+        kwargs["stream_result"]["assistant_text"] = "OpenCode streamed"
+        yield 'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "OpenCode streamed"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 2,
+        "completion_tokens": 4,
+        "total_tokens": 6,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="opencode",
+            owned_by="opencode",
+            models=["opencode/anthropic/claude-sonnet-4-5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(
+            responses_module.streaming_utils,
+            "stream_response_chunks",
+            new=fake_stream_response_chunks,
+        ),
+    ):
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={
+                "model": "opencode/anthropic/claude-sonnet-4-5",
+                "input": "hi",
+                "stream": True,
+            },
+        ) as response:
+            body = "".join(response.iter_text())
+
+    assert response.status_code == 200
+    assert "response.created" in body
+    assert calls["create_client"]["model"] == "anthropic/claude-sonnet-4-5"
+    assert calls["stream_events_at_call"] is True
+
+
 def test_list_mcp_servers_filters_safe_fields():
     mcp_return = {
         "stdio-server": {

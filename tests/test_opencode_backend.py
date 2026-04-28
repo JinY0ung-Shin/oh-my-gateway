@@ -260,3 +260,584 @@ async def test_opencode_client_reports_empty_json_response(monkeypatch):
             ),
         }
     ]
+
+
+async def test_opencode_client_streams_text_deltas_from_event_sse(monkeypatch):
+    """Streaming mode uses prompt_async and converts OpenCode text deltas."""
+    calls = []
+
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-1",
+                "partID": "part-1",
+                "field": "text",
+                "delta": "hel",
+            },
+        },
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-1",
+                "partID": "part-1",
+                "field": "text",
+                "delta": "lo",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield f"event: {event['type']}"
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            calls.append(("STREAM", method, path, kwargs))
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            calls.append(("POST", path, kwargs))
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert calls[1] == (
+        "STREAM",
+        "GET",
+        "/event",
+        {"params": None},
+    )
+    assert calls[2][0] == "POST"
+    assert calls[2][1] == "/session/oc-session/prompt_async"
+    assert [chunk["event"]["delta"]["text"] for chunk in chunks[:2]] == ["hel", "lo"]
+    assert chunks[-1] == {"type": "result", "subtype": "success", "result": "hello"}
+
+
+async def test_opencode_client_streams_tool_use_and_result_from_event_sse(monkeypatch):
+    """Streaming mode converts OpenCode tool updates to gateway tool chunks."""
+    events = [
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "running",
+                        "input": {"command": "pwd"},
+                        "title": "pwd",
+                    },
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "pwd"},
+                        "output": "/tmp/work\n",
+                        "title": "pwd",
+                        "metadata": {},
+                    },
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-text",
+                    "type": "text",
+                    "text": "done",
+                },
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert {
+        "type": "tool_use",
+        "id": "call-1",
+        "name": "bash",
+        "input": {"command": "pwd"},
+    } in [block for chunk in chunks for block in chunk.get("content", [])]
+    assert {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "content": "/tmp/work\n",
+        "is_error": False,
+    } in [block for chunk in chunks for block in chunk.get("content", [])]
+    assert chunks[-1]["result"] == "done"
+
+
+async def test_opencode_streaming_aggregates_step_finish_usage(monkeypatch):
+    """Streaming mode aggregates per-step OpenCode token usage."""
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "ok",
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-step-1",
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 11,
+                        "output": 5,
+                        "reasoning": 2,
+                        "cache": {"read": 3, "write": 7},
+                    },
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-step-2",
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 13,
+                        "output": 7,
+                        "reasoning": 1,
+                        "cache": {"read": 0, "write": 4},
+                    },
+                },
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks[-1]["usage"] == {
+        "input_tokens": 38,
+        "output_tokens": 12,
+    }
+
+
+async def test_opencode_streaming_ignores_initial_idle_until_activity(monkeypatch):
+    """An idle snapshot before any session activity must not end the stream."""
+    events = [
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "after-idle",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks[-1]["result"] == "after-idle"
+
+
+async def test_opencode_streaming_event_client_disables_read_timeout(monkeypatch):
+    """The /event stream client disables read timeout while keeping connect timeout."""
+    client_kwargs = []
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"session.idle","properties":{"sessionID":"oc-session"}}'
+            yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            client_kwargs.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    _ = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    event_timeout = client_kwargs[1]["timeout"]
+    assert event_timeout.connect == backend.timeout
+    assert event_timeout.read is None
+
+
+async def test_opencode_streaming_waits_for_non_empty_tool_input(monkeypatch):
+    """Do not emit tool_use on pending empty input when a later update has input."""
+    events = [
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {"status": "pending", "input": {}},
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {"status": "running", "input": {"command": "pwd"}},
+                },
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+    tool_uses = [
+        block
+        for chunk in chunks
+        for block in chunk.get("content", [])
+        if block.get("type") == "tool_use"
+    ]
+
+    assert tool_uses == [
+        {
+            "type": "tool_use",
+            "id": "call-1",
+            "name": "bash",
+            "input": {"command": "pwd"},
+        }
+    ]

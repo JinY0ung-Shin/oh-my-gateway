@@ -223,6 +223,12 @@ async def _disconnect_session_client(session, reason: str, client=None) -> None:
         logger.debug("SDK client disconnect failed after %s", reason, exc_info=True)
 
 
+def _configure_client_streaming(client: Any, enabled: bool) -> None:
+    """Enable backend-specific event streaming when a client supports it."""
+    if client is not None and hasattr(client, "stream_events"):
+        setattr(client, "stream_events", enabled)
+
+
 async def _responses_streaming_preflight(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
@@ -571,6 +577,7 @@ async def create_response(
             try:
                 chunks_buffer = []
 
+                _configure_client_streaming(session.client, True)
                 chunk_source = backend.run_completion_with_client(session.client, prompt, session)
 
                 # Bridge SDK iteration through a background task to keep
@@ -705,6 +712,7 @@ async def create_response(
             # Execute backend through the persistent client.
             chunks = []
             active_client = session.client
+            _configure_client_streaming(active_client, False)
             async for chunk in backend.run_completion_with_client(active_client, prompt, session):
                 chunks.append(chunk)
 
@@ -835,6 +843,7 @@ async def _handle_function_call_output(
             stream_result = {"success": False}
             try:
                 chunks_buffer = []
+                _configure_client_streaming(active_client, True)
                 # After the hook returns deny+reason, the SDK continues
                 # processing from where it left off.  Use receive_response_from_client
                 # when available; do not start a new prompt.
@@ -922,6 +931,7 @@ async def _handle_function_call_output(
         # After the hook returns deny+reason, the SDK continues
         # processing from where it left off — no new query needed.
         receiver = getattr(backend, "receive_response_from_client", None)
+        _configure_client_streaming(active_client, False)
         if receiver is not None:
             chunk_source = receiver(active_client, session)
         else:
