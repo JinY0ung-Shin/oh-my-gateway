@@ -519,15 +519,16 @@ def _store_opencode_pending_question(
             continue
         if block.get("type") != "tool_use" or block.get("name") != "question":
             continue
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        request_id = metadata.get("opencode_question_request_id")
+        if not isinstance(request_id, str) or not request_id:
+            continue
         input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
         arguments = _normalize_opencode_question_arguments(input_value)
         if arguments is None:
             continue
-        call_id = block.get("id")
-        if not isinstance(call_id, str) or not call_id:
-            continue
         session.pending_tool_call = {
-            "call_id": call_id,
+            "call_id": request_id,
             "name": ASK_USER_QUESTION_TOOL_NAME,
             "arguments": arguments,
             "backend": "opencode",
@@ -553,11 +554,20 @@ def _normalize_opencode_question_arguments(input_value: Dict[str, Any]) -> Optio
 
 async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
-        if _store_opencode_pending_question(resolved, session, chunk):
-            close = getattr(chunk_source, "aclose", None)
-            if callable(close):
-                await close()
-            return
+        if resolved.backend == "opencode" and isinstance(chunk, dict):
+            content = chunk.get("content")
+            if isinstance(content, list) and any(
+                isinstance(block, dict)
+                and block.get("type") == "tool_use"
+                and block.get("name") == "question"
+                for block in content
+            ):
+                if _store_opencode_pending_question(resolved, session, chunk):
+                    close = getattr(chunk_source, "aclose", None)
+                    if callable(close):
+                        await close()
+                    return
+                continue
         yield chunk
 
 

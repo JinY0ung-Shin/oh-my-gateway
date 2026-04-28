@@ -301,6 +301,30 @@ class OpenCodeClient:
             body["system"] = client.system_prompt
         return body
 
+    def _question_reply_body(self, output: str) -> Dict[str, Any]:
+        answers: list[list[str]]
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = output
+
+        if (
+            isinstance(parsed, list)
+            and all(isinstance(item, list) for item in parsed)
+            and all(isinstance(answer, str) for item in parsed for answer in item)
+        ):
+            answers = [[answer for answer in item] for item in parsed]
+        elif isinstance(parsed, list) and all(isinstance(item, str) for item in parsed):
+            answers = [[item for item in parsed]]
+        else:
+            answers = [[str(output)]]
+        return {"answers": answers}
+
+    def _describe_http_error(self, response: Any) -> str:
+        status = getattr(response, "status_code", "unknown")
+        body = (getattr(response, "text", "") or "")[:500].replace("\n", "\\n")
+        return f"OpenCode HTTP {status}: {body}"
+
     async def _iter_sse_events(self, response: Any) -> AsyncGenerator[Dict[str, Any], None]:
         event_type: Optional[str] = None
         data_lines: list[str] = []
@@ -474,36 +498,46 @@ class OpenCodeClient:
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Resume an OpenCode question tool call with the user's answer."""
         _ = session
-        body: Dict[str, Any] = {
-            "agent": self._agent,
-            "parts": [
-                {
-                    "type": "tool",
-                    "callID": call_id,
-                    "tool": "question",
-                    "state": {"status": "completed", "output": output},
-                }
-            ],
-        }
-        model = self._split_provider_model(client.model)
-        if model:
-            body["model"] = model
-
+        request_id = call_id
+        converter = OpenCodeEventConverter(session_id=client.session_id)
         try:
-            async with httpx.AsyncClient(**self._client_kwargs()) as http_client:
-                response = await http_client.post(
-                    f"/session/{client.session_id}/message",
-                    json=body,
+            async with httpx.AsyncClient(**self._event_client_kwargs()) as event_client:
+                async with event_client.stream(
+                    "GET",
+                    "/event",
                     params=self._directory_params(client.cwd),
-                )
-                response.raise_for_status()
-                payload = response.json()
+                ) as event_response:
+                    event_response.raise_for_status()
+                    async with httpx.AsyncClient(**self._client_kwargs()) as reply_client:
+                        response = await reply_client.post(
+                            f"/question/{request_id}/reply",
+                            json=self._question_reply_body(output),
+                            params=self._directory_params(client.cwd),
+                        )
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError:
+                            raise RuntimeError(self._describe_http_error(response)) from None
+
+                    async for event in self._iter_sse_events(event_response):
+                        error_message = converter.error_message(event)
+                        if error_message:
+                            yield {
+                                "type": "error",
+                                "is_error": True,
+                                "error_message": error_message,
+                            }
+                            return
+                        if converter.finished(event):
+                            break
+                        for chunk in converter.convert(event):
+                            yield chunk
         except Exception as exc:
             logger.error("OpenCode question continuation failed: %s", exc, exc_info=True)
             yield {"type": "error", "is_error": True, "error_message": str(exc)}
             return
 
-        text = self._extract_text(payload)
+        text = converter.final_text()
         yield {"type": "assistant", "content": [{"type": "text", "text": text}]}
         yield {"type": "result", "subtype": "success", "result": text}
 

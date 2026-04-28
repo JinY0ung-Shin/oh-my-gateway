@@ -23,6 +23,9 @@ class OpenCodeEventConverter:
         """Convert one OpenCode event and update accumulated stream state."""
         if self._event_session_id(event) != self.session_id:
             return []
+        question_chunk = self._convert_question_event(event)
+        if question_chunk:
+            return [question_chunk]
         self._record_message_role(event)
         if event.get("type") == "message.updated":
             return []
@@ -109,6 +112,33 @@ class OpenCodeEventConverter:
                 "type": "content_block_delta",
                 "delta": {"type": "text_delta", "text": delta},
             },
+        }
+
+    def _convert_question_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if event.get("type") != "question.asked":
+            return None
+        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        request_id = props.get("id")
+        questions = props.get("questions")
+        if not isinstance(request_id, str) or not request_id or not isinstance(questions, list):
+            return None
+        tool = props.get("tool") if isinstance(props.get("tool"), dict) else {}
+        metadata = {"opencode_question_request_id": request_id}
+        tool_call_id = tool.get("callID")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            metadata["opencode_tool_call_id"] = tool_call_id
+        self.saw_activity = True
+        return {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": request_id,
+                    "name": "question",
+                    "input": {"questions": questions},
+                    "metadata": metadata,
+                }
+            ],
         }
 
     def _convert_text_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -211,6 +241,7 @@ class OpenCodeEventConverter:
         if not call_id:
             return []
         status = tool_state.get("status")
+        tool_name = str(part.get("tool") or "unknown")
         chunks: List[Dict[str, Any]] = []
 
         input_value = tool_state.get("input")
@@ -219,8 +250,16 @@ class OpenCodeEventConverter:
             status in ("running", "completed", "error")
             or (status == "pending" and has_input)
         )
+        if tool_name == "question":
+            if should_emit_use:
+                self.emitted_tool_uses.add(call_id)
+                self.saw_activity = True
+            if status in ("completed", "error"):
+                self.emitted_tool_results.add(call_id)
+                self.saw_activity = True
+            return []
+
         if should_emit_use and call_id not in self.emitted_tool_uses:
-            tool_name = str(part.get("tool") or "unknown")
             chunks.append(
                 {
                     "type": "assistant",

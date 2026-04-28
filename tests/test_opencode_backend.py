@@ -402,8 +402,56 @@ def test_opencode_event_converter_emits_error_tool_result():
     ]
 
 
-def test_opencode_event_converter_emits_question_tool_use():
-    """Question tool updates are exposed as Responses-compatible tool_use chunks."""
+def test_opencode_event_converter_emits_question_request_tool_use():
+    """Question requests are exposed as Responses-compatible tool_use chunks."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    chunks = converter.convert(
+        {
+            "type": "question.asked",
+            "properties": {
+                "id": "que_1",
+                "sessionID": "oc-session",
+                "questions": [
+                    {
+                        "question": "Continue?",
+                        "options": [{"label": "Yes"}, {"label": "No"}],
+                    },
+                ],
+                "tool": {"messageID": "msg_1", "callID": "call_1"},
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "que_1",
+                    "name": "question",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "Continue?",
+                                "options": [{"label": "Yes"}, {"label": "No"}],
+                            }
+                        ],
+                    },
+                    "metadata": {
+                        "opencode_question_request_id": "que_1",
+                        "opencode_tool_call_id": "call_1",
+                    },
+                }
+            ],
+        }
+    ]
+
+
+def test_opencode_event_converter_suppresses_question_tool_part_updates():
+    """Question tool part updates should not be exposed before question.asked."""
     from src.backends.opencode.events import OpenCodeEventConverter
 
     converter = OpenCodeEventConverter(session_id="oc-session")
@@ -415,12 +463,16 @@ def test_opencode_event_converter_emits_question_tool_use():
                     "sessionID": "oc-session",
                     "type": "tool",
                     "tool": "question",
-                    "callID": "q1",
+                    "callID": "call_1",
                     "state": {
                         "status": "running",
                         "input": {
-                            "question": "Continue?",
-                            "options": [{"label": "Yes"}, {"label": "No"}],
+                            "questions": [
+                                {
+                                    "question": "Continue?",
+                                    "options": [{"label": "Yes"}, {"label": "No"}],
+                                }
+                            ]
                         },
                     },
                 }
@@ -428,22 +480,8 @@ def test_opencode_event_converter_emits_question_tool_use():
         }
     )
 
-    assert chunks == [
-        {
-            "type": "assistant",
-            "content": [
-                {
-                    "type": "tool_use",
-                    "id": "q1",
-                    "name": "question",
-                    "input": {
-                        "question": "Continue?",
-                        "options": [{"label": "Yes"}, {"label": "No"}],
-                    },
-                }
-            ],
-        }
-    ]
+    assert chunks == []
+    assert converter.saw_activity is True
 
 
 def test_opencode_event_converter_accumulates_step_finish_usage():
@@ -645,19 +683,49 @@ async def test_opencode_client_uses_configured_agent(monkeypatch):
     assert chunks[-1]["result"] == "ok"
 
 
-async def test_opencode_client_resumes_question_with_tool_output(monkeypatch):
-    """OpenCode question continuation sends a completed question tool part."""
+async def test_opencode_client_resumes_question_with_reply_endpoint(monkeypatch):
+    """OpenCode question continuation replies to the pending question request."""
     calls = []
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-2",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "continued",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
 
     class FakeResponse:
+        def __init__(self, payload=True):
+            self._payload = payload
+
         def raise_for_status(self):
             return None
 
         def json(self):
-            return {
-                "info": {"role": "assistant"},
-                "parts": [{"type": "text", "text": "continued"}],
-            }
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield f"event: {event['type']}"
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
 
     class FakeAsyncClient:
         def __init__(self, **kwargs):
@@ -669,8 +737,12 @@ async def test_opencode_client_resumes_question_with_tool_output(monkeypatch):
         async def __aexit__(self, *args):
             return None
 
+        def stream(self, method, path, **kwargs):
+            calls.append(("STREAM", method, path, kwargs))
+            return FakeStreamContext()
+
         async def post(self, path, **kwargs):
-            calls.append((path, kwargs))
+            calls.append(("POST", path, kwargs))
             return FakeResponse()
 
     monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
@@ -691,7 +763,7 @@ async def test_opencode_client_resumes_question_with_tool_output(monkeypatch):
         chunk
         async for chunk in backend.resume_question_with_client(
             client,
-            "q1",
+            "que_1",
             "yes",
             Session(session_id="gw-session"),
         )
@@ -699,25 +771,30 @@ async def test_opencode_client_resumes_question_with_tool_output(monkeypatch):
 
     assert calls == [
         (
-            "/session/oc-session/message",
+            "STREAM",
+            "GET",
+            "/event",
+            {"params": {"directory": "/tmp/work"}},
+        ),
+        (
+            "POST",
+            "/question/que_1/reply",
             {
                 "json": {
-                    "agent": "plan",
-                    "parts": [
-                        {
-                            "type": "tool",
-                            "callID": "q1",
-                            "tool": "question",
-                            "state": {"status": "completed", "output": "yes"},
-                        }
-                    ],
-                    "model": {"providerID": "openai", "modelID": "gpt-5.5"},
+                    "answers": [["yes"]],
                 },
                 "params": {"directory": "/tmp/work"},
             },
         )
     ]
     assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "continued"},
+            },
+        },
         {"type": "assistant", "content": [{"type": "text", "text": "continued"}]},
         {"type": "result", "subtype": "success", "result": "continued"},
     ]

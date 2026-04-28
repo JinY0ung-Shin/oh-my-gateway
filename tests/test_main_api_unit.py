@@ -477,8 +477,9 @@ def test_opencode_question_tool_use_returns_requires_action(isolated_session_man
             "content": [
                 {
                     "type": "tool_use",
-                    "id": "q1",
+                    "id": "que_1",
                     "name": "question",
+                    "metadata": {"opencode_question_request_id": "que_1"},
                     "input": {
                         "question": "Continue?",
                         "options": [{"label": "Yes"}, {"label": "No"}],
@@ -513,7 +514,7 @@ def test_opencode_question_tool_use_returns_requires_action(isolated_session_man
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "requires_action"
-    assert data["output"][0]["call_id"] == "q1"
+    assert data["output"][0]["call_id"] == "que_1"
     assert data["output"][0]["name"] == "AskUserQuestion"
     assert json.loads(data["output"][0]["arguments"]) == {
         "question": "Continue?",
@@ -521,7 +522,7 @@ def test_opencode_question_tool_use_returns_requires_action(isolated_session_man
     }
     session = next(iter(isolated_session_manager.sessions.values()))
     assert session.pending_tool_call == {
-        "call_id": "q1",
+        "call_id": "que_1",
         "name": "AskUserQuestion",
         "arguments": {
             "question": "Continue?",
@@ -551,8 +552,9 @@ def test_opencode_questions_array_tool_use_returns_ask_user_question(
             "content": [
                 {
                     "type": "tool_use",
-                    "id": "q1",
+                    "id": "que_1",
                     "name": "question",
+                    "metadata": {"opencode_question_request_id": "que_1"},
                     "input": {
                         "questions": [
                             {
@@ -602,7 +604,7 @@ def test_opencode_questions_array_tool_use_returns_ask_user_question(
     assert response.status_code == 200
     data = response.json()
     assert data["status"] == "requires_action"
-    assert data["output"][0]["call_id"] == "q1"
+    assert data["output"][0]["call_id"] == "que_1"
     assert data["output"][0]["name"] == "AskUserQuestion"
     arguments = json.loads(data["output"][0]["arguments"])
     assert arguments["questions"][0]["header"] == "도구 테스트"
@@ -610,7 +612,7 @@ def test_opencode_questions_array_tool_use_returns_ask_user_question(
 
     session = next(iter(isolated_session_manager.sessions.values()))
     assert session.pending_tool_call == {
-        "call_id": "q1",
+        "call_id": "que_1",
         "name": "AskUserQuestion",
         "arguments": arguments,
         "backend": "opencode",
@@ -637,8 +639,9 @@ def test_opencode_streaming_question_tool_use_emits_ask_user_question(
             "content": [
                 {
                     "type": "tool_use",
-                    "id": "q1",
+                    "id": "que_1",
                     "name": "question",
+                    "metadata": {"opencode_question_request_id": "que_1"},
                     "input": {
                         "questions": [
                             {
@@ -703,8 +706,9 @@ async def test_opencode_question_capture_stops_waiting_for_stream_end():
                 "content": [
                     {
                         "type": "tool_use",
-                        "id": "q1",
+                        "id": "que_1",
                         "name": "question",
+                        "metadata": {"opencode_question_request_id": "que_1"},
                         "input": {"question": "Continue?"},
                     }
                 ],
@@ -725,7 +729,7 @@ async def test_opencode_question_capture_stops_waiting_for_stream_end():
         await captured.aclose()
 
     assert session.pending_tool_call == {
-        "call_id": "q1",
+        "call_id": "que_1",
         "name": "AskUserQuestion",
         "arguments": {"question": "Continue?"},
         "backend": "opencode",
