@@ -16,7 +16,6 @@ class OpenCodeEventConverter:
     emitted_tool_uses: set[str] = field(default_factory=set)
     emitted_tool_results: set[str] = field(default_factory=set)
     usage: Optional[Dict[str, int]] = None
-    pending_question: Optional[Dict[str, Any]] = None
     saw_activity: bool = False
 
     def convert(self, event: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -179,17 +178,6 @@ class OpenCodeEventConverter:
         )
         if should_emit_use and call_id not in self.emitted_tool_uses:
             tool_name = str(part.get("tool") or "unknown")
-            if (
-                tool_name == "question"
-                and isinstance(input_value, dict)
-                and isinstance(input_value.get("question"), str)
-                and input_value["question"]
-            ):
-                self.pending_question = {
-                    "call_id": call_id,
-                    "name": "question",
-                    "arguments": input_value,
-                }
             chunks.append(
                 {
                     "type": "assistant",

@@ -391,6 +391,75 @@ def test_opencode_function_call_output_resumes_question(isolated_session_manager
     assert session.turn_counter == 2
 
 
+def test_opencode_streaming_function_call_output_resumes_question(isolated_session_manager):
+    """Streaming OpenCode function_call_output uses the backend question resume API."""
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "opencode"
+    session.turn_counter = 1
+    session.client = object()
+    session.pending_tool_call = {
+        "call_id": "q1",
+        "name": "question",
+        "arguments": {"question": "Continue?"},
+        "backend": "opencode",
+    }
+    calls = {}
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    async def resume_question_with_client(client, call_id, output, session):
+        calls["resume"] = {"client": client, "call_id": call_id, "output": output}
+        yield {"type": "assistant", "content": [{"type": "text", "text": "continued"}]}
+        yield {"type": "result", "subtype": "success", "result": "continued"}
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.verify = AsyncMock(return_value=True)
+    backend.resume_question_with_client = resume_question_with_client
+    backend.parse_message.return_value = "continued"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "opencode/openai/gpt-5.5",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "input": [
+                    {"type": "function_call_output", "call_id": "q1", "output": "yes"}
+                ],
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert calls["resume"] == {
+        "client": session.client,
+        "call_id": "q1",
+        "output": "yes",
+    }
+    assert "response.output_text.delta" in response.text
+    assert "continued" in response.text
+    assert "response.completed" in response.text
+    assert "response.failed" not in response.text
+    assert session.pending_tool_call is None
+    assert session.turn_counter == 2
+
+
 def test_opencode_question_tool_use_returns_requires_action(isolated_session_manager):
     """OpenCode question tool_use chunks become Responses requires_action output."""
 

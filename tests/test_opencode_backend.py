@@ -313,14 +313,6 @@ def test_opencode_event_converter_emits_question_tool_use():
             ],
         }
     ]
-    assert converter.pending_question == {
-        "call_id": "q1",
-        "name": "question",
-        "arguments": {
-            "question": "Continue?",
-            "options": [{"label": "Yes"}, {"label": "No"}],
-        },
-    }
 
 
 def test_opencode_event_converter_accumulates_step_finish_usage():

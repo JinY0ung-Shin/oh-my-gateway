@@ -938,8 +938,7 @@ async def _handle_function_call_output(
                 # processing from where it left off.  Use receive_response_from_client
                 # when available; do not start a new prompt.
                 if resolved.backend == "opencode":
-                    resume = getattr(backend, "resume_question_with_client")
-                    backend_source = resume(
+                    backend_source = backend.resume_question_with_client(
                         active_client,
                         fc_output["call_id"],
                         fc_output["output"],
@@ -1036,8 +1035,7 @@ async def _handle_function_call_output(
         # processing from where it left off — no new query needed.
         _configure_client_streaming(active_client, False)
         if resolved.backend == "opencode":
-            resume = getattr(backend, "resume_question_with_client")
-            backend_source = resume(
+            backend_source = backend.resume_question_with_client(
                 active_client,
                 fc_output["call_id"],
                 fc_output["output"],
