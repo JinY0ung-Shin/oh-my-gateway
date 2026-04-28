@@ -99,6 +99,8 @@ export OPENCODE_BASE_URL=http://127.0.0.1:4096
 
 Managed server mode starts `opencode serve` automatically when `OPENCODE_BASE_URL` is unset. Managed mode requires the `opencode` binary on `PATH`.
 
+Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, and server authentication variables are documented in `.env.example`.
+
 ### Bash Sandbox
 
 The gateway can enable OS-level process isolation for Bash tool execution using the Claude Agent SDK's `SandboxSettings`. This uses macOS Seatbelt or Linux bubblewrap to restrict what Bash commands can access.

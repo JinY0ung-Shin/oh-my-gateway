@@ -85,7 +85,7 @@ class OpenCodeClient:
 
     def runtime_metadata(self) -> Dict[str, Any]:
         """Return operational details for admin diagnostics."""
-        mode = "external" if os.getenv("OPENCODE_BASE_URL") else "managed"
+        mode = "managed" if self._process is not None else "external"
         return {
             "mode": mode,
             "base_url": self.base_url,

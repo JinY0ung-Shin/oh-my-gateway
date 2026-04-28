@@ -26,6 +26,23 @@ def test_opencode_client_exposes_runtime_metadata(monkeypatch):
     }
 
 
+def test_opencode_runtime_metadata_treats_explicit_base_url_as_external(monkeypatch):
+    """Direct base_url construction is external mode even without OPENCODE_BASE_URL."""
+    monkeypatch.delenv("OPENCODE_BASE_URL", raising=False)
+    monkeypatch.setenv("OPENCODE_MODELS", "openai/gpt-5.5")
+
+    import src.backends.opencode.client as client_module
+    import src.backends.opencode.constants as constants_module
+
+    importlib.reload(constants_module)
+    client_module = importlib.reload(client_module)
+
+    client = client_module.OpenCodeClient(base_url="http://127.0.0.1:4096")
+
+    assert client.runtime_metadata()["mode"] == "external"
+    assert client.runtime_metadata()["managed_process"] is False
+
+
 def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
     """OpenCode descriptor resolves opencode/<provider>/<model> IDs."""
     monkeypatch.setenv("OPENCODE_MODELS", "anthropic/claude-sonnet-4-5")
