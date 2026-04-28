@@ -514,7 +514,7 @@ def test_opencode_question_tool_use_returns_requires_action(isolated_session_man
     data = response.json()
     assert data["status"] == "requires_action"
     assert data["output"][0]["call_id"] == "q1"
-    assert data["output"][0]["name"] == "question"
+    assert data["output"][0]["name"] == "AskUserQuestion"
     assert json.loads(data["output"][0]["arguments"]) == {
         "question": "Continue?",
         "options": [{"label": "Yes"}, {"label": "No"}],
@@ -522,7 +522,7 @@ def test_opencode_question_tool_use_returns_requires_action(isolated_session_man
     session = next(iter(isolated_session_manager.sessions.values()))
     assert session.pending_tool_call == {
         "call_id": "q1",
-        "name": "question",
+        "name": "AskUserQuestion",
         "arguments": {
             "question": "Continue?",
             "options": [{"label": "Yes"}, {"label": "No"}],
@@ -530,6 +530,158 @@ def test_opencode_question_tool_use_returns_requires_action(isolated_session_man
         "backend": "opencode",
     }
     assert session.turn_counter == 1
+
+
+def test_opencode_questions_array_tool_use_returns_ask_user_question(
+    isolated_session_manager,
+):
+    """OpenCode question tool input is normalized to the AskUserQuestion interface."""
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "q1",
+                    "name": "question",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "question 도구 테스트입니다. 어떤 방식으로 진행할까요?",
+                                "header": "도구 테스트",
+                                "options": [
+                                    {
+                                        "label": "간단 응답",
+                                        "description": "선택 결과만 확인합니다.",
+                                    },
+                                    {
+                                        "label": "짧은 설명",
+                                        "description": "question 도구 사용 결과를 설명합니다.",
+                                    },
+                                ],
+                                "multiple": False,
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = None
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "opencode/openai/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "requires_action"
+    assert data["output"][0]["call_id"] == "q1"
+    assert data["output"][0]["name"] == "AskUserQuestion"
+    arguments = json.loads(data["output"][0]["arguments"])
+    assert arguments["questions"][0]["header"] == "도구 테스트"
+    assert arguments["questions"][0]["options"][0]["label"] == "간단 응답"
+
+    session = next(iter(isolated_session_manager.sessions.values()))
+    assert session.pending_tool_call == {
+        "call_id": "q1",
+        "name": "AskUserQuestion",
+        "arguments": arguments,
+        "backend": "opencode",
+    }
+    assert session.turn_counter == 1
+
+
+def test_opencode_streaming_question_tool_use_emits_ask_user_question(
+    isolated_session_manager,
+):
+    """Streaming OpenCode question tool calls use the AskUserQuestion wire name."""
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "q1",
+                    "name": "question",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "Continue?",
+                                "options": [{"label": "Yes"}, {"label": "No"}],
+                            }
+                        ]
+                    },
+                }
+            ],
+        }
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = None
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "opencode/openai/gpt-5.5",
+                "input": "hi",
+                "stream": True,
+            },
+        )
+
+    assert response.status_code == 200
+    assert '"status": "requires_action"' in response.text
+    assert '"name": "AskUserQuestion"' in response.text
+    assert '"name": "question"' not in response.text
 
 
 def test_list_mcp_servers_filters_safe_fields():

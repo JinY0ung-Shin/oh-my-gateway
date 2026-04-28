@@ -48,6 +48,8 @@ from src.routes.deps import (
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+
 
 def _generate_msg_id() -> str:
     """Generate an output item ID: msg_<hex>."""
@@ -505,37 +507,54 @@ def _store_opencode_pending_question(
     resolved: ResolvedModel,
     session,
     chunk: Dict[str, Any],
-) -> None:
+) -> bool:
     """Capture OpenCode question tool_use chunks as pending Responses actions."""
     if resolved.backend != "opencode" or not isinstance(chunk, dict):
-        return
+        return False
     content = chunk.get("content")
     if not isinstance(content, list):
-        return
+        return False
     for block in content:
         if not isinstance(block, dict):
             continue
         if block.get("type") != "tool_use" or block.get("name") != "question":
             continue
         input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
-        question = input_value.get("question")
+        arguments = _normalize_opencode_question_arguments(input_value)
+        if arguments is None:
+            continue
         call_id = block.get("id")
         if not isinstance(call_id, str) or not call_id:
             continue
-        if not isinstance(question, str) or not question:
-            continue
         session.pending_tool_call = {
             "call_id": call_id,
-            "name": "question",
-            "arguments": input_value,
+            "name": ASK_USER_QUESTION_TOOL_NAME,
+            "arguments": arguments,
             "backend": "opencode",
         }
-        return
+        return True
+    return False
+
+
+def _normalize_opencode_question_arguments(input_value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return OpenCode question input in the public AskUserQuestion argument shape."""
+    question = input_value.get("question")
+    if isinstance(question, str) and question:
+        return input_value
+
+    questions = input_value.get("questions")
+    if not isinstance(questions, list):
+        return None
+    for item in questions:
+        if isinstance(item, dict) and isinstance(item.get("question"), str) and item["question"]:
+            return input_value
+    return None
 
 
 async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
-        _store_opencode_pending_question(resolved, session, chunk)
+        if _store_opencode_pending_question(resolved, session, chunk):
+            continue
         yield chunk
 
 
