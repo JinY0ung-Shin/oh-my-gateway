@@ -4,6 +4,28 @@ import importlib
 import json
 
 
+def test_opencode_client_exposes_runtime_metadata(monkeypatch):
+    """OpenCode client reports operational metadata for diagnostics."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setenv("OPENCODE_MODELS", "openai/gpt-5.5")
+
+    import src.backends.opencode.client as client_module
+    import src.backends.opencode.constants as constants_module
+
+    importlib.reload(constants_module)
+    client_module = importlib.reload(client_module)
+
+    client = client_module.OpenCodeClient()
+
+    assert client.runtime_metadata() == {
+        "mode": "external",
+        "base_url": "http://127.0.0.1:4096",
+        "agent": "general",
+        "models": ["opencode/openai/gpt-5.5"],
+        "managed_process": False,
+    }
+
+
 def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
     """OpenCode descriptor resolves opencode/<provider>/<model> IDs."""
     monkeypatch.setenv("OPENCODE_MODELS", "anthropic/claude-sonnet-4-5")

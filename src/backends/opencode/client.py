@@ -83,6 +83,17 @@ class OpenCodeClient:
     def get_auth_provider(self):
         return OpenCodeAuthProvider()
 
+    def runtime_metadata(self) -> Dict[str, Any]:
+        """Return operational details for admin diagnostics."""
+        mode = "external" if os.getenv("OPENCODE_BASE_URL") else "managed"
+        return {
+            "mode": mode,
+            "base_url": self.base_url,
+            "agent": self._agent,
+            "models": self.supported_models(),
+            "managed_process": self._process is not None,
+        }
+
     def _auth(self) -> Optional[httpx.BasicAuth]:
         if not self._server_password:
             return None

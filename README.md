@@ -72,11 +72,32 @@ Key environment variables (see `.env.example` for full list):
 | `TOKEN_STREAMING` | `true` | Token-level partial streaming |
 | `MAX_TIMEOUT` | `600000` | Request timeout (ms) |
 | `DEFAULT_MAX_TURNS` | `10` | Max agent turns per request |
+| `BACKENDS` | `claude` | Backend allowlist, for example `claude,opencode` |
+| `OPENCODE_MODELS` | _(unset)_ | Comma-separated OpenCode `provider/model` IDs exposed as `opencode/...` |
+| `OPENCODE_BASE_URL` | _(unset)_ | External OpenCode server URL; unset starts managed mode |
 | `DISALLOWED_SUBAGENT_TYPES` | `statusline-setup` | Comma-separated subagent types to block |
 | `CLAUDE_SANDBOX_ENABLED` | unset | Bash sandbox: unset = project settings, `true` = force on, `false` = force off |
 | `MCP_CONFIG` | — | MCP server config (JSON string or file path) |
 | `API_KEY` | — | Optional Bearer token for access control |
 | `SESSION_MAX_AGE_MINUTES` | `60` | Session TTL |
+
+### OpenCode Backend
+
+OpenCode is opt-in. Claude remains the default backend when `BACKENDS` is unset.
+
+```bash
+export BACKENDS=claude,opencode
+export OPENCODE_MODELS=openai/gpt-5.5
+```
+
+External server mode:
+
+```bash
+opencode serve --hostname 127.0.0.1 --port 4096
+export OPENCODE_BASE_URL=http://127.0.0.1:4096
+```
+
+Managed server mode starts `opencode serve` automatically when `OPENCODE_BASE_URL` is unset. Managed mode requires the `opencode` binary on `PATH`.
 
 ### Bash Sandbox
 
@@ -124,6 +145,16 @@ curl -N http://localhost:8000/v1/responses \
 curl http://localhost:8000/v1/responses \
   -H "Content-Type: application/json" \
   -d '{"model": "sonnet", "input": "What did I just say?", "previous_response_id": "<response_id_from_previous_turn>"}'
+```
+
+### OpenCode Smoke Test
+
+Live OpenCode smoke test:
+
+```bash
+OPENCODE_SMOKE_BASE_URL=http://127.0.0.1:4096 \
+OPENCODE_SMOKE_MODEL=openai/gpt-5.5 \
+uv run pytest tests/integration/test_opencode_smoke.py -q
 ```
 
 ### Per-User Workspace Isolation
