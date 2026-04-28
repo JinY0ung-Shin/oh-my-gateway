@@ -975,6 +975,7 @@ async def _handle_function_call_output(
                         "previous_response_id": body.previous_response_id,
                         "turn": next_turn,
                         "continuation": True,
+                        "function_call_output_call_id": fc_output["call_id"],
                     },
                 )
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
