@@ -151,6 +151,107 @@ def test_opencode_event_converter_ignores_other_sessions():
     assert converter.final_text() == ""
 
 
+def test_opencode_event_converter_ignores_user_text_parts():
+    """OpenCode event converter only emits text from assistant messages."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    user_message = {
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "info": {
+                "id": "msg-user",
+                "role": "user",
+                "sessionID": "oc-session",
+            },
+        },
+    }
+    user_part = {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "part": {
+                "id": "part-user",
+                "messageID": "msg-user",
+                "sessionID": "oc-session",
+                "type": "text",
+                "text": "Say exactly ok",
+            },
+        },
+    }
+    assistant_message = {
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "info": {
+                "id": "msg-assistant",
+                "role": "assistant",
+                "sessionID": "oc-session",
+            },
+        },
+    }
+    assistant_start = {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "part": {
+                "id": "part-assistant",
+                "messageID": "msg-assistant",
+                "sessionID": "oc-session",
+                "type": "text",
+                "text": "",
+            },
+        },
+    }
+    assistant_delta = {
+        "type": "message.part.delta",
+        "properties": {
+            "sessionID": "oc-session",
+            "messageID": "msg-assistant",
+            "partID": "part-assistant",
+            "field": "text",
+            "delta": "ok",
+        },
+    }
+    assistant_done = {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "part": {
+                "id": "part-assistant",
+                "messageID": "msg-assistant",
+                "sessionID": "oc-session",
+                "type": "text",
+                "text": "ok",
+            },
+        },
+    }
+
+    chunks = []
+    for event in [
+        user_message,
+        user_part,
+        assistant_message,
+        assistant_start,
+        assistant_delta,
+        assistant_done,
+    ]:
+        chunks.extend(converter.convert(event))
+
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "ok"},
+            },
+        }
+    ]
+    assert converter.final_text() == "ok"
+
+
 def test_opencode_event_converter_emits_tool_use_and_result_once():
     """OpenCode event converter emits a tool_use and a completed tool_result."""
     from src.backends.opencode.events import OpenCodeEventConverter
