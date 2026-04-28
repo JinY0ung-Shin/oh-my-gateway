@@ -52,6 +52,25 @@ class TestAdminPage:
         assert "Failed to load full message" in r.text
 
 
+class TestAdminChatPage:
+    def test_get_admin_chat_page(self, admin_client):
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "text/html" in r.headers["content-type"]
+        assert "GATEWAY CHAT" in r.text
+
+    def test_admin_chat_page_supports_multi_select_ask_questions(self, admin_client):
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "data-multiple" in r.text
+        assert "ask-option-marker" in r.text
+        assert "aria-pressed" in r.text
+        assert "questions = [argsObj]" in r.text
+        assert "JSON.stringify(answersByQuestion)" in r.text
+
+
 class TestAdminAuth:
     def test_logout(self, admin_client):
         r = admin_client.post("/admin/api/logout")
