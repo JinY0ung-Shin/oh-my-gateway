@@ -99,6 +99,58 @@ def test_auth_manager_returns_opencode_provider():
     assert provider.name == "opencode"
 
 
+def test_opencode_event_converter_emits_text_delta_and_final_text():
+    """OpenCode event converter emits gateway text deltas and accumulates final text."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "p1",
+                "field": "text",
+                "delta": "hello",
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "hello"},
+            },
+        }
+    ]
+    assert converter.final_text() == "hello"
+
+
+def test_opencode_event_converter_ignores_other_sessions():
+    """OpenCode event converter ignores events for unrelated sessions."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "other-session",
+                "partID": "p1",
+                "field": "text",
+                "delta": "wrong",
+            },
+        }
+    )
+
+    assert chunks == []
+    assert converter.final_text() == ""
+
+
 async def test_opencode_client_sends_prompt_to_existing_server(monkeypatch):
     """OpenCode client creates a session and sends prompt bodies over HTTP."""
     calls = []

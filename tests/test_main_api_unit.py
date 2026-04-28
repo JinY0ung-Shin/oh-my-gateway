@@ -276,6 +276,59 @@ def test_responses_streaming_enables_opencode_event_streaming():
     assert calls["stream_events_at_call"] is True
 
 
+def test_opencode_streaming_disconnects_client_on_error(isolated_session_manager):
+    """Streaming OpenCode failures disconnect the persistent session client."""
+
+    class FakeOpenCodeSessionClient:
+        stream_events = False
+
+        def __init__(self):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+    created_client = FakeOpenCodeSessionClient()
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return created_client
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {"type": "error", "is_error": True, "error_message": "stream failed"}
+
+    backend = MagicMock()
+    backend.name = "opencode"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = None
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", backend)
+
+    with client_context() as (client, _):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "opencode/openai/gpt-5.5", "input": "hi", "stream": True},
+        )
+
+    assert response.status_code == 200
+    assert "response.failed" in response.text
+    assert created_client.disconnected is True
+
+
 def test_list_mcp_servers_filters_safe_fields():
     mcp_return = {
         "stdio-server": {
