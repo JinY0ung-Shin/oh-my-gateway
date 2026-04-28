@@ -554,7 +554,10 @@ def _normalize_opencode_question_arguments(input_value: Dict[str, Any]) -> Optio
 async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
         if _store_opencode_pending_question(resolved, session, chunk):
-            continue
+            close = getattr(chunk_source, "aclose", None)
+            if callable(close):
+                await close()
+            return
         yield chunk
 
 

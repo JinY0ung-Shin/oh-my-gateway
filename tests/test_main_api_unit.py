@@ -684,6 +684,55 @@ def test_opencode_streaming_question_tool_use_emits_ask_user_question(
     assert '"name": "question"' not in response.text
 
 
+async def test_opencode_question_capture_stops_waiting_for_stream_end():
+    """OpenCode question pauses should not wait for the backend event stream to idle."""
+    resolved = ResolvedModel(
+        "opencode/openai/gpt-5.5",
+        "opencode",
+        "openai/gpt-5.5",
+    )
+    session = MagicMock()
+    session.pending_tool_call = None
+    source_closed = False
+
+    async def chunk_source():
+        nonlocal source_closed
+        try:
+            yield {
+                "type": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "q1",
+                        "name": "question",
+                        "input": {"question": "Continue?"},
+                    }
+                ],
+            }
+            await asyncio.Event().wait()
+        finally:
+            source_closed = True
+
+    captured = responses_module._capture_opencode_pending_questions(
+        chunk_source(), resolved, session
+    )
+
+    try:
+        await asyncio.wait_for(captured.__anext__(), timeout=0.05)
+    except StopAsyncIteration:
+        pass
+    finally:
+        await captured.aclose()
+
+    assert session.pending_tool_call == {
+        "call_id": "q1",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Continue?"},
+        "backend": "opencode",
+    }
+    assert source_closed is True
+
+
 def test_list_mcp_servers_filters_safe_fields():
     mcp_return = {
         "stdio-server": {
