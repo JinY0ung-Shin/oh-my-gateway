@@ -1,6 +1,7 @@
 """OpenCode backend tests."""
 
 import importlib
+import json
 
 
 def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
@@ -137,9 +138,125 @@ async def test_opencode_client_sends_prompt_to_existing_server(monkeypatch):
         "providerID": "anthropic",
         "modelID": "claude-sonnet-4-5",
     }
+    assert calls[1][2]["json"]["agent"] == "general"
     assert calls[1][2]["json"]["parts"] == [{"type": "text", "text": "say hi"}]
     assert getattr(session, "opencode_session_id") == "oc-session"
     assert chunks[-1]["result"] == "hello from opencode"
     assert chunks[-1]["usage"]["input_tokens"] == 7
     assert chunks[-1]["usage"]["output_tokens"] == 3
     assert backend.parse_message(chunks) == "hello from opencode"
+
+
+async def test_opencode_client_uses_configured_agent(monkeypatch):
+    """OPENCODE_AGENT overrides the default OpenCode request agent."""
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, path, **kwargs):
+            calls.append((path, kwargs))
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse(
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "text", "text": "ok"}],
+                }
+            )
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setenv("OPENCODE_AGENT", "plan")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert calls[1][1]["json"]["agent"] == "plan"
+    assert chunks[-1]["result"] == "ok"
+
+
+async def test_opencode_client_reports_empty_json_response(monkeypatch):
+    """Empty OpenCode response bodies produce actionable backend errors."""
+
+    class EmptyResponse:
+        status_code = 200
+        text = ""
+        headers = {"content-type": "application/json", "content-length": "0"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise json.JSONDecodeError("Expecting value", "", 0)
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return EmptyResponse()
+
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks == [
+        {
+            "type": "error",
+            "is_error": True,
+            "error_message": (
+                "OpenCode returned an empty or non-JSON response "
+                "(status=200, content-type=application/json, body='')"
+            ),
+        }
+    ]

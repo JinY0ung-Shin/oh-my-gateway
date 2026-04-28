@@ -55,6 +55,7 @@ class OpenCodeClient:
         self._process: Optional[subprocess.Popen[str]] = None
         self._server_username = os.getenv("OPENCODE_SERVER_USERNAME", "opencode")
         self._server_password = os.getenv("OPENCODE_SERVER_PASSWORD")
+        self._agent = os.getenv("OPENCODE_AGENT", "general").strip() or "general"
 
         if not self.base_url:
             self.base_url = self._start_managed_server()
@@ -256,6 +257,16 @@ class OpenCodeClient:
             "total_tokens": input_tokens + output_tokens + reasoning_tokens,
         }
 
+    def _describe_non_json_response(self, response: Any) -> str:
+        status = getattr(response, "status_code", "unknown")
+        headers = getattr(response, "headers", {}) or {}
+        content_type = headers.get("content-type", "unknown")
+        body = (getattr(response, "text", "") or "")[:200].replace("\n", "\\n")
+        return (
+            "OpenCode returned an empty or non-JSON response "
+            f"(status={status}, content-type={content_type}, body={body!r})"
+        )
+
     async def run_completion_with_client(
         self,
         client: OpenCodeSessionClient,
@@ -263,7 +274,10 @@ class OpenCodeClient:
         session: Any,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         _ = session
-        body: Dict[str, Any] = {"parts": [{"type": "text", "text": prompt}]}
+        body: Dict[str, Any] = {
+            "agent": self._agent,
+            "parts": [{"type": "text", "text": prompt}],
+        }
         model = self._split_provider_model(client.model)
         if model:
             body["model"] = model
@@ -278,7 +292,13 @@ class OpenCodeClient:
                     params=self._directory_params(client.cwd),
                 )
                 response.raise_for_status()
-                payload = response.json()
+                try:
+                    payload = response.json()
+                except json.JSONDecodeError:
+                    error_message = self._describe_non_json_response(response)
+                    logger.error("OpenCode session prompt returned invalid JSON: %s", error_message)
+                    yield {"type": "error", "is_error": True, "error_message": error_message}
+                    return
         except Exception as exc:
             logger.error("OpenCode session prompt failed: %s", exc, exc_info=True)
             yield {"type": "error", "is_error": True, "error_message": str(exc)}
