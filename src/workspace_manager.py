@@ -95,7 +95,12 @@ class WorkspaceManager:
             logger.debug("Template source .claude/ not found at %s, skipping sync", src)
             return
         dst = workspace / ".claude"
-        shutil.copytree(src, dst, dirs_exist_ok=True)
+        if dst.exists():
+            if dst.is_symlink():
+                dst.unlink()
+            else:
+                shutil.rmtree(dst)
+        shutil.copytree(src, dst)
         logger.debug("Synced .claude/ template to %s", dst)
 
     def _sync_project_files(self, workspace: Path) -> None:
