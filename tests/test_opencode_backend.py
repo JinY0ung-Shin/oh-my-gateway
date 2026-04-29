@@ -73,6 +73,27 @@ def test_opencode_managed_config_allows_question_permission_override(monkeypatch
     assert config["permission"]["question"] == "allow"
 
 
+def test_opencode_managed_config_can_include_wrapper_mcp(monkeypatch):
+    """Managed OpenCode config can copy wrapper MCP servers when enabled."""
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.delenv("OPENCODE_QUESTION_PERMISSION", raising=False)
+    monkeypatch.setenv("OPENCODE_USE_WRAPPER_MCP_CONFIG", "true")
+    monkeypatch.setenv("OPENCODE_DEFAULT_MODEL", "openai/gpt-5.5")
+    monkeypatch.setattr(
+        "src.mcp_config.get_validated_mcp_config",
+        lambda: {"demo": {"type": "stdio", "command": "uvx", "args": ["demo"]}},
+    )
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    client = OpenCodeClient(base_url="http://127.0.0.1:4096")
+    config = json.loads(client._managed_config_content())
+
+    assert config["model"] == "openai/gpt-5.5"
+    assert config["permission"]["question"] == "ask"
+    assert config["mcp"]["demo"] == {"type": "local", "command": ["uvx", "demo"]}
+
+
 def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
     """OpenCode descriptor resolves opencode/<provider>/<model> IDs."""
     monkeypatch.setenv("OPENCODE_MODELS", "anthropic/claude-sonnet-4-5")

@@ -20,8 +20,10 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 
 import httpx
 
+import src.mcp_config as mcp_config
 from src.backends.opencode.auth import OpenCodeAuthProvider
-from src.backends.opencode.constants import OPENCODE_MODELS
+from src.backends.opencode.config import build_opencode_config, parse_opencode_config_content
+from src.backends.opencode.constants import OPENCODE_MODELS, use_wrapper_mcp_config
 from src.backends.opencode.events import OpenCodeEventConverter
 from src.constants import DEFAULT_TIMEOUT_MS
 
@@ -88,17 +90,14 @@ class OpenCodeClient:
         return httpx.BasicAuth(self._server_username, self._server_password)
 
     def _managed_config_content(self) -> str:
-        existing = os.getenv("OPENCODE_CONFIG_CONTENT")
-        if existing:
-            return existing
-
-        config: Dict[str, Any] = {
-            "permission": {"question": os.getenv("OPENCODE_QUESTION_PERMISSION", "ask")},
-            "share": "disabled",
-        }
-        default_model = os.getenv("OPENCODE_DEFAULT_MODEL")
-        if default_model:
-            config["model"] = default_model
+        base_config = parse_opencode_config_content(os.getenv("OPENCODE_CONFIG_CONTENT"))
+        mcp_servers = mcp_config.get_validated_mcp_config() if use_wrapper_mcp_config() else {}
+        config = build_opencode_config(
+            base_config=base_config,
+            mcp_servers=mcp_servers,
+            default_model=os.getenv("OPENCODE_DEFAULT_MODEL") or None,
+            question_permission=os.getenv("OPENCODE_QUESTION_PERMISSION", "ask"),
+        )
         return json.dumps(config)
 
     def _start_managed_server(self) -> str:

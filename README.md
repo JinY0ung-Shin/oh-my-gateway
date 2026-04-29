@@ -75,6 +75,7 @@ Key environment variables (see `.env.example` for full list):
 | `BACKENDS` | `claude` | Backend allowlist, for example `claude,opencode` |
 | `OPENCODE_MODELS` | _(unset)_ | Comma-separated OpenCode `provider/model` IDs exposed as `opencode/...` |
 | `OPENCODE_BASE_URL` | _(unset)_ | External OpenCode server URL; unset starts managed mode |
+| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | `false` | Copy validated wrapper `MCP_CONFIG` into managed OpenCode config |
 | `DISALLOWED_SUBAGENT_TYPES` | `statusline-setup` | Comma-separated subagent types to block |
 | `CLAUDE_SANDBOX_ENABLED` | unset | Bash sandbox: unset = project settings, `true` = force on, `false` = force off |
 | `MCP_CONFIG` | — | MCP server config (JSON string or file path) |
@@ -99,7 +100,11 @@ export OPENCODE_BASE_URL=http://127.0.0.1:4096
 
 Managed server mode starts `opencode serve` automatically when `OPENCODE_BASE_URL` is unset. Managed mode requires the `opencode` binary on `PATH`. Managed mode exposes OpenCode's `question` tool by default with `OPENCODE_QUESTION_PERMISSION=ask`; set it to `deny` to hide the tool.
 
-Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, and server authentication variables are documented in `.env.example`.
+OpenCode MCP integration is available only in managed mode. Set `OPENCODE_USE_WRAPPER_MCP_CONFIG=true` to copy the validated wrapper `MCP_CONFIG` into the generated OpenCode config. The wrapper converts `stdio` servers to OpenCode `local` MCP entries and `http`, `sse`, or `streamable-http` servers to OpenCode `remote` entries. External OpenCode servers keep their own config and are not modified by the gateway.
+
+When `OPENCODE_CONFIG_CONTENT` is set in managed mode, the wrapper parses it as JSON, preserves explicit values, fills missing safe defaults, and then serializes the generated config passed to `opencode serve`.
+
+Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, `OPENCODE_USE_WRAPPER_MCP_CONFIG`, and server authentication variables are documented in `.env.example`.
 
 ### Bash Sandbox
 

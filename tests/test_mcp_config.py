@@ -186,3 +186,90 @@ class TestGetMcpServers:
     def test_returns_dict(self):
         result = get_mcp_servers()
         assert isinstance(result, dict)
+
+
+class TestValidatedMcpConfig:
+    """Test reusable validated MCP config access."""
+
+    def test_returns_copy_of_loaded_servers(self, monkeypatch):
+        import src.mcp_config as mcp_config
+
+        monkeypatch.setattr(
+            mcp_config,
+            "_server_mcp_config",
+            {"demo": {"type": "stdio", "command": "uvx"}},
+        )
+
+        result = mcp_config.get_validated_mcp_config()
+        result["demo"]["command"] = "changed"
+
+        assert mcp_config.get_validated_mcp_config()["demo"]["command"] == "uvx"
+
+
+class TestOpenCodeConfigGeneration:
+    """Test conversion from wrapper MCP config into OpenCode config."""
+
+    def test_build_opencode_config_includes_safe_defaults_and_mcp_servers(self):
+        from src.backends.opencode.config import build_opencode_config
+
+        config = build_opencode_config(
+            base_config={},
+            mcp_servers={
+                "filesystem": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+                    "env": {"ROOT": "/workspace"},
+                },
+                "docs": {
+                    "type": "streamable-http",
+                    "url": "http://localhost:3000/mcp",
+                    "headers": {"Authorization": "Bearer token"},
+                },
+            },
+            default_model="openai/gpt-5.5",
+            question_permission="ask",
+        )
+
+        assert config["permission"]["question"] == "ask"
+        assert config["share"] == "disabled"
+        assert config["model"] == "openai/gpt-5.5"
+        assert config["mcp"]["filesystem"] == {
+            "type": "local",
+            "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+            "environment": {"ROOT": "/workspace"},
+        }
+        assert config["mcp"]["docs"] == {
+            "type": "remote",
+            "url": "http://localhost:3000/mcp",
+            "headers": {"Authorization": "Bearer token"},
+        }
+
+    def test_build_opencode_config_preserves_explicit_base_config_over_defaults(self):
+        from src.backends.opencode.config import build_opencode_config
+
+        config = build_opencode_config(
+            base_config={
+                "share": "enabled",
+                "permission": {"question": "deny"},
+                "mcp": {"filesystem": {"enabled": False}},
+            },
+            mcp_servers={"filesystem": {"type": "stdio", "command": "npx", "args": ["demo"]}},
+            default_model="openai/gpt-5.5",
+            question_permission="ask",
+        )
+
+        assert config["share"] == "enabled"
+        assert config["permission"]["question"] == "deny"
+        assert config["model"] == "openai/gpt-5.5"
+        assert config["mcp"]["filesystem"] == {"enabled": False}
+
+    def test_parse_opencode_config_content_adds_env_context_to_json_errors(self):
+        from src.backends.opencode.config import parse_opencode_config_content
+
+        try:
+            parse_opencode_config_content("{ invalid json }")
+        except ValueError as exc:
+            assert "OPENCODE_CONFIG_CONTENT is not valid JSON" in str(exc)
+        else:
+            raise AssertionError("expected ValueError")
