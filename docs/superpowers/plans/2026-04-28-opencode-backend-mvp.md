@@ -1,5 +1,9 @@
 # OpenCode Backend MVP Implementation Plan
 
+> **SUPERSEDED:** The current OpenCode backend is managed-only. The earlier
+> dual-mode implementation plan that referenced `OPENCODE_BASE_URL` was
+> replaced; external OpenCode servers are no longer supported.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build an opt-in OpenCode backend that can be selected through `BACKENDS` and called through `/v1/models` and `/v1/responses`.

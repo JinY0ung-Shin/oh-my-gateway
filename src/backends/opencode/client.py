@@ -51,17 +51,18 @@ class OpenCodeClient:
     def __init__(
         self,
         timeout: Optional[int] = None,
-        base_url: Optional[str] = None,
     ) -> None:
         self.timeout = (timeout if timeout is not None else DEFAULT_TIMEOUT_MS) / 1000
-        self.base_url = (base_url or os.getenv("OPENCODE_BASE_URL") or "").rstrip("/")
         self._process: Optional[subprocess.Popen[str]] = None
         self._server_username = os.getenv("OPENCODE_SERVER_USERNAME", "opencode")
         self._server_password = os.getenv("OPENCODE_SERVER_PASSWORD")
         self._agent = os.getenv("OPENCODE_AGENT", "general").strip() or "general"
 
-        if not self.base_url:
-            self.base_url = self._start_managed_server()
+        if os.getenv("OPENCODE_BASE_URL"):
+            raise RuntimeError(
+                "OPENCODE_BASE_URL is no longer supported; unset it to use managed OpenCode"
+            )
+        self.base_url = self._start_managed_server()
 
     @property
     def name(self) -> str:
@@ -75,9 +76,8 @@ class OpenCodeClient:
 
     def runtime_metadata(self) -> Dict[str, Any]:
         """Return operational details for admin diagnostics."""
-        mode = "managed" if self._process is not None else "external"
         return {
-            "mode": mode,
+            "mode": "managed",
             "base_url": self.base_url,
             "agent": self._agent,
             "models": self.supported_models(),

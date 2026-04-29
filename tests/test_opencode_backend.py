@@ -3,32 +3,28 @@
 import importlib
 import json
 
-
-def test_opencode_client_exposes_runtime_metadata(monkeypatch):
-    """OpenCode client reports operational metadata for diagnostics."""
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
-    monkeypatch.setenv("OPENCODE_MODELS", "openai/gpt-5.5")
-
-    import src.backends.opencode.client as client_module
-    import src.backends.opencode.constants as constants_module
-
-    importlib.reload(constants_module)
-    client_module = importlib.reload(client_module)
-
-    client = client_module.OpenCodeClient()
-
-    assert client.runtime_metadata() == {
-        "mode": "external",
-        "base_url": "http://127.0.0.1:4096",
-        "agent": "general",
-        "models": ["opencode/openai/gpt-5.5"],
-        "managed_process": False,
-    }
+import pytest
 
 
-def test_opencode_runtime_metadata_treats_explicit_base_url_as_external(monkeypatch):
-    """Direct base_url construction is external mode even without OPENCODE_BASE_URL."""
+@pytest.fixture(autouse=True)
+def stub_opencode_managed_server(monkeypatch):
+    """Avoid starting a real OpenCode process in unit tests."""
     monkeypatch.delenv("OPENCODE_BASE_URL", raising=False)
+
+    def fail_if_process_starts(*args, **kwargs):
+        raise AssertionError("unit tests must not start a real opencode process")
+
+    monkeypatch.setattr("src.backends.opencode.client.subprocess.Popen", fail_if_process_starts)
+    monkeypatch.setattr(
+        "src.backends.opencode.client.OpenCodeClient._start_managed_server",
+        lambda self: "http://127.0.0.1:4096",
+        raising=False,
+    )
+
+
+def test_opencode_client_rejects_legacy_base_url_env(monkeypatch):
+    """OPENCODE_BASE_URL is rejected instead of silently changing backend behavior."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://external.example:4096")
     monkeypatch.setenv("OPENCODE_MODELS", "openai/gpt-5.5")
 
     import src.backends.opencode.client as client_module
@@ -36,11 +32,24 @@ def test_opencode_runtime_metadata_treats_explicit_base_url_as_external(monkeypa
 
     importlib.reload(constants_module)
     client_module = importlib.reload(client_module)
+    # Safety net: if the fail-fast branch is removed later, keep this reloaded
+    # class from starting a real OpenCode process.
+    monkeypatch.setattr(
+        client_module.OpenCodeClient,
+        "_start_managed_server",
+        lambda self: "http://127.0.0.1:15555",
+    )
 
-    client = client_module.OpenCodeClient(base_url="http://127.0.0.1:4096")
+    with pytest.raises(RuntimeError, match="OPENCODE_BASE_URL is no longer supported"):
+        client_module.OpenCodeClient()
 
-    assert client.runtime_metadata()["mode"] == "external"
-    assert client.runtime_metadata()["managed_process"] is False
+
+def test_opencode_client_constructor_rejects_external_base_url():
+    """External OpenCode servers are no longer a supported backend mode."""
+    from src.backends.opencode.client import OpenCodeClient
+
+    with pytest.raises(TypeError):
+        OpenCodeClient(base_url="http://127.0.0.1:4096")
 
 
 def test_opencode_managed_config_enables_question_tool_by_default(monkeypatch):
@@ -51,7 +60,7 @@ def test_opencode_managed_config_enables_question_tool_by_default(monkeypatch):
 
     from src.backends.opencode.client import OpenCodeClient
 
-    client = OpenCodeClient(base_url="http://127.0.0.1:4096")
+    client = OpenCodeClient()
 
     config = json.loads(client._managed_config_content())
 
@@ -66,7 +75,7 @@ def test_opencode_managed_config_allows_question_permission_override(monkeypatch
 
     from src.backends.opencode.client import OpenCodeClient
 
-    client = OpenCodeClient(base_url="http://127.0.0.1:4096")
+    client = OpenCodeClient()
 
     config = json.loads(client._managed_config_content())
 
@@ -86,7 +95,7 @@ def test_opencode_managed_config_can_include_wrapper_mcp(monkeypatch):
 
     from src.backends.opencode.client import OpenCodeClient
 
-    client = OpenCodeClient(base_url="http://127.0.0.1:4096")
+    client = OpenCodeClient()
     config = json.loads(client._managed_config_content())
 
     assert config["model"] == "openai/gpt-5.5"
@@ -129,7 +138,6 @@ def test_opencode_descriptor_rejects_unprefixed_model(monkeypatch):
 
 def test_opencode_auth_provider_validates_managed_binary(monkeypatch):
     """Managed mode is valid when the opencode binary is available."""
-    monkeypatch.delenv("OPENCODE_BASE_URL", raising=False)
     monkeypatch.setattr("src.backends.opencode.auth.shutil.which", lambda name: "/bin/opencode")
 
     from src.backends.opencode.auth import OpenCodeAuthProvider
@@ -139,6 +147,35 @@ def test_opencode_auth_provider_validates_managed_binary(monkeypatch):
     assert status["valid"] is True
     assert status["errors"] == []
     assert status["config"]["mode"] == "managed"
+
+
+def test_opencode_auth_provider_rejects_legacy_base_url_regardless_of_binary(monkeypatch):
+    """OPENCODE_BASE_URL fails auth validation instead of selecting external mode."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.auth.shutil.which", lambda name: "/bin/opencode")
+
+    from src.backends.opencode.auth import OpenCodeAuthProvider
+
+    status = OpenCodeAuthProvider().validate()
+
+    assert status["valid"] is False
+    assert status["errors"] == [
+        "OPENCODE_BASE_URL is no longer supported; unset it to use managed OpenCode"
+    ]
+    assert status["config"]["mode"] == "managed"
+
+
+def test_opencode_auth_env_excludes_legacy_base_url(monkeypatch):
+    """Backend env passthrough should not advertise an external-server mode."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setenv("OPENCODE_DEFAULT_MODEL", "openai/gpt-5.5")
+
+    from src.backends.opencode.auth import OpenCodeAuthProvider
+
+    env = OpenCodeAuthProvider().build_env()
+
+    assert "OPENCODE_BASE_URL" not in env
+    assert env["OPENCODE_DEFAULT_MODEL"] == "openai/gpt-5.5"
 
 
 def test_auth_manager_returns_opencode_provider():
@@ -612,7 +649,6 @@ async def test_opencode_client_sends_prompt_to_existing_server(monkeypatch):
                 }
             )
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -687,7 +723,6 @@ async def test_opencode_client_uses_configured_agent(monkeypatch):
                 }
             )
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setenv("OPENCODE_AGENT", "plan")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
@@ -766,7 +801,6 @@ async def test_opencode_client_resumes_question_with_reply_endpoint(monkeypatch)
             calls.append(("POST", path, kwargs))
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setenv("OPENCODE_AGENT", "plan")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
@@ -860,7 +894,6 @@ async def test_opencode_client_reports_empty_json_response(monkeypatch):
                 return FakeResponse({"id": "oc-session"})
             return EmptyResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -959,7 +992,6 @@ async def test_opencode_client_streams_text_deltas_from_event_sse(monkeypatch):
                 return FakeResponse({"id": "oc-session"})
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -1081,7 +1113,6 @@ async def test_opencode_client_streams_tool_use_and_result_from_event_sse(monkey
                 return FakeResponse({"id": "oc-session"})
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -1200,7 +1231,6 @@ async def test_opencode_streaming_aggregates_step_finish_usage(monkeypatch):
                 return FakeResponse({"id": "oc-session"})
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -1279,7 +1309,6 @@ async def test_opencode_streaming_ignores_initial_idle_until_activity(monkeypatc
                 return FakeResponse({"id": "oc-session"})
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -1342,7 +1371,6 @@ async def test_opencode_streaming_event_client_disables_read_timeout(monkeypatch
                 return FakeResponse({"id": "oc-session"})
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient
@@ -1436,7 +1464,6 @@ async def test_opencode_streaming_waits_for_non_empty_tool_input(monkeypatch):
                 return FakeResponse({"id": "oc-session"})
             return FakeResponse()
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
 
     from src.backends.opencode.client import OpenCodeClient

@@ -1,5 +1,9 @@
 # OpenCode Backend MVP Design
 
+> **SUPERSEDED:** The current OpenCode backend is managed-only. The earlier
+> dual-mode design that referenced `OPENCODE_BASE_URL` was replaced; external
+> OpenCode servers are no longer supported.
+
 Date: 2026-04-28
 
 ## Goal

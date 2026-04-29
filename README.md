@@ -74,8 +74,7 @@ Key environment variables (see `.env.example` for full list):
 | `DEFAULT_MAX_TURNS` | `10` | Max agent turns per request |
 | `BACKENDS` | `claude` | Backend allowlist, for example `claude,opencode` |
 | `OPENCODE_MODELS` | _(unset)_ | Comma-separated OpenCode `provider/model` IDs exposed as `opencode/...` |
-| `OPENCODE_BASE_URL` | _(unset)_ | External OpenCode server URL; unset starts managed mode |
-| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | `false` | Copy validated wrapper `MCP_CONFIG` into managed OpenCode config |
+| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | `false` | Copy validated wrapper `MCP_CONFIG` into OpenCode config |
 | `DISALLOWED_SUBAGENT_TYPES` | `statusline-setup` | Comma-separated subagent types to block |
 | `CLAUDE_SANDBOX_ENABLED` | unset | Bash sandbox: unset = project settings, `true` = force on, `false` = force off |
 | `MCP_CONFIG` | — | MCP server config (JSON string or file path) |
@@ -91,18 +90,11 @@ export BACKENDS=claude,opencode
 export OPENCODE_MODELS=openai/gpt-5.5
 ```
 
-External server mode:
+The gateway starts `opencode serve` automatically and requires the `opencode` binary on `PATH`. The Docker image installs OpenCode during build. OpenCode's `question` tool is exposed by default with `OPENCODE_QUESTION_PERMISSION=ask`; set it to `deny` to hide the tool.
 
-```bash
-opencode serve --hostname 127.0.0.1 --port 4096
-export OPENCODE_BASE_URL=http://127.0.0.1:4096
-```
+Set `OPENCODE_USE_WRAPPER_MCP_CONFIG=true` to copy the validated wrapper `MCP_CONFIG` into the generated OpenCode config. The wrapper converts `stdio` servers to OpenCode `local` MCP entries and `http`, `sse`, or `streamable-http` servers to OpenCode `remote` entries.
 
-Managed server mode starts `opencode serve` automatically when `OPENCODE_BASE_URL` is unset. Managed mode requires the `opencode` binary on `PATH`. Managed mode exposes OpenCode's `question` tool by default with `OPENCODE_QUESTION_PERMISSION=ask`; set it to `deny` to hide the tool.
-
-OpenCode MCP integration is available only in managed mode. Set `OPENCODE_USE_WRAPPER_MCP_CONFIG=true` to copy the validated wrapper `MCP_CONFIG` into the generated OpenCode config. The wrapper converts `stdio` servers to OpenCode `local` MCP entries and `http`, `sse`, or `streamable-http` servers to OpenCode `remote` entries. External OpenCode servers keep their own config and are not modified by the gateway.
-
-When `OPENCODE_CONFIG_CONTENT` is set in managed mode, the wrapper parses it as JSON, preserves explicit values, fills missing safe defaults, and then serializes the generated config passed to `opencode serve`.
+When `OPENCODE_CONFIG_CONTENT` is set, the wrapper parses it as JSON, preserves explicit values, fills missing safe defaults, and then serializes the generated config passed to `opencode serve`.
 
 Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, `OPENCODE_USE_WRAPPER_MCP_CONFIG`, and server authentication variables are documented in `.env.example`.
 
@@ -159,7 +151,7 @@ curl http://localhost:8000/v1/responses \
 Live OpenCode smoke test:
 
 ```bash
-OPENCODE_SMOKE_BASE_URL=http://127.0.0.1:4096 \
+OPENCODE_SMOKE_ENABLED=1 \
 OPENCODE_SMOKE_MODEL=openai/gpt-5.5 \
 uv run pytest tests/integration/test_opencode_smoke.py -q
 ```
@@ -319,6 +311,11 @@ docker build \
   --build-arg PIP_INDEX_URL=https://pypi.example.com/simple \
   -t claude-code-gateway .
 
+# Pin or override the OpenCode version
+docker build \
+  --build-arg OPENCODE_VERSION=1.14.29 \
+  -t claude-code-gateway .
+
 # With API key auth
 docker run -d -p 8000:8000 \
   -e ANTHROPIC_AUTH_TOKEN=your-key \
@@ -335,9 +332,16 @@ docker run -d -p 8000:8000 \
   -v /path/to/project:/workspace \
   -e CLAUDE_CWD=/workspace \
   claude-code-gateway
+
+# With OpenCode enabled
+docker run -d -p 8000:8000 \
+  -e BACKENDS=claude,opencode \
+  -e OPENCODE_MODELS=openai/gpt-5.5 \
+  -e OPENAI_API_KEY=your-key \
+  claude-code-gateway
 ```
 
-Or with docker-compose: `docker compose up -d`
+Or with docker-compose: set `BACKENDS=claude,opencode`, `OPENCODE_MODELS`, and provider keys in `.env`, then run `docker compose up -d`. The image includes OpenCode and the gateway starts it automatically.
 
 ## Development
 

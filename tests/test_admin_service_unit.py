@@ -25,8 +25,6 @@ async def test_admin_backend_health_includes_opencode_metadata(monkeypatch):
     from src.admin_service import get_backends_health
     from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
 
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
-
     def resolve(model):
         if model == "opencode/openai/gpt-5.5":
             return ResolvedModel(model, "opencode", "openai/gpt-5.5")
@@ -43,11 +41,11 @@ async def test_admin_backend_health_includes_opencode_metadata(monkeypatch):
 
         def runtime_metadata(self):
             return {
-                "mode": "external",
+                "mode": "managed",
                 "base_url": "http://127.0.0.1:4096",
                 "agent": "general",
                 "models": ["opencode/openai/gpt-5.5"],
-                "managed_process": False,
+                "managed_process": True,
             }
 
     BackendRegistry.clear()
@@ -59,7 +57,7 @@ async def test_admin_backend_health_includes_opencode_metadata(monkeypatch):
     health = await get_backends_health()
 
     opencode = next(item for item in health if item["name"] == "opencode")
-    assert opencode["metadata"]["mode"] == "external"
+    assert opencode["metadata"]["mode"] == "managed"
     assert opencode["metadata"]["base_url"] == "http://127.0.0.1:4096"
     assert opencode["metadata"]["models"] == ["opencode/openai/gpt-5.5"]
 
