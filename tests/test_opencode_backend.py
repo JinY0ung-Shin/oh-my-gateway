@@ -2,6 +2,8 @@
 
 import importlib
 import json
+import logging
+from pathlib import Path
 
 import pytest
 
@@ -111,17 +113,13 @@ def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
 
     opencode_pkg = importlib.reload(opencode_pkg)
 
-    resolved = opencode_pkg.OPENCODE_DESCRIPTOR.resolve_fn(
-        "opencode/anthropic/claude-sonnet-4-5"
-    )
+    resolved = opencode_pkg.OPENCODE_DESCRIPTOR.resolve_fn("opencode/anthropic/claude-sonnet-4-5")
 
     assert resolved is not None
     assert resolved.public_model == "opencode/anthropic/claude-sonnet-4-5"
     assert resolved.backend == "opencode"
     assert resolved.provider_model == "anthropic/claude-sonnet-4-5"
-    assert opencode_pkg.OPENCODE_DESCRIPTOR.models == [
-        "opencode/anthropic/claude-sonnet-4-5"
-    ]
+    assert opencode_pkg.OPENCODE_DESCRIPTOR.models == ["opencode/anthropic/claude-sonnet-4-5"]
 
 
 def test_opencode_descriptor_rejects_unprefixed_model(monkeypatch):
@@ -508,6 +506,50 @@ def test_opencode_event_converter_emits_question_request_tool_use():
     ]
 
 
+def test_opencode_event_converter_emits_permission_request_tool_use():
+    """Permission requests are exposed as resumable OpenCode tool_use chunks."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    chunks = converter.convert(
+        {
+            "type": "permission.asked",
+            "properties": {
+                "id": "perm_1",
+                "sessionID": "oc-session",
+                "permission": "bash",
+                "patterns": ["npm test"],
+                "always": ["npm *"],
+                "metadata": {"command": "npm test"},
+                "tool": {"messageID": "msg_1", "callID": "call_1"},
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "perm_1",
+                    "name": "permission",
+                    "input": {
+                        "permission": "bash",
+                        "patterns": ["npm test"],
+                        "always": ["npm *"],
+                        "metadata": {"command": "npm test"},
+                    },
+                    "metadata": {
+                        "opencode_permission_request_id": "perm_1",
+                        "opencode_tool_call_id": "call_1",
+                    },
+                }
+            ],
+        }
+    ]
+
+
 def test_opencode_event_converter_suppresses_question_tool_part_updates():
     """Question tool part updates should not be exposed before question.asked."""
     from src.backends.opencode.events import OpenCodeEventConverter
@@ -596,9 +638,10 @@ def test_opencode_event_converter_finishes_only_after_activity():
         }
     )
 
-    assert converter.finished(
-        {"type": "session.idle", "properties": {"sessionID": "other-session"}}
-    ) is False
+    assert (
+        converter.finished({"type": "session.idle", "properties": {"sessionID": "other-session"}})
+        is False
+    )
     assert converter.finished(idle_event) is True
 
 
@@ -840,7 +883,7 @@ async def test_opencode_client_resumes_question_with_reply_endpoint(monkeypatch)
                 },
                 "params": {"directory": "/tmp/work"},
             },
-        )
+        ),
     ]
     assert chunks == [
         {
@@ -853,6 +896,285 @@ async def test_opencode_client_resumes_question_with_reply_endpoint(monkeypatch)
         {"type": "assistant", "content": [{"type": "text", "text": "continued"}]},
         {"type": "result", "subtype": "success", "result": "continued"},
     ]
+
+
+async def test_opencode_client_resumes_permission_with_reply_endpoint(monkeypatch):
+    """OpenCode permission continuation replies to the pending permission request."""
+    calls = []
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-2",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "approved",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield f"event: {event['type']}"
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            calls.append(("STREAM", method, path, kwargs))
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            calls.append(("POST", path, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+    chunks = [
+        chunk
+        async for chunk in backend.resume_permission_with_client(
+            client,
+            "perm_1",
+            "always",
+            Session(session_id="gw-session"),
+        )
+    ]
+
+    assert calls == [
+        (
+            "STREAM",
+            "GET",
+            "/event",
+            {"params": {"directory": "/tmp/work"}},
+        ),
+        (
+            "POST",
+            "/permission/perm_1/reply",
+            {
+                "json": {"reply": "always"},
+                "params": {"directory": "/tmp/work"},
+            },
+        ),
+    ]
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "approved"},
+            },
+        },
+        {"type": "assistant", "content": [{"type": "text", "text": "approved"}]},
+        {"type": "result", "subtype": "success", "result": "approved"},
+    ]
+
+
+async def test_opencode_session_client_disconnect_deletes_server_session(monkeypatch):
+    """OpenCode session cleanup deletes the corresponding server-side session."""
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            calls.append(("CLIENT", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def delete(self, path, **kwargs):
+            calls.append(("DELETE", path, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeSessionClient
+
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+        base_url="http://127.0.0.1:4096",
+        timeout=12.5,
+    )
+
+    await client.disconnect()
+
+    assert calls == [
+        ("CLIENT", {"base_url": "http://127.0.0.1:4096", "timeout": 12.5}),
+        (
+            "DELETE",
+            "/session/oc-session",
+            {"params": {"directory": "/tmp/work"}},
+        ),
+    ]
+
+
+async def test_opencode_session_client_disconnect_logs_warning_on_failure(
+    monkeypatch,
+    caplog,
+):
+    """OpenCode cleanup failures should be visible in operator logs."""
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def delete(self, path, **kwargs):
+            raise RuntimeError("delete failed")
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeSessionClient
+
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+        base_url="http://127.0.0.1:4096",
+        timeout=12.5,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.backends.opencode.client"):
+        await client.disconnect()
+
+    assert "OpenCode session delete failed for oc-session" in caplog.text
+
+
+def test_opencode_prompt_body_converts_attached_image_markers_to_file_parts(tmp_path):
+    """Responses image markers are sent to OpenCode as file parts."""
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+
+    image_dir = tmp_path / ".claude_images"
+    image_dir.mkdir()
+    image_path = image_dir / "img_0123456789abcdef.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd=str(tmp_path),
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+
+    body = backend._prompt_body(
+        client,
+        f'describe this\n<attached_image path="{image_path}" />\nthanks',
+    )
+
+    assert body["parts"] == [
+        {"type": "text", "text": "describe this\n"},
+        {
+            "type": "file",
+            "mime": "image/png",
+            "filename": Path(image_path).name,
+            "url": "data:image/png;base64,iVBORw0KGgpmYWtl",
+        },
+        {"type": "text", "text": "\nthanks"},
+    ]
+
+
+def test_opencode_prompt_body_treats_untrusted_attached_image_marker_as_text(
+    tmp_path,
+    caplog,
+):
+    """User-authored image markers must not trigger arbitrary local file reads."""
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret_path = tmp_path / "secret.txt"
+    secret_path.write_text("do not read", encoding="utf-8")
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd=str(workspace),
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+
+    prompt = f'before <attached_image path="{secret_path}" /> after'
+    with caplog.at_level(logging.WARNING, logger="src.backends.opencode.client"):
+        body = backend._prompt_body(client, prompt)
+
+    assert body["parts"] == [{"type": "text", "text": prompt}]
+    assert "OpenCode dropped untrusted attached_image marker" in caplog.text
+
+
+def test_opencode_permission_reply_body_fails_closed_for_unknown_inputs():
+    """Unknown permission outputs must reject instead of allowing once."""
+    from src.backends.opencode.client import OpenCodeClient
+
+    backend = OpenCodeClient()
+
+    assert backend._permission_reply_body("") == {"reply": "reject"}
+    assert backend._permission_reply_body("maybe") == {"reply": "reject"}
+    assert backend._permission_reply_body('{"reply":"later"}') == {"reply": "reject"}
+
+
+def test_opencode_permission_reply_body_normalizes_known_inputs():
+    """Known permission outputs map to OpenCode's reply enum."""
+    from src.backends.opencode.client import OpenCodeClient
+
+    backend = OpenCodeClient()
+
+    assert backend._permission_reply_body("yes") == {"reply": "once"}
+    assert backend._permission_reply_body("no") == {"reply": "reject"}
+    assert backend._permission_reply_body('{"reply":"always","message":"remember"}') == {
+        "reply": "always",
+        "message": "remember",
+    }
 
 
 async def test_opencode_client_reports_empty_json_response(monkeypatch):

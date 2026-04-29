@@ -462,10 +462,10 @@ async def _unblock_pending_tool_call(
         raise
 
 
-async def _prepare_opencode_question_continuation(
+async def _prepare_opencode_tool_continuation(
     session, backend: "BackendClient", fc_output: Dict[str, str]
-) -> None:
-    """Validate and reserve an OpenCode pending question continuation."""
+) -> str:
+    """Validate and reserve an OpenCode pending tool continuation."""
     await session.lock.acquire()
     try:
         if session.pending_tool_call is None:
@@ -484,11 +484,23 @@ async def _prepare_opencode_question_continuation(
                 ),
             )
 
-        resume = getattr(backend, "resume_question_with_client", None)
+        pending = session.pending_tool_call
+        resume_kind = pending.get("opencode_resume")
+        if resume_kind is None:
+            resume_kind = "question"
+        if resume_kind not in ("question", "permission"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported OpenCode resume kind: {resume_kind}",
+            )
+        if resume_kind == "permission":
+            resume = getattr(backend, "resume_permission_with_client", None)
+        else:
+            resume = getattr(backend, "resume_question_with_client", None)
         if not callable(resume):
             raise HTTPException(
                 status_code=400,
-                detail="OpenCode question continuation is not supported by this backend",
+                detail=f"OpenCode {resume_kind} continuation is not supported by this backend",
             )
 
         if session.client is None:
@@ -498,43 +510,10 @@ async def _prepare_opencode_question_continuation(
             )
 
         session.pending_tool_call = None
+        return resume_kind
     except Exception:
         session.lock.release()
         raise
-
-
-def _store_opencode_pending_question(
-    resolved: ResolvedModel,
-    session,
-    chunk: Dict[str, Any],
-) -> bool:
-    """Capture OpenCode question tool_use chunks as pending Responses actions."""
-    if resolved.backend != "opencode" or not isinstance(chunk, dict):
-        return False
-    content = chunk.get("content")
-    if not isinstance(content, list):
-        return False
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") != "tool_use" or block.get("name") != "question":
-            continue
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-        request_id = metadata.get("opencode_question_request_id")
-        if not isinstance(request_id, str) or not request_id:
-            continue
-        input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
-        arguments = _normalize_opencode_question_arguments(input_value)
-        if arguments is None:
-            continue
-        session.pending_tool_call = {
-            "call_id": request_id,
-            "name": ASK_USER_QUESTION_TOOL_NAME,
-            "arguments": arguments,
-            "backend": "opencode",
-        }
-        return True
-    return False
 
 
 def _normalize_opencode_question_arguments(input_value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -552,6 +531,95 @@ def _normalize_opencode_question_arguments(input_value: Dict[str, Any]) -> Optio
     return None
 
 
+def _normalize_opencode_permission_arguments(
+    input_value: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return OpenCode permission input in the public AskUserQuestion shape."""
+    permission = input_value.get("permission")
+    if not isinstance(permission, str) or not permission:
+        return None
+
+    raw_patterns = input_value.get("patterns")
+    patterns = (
+        [item for item in raw_patterns if isinstance(item, str)]
+        if isinstance(raw_patterns, list)
+        else []
+    )
+    raw_always = input_value.get("always")
+    always = (
+        [item for item in raw_always if isinstance(item, str)]
+        if isinstance(raw_always, list)
+        else []
+    )
+    metadata = input_value.get("metadata") if isinstance(input_value.get("metadata"), dict) else {}
+    target = ", ".join(patterns) if patterns else "(no patterns specified)"
+    allowed_context = f"; already allowed: {', '.join(always)}" if always else ""
+    return {
+        "question": f"OpenCode requests permission '{permission}' for: {target}{allowed_context}",
+        "options": [
+            {"label": "once", "description": "Allow this request once."},
+            {"label": "always", "description": "Always allow matching requests."},
+            {"label": "reject", "description": "Reject this request."},
+        ],
+        "permission": permission,
+        "patterns": patterns,
+        "always": always,
+        "metadata": metadata,
+    }
+
+
+def _store_opencode_pending_tool_call(
+    resolved: ResolvedModel,
+    session,
+    chunk: Dict[str, Any],
+) -> bool:
+    """Capture the first resumable OpenCode tool_use from a backend chunk."""
+    if resolved.backend != "opencode" or not isinstance(chunk, dict):
+        return False
+    content = chunk.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use":
+            continue
+        tool_name = block.get("name")
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
+        if tool_name == "question":
+            request_id = metadata.get("opencode_question_request_id")
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            arguments = _normalize_opencode_question_arguments(input_value)
+            if arguments is None:
+                continue
+            session.pending_tool_call = {
+                "call_id": request_id,
+                "name": ASK_USER_QUESTION_TOOL_NAME,
+                "arguments": arguments,
+                "backend": "opencode",
+                "opencode_resume": "question",
+            }
+            return True
+        if tool_name == "permission":
+            request_id = metadata.get("opencode_permission_request_id")
+            if not isinstance(request_id, str) or not request_id:
+                continue
+            arguments = _normalize_opencode_permission_arguments(input_value)
+            if arguments is None:
+                continue
+            session.pending_tool_call = {
+                "call_id": request_id,
+                "name": ASK_USER_QUESTION_TOOL_NAME,
+                "arguments": arguments,
+                "backend": "opencode",
+                "opencode_resume": "permission",
+            }
+            return True
+    return False
+
+
 async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
         if resolved.backend == "opencode" and isinstance(chunk, dict):
@@ -559,10 +627,10 @@ async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedMo
             if isinstance(content, list) and any(
                 isinstance(block, dict)
                 and block.get("type") == "tool_use"
-                and block.get("name") == "question"
+                and block.get("name") in ("question", "permission")
                 for block in content
             ):
-                if _store_opencode_pending_question(resolved, session, chunk):
+                if _store_opencode_pending_tool_call(resolved, session, chunk):
                     close = getattr(chunk_source, "aclose", None)
                     if callable(close):
                         await close()
@@ -689,9 +757,7 @@ async def create_response(
                 chunks_buffer = []
 
                 _configure_client_streaming(session.client, True)
-                backend_source = backend.run_completion_with_client(
-                    session.client, prompt, session
-                )
+                backend_source = backend.run_completion_with_client(session.client, prompt, session)
                 chunk_source = _capture_opencode_pending_questions(
                     backend_source, resolved, session
                 )
@@ -948,8 +1014,11 @@ async def _handle_function_call_output(
     # --- Validate + unblock under session lock, then keep the lock through
     # the continuation read so no concurrent request can mutate session state
     # between the tool output and SDK resume.
+    opencode_resume_kind = "question"
     if resolved.backend == "opencode":
-        await _prepare_opencode_question_continuation(session, backend, fc_output)
+        opencode_resume_kind = await _prepare_opencode_tool_continuation(
+            session, backend, fc_output
+        )
     else:
         await _unblock_pending_tool_call(session, backend, fc_output)
 
@@ -970,12 +1039,20 @@ async def _handle_function_call_output(
                 # processing from where it left off.  Use receive_response_from_client
                 # when available; do not start a new prompt.
                 if resolved.backend == "opencode":
-                    backend_source = backend.resume_question_with_client(
-                        active_client,
-                        fc_output["call_id"],
-                        fc_output["output"],
-                        session,
-                    )
+                    if opencode_resume_kind == "permission":
+                        backend_source = backend.resume_permission_with_client(
+                            active_client,
+                            fc_output["call_id"],
+                            fc_output["output"],
+                            session,
+                        )
+                    else:
+                        backend_source = backend.resume_question_with_client(
+                            active_client,
+                            fc_output["call_id"],
+                            fc_output["output"],
+                            session,
+                        )
                 else:
                     receiver = getattr(backend, "receive_response_from_client", None)
                     if receiver is not None:
@@ -1068,12 +1145,20 @@ async def _handle_function_call_output(
         # processing from where it left off — no new query needed.
         _configure_client_streaming(active_client, False)
         if resolved.backend == "opencode":
-            backend_source = backend.resume_question_with_client(
-                active_client,
-                fc_output["call_id"],
-                fc_output["output"],
-                session,
-            )
+            if opencode_resume_kind == "permission":
+                backend_source = backend.resume_permission_with_client(
+                    active_client,
+                    fc_output["call_id"],
+                    fc_output["output"],
+                    session,
+                )
+            else:
+                backend_source = backend.resume_question_with_client(
+                    active_client,
+                    fc_output["call_id"],
+                    fc_output["output"],
+                    session,
+                )
         else:
             receiver = getattr(backend, "receive_response_from_client", None)
             if receiver is not None:

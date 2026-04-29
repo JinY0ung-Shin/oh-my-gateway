@@ -170,6 +170,14 @@ class TestValidateImageRequest:
         # Should not raise
         _validate_image_request(req, backend)
 
+    def test_validate_image_request_passes_for_opencode(self):
+        """OpenCode supports image input through request file parts."""
+        req = self._make_image_request()
+        backend = MagicMock(spec=[])
+        backend.name = "opencode"
+
+        _validate_image_request(req, backend)
+
     def test_validate_image_request_no_images_always_passes(self):
         """No error when request contains no images, regardless of backend support."""
         text_input = [{"role": "user", "content": [{"type": "input_text", "text": "no image"}]}]

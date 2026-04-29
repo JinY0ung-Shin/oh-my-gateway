@@ -26,6 +26,9 @@ class OpenCodeEventConverter:
         question_chunk = self._convert_question_event(event)
         if question_chunk:
             return [question_chunk]
+        permission_chunk = self._convert_permission_event(event)
+        if permission_chunk:
+            return [permission_chunk]
         self._record_message_role(event)
         if event.get("type") == "message.updated":
             return []
@@ -141,6 +144,46 @@ class OpenCodeEventConverter:
             ],
         }
 
+    def _convert_permission_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if event.get("type") != "permission.asked":
+            return None
+        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        request_id = props.get("id")
+        permission = props.get("permission")
+        if not isinstance(request_id, str) or not request_id:
+            return None
+        if not isinstance(permission, str) or not permission:
+            return None
+
+        patterns = props.get("patterns")
+        always = props.get("always")
+        metadata_value = props.get("metadata")
+        input_value = {
+            "permission": permission,
+            "patterns": patterns if isinstance(patterns, list) else [],
+            "always": always if isinstance(always, list) else [],
+            "metadata": metadata_value if isinstance(metadata_value, dict) else {},
+        }
+        metadata = {"opencode_permission_request_id": request_id}
+        tool = props.get("tool") if isinstance(props.get("tool"), dict) else {}
+        tool_call_id = tool.get("callID")
+        if isinstance(tool_call_id, str) and tool_call_id:
+            metadata["opencode_tool_call_id"] = tool_call_id
+
+        self.saw_activity = True
+        return {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": request_id,
+                    "name": "permission",
+                    "input": input_value,
+                    "metadata": metadata,
+                }
+            ],
+        }
+
     def _convert_text_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not self._is_assistant_output_event(event):
             return None
@@ -246,9 +289,8 @@ class OpenCodeEventConverter:
 
         input_value = tool_state.get("input")
         has_input = bool(input_value)
-        should_emit_use = (
-            status in ("running", "completed", "error")
-            or (status == "pending" and has_input)
+        should_emit_use = status in ("running", "completed", "error") or (
+            status == "pending" and has_input
         )
         if tool_name == "question":
             if should_emit_use:

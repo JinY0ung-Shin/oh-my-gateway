@@ -7,6 +7,8 @@ to the same server API directly with httpx.
 
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 import logging
 import os
@@ -29,6 +31,17 @@ from src.constants import DEFAULT_TIMEOUT_MS
 
 logger = logging.getLogger(__name__)
 
+_ATTACHED_IMAGE_RE = re.compile(r'<attached_image\s+path="([^"]+)"\s*/>')
+_IMAGE_FILE_RE = re.compile(r"^img_[0-9a-f]{16}\.(?:png|jpg|jpeg|gif|webp)$")
+_IMAGE_MIME_BY_SUFFIX = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+_PERMISSION_REPLIES = {"once", "always", "reject"}
+
 
 @dataclass
 class OpenCodeSessionClient:
@@ -39,10 +52,31 @@ class OpenCodeSessionClient:
     model: Optional[str]
     system_prompt: Optional[str]
     stream_events: bool = False
+    base_url: Optional[str] = None
+    timeout: Optional[float] = None
+    auth: Optional[httpx.Auth] = None
 
     async def disconnect(self) -> None:
-        """Compatibility hook for SessionManager cleanup."""
-        return None
+        """Delete the OpenCode session when the gateway session is cleaned up."""
+        if not self.base_url:
+            return
+        kwargs: Dict[str, Any] = {"base_url": self.base_url}
+        if self.timeout is not None:
+            kwargs["timeout"] = self.timeout
+        if self.auth is not None:
+            kwargs["auth"] = self.auth
+
+        try:
+            async with httpx.AsyncClient(**kwargs) as client:
+                response = await client.delete(
+                    f"/session/{self.session_id}",
+                    params={"directory": self.cwd} if self.cwd else None,
+                )
+                if getattr(response, "status_code", None) == 404:
+                    return
+                response.raise_for_status()
+        except Exception:
+            logger.warning("OpenCode session delete failed for %s", self.session_id, exc_info=True)
 
 
 class OpenCodeClient:
@@ -146,8 +180,7 @@ class OpenCodeClient:
 
         self.close()
         raise TimeoutError(
-            f"Timeout waiting for OpenCode server after {timeout_ms}ms: "
-            f"{''.join(output).strip()}"
+            f"Timeout waiting for OpenCode server after {timeout_ms}ms: {''.join(output).strip()}"
         )
 
     def close(self) -> None:
@@ -249,6 +282,9 @@ class OpenCodeClient:
             cwd=str(Path(cwd)) if cwd else None,
             model=model,
             system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+            base_url=self.base_url,
+            timeout=self.timeout,
+            auth=self._auth(),
         )
 
     def _extract_text(self, payload: Dict[str, Any]) -> str:
@@ -291,7 +327,7 @@ class OpenCodeClient:
     def _prompt_body(self, client: OpenCodeSessionClient, prompt: str) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "agent": self._agent,
-            "parts": [{"type": "text", "text": prompt}],
+            "parts": self._prompt_parts(prompt, client.cwd),
         }
         model = self._split_provider_model(client.model)
         if model:
@@ -299,6 +335,60 @@ class OpenCodeClient:
         if client.system_prompt:
             body["system"] = client.system_prompt
         return body
+
+    async def _prompt_body_async(
+        self,
+        client: OpenCodeSessionClient,
+        prompt: str,
+    ) -> Dict[str, Any]:
+        return await asyncio.to_thread(self._prompt_body, client, prompt)
+
+    def _prompt_parts(self, prompt: str, cwd: Optional[str]) -> List[Dict[str, Any]]:
+        parts: List[Dict[str, Any]] = []
+        cursor = 0
+        for match in _ATTACHED_IMAGE_RE.finditer(prompt):
+            raw_path = match.group(1)
+            file_part = self._file_part_from_path(raw_path, cwd)
+            if file_part is None:
+                logger.warning("OpenCode dropped untrusted attached_image marker: %s", raw_path)
+                continue
+            if match.start() > cursor:
+                parts.append({"type": "text", "text": prompt[cursor : match.start()]})
+            parts.append(file_part)
+            cursor = match.end()
+
+        if cursor < len(prompt) or not parts:
+            parts.append({"type": "text", "text": prompt[cursor:]})
+        return parts
+
+    def _trusted_attached_image_path(self, raw_path: str, cwd: Optional[str]) -> Optional[Path]:
+        if not cwd:
+            return None
+        try:
+            path = Path(raw_path).resolve(strict=True)
+            image_dir = (Path(cwd).resolve() / ".claude_images").resolve()
+        except (OSError, RuntimeError):
+            return None
+        if not path.is_file() or path.parent != image_dir:
+            return None
+        if path.suffix.lower() not in _IMAGE_MIME_BY_SUFFIX:
+            return None
+        if not _IMAGE_FILE_RE.fullmatch(path.name):
+            return None
+        return path
+
+    def _file_part_from_path(self, raw_path: str, cwd: Optional[str]) -> Optional[Dict[str, Any]]:
+        path = self._trusted_attached_image_path(raw_path, cwd)
+        if path is None:
+            return None
+        mime = _IMAGE_MIME_BY_SUFFIX.get(path.suffix.lower(), "application/octet-stream")
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return {
+            "type": "file",
+            "mime": mime,
+            "filename": path.name,
+            "url": f"data:{mime};base64,{encoded}",
+        }
 
     def _question_reply_body(self, output: str) -> Dict[str, Any]:
         answers: list[list[str]]
@@ -318,6 +408,45 @@ class OpenCodeClient:
         else:
             answers = [[str(output)]]
         return {"answers": answers}
+
+    def _permission_reply_body(self, output: str) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(output)
+        except json.JSONDecodeError:
+            parsed = output
+
+        message: Optional[str] = None
+        candidates: list[str] = []
+        if isinstance(parsed, dict):
+            for key in ("reply", "answer", "output"):
+                value = parsed.get(key)
+                if isinstance(value, str):
+                    candidates.append(value)
+            value = parsed.get("message")
+            if isinstance(value, str) and value:
+                message = value
+        elif isinstance(parsed, list):
+            candidates.extend(item for item in parsed if isinstance(item, str))
+        elif isinstance(parsed, str):
+            candidates.append(parsed)
+
+        reply: Optional[str] = None
+        for candidate in candidates:
+            normalized = candidate.strip().lower()
+            if normalized in _PERMISSION_REPLIES:
+                reply = normalized
+                break
+            if normalized in {"yes", "y", "allow", "approve", "approved", "ok", "okay"}:
+                reply = "once"
+                break
+            if normalized in {"no", "n", "deny", "denied", "reject", "rejected"}:
+                reply = "reject"
+                break
+
+        body = {"reply": reply or "reject"}
+        if message:
+            body["message"] = message
+        return body
 
     def _describe_http_error(self, response: Any) -> str:
         status = getattr(response, "status_code", "unknown")
@@ -369,7 +498,7 @@ class OpenCodeClient:
         client: OpenCodeSessionClient,
         prompt: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        body = self._prompt_body(client, prompt)
+        body = await self._prompt_body_async(client, prompt)
         converter = OpenCodeEventConverter(session_id=client.session_id)
 
         try:
@@ -437,7 +566,7 @@ class OpenCodeClient:
                 yield chunk
             return
 
-        body = self._prompt_body(client, prompt)
+        body = await self._prompt_body_async(client, prompt)
 
         try:
             async with httpx.AsyncClient(**self._client_kwargs()) as http_client:
@@ -488,16 +617,15 @@ class OpenCodeClient:
         yield assistant
         yield result
 
-    async def resume_question_with_client(
+    async def _resume_with_client(
         self,
         client: OpenCodeSessionClient,
-        call_id: str,
-        output: str,
+        reply_path: str,
+        reply_body: Dict[str, Any],
         session: Any,
+        label: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Resume an OpenCode question tool call with the user's answer."""
         _ = session
-        request_id = call_id
         converter = OpenCodeEventConverter(session_id=client.session_id)
         try:
             async with httpx.AsyncClient(**self._event_client_kwargs()) as event_client:
@@ -509,8 +637,8 @@ class OpenCodeClient:
                     event_response.raise_for_status()
                     async with httpx.AsyncClient(**self._client_kwargs()) as reply_client:
                         response = await reply_client.post(
-                            f"/question/{request_id}/reply",
-                            json=self._question_reply_body(output),
+                            reply_path,
+                            json=reply_body,
                             params=self._directory_params(client.cwd),
                         )
                         try:
@@ -532,13 +660,47 @@ class OpenCodeClient:
                         for chunk in converter.convert(event):
                             yield chunk
         except Exception as exc:
-            logger.error("OpenCode question continuation failed: %s", exc, exc_info=True)
+            logger.error("OpenCode %s continuation failed: %s", label, exc, exc_info=True)
             yield {"type": "error", "is_error": True, "error_message": str(exc)}
             return
 
         text = converter.final_text()
         yield {"type": "assistant", "content": [{"type": "text", "text": text}]}
         yield {"type": "result", "subtype": "success", "result": text}
+
+    async def resume_question_with_client(
+        self,
+        client: OpenCodeSessionClient,
+        call_id: str,
+        output: str,
+        session: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Resume an OpenCode question tool call with the user's answer."""
+        async for chunk in self._resume_with_client(
+            client,
+            f"/question/{call_id}/reply",
+            self._question_reply_body(output),
+            session,
+            "question",
+        ):
+            yield chunk
+
+    async def resume_permission_with_client(
+        self,
+        client: OpenCodeSessionClient,
+        call_id: str,
+        output: str,
+        session: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Resume an OpenCode permission prompt with the user's decision."""
+        async for chunk in self._resume_with_client(
+            client,
+            f"/permission/{call_id}/reply",
+            self._permission_reply_body(output),
+            session,
+            "permission",
+        ):
+            yield chunk
 
     def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         for message in reversed(messages):
