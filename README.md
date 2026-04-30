@@ -7,7 +7,7 @@
 
 OpenAI-compatible gateway for coding agent backends. It exposes Claude Agent SDK and OpenCode through one `/v1/responses` API with streaming, multi-turn `previous_response_id` chaining, MCP integration, workspace isolation, and an admin dashboard.
 
-> Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude.
+> Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose service is now `gateway`; update commands such as `docker compose logs claude-wrapper` to use `gateway`.
 
 ## Quick Start
 
