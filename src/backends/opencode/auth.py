@@ -17,13 +17,12 @@ class OpenCodeAuthProvider(BackendAuthProvider):
         return "opencode"
 
     def validate(self) -> Dict[str, Any]:
-        if os.getenv("OPENCODE_BASE_URL"):
+        base_url = os.getenv("OPENCODE_BASE_URL")
+        if base_url:
             return {
-                "valid": False,
-                "errors": [
-                    "OPENCODE_BASE_URL is no longer supported; unset it to use managed OpenCode"
-                ],
-                "config": {"mode": "managed"},
+                "valid": True,
+                "errors": [],
+                "config": {"mode": "external", "base_url": base_url},
             }
 
         binary = shutil.which(os.getenv("OPENCODE_BIN", "opencode"))
@@ -48,6 +47,7 @@ class OpenCodeAuthProvider(BackendAuthProvider):
             "OPENCODE_PORT",
             "OPENCODE_START_TIMEOUT_MS",
             "OPENCODE_AGENT",
+            "OPENCODE_BASE_URL",
             "OPENCODE_SERVER_USERNAME",
             "OPENCODE_SERVER_PASSWORD",
             "OPENCODE_CONFIG_CONTENT",
