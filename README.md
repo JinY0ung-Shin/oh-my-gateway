@@ -35,6 +35,7 @@ curl http://localhost:8000/v1/responses \
 | OpenCode backend overview + when to use which mode | [docs/opencode/](docs/opencode/) |
 | OpenCode managed mode (gateway spawns `opencode serve`) | [docs/opencode/managed.md](docs/opencode/managed.md) |
 | OpenCode external mode (point at an existing `opencode serve`) | [docs/opencode/external.md](docs/opencode/external.md) |
+| OpenCode + LiteLLM recipes (reasoning content, multi-provider routing) | [docs/opencode/litellm.md](docs/opencode/litellm.md) |
 | SSE streaming event reference | [docs/streaming-events.md](docs/streaming-events.md) |
 | System prompt presets | [docs/](docs/) — `claude-code-system-prompt-reference.md`, `compact-system-prompt.md`, `minimal-system-prompt.md` |
 
