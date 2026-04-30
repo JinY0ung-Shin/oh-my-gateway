@@ -180,6 +180,65 @@ async def test_stream_response_chunks_success_suppresses_thinking_and_formats_to
 
 
 @pytest.mark.asyncio
+async def test_stream_response_chunks_suppresses_ask_user_question_response_result():
+    async def ask_user_question_continuation_source():
+        yield {
+            "type": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "toolu_ask_1",
+                    "content": "User responded: 그냥 테스트",
+                    "is_error": True,
+                }
+            ],
+        }
+        yield {
+            "type": "assistant",
+            "content": [{"type": "text", "text": "잘 작동하네요."}],
+        }
+        yield {
+            "type": "result",
+            "subtype": "success",
+            "result": "잘 작동하네요.",
+        }
+
+    chunks_buffer = []
+    stream_result = {}
+
+    lines = [
+        line
+        async for line in stream_response_chunks(
+            chunk_source=ask_user_question_continuation_source(),
+            model="claude-test",
+            response_id="resp-stream-ask",
+            output_item_id="msg-stream-ask",
+            chunks_buffer=chunks_buffer,
+            logger=logging.getLogger("test-stream-ask-user-question"),
+            prompt_text="",
+            metadata={},
+            stream_result=stream_result,
+            request_context={
+                "continuation": True,
+                "function_call_output_call_id": "toolu_ask_1",
+            },
+        )
+    ]
+
+    parsed = [_parse_response_sse(line) for line in lines]
+    event_types = [event_type for event_type, _payload in parsed]
+
+    assert "response.tool_result" not in event_types
+    assert [
+        payload["delta"]
+        for event_type, payload in parsed
+        if event_type == "response.output_text.delta"
+    ] == ["잘 작동하네요."]
+    assert parsed[-1][0] == "response.completed"
+    assert stream_result["success"] is True
+
+
+@pytest.mark.asyncio
 async def test_stream_response_chunks_formats_legacy_assistant_messages():
     async def legacy_assistant_source():
         yield {

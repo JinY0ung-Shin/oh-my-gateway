@@ -485,6 +485,7 @@ async def get_backends_health() -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     for name in backend_names:
         info: Dict[str, Any] = {"name": name, "registered": False}
+        client = None
 
         # Registration status
         if BackendRegistry.is_registered(name):
@@ -517,6 +518,19 @@ async def get_backends_health() -> List[Dict[str, Any]]:
             }
         except Exception as e:
             info["auth"] = {"valid": False, "method": "unknown", "errors": [str(e)]}
+
+        metadata: Dict[str, Any] = {}
+        runtime_metadata = getattr(client, "runtime_metadata", None) if client else None
+        if callable(runtime_metadata):
+            try:
+                metadata = runtime_metadata()
+            except Exception:
+                logger.warning(
+                    "Failed to collect backend runtime metadata for %s",
+                    name,
+                    exc_info=True,
+                )
+        info["metadata"] = metadata
 
         results.append(info)
 

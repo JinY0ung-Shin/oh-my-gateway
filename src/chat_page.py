@@ -326,6 +326,9 @@ body::after {
   font-weight: 600;
   margin-bottom: 0.4rem;
 }
+.ask-prompt .ask-question {
+  margin-bottom: 0.65rem;
+}
 .ask-prompt .ask-options {
   display: flex;
   flex-direction: column;
@@ -345,6 +348,11 @@ body::after {
   cursor: pointer;
   transition: all 0.15s;
 }
+.ask-prompt .ask-option-btn.multi {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+}
 .ask-prompt .ask-option-btn:hover {
   border-color: var(--magenta);
   background: rgba(255, 0, 255, 0.08);
@@ -354,7 +362,15 @@ body::after {
   background: rgba(255, 0, 255, 0.15);
   color: var(--magenta);
 }
+.ask-prompt .ask-option-marker {
+  flex: 0 0 auto;
+  color: var(--magenta);
+}
+.ask-prompt .ask-option-main {
+  min-width: 0;
+}
 .ask-prompt .ask-option-desc {
+  display: block;
   font-size: var(--fs-xs);
   color: var(--text-dim);
   margin-top: 2px;
@@ -784,25 +800,36 @@ function showAskPrompt(argsObj, callId, responseId) {
   div.id = 'ask-prompt-' + callId;
 
   // Parse structured questions with options
-  const questions = argsObj.questions;
+  let questions = argsObj.questions;
+  if ((!Array.isArray(questions) || questions.length === 0) && argsObj.question && Array.isArray(argsObj.options)) {
+    questions = [argsObj];
+  }
   if (questions && Array.isArray(questions) && questions.length > 0) {
     // Structured format: { questions: [{ question, header, options }] }
     let html = '<div class="role">AskUserQuestion</div>';
-    for (const q of questions) {
+    for (let i = 0; i < questions.length; i++) {
+      const q = questions[i];
+      const multiple = q.multiple === true;
+      html += '<div class="ask-question" data-index="' + i + '" data-multiple="' + (multiple ? 'true' : 'false') + '">';
       if (q.header) html += '<div class="ask-header">' + escapeHtml(q.header) + '</div>';
       if (q.question) html += '<div class="ask-bubble">' + escapeHtml(q.question) + '</div>';
       if (q.options && Array.isArray(q.options)) {
         html += '<div class="ask-options">';
         for (const opt of q.options) {
-          const label = opt.label || opt;
-          const desc = opt.description || '';
-          html += '<button class="ask-option-btn" data-label="' + escapeAttr(label) + '">' +
-            escapeHtml(label) +
-            (desc ? '<div class="ask-option-desc">' + escapeHtml(desc) + '</div>' : '') +
+          const isObjectOption = typeof opt === 'object' && opt !== null;
+          const label = typeof opt === 'string' ? opt : (isObjectOption ? (opt.label || '') : '');
+          const desc = isObjectOption ? (opt.description || '') : '';
+          if (!label) continue;
+          html += '<button type="button" class="ask-option-btn' + (multiple ? ' multi' : '') + '" data-label="' + escapeAttr(label) + '" aria-pressed="false">' +
+            (multiple ? '<span class="ask-option-marker" aria-hidden="true">[ ]</span>' : '') +
+            '<span class="ask-option-main"><span class="ask-option-label">' + escapeHtml(label) + '</span>' +
+            (desc ? '<span class="ask-option-desc">' + escapeHtml(desc) + '</span>' : '') +
+            '</span>' +
             '</button>';
         }
         html += '</div>';
       }
+      html += '</div>';
     }
     html += '<div class="ask-input-row">' +
       '<input type="text" class="ask-input" placeholder="직접 입력...">' +
@@ -822,12 +849,26 @@ function showAskPrompt(argsObj, callId, responseId) {
   chatEl.appendChild(div);
   scrollToBottom();
 
-  // Option button click → fill input
+  // Option button click -> update selected answers
   div.querySelectorAll('.ask-option-btn').forEach(btn => {
     btn.addEventListener('click', () => {
-      div.querySelectorAll('.ask-option-btn').forEach(b => b.classList.remove('selected'));
-      btn.classList.add('selected');
-      div.querySelector('.ask-input').value = btn.dataset.label;
+      const question = btn.closest('.ask-question');
+      const multiple = question && question.dataset.multiple === 'true';
+      if (multiple) {
+        btn.classList.toggle('selected');
+        const selected = btn.classList.contains('selected');
+        btn.setAttribute('aria-pressed', selected ? 'true' : 'false');
+        const marker = btn.querySelector('.ask-option-marker');
+        if (marker) marker.textContent = selected ? '[x]' : '[ ]';
+      } else if (question) {
+        question.querySelectorAll('.ask-option-btn').forEach(b => {
+          b.classList.remove('selected');
+          b.setAttribute('aria-pressed', 'false');
+        });
+        btn.classList.add('selected');
+        btn.setAttribute('aria-pressed', 'true');
+      }
+      syncAskInputPreview(div);
     });
   });
 
@@ -841,11 +882,51 @@ function showAskPrompt(argsObj, callId, responseId) {
   askInput.focus();
 }
 
+function selectedLabelsForQuestion(questionEl) {
+  return Array.from(questionEl.querySelectorAll('.ask-option-btn.selected'))
+    .map(btn => btn.dataset.label || '')
+    .filter(Boolean);
+}
+
+function syncAskInputPreview(container) {
+  const input = container.querySelector('.ask-input');
+  if (!input) return;
+  const questions = Array.from(container.querySelectorAll('.ask-question'));
+  if (!questions.length) return;
+  const labels = questions.flatMap(selectedLabelsForQuestion);
+  input.value = labels.join(', ');
+}
+
+function collectAskAnswer(container) {
+  const input = container.querySelector('.ask-input');
+  const typed = input ? input.value.trim() : '';
+  const questions = Array.from(container.querySelectorAll('.ask-question'));
+  if (!questions.length) return { payload: typed, display: typed };
+
+  const answersByQuestion = questions.map(selectedLabelsForQuestion);
+  const hasSelected = answersByQuestion.some(answers => answers.length > 0);
+  if (!hasSelected) return { payload: typed, display: typed };
+
+  const display = answersByQuestion
+    .map(answers => answers.join(', '))
+    .filter(Boolean)
+    .join(' / ');
+  if (questions.length === 1) {
+    const multiple = questions[0].dataset.multiple === 'true';
+    const answers = answersByQuestion[0];
+    return {
+      payload: multiple ? JSON.stringify(answers) : answers[0],
+      display,
+    };
+  }
+  return { payload: JSON.stringify(answersByQuestion), display };
+}
+
 async function doSubmitAsk(container) {
   if (!pendingAsk) return;
   const input = container.querySelector('.ask-input');
-  const answer = input.value.trim();
-  if (!answer) return;
+  const answer = collectAskAnswer(container);
+  if (!answer.payload) return;
 
   const { call_id, response_id } = pendingAsk;
   pendingAsk = null;
@@ -856,11 +937,11 @@ async function doSubmitAsk(container) {
   container.querySelector('.ask-submit').textContent = 'SENT';
   container.querySelectorAll('.ask-option-btn').forEach(b => { b.disabled = true; });
 
-  addMessage('user', answer);
+  addMessage('user', answer.display || answer.payload);
 
   await streamRequest({
     model: modelSelect.value,
-    input: [{ type: 'function_call_output', call_id, output: answer }],
+    input: [{ type: 'function_call_output', call_id, output: answer.payload }],
     previous_response_id: response_id,
     stream: true,
   });

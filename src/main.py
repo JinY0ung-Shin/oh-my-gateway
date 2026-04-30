@@ -1,6 +1,7 @@
 import os
 import json
 import asyncio
+import inspect
 import logging
 import secrets
 import string
@@ -180,6 +181,20 @@ async def _verify_backends() -> None:
             logger.error(f"⚠️  {name} backend verification failed: {e}")
 
 
+async def _shutdown_backends() -> None:
+    """Close backend-owned resources such as managed child processes."""
+    for name, backend in BackendRegistry.all_backends().items():
+        close = getattr(backend, "close", None) or getattr(backend, "shutdown", None)
+        if close is None:
+            continue
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning("Backend %s shutdown failed", name, exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize backends, verify authentication, and start background tasks."""
@@ -274,6 +289,7 @@ async def lifespan(app: FastAPI):
     # Cleanup on shutdown (async to disconnect SDK clients)
     logger.info("Shutting down session manager...")
     await session_manager.async_shutdown()
+    await _shutdown_backends()
     await usage_logger.close()
 
 

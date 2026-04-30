@@ -1,0 +1,1814 @@
+"""OpenCode backend tests."""
+
+import importlib
+import json
+import logging
+from pathlib import Path
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def stub_opencode_managed_server(monkeypatch):
+    """Avoid starting a real OpenCode process in unit tests."""
+    monkeypatch.delenv("OPENCODE_BASE_URL", raising=False)
+
+    def fail_if_process_starts(*args, **kwargs):
+        raise AssertionError("unit tests must not start a real opencode process")
+
+    monkeypatch.setattr("src.backends.opencode.client.subprocess.Popen", fail_if_process_starts)
+    monkeypatch.setattr(
+        "src.backends.opencode.client.OpenCodeClient._start_managed_server",
+        lambda self: "http://127.0.0.1:4096",
+        raising=False,
+    )
+
+
+def test_opencode_client_rejects_legacy_base_url_env(monkeypatch):
+    """OPENCODE_BASE_URL is rejected instead of silently changing backend behavior."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://external.example:4096")
+    monkeypatch.setenv("OPENCODE_MODELS", "openai/gpt-5.5")
+
+    import src.backends.opencode.client as client_module
+    import src.backends.opencode.constants as constants_module
+
+    importlib.reload(constants_module)
+    client_module = importlib.reload(client_module)
+    # Safety net: if the fail-fast branch is removed later, keep this reloaded
+    # class from starting a real OpenCode process.
+    monkeypatch.setattr(
+        client_module.OpenCodeClient,
+        "_start_managed_server",
+        lambda self: "http://127.0.0.1:15555",
+    )
+
+    with pytest.raises(RuntimeError, match="OPENCODE_BASE_URL is no longer supported"):
+        client_module.OpenCodeClient()
+
+
+def test_opencode_client_constructor_rejects_external_base_url():
+    """External OpenCode servers are no longer a supported backend mode."""
+    from src.backends.opencode.client import OpenCodeClient
+
+    with pytest.raises(TypeError):
+        OpenCodeClient(base_url="http://127.0.0.1:4096")
+
+
+def test_opencode_managed_config_enables_question_tool_by_default(monkeypatch):
+    """Managed OpenCode config exposes the question tool by default."""
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.delenv("OPENCODE_QUESTION_PERMISSION", raising=False)
+    monkeypatch.delenv("OPENCODE_DEFAULT_MODEL", raising=False)
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    client = OpenCodeClient()
+
+    config = json.loads(client._managed_config_content())
+
+    assert config["permission"]["question"] == "ask"
+    assert config["share"] == "disabled"
+
+
+def test_opencode_managed_config_allows_question_permission_override(monkeypatch):
+    """Operators can override the managed OpenCode question permission."""
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.setenv("OPENCODE_QUESTION_PERMISSION", "allow")
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    client = OpenCodeClient()
+
+    config = json.loads(client._managed_config_content())
+
+    assert config["permission"]["question"] == "allow"
+
+
+def test_opencode_managed_config_can_include_wrapper_mcp(monkeypatch):
+    """Managed OpenCode config can copy wrapper MCP servers when enabled."""
+    monkeypatch.delenv("OPENCODE_CONFIG_CONTENT", raising=False)
+    monkeypatch.delenv("OPENCODE_QUESTION_PERMISSION", raising=False)
+    monkeypatch.setenv("OPENCODE_USE_WRAPPER_MCP_CONFIG", "true")
+    monkeypatch.setenv("OPENCODE_DEFAULT_MODEL", "openai/gpt-5.5")
+    monkeypatch.setattr(
+        "src.mcp_config.get_validated_mcp_config",
+        lambda: {"demo": {"type": "stdio", "command": "uvx", "args": ["demo"]}},
+    )
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    client = OpenCodeClient()
+    config = json.loads(client._managed_config_content())
+
+    assert config["model"] == "openai/gpt-5.5"
+    assert config["permission"]["question"] == "ask"
+    assert config["mcp"]["demo"] == {"type": "local", "command": ["uvx", "demo"]}
+
+
+def test_opencode_descriptor_resolves_prefixed_model(monkeypatch):
+    """OpenCode descriptor resolves opencode/<provider>/<model> IDs."""
+    monkeypatch.setenv("OPENCODE_MODELS", "anthropic/claude-sonnet-4-5")
+
+    import src.backends.opencode as opencode_pkg
+
+    opencode_pkg = importlib.reload(opencode_pkg)
+
+    resolved = opencode_pkg.OPENCODE_DESCRIPTOR.resolve_fn("opencode/anthropic/claude-sonnet-4-5")
+
+    assert resolved is not None
+    assert resolved.public_model == "opencode/anthropic/claude-sonnet-4-5"
+    assert resolved.backend == "opencode"
+    assert resolved.provider_model == "anthropic/claude-sonnet-4-5"
+    assert opencode_pkg.OPENCODE_DESCRIPTOR.models == ["opencode/anthropic/claude-sonnet-4-5"]
+
+
+def test_opencode_descriptor_rejects_unprefixed_model(monkeypatch):
+    """OpenCode descriptor does not claim bare provider/model IDs."""
+    monkeypatch.setenv("OPENCODE_MODELS", "anthropic/claude-sonnet-4-5")
+
+    import src.backends.opencode as opencode_pkg
+
+    opencode_pkg = importlib.reload(opencode_pkg)
+
+    assert opencode_pkg.OPENCODE_DESCRIPTOR.resolve_fn("anthropic/claude-sonnet-4-5") is None
+    assert opencode_pkg.OPENCODE_DESCRIPTOR.resolve_fn("opencode/missing_provider_model") is None
+
+
+def test_opencode_auth_provider_validates_managed_binary(monkeypatch):
+    """Managed mode is valid when the opencode binary is available."""
+    monkeypatch.setattr("src.backends.opencode.auth.shutil.which", lambda name: "/bin/opencode")
+
+    from src.backends.opencode.auth import OpenCodeAuthProvider
+
+    status = OpenCodeAuthProvider().validate()
+
+    assert status["valid"] is True
+    assert status["errors"] == []
+    assert status["config"]["mode"] == "managed"
+
+
+def test_opencode_auth_provider_rejects_legacy_base_url_regardless_of_binary(monkeypatch):
+    """OPENCODE_BASE_URL fails auth validation instead of selecting external mode."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setattr("src.backends.opencode.auth.shutil.which", lambda name: "/bin/opencode")
+
+    from src.backends.opencode.auth import OpenCodeAuthProvider
+
+    status = OpenCodeAuthProvider().validate()
+
+    assert status["valid"] is False
+    assert status["errors"] == [
+        "OPENCODE_BASE_URL is no longer supported; unset it to use managed OpenCode"
+    ]
+    assert status["config"]["mode"] == "managed"
+
+
+def test_opencode_auth_env_excludes_legacy_base_url(monkeypatch):
+    """Backend env passthrough should not advertise an external-server mode."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.setenv("OPENCODE_DEFAULT_MODEL", "openai/gpt-5.5")
+
+    from src.backends.opencode.auth import OpenCodeAuthProvider
+
+    env = OpenCodeAuthProvider().build_env()
+
+    assert "OPENCODE_BASE_URL" not in env
+    assert env["OPENCODE_DEFAULT_MODEL"] == "openai/gpt-5.5"
+
+
+def test_auth_manager_returns_opencode_provider():
+    """auth_manager can instantiate OpenCode auth before live backend registration."""
+    from src.auth import auth_manager
+
+    provider = auth_manager.get_provider("opencode")
+
+    assert provider.name == "opencode"
+
+
+def test_opencode_event_converter_emits_text_delta_and_final_text():
+    """OpenCode event converter emits gateway text deltas and accumulates final text."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "p1",
+                "field": "text",
+                "delta": "hello",
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "hello"},
+            },
+        }
+    ]
+    assert converter.final_text() == "hello"
+
+
+def test_opencode_event_converter_ignores_other_sessions():
+    """OpenCode event converter ignores events for unrelated sessions."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "other-session",
+                "partID": "p1",
+                "field": "text",
+                "delta": "wrong",
+            },
+        }
+    )
+
+    assert chunks == []
+    assert converter.final_text() == ""
+
+
+def test_opencode_event_converter_ignores_user_text_parts():
+    """OpenCode event converter only emits text from assistant messages."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    user_message = {
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "info": {
+                "id": "msg-user",
+                "role": "user",
+                "sessionID": "oc-session",
+            },
+        },
+    }
+    user_part = {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "part": {
+                "id": "part-user",
+                "messageID": "msg-user",
+                "sessionID": "oc-session",
+                "type": "text",
+                "text": "Say exactly ok",
+            },
+        },
+    }
+    assistant_message = {
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "info": {
+                "id": "msg-assistant",
+                "role": "assistant",
+                "sessionID": "oc-session",
+            },
+        },
+    }
+    assistant_start = {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "part": {
+                "id": "part-assistant",
+                "messageID": "msg-assistant",
+                "sessionID": "oc-session",
+                "type": "text",
+                "text": "",
+            },
+        },
+    }
+    assistant_delta = {
+        "type": "message.part.delta",
+        "properties": {
+            "sessionID": "oc-session",
+            "messageID": "msg-assistant",
+            "partID": "part-assistant",
+            "field": "text",
+            "delta": "ok",
+        },
+    }
+    assistant_done = {
+        "type": "message.part.updated",
+        "properties": {
+            "sessionID": "oc-session",
+            "part": {
+                "id": "part-assistant",
+                "messageID": "msg-assistant",
+                "sessionID": "oc-session",
+                "type": "text",
+                "text": "ok",
+            },
+        },
+    }
+
+    chunks = []
+    for event in [
+        user_message,
+        user_part,
+        assistant_message,
+        assistant_start,
+        assistant_delta,
+        assistant_done,
+    ]:
+        chunks.extend(converter.convert(event))
+
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "ok"},
+            },
+        }
+    ]
+    assert converter.final_text() == "ok"
+
+
+def test_opencode_event_converter_emits_tool_use_and_result_once():
+    """OpenCode event converter emits a tool_use and a completed tool_result."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    running_chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {"status": "running", "input": {"command": "pwd"}},
+                },
+            },
+        }
+    )
+    completed_chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "pwd"},
+                        "output": "/tmp/work\n",
+                    },
+                },
+            },
+        }
+    )
+
+    assert running_chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "bash",
+                    "input": {"command": "pwd"},
+                }
+            ],
+        }
+    ]
+    assert completed_chunks == [
+        {
+            "type": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "/tmp/work\n",
+                    "is_error": False,
+                }
+            ],
+        }
+    ]
+
+
+def test_opencode_event_converter_emits_error_tool_result():
+    """OpenCode event converter emits error tool results from failed tool updates."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "error",
+                        "input": {"command": "exit 1"},
+                        "error": "failed",
+                    },
+                },
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "call-1",
+                    "name": "bash",
+                    "input": {"command": "exit 1"},
+                }
+            ],
+        },
+        {
+            "type": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "call-1",
+                    "content": "failed",
+                    "is_error": True,
+                }
+            ],
+        },
+    ]
+
+
+def test_opencode_event_converter_emits_question_request_tool_use():
+    """Question requests are exposed as Responses-compatible tool_use chunks."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    chunks = converter.convert(
+        {
+            "type": "question.asked",
+            "properties": {
+                "id": "que_1",
+                "sessionID": "oc-session",
+                "questions": [
+                    {
+                        "question": "Continue?",
+                        "options": [{"label": "Yes"}, {"label": "No"}],
+                    },
+                ],
+                "tool": {"messageID": "msg_1", "callID": "call_1"},
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "que_1",
+                    "name": "question",
+                    "input": {
+                        "questions": [
+                            {
+                                "question": "Continue?",
+                                "options": [{"label": "Yes"}, {"label": "No"}],
+                            }
+                        ],
+                    },
+                    "metadata": {
+                        "opencode_question_request_id": "que_1",
+                        "opencode_tool_call_id": "call_1",
+                    },
+                }
+            ],
+        }
+    ]
+
+
+def test_opencode_event_converter_emits_permission_request_tool_use():
+    """Permission requests are exposed as resumable OpenCode tool_use chunks."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    chunks = converter.convert(
+        {
+            "type": "permission.asked",
+            "properties": {
+                "id": "perm_1",
+                "sessionID": "oc-session",
+                "permission": "bash",
+                "patterns": ["npm test"],
+                "always": ["npm *"],
+                "metadata": {"command": "npm test"},
+                "tool": {"messageID": "msg_1", "callID": "call_1"},
+            },
+        }
+    )
+
+    assert chunks == [
+        {
+            "type": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "perm_1",
+                    "name": "permission",
+                    "input": {
+                        "permission": "bash",
+                        "patterns": ["npm test"],
+                        "always": ["npm *"],
+                        "metadata": {"command": "npm test"},
+                    },
+                    "metadata": {
+                        "opencode_permission_request_id": "perm_1",
+                        "opencode_tool_call_id": "call_1",
+                    },
+                }
+            ],
+        }
+    ]
+
+
+def test_opencode_event_converter_suppresses_question_tool_part_updates():
+    """Question tool part updates should not be exposed before question.asked."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "sessionID": "oc-session",
+                    "type": "tool",
+                    "tool": "question",
+                    "callID": "call_1",
+                    "state": {
+                        "status": "running",
+                        "input": {
+                            "questions": [
+                                {
+                                    "question": "Continue?",
+                                    "options": [{"label": "Yes"}, {"label": "No"}],
+                                }
+                            ]
+                        },
+                    },
+                }
+            },
+        }
+    )
+
+    assert chunks == []
+    assert converter.saw_activity is True
+
+
+def test_opencode_event_converter_accumulates_step_finish_usage():
+    """OpenCode event converter accumulates usage from step-finish parts."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+
+    chunks = converter.convert(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 11,
+                        "output": 5,
+                        "reasoning": 2,
+                        "cache": {"read": 3, "write": 7},
+                    },
+                },
+            },
+        }
+    )
+
+    assert chunks == []
+    assert converter.usage == {
+        "input_tokens": 21,
+        "output_tokens": 5,
+        "total_tokens": 28,
+    }
+    assert converter.saw_activity is True
+
+
+def test_opencode_event_converter_finishes_only_after_activity():
+    """OpenCode event converter requires session activity before idle finishes."""
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    converter = OpenCodeEventConverter(session_id="oc-session")
+    idle_event = {"type": "session.idle", "properties": {"sessionID": "oc-session"}}
+
+    assert converter.finished(idle_event) is False
+
+    converter.convert(
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "ok",
+            },
+        }
+    )
+
+    assert (
+        converter.finished({"type": "session.idle", "properties": {"sessionID": "other-session"}})
+        is False
+    )
+    assert converter.finished(idle_event) is True
+
+
+async def test_opencode_client_sends_prompt_to_existing_server(monkeypatch):
+    """OpenCode client creates a session and sends prompt bodies over HTTP."""
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def get(self, path):
+            calls.append(("GET", path, {}))
+            return FakeResponse({"healthy": True, "version": "test"})
+
+        async def post(self, path, **kwargs):
+            calls.append(("POST", path, kwargs))
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse(
+                {
+                    "info": {
+                        "role": "assistant",
+                        "tokens": {
+                            "input": 7,
+                            "output": 3,
+                            "reasoning": 0,
+                            "cache": {"read": 0, "write": 0},
+                        },
+                    },
+                    "parts": [{"type": "text", "text": "hello from opencode"}],
+                }
+            )
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(
+        session=session,
+        model="anthropic/claude-sonnet-4-5",
+        system_prompt="request instructions",
+        _custom_base="base prompt",
+        cwd="/tmp/work",
+    )
+    chunks = [
+        chunk async for chunk in backend.run_completion_with_client(client, "say hi", session)
+    ]
+
+    assert calls[0] == (
+        "POST",
+        "/session",
+        {"json": {"title": "gw-session"}, "params": {"directory": "/tmp/work"}},
+    )
+    assert calls[1][0] == "POST"
+    assert calls[1][1] == "/session/oc-session/message"
+    assert calls[1][2]["json"]["system"] == "base prompt\n\nrequest instructions"
+    assert calls[1][2]["json"]["model"] == {
+        "providerID": "anthropic",
+        "modelID": "claude-sonnet-4-5",
+    }
+    assert calls[1][2]["json"]["agent"] == "general"
+    assert calls[1][2]["json"]["parts"] == [{"type": "text", "text": "say hi"}]
+    assert getattr(session, "opencode_session_id") == "oc-session"
+    assert chunks[-1]["result"] == "hello from opencode"
+    assert chunks[-1]["usage"]["input_tokens"] == 7
+    assert chunks[-1]["usage"]["output_tokens"] == 3
+    assert backend.parse_message(chunks) == "hello from opencode"
+
+
+async def test_opencode_client_uses_configured_agent(monkeypatch):
+    """OPENCODE_AGENT overrides the default OpenCode request agent."""
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, path, **kwargs):
+            calls.append((path, kwargs))
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse(
+                {
+                    "info": {"role": "assistant"},
+                    "parts": [{"type": "text", "text": "ok"}],
+                }
+            )
+
+    monkeypatch.setenv("OPENCODE_AGENT", "plan")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert calls[1][1]["json"]["agent"] == "plan"
+    assert chunks[-1]["result"] == "ok"
+
+
+async def test_opencode_client_resumes_question_with_reply_endpoint(monkeypatch):
+    """OpenCode question continuation replies to the pending question request."""
+    calls = []
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-2",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "continued",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=True):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield f"event: {event['type']}"
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            calls.append(("STREAM", method, path, kwargs))
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            calls.append(("POST", path, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setenv("OPENCODE_AGENT", "plan")
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+    chunks = [
+        chunk
+        async for chunk in backend.resume_question_with_client(
+            client,
+            "que_1",
+            "yes",
+            Session(session_id="gw-session"),
+        )
+    ]
+
+    assert calls == [
+        (
+            "STREAM",
+            "GET",
+            "/event",
+            {"params": {"directory": "/tmp/work"}},
+        ),
+        (
+            "POST",
+            "/question/que_1/reply",
+            {
+                "json": {
+                    "answers": [["yes"]],
+                },
+                "params": {"directory": "/tmp/work"},
+            },
+        ),
+    ]
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "continued"},
+            },
+        },
+        {"type": "assistant", "content": [{"type": "text", "text": "continued"}]},
+        {"type": "result", "subtype": "success", "result": "continued"},
+    ]
+
+
+async def test_opencode_client_resumes_permission_with_reply_endpoint(monkeypatch):
+    """OpenCode permission continuation replies to the pending permission request."""
+    calls = []
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-2",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "approved",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield f"event: {event['type']}"
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            calls.append(("STREAM", method, path, kwargs))
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            calls.append(("POST", path, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+    chunks = [
+        chunk
+        async for chunk in backend.resume_permission_with_client(
+            client,
+            "perm_1",
+            "always",
+            Session(session_id="gw-session"),
+        )
+    ]
+
+    assert calls == [
+        (
+            "STREAM",
+            "GET",
+            "/event",
+            {"params": {"directory": "/tmp/work"}},
+        ),
+        (
+            "POST",
+            "/permission/perm_1/reply",
+            {
+                "json": {"reply": "always"},
+                "params": {"directory": "/tmp/work"},
+            },
+        ),
+    ]
+    assert chunks == [
+        {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": "approved"},
+            },
+        },
+        {"type": "assistant", "content": [{"type": "text", "text": "approved"}]},
+        {"type": "result", "subtype": "success", "result": "approved"},
+    ]
+
+
+async def test_opencode_session_client_disconnect_deletes_server_session(monkeypatch):
+    """OpenCode session cleanup deletes the corresponding server-side session."""
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            calls.append(("CLIENT", kwargs))
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def delete(self, path, **kwargs):
+            calls.append(("DELETE", path, kwargs))
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeSessionClient
+
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+        base_url="http://127.0.0.1:4096",
+        timeout=12.5,
+    )
+
+    await client.disconnect()
+
+    assert calls == [
+        ("CLIENT", {"base_url": "http://127.0.0.1:4096", "timeout": 12.5}),
+        (
+            "DELETE",
+            "/session/oc-session",
+            {"params": {"directory": "/tmp/work"}},
+        ),
+    ]
+
+
+async def test_opencode_session_client_disconnect_logs_warning_on_failure(
+    monkeypatch,
+    caplog,
+):
+    """OpenCode cleanup failures should be visible in operator logs."""
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def delete(self, path, **kwargs):
+            raise RuntimeError("delete failed")
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeSessionClient
+
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd="/tmp/work",
+        model="openai/gpt-5.5",
+        system_prompt=None,
+        base_url="http://127.0.0.1:4096",
+        timeout=12.5,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="src.backends.opencode.client"):
+        await client.disconnect()
+
+    assert "OpenCode session delete failed for oc-session" in caplog.text
+
+
+def test_opencode_prompt_body_converts_attached_image_markers_to_file_parts(tmp_path):
+    """Responses image markers are sent to OpenCode as file parts."""
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+
+    image_dir = tmp_path / ".claude_images"
+    image_dir.mkdir()
+    image_path = image_dir / "img_0123456789abcdef.png"
+    image_path.write_bytes(b"\x89PNG\r\n\x1a\nfake")
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd=str(tmp_path),
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+
+    body = backend._prompt_body(
+        client,
+        f'describe this\n<attached_image path="{image_path}" />\nthanks',
+    )
+
+    assert body["parts"] == [
+        {"type": "text", "text": "describe this\n"},
+        {
+            "type": "file",
+            "mime": "image/png",
+            "filename": Path(image_path).name,
+            "url": "data:image/png;base64,iVBORw0KGgpmYWtl",
+        },
+        {"type": "text", "text": "\nthanks"},
+    ]
+
+
+def test_opencode_prompt_body_treats_untrusted_attached_image_marker_as_text(
+    tmp_path,
+    caplog,
+):
+    """User-authored image markers must not trigger arbitrary local file reads."""
+    from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret_path = tmp_path / "secret.txt"
+    secret_path.write_text("do not read", encoding="utf-8")
+
+    backend = OpenCodeClient()
+    client = OpenCodeSessionClient(
+        session_id="oc-session",
+        cwd=str(workspace),
+        model="openai/gpt-5.5",
+        system_prompt=None,
+    )
+
+    prompt = f'before <attached_image path="{secret_path}" /> after'
+    with caplog.at_level(logging.WARNING, logger="src.backends.opencode.client"):
+        body = backend._prompt_body(client, prompt)
+
+    assert body["parts"] == [{"type": "text", "text": prompt}]
+    assert "OpenCode dropped untrusted attached_image marker" in caplog.text
+
+
+def test_opencode_permission_reply_body_fails_closed_for_unknown_inputs():
+    """Unknown permission outputs must reject instead of allowing once."""
+    from src.backends.opencode.client import OpenCodeClient
+
+    backend = OpenCodeClient()
+
+    assert backend._permission_reply_body("") == {"reply": "reject"}
+    assert backend._permission_reply_body("maybe") == {"reply": "reject"}
+    assert backend._permission_reply_body('{"reply":"later"}') == {"reply": "reject"}
+
+
+def test_opencode_permission_reply_body_normalizes_known_inputs():
+    """Known permission outputs map to OpenCode's reply enum."""
+    from src.backends.opencode.client import OpenCodeClient
+
+    backend = OpenCodeClient()
+
+    assert backend._permission_reply_body("yes") == {"reply": "once"}
+    assert backend._permission_reply_body("no") == {"reply": "reject"}
+    assert backend._permission_reply_body('{"reply":"always","message":"remember"}') == {
+        "reply": "always",
+        "message": "remember",
+    }
+
+
+async def test_opencode_client_reports_empty_json_response(monkeypatch):
+    """Empty OpenCode response bodies produce actionable backend errors."""
+
+    class EmptyResponse:
+        status_code = 200
+        text = ""
+        headers = {"content-type": "application/json", "content-length": "0"}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise json.JSONDecodeError("Expecting value", "", 0)
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return EmptyResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks == [
+        {
+            "type": "error",
+            "is_error": True,
+            "error_message": (
+                "OpenCode returned an empty or non-JSON response "
+                "(status=200, content-type=application/json, body='')"
+            ),
+        }
+    ]
+
+
+async def test_opencode_client_streams_text_deltas_from_event_sse(monkeypatch):
+    """Streaming mode uses prompt_async and converts OpenCode text deltas."""
+    calls = []
+
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-1",
+                "partID": "part-1",
+                "field": "text",
+                "delta": "hel",
+            },
+        },
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "messageID": "msg-1",
+                "partID": "part-1",
+                "field": "text",
+                "delta": "lo",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield f"event: {event['type']}"
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            calls.append(("STREAM", method, path, kwargs))
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            calls.append(("POST", path, kwargs))
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert calls[1] == (
+        "STREAM",
+        "GET",
+        "/event",
+        {"params": None},
+    )
+    assert calls[2][0] == "POST"
+    assert calls[2][1] == "/session/oc-session/prompt_async"
+    assert [chunk["event"]["delta"]["text"] for chunk in chunks[:2]] == ["hel", "lo"]
+    assert chunks[-1] == {"type": "result", "subtype": "success", "result": "hello"}
+
+
+async def test_opencode_client_streams_tool_use_and_result_from_event_sse(monkeypatch):
+    """Streaming mode converts OpenCode tool updates to gateway tool chunks."""
+    events = [
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "running",
+                        "input": {"command": "pwd"},
+                        "title": "pwd",
+                    },
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {
+                        "status": "completed",
+                        "input": {"command": "pwd"},
+                        "output": "/tmp/work\n",
+                        "title": "pwd",
+                        "metadata": {},
+                    },
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-text",
+                    "type": "text",
+                    "text": "done",
+                },
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert {
+        "type": "tool_use",
+        "id": "call-1",
+        "name": "bash",
+        "input": {"command": "pwd"},
+    } in [block for chunk in chunks for block in chunk.get("content", [])]
+    assert {
+        "type": "tool_result",
+        "tool_use_id": "call-1",
+        "content": "/tmp/work\n",
+        "is_error": False,
+    } in [block for chunk in chunks for block in chunk.get("content", [])]
+    assert chunks[-1]["result"] == "done"
+
+
+async def test_opencode_streaming_aggregates_step_finish_usage(monkeypatch):
+    """Streaming mode aggregates per-step OpenCode token usage."""
+    events = [
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "ok",
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-step-1",
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 11,
+                        "output": 5,
+                        "reasoning": 2,
+                        "cache": {"read": 3, "write": 7},
+                    },
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-step-2",
+                    "type": "step-finish",
+                    "tokens": {
+                        "input": 13,
+                        "output": 7,
+                        "reasoning": 1,
+                        "cache": {"read": 0, "write": 4},
+                    },
+                },
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks[-1]["usage"] == {
+        "input_tokens": 38,
+        "output_tokens": 12,
+    }
+
+
+async def test_opencode_streaming_ignores_initial_idle_until_activity(monkeypatch):
+    """An idle snapshot before any session activity must not end the stream."""
+    events = [
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+        {
+            "type": "message.part.delta",
+            "properties": {
+                "sessionID": "oc-session",
+                "partID": "part-text",
+                "field": "text",
+                "delta": "after-idle",
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks[-1]["result"] == "after-idle"
+
+
+async def test_opencode_streaming_event_client_disables_read_timeout(monkeypatch):
+    """The /event stream client disables read timeout while keeping connect timeout."""
+    client_kwargs = []
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            yield 'data: {"type":"session.idle","properties":{"sessionID":"oc-session"}}'
+            yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            client_kwargs.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    _ = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    event_timeout = client_kwargs[1]["timeout"]
+    assert event_timeout.connect == backend.timeout
+    assert event_timeout.read is None
+
+
+async def test_opencode_streaming_waits_for_non_empty_tool_input(monkeypatch):
+    """Do not emit tool_use on pending empty input when a later update has input."""
+    events = [
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {"status": "pending", "input": {}},
+                },
+            },
+        },
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "sessionID": "oc-session",
+                "part": {
+                    "id": "part-tool",
+                    "type": "tool",
+                    "callID": "call-1",
+                    "tool": "bash",
+                    "state": {"status": "running", "input": {"command": "pwd"}},
+                },
+            },
+        },
+        {"type": "session.idle", "properties": {"sessionID": "oc-session"}},
+    ]
+
+    class FakeResponse:
+        def __init__(self, payload=None):
+            self._payload = payload or {}
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self._payload
+
+    class FakeStreamResponse:
+        def raise_for_status(self):
+            return None
+
+        async def aiter_lines(self):
+            for event in events:
+                yield "data: " + json.dumps(event)
+                yield ""
+
+    class FakeStreamContext:
+        async def __aenter__(self):
+            return FakeStreamResponse()
+
+        async def __aexit__(self, *args):
+            return None
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        def stream(self, method, path, **kwargs):
+            return FakeStreamContext()
+
+        async def post(self, path, **kwargs):
+            if path == "/session":
+                return FakeResponse({"id": "oc-session"})
+            return FakeResponse()
+
+    monkeypatch.setattr("src.backends.opencode.client.httpx.AsyncClient", FakeAsyncClient)
+
+    from src.backends.opencode.client import OpenCodeClient
+    from src.session_manager import Session
+
+    backend = OpenCodeClient()
+    session = Session(session_id="gw-session")
+    client = await backend.create_client(session=session, model="openai/gpt-5.1-codex")
+    client.stream_events = True
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+    tool_uses = [
+        block
+        for chunk in chunks
+        for block in chunk.get("content", [])
+        if block.get("type") == "tool_use"
+    ]
+
+    assert tool_uses == [
+        {
+            "type": "tool_use",
+            "id": "call-1",
+            "name": "bash",
+            "input": {"command": "pwd"},
+        }
+    ]

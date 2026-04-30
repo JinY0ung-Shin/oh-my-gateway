@@ -20,6 +20,48 @@ from src.admin_service import (
 )
 
 
+async def test_admin_backend_health_includes_opencode_metadata(monkeypatch):
+    """Backend health includes runtime metadata exposed by OpenCode."""
+    from src.admin_service import get_backends_health
+    from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
+
+    def resolve(model):
+        if model == "opencode/openai/gpt-5.5":
+            return ResolvedModel(model, "opencode", "openai/gpt-5.5")
+        return None
+
+    class FakeOpenCodeBackend:
+        name = "opencode"
+
+        def supported_models(self):
+            return ["opencode/openai/gpt-5.5"]
+
+        async def verify(self):
+            return True
+
+        def runtime_metadata(self):
+            return {
+                "mode": "managed",
+                "base_url": "http://127.0.0.1:4096",
+                "agent": "general",
+                "models": ["opencode/openai/gpt-5.5"],
+                "managed_process": True,
+            }
+
+    BackendRegistry.clear()
+    BackendRegistry.register_descriptor(
+        BackendDescriptor("opencode", "opencode", ["opencode/openai/gpt-5.5"], resolve)
+    )
+    BackendRegistry.register("opencode", FakeOpenCodeBackend())
+
+    health = await get_backends_health()
+
+    opencode = next(item for item in health if item["name"] == "opencode")
+    assert opencode["metadata"]["mode"] == "managed"
+    assert opencode["metadata"]["base_url"] == "http://127.0.0.1:4096"
+    assert opencode["metadata"]["models"] == ["opencode/openai/gpt-5.5"]
+
+
 @pytest.fixture
 def workspace(tmp_path):
     """Create a realistic workspace with .claude directory."""

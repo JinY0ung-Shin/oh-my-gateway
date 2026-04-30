@@ -44,6 +44,9 @@ from src.chunk_processing import (  # noqa: F401
 )
 
 
+_ASK_USER_RESPONSE_PREFIX = "User responded:"
+
+
 # ---------------------------------------------------------------------------
 # Error-logging helpers
 # ---------------------------------------------------------------------------
@@ -399,11 +402,41 @@ def _record_tool_result(tool_stats: ToolStatsCollector, tool_block: Dict[str, An
     )
 
 
+def _remember_tool_use(tool_names_by_id: Dict[str, str], tool_block: Dict[str, Any]) -> None:
+    tool_use_id = _block_field(tool_block, "id") or _block_field(tool_block, "tool_use_id")
+    name = _block_field(tool_block, "name")
+    if isinstance(tool_use_id, str) and tool_use_id and isinstance(name, str) and name:
+        tool_names_by_id[tool_use_id] = name
+
+
+def _is_synthetic_ask_user_response_result(
+    result_block: Dict[str, Any],
+    tool_names_by_id: Dict[str, str],
+    request_context: Optional[Dict[str, Any]],
+) -> bool:
+    content = result_block.get("content")
+    if not isinstance(content, str) or not content.startswith(_ASK_USER_RESPONSE_PREFIX):
+        return False
+
+    tool_use_id = result_block.get("tool_use_id")
+    if not isinstance(tool_use_id, str) or not tool_use_id:
+        return False
+
+    if tool_names_by_id.get(tool_use_id) == "AskUserQuestion":
+        return True
+
+    if not isinstance(request_context, dict):
+        return False
+    return request_context.get("function_call_output_call_id") == tool_use_id
+
+
 def _tool_use_events(
     tool_block: Dict[str, Any],
     tool_stats: ToolStatsCollector,
     next_seq: Callable[[], int],
+    tool_names_by_id: Dict[str, str],
 ) -> list[str]:
+    _remember_tool_use(tool_names_by_id, tool_block)
     _record_tool_use(tool_stats, tool_block)
     is_subagent_tool = tool_block.get("parent_tool_use_id") is not None
     if is_subagent_tool and not SUBAGENT_STREAM_TOOL_BLOCKS:
@@ -421,10 +454,21 @@ def _user_tool_result_events(
     chunk: Dict[str, Any],
     tool_stats: ToolStatsCollector,
     next_seq: Callable[[], int],
+    tool_names_by_id: Dict[str, str],
+    request_context: Optional[Dict[str, Any]],
 ) -> list[str]:
     tool_results, parent_id = extract_user_tool_results(chunk)
-    for tr_block in tool_results:
+    normalized_results = [_normalize_tool_result(tr_block) for tr_block in tool_results]
+    visible_results = []
+    for tr_block in normalized_results:
+        if _is_synthetic_ask_user_response_result(
+            tr_block, tool_names_by_id, request_context
+        ):
+            tr_block["is_error"] = False
+            _record_tool_result(tool_stats, tr_block)
+            continue
         _record_tool_result(tool_stats, tr_block)
+        visible_results.append(tr_block)
 
     is_subagent_result = parent_id is not None
     if is_subagent_result and not SUBAGENT_STREAM_TOOL_BLOCKS:
@@ -435,7 +479,7 @@ def _user_tool_result_events(
             sequence_number=next_seq(),
             parent_tool_use_id=parent_id,
         )
-        for tr_block in tool_results
+        for tr_block in visible_results
     ]
 
 
@@ -443,14 +487,25 @@ def _embedded_tool_events(
     chunk: Dict[str, Any],
     tool_stats: ToolStatsCollector,
     next_seq: Callable[[], int],
+    tool_names_by_id: Dict[str, str],
+    request_context: Optional[Dict[str, Any]],
 ) -> list[str]:
     events = []
     for tool_block in extract_embedded_tool_blocks(chunk):
         block_type = _block_field(tool_block, "type")
+        result_block = None
+        suppress_result = False
         if block_type == "tool_use":
+            _remember_tool_use(tool_names_by_id, tool_block)
             _record_tool_use(tool_stats, tool_block)
         elif block_type == "tool_result":
-            _record_tool_result(tool_stats, tool_block)
+            result_block = _normalize_tool_result(tool_block)
+            suppress_result = _is_synthetic_ask_user_response_result(
+                result_block, tool_names_by_id, request_context
+            )
+            if suppress_result:
+                result_block["is_error"] = False
+            _record_tool_result(tool_stats, result_block)
 
         is_subagent_block = tool_block.get("parent_tool_use_id") is not None
         if is_subagent_block and not SUBAGENT_STREAM_TOOL_BLOCKS:
@@ -464,9 +519,11 @@ def _embedded_tool_events(
                 )
             )
         elif block_type == "tool_result":
+            if suppress_result:
+                continue
             events.append(
                 make_tool_result_response_sse(
-                    tool_block,
+                    result_block if result_block is not None else tool_block,
                     sequence_number=next_seq(),
                     parent_tool_use_id=tool_block.get("parent_tool_use_id"),
                 )
@@ -512,6 +569,7 @@ async def stream_response_chunks(
     # aggregates tool-call name/count/errors/latency for the usage_tool table.
     usage_start = time.monotonic()
     tool_stats = ToolStatsCollector()
+    tool_names_by_id: Dict[str, str] = {}
 
     def _next_seq() -> int:
         nonlocal seq
@@ -679,13 +737,17 @@ async def stream_response_chunks(
             handled, tool_block = tool_acc.process_stream_event(chunk)
             if handled:
                 if tool_block:
-                    for event in _tool_use_events(tool_block, tool_stats, _next_seq):
+                    for event in _tool_use_events(
+                        tool_block, tool_stats, _next_seq, tool_names_by_id
+                    ):
                         yield event
                 continue
 
             # User chunks with tool_result blocks
             if chunk.get("type") == "user":
-                for event in _user_tool_result_events(chunk, tool_stats, _next_seq):
+                for event in _user_tool_result_events(
+                    chunk, tool_stats, _next_seq, tool_names_by_id, request_context
+                ):
                     yield event
                 chunks_buffer.append(chunk)
                 continue
@@ -694,7 +756,9 @@ async def stream_response_chunks(
             # This MUST run before the token-streaming skip below so that tool
             # blocks inside assistant content chunks are not silently dropped
             # when token_streaming is True.
-            for event in _embedded_tool_events(chunk, tool_stats, _next_seq):
+            for event in _embedded_tool_events(
+                chunk, tool_stats, _next_seq, tool_names_by_id, request_context
+            ):
                 yield event
 
             # Skip duplicate assistant text in token-streaming mode.

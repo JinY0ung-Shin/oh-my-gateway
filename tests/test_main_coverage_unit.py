@@ -283,6 +283,7 @@ class TestResponsesApiSessionValidation:
             )
 
         assert response.status_code == 503
+        assert "Claude Code SDK" not in response.json()["error"]["message"]
         # Session was created then cleaned up by the failing path.
         assert session_manager.get_stats()["active_sessions"] == active_before
 

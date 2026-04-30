@@ -3,6 +3,7 @@
 Loads server-level MCP config from the MCP_CONFIG environment variable.
 """
 
+import copy
 import json
 import logging
 from pathlib import Path
@@ -100,3 +101,8 @@ _server_mcp_config: McpServersDict = load_mcp_config()
 def get_mcp_servers() -> McpServersDict:
     """Get the pre-loaded server-level MCP server config."""
     return _server_mcp_config
+
+
+def get_validated_mcp_config() -> McpServersDict:
+    """Return a copy of the already validated wrapper MCP config."""
+    return copy.deepcopy(_server_mcp_config)

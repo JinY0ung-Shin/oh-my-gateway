@@ -117,6 +117,25 @@ class TestResolve:
         manager.resolve("dave", sync_template=True)
         assert (workspace / ".claude" / "settings.json").read_text() == '{"key": "value"}'
 
+    def test_sync_template_removes_deleted_claude_template_files(
+        self, manager, tmp_base, tmp_template
+    ):
+        skill_dir = tmp_template / ".claude" / "skills" / "old-skill"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: old-skill\ndescription: Old skill\n---\nOld"
+        )
+
+        workspace = manager.resolve("frank", sync_template=True)
+        copied_skill = workspace / ".claude" / "skills" / "old-skill" / "SKILL.md"
+        assert copied_skill.is_file()
+
+        (skill_dir / "SKILL.md").unlink()
+        skill_dir.rmdir()
+        manager.resolve("frank", sync_template=True)
+
+        assert not copied_skill.exists()
+
     def test_no_template_source_skips_sync(self, manager_no_template, tmp_base):
         workspace = manager_no_template.resolve("eve", sync_template=True)
         assert not (workspace / ".claude").exists()

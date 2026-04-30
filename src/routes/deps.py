@@ -83,6 +83,9 @@ def validate_image_request(request: Any, backend: BackendClient) -> None:
     if not request_has_images(request):
         return
 
+    if getattr(backend, "name", None) == "opencode":
+        return
+
     # Check backend supports images
     if not hasattr(backend, "image_handler"):
         raise HTTPException(

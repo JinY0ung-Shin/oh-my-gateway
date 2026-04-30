@@ -3,12 +3,19 @@ FROM python:3.12-slim
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PATH="/root/.opencode/bin:${PATH}"
 
 # Install system dependencies.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends jq \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq ripgrep \
     && rm -rf /var/lib/apt/lists/*
+
+ARG OPENCODE_VERSION=1.14.29
+
+# Install OpenCode for the managed OpenCode backend.
+RUN curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION} --no-modify-path \
+    && opencode --version
 
 WORKDIR /app
 

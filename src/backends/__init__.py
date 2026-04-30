@@ -7,6 +7,7 @@ as the primary entry points for ``main.py``.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Optional
 
 from src.backends.base import (  # noqa: F401
@@ -19,14 +20,31 @@ from src.backends.base import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 
+def _enabled_backend_names() -> list[str]:
+    """Return backend names enabled by BACKENDS, preserving order."""
+    raw = os.getenv("BACKENDS", "claude")
+    names: list[str] = []
+    for item in raw.split(","):
+        name = item.strip().lower()
+        if name and name not in names:
+            names.append(name)
+    return names or ["claude"]
+
+
 def discover_backends(registry_cls=None) -> None:
     """Discover and register all known backends."""
     if registry_cls is None:
         registry_cls = BackendRegistry
 
-    from src.backends.claude import register as register_claude
-
-    register_claude(registry_cls=registry_cls)
+    for name in _enabled_backend_names():
+        if name == "claude":
+            from src.backends import claude as backend_pkg
+        elif name == "opencode":
+            from src.backends import opencode as backend_pkg
+        else:
+            logger.warning("Unknown backend in BACKENDS=%r; skipping", name)
+            continue
+        backend_pkg.register(registry_cls=registry_cls)
 
 
 def resolve_model(model: str) -> Optional[ResolvedModel]:
