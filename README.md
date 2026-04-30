@@ -27,6 +27,17 @@ curl http://localhost:8000/v1/responses \
   -d '{"model": "sonnet", "input": "Hello"}'
 ```
 
+## Documentation
+
+| Topic | Doc |
+|-------|-----|
+| Claude Code backend (auth, workspaces, sandbox, thinking, MCP, subagents) | [docs/claude-code/](docs/claude-code/) |
+| OpenCode backend overview + when to use which mode | [docs/opencode/](docs/opencode/) |
+| OpenCode managed mode (gateway spawns `opencode serve`) | [docs/opencode/managed.md](docs/opencode/managed.md) |
+| OpenCode external mode (point at an existing `opencode serve`) | [docs/opencode/external.md](docs/opencode/external.md) |
+| SSE streaming event reference | [docs/streaming-events.md](docs/streaming-events.md) |
+| System prompt presets | [docs/](docs/) — `claude-code-system-prompt-reference.md`, `compact-system-prompt.md`, `minimal-system-prompt.md` |
+
 ## Features
 
 - **Responses API** — `/v1/responses` with `previous_response_id` chaining
@@ -122,7 +133,7 @@ In external mode the gateway does **not** start a subprocess and does **not** ge
 
 Request-time options (`OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, `OPENCODE_MODELS`) and basic-auth credentials still apply. Verify the active mode with `GET /admin/api/backends` — the `opencode.config.mode` field reports `managed` or `external`.
 
-Additional OpenCode options such as `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, `OPENCODE_USE_WRAPPER_MCP_CONFIG`, and server authentication variables are documented in `.env.example`. See **[docs/opencode-litellm.md](docs/opencode-litellm.md)** for a full LiteLLM + OpenCode setup walkthrough including MCP server configuration.
+Full setup walkthroughs (LiteLLM provider, MCP servers, docker-compose, troubleshooting) live under **[docs/opencode/](docs/opencode/)** — see [managed.md](docs/opencode/managed.md) and [external.md](docs/opencode/external.md). The Claude backend has its own detailed guide at **[docs/claude-code/](docs/claude-code/)**.
 
 ### Bash Sandbox
 
