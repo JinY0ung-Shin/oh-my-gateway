@@ -24,9 +24,9 @@ def stub_opencode_managed_server(monkeypatch):
     )
 
 
-def test_opencode_client_rejects_legacy_base_url_env(monkeypatch):
-    """OPENCODE_BASE_URL is rejected instead of silently changing backend behavior."""
-    monkeypatch.setenv("OPENCODE_BASE_URL", "http://external.example:4096")
+def test_opencode_client_uses_external_base_url_env(monkeypatch):
+    """OPENCODE_BASE_URL selects external mode without starting a managed server."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://external.example:4096/")
     monkeypatch.setenv("OPENCODE_MODELS", "openai/gpt-5.5")
 
     import src.backends.opencode.client as client_module
@@ -34,16 +34,28 @@ def test_opencode_client_rejects_legacy_base_url_env(monkeypatch):
 
     importlib.reload(constants_module)
     client_module = importlib.reload(client_module)
-    # Safety net: if the fail-fast branch is removed later, keep this reloaded
-    # class from starting a real OpenCode process.
+
+    started_managed = False
+
+    def fail_if_managed_starts(self):
+        nonlocal started_managed
+        started_managed = True
+        raise AssertionError("external mode must not start a managed opencode process")
+
     monkeypatch.setattr(
         client_module.OpenCodeClient,
         "_start_managed_server",
-        lambda self: "http://127.0.0.1:15555",
+        fail_if_managed_starts,
     )
 
-    with pytest.raises(RuntimeError, match="OPENCODE_BASE_URL is no longer supported"):
-        client_module.OpenCodeClient()
+    client = client_module.OpenCodeClient()
+
+    assert client._mode == "external"
+    assert client.base_url == "http://external.example:4096"
+    assert started_managed is False
+    assert client.runtime_metadata()["mode"] == "external"
+    assert client.runtime_metadata()["managed_process"] is False
+    client.close()
 
 
 def test_opencode_client_constructor_rejects_external_base_url():
@@ -147,24 +159,61 @@ def test_opencode_auth_provider_validates_managed_binary(monkeypatch):
     assert status["config"]["mode"] == "managed"
 
 
-def test_opencode_auth_provider_rejects_legacy_base_url_regardless_of_binary(monkeypatch):
-    """OPENCODE_BASE_URL fails auth validation instead of selecting external mode."""
+def test_opencode_client_rejects_invalid_external_base_url(monkeypatch):
+    """External mode requires a usable HTTP(S) base URL."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "not-a-url")
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    with pytest.raises(ValueError, match="OPENCODE_BASE_URL must be an http\\(s\\) URL"):
+        OpenCodeClient()
+
+
+def test_opencode_client_warns_when_external_auth_password_is_unset(monkeypatch, caplog):
+    """External mode logs a warning when requests will be sent without basic auth."""
     monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
+    monkeypatch.delenv("OPENCODE_SERVER_PASSWORD", raising=False)
+    caplog.set_level(logging.WARNING, logger="src.backends.opencode.client")
+
+    from src.backends.opencode.client import OpenCodeClient
+
+    OpenCodeClient()
+
+    assert "OPENCODE_SERVER_PASSWORD is unset" in caplog.text
+
+
+def test_opencode_auth_provider_validates_external_base_url_regardless_of_binary(monkeypatch):
+    """OPENCODE_BASE_URL selects external mode without requiring the binary."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096/")
     monkeypatch.setattr("src.backends.opencode.auth.shutil.which", lambda name: "/bin/opencode")
 
     from src.backends.opencode.auth import OpenCodeAuthProvider
 
     status = OpenCodeAuthProvider().validate()
 
+    assert status["valid"] is True
+    assert status["errors"] == []
+    assert status["config"] == {
+        "mode": "external",
+        "base_url": "http://127.0.0.1:4096",
+    }
+
+
+def test_opencode_auth_provider_rejects_invalid_external_base_url(monkeypatch):
+    """Auth diagnostics report invalid external URLs before request time."""
+    monkeypatch.setenv("OPENCODE_BASE_URL", "garbage")
+
+    from src.backends.opencode.auth import OpenCodeAuthProvider
+
+    status = OpenCodeAuthProvider().validate()
+
     assert status["valid"] is False
-    assert status["errors"] == [
-        "OPENCODE_BASE_URL is no longer supported; unset it to use managed OpenCode"
-    ]
-    assert status["config"]["mode"] == "managed"
+    assert status["errors"] == ["OPENCODE_BASE_URL must be an http(s) URL with a host"]
+    assert status["config"] == {"mode": "external", "base_url": "garbage"}
 
 
-def test_opencode_auth_env_excludes_legacy_base_url(monkeypatch):
-    """Backend env passthrough should not advertise an external-server mode."""
+def test_opencode_auth_env_includes_external_base_url_for_diagnostics(monkeypatch):
+    """Backend env diagnostics should advertise configured external-server mode."""
     monkeypatch.setenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096")
     monkeypatch.setenv("OPENCODE_DEFAULT_MODEL", "openai/gpt-5.5")
 
@@ -172,7 +221,7 @@ def test_opencode_auth_env_excludes_legacy_base_url(monkeypatch):
 
     env = OpenCodeAuthProvider().build_env()
 
-    assert "OPENCODE_BASE_URL" not in env
+    assert env["OPENCODE_BASE_URL"] == "http://127.0.0.1:4096"
     assert env["OPENCODE_DEFAULT_MODEL"] == "openai/gpt-5.5"
 
 
