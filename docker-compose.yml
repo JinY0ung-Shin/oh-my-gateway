@@ -1,5 +1,5 @@
 services:
-  claude-wrapper:
+  gateway:
     build:
       context: .
       # Inherit proxy settings from the host shell at build time.
@@ -19,8 +19,8 @@ services:
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
     # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
-    # before starting the wrapper, so the usage-log engine can connect on first
-    # try.  ``required: false`` (Compose v2.20+) keeps the wrapper runnable
+    # before starting the gateway, so the usage-log engine can connect on first
+    # try.  ``required: false`` (Compose v2.20+) keeps the gateway runnable
     # when the ``logging`` profile is off and gateway-log isn't created.
     depends_on:
       gateway-log:

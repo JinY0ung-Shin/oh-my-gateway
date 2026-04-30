@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""
-Test working directory configuration for Claude Code OpenAI wrapper.
-Tests that the working directory defaults to a temp directory when CLAUDE_CWD is not set.
-"""
+"""Test working directory configuration for the Claude backend."""
 
 import os
 import sys

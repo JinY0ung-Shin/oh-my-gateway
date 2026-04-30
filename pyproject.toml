@@ -1,7 +1,7 @@
 [project]
-name = "claude-code-gateway"
+name = "oh-my-gateway"
 version = "2.2.0"
-description = "API gateway for Claude Code"
+description = "OpenAI-compatible gateway for Claude Agent SDK and OpenCode"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -33,7 +33,7 @@ dev = [
 ]
 
 [project.scripts]
-claude-wrapper = "src.main:run_server"
+oh-my-gateway = "src.main:run_server"
 
 [build-system]
 requires = ["hatchling"]

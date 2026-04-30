@@ -104,5 +104,5 @@ def get_mcp_servers() -> McpServersDict:
 
 
 def get_validated_mcp_config() -> McpServersDict:
-    """Return a copy of the already validated wrapper MCP config."""
+    """Return a copy of the already validated gateway MCP config."""
     return copy.deepcopy(_server_mcp_config)

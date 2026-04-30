@@ -131,7 +131,7 @@ Streaming, `previous_response_id` chaining, `user` workspace isolation work the 
 
 ## MCP servers
 
-OpenCode has its own MCP config schema (separate from the wrapper's `MCP_CONFIG`). You can configure it two ways, and they can be mixed.
+OpenCode has its own MCP config schema (separate from the gateway's `MCP_CONFIG`). You can configure it two ways, and they can be mixed.
 
 ### Option A — inline in `OPENCODE_CONFIG_CONTENT`
 
@@ -160,7 +160,7 @@ OpenCode's native MCP block uses `type: "local"` (stdio) or `type: "remote"` (HT
 
 `{env:VAR}` interpolation works in `headers` values and inside `environment`. Variables must exist in the gateway env for OpenCode to inherit.
 
-### Option B — reuse the wrapper's `MCP_CONFIG`
+### Option B — reuse the gateway's `MCP_CONFIG`
 
 If you already have `MCP_CONFIG` set up for Claude, forward it to OpenCode automatically:
 
@@ -168,14 +168,14 @@ If you already have `MCP_CONFIG` set up for Claude, forward it to OpenCode autom
 OPENCODE_USE_WRAPPER_MCP_CONFIG=true
 ```
 
-The converter at `src/backends/opencode/config.py:_convert_mcp_server` translates wrapper transports into OpenCode types:
+The converter at `src/backends/opencode/config.py:_convert_mcp_server` translates gateway MCP transports into OpenCode types:
 
-| Wrapper `type` | OpenCode `type` | Notes |
+| Gateway `type` | OpenCode `type` | Notes |
 |----------------|-----------------|-------|
 | `stdio` | `local` | `command` + `args` flattened into one list; `env`/`environment` copied across |
 | `http`, `sse`, `streamable-http` | `remote` | `url`, `headers`, `oauth`, `enabled`, `timeout` preserved |
 
-Wrapper `MCP_CONFIG` example that works on both backends:
+Gateway `MCP_CONFIG` example that works on both backends:
 
 ```json
 {
@@ -197,7 +197,7 @@ Wrapper `MCP_CONFIG` example that works on both backends:
 ### Precedence (Option A + B combined)
 
 - Servers explicitly defined in `OPENCODE_CONFIG_CONTENT.mcp` are kept as-is
-- Wrapper `MCP_CONFIG` entries are added **only** for names not already present (the merger uses `setdefault`)
+- Gateway `MCP_CONFIG` entries are added **only** for names not already present (the merger uses `setdefault`)
 
 So `MCP_CONFIG` is the shared baseline; override per-OpenCode by adding the same name to `OPENCODE_CONFIG_CONTENT.mcp`.
 
@@ -291,5 +291,5 @@ Useful checks:
 | `OPENCODE_DEFAULT_MODEL` | unset | Used when request omits provider/model |
 | `OPENCODE_QUESTION_PERMISSION` | `ask` | `ask` / `allow` / `deny` for the `question` tool |
 | `OPENCODE_CONFIG_CONTENT` | `{}` | Provider + MCP config injected into the subprocess |
-| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | `false` | Forward wrapper `MCP_CONFIG` to OpenCode |
+| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | `false` | Forward gateway `MCP_CONFIG` to OpenCode |
 | `OPENCODE_MODELS` | unset | Public allowlist of `<provider>/<model>` ids |

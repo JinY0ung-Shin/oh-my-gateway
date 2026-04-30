@@ -5,7 +5,7 @@ def get_admin_css() -> str:
     """Return the admin dashboard css styles."""
     return """/* ================================================================
    TERMINAL / HACKER DESIGN SYSTEM
-   Claude Code Gateway — Admin Terminal v2.0
+   Oh My Gateway — Admin Terminal v2.0
    ================================================================ */
 
 :root {

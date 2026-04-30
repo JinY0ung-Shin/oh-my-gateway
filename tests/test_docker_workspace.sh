@@ -9,7 +9,7 @@ echo "========================================="
 echo -e "\n1. Testing default configuration (isolated temp dir):"
 docker run --rm \
   -v ~/.claude:/root/.claude \
-  claude-wrapper:test \
+  oh-my-gateway:test \
   python -c "from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(); print(f'Working directory: {cli.cwd}'); print(f'Is temp dir: {cli.temp_dir is not None}')"
 
 # Test 2: With CLAUDE_CWD environment variable
@@ -17,7 +17,7 @@ echo -e "\n2. Testing with CLAUDE_CWD environment variable:"
 docker run --rm \
   -v ~/.claude:/root/.claude \
   -e CLAUDE_CWD=/app \
-  claude-wrapper:test \
+  oh-my-gateway:test \
   python -c "import os; from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(cwd=os.getenv('CLAUDE_CWD')); print(f'Working directory: {cli.cwd}'); print(f'Is temp dir: {cli.temp_dir is not None}')"
 
 # Test 3: With mounted workspace
@@ -27,7 +27,7 @@ docker run --rm \
   -v ~/.claude:/root/.claude \
   -v /tmp/test_workspace:/workspace \
   -e CLAUDE_CWD=/workspace \
-  claude-wrapper:test \
+  oh-my-gateway:test \
   python -c "import os; from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(cwd=os.getenv('CLAUDE_CWD')); print(f'Working directory: {cli.cwd}'); print(f'Directory exists: {os.path.exists(cli.cwd)}')"
 
 echo -e "\n========================================="

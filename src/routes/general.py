@@ -46,7 +46,7 @@ async def list_mcp_servers(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """List available MCP servers configured on this wrapper instance."""
+    """List available MCP servers configured on this gateway instance."""
     await verify_api_key(request, credentials)
 
     mcp_servers = get_mcp_servers()
@@ -71,7 +71,7 @@ async def health_check(request: Request):
     _ = request  # slowapi requires a request parameter in decorated handlers.
     return {
         "status": "healthy",
-        "service": "claude-code-gateway",
+        "service": "oh-my-gateway",
         "backends": list(BackendRegistry.all_backends().keys()),
     }
 
@@ -85,7 +85,7 @@ async def version_info(request: Request):
 
     return {
         "version": __version__,
-        "service": "claude-code-gateway",
+        "service": "oh-my-gateway",
         "api_version": "v1",
     }
 

@@ -9,7 +9,7 @@
 | **Routing** | `model: "sonnet" / "opus" / "haiku"` | `model: "opencode/<provider>/<model>"` |
 | **Auth** | Anthropic API key or `claude auth login` | Provider-specific keys (passed through OpenCode) |
 | **Provider variety** | Anthropic only | Any OpenAI-compatible endpoint |
-| **MCP tools** | Native | Native (per OpenCode); wrapper `MCP_CONFIG` can be forwarded |
+| **MCP tools** | Native | Native (per OpenCode); gateway `MCP_CONFIG` can be forwarded |
 | **Reasoning models** | First-class via SDK | Works through any reasoning model on the provider side (e.g. via LiteLLM `merge_reasoning_content_in_choices: true`) |
 | **Best for** | Anthropic Claude usage | Multi-provider routing, on-prem models, vendor isolation |
 
@@ -22,7 +22,7 @@ OpenCode runs in one of two modes. Pick based on **where the agent process needs
 |  | **Managed** (default) | **External** |
 |---|----------------------|---------------|
 | Where OpenCode runs | Subprocess inside the gateway container | Separate process / host |
-| Who owns the config | Gateway (built from `OPENCODE_CONFIG_CONTENT` + wrapper `MCP_CONFIG`) | The external server itself |
+| Who owns the config | Gateway (built from `OPENCODE_CONFIG_CONTENT` + gateway `MCP_CONFIG`) | The external server itself |
 | Filesystem access | Whatever the gateway container can see | Whatever the external host can see |
 | Setup complexity | Low | Medium |
 | Use when… | Single deployment, gateway container is the trust boundary | Gateway is sandboxed but OpenCode needs broader filesystem access; or several gateway replicas share one OpenCode |
@@ -90,7 +90,7 @@ opencode/<provider>/<model>
 
 `<provider>` matches a key under `provider` in OpenCode's config (managed mode: `OPENCODE_CONFIG_CONTENT`; external mode: whatever config the external server loads). `<model>` matches a key under that provider's `models` block.
 
-The gateway's **`OPENCODE_MODELS` env var is an allowlist** that controls which `opencode/<provider>/<model>` ids `/v1/models` returns and which the `/v1/responses` endpoint accepts. Anything not in the list is rejected at the wrapper layer, even if the underlying OpenCode server would happily run it.
+The gateway's **`OPENCODE_MODELS` env var is an allowlist** that controls which `opencode/<provider>/<model>` ids `/v1/models` returns and which the `/v1/responses` endpoint accepts. Anything not in the list is rejected at the gateway layer, even if the underlying OpenCode server would happily run it.
 
 ```bash
 OPENCODE_MODELS=litellm/claude-sonnet-4-5,litellm/gpt-4o,openai/gpt-5.5
@@ -125,7 +125,7 @@ These are silently ignored in external mode:
 | `OPENCODE_HOST`, `OPENCODE_PORT` | Bind address for the spawned subprocess |
 | `OPENCODE_START_TIMEOUT_MS` | Startup wait timeout (default 5000) |
 | `OPENCODE_CONFIG_CONTENT` | Provider/MCP config injected into the subprocess |
-| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | Forward wrapper `MCP_CONFIG` to OpenCode |
+| `OPENCODE_USE_WRAPPER_MCP_CONFIG` | Forward gateway `MCP_CONFIG` to OpenCode |
 
 ## Switching modes
 

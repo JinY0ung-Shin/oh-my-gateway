@@ -175,7 +175,7 @@ SUBAGENT_STREAM_PROGRESS=true        # default: forward task_started/progress ev
 
 ## MCP Server Integration
 
-The gateway forwards configured MCP servers to Claude. Configure once with the wrapper's shared `MCP_CONFIG`:
+The gateway forwards configured MCP servers to Claude. Configure once with the gateway's shared `MCP_CONFIG`:
 
 ```bash
 MCP_CONFIG=/path/to/mcp-config.json

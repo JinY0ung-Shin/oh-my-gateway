@@ -147,7 +147,7 @@ OPENCODE_MODELS=litellm/claude-sonnet-4-5,litellm/gpt-4o,openai/gpt-5.5
 
 ## MCP servers with OpenCode
 
-OpenCode has its **own** MCP config schema (separate from the wrapper's
+OpenCode has its **own** MCP config schema (separate from the gateway's
 `MCP_CONFIG`). You can configure it two ways, and they can be mixed.
 
 ### Option A — Inline MCP servers in `OPENCODE_CONFIG_CONTENT`
@@ -182,7 +182,7 @@ OpenCode's native format uses a top-level `mcp` block with two server types:
 The variable must be exported to the gateway process so OpenCode (started as
 a child of the gateway) inherits it.
 
-### Option B — Reuse the wrapper's `MCP_CONFIG`
+### Option B — Reuse the gateway's `MCP_CONFIG`
 
 If you already have `MCP_CONFIG` set up for Claude (gateway-wide MCP), have
 the gateway forward it to OpenCode automatically:
@@ -192,14 +192,14 @@ OPENCODE_USE_WRAPPER_MCP_CONFIG=true
 ```
 
 The converter at `src/backends/opencode/config.py:_convert_mcp_server` maps
-wrapper transports to OpenCode types:
+gateway MCP transports to OpenCode types:
 
-| Wrapper `type` | OpenCode `type` | Notes |
+| Gateway `type` | OpenCode `type` | Notes |
 |----------------|-----------------|-------|
 | `stdio` | `local` | `command` + `args` flattened into a single list; `env`/`environment` copied across |
 | `http`, `sse`, `streamable-http` | `remote` | `url`, `headers`, `oauth`, `enabled`, `timeout` preserved |
 
-Wrapper `MCP_CONFIG` example that works on both backends:
+Gateway `MCP_CONFIG` example that works on both backends:
 
 ```json
 {
@@ -224,7 +224,7 @@ and `search` as `remote`.
 ### Precedence (when you mix A + B)
 
 - Servers explicitly defined in `OPENCODE_CONFIG_CONTENT.mcp` are kept as-is.
-- Wrapper `MCP_CONFIG` entries are added **only** for names not already
+- Gateway `MCP_CONFIG` entries are added **only** for names not already
   present (the merger uses `setdefault`, see `build_opencode_config` →
   `mcp_config.setdefault(name, ...)`).
 
@@ -252,7 +252,7 @@ same name to `OPENCODE_CONFIG_CONTENT.mcp`.
   is unset OpenCode fails the server load. Confirm with
   `GET /admin/api/config` (redacted) that the var made it into the gateway
   env.
-- **stdio `env` vs `environment`** — wrapper `MCP_CONFIG` accepts either
+- **stdio `env` vs `environment`** — gateway `MCP_CONFIG` accepts either
   field name, OpenCode only writes `environment`. The converter handles
   both directions automatically.
 
@@ -292,7 +292,7 @@ services:
 | OpenCode replies but model errors out | model key not in `OPENCODE_CONFIG_CONTENT.provider.litellm.models`, or LiteLLM doesn't know that model |
 | `opencode binary not found on PATH` | install OpenCode (`npm i -g opencode-ai`) or use the Docker image |
 | 401 from OpenCode | `LITELLM_API_KEY` unset or `{env:...}` interpolation typo |
-| Wrapper MCP tools missing in OpenCode sessions | set `OPENCODE_USE_WRAPPER_MCP_CONFIG=true` |
+| Gateway MCP tools missing in OpenCode sessions | set `OPENCODE_USE_WRAPPER_MCP_CONFIG=true` |
 | OpenCode MCP tools listed but never called | server failed to start; check gateway logs for `[opencode]` MCP load errors and verify command/url is reachable |
 | `mcp__<x>__<y>` shows for Claude but not OpenCode (or vice versa) | server defined only in one config; either add it to the other side or use Option B |
 
@@ -308,9 +308,9 @@ Useful checks:
 
 - `src/backends/opencode/constants.py` — parses `OPENCODE_MODELS`
 - `src/backends/opencode/config.py` — merges `OPENCODE_CONFIG_CONTENT` with
-  defaults and wrapper MCP servers; `_convert_mcp_server` does the
+  defaults and gateway MCP servers; `_convert_mcp_server` does the
   stdio→local / http→remote translation
 - `src/backends/opencode/auth.py` — env vars forwarded to managed
   `opencode serve`
-- `src/mcp_config.py` — wrapper `MCP_CONFIG` parser (shared with Claude)
+- `src/mcp_config.py` — gateway `MCP_CONFIG` parser (shared with Claude)
 - `.env.example` — full list of `OPENCODE_*` env vars
