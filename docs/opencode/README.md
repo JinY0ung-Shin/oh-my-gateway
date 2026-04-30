@@ -36,6 +36,7 @@ Detailed setup:
 
 - **[managed.md](managed.md)** — managed-mode setup with LiteLLM provider and MCP server walkthrough
 - **[external.md](external.md)** — external-mode setup, security model, and what's a no-op
+- **[litellm.md](litellm.md)** — LiteLLM-specific recipes (reasoning_content rendering, virtual keys, upstream patterns)
 
 ## Quick start (managed mode)
 
