@@ -18,7 +18,7 @@ def build_chat_page() -> str:
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
 /* ================================================================
-   TERMINAL CHAT UI — Claude Code Gateway
+   TERMINAL CHAT UI — Oh My Gateway
    Matches the admin panel phosphor/CRT aesthetic
    ================================================================ */
 
@@ -642,7 +642,7 @@ body::after {
 ╚██████╗██║  ██║██║  ██║   ██║
  ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝
     </div>
-    <p>Claude Code Gateway Chat Terminal</p>
+    <p>Oh My Gateway Chat Terminal</p>
     <p class="hint">메시지를 입력하고 Enter로 전송 (Shift+Enter: 줄바꿈)</p>
     <p class="hint">v1/responses API를 통해 실시간 SSE 스트리밍</p>
   </div>

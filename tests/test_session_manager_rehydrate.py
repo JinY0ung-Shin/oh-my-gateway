@@ -9,8 +9,8 @@ from src.session_manager import _encode_cwd
 
 def test_encode_cwd_replaces_slash_underscore_dot_with_dash():
     assert (
-        _encode_cwd("/home/mireiffe/world/claude-code-gateway/working_dir/se91.kim")
-        == "-home-mireiffe-world-claude-code-gateway-working-dir-se91-kim"
+        _encode_cwd("/home/mireiffe/world/oh-my-gateway/working_dir/se91.kim")
+        == "-home-mireiffe-world-oh-my-gateway-working-dir-se91-kim"
     )
 
 

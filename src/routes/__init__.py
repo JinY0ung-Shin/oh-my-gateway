@@ -1,4 +1,4 @@
-"""Route modules for the Claude Code OpenAI API Wrapper."""
+"""Route modules for Oh My Gateway."""
 
 from src.routes.responses import router as responses_router
 from src.routes.sessions import router as sessions_router

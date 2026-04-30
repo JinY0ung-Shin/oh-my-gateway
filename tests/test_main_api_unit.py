@@ -78,7 +78,7 @@ def test_health_endpoint_returns_request_id_header():
 
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
-    assert response.json()["service"] == "claude-code-gateway"
+    assert response.json()["service"] == "oh-my-gateway"
     assert response.headers["x-request-id"]
 
 
@@ -120,9 +120,9 @@ def test_models_version_and_root_endpoints():
     assert models_response.json()["object"] == "list"
     assert version_response.status_code == 200
     assert version_response.json()["api_version"] == "v1"
-    assert version_response.json()["service"] == "claude-code-gateway"
+    assert version_response.json()["service"] == "oh-my-gateway"
     assert root_response.status_code == 200
-    assert "Claude Code Gateway" in root_response.text
+    assert "Oh My Gateway" in root_response.text
 
 
 def test_models_endpoint_lists_opencode_models_when_registered():

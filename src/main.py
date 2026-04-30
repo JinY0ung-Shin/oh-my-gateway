@@ -295,8 +295,8 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="Claude Code Gateway",
-    description="API gateway for Claude Code",
+    title="Oh My Gateway",
+    description="OpenAI-compatible gateway for coding agent backends",
     version=__version__,
     lifespan=lifespan,
 )

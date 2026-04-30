@@ -100,7 +100,7 @@ def build_admin_page() -> str:
       <!-- Header Bar -->
       <div class="header-bar">
         <div>
-          <span class="text-xs text-muted">CLAUDE CODE GATEWAY</span>
+          <span class="text-xs text-muted">OH MY GATEWAY</span>
           <span class="text-xs" style="color:var(--green-dim); margin-left:0.5rem">// ADMIN TERMINAL v2.0</span>
         </div>
         <div class="flex-gap-sm">

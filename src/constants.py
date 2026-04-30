@@ -1,5 +1,5 @@
 """
-Constants and configuration for Claude Code Gateway.
+Constants and configuration for Oh My Gateway.
 
 Single source of truth for shared configuration values.
 Backend-specific constants live in ``src/backends/<name>/constants.py``.
@@ -43,7 +43,9 @@ PROMPT_LANGUAGE = os.getenv("PROMPT_LANGUAGE", "English")
 DEFAULT_MAX_TURNS = int(os.getenv("DEFAULT_MAX_TURNS", "10"))
 DEFAULT_TIMEOUT_MS = parse_int_env("MAX_TIMEOUT", 600_000)  # 10 minutes
 DEFAULT_PORT = int(os.getenv("PORT", "8000"))
-DEFAULT_HOST = os.getenv("CLAUDE_WRAPPER_HOST", "0.0.0.0")  # nosec B104
+DEFAULT_HOST = (
+    os.getenv("GATEWAY_HOST") or os.getenv("CLAUDE_WRAPPER_HOST") or "0.0.0.0"
+)  # nosec B104
 MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))  # 10MB
 
 # Permission Modes

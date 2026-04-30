@@ -26,7 +26,7 @@ class TestAdminPage:
         r = admin_client.get("/admin")
         assert r.status_code == 200
         assert "text/html" in r.headers["content-type"]
-        assert "CLAUDE CODE GATEWAY" in r.text
+        assert "OH MY GATEWAY" in r.text
 
     def test_get_admin_page_includes_integrity_and_crossorigin_for_cdn_assets(self, admin_client):
         r = admin_client.get("/admin")

@@ -410,6 +410,7 @@ def get_redacted_config() -> Dict[str, Any]:
         "DEFAULT_MAX_TURNS",
         "MAX_TIMEOUT",
         "PORT",
+        "GATEWAY_HOST",
         "CLAUDE_WRAPPER_HOST",
         "MAX_REQUEST_SIZE",
         "CORS_ORIGINS",
