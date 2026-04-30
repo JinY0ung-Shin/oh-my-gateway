@@ -18,8 +18,11 @@ uv sync
 cp .env.example .env
 
 export ANTHROPIC_AUTH_TOKEN=your-api-key
+export ADMIN_API_KEY=change-this-admin-key
 uv run uvicorn src.main:app --reload --port 8000
 ```
+
+`ADMIN_API_KEY` is required at startup because the admin surface can inspect files and change runtime settings. Use `API_KEY` separately when public gateway endpoints need bearer-token protection.
 
 ```bash
 curl http://localhost:8000/v1/responses \
@@ -98,14 +101,21 @@ Most settings are environment variables. Start with `.env.example`.
 | `CLAUDE_AUTH_METHOD` | Force `api_key` or `cli` auth |
 | `BACKENDS` | Backend allowlist, for example `claude,opencode` |
 | `DEFAULT_MODEL` | Default model for requests without `model` |
+| `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
+| `MAX_TIMEOUT` | Backend timeout in milliseconds |
+| `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
+| `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
 | `GATEWAY_HOST` | Host bind address; falls back to legacy `CLAUDE_WRAPPER_HOST` |
 | `CLAUDE_CWD` | Global Claude working directory |
 | `USER_WORKSPACES_DIR` | Per-user workspace root |
 | `MCP_CONFIG` | Shared MCP server config |
+| `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
+| `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models |
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
+| `USAGE_LOG_DB_URL` | Optional SQLAlchemy URL for usage logging |
 
 ## Docker
 
@@ -166,6 +176,29 @@ Primary endpoints:
 - `GET /version`
 
 Admin endpoints live under `/admin` and `/admin/api/*`.
+
+When `USAGE_LOG_DB_URL` is configured, usage analytics are available under `/admin/api/usage/*`: `summary`, `users`, `tools`, `series`, `tools-series`, and `turns`.
+
+## Response Compatibility
+
+Effective `/v1/responses` request fields:
+
+- `model`: `sonnet`, `opus`, `haiku`, or `opencode/<provider>/<model>`.
+- `input`: string, message array, `input_text` or `input_image` parts, or `function_call_output`.
+- `instructions`: system/developer prompt for a new session only.
+- `previous_response_id`: continue the latest turn of an existing session.
+- `stream`: emit Responses-style SSE events.
+- `metadata`: stored on responses; allowlisted keys can be forwarded to Claude with `METADATA_ENV_ALLOWLIST`.
+- `allowed_tools`: explicit Claude tool allowlist.
+- `user`: per-user workspace key.
+
+The request model also accepts `store`, `temperature`, and `max_output_tokens` for client compatibility, but those fields are not currently forwarded as generation controls.
+
+Notable deviations from OpenAI Responses API behavior:
+
+- `instructions`, `system`, or `developer` input items cannot be used with `previous_response_id`; the session prompt is fixed after turn one.
+- A stale `previous_response_id` returns `409` with the latest valid response ID for client recovery.
+- Mixing backends inside one session is rejected.
 
 ## Terms
 
