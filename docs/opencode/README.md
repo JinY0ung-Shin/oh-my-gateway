@@ -133,7 +133,7 @@ To move from managed → external:
 
 1. Stand up `opencode serve` on the target host with the same config you previously fed to the gateway via `OPENCODE_CONFIG_CONTENT`.
 2. Set `OPENCODE_BASE_URL` (and basic-auth env vars if applicable) on the gateway.
-3. Restart the gateway. Verify `GET /admin/api/backends` shows `opencode.config.mode = external`.
+3. Restart the gateway. Verify `GET /admin/api/backends` shows the OpenCode backend item's `metadata.mode = external`.
 4. Optional: clear `OPENCODE_CONFIG_CONTENT` and `OPENCODE_USE_WRAPPER_MCP_CONFIG` from the gateway env. They're no-ops in external mode but removing them avoids confusion.
 
 External → managed is the reverse: unset `OPENCODE_BASE_URL`, restore the config envs, restart.
@@ -142,8 +142,9 @@ External → managed is the reverse: unset `OPENCODE_BASE_URL`, restore the conf
 
 ```bash
 # Mode + base url
-curl -s http://localhost:8000/admin/api/backends | jq '.opencode.config'
-# {"mode": "managed", "binary": "/usr/local/bin/opencode"} OR
+curl -s http://localhost:8000/admin/api/backends \
+  | jq '.backends[] | select(.name == "opencode") | .metadata'
+# {"mode": "managed", "base_url": "http://127.0.0.1:...", ...} OR
 # {"mode": "external", "base_url": "http://opencode-host:7891"}
 
 # Models actually exposed

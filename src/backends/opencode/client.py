@@ -39,7 +39,7 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 import httpx
 
 import src.mcp_config as mcp_config
-from src.backends.opencode.auth import OpenCodeAuthProvider
+from src.backends.opencode.auth import OpenCodeAuthProvider, normalize_opencode_base_url
 from src.backends.opencode.config import build_opencode_config, parse_opencode_config_content
 from src.backends.opencode.constants import OPENCODE_MODELS, use_wrapper_mcp_config
 from src.backends.opencode.events import OpenCodeEventConverter
@@ -109,15 +109,23 @@ class OpenCodeClient:
         self._agent = os.getenv("OPENCODE_AGENT", "general").strip() or "general"
 
         external_url = os.getenv("OPENCODE_BASE_URL")
-        if external_url:
+        if external_url and external_url.strip():
+            normalized_url, error = normalize_opencode_base_url(external_url)
+            if error:
+                raise ValueError(error)
             self._mode = "external"
-            self.base_url = external_url.rstrip("/")
+            self.base_url = normalized_url
             logger.info(
                 "OpenCode backend in external mode: %s "
                 "(OPENCODE_CONFIG_CONTENT and OPENCODE_USE_WRAPPER_MCP_CONFIG "
                 "are no-ops; the external server owns its config)",
                 self.base_url,
             )
+            if not self._server_password:
+                logger.warning(
+                    "OPENCODE_SERVER_PASSWORD is unset; external OpenCode requests "
+                    "will be sent without basic auth"
+                )
         else:
             self._mode = "managed"
             self.base_url = self._start_managed_server()

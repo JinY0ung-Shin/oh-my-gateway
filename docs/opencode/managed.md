@@ -31,14 +31,15 @@ If you need OpenCode to run somewhere else, see [external.md](external.md).
 Verify the gateway sees the binary:
 
 ```bash
-curl -s http://localhost:8000/admin/api/backends | jq '.opencode'
+curl -s http://localhost:8000/admin/api/backends \
+  | jq '.backends[] | select(.name == "opencode") | {healthy, auth, metadata}'
 ```
 
 ```json
 {
-  "valid": true,
-  "errors": [],
-  "config": {"mode": "managed", "binary": "/usr/local/bin/opencode"}
+  "healthy": true,
+  "auth": {"valid": true, "errors": []},
+  "metadata": {"mode": "managed", "base_url": "http://127.0.0.1:4096"}
 }
 ```
 
@@ -243,8 +244,9 @@ services:
 ## Verification
 
 ```bash
-# Backend mode + binary path
-curl -s http://localhost:8000/admin/api/backends | jq '.opencode.config'
+# Backend mode + base URL
+curl -s http://localhost:8000/admin/api/backends \
+  | jq '.backends[] | select(.name == "opencode") | .metadata'
 
 # Models exposed
 curl -s http://localhost:8000/v1/models | jq '.data[].id'
@@ -272,7 +274,7 @@ uv run pytest tests/integration/test_opencode_smoke.py -q
 
 Useful checks:
 
-- `GET /admin/api/backends` — backend health, mode, binary path
+- `GET /admin/api/backends` — backend health, auth status, mode, and base URL
 - `GET /admin/api/mcp-servers` — what MCP each backend sees
 - `GET /admin/api/config` — redacted env (verify variables made it in)
 - gateway stdout — captures the OpenCode subprocess's stdout/stderr

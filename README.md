@@ -132,7 +132,7 @@ In external mode the gateway does **not** start a subprocess and does **not** ge
 - `OPENCODE_USE_WRAPPER_MCP_CONFIG`
 - `OPENCODE_BIN`, `OPENCODE_HOST`, `OPENCODE_PORT`, `OPENCODE_START_TIMEOUT_MS`
 
-Request-time options (`OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, `OPENCODE_MODELS`) and basic-auth credentials still apply. Verify the active mode with `GET /admin/api/backends` — the `opencode.config.mode` field reports `managed` or `external`.
+Request-time options (`OPENCODE_AGENT`, `OPENCODE_DEFAULT_MODEL`, `OPENCODE_QUESTION_PERMISSION`, `OPENCODE_MODELS`) and basic-auth credentials still apply. Verify the active mode with `GET /admin/api/backends` — the OpenCode backend item's `metadata.mode` field reports `managed` or `external`.
 
 Full setup walkthroughs (LiteLLM provider, MCP servers, docker-compose, troubleshooting) live under **[docs/opencode/](docs/opencode/)** — see [managed.md](docs/opencode/managed.md) and [external.md](docs/opencode/external.md). The Claude backend has its own detailed guide at **[docs/claude-code/](docs/claude-code/)**.
 
@@ -260,7 +260,7 @@ The gateway includes a built-in admin dashboard at `/admin` (requires `ADMIN_API
 |--------|----------|-------------|
 | `GET` | `/admin/api/summary` | Dashboard summary (models, sessions, backends) |
 | `GET` | `/admin/api/server-info` | Server version and runtime info |
-| `GET` | `/admin/api/backends` | Backend health, auth status, model availability (reports `mode: managed` or `mode: external` for OpenCode) |
+| `GET` | `/admin/api/backends` | Backend health, auth status, model availability (reports `metadata.mode: managed` or `metadata.mode: external` for OpenCode) |
 | `GET` | `/admin/api/mcp-servers` | MCP server config and tool patterns |
 | `GET` | `/admin/api/tools` | Tool registry per backend and MCP patterns |
 | `GET` | `/admin/api/sandbox` | Sandbox and permission mode config |

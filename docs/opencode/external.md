@@ -123,7 +123,8 @@ OPENCODE_DEFAULT_MODEL=litellm/claude-sonnet-4-5
 Restart the gateway. Verify the mode:
 
 ```bash
-curl -s http://localhost:8000/admin/api/backends | jq '.opencode.config'
+curl -s http://localhost:8000/admin/api/backends \
+  | jq '.backends[] | select(.name == "opencode") | .metadata'
 ```
 
 ```json
@@ -172,7 +173,7 @@ External mode shifts trust boundaries. Things to think about:
 
 ## Verification checklist
 
-- [ ] `GET /admin/api/backends` shows `opencode.config.mode = "external"` and the right `base_url`
+- [ ] `GET /admin/api/backends` shows the OpenCode backend item's `metadata.mode = "external"` and the right `base_url`
 - [ ] `curl -u user:pass <url>/global/health` returns `{"healthy": true}` from the gateway's network
 - [ ] `GET /v1/models` lists your `OPENCODE_MODELS` entries with `opencode/` prefix
 - [ ] A streamed `/v1/responses` request returns content and the LiteLLM/provider logs show the corresponding upstream call
