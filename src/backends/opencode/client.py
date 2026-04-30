@@ -3,6 +3,22 @@
 Wraps the OpenCode headless HTTP server into the gateway ``BackendClient``
 protocol.  The official OpenCode SDK is TypeScript; this Python backend talks
 to the same server API directly with httpx.
+
+Two operating modes:
+
+- **managed** (default) — the gateway spawns ``opencode serve`` as a
+  subprocess and feeds it a generated config built from
+  ``OPENCODE_CONFIG_CONTENT`` and (optionally) the wrapper's ``MCP_CONFIG``.
+- **external** — when ``OPENCODE_BASE_URL`` is set, the gateway points its
+  HTTP client at that URL instead of starting a subprocess.  The external
+  server owns its own config, so wrapper-side options that affect server
+  startup (``OPENCODE_CONFIG_CONTENT``, ``OPENCODE_USE_WRAPPER_MCP_CONFIG``,
+  ``OPENCODE_BIN``, ``OPENCODE_HOST``, ``OPENCODE_PORT``,
+  ``OPENCODE_START_TIMEOUT_MS``) become no-ops.  Request-time parameters
+  (``OPENCODE_AGENT``, ``OPENCODE_DEFAULT_MODEL``,
+  ``OPENCODE_QUESTION_PERMISSION``, ``OPENCODE_MODELS``) and basic-auth
+  credentials (``OPENCODE_SERVER_USERNAME`` / ``OPENCODE_SERVER_PASSWORD``)
+  still apply.
 """
 
 from __future__ import annotations
@@ -92,11 +108,19 @@ class OpenCodeClient:
         self._server_password = os.getenv("OPENCODE_SERVER_PASSWORD")
         self._agent = os.getenv("OPENCODE_AGENT", "general").strip() or "general"
 
-        if os.getenv("OPENCODE_BASE_URL"):
-            raise RuntimeError(
-                "OPENCODE_BASE_URL is no longer supported; unset it to use managed OpenCode"
+        external_url = os.getenv("OPENCODE_BASE_URL")
+        if external_url:
+            self._mode = "external"
+            self.base_url = external_url.rstrip("/")
+            logger.info(
+                "OpenCode backend in external mode: %s "
+                "(OPENCODE_CONFIG_CONTENT and OPENCODE_USE_WRAPPER_MCP_CONFIG "
+                "are no-ops; the external server owns its config)",
+                self.base_url,
             )
-        self.base_url = self._start_managed_server()
+        else:
+            self._mode = "managed"
+            self.base_url = self._start_managed_server()
 
     @property
     def name(self) -> str:
@@ -111,7 +135,7 @@ class OpenCodeClient:
     def runtime_metadata(self) -> Dict[str, Any]:
         """Return operational details for admin diagnostics."""
         return {
-            "mode": "managed",
+            "mode": self._mode,
             "base_url": self.base_url,
             "agent": self._agent,
             "models": self.supported_models(),
