@@ -7,7 +7,7 @@ from src.session_manager import session_manager as global_sm
 
 def test_evicted_session_with_jsonl_rehydrates_via_get_session(tmp_path, monkeypatch):
     monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
-    cwd = "/home/mireiffe/world/oh-my-gateway/working_dir/u"
+    cwd = "/tmp/example_workspace/project.root/test_user"
     sid = "rehydrate-me-001"
     encoded = session_manager._encode_cwd(cwd)
     jsonl = tmp_path / encoded / f"{sid}.jsonl"
