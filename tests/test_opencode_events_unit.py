@@ -99,7 +99,7 @@ def test_record_message_role_ignores_event_when_info_not_dict():
 def test_convert_question_event_returns_none_when_request_id_missing():
     event = {
         "type": "question.asked",
-        "properties": {"questions": ["q1"]},
+        "properties": {"sessionID": "sess-1", "questions": ["q1"]},
     }
     assert _conv().convert(event) == []
 
@@ -112,7 +112,7 @@ def test_convert_question_event_returns_none_when_request_id_missing():
 def test_convert_permission_event_returns_none_for_missing_id():
     event = {
         "type": "permission.asked",
-        "properties": {"permission": "read"},
+        "properties": {"sessionID": "sess-1", "permission": "read"},
     }
     assert _conv().convert(event) == []
 
@@ -120,7 +120,7 @@ def test_convert_permission_event_returns_none_for_missing_id():
 def test_convert_permission_event_returns_none_for_missing_permission():
     event = {
         "type": "permission.asked",
-        "properties": {"id": "req-1", "permission": ""},
+        "properties": {"sessionID": "sess-1", "id": "req-1", "permission": ""},
     }
     assert _conv().convert(event) == []
 

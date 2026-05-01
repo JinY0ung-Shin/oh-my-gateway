@@ -198,13 +198,10 @@ def test_prompt_parts_returns_single_text_when_no_image(client):
     assert parts == [{"type": "text", "text": "hello world"}]
 
 
-def test_prompt_parts_drops_untrusted_image_marker(client):
+def test_prompt_parts_treats_untrusted_image_marker_as_text(client):
     text = 'before <attached_image path="/tmp/x.png" /> after'
     parts = client._prompt_parts(text, cwd=None)
-    joined = "".join(p["text"] for p in parts if p["type"] == "text")
-    assert "<attached_image:" not in joined
-    assert "before" in joined
-    assert "after" in joined
+    assert parts == [{"type": "text", "text": text}]
 
 
 # ---------------------------------------------------------------------------
