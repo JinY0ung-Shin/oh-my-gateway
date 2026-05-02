@@ -80,7 +80,7 @@ def test_codex_sandbox_mode_uses_cli_enum_and_normalizes_legacy_aliases(monkeypa
     from src.backends.codex.constants import sandbox_mode
 
     monkeypatch.delenv("CODEX_SANDBOX", raising=False)
-    assert sandbox_mode() == "workspace-write"
+    assert sandbox_mode() == "danger-full-access"
 
     monkeypatch.setenv("CODEX_SANDBOX", "workspaceWrite")
     assert sandbox_mode() == "workspace-write"
@@ -203,7 +203,7 @@ async def test_codex_client_starts_thread_and_converts_completed_turn(monkeypatc
             "model": "gpt-5.5",
             "cwd": str(tmp_path),
             "approvalPolicy": "never",
-            "sandbox": "workspace-write",
+            "sandbox": "danger-full-access",
             "developerInstructions": "extra instructions",
             "serviceName": "oh-my-gateway",
         }
@@ -233,6 +233,80 @@ async def test_codex_client_starts_thread_and_converts_completed_turn(monkeypatc
     assert fake_rpc.closed is False
     backend.close()
     assert fake_rpc.closed is True
+
+
+@pytest.mark.asyncio
+async def test_codex_client_finishes_when_thread_returns_idle_without_turn_completed(
+    monkeypatch,
+):
+    """Current Codex CLI can end turns with thread idle instead of turn/completed."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "item/agentMessage/delta",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "item_1",
+                "delta": "hi",
+            },
+        },
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "item_1",
+                    "phase": "final_answer",
+                    "text": "hi",
+                },
+            },
+        },
+        {
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 2,
+                        "cachedInputTokens": 1,
+                        "outputTokens": 1,
+                    },
+                },
+            },
+        },
+        {
+            "method": "thread/status/changed",
+            "params": {
+                "threadId": "thr_codex",
+                "status": {"type": "idle"},
+            },
+        },
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session")
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks[0] == {
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "hi"},
+        },
+    }
+    assert chunks[-2]["content"] == [{"type": "text", "text": "hi"}]
+    assert chunks[-2]["usage"] == {"input_tokens": 3, "output_tokens": 1}
+    assert chunks[-1]["type"] == "result"
+    assert chunks[-1]["result"] == "hi"
 
 
 @pytest.mark.asyncio
@@ -289,7 +363,7 @@ async def test_codex_client_reuses_session_thread(monkeypatch):
     assert fake_rpc.thread_resume_calls == [
         (
             "thr_existing",
-            {"model": "gpt-5.5", "approvalPolicy": "never", "sandbox": "workspace-write"},
+            {"model": "gpt-5.5", "approvalPolicy": "never", "sandbox": "danger-full-access"},
         )
     ]
 

@@ -477,7 +477,7 @@ class CodexClient:
                     }
                     return
                 turn_id = str(turn_obj["id"])
-                notification_iter = self._notification_iterator(rpc, turn_id)
+                notification_iter = self._notification_iterator(rpc, client.thread_id, turn_id)
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -502,6 +502,7 @@ class CodexClient:
     def _notification_iterator(
         self,
         rpc: CodexJsonRpcClient,
+        thread_id: str,
         turn_id: str,
     ) -> Iterator[Dict[str, Any]]:
         items: list[dict[str, Any]] = []
@@ -509,20 +510,23 @@ class CodexClient:
         while True:
             notification = rpc.next_notification()
             yield from self._chunks_from_notification(
+                thread_id=thread_id,
                 turn_id=turn_id,
                 notification=notification,
                 items=items,
                 usage_box=usage_box,
             )
-            if (
-                notification.get("method") == "turn/completed"
-                and (notification.get("params") or {}).get("turn", {}).get("id") == turn_id
+            if self._is_terminal_notification(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                notification=notification,
             ):
                 break
 
     def _chunks_from_notifications(
         self,
         *,
+        thread_id: Optional[str] = None,
         turn_id: str,
         notifications: Iterable[Dict[str, Any]],
     ) -> Iterator[Dict[str, Any]]:
@@ -530,6 +534,7 @@ class CodexClient:
         usage_box: dict[str, Optional[dict[str, int]]] = {"usage": None}
         for notification in notifications:
             yield from self._chunks_from_notification(
+                thread_id=thread_id,
                 turn_id=turn_id,
                 notification=notification,
                 items=items,
@@ -539,6 +544,7 @@ class CodexClient:
     def _chunks_from_notification(
         self,
         *,
+        thread_id: Optional[str],
         turn_id: str,
         notification: Dict[str, Any],
         items: list[dict[str, Any]],
@@ -552,7 +558,11 @@ class CodexClient:
         notification_turn_id = params.get("turnId")
         turn = params.get("turn")
         if isinstance(turn, dict):
-            notification_turn_id = turn.get("id")
+            notification_turn_id = turn.get("id") or notification_turn_id
+
+        if self._is_thread_idle_notification(thread_id, notification):
+            yield from self._completion_chunks(items, usage_box)
+            return
 
         if notification_turn_id != turn_id:
             return
@@ -590,9 +600,48 @@ class CodexClient:
             }
             return
 
-        final_text = self._final_response_from_items(items)
-        if not final_text:
-            return
+        yield from self._completion_chunks(items, usage_box)
+
+    def _is_terminal_notification(
+        self,
+        *,
+        thread_id: str,
+        turn_id: str,
+        notification: Dict[str, Any],
+    ) -> bool:
+        method = notification.get("method")
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            return False
+
+        if method == "turn/completed":
+            notification_turn_id = params.get("turnId")
+            turn = params.get("turn")
+            if isinstance(turn, dict):
+                notification_turn_id = turn.get("id") or notification_turn_id
+            return notification_turn_id == turn_id
+
+        return self._is_thread_idle_notification(thread_id, notification)
+
+    def _is_thread_idle_notification(
+        self,
+        thread_id: Optional[str],
+        notification: Dict[str, Any],
+    ) -> bool:
+        if not thread_id or notification.get("method") != "thread/status/changed":
+            return False
+        params = notification.get("params")
+        if not isinstance(params, dict) or params.get("threadId") != thread_id:
+            return False
+        status = params.get("status")
+        return isinstance(status, dict) and status.get("type") == "idle"
+
+    def _completion_chunks(
+        self,
+        items: list[dict[str, Any]],
+        usage_box: dict[str, Optional[dict[str, int]]],
+    ) -> Iterator[Dict[str, Any]]:
+        final_text = self._final_response_from_items(items) or ""
 
         assistant: Dict[str, Any] = {
             "type": "assistant",

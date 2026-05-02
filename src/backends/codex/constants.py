@@ -39,7 +39,7 @@ def approval_policy() -> str:
 
 
 def sandbox_mode() -> str:
-    raw = os.getenv("CODEX_SANDBOX", "workspace-write").strip() or "workspace-write"
+    raw = os.getenv("CODEX_SANDBOX", "danger-full-access").strip() or "danger-full-access"
     legacy_aliases = {
         "readOnly": "read-only",
         "workspaceWrite": "workspace-write",

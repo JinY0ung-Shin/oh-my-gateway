@@ -50,7 +50,7 @@ JSON-RPC client instead of adding an unavailable package dependency.
 | `CODEX_BIN` | Codex CLI binary name/path. Default: `codex` |
 | `CODEX_MODELS` | Comma-separated model allowlist exposed as `codex/<model>`. Default: `gpt-5.5` |
 | `CODEX_APPROVAL_POLICY` | `approvalPolicy` sent to Codex threads and turns. Default: `never` |
-| `CODEX_SANDBOX` | Thread-level Codex sandbox mode. Default: `workspace-write` |
+| `CODEX_SANDBOX` | Thread-level Codex sandbox mode. Default: `danger-full-access` for local experimental use |
 | `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |
 
 ## MVP Limits

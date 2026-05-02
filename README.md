@@ -33,7 +33,7 @@ curl http://localhost:8000/v1/responses \
 ## What It Provides
 
 - **Responses API**: `/v1/responses` with non-streaming and SSE streaming responses.
-- **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`), OpenCode (`opencode/<provider>/<model>`), and Codex (`codex/<model>`).
+- **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`), OpenCode (`opencode/<provider>/<model>`), and experimental Codex (`codex/<model>`).
 - **Session continuity**: `previous_response_id` and server-side session tracking.
 - **Workspace isolation**: temporary sessions by default, or per-user directories with `USER_WORKSPACES_DIR`.
 - **MCP support**: shared gateway `MCP_CONFIG`, with optional OpenCode managed-mode config generation.
@@ -49,7 +49,7 @@ curl http://localhost:8000/v1/responses \
 | OpenCode managed mode | [docs/opencode/managed.md](docs/opencode/managed.md) |
 | OpenCode external mode | [docs/opencode/external.md](docs/opencode/external.md) |
 | OpenCode + LiteLLM recipes | [docs/opencode/litellm.md](docs/opencode/litellm.md) |
-| Codex backend setup and SDK status | [docs/codex/](docs/codex/) |
+| Experimental Codex backend setup and SDK status | [docs/codex/](docs/codex/) |
 | Streaming event reference | [docs/streaming-events.md](docs/streaming-events.md) |
 | System prompt presets | [docs/](docs/) |
 
@@ -69,14 +69,14 @@ BACKENDS=claude,opencode
 OPENCODE_MODELS=openai/gpt-5.5
 ```
 
-Enable Codex alongside Claude:
+Enable the experimental Codex backend alongside Claude:
 
 ```bash
 BACKENDS=claude,codex
 CODEX_MODELS=gpt-5.5
 ```
 
-Codex uses the local `codex app-server` harness through JSON-RPC, not the OpenAI Responses API. The official Python SDK exists but is experimental and may not be installable from PyPI; see [docs/codex/](docs/codex/) for the current integration notes.
+The Codex backend is experimental. It is intended for local evaluation while the Codex CLI and SDK integration surface are still changing, so request behavior and configuration may change between releases. It uses the local `codex app-server` harness through JSON-RPC, not the OpenAI Responses API. The official Python SDK exists but is experimental and may not be installable from PyPI; see [docs/codex/](docs/codex/) for the current integration notes.
 
 OpenCode has two modes:
 
@@ -123,10 +123,10 @@ Most settings are environment variables. Start with `.env.example`.
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models |
-| `CODEX_BIN` | Codex CLI binary name/path; default `codex` |
+| `CODEX_BIN` | Experimental Codex CLI binary name/path; default `codex` |
 | `CODEX_MODELS` | Gateway allowlist for Codex models; default `gpt-5.5` |
 | `CODEX_APPROVAL_POLICY` | Codex approval policy; default `never` |
-| `CODEX_SANDBOX` | Codex thread sandbox mode; default `workspace-write` |
+| `CODEX_SANDBOX` | Codex thread sandbox mode; default `danger-full-access` for local experimental use |
 | `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
