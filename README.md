@@ -5,7 +5,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/JinY0ung-Shin/oh-my-gateway)
 [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-OpenAI-compatible gateway for coding agent backends. It exposes Claude Agent SDK and OpenCode through one `/v1/responses` API with streaming, multi-turn `previous_response_id` chaining, MCP integration, workspace isolation, and an admin dashboard.
+OpenAI-compatible gateway for coding agent backends. It exposes Claude Agent SDK, OpenCode, and Codex through one `/v1/responses` API with streaming, multi-turn `previous_response_id` chaining, MCP integration, workspace isolation, and an admin dashboard.
 
 > Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose service is now `gateway`; update commands such as `docker compose logs claude-wrapper` to use `gateway`.
 
@@ -33,7 +33,7 @@ curl http://localhost:8000/v1/responses \
 ## What It Provides
 
 - **Responses API**: `/v1/responses` with non-streaming and SSE streaming responses.
-- **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`) and OpenCode (`opencode/<provider>/<model>`).
+- **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`), OpenCode (`opencode/<provider>/<model>`), and Codex (`codex/<model>`).
 - **Session continuity**: `previous_response_id` and server-side session tracking.
 - **Workspace isolation**: temporary sessions by default, or per-user directories with `USER_WORKSPACES_DIR`.
 - **MCP support**: shared gateway `MCP_CONFIG`, with optional OpenCode managed-mode config generation.
@@ -49,6 +49,7 @@ curl http://localhost:8000/v1/responses \
 | OpenCode managed mode | [docs/opencode/managed.md](docs/opencode/managed.md) |
 | OpenCode external mode | [docs/opencode/external.md](docs/opencode/external.md) |
 | OpenCode + LiteLLM recipes | [docs/opencode/litellm.md](docs/opencode/litellm.md) |
+| Codex backend setup and SDK status | [docs/codex/](docs/codex/) |
 | Streaming event reference | [docs/streaming-events.md](docs/streaming-events.md) |
 | System prompt presets | [docs/](docs/) |
 
@@ -67,6 +68,15 @@ Enable OpenCode alongside Claude:
 BACKENDS=claude,opencode
 OPENCODE_MODELS=openai/gpt-5.5
 ```
+
+Enable Codex alongside Claude:
+
+```bash
+BACKENDS=claude,codex
+CODEX_MODELS=gpt-5.5
+```
+
+Codex uses the local `codex app-server` harness through JSON-RPC, not the OpenAI Responses API. The official Python SDK exists but is experimental and may not be installable from PyPI; see [docs/codex/](docs/codex/) for the current integration notes.
 
 OpenCode has two modes:
 
@@ -99,7 +109,7 @@ Most settings are environment variables. Start with `.env.example`.
 |----------|---------|
 | `ANTHROPIC_AUTH_TOKEN` | Claude API key auth |
 | `CLAUDE_AUTH_METHOD` | Force `api_key` or `cli` auth |
-| `BACKENDS` | Backend allowlist, for example `claude,opencode` |
+| `BACKENDS` | Backend allowlist, for example `claude,opencode,codex` |
 | `DEFAULT_MODEL` | Default model for requests without `model` |
 | `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
 | `MAX_TIMEOUT` | Backend timeout in milliseconds |
@@ -113,6 +123,11 @@ Most settings are environment variables. Start with `.env.example`.
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models |
+| `CODEX_BIN` | Codex CLI binary name/path; default `codex` |
+| `CODEX_MODELS` | Gateway allowlist for Codex models; default `gpt-5.5` |
+| `CODEX_APPROVAL_POLICY` | Codex approval policy; default `never` |
+| `CODEX_SANDBOX` | Codex thread sandbox mode; default `workspace-write` |
+| `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
 | `USAGE_LOG_DB_URL` | Optional SQLAlchemy URL for usage logging |
@@ -183,7 +198,7 @@ When `USAGE_LOG_DB_URL` is configured, usage analytics are available under `/adm
 
 Effective `/v1/responses` request fields:
 
-- `model`: `sonnet`, `opus`, `haiku`, or `opencode/<provider>/<model>`.
+- `model`: `sonnet`, `opus`, `haiku`, `opencode/<provider>/<model>`, or `codex/<model>`.
 - `input`: string, message array, `input_text` or `input_image` parts, or `function_call_output`.
 - `instructions`: system/developer prompt for a new session only.
 - `previous_response_id`: continue the latest turn of an existing session.
@@ -204,7 +219,7 @@ Notable deviations from OpenAI Responses API behavior:
 
 You must use your own upstream credentials. This project does not pool credentials, resell access, or bypass upstream authentication.
 
-Oh My Gateway is an independent open-source project and is not affiliated with or endorsed by Anthropic or the OpenCode authors.
+Oh My Gateway is an independent open-source project and is not affiliated with or endorsed by Anthropic, OpenAI, or the OpenCode authors.
 
 ## License
 

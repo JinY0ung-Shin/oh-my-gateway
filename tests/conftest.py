@@ -28,8 +28,10 @@ def register_all_descriptors():
     need descriptors before registering fake backends.
     """
     from src.backends.claude import CLAUDE_DESCRIPTOR
+    from src.backends.codex import CODEX_DESCRIPTOR
 
     BackendRegistry.register_descriptor(CLAUDE_DESCRIPTOR)
+    BackendRegistry.register_descriptor(CODEX_DESCRIPTOR)
 
 
 @pytest.fixture(autouse=True)

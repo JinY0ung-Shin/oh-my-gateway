@@ -106,6 +106,23 @@ class TestDiscoverBackends:
 
         assert calls == [("claude", "registry"), ("opencode", "registry")]
 
+    def test_discover_backends_registers_codex_from_backends_env(self, monkeypatch):
+        """BACKENDS=codex dispatches to the Codex backend package."""
+        import src.backends.codex as codex_pkg
+
+        calls = []
+
+        monkeypatch.setenv("BACKENDS", "codex")
+        monkeypatch.setattr(
+            codex_pkg, "register", lambda registry_cls=None: calls.append(registry_cls)
+        )
+
+        from src.backends import discover_backends
+
+        discover_backends(registry_cls="registry")
+
+        assert calls == ["registry"]
+
     def test_discover_backends_defaults_to_claude_only(self, monkeypatch):
         """Unset BACKENDS preserves current Claude-only startup behavior."""
         import src.backends.claude as claude_pkg
@@ -114,7 +131,9 @@ class TestDiscoverBackends:
         calls = []
 
         monkeypatch.delenv("BACKENDS", raising=False)
-        monkeypatch.setattr(claude_pkg, "register", lambda registry_cls=None: calls.append("claude"))
+        monkeypatch.setattr(
+            claude_pkg, "register", lambda registry_cls=None: calls.append("claude")
+        )
         monkeypatch.setattr(
             opencode_pkg, "register", lambda registry_cls=None: calls.append("opencode")
         )
@@ -134,7 +153,9 @@ class TestDiscoverBackends:
         calls = []
 
         monkeypatch.setenv("BACKENDS", "unknown,opencode")
-        monkeypatch.setattr(claude_pkg, "register", lambda registry_cls=None: calls.append("claude"))
+        monkeypatch.setattr(
+            claude_pkg, "register", lambda registry_cls=None: calls.append("claude")
+        )
         monkeypatch.setattr(
             opencode_pkg, "register", lambda registry_cls=None: calls.append("opencode")
         )

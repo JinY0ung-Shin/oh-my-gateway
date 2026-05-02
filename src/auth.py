@@ -65,6 +65,12 @@ def _get_opencode_auth_provider_class():
     return OpenCodeAuthProvider
 
 
+def _get_codex_auth_provider_class():
+    from src.backends.codex.auth import CodexAuthProvider
+
+    return CodexAuthProvider
+
+
 # ============================================================================
 # ClaudeCodeAuthManager — backward-compatible gateway auth manager
 # ============================================================================
@@ -115,6 +121,8 @@ class ClaudeCodeAuthManager:
             return self._claude_provider
         if backend == "opencode":
             return _get_opencode_auth_provider_class()()
+        if backend == "codex":
+            return _get_codex_auth_provider_class()()
         raise ValueError(f"Unknown backend: {backend!r}")
 
     # ------------------------------------------------------------------
@@ -275,4 +283,6 @@ def __getattr__(name):
         return _get_claude_auth_provider_class()
     if name == "OpenCodeAuthProvider":
         return _get_opencode_auth_provider_class()
+    if name == "CodexAuthProvider":
+        return _get_codex_auth_provider_class()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

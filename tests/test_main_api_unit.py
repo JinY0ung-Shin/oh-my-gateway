@@ -203,6 +203,56 @@ def test_responses_dispatches_to_opencode_backend_without_mcp():
     assert calls["prompt"] == "hi"
 
 
+def test_responses_dispatches_to_codex_backend_without_mcp():
+    """Responses requests for codex/... models dispatch to Codex backend."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"content": [{"type": "text", "text": "Codex response"}]}
+        yield {"type": "result", "subtype": "success", "result": "Codex response"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "Codex response"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 2,
+        "completion_tokens": 4,
+        "total_tokens": 6,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert calls["create_client"]["model"] == "gpt-5.5"
+    assert calls["create_client"]["mcp_servers"] is None
+    assert calls["prompt"] == "hi"
+
+
 def test_responses_streaming_enables_opencode_event_streaming():
     """Streaming OpenCode responses ask the OpenCode client to use /event."""
     calls = {}
