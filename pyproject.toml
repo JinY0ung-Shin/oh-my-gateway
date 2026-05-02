@@ -1,7 +1,7 @@
 [project]
 name = "oh-my-gateway"
 version = "2.2.0"
-description = "OpenAI-compatible gateway for Claude Agent SDK and OpenCode"
+description = "OpenAI-compatible gateway for Claude Agent SDK, OpenCode, and Codex"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"

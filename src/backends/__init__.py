@@ -41,6 +41,8 @@ def discover_backends(registry_cls=None) -> None:
             from src.backends import claude as backend_pkg
         elif name == "opencode":
             from src.backends import opencode as backend_pkg
+        elif name == "codex":
+            from src.backends import codex as backend_pkg
         else:
             logger.warning("Unknown backend in BACKENDS=%r; skipping", name)
             continue
