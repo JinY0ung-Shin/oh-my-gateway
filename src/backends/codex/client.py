@@ -69,6 +69,9 @@ class CodexJsonRpcClient:
             args.extend(["--config", override])
         args.extend(["app-server", "--listen", "stdio://"])
 
+        # Inherit the gateway environment so Codex CLI auth/runtime settings
+        # such as OPENAI_API_KEY and CODEX_HOME remain available. Request
+        # metadata is allowlisted separately and overlaid below.
         proc_env = os.environ.copy()
         proc_env.update(self.env)
         self._proc = subprocess.Popen(  # noqa: S603 - binary is operator-configured
@@ -84,6 +87,9 @@ class CodexJsonRpcClient:
         )
         self._start_stderr_drain_thread()
         self._initialize()
+
+    def is_running(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
 
     def close(self) -> None:
         if self._proc is None:
@@ -251,9 +257,12 @@ class CodexSessionClient:
     model: Optional[str]
     cwd: Optional[str]
     stream_events: bool = False
+    env: Optional[Dict[str, str]] = None
+    owns_rpc: bool = False
 
     async def disconnect(self) -> None:
-        await asyncio.to_thread(self.rpc.close)
+        if self.owns_rpc:
+            await asyncio.to_thread(self.rpc.close)
 
 
 class CodexClient:
@@ -261,6 +270,9 @@ class CodexClient:
 
     def __init__(self, timeout: Optional[int] = None) -> None:
         self.timeout = (timeout if timeout is not None else DEFAULT_TIMEOUT_MS) / 1000
+        self._rpc: Optional[CodexJsonRpcClient] = None
+        self._rpc_env: Dict[str, str] = {}
+        self._rpc_lock = asyncio.Lock()
 
     @property
     def name(self) -> str:
@@ -278,7 +290,17 @@ class CodexClient:
             "models": self.supported_models(),
             "approval_policy": approval_policy(),
             "sandbox": sandbox_mode(),
+            "shared_process": self._rpc_is_usable(self._rpc),
         }
+
+    def close(self) -> None:
+        rpc = self._rpc
+        self._rpc = None
+        self._rpc_env = {}
+        if rpc is not None:
+            rpc.close()
+
+    shutdown = close
 
     async def verify(self) -> bool:
         rpc = CodexJsonRpcClient(
@@ -312,39 +334,80 @@ class CodexClient:
     ) -> CodexSessionClient:
         _ = (allowed_tools, disallowed_tools, permission_mode, mcp_servers, task_budget)
         env = self._metadata_env(extra_env)
-        rpc = CodexJsonRpcClient(
-            binary=codex_bin(),
+        async with self._rpc_lock:
+            try:
+                rpc = await self._ensure_rpc_locked(env)
+
+                params = self._thread_params(
+                    model=model,
+                    cwd=cwd,
+                    system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+                )
+                thread_id = getattr(session, "codex_thread_id", None)
+                if thread_id:
+                    await asyncio.to_thread(rpc.thread_resume, thread_id, params)
+                else:
+                    result = await asyncio.to_thread(
+                        rpc.thread_start,
+                        {**params, "serviceName": "oh-my-gateway"},
+                    )
+                    thread = result.get("thread")
+                    if not isinstance(thread, dict) or not thread.get("id"):
+                        raise CodexAppServerError("thread/start response missing thread.id")
+                    thread_id = str(thread["id"])
+                    setattr(session, "codex_thread_id", thread_id)
+            except Exception:
+                await self._close_rpc_locked()
+                raise
+
+        return CodexSessionClient(
+            rpc=rpc,
+            thread_id=thread_id,
+            model=model,
             cwd=cwd,
             env=env,
-            config_overrides=configured_config_overrides(),
-            read_timeout=self.timeout,
+            owns_rpc=False,
         )
-        try:
-            await asyncio.to_thread(rpc.start)
 
-            params = self._thread_params(
-                model=model,
-                cwd=cwd,
-                system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+    async def _ensure_rpc_locked(self, env: Dict[str, str]) -> CodexJsonRpcClient:
+        if self._rpc is not None and env != self._rpc_env:
+            await self._close_rpc_locked()
+
+        if not self._rpc_is_usable(self._rpc):
+            if self._rpc is not None:
+                await self._close_rpc_locked()
+            rpc = CodexJsonRpcClient(
+                binary=codex_bin(),
+                cwd=None,
+                env=env,
+                config_overrides=configured_config_overrides(),
+                read_timeout=self.timeout,
             )
-            thread_id = getattr(session, "codex_thread_id", None)
-            if thread_id:
-                await asyncio.to_thread(rpc.thread_resume, thread_id, params)
-            else:
-                result = await asyncio.to_thread(
-                    rpc.thread_start,
-                    {**params, "serviceName": "oh-my-gateway"},
-                )
-                thread = result.get("thread")
-                if not isinstance(thread, dict) or not thread.get("id"):
-                    raise CodexAppServerError("thread/start response missing thread.id")
-                thread_id = str(thread["id"])
-                setattr(session, "codex_thread_id", thread_id)
-        except Exception:
-            await asyncio.to_thread(rpc.close)
-            raise
+            try:
+                await asyncio.to_thread(rpc.start)
+            except Exception:
+                await asyncio.to_thread(rpc.close)
+                raise
+            self._rpc = rpc
+            self._rpc_env = dict(env)
 
-        return CodexSessionClient(rpc=rpc, thread_id=thread_id, model=model, cwd=cwd)
+        assert self._rpc is not None
+        return self._rpc
+
+    async def _close_rpc_locked(self) -> None:
+        rpc = self._rpc
+        self._rpc = None
+        self._rpc_env = {}
+        if rpc is not None:
+            await asyncio.to_thread(rpc.close)
+
+    def _rpc_is_usable(self, rpc: Optional[CodexJsonRpcClient]) -> bool:
+        if rpc is None:
+            return False
+        is_running = getattr(rpc, "is_running", None)
+        if callable(is_running):
+            return bool(is_running())
+        return not bool(getattr(rpc, "closed", False))
 
     def _metadata_env(self, extra_env: Optional[Dict[str, str]]) -> Dict[str, str]:
         if not extra_env:
@@ -396,35 +459,38 @@ class CodexClient:
         session: Any,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         _ = session
-        try:
-            turn = await asyncio.to_thread(
-                client.rpc.turn_start,
-                client.thread_id,
-                [{"type": "text", "text": prompt}],
-                self._turn_params(client),
-            )
-            turn_obj = turn.get("turn")
-            if not isinstance(turn_obj, dict) or not turn_obj.get("id"):
-                yield {
-                    "type": "error",
-                    "is_error": True,
-                    "error_message": "turn/start response missing turn.id",
-                }
-                return
-            turn_id = str(turn_obj["id"])
-            notification_iter = self._notification_iterator(client.rpc, turn_id)
-            while True:
-                has_value, chunk = await asyncio.to_thread(
-                    self._next_chunk,
-                    notification_iter,
+        async with self._rpc_lock:
+            try:
+                rpc = await self._ensure_rpc_locked(client.env or {})
+                turn = await asyncio.to_thread(
+                    rpc.turn_start,
+                    client.thread_id,
+                    [{"type": "text", "text": prompt}],
+                    self._turn_params(client),
                 )
-                if not has_value:
-                    break
-                if chunk is not None:
-                    yield chunk
-        except Exception as exc:
-            logger.error("Codex app-server turn failed: %s", exc, exc_info=True)
-            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+                turn_obj = turn.get("turn")
+                if not isinstance(turn_obj, dict) or not turn_obj.get("id"):
+                    yield {
+                        "type": "error",
+                        "is_error": True,
+                        "error_message": "turn/start response missing turn.id",
+                    }
+                    return
+                turn_id = str(turn_obj["id"])
+                notification_iter = self._notification_iterator(rpc, turn_id)
+                while True:
+                    has_value, chunk = await asyncio.to_thread(
+                        self._next_chunk,
+                        notification_iter,
+                    )
+                    if not has_value:
+                        break
+                    if chunk is not None:
+                        yield chunk
+            except Exception as exc:
+                await self._close_rpc_locked()
+                logger.error("Codex app-server turn failed: %s", exc, exc_info=True)
+                yield {"type": "error", "is_error": True, "error_message": str(exc)}
 
     @staticmethod
     def _next_chunk(iterator: Iterator[Dict[str, Any]]) -> tuple[bool, Optional[Dict[str, Any]]]:

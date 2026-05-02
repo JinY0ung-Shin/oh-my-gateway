@@ -27,6 +27,9 @@ curl http://localhost:8000/v1/responses \
   Codex login or Codex-supported API-key setup.
 - Each gateway session maps to one Codex app-server thread. The gateway stores
   the Codex thread id on the server-side session for subsequent turns.
+- The gateway keeps one Codex app-server subprocess per backend instance and
+  serializes Codex turns through that shared process. This avoids per-session
+  process startup cost while keeping the MVP transport simple.
 
 ## Python SDK Status
 
@@ -53,6 +56,8 @@ JSON-RPC client instead of adding an unavailable package dependency.
 ## MVP Limits
 
 - Text prompts and text responses are supported.
+- Codex turns are serialized through one shared app-server process; concurrent
+  Codex request multiplexing is not implemented yet.
 - OpenAI Responses API function-call continuations are not mapped to Codex
   approval flows yet. Codex app-server approval requests are cancelled until
   the gateway has an explicit approval UI.

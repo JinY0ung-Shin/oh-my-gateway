@@ -230,7 +230,45 @@ async def test_codex_client_starts_thread_and_converts_completed_turn(monkeypatc
     assert getattr(session, "codex_thread_id") == "thr_codex"
 
     await client.disconnect()
+    assert fake_rpc.closed is False
+    backend.close()
     assert fake_rpc.closed is True
+
+
+@pytest.mark.asyncio
+async def test_codex_client_reuses_shared_rpc_process(monkeypatch):
+    """One Codex backend process is reused across gateway sessions."""
+    created = []
+
+    def fake_factory(**kwargs):
+        rpc = FakeRpc()
+        created.append((rpc, kwargs))
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", fake_factory)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session_one = SimpleNamespace(session_id="gw-session-1")
+    session_two = SimpleNamespace(session_id="gw-session-2")
+
+    client_one = await backend.create_client(session=session_one, model="gpt-5.5")
+    client_two = await backend.create_client(session=session_two, model="gpt-5.5")
+
+    assert client_one.thread_id == "thr_codex"
+    assert client_two.thread_id == "thr_codex"
+    assert len(created) == 1
+    rpc, kwargs = created[0]
+    assert kwargs["cwd"] is None
+    assert len(rpc.thread_start_calls) == 2
+
+    await client_one.disconnect()
+    await client_two.disconnect()
+    assert rpc.closed is False
+
+    backend.close()
+    assert rpc.closed is True
 
 
 @pytest.mark.asyncio
@@ -277,6 +315,43 @@ async def test_codex_client_closes_rpc_when_thread_start_fails(monkeypatch):
         await backend.create_client(session=session, model="gpt-5.5")
 
     assert fake_rpc.closed is True
+
+
+@pytest.mark.asyncio
+async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
+    """Transport failures close the shared app-server so the next request restarts it."""
+
+    class FailingTurnRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise RuntimeError("transport failed")
+
+    created = []
+
+    def fake_factory(**kwargs):
+        rpc = FailingTurnRpc() if not created else FakeRpc()
+        created.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", fake_factory)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session")
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert chunks == [
+        {"type": "error", "is_error": True, "error_message": "transport failed"}
+    ]
+    assert created[0].closed is True
+
+    await backend.create_client(session=SimpleNamespace(session_id="gw-session-2"), model="gpt-5.5")
+
+    assert len(created) == 2
+    assert created[1].closed is False
 
 
 @pytest.mark.asyncio
@@ -373,7 +448,7 @@ def test_codex_json_rpc_client_does_not_auto_accept_approval_requests():
 
 @pytest.mark.asyncio
 async def test_codex_session_disconnect_is_async(monkeypatch):
-    """Session cleanup can await Codex session disconnect."""
+    """Session cleanup can await Codex handles without closing shared backend RPC."""
     fake_rpc = FakeRpc()
 
     from src.backends.codex.client import CodexSessionClient
@@ -382,4 +457,4 @@ async def test_codex_session_disconnect_is_async(monkeypatch):
 
     await asyncio.wait_for(client.disconnect(), timeout=1)
 
-    assert fake_rpc.closed is True
+    assert fake_rpc.closed is False
