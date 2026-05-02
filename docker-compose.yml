@@ -14,8 +14,12 @@ services:
         - http_proxy
         - https_proxy
         - no_proxy
-        # Optional pip index overrides for private/corporate PyPI mirrors.
+        # Optional apt/npm/pip overrides for private/corporate mirrors.
         # Export these in the shell before 'docker compose build' on corp networks.
+        - APT_MIRROR_URL
+        - APT_SECURITY_MIRROR_URL
+        - NPM_CONFIG_REGISTRY
+        - OPENCODE_VERSION
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
     # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck

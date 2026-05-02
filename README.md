@@ -150,6 +150,22 @@ cp .env.example .env
 docker compose up -d
 ```
 
+For corporate networks, Compose forwards build-time mirror settings from the
+host environment or `.env`:
+
+```bash
+APT_MIRROR_URL=http://apt-mirror.example.com/debian \
+APT_SECURITY_MIRROR_URL=http://apt-mirror.example.com/debian-security \
+NPM_CONFIG_REGISTRY=https://npm.example.com/repository/npm/ \
+PIP_INDEX_URL=https://pypi.example.com/simple/ \
+docker compose build
+```
+
+The Docker image is pinned to Debian trixie. OpenCode is installed from npm as
+`opencode-ai@${OPENCODE_VERSION:-1.14.29}`; mirror that package plus the
+matching platform package such as `opencode-linux-x64` or
+`opencode-linux-arm64`.
+
 The Compose service is named `gateway`. Optional usage logging is available through the `logging` profile:
 
 ```bash

@@ -1,21 +1,50 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-trixie AS opencode-builder
+
+ARG APT_MIRROR_URL=
+ARG APT_SECURITY_MIRROR_URL=
+
+COPY docker/apt_mirror_sources.sh /usr/local/bin/apt_mirror_sources.sh
+
+RUN sh /usr/local/bin/apt_mirror_sources.sh \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG OPENCODE_VERSION=1.14.29
+ARG NPM_CONFIG_REGISTRY=
+
+# Install OpenCode through npm in the builder, then keep only the native binary.
+RUN if [ -n "$NPM_CONFIG_REGISTRY" ]; then \
+        npm install -g --include=optional --registry "$NPM_CONFIG_REGISTRY" "opencode-ai@${OPENCODE_VERSION}"; \
+    else \
+        npm install -g --include=optional "opencode-ai@${OPENCODE_VERSION}"; \
+    fi \
+    && opencode --version \
+    && install -m 0755 /usr/local/lib/node_modules/opencode-ai/bin/.opencode /usr/local/bin/opencode \
+    && /usr/local/bin/opencode --version
+
+FROM python:3.12-slim-trixie AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    PIP_NO_CACHE_DIR=1 \
-    PATH="/root/.opencode/bin:${PATH}"
+    PIP_NO_CACHE_DIR=1
+
+ARG APT_MIRROR_URL=
+ARG APT_SECURITY_MIRROR_URL=
 
 # Install system dependencies.
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq ripgrep \
-    && rm -rf /var/lib/apt/lists/*
+COPY docker/apt_mirror_sources.sh /usr/local/bin/apt_mirror_sources.sh
 
-ARG OPENCODE_VERSION=1.14.29
+RUN sh /usr/local/bin/apt_mirror_sources.sh \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq ripgrep \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f /usr/local/bin/apt_mirror_sources.sh
 
 # Install OpenCode for the managed OpenCode backend.
-RUN curl -fsSL https://opencode.ai/install | bash -s -- --version ${OPENCODE_VERSION} --no-modify-path \
-    && opencode --version
+COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode
+RUN opencode --version
 
 WORKDIR /app
 
