@@ -22,6 +22,7 @@ services:
         - OPENCODE_VERSION
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
+        - PIP_TRUSTED_HOST
     # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
     # before starting the gateway, so the usage-log engine can connect on first
     # try.  ``required: false`` (Compose v2.20+) keeps the gateway runnable
@@ -40,8 +41,11 @@ services:
       - ~/.claude:/root/.claude
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
-      # Claude working directory (shared with host for inspection/editing)
-      - ./working_dir:/app/working_dir
+      # Claude working directory (shared with host for inspection/editing).
+      # Host path comes from CLAUDE_CWD in .env (parse-time interpolation);
+      # falls back to ./working_dir. Container path stays fixed so the
+      # CLAUDE_CWD override below is always valid.
+      - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
       # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
     # All runtime configuration comes from .env (see .env.example for the full list).

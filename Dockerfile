@@ -53,16 +53,21 @@ RUN uv --version
 WORKDIR /app
 
 # Optional: point pip at a private/corporate PyPI mirror.
+# PIP_TRUSTED_HOST is required when the mirror is served over plain HTTP;
+# pip silently ignores HTTP indexes otherwise. Space-separated for multiple hosts.
 ARG PIP_INDEX_URL=
 ARG PIP_EXTRA_INDEX_URL=
+ARG PIP_TRUSTED_HOST=
 
 # Install pinned runtime dependencies exported from uv.lock.
 COPY requirements.txt ./
 RUN PIP_INDEX_URL="$PIP_INDEX_URL" \
     PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" \
+    PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
     python -m pip install --upgrade pip \
     && PIP_INDEX_URL="$PIP_INDEX_URL" \
     PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" \
+    PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
     python -m pip install -r requirements.txt
 
 # Copy runtime files used by the app.
