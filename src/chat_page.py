@@ -587,6 +587,82 @@ body::after {
 /* Focus visible */
 :focus-visible { outline: 1px solid var(--green); outline-offset: 2px; }
 
+/* === Auth Overlay === */
+.auth-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 10001;
+  padding: 1rem;
+}
+.auth-overlay.hidden { display: none; }
+.auth-box {
+  width: min(420px, 100%);
+  background: var(--bg);
+  border: 1px solid var(--green-dim);
+  padding: 1.5rem;
+  box-shadow: var(--green-glow);
+}
+.auth-box h2 {
+  color: var(--green);
+  font-size: var(--fs-lg);
+  margin-bottom: 0.5rem;
+  text-shadow: 0 0 6px var(--green-muted);
+  letter-spacing: 0.08em;
+}
+.auth-box .auth-prompt {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  margin-bottom: 1rem;
+}
+.auth-box .auth-label {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  margin-bottom: 4px;
+  display: block;
+}
+.auth-box .auth-input {
+  width: 100%;
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  background: var(--bg-deep);
+  color: var(--text);
+  border: 1px solid var(--border-bright);
+  padding: 8px 10px;
+  outline: none;
+  margin-bottom: 0.75rem;
+}
+.auth-box .auth-input:focus {
+  border-color: var(--green-dim);
+  box-shadow: 0 0 6px var(--green-muted);
+}
+.auth-box .auth-submit {
+  width: 100%;
+  font-family: var(--font);
+  font-size: var(--fs-sm);
+  padding: 8px 14px;
+  background: var(--bg-raised);
+  color: var(--green);
+  border: 1px solid var(--green-dim);
+  cursor: pointer;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.auth-box .auth-submit:hover {
+  background: var(--green-subtle);
+  text-shadow: 0 0 4px var(--green-muted);
+}
+.auth-box .auth-error {
+  color: var(--red);
+  font-size: var(--fs-xs);
+  margin-top: 0.5rem;
+  min-height: 1em;
+}
+
 /* Send button active */
 .send-btn:active:not(:disabled) { transform: scale(0.96); background: var(--green-muted); }
 
@@ -611,6 +687,20 @@ body::after {
 </style>
 </head>
 <body>
+
+<!-- Auth Overlay (admin login gate — hidden once authenticated) -->
+<div class="auth-overlay" id="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-title">
+  <div class="auth-box">
+    <h2 id="auth-title">ACCESS TERMINAL</h2>
+    <p class="auth-prompt">ADMIN_API_KEY required for chat access</p>
+    <form id="auth-form">
+      <label class="auth-label" for="auth-key">root@gateway:~#</label>
+      <input type="password" id="auth-key" class="auth-input" placeholder="••••••••••••••••" autocomplete="current-password" required>
+      <button type="submit" class="auth-submit">AUTHENTICATE</button>
+      <p class="auth-error" id="auth-error" aria-live="polite"></p>
+    </form>
+  </div>
+</div>
 
 <!-- Header -->
 <div class="header">
@@ -1147,6 +1237,60 @@ apiKeyEl.addEventListener('change', () => {
   else localStorage.removeItem('gateway_api_key');
   loadModels();
 });
+
+// ================================================================
+// Admin auth gate — mirrors /admin login flow so /admin/chat works directly
+// ================================================================
+const authOverlay = document.getElementById('auth-overlay');
+const authForm = document.getElementById('auth-form');
+const authKeyEl = document.getElementById('auth-key');
+const authErrorEl = document.getElementById('auth-error');
+
+function showAuthOverlay() {
+  authOverlay.classList.remove('hidden');
+  authKeyEl.focus();
+}
+function hideAuthOverlay() {
+  authOverlay.classList.add('hidden');
+  authErrorEl.textContent = '';
+  inputEl.focus();
+}
+
+async function checkAdminAuth() {
+  try {
+    const r = await fetch('/admin/api/server-info', { credentials: 'same-origin' });
+    if (r.ok) { hideAuthOverlay(); return true; }
+  } catch {}
+  showAuthOverlay();
+  return false;
+}
+
+authForm.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  authErrorEl.textContent = '';
+  const key = authKeyEl.value;
+  if (!key) return;
+  try {
+    const r = await fetch('/admin/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({ api_key: key }),
+    });
+    if (r.ok) {
+      authKeyEl.value = '';
+      hideAuthOverlay();
+    } else {
+      let detail = 'Authentication failed';
+      try { const d = await r.json(); detail = d.detail || detail; } catch {}
+      authErrorEl.textContent = detail;
+    }
+  } catch {
+    authErrorEl.textContent = 'Connection refused';
+  }
+});
+
+checkAdminAuth();
 
 loadModels();
 inputEl.focus();

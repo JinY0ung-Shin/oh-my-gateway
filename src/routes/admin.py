@@ -112,8 +112,8 @@ async def admin_page():
 
 
 @router.get("/chat", response_class=HTMLResponse)
-async def admin_chat_page(_=Depends(require_admin)):
-    """Serve the chat UI page (requires admin authentication)."""
+async def admin_chat_page():
+    """Serve the chat UI page. Auth gate is handled client-side, matching /admin."""
     from src.chat_page import build_chat_page
 
     return HTMLResponse(build_chat_page())

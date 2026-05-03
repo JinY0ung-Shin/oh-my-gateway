@@ -70,6 +70,20 @@ class TestAdminChatPage:
         assert "questions = [argsObj]" in r.text
         assert "JSON.stringify(answersByQuestion)" in r.text
 
+    def test_admin_chat_page_serves_login_gate_to_unauthenticated_clients(self):
+        """Anonymous GET /admin/chat should return 200 with the inline auth gate."""
+        with patch.dict(os.environ, {"ADMIN_API_KEY": "test-key"}):
+            from src.main import app
+
+            client = TestClient(app)
+            r = client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "text/html" in r.headers["content-type"]
+        assert 'id="auth-overlay"' in r.text
+        assert "/admin/api/login" in r.text
+        assert "ACCESS TERMINAL" in r.text
+
 
 class TestAdminAuth:
     def test_logout(self, admin_client):
