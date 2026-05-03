@@ -38,7 +38,7 @@ services:
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     volumes:
-      - ~/.claude:/root/.claude
+      - ~/.claude:/home/app/.claude
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
       # Claude working directory (shared with host for inspection/editing).

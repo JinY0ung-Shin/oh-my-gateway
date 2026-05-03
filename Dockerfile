@@ -75,6 +75,17 @@ COPY src ./src
 # The admin system-prompt UI loads these templates at runtime.
 COPY docs/*system-prompt*.md ./docs/
 
+# Run as non-root. The Claude CLI refuses --dangerously-skip-permissions under
+# root, and the gateway always opens sessions with permission_mode=bypassPermissions
+# (see src/routes/responses.py), so the container must run as a regular user.
+# uid 1000 matches the typical host developer uid so bind-mounted ./data and
+# ./working_dir stay writable without extra chown on the host.
+RUN useradd -m -u 1000 -s /bin/bash app \
+    && mkdir -p /app/data /app/working_dir \
+    && chown -R app:app /app /home/app
+ENV HOME=/home/app
+USER app
+
 # Expose the port (default 8000; overridable via PORT env var at runtime).
 EXPOSE 8000
 
