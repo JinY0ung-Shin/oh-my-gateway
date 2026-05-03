@@ -81,7 +81,7 @@ COPY docs/*system-prompt*.md ./docs/
 # uid 1000 matches the typical host developer uid so bind-mounted ./data and
 # ./working_dir stay writable without extra chown on the host.
 RUN useradd -m -u 1000 -s /bin/bash app \
-    && mkdir -p /app/data /app/working_dir \
+    && mkdir -p /app/data /app/working_dir /home/app/.claude \
     && chown -R app:app /app /home/app
 ENV HOME=/home/app
 USER app

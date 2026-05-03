@@ -38,7 +38,14 @@ services:
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
     volumes:
-      - ~/.claude:/home/app/.claude
+      # Container's claude CLI state lives in a named docker volume rather than
+      # a host bind mount: host customizations (skills, CLAUDE.md, conversation
+      # history) do not leak in, but per-container state — conversation logs,
+      # caches, settings written by the SDK — survives container recreates.
+      # Auth comes from ANTHROPIC_AUTH_TOKEN in .env, not from a credentials
+      # file. To opt back into host assets, add a separate read-only mount,
+      # e.g. ~/.claude/skills:/home/app/.claude/skills:ro
+      - claude_home:/home/app/.claude
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
       # Claude working directory (shared with host for inspection/editing).
@@ -84,3 +91,9 @@ services:
       timeout: 5s
       retries: 10
     restart: unless-stopped
+
+volumes:
+  # Claude CLI per-container state (conversation history, caches, settings).
+  # Inspect with: docker volume inspect claude-code-openai-wrapper_claude_home
+  # Wipe with:    docker compose down -v   (or: docker volume rm <name>)
+  claude_home:
