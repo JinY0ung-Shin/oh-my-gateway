@@ -46,6 +46,10 @@ RUN sh /usr/local/bin/apt_mirror_sources.sh \
 COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode
 RUN opencode --version
 
+# Install uv for skills/scripts that invoke `uv run` inside the container.
+COPY --from=ghcr.io/astral-sh/uv:0.9.26 /uv /uvx /usr/local/bin/
+RUN uv --version
+
 WORKDIR /app
 
 # Optional: point pip at a private/corporate PyPI mirror.
