@@ -7,6 +7,8 @@
 #   CLAUDE_PLUGIN_NAME         plugin name (default: repo basename)
 #   CLAUDE_PLUGIN_MARKETPLACE  marketplace label (default: external)
 #   CLAUDE_PLUGIN_VERSION      branch or tag (default: main)
+#   CLAUDE_PLUGIN_GIT_USERNAME HTTPS git username for private repos (optional)
+#   CLAUDE_PLUGIN_GIT_TOKEN    HTTPS git token/password for private repos (optional)
 set -eu
 
 REPO="${CLAUDE_PLUGIN_REPO:-}"
@@ -16,6 +18,8 @@ DEFAULT_NAME="$(basename "$REPO" .git)"
 NAME="${CLAUDE_PLUGIN_NAME:-$DEFAULT_NAME}"
 MARKETPLACE="${CLAUDE_PLUGIN_MARKETPLACE:-external}"
 VERSION="${CLAUDE_PLUGIN_VERSION:-main}"
+GIT_USERNAME="${CLAUDE_PLUGIN_GIT_USERNAME:-}"
+GIT_TOKEN="${CLAUDE_PLUGIN_GIT_TOKEN:-}"
 
 CLAUDE_HOME="$HOME/.claude"
 PLUGINS_ROOT="$CLAUDE_HOME/plugins"
@@ -29,6 +33,28 @@ SETTINGS="$CLAUDE_HOME/settings.json"
 KEY="${NAME}@${MARKETPLACE}"
 
 mkdir -p "$PLUGINS_ROOT/cache/$MARKETPLACE/$NAME" "$CLAUDE_HOME"
+
+GIT_ASKPASS_FILE=""
+if [ -n "$GIT_USERNAME$GIT_TOKEN" ]; then
+    if [ -z "$GIT_USERNAME" ] || [ -z "$GIT_TOKEN" ]; then
+        echo "[install_plugins] CLAUDE_PLUGIN_GIT_USERNAME and CLAUDE_PLUGIN_GIT_TOKEN must be set together" >&2
+        exit 1
+    fi
+
+    GIT_ASKPASS_FILE="$(mktemp)"
+    cat > "$GIT_ASKPASS_FILE" <<'EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s\n' "$CLAUDE_PLUGIN_GIT_USERNAME" ;;
+    *Password*) printf '%s\n' "$CLAUDE_PLUGIN_GIT_TOKEN" ;;
+    *) printf '\n' ;;
+esac
+EOF
+    chmod 700 "$GIT_ASKPASS_FILE"
+    export GIT_ASKPASS="$GIT_ASKPASS_FILE"
+    export GIT_TERMINAL_PROMPT=0
+    trap 'if [ -n "$GIT_ASKPASS_FILE" ]; then rm -f "$GIT_ASKPASS_FILE"; fi' EXIT HUP INT TERM
+fi
 
 # Clone or update. No silent fallback to the repo's default branch: a wrong
 # CLAUDE_PLUGIN_VERSION must error clearly on first start, otherwise the
