@@ -75,6 +75,10 @@ COPY src ./src
 # The admin system-prompt UI loads these templates at runtime.
 COPY docs/*system-prompt*.md ./docs/
 
+# Optional GitHub plugin auto-install on container start (see CLAUDE_PLUGIN_* env vars).
+COPY docker/install_plugins.sh /usr/local/bin/install_plugins.sh
+RUN chmod +x /usr/local/bin/install_plugins.sh
+
 # Run as non-root. The Claude CLI refuses --dangerously-skip-permissions under
 # root, and the gateway always opens sessions with permission_mode=bypassPermissions
 # (see src/routes/responses.py), so the container must run as a regular user.
@@ -91,4 +95,4 @@ EXPOSE 8000
 
 # Run the app with Uvicorn and honor PORT env var.
 # exec ensures SIGTERM from docker stop reaches uvicorn.
-CMD ["sh", "-c", "exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "/usr/local/bin/install_plugins.sh && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
