@@ -56,7 +56,9 @@ def test_dockerfile_installs_opencode_binary_for_managed_mode():
     assert "npm install -g" in dockerfile
     assert '"opencode-ai@${OPENCODE_VERSION}"' in dockerfile
     assert "install -m 0755" in dockerfile
-    assert "COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode" in dockerfile
+    assert (
+        "COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode" in dockerfile
+    )
     assert "https://opencode.ai/install" not in dockerfile
     assert "opencode --version" in dockerfile
 
@@ -68,7 +70,10 @@ def test_final_docker_stage_does_not_keep_node_or_npm():
 
     assert "nodejs npm" not in final_stage
     assert "npm install" not in final_stage
-    assert "COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode" in final_stage
+    assert (
+        "COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode"
+        in final_stage
+    )
 
 
 def test_dockerfile_allows_apt_mirror_override():
@@ -127,6 +132,20 @@ def test_compose_forwards_corporate_build_mirror_args():
     assert "- OPENCODE_VERSION" in compose
     assert "- PIP_INDEX_URL" in compose
     assert "- PIP_EXTRA_INDEX_URL" in compose
+
+
+def test_compose_mounts_host_ca_bundle_with_debian_default_path():
+    """Compose should let git/curl use the host CA bundle by default."""
+    compose = (ROOT / "docker-compose.yml").read_text()
+    env_example = (ROOT / ".env.example").read_text()
+
+    expected = (
+        "${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:"
+        "/etc/ssl/certs/ca-certificates.crt:ro"
+    )
+
+    assert expected in compose
+    assert "HOST_CA_CERTIFICATES_PATH=/etc/ssl/certs/ca-certificates.crt" in env_example
 
 
 def test_compose_does_not_configure_external_opencode_server():

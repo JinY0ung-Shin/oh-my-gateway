@@ -46,6 +46,10 @@ services:
       # file. To opt back into host assets, add a separate read-only mount,
       # e.g. ~/.claude/skills:/home/app/.claude/skills:ro
       - claude_home:/home/app/.claude
+      # Share the host CA bundle with the container so git/curl/Python trust the
+      # same corporate roots. Override HOST_CA_CERTIFICATES_PATH in .env when
+      # the host bundle lives outside the Debian/Ubuntu default path.
+      - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
       # Claude working directory (shared with host for inspection/editing).
