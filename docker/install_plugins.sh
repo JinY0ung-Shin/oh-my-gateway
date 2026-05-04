@@ -1,13 +1,13 @@
 #!/bin/sh
-# Idempotent installer for a Claude Code plugin from GitHub.
+# Idempotent installer for a Claude Code plugin from a marketplace repository.
 # Activated when CLAUDE_PLUGIN_REPO is set; otherwise no-op.
 #
 # Env vars:
-#   CLAUDE_PLUGIN_REPO         git URL (required to activate; empty = skip)
+#   CLAUDE_PLUGIN_REPO         marketplace URL/path/GitHub repo (required to activate; empty = skip)
 #   CLAUDE_PLUGIN_NAME         plugin name (default: repo basename)
-#   CLAUDE_PLUGIN_MARKETPLACE  marketplace label (default: external)
-#   CLAUDE_PLUGIN_VERSION      branch or tag (default: main)
-#   CLAUDE_PLUGIN_PATH         repo-relative plugin directory (optional)
+#   CLAUDE_PLUGIN_MARKETPLACE  marketplace name from marketplace.json (optional)
+#   CLAUDE_PLUGIN_SCOPE        install scope: user, project, or local (default: user)
+#   CLAUDE_PLUGIN_CLAUDE_BIN   Claude CLI path override (optional)
 #   CLAUDE_PLUGIN_GIT_USERNAME HTTPS git username for private repos (optional)
 #   CLAUDE_PLUGIN_GIT_TOKEN    HTTPS git token/password for private repos (optional)
 set -eu
@@ -15,26 +15,21 @@ set -eu
 REPO="${CLAUDE_PLUGIN_REPO:-}"
 [ -z "$REPO" ] && exit 0
 
-DEFAULT_NAME="$(basename "$REPO" .git)"
+DEFAULT_NAME="$(basename "$REPO")"
+DEFAULT_NAME="${DEFAULT_NAME%%#*}"
+DEFAULT_NAME="${DEFAULT_NAME%%@*}"
+DEFAULT_NAME="${DEFAULT_NAME%.git}"
 NAME="${CLAUDE_PLUGIN_NAME:-$DEFAULT_NAME}"
-MARKETPLACE="${CLAUDE_PLUGIN_MARKETPLACE:-external}"
-VERSION="${CLAUDE_PLUGIN_VERSION:-main}"
-PLUGIN_PATH="${CLAUDE_PLUGIN_PATH:-}"
+MARKETPLACE="${CLAUDE_PLUGIN_MARKETPLACE:-}"
+SCOPE="${CLAUDE_PLUGIN_SCOPE:-user}"
+CLAUDE_BIN="${CLAUDE_PLUGIN_CLAUDE_BIN:-}"
 GIT_USERNAME="${CLAUDE_PLUGIN_GIT_USERNAME:-}"
 GIT_TOKEN="${CLAUDE_PLUGIN_GIT_TOKEN:-}"
 
-CLAUDE_HOME="$HOME/.claude"
-PLUGINS_ROOT="$CLAUDE_HOME/plugins"
-CACHE_DIR="$PLUGINS_ROOT/cache/$MARKETPLACE/$NAME/$VERSION"
-MARKETPLACE_DIR="$PLUGINS_ROOT/marketplaces/$MARKETPLACE"
-MARKETPLACE_PLUGIN_DIR="$MARKETPLACE_DIR/plugins/$NAME"
-REGISTRY="$PLUGINS_ROOT/installed_plugins.json"
-KNOWN_MARKETPLACES="$PLUGINS_ROOT/known_marketplaces.json"
-MARKETPLACE_MANIFEST="$MARKETPLACE_DIR/.claude-plugin/marketplace.json"
-SETTINGS="$CLAUDE_HOME/settings.json"
-KEY="${NAME}@${MARKETPLACE}"
-
-mkdir -p "$PLUGINS_ROOT/cache/$MARKETPLACE/$NAME" "$CLAUDE_HOME"
+[ -n "$NAME" ] || {
+    echo "[install_plugins] CLAUDE_PLUGIN_NAME is required when it cannot be inferred from CLAUDE_PLUGIN_REPO" >&2
+    exit 1
+}
 
 GIT_ASKPASS_FILE=""
 if [ -n "$GIT_USERNAME$GIT_TOKEN" ]; then
@@ -58,108 +53,53 @@ EOF
     trap 'if [ -n "$GIT_ASKPASS_FILE" ]; then rm -f "$GIT_ASKPASS_FILE"; fi' EXIT HUP INT TERM
 fi
 
-# Clone or update. No silent fallback to the repo's default branch: a wrong
-# CLAUDE_PLUGIN_VERSION must error clearly on first start, otherwise the
-# initial clone succeeds against (say) `master` while the cache path encodes
-# `main`, and the next restart fails on `fetch origin main`.
-if [ -d "$CACHE_DIR/.git" ]; then
-    git -C "$CACHE_DIR" remote set-url origin "$REPO"
-    git -C "$CACHE_DIR" fetch --depth 1 origin "$VERSION"
-    git -C "$CACHE_DIR" checkout -B "$VERSION" FETCH_HEAD
-else
-    git clone --depth 1 --branch "$VERSION" "$REPO" "$CACHE_DIR"
+find_bundled_claude() {
+    PYTHON_BIN=""
+    if command -v python3 >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python3)"
+    elif command -v python >/dev/null 2>&1; then
+        PYTHON_BIN="$(command -v python)"
+    fi
+
+    [ -n "$PYTHON_BIN" ] || return 1
+
+    "$PYTHON_BIN" - <<'PY'
+from pathlib import Path
+import platform
+import claude_agent_sdk
+
+cli_name = "claude.exe" if platform.system() == "Windows" else "claude"
+path = Path(claude_agent_sdk.__file__).parent / "_bundled" / cli_name
+if path.exists() and path.is_file():
+    print(path)
+PY
+}
+
+if [ -z "$CLAUDE_BIN" ]; then
+    if command -v claude >/dev/null 2>&1; then
+        CLAUDE_BIN="$(command -v claude)"
+    else
+        CLAUDE_BIN="$(find_bundled_claude || true)"
+    fi
 fi
 
-PLUGIN_DIR="$CACHE_DIR"
-if [ -n "$PLUGIN_PATH" ]; then
-    case "$PLUGIN_PATH" in
-        /*|..|../*|*/..|*/../*)
-            echo "[install_plugins] CLAUDE_PLUGIN_PATH must be a repo-relative path without '..': $PLUGIN_PATH" >&2
-            exit 1
-            ;;
-    esac
-    PLUGIN_DIR="$CACHE_DIR/$PLUGIN_PATH"
-elif [ ! -f "$PLUGIN_DIR/.claude-plugin/plugin.json" ] && [ -f "$CACHE_DIR/plugins/$NAME/.claude-plugin/plugin.json" ]; then
-    PLUGIN_DIR="$CACHE_DIR/plugins/$NAME"
-fi
-
-PLUGIN_MANIFEST="$PLUGIN_DIR/.claude-plugin/plugin.json"
-[ -f "$PLUGIN_MANIFEST" ] || {
-    echo "[install_plugins] missing plugin manifest: $PLUGIN_MANIFEST" >&2
-    echo "[install_plugins] set CLAUDE_PLUGIN_PATH when the plugin lives below the repository root" >&2
+[ -x "$CLAUDE_BIN" ] || {
+    echo "[install_plugins] claude CLI is required for marketplace plugin install" >&2
+    echo "[install_plugins] set CLAUDE_PLUGIN_CLAUDE_BIN or install claude-agent-sdk with its bundled CLI" >&2
     exit 1
 }
 
-SHA="$(git -C "$CACHE_DIR" rev-parse HEAD)"
-NOW="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)"
-PLUGIN_DESCRIPTION="$(jq -r '.description // ""' "$PLUGIN_MANIFEST" 2>/dev/null || true)"
-PLUGIN_VERSION="$(jq -r '.version // ""' "$PLUGIN_MANIFEST" 2>/dev/null || true)"
-[ -z "$PLUGIN_VERSION" ] && PLUGIN_VERSION="$VERSION"
-
-# Preserve the original installedAt across restarts; only lastUpdated moves.
-INSTALLED_AT=""
-if [ -f "$REGISTRY" ]; then
-    INSTALLED_AT="$(jq -r --arg k "$KEY" '.plugins[$k][0].installedAt // ""' "$REGISTRY" 2>/dev/null || true)"
+PLUGIN_SPEC="$NAME"
+if [ -n "$MARKETPLACE" ]; then
+    PLUGIN_SPEC="$NAME@$MARKETPLACE"
 fi
-[ -z "$INSTALLED_AT" ] && INSTALLED_AT="$NOW"
 
-ENTRY="$(jq -n --arg p "$PLUGIN_DIR" --arg v "$VERSION" \
-    --arg ia "$INSTALLED_AT" --arg lu "$NOW" --arg sha "$SHA" \
-    '{scope:"user", installPath:$p, version:$v, installedAt:$ia, lastUpdated:$lu, gitCommitSha:$sha}')"
-
-TMP="$(mktemp)"
-if [ -f "$REGISTRY" ]; then
-    jq --arg k "$KEY" --argjson e "$ENTRY" \
-        '.version = 2 | .plugins = ((.plugins // {}) | (.[$k] = [$e]))' \
-        "$REGISTRY" > "$TMP"
+if [ -e "$REPO" ]; then
+    "$CLAUDE_BIN" plugin marketplace add "$REPO" --scope "$SCOPE"
 else
-    jq -n --arg k "$KEY" --argjson e "$ENTRY" \
-        '{version: 2, plugins: {($k): [$e]}}' > "$TMP"
+    "$CLAUDE_BIN" plugin marketplace add "$REPO" --scope "$SCOPE" --sparse .claude-plugin plugins
 fi
-mv "$TMP" "$REGISTRY"
 
-# Claude also validates enabled plugins against their marketplace metadata.
-# Direct GitHub installs do not have a real marketplace checkout, so create a
-# small synthetic one that points at this cache entry.
-mkdir -p "$MARKETPLACE_DIR/.claude-plugin" "$MARKETPLACE_PLUGIN_DIR/.claude-plugin"
-cp "$PLUGIN_MANIFEST" "$MARKETPLACE_PLUGIN_DIR/.claude-plugin/plugin.json"
+"$CLAUDE_BIN" plugin install "$PLUGIN_SPEC" --scope "$SCOPE"
 
-TMP="$(mktemp)"
-if [ -f "$KNOWN_MARKETPLACES" ]; then
-    jq --arg m "$MARKETPLACE" --arg r "$REPO" --arg p "$MARKETPLACE_DIR" --arg t "$NOW" \
-        '.[$m] = ((.[$m] // {}) | .source = {source:"git", url:$r} | .installLocation = $p | .lastUpdated = $t)' \
-        "$KNOWN_MARKETPLACES" > "$TMP"
-else
-    jq -n --arg m "$MARKETPLACE" --arg r "$REPO" --arg p "$MARKETPLACE_DIR" --arg t "$NOW" \
-        '{($m): {source:{source:"git", url:$r}, installLocation:$p, lastUpdated:$t}}' \
-        > "$TMP"
-fi
-mv "$TMP" "$KNOWN_MARKETPLACES"
-
-TMP="$(mktemp)"
-if [ -f "$MARKETPLACE_MANIFEST" ]; then
-    jq --arg m "$MARKETPLACE" --arg n "$NAME" --arg d "$PLUGIN_DESCRIPTION" --arg v "$PLUGIN_VERSION" \
-        '.name = (.name // $m)
-         | .plugins = ([((.plugins // [])[]) | select(.name != $n)]
-             + [{name:$n, description:$d, version:$v, source:("./plugins/" + $n)}])' \
-        "$MARKETPLACE_MANIFEST" > "$TMP"
-else
-    jq -n --arg m "$MARKETPLACE" --arg n "$NAME" --arg d "$PLUGIN_DESCRIPTION" --arg v "$PLUGIN_VERSION" \
-        '{name:$m, owner:{name:"External"}, metadata:{description:"Auto-installed external plugins", version:"1"}, plugins:[{name:$n, description:$d, version:$v, source:("./plugins/" + $n)}]}' \
-        > "$TMP"
-fi
-mv "$TMP" "$MARKETPLACE_MANIFEST"
-
-# Registry-only install leaves the plugin disabled — Claude reads
-# enabledPlugins from settings.json before activating skills/hooks/MCP.
-TMP="$(mktemp)"
-if [ -f "$SETTINGS" ]; then
-    jq --arg k "$KEY" \
-        '.enabledPlugins = ((.enabledPlugins // {}) | (.[$k] = true))' \
-        "$SETTINGS" > "$TMP"
-else
-    jq -n --arg k "$KEY" '{enabledPlugins: {($k): true}}' > "$TMP"
-fi
-mv "$TMP" "$SETTINGS"
-
-echo "[install_plugins] $KEY -> $PLUGIN_DIR ($VERSION @ $(printf '%.7s' "$SHA")) enabled"
+echo "[install_plugins] installed $PLUGIN_SPEC from marketplace source $REPO (scope: $SCOPE)"

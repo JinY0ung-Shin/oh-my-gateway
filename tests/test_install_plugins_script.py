@@ -43,130 +43,129 @@ def _write_plugin_files(plugin_dir: Path, *, name: str = "demo") -> None:
     )
 
 
-def _make_plugin_repo(tmp_path: Path) -> Path:
+def _write_marketplace_files(
+    repo: Path, *, marketplace: str = "external", plugin: str = "demo"
+) -> None:
+    meta = repo / ".claude-plugin"
+    meta.mkdir(parents=True)
+    (meta / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": marketplace,
+                "owner": {"name": "Test"},
+                "plugins": [
+                    {
+                        "name": plugin,
+                        "description": f"{plugin} plugin",
+                        "version": "0.1.0",
+                        "source": f"./plugins/{plugin}",
+                    }
+                ],
+            }
+        )
+    )
+    _write_plugin_files(repo / "plugins" / plugin, name=plugin)
+
+
+def _make_marketplace_repo(tmp_path: Path) -> Path:
     repo = tmp_path / "repo"
-    _write_plugin_files(repo)
-    _run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    _run(["git", "config", "user.email", "review@example.com"], cwd=repo)
-    _run(["git", "config", "user.name", "review"], cwd=repo)
-    _run(["git", "add", "."], cwd=repo)
-    _run(["git", "commit", "-q", "-m", "init"], cwd=repo)
+    _write_marketplace_files(repo)
     return repo
 
 
-def test_plugin_installer_autodetects_marketplace_plugin_directory(tmp_path):
-    repo = tmp_path / "repo"
-    _write_plugin_files(repo / "plugins" / "MonSemi", name="MonSemi")
-    _run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    _run(["git", "config", "user.email", "review@example.com"], cwd=repo)
-    _run(["git", "config", "user.name", "review"], cwd=repo)
-    _run(["git", "add", "."], cwd=repo)
-    _run(["git", "commit", "-q", "-m", "init"], cwd=repo)
-
-    home = tmp_path / "home"
-    env = {
-        **os.environ,
-        "HOME": str(home),
-        "CLAUDE_PLUGIN_REPO": str(repo),
-        "CLAUDE_PLUGIN_NAME": "MonSemi",
-        "CLAUDE_PLUGIN_MARKETPLACE": "external",
-        "CLAUDE_PLUGIN_VERSION": "main",
-    }
-
-    _run(["sh", str(SCRIPT)], env=env)
-
-    registry = json.loads((home / ".claude/plugins/installed_plugins.json").read_text())
-    install_path = Path(registry["plugins"]["MonSemi@external"][0]["installPath"])
-    assert install_path.name == "MonSemi"
-    assert install_path.parent.name == "plugins"
-
-
-def test_plugin_installer_uses_configured_repo_relative_plugin_path(tmp_path):
-    repo = tmp_path / "repo"
-    _write_plugin_files(repo / "packages" / "MonSemi", name="MonSemi")
-    _run(["git", "init", "-q", "-b", "main"], cwd=repo)
-    _run(["git", "config", "user.email", "review@example.com"], cwd=repo)
-    _run(["git", "config", "user.name", "review"], cwd=repo)
-    _run(["git", "add", "."], cwd=repo)
-    _run(["git", "commit", "-q", "-m", "init"], cwd=repo)
-
-    home = tmp_path / "home"
-    env = {
-        **os.environ,
-        "HOME": str(home),
-        "CLAUDE_PLUGIN_REPO": str(repo),
-        "CLAUDE_PLUGIN_NAME": "MonSemi",
-        "CLAUDE_PLUGIN_MARKETPLACE": "external",
-        "CLAUDE_PLUGIN_VERSION": "main",
-        "CLAUDE_PLUGIN_PATH": "packages/MonSemi",
-    }
-
-    _run(["sh", str(SCRIPT)], env=env)
-
-    registry = json.loads((home / ".claude/plugins/installed_plugins.json").read_text())
-    install_path = Path(registry["plugins"]["MonSemi@external"][0]["installPath"])
-    assert install_path.name == "MonSemi"
-    assert install_path.parent.name == "packages"
-
-
-def test_plugin_installer_uses_askpass_for_https_git_credentials(tmp_path):
+def test_plugin_installer_uses_claude_marketplace_commands_with_git_credentials(tmp_path):
     home = tmp_path / "home"
     bin_dir = tmp_path / "bin"
-    log = tmp_path / "git.log"
+    log = tmp_path / "claude.log"
     bin_dir.mkdir()
 
-    fake_git = bin_dir / "git"
-    fake_git.write_text(
+    fake_claude = bin_dir / "claude"
+    fake_claude.write_text(
         """#!/bin/sh
 set -eu
 
-printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
+printf '%s\\n' "$*" >> "$FAKE_CLAUDE_LOG"
 
-if [ "${1:-}" = "clone" ]; then
-    "$GIT_ASKPASS" "Username for 'https://github.example'" >> "$FAKE_GIT_LOG"
-    "$GIT_ASKPASS" "Password for 'https://bot@github.example'" >> "$FAKE_GIT_LOG"
-    target="$7"
-    mkdir -p "$target/.git" "$target/.claude-plugin"
-    printf '%s\\n' '{"name":"demo","version":"main","description":"Demo plugin"}' > "$target/.claude-plugin/plugin.json"
-    exit 0
+if [ "${1:-}" = "plugin" ] && [ "${2:-}" = "marketplace" ] && [ "${3:-}" = "add" ]; then
+    "$GIT_ASKPASS" "Username for 'https://github.example'" >> "$FAKE_CLAUDE_LOG"
+    "$GIT_ASKPASS" "Password for 'https://bot@github.example'" >> "$FAKE_CLAUDE_LOG"
 fi
-
-if [ "${1:-}" = "-C" ] && [ "${3:-}" = "rev-parse" ]; then
-    printf '%s\\n' "0123456789abcdef0123456789abcdef01234567"
-    exit 0
-fi
-
-printf '%s\\n' "unexpected git invocation: $*" >&2
-exit 1
 """
     )
-    fake_git.chmod(0o755)
+    fake_claude.chmod(0o755)
 
     env = {
         **os.environ,
         "HOME": str(home),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
-        "FAKE_GIT_LOG": str(log),
-        "CLAUDE_PLUGIN_REPO": "https://github.example/acme/demo.git",
-        "CLAUDE_PLUGIN_NAME": "demo",
-        "CLAUDE_PLUGIN_MARKETPLACE": "external",
-        "CLAUDE_PLUGIN_VERSION": "main",
+        "FAKE_CLAUDE_LOG": str(log),
+        "CLAUDE_PLUGIN_REPO": "https://github.example/acme/marketplace.git",
+        "CLAUDE_PLUGIN_NAME": "MonSemi",
+        "CLAUDE_PLUGIN_MARKETPLACE": "monsemi",
         "CLAUDE_PLUGIN_GIT_USERNAME": "bot",
         "CLAUDE_PLUGIN_GIT_TOKEN": "secret-token",
     }
 
     _run(["sh", str(SCRIPT)], env=env)
 
-    git_log = log.read_text()
-    assert "bot\n" in git_log
-    assert "secret-token\n" in git_log
+    claude_log = log.read_text()
+    assert (
+        "plugin marketplace add https://github.example/acme/marketplace.git "
+        "--scope user --sparse .claude-plugin plugins\n"
+    ) in claude_log
+    assert "plugin install MonSemi@monsemi --scope user\n" in claude_log
+    assert "bot\n" in claude_log
+    assert "secret-token\n" in claude_log
 
 
-def test_direct_plugin_install_registers_cli_usable_marketplace(tmp_path):
+def test_plugin_installer_falls_back_to_sdk_bundled_claude(tmp_path):
+    home = tmp_path / "home"
+    bin_dir = tmp_path / "bin"
+    bundled_dir = tmp_path / "sdk" / "_bundled"
+    log = tmp_path / "claude.log"
+    bin_dir.mkdir()
+    bundled_dir.mkdir(parents=True)
+
+    fake_python = bin_dir / "python3"
+    fake_python.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$FAKE_BUNDLED_CLAUDE"
+"""
+    )
+    fake_python.chmod(0o755)
+
+    fake_claude = bundled_dir / "claude"
+    fake_claude.write_text(
+        """#!/bin/sh
+set -eu
+printf '%s\\n' "$*" >> "$FAKE_CLAUDE_LOG"
+"""
+    )
+    fake_claude.chmod(0o755)
+
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "FAKE_BUNDLED_CLAUDE": str(fake_claude),
+        "FAKE_CLAUDE_LOG": str(log),
+        "CLAUDE_PLUGIN_REPO": "https://github.example/acme/marketplace.git",
+        "CLAUDE_PLUGIN_NAME": "MonSemi",
+        "CLAUDE_PLUGIN_MARKETPLACE": "monsemi",
+    }
+
+    _run(["sh", str(SCRIPT)], env=env)
+
+    claude_log = log.read_text()
+    assert "plugin marketplace add https://github.example/acme/marketplace.git" in claude_log
+    assert "plugin install MonSemi@monsemi --scope user\n" in claude_log
+
+
+def test_marketplace_install_registers_cli_usable_plugin_from_local_directory(tmp_path):
     if shutil.which("claude") is None:
         pytest.skip("Claude CLI is not installed")
 
-    repo = _make_plugin_repo(tmp_path)
+    repo = _make_marketplace_repo(tmp_path)
     home = tmp_path / "home"
     env = {
         **os.environ,
@@ -174,7 +173,6 @@ def test_direct_plugin_install_registers_cli_usable_marketplace(tmp_path):
         "CLAUDE_PLUGIN_REPO": str(repo),
         "CLAUDE_PLUGIN_NAME": "demo",
         "CLAUDE_PLUGIN_MARKETPLACE": "external",
-        "CLAUDE_PLUGIN_VERSION": "main",
     }
 
     _run(["sh", str(SCRIPT)], env=env)
