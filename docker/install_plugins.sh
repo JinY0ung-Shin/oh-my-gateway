@@ -7,6 +7,7 @@
 #   CLAUDE_PLUGIN_NAME         plugin name (default: repo basename)
 #   CLAUDE_PLUGIN_MARKETPLACE  marketplace label (default: external)
 #   CLAUDE_PLUGIN_VERSION      branch or tag (default: main)
+#   CLAUDE_PLUGIN_PATH         repo-relative plugin directory (optional)
 #   CLAUDE_PLUGIN_GIT_USERNAME HTTPS git username for private repos (optional)
 #   CLAUDE_PLUGIN_GIT_TOKEN    HTTPS git token/password for private repos (optional)
 set -eu
@@ -18,6 +19,7 @@ DEFAULT_NAME="$(basename "$REPO" .git)"
 NAME="${CLAUDE_PLUGIN_NAME:-$DEFAULT_NAME}"
 MARKETPLACE="${CLAUDE_PLUGIN_MARKETPLACE:-external}"
 VERSION="${CLAUDE_PLUGIN_VERSION:-main}"
+PLUGIN_PATH="${CLAUDE_PLUGIN_PATH:-}"
 GIT_USERNAME="${CLAUDE_PLUGIN_GIT_USERNAME:-}"
 GIT_TOKEN="${CLAUDE_PLUGIN_GIT_TOKEN:-}"
 
@@ -68,9 +70,23 @@ else
     git clone --depth 1 --branch "$VERSION" "$REPO" "$CACHE_DIR"
 fi
 
-PLUGIN_MANIFEST="$CACHE_DIR/.claude-plugin/plugin.json"
+PLUGIN_DIR="$CACHE_DIR"
+if [ -n "$PLUGIN_PATH" ]; then
+    case "$PLUGIN_PATH" in
+        /*|..|../*|*/..|*/../*)
+            echo "[install_plugins] CLAUDE_PLUGIN_PATH must be a repo-relative path without '..': $PLUGIN_PATH" >&2
+            exit 1
+            ;;
+    esac
+    PLUGIN_DIR="$CACHE_DIR/$PLUGIN_PATH"
+elif [ ! -f "$PLUGIN_DIR/.claude-plugin/plugin.json" ] && [ -f "$CACHE_DIR/plugins/$NAME/.claude-plugin/plugin.json" ]; then
+    PLUGIN_DIR="$CACHE_DIR/plugins/$NAME"
+fi
+
+PLUGIN_MANIFEST="$PLUGIN_DIR/.claude-plugin/plugin.json"
 [ -f "$PLUGIN_MANIFEST" ] || {
     echo "[install_plugins] missing plugin manifest: $PLUGIN_MANIFEST" >&2
+    echo "[install_plugins] set CLAUDE_PLUGIN_PATH when the plugin lives below the repository root" >&2
     exit 1
 }
 
@@ -87,7 +103,7 @@ if [ -f "$REGISTRY" ]; then
 fi
 [ -z "$INSTALLED_AT" ] && INSTALLED_AT="$NOW"
 
-ENTRY="$(jq -n --arg p "$CACHE_DIR" --arg v "$VERSION" \
+ENTRY="$(jq -n --arg p "$PLUGIN_DIR" --arg v "$VERSION" \
     --arg ia "$INSTALLED_AT" --arg lu "$NOW" --arg sha "$SHA" \
     '{scope:"user", installPath:$p, version:$v, installedAt:$ia, lastUpdated:$lu, gitCommitSha:$sha}')"
 
@@ -146,4 +162,4 @@ else
 fi
 mv "$TMP" "$SETTINGS"
 
-echo "[install_plugins] $KEY -> $CACHE_DIR ($VERSION @ $(printf '%.7s' "$SHA")) enabled"
+echo "[install_plugins] $KEY -> $PLUGIN_DIR ($VERSION @ $(printf '%.7s' "$SHA")) enabled"

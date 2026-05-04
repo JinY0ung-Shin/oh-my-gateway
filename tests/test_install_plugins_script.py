@@ -23,29 +23,90 @@ def _run(cmd, *, cwd=None, env=None):
     )
 
 
-def _make_plugin_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "repo"
-    skill = repo / "skills" / "demo"
-    meta = repo / ".claude-plugin"
+def _write_plugin_files(plugin_dir: Path, *, name: str = "demo") -> None:
+    skill = plugin_dir / "skills" / name
+    meta = plugin_dir / ".claude-plugin"
     skill.mkdir(parents=True)
-    meta.mkdir()
+    meta.mkdir(parents=True)
     (meta / "plugin.json").write_text(
         json.dumps(
             {
-                "name": "demo",
+                "name": name,
                 "version": "main",
-                "description": "Demo plugin",
+                "description": f"{name} plugin",
                 "skills": "./skills/",
             }
         )
     )
-    (skill / "SKILL.md").write_text("---\nname: demo\ndescription: Demo skill\n---\n\n# Demo\n")
+    (skill / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} skill\n---\n\n# {name}\n"
+    )
+
+
+def _make_plugin_repo(tmp_path: Path) -> Path:
+    repo = tmp_path / "repo"
+    _write_plugin_files(repo)
     _run(["git", "init", "-q", "-b", "main"], cwd=repo)
     _run(["git", "config", "user.email", "review@example.com"], cwd=repo)
     _run(["git", "config", "user.name", "review"], cwd=repo)
     _run(["git", "add", "."], cwd=repo)
     _run(["git", "commit", "-q", "-m", "init"], cwd=repo)
     return repo
+
+
+def test_plugin_installer_autodetects_marketplace_plugin_directory(tmp_path):
+    repo = tmp_path / "repo"
+    _write_plugin_files(repo / "plugins" / "MonSemi", name="MonSemi")
+    _run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    _run(["git", "config", "user.email", "review@example.com"], cwd=repo)
+    _run(["git", "config", "user.name", "review"], cwd=repo)
+    _run(["git", "add", "."], cwd=repo)
+    _run(["git", "commit", "-q", "-m", "init"], cwd=repo)
+
+    home = tmp_path / "home"
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CLAUDE_PLUGIN_REPO": str(repo),
+        "CLAUDE_PLUGIN_NAME": "MonSemi",
+        "CLAUDE_PLUGIN_MARKETPLACE": "external",
+        "CLAUDE_PLUGIN_VERSION": "main",
+    }
+
+    _run(["sh", str(SCRIPT)], env=env)
+
+    registry = json.loads((home / ".claude/plugins/installed_plugins.json").read_text())
+    install_path = Path(registry["plugins"]["MonSemi@external"][0]["installPath"])
+    assert install_path.name == "MonSemi"
+    assert install_path.parent.name == "plugins"
+
+
+def test_plugin_installer_uses_configured_repo_relative_plugin_path(tmp_path):
+    repo = tmp_path / "repo"
+    _write_plugin_files(repo / "packages" / "MonSemi", name="MonSemi")
+    _run(["git", "init", "-q", "-b", "main"], cwd=repo)
+    _run(["git", "config", "user.email", "review@example.com"], cwd=repo)
+    _run(["git", "config", "user.name", "review"], cwd=repo)
+    _run(["git", "add", "."], cwd=repo)
+    _run(["git", "commit", "-q", "-m", "init"], cwd=repo)
+
+    home = tmp_path / "home"
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CLAUDE_PLUGIN_REPO": str(repo),
+        "CLAUDE_PLUGIN_NAME": "MonSemi",
+        "CLAUDE_PLUGIN_MARKETPLACE": "external",
+        "CLAUDE_PLUGIN_VERSION": "main",
+        "CLAUDE_PLUGIN_PATH": "packages/MonSemi",
+    }
+
+    _run(["sh", str(SCRIPT)], env=env)
+
+    registry = json.loads((home / ".claude/plugins/installed_plugins.json").read_text())
+    install_path = Path(registry["plugins"]["MonSemi@external"][0]["installPath"])
+    assert install_path.name == "MonSemi"
+    assert install_path.parent.name == "packages"
 
 
 def test_plugin_installer_uses_askpass_for_https_git_credentials(tmp_path):
