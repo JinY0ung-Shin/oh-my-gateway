@@ -214,6 +214,7 @@ class TestUserSessionBinding:
 
         assert resp.status_code == 400
         assert "user mismatch" in resp.json()["error"]["message"].lower()
+        mock_wm.resolve.assert_not_called()
 
     def test_followup_reuses_stored_workspace(self, isolated_session_manager):
         """Follow-up requests reuse the workspace stored in the session."""
@@ -248,9 +249,7 @@ class TestUserSessionBinding:
             )
 
         assert resp.status_code == 200
-        # workspace_manager.resolve is called once with sync_template=False for the
-        # early cwd lookup used by get_session rehydrate-on-miss; never with sync_template=True.
-        mock_wm.resolve.assert_called_once_with("alice", sync_template=False, backend="claude")
+        mock_wm.resolve.assert_not_called()
         # cwd should be the stored workspace path (from session.workspace, not the early resolve)
         assert create_calls[0]["cwd"] == "/tmp/ws/alice"
 
@@ -284,7 +283,7 @@ class TestUserSessionBinding:
             patch.object(
                 isolated_session_manager,
                 "get_session",
-                side_effect=[None, session, session],
+                side_effect=[None, None, session, session],
             ) as mock_get_session,
             client_context_with_workspace(mock_wm) as (client, mock_cli),
         ):
@@ -308,6 +307,7 @@ class TestUserSessionBinding:
             call("alice", sync_template=False),
         ]
         assert mock_get_session.call_args_list == [
+            call(existing_session_id),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice/claude"),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice"),
             call(existing_session_id),
@@ -339,7 +339,7 @@ class TestUserSessionBinding:
             patch.object(
                 isolated_session_manager,
                 "get_session",
-                return_value=session,
+                side_effect=[None, session, session],
             ) as mock_get_session,
             client_context_with_workspace(mock_wm) as (client, mock_cli),
         ):
@@ -361,6 +361,7 @@ class TestUserSessionBinding:
         assert resp.status_code == 200
         mock_wm.resolve.assert_called_once_with("alice", sync_template=False, backend="codex")
         assert mock_get_session.call_args_list == [
+            call(existing_session_id),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice/codex"),
             call(existing_session_id),
         ]

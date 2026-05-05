@@ -320,6 +320,21 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             detail=f"previous_response_id '{body.previous_response_id}' is invalid",
         )
     session_id, turn = parsed
+    session = session_manager.get_session(session_id)
+    if session is not None:
+        if session.user != body.user:
+            raise HTTPException(
+                status_code=400,
+                detail=f"User mismatch: session belongs to {session.user!r}, "
+                f"but request specifies {body.user!r}",
+            )
+        if turn > session.turn_counter:
+            raise HTTPException(
+                status_code=404,
+                detail=f"previous_response_id '{body.previous_response_id}' references a future turn",
+            )
+        return session_id, session
+
     _early_cwd: Optional[str] = None
     if body.user:
         try:
@@ -343,6 +358,12 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
                 f"Session for previous_response_id "
                 f"'{body.previous_response_id}' not found or expired"
             ),
+        )
+    if session.user != body.user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User mismatch: session belongs to {session.user!r}, "
+            f"but request specifies {body.user!r}",
         )
     if turn > session.turn_counter:
         raise HTTPException(
