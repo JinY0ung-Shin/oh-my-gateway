@@ -95,6 +95,27 @@ class TestResolve:
         assert workspace.parent == tmp_base
         assert workspace.name.startswith("_tmp_")
 
+    def test_named_user_backend_creates_backend_directory(self, manager, tmp_base):
+        workspace = manager.resolve("alice", backend="codex", sync_template=False)
+        assert workspace == tmp_base / "alice" / "codex"
+        assert workspace.is_dir()
+
+    def test_named_user_backend_directories_are_independent(self, manager, tmp_base):
+        claude = manager.resolve("alice", backend="claude", sync_template=False)
+        codex = manager.resolve("alice", backend="codex", sync_template=False)
+        assert claude == tmp_base / "alice" / "claude"
+        assert codex == tmp_base / "alice" / "codex"
+        assert claude != codex
+
+    def test_anonymous_ignores_backend_for_tmp_layout(self, manager, tmp_base):
+        workspace = manager.resolve(None, backend="opencode", sync_template=False)
+        assert workspace.parent == tmp_base
+        assert workspace.name.startswith("_tmp_")
+
+    def test_rejects_invalid_backend_name(self, manager):
+        with pytest.raises(ValueError, match="Invalid backend"):
+            manager.resolve("alice", backend="../codex", sync_template=False)
+
     def test_anonymous_returns_different_dirs(self, manager):
         w1 = manager.resolve(None, sync_template=False)
         w2 = manager.resolve(None, sync_template=False)

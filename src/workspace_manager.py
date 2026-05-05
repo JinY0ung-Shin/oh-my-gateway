@@ -14,6 +14,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
+_BACKEND_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class WorkspaceManager:
@@ -35,24 +36,30 @@ class WorkspaceManager:
         self.template_source = Path(template_source) if template_source else None
         self.project_root = Path(project_root) if project_root else None
 
-    def resolve(self, user: Optional[str] = None, sync_template: bool = False) -> Path:
+    def resolve(
+        self,
+        user: Optional[str] = None,
+        sync_template: bool = False,
+        backend: Optional[str] = None,
+    ) -> Path:
         """Return the workspace path for *user*, creating it if necessary.
 
-        When *user* is ``None``, a temporary directory (``_tmp_{uuid}``) is
-        created under *base_path*.  When *sync_template* is ``True`` and a
-        template source is configured, the ``.claude/`` directory is copied
-        (overwriting existing files).
+        Named users use ``base_path/user/backend`` when *backend* is provided.
+        Anonymous workspaces remain session-scoped ``_tmp_{uuid}`` directories.
         """
+        backend_name = self._sanitize_backend(backend)
         if user is not None:
             sanitized = self._sanitize(user)
             workspace = self.base_path / sanitized
+            if backend_name:
+                workspace = workspace / backend_name
         else:
             workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
 
         workspace.mkdir(parents=True, exist_ok=True)
 
         if sync_template:
-            self._sync_template(workspace)
+            self._sync_template(workspace, backend=backend_name)
             self._sync_project_files(workspace)
 
         return workspace
@@ -84,10 +91,21 @@ class WorkspaceManager:
             )
         return user
 
+    def _sanitize_backend(self, backend: Optional[str]) -> Optional[str]:
+        """Validate and return a backend directory name."""
+        if backend is None:
+            return None
+        if not backend or not _BACKEND_PATTERN.match(backend):
+            raise ValueError(
+                f"Invalid backend: {backend!r}. Must match ^[a-z][a-z0-9_-]{{0,31}}$"
+            )
+        return backend
+
     _PROJECT_FILES = ("pyproject.toml", "uv.lock")
 
-    def _sync_template(self, workspace: Path) -> None:
-        """Copy ``.claude/`` from template source into *workspace*."""
+    def _sync_template(self, workspace: Path, backend: Optional[str] = None) -> None:
+        """Copy backend template files into *workspace*."""
+        _ = backend
         if self.template_source is None:
             return
         src = self.template_source / ".claude"
