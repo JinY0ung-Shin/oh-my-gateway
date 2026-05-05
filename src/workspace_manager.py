@@ -103,23 +103,83 @@ class WorkspaceManager:
 
     _PROJECT_FILES = ("pyproject.toml", "uv.lock")
 
-    def _sync_template(self, workspace: Path, backend: Optional[str] = None) -> None:
-        """Copy backend template files into *workspace*."""
-        _ = backend
-        if self.template_source is None:
-            return
-        src = self.template_source / ".claude"
-        if not src.is_dir():
-            logger.debug("Template source .claude/ not found at %s, skipping sync", src)
-            return
-        dst = workspace / ".claude"
+    def _replace_tree(self, src: Path, dst: Path) -> None:
         if dst.exists():
             if dst.is_symlink():
                 dst.unlink()
             else:
                 shutil.rmtree(dst)
         shutil.copytree(src, dst)
-        logger.debug("Synced .claude/ template to %s", dst)
+
+    def _copy_template_file(self, name: str, workspace: Path) -> None:
+        if self.template_source is None:
+            return
+        src = self.template_source / name
+        if not src.is_file():
+            return
+        dst = workspace / name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        shutil.copy2(src, dst)
+
+    def _copy_template_dir(self, name: str, workspace: Path) -> bool:
+        if self.template_source is None:
+            return False
+        src = self.template_source / name
+        if not src.is_dir():
+            return False
+        self._replace_tree(src, workspace / name)
+        return True
+
+    def _mirror_skill_dirs(self, sources: tuple[Path, ...], dst: Path) -> None:
+        for src in sources:
+            if not src.is_dir():
+                continue
+            dst.mkdir(parents=True, exist_ok=True)
+            for child in sorted(src.iterdir()):
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                skill_file = child / "SKILL.md"
+                if not skill_file.is_file() or skill_file.is_symlink():
+                    continue
+                target = dst / child.name
+                if target.exists():
+                    continue
+                shutil.copytree(child, target)
+
+    def _sync_template(self, workspace: Path, backend: Optional[str] = None) -> None:
+        """Copy backend-native templates into *workspace*."""
+        if self.template_source is None:
+            return
+
+        if backend == "codex":
+            self._copy_template_dir(".agents", workspace)
+            self._copy_template_file("AGENTS.md", workspace)
+            skills_dst = workspace / ".agents" / "skills"
+            if not skills_dst.exists():
+                self._mirror_skill_dirs(
+                    (self.template_source / ".claude" / "skills",), skills_dst
+                )
+            logger.debug("Synced Codex template to %s", workspace)
+            return
+
+        if backend == "opencode":
+            self._copy_template_dir(".opencode", workspace)
+            skills_dst = workspace / ".opencode" / "skills"
+            if not skills_dst.exists():
+                self._mirror_skill_dirs(
+                    (
+                        self.template_source / ".claude" / "skills",
+                        self.template_source / ".agents" / "skills",
+                    ),
+                    skills_dst,
+                )
+            logger.debug("Synced OpenCode template to %s", workspace)
+            return
+
+        self._copy_template_dir(".claude", workspace)
+        self._copy_template_file("CLAUDE.md", workspace)
+        logger.debug("Synced Claude template to %s", workspace)
 
     def _sync_project_files(self, workspace: Path) -> None:
         """Symlink project files (pyproject.toml, uv.lock) into *workspace*.
@@ -161,11 +221,11 @@ def _resolve_base_path() -> Path:
 
 
 def _resolve_template_source() -> Optional[Path]:
-    """Determine the .claude template source directory."""
+    """Determine the agent template source directory."""
     claude_cwd = os.getenv("CLAUDE_CWD", "")
     if claude_cwd:
         p = Path(claude_cwd)
-        if (p / ".claude").is_dir():
+        if p.is_dir():
             return p
     return None
 

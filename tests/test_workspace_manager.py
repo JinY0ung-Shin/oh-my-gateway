@@ -17,13 +17,30 @@ def tmp_base(tmp_path):
 
 @pytest.fixture
 def tmp_template(tmp_path):
-    """Provide a temporary CLAUDE_CWD with a .claude folder."""
+    """Provide a temporary CLAUDE_CWD-style template directory."""
     template = tmp_path / "template"
+
     claude_dir = template / ".claude"
     claude_dir.mkdir(parents=True)
     (claude_dir / "settings.json").write_text('{"key": "value"}')
     (claude_dir / "subdir").mkdir()
     (claude_dir / "subdir" / "nested.txt").write_text("nested content")
+    claude_skill = claude_dir / "skills" / "shared-skill"
+    claude_skill.mkdir(parents=True)
+    (claude_skill / "SKILL.md").write_text(
+        "---\nname: shared-skill\ndescription: Claude skill\n---\nClaude"
+    )
+    (template / "CLAUDE.md").write_text("# Claude instructions\n")
+
+    agents_dir = template / ".agents"
+    agents_dir.mkdir()
+    (agents_dir / "config.json").write_text('{"agent": true}')
+    (template / "AGENTS.md").write_text("# Agent instructions\n")
+
+    opencode_dir = template / ".opencode"
+    opencode_dir.mkdir()
+    (opencode_dir / "opencode.json").write_text('{"permission": {}}')
+
     return template
 
 
@@ -127,6 +144,65 @@ class TestResolve:
         assert claude_dir.is_dir()
         assert (claude_dir / "settings.json").read_text() == '{"key": "value"}'
         assert (claude_dir / "subdir" / "nested.txt").read_text() == "nested content"
+
+    def test_claude_sync_copies_only_claude_native_files(self, manager):
+        workspace = manager.resolve("alice", backend="claude", sync_template=True)
+        assert (workspace / ".claude" / "settings.json").is_file()
+        assert (workspace / "CLAUDE.md").read_text() == "# Claude instructions\n"
+        assert not (workspace / ".agents").exists()
+        assert not (workspace / ".opencode").exists()
+
+    def test_codex_sync_copies_agents_and_mirrors_claude_skills(self, manager):
+        workspace = manager.resolve("alice", backend="codex", sync_template=True)
+        assert (workspace / ".agents" / "config.json").is_file()
+        assert (workspace / "AGENTS.md").read_text() == "# Agent instructions\n"
+        mirrored = workspace / ".agents" / "skills" / "shared-skill" / "SKILL.md"
+        assert mirrored.read_text().endswith("Claude")
+        assert not (workspace / ".claude").exists()
+        assert not (workspace / ".opencode").exists()
+
+    def test_opencode_sync_copies_opencode_and_mirrors_claude_skills(self, manager):
+        workspace = manager.resolve("alice", backend="opencode", sync_template=True)
+        assert (workspace / ".opencode" / "opencode.json").is_file()
+        mirrored = workspace / ".opencode" / "skills" / "shared-skill" / "SKILL.md"
+        assert mirrored.read_text().endswith("Claude")
+        assert not (workspace / ".claude").exists()
+        assert not (workspace / ".agents").exists()
+
+    def test_codex_native_skills_win_over_claude_mirror(self, tmp_base, tmp_template):
+        native = tmp_template / ".agents" / "skills" / "shared-skill"
+        native.mkdir(parents=True)
+        (native / "SKILL.md").write_text(
+            "---\nname: shared-skill\ndescription: Codex native\n---\nCodex"
+        )
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=tmp_template)
+        workspace = mgr.resolve("alice", backend="codex", sync_template=True)
+        skill = workspace / ".agents" / "skills" / "shared-skill" / "SKILL.md"
+        assert skill.read_text().endswith("Codex")
+
+    def test_opencode_claude_compatibility_wins_over_agents_duplicate(
+        self, tmp_base, tmp_template
+    ):
+        agent_skill = tmp_template / ".agents" / "skills" / "shared-skill"
+        agent_skill.mkdir(parents=True)
+        (agent_skill / "SKILL.md").write_text(
+            "---\nname: shared-skill\ndescription: Agent copy\n---\nAgent"
+        )
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=tmp_template)
+        workspace = mgr.resolve("alice", backend="opencode", sync_template=True)
+        skill = workspace / ".opencode" / "skills" / "shared-skill" / "SKILL.md"
+        assert skill.read_text().endswith("Claude")
+
+    def test_template_source_without_claude_dir_can_sync_agents(self, tmp_base, tmp_path):
+        template = tmp_path / "template"
+        agents = template / ".agents"
+        agents.mkdir(parents=True)
+        (agents / "config.json").write_text('{"agent": true}')
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=template)
+
+        workspace = mgr.resolve("alice", backend="codex", sync_template=True)
+
+        assert (workspace / ".agents" / "config.json").is_file()
 
     def test_sync_template_false_skips_copy(self, manager, tmp_base):
         workspace = manager.resolve("carol", sync_template=False)
