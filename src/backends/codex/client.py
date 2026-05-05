@@ -220,6 +220,7 @@ class CodexJsonRpcClient:
             return {"decision": "cancel"}
         if method == "item/permissions/requestApproval":
             return {"permissions": {}, "scope": "turn"}
+        logger.warning("Unknown Codex server request method: %r", method)
         return {}
 
     def _write_message(self, payload: Dict[str, Any]) -> None:
@@ -552,8 +553,25 @@ class CodexClient:
                 method = client.pending_approval_method or ""
                 params = client.pending_approval_params or {}
                 request_id = client.pending_approval_request_id
-                if request_id is None or str(request_id) != str(call_id):
-                    request_id = call_id
+                if request_id is None:
+                    logger.error(
+                        "Codex approval continuation is missing pending request id for call_id %r",
+                        call_id,
+                    )
+                    yield {
+                        "type": "error",
+                        "is_error": True,
+                        "error_message": "Codex approval continuation is missing request id",
+                    }
+                    return
+                if str(request_id) != str(call_id):
+                    message = (
+                        "Codex approval request id mismatch: pending "
+                        f"{request_id!r}, received {call_id!r}"
+                    )
+                    logger.error(message)
+                    yield {"type": "error", "is_error": True, "error_message": message}
+                    return
                 turn_id = client.pending_approval_turn_id or str(params.get("turnId") or "")
                 if not turn_id:
                     yield {

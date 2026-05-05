@@ -786,6 +786,60 @@ class TestContinuationNonStreaming:
         assert exc_info.value.status_code == 502
         sdk_client.disconnect.assert_awaited_once()
 
+    async def test_non_streaming_continuation_timeout_returns_504_and_releases_lock(
+        self, monkeypatch
+    ):
+        """Non-streaming continuation has a route-level timeout guard."""
+        from fastapi import HTTPException
+
+        from src.routes.responses import _handle_function_call_output
+
+        session_id = "00000000-0000-0000-0000-000000000000"
+        session = _make_continuation_session(session_id, turn=1)
+        sdk_client = AsyncMock()
+        sdk_client.disconnect = AsyncMock()
+        session.client = sdk_client
+        body = _make_body(stream=False)
+        resolved = _make_resolved()
+
+        backend = MagicMock()
+        backend.run_completion_with_client = MagicMock()
+
+        async def fake_receive(client, sess):
+            await asyncio.Event().wait()
+            yield {"type": "result", "subtype": "success", "result": "unreachable"}
+
+        backend.receive_response_from_client = fake_receive
+        backend.parse_message = MagicMock(return_value=None)
+        monkeypatch.setattr(
+            responses_module,
+            "NON_STREAM_CONTINUATION_TIMEOUT_SECONDS",
+            0.01,
+            raising=False,
+        )
+
+        with patch.object(responses_module, "session_manager") as mock_sm:
+            mock_sm.add_assistant_response = MagicMock()
+
+            with pytest.raises(HTTPException) as exc_info:
+                await asyncio.wait_for(
+                    _handle_function_call_output(
+                        body,
+                        resolved,
+                        backend,
+                        session,
+                        session_id,
+                        "/tmp/ws/test",
+                        {"call_id": "toolu_abc", "output": "yes"},
+                    ),
+                    timeout=0.5,
+                )
+
+        assert exc_info.value.status_code == 504
+        assert "timed out" in exc_info.value.detail
+        assert not session.lock.locked()
+        sdk_client.disconnect.assert_awaited_once()
+
     async def test_empty_response_returns_502(self):
         """When backend yields no text, returns 502."""
         from fastapi import HTTPException

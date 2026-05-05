@@ -1,6 +1,7 @@
 """Responses API endpoint (/v1/responses)."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -33,7 +34,7 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.rate_limiter import rate_limit_endpoint
-from src.constants import PERMISSION_MODE_BYPASS
+from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
 from src.usage_logger import usage_logger
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_MS / 1000
 
 
 def _generate_msg_id() -> str:
@@ -776,6 +778,30 @@ async def _capture_pending_tool_questions(chunk_source, resolved: ResolvedModel,
         yield chunk
 
 
+async def _collect_non_stream_continuation_chunks(chunk_source):
+    chunks = []
+
+    async def _consume():
+        async for chunk in chunk_source:
+            chunks.append(chunk)
+
+    try:
+        await asyncio.wait_for(
+            _consume(),
+            timeout=NON_STREAM_CONTINUATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        close = getattr(chunk_source, "aclose", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                await close()
+        raise HTTPException(
+            status_code=504,
+            detail=(f"Continuation timed out after {NON_STREAM_CONTINUATION_TIMEOUT_SECONDS:.3g}s"),
+        ) from exc
+    return chunks
+
+
 @router.post("/v1/responses")
 @rate_limit_endpoint("responses")
 async def create_response(
@@ -1117,12 +1143,12 @@ async def _handle_function_call_output(
     """Handle a function_call_output continuation request.
 
     Validates that the session has a pending tool call with a matching
-    ``call_id``, unblocks the SDK's PreToolUse hook, and then streams
-    the continuation response from the existing :class:`ClaudeSDKClient`.
+    ``call_id``, reserves the backend-specific continuation, and then reads
+    the continuation response from the existing backend session client.
 
-    The validation and event-unblock are performed atomically under the
+    The validation and continuation preparation are performed atomically under the
     session lock to prevent races where concurrent requests could read
-    stale ``pending_tool_call`` / ``input_event`` state.
+    stale ``pending_tool_call`` / backend resume state.
     """
     import time as _time
 
@@ -1153,9 +1179,8 @@ async def _handle_function_call_output(
             try:
                 chunks_buffer = []
                 _configure_client_streaming(active_client, True)
-                # After the hook returns deny+reason, the SDK continues
-                # processing from where it left off.  Use receive_response_from_client
-                # when available; do not start a new prompt.
+                # Resume the backend-specific pending tool request; do not
+                # start a new prompt for continuation turns.
                 if resolved.backend == "opencode":
                     if opencode_resume_kind == "permission":
                         backend_source = backend.resume_permission_with_client(
@@ -1263,9 +1288,8 @@ async def _handle_function_call_output(
     # --- Non-streaming continuation ---
     continuation_success = False
     try:
-        chunks = []
-        # After the hook returns deny+reason, the SDK continues
-        # processing from where it left off — no new query needed.
+        # Resume the backend-specific pending tool request; do not start a
+        # new prompt for continuation turns.
         _configure_client_streaming(active_client, False)
         if resolved.backend == "opencode":
             if opencode_resume_kind == "permission":
@@ -1295,8 +1319,9 @@ async def _handle_function_call_output(
                 backend_source = receiver(active_client, session)
             else:
                 backend_source = backend.run_completion_with_client(active_client, "", session)
-        async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
-            chunks.append(chunk)
+        chunks = await _collect_non_stream_continuation_chunks(
+            _capture_pending_tool_questions(backend_source, resolved, session)
+        )
 
         # Check for another pending_tool_call
         if session.pending_tool_call is not None:

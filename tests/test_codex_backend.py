@@ -638,6 +638,45 @@ async def test_codex_client_resumes_command_approval_and_continues_turn(monkeypa
 
 
 @pytest.mark.asyncio
+async def test_codex_resume_approval_rejects_request_id_mismatch(monkeypatch):
+    """Approval resume refuses corrupted request state instead of falling back silently."""
+    fake_rpc = FakeRpc()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    client.pending_approval_request_id = "approval_other"
+    client.pending_approval_method = "item/commandExecution/requestApproval"
+    client.pending_approval_turn_id = "turn_1"
+    client.pending_approval_params = {"turnId": "turn_1"}
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            client,
+            "approval_1",
+            "accept",
+            session,
+        )
+    ]
+
+    assert fake_rpc.respond_calls == []
+    assert chunks == [
+        {
+            "type": "error",
+            "is_error": True,
+            "error_message": (
+                "Codex approval request id mismatch: pending 'approval_other', "
+                "received 'approval_1'"
+            ),
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_codex_client_reuses_shared_rpc_process(monkeypatch):
     """One Codex backend process is reused across gateway sessions."""
     created = []
@@ -844,6 +883,19 @@ def test_codex_json_rpc_client_does_not_auto_accept_approval_requests():
         "permissions": {},
         "scope": "turn",
     }
+
+
+def test_codex_json_rpc_client_logs_unknown_server_request(caplog):
+    """Unknown app-server request methods stay deny-neutral but visible in logs."""
+    from src.backends.codex.client import CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+
+    with caplog.at_level("WARNING", logger="src.backends.codex.client"):
+        assert rpc._handle_server_request({"method": "item/newFeature/requestApproval"}) == {}
+
+    assert "Unknown Codex server request method" in caplog.text
+    assert "item/newFeature/requestApproval" in caplog.text
 
 
 def test_codex_json_rpc_client_queues_approval_requests_while_waiting_for_response(
