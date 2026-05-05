@@ -225,6 +225,52 @@ class TestResolve:
         assert (workspace / ".agents" / "skills" / "shared-skill" / "SKILL.md").is_file()
         assert not (target / "skills").exists()
 
+    def test_codex_mirror_replaces_symlinked_skills_dir(self, tmp_base, tmp_path):
+        template = tmp_path / "template"
+        skill = template / ".claude" / "skills" / "shared-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: shared-skill\ndescription: Claude skill\n---\nClaude"
+        )
+        target = tmp_path / "outside-skills"
+        target.mkdir()
+
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=template)
+        workspace = mgr.resolve("alice", backend="codex", sync_template=False)
+        (workspace / ".agents").mkdir()
+        (workspace / ".agents" / "skills").symlink_to(target, target_is_directory=True)
+
+        mgr.resolve("alice", backend="codex", sync_template=True)
+
+        skills = workspace / ".agents" / "skills"
+        assert skills.is_dir()
+        assert not skills.is_symlink()
+        assert (skills / "shared-skill" / "SKILL.md").is_file()
+        assert not (target / "shared-skill").exists()
+
+    def test_opencode_mirror_replaces_symlinked_skills_dir(self, tmp_base, tmp_path):
+        template = tmp_path / "template"
+        skill = template / ".claude" / "skills" / "shared-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: shared-skill\ndescription: Claude skill\n---\nClaude"
+        )
+        target = tmp_path / "outside-skills"
+        target.mkdir()
+
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=template)
+        workspace = mgr.resolve("alice", backend="opencode", sync_template=False)
+        (workspace / ".opencode").mkdir()
+        (workspace / ".opencode" / "skills").symlink_to(target, target_is_directory=True)
+
+        mgr.resolve("alice", backend="opencode", sync_template=True)
+
+        skills = workspace / ".opencode" / "skills"
+        assert skills.is_dir()
+        assert not skills.is_symlink()
+        assert (skills / "shared-skill" / "SKILL.md").is_file()
+        assert not (target / "shared-skill").exists()
+
     def test_skill_dirs_containing_symlinks_are_not_mirrored(self, tmp_base, tmp_path):
         template = tmp_path / "template"
         skill = template / ".claude" / "skills" / "unsafe-skill"

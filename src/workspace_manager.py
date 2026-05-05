@@ -176,7 +176,7 @@ class WorkspaceManager:
             self._copy_template_dir(".agents", workspace)
             self._copy_template_file("AGENTS.md", workspace)
             skills_dst = workspace / ".agents" / "skills"
-            if not skills_dst.exists():
+            if skills_dst.is_symlink() or not skills_dst.exists():
                 self._mirror_skill_dirs(
                     (self.template_source / ".claude" / "skills",), skills_dst
                 )
@@ -186,7 +186,7 @@ class WorkspaceManager:
         if backend == "opencode":
             self._copy_template_dir(".opencode", workspace)
             skills_dst = workspace / ".opencode" / "skills"
-            if not skills_dst.exists():
+            if skills_dst.is_symlink() or not skills_dst.exists():
                 self._mirror_skill_dirs(
                     (
                         self.template_source / ".claude" / "skills",
