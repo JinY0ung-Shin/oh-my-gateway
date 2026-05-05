@@ -554,6 +554,32 @@ class TestResponsesStreamingValidationViaEndpoint:
         assert response.status_code == 400
         mock_cli.create_client.assert_not_called()
 
+    def test_streaming_create_client_failure_returns_503_and_releases_lock(self):
+        """Streaming client creation failure cleans up before returning a response."""
+        captured = {}
+
+        async def failing_create_client(**kwargs):
+            captured["session"] = kwargs["session"]
+            raise RuntimeError("simulated streaming SDK boot failure")
+
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(side_effect=failing_create_client)
+
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "Hi",
+                    "stream": True,
+                },
+            )
+
+        session = captured["session"]
+        assert response.status_code == 503
+        assert not session.lock.locked()
+        assert session.client is None
+        assert session_manager.get_session(session.session_id) is None
+
 
 # ===========================================================================
 # Validation handler body read exception in DEBUG mode
