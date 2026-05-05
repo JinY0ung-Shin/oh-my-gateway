@@ -71,7 +71,9 @@ class TestUserParam:
             )
 
         assert resp.status_code == 200
-        mock_wm.resolve.assert_called_once_with("alice", sync_template=True)
+        mock_wm.resolve.assert_called_once_with(
+            "alice", sync_template=True, backend="claude"
+        )
 
     def test_user_none_creates_temp_workspace(self, isolated_session_manager):
         mock_wm = MagicMock()
@@ -89,12 +91,14 @@ class TestUserParam:
             )
 
         assert resp.status_code == 200
-        mock_wm.resolve.assert_called_once_with(None, sync_template=True)
+        mock_wm.resolve.assert_called_once_with(
+            None, sync_template=True, backend="claude"
+        )
 
     def test_cwd_passed_to_run_completion(self, isolated_session_manager):
         """cwd is forwarded to create_client (which spawns the persistent SDK session)."""
         mock_wm = MagicMock()
-        mock_wm.resolve.return_value = Path("/tmp/ws/alice")
+        mock_wm.resolve.return_value = Path("/tmp/ws/alice/claude")
         create_calls = []
 
         async def fake_create_client(**kwargs):
@@ -115,7 +119,42 @@ class TestUserParam:
 
         assert resp.status_code == 200
         assert len(create_calls) == 1
-        assert create_calls[0]["cwd"] == "/tmp/ws/alice"
+        assert create_calls[0]["cwd"] == "/tmp/ws/alice/claude"
+
+    def test_responses_resolves_codex_workspace_with_codex_backend(
+        self, isolated_session_manager
+    ):
+        mock_wm = MagicMock()
+        mock_wm.resolve.return_value = Path("/tmp/ws/alice/codex")
+        create_calls = []
+
+        async def fake_create_client(**kwargs):
+            create_calls.append(kwargs)
+            return object()
+
+        async def fake_run_completion(client, prompt, session):
+            yield {"subtype": "success", "result": "Hello from Codex"}
+
+        with client_context_with_workspace(mock_wm) as (client, mock_cli):
+            BackendRegistry.unregister("claude")
+            BackendRegistry.register("codex", mock_cli)
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion
+            mock_cli.parse_message = MagicMock(return_value="Hello from Codex")
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": "codex/gpt-5.5",
+                    "input": "hello",
+                    "user": "alice",
+                },
+            )
+
+        assert resp.status_code == 200
+        mock_wm.resolve.assert_called_once_with(
+            "alice", sync_template=True, backend="codex"
+        )
+        assert create_calls[0]["cwd"] == "/tmp/ws/alice/codex"
 
     def test_invalid_user_returns_400(self, isolated_session_manager):
         mock_wm = MagicMock()
@@ -219,6 +258,8 @@ class TestUserSessionBinding:
         assert resp.status_code == 200
         # workspace_manager.resolve is called once with sync_template=False for the
         # early cwd lookup used by get_session rehydrate-on-miss; never with sync_template=True.
-        mock_wm.resolve.assert_called_once_with("alice", sync_template=False)
+        mock_wm.resolve.assert_called_once_with(
+            "alice", sync_template=False, backend="claude"
+        )
         # cwd should be the stored workspace path (from session.workspace, not the early resolve)
         assert create_calls[0]["cwd"] == "/tmp/ws/alice"

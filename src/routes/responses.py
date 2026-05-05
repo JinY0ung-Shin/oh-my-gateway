@@ -306,7 +306,7 @@ def _validate_response_continuation(body: ResponseCreateRequest) -> None:
                 )
 
 
-def _resolve_response_session(body: ResponseCreateRequest) -> tuple[str, Any]:
+def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tuple[str, Any]:
     if not body.previous_response_id:
         session_id = str(uuid.uuid4())
         return session_id, session_manager.get_or_create_session(session_id)
@@ -321,10 +321,23 @@ def _resolve_response_session(body: ResponseCreateRequest) -> tuple[str, Any]:
     _early_cwd: Optional[str] = None
     if body.user:
         try:
-            _early_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+            _early_cwd = str(
+                workspace_manager.resolve(
+                    body.user, sync_template=False, backend=backend
+                )
+            )
         except (ValueError, OSError):
             pass
     session = session_manager.get_session(session_id, user=body.user, cwd=_early_cwd)
+    if session is None and backend == "claude" and body.user:
+        try:
+            legacy_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+        except (ValueError, OSError):
+            legacy_cwd = None
+        if legacy_cwd and legacy_cwd != _early_cwd:
+            session = session_manager.get_session(
+                session_id, user=body.user, cwd=legacy_cwd
+            )
     if not session:
         raise HTTPException(
             status_code=404,
@@ -346,6 +359,7 @@ async def _resolve_response_workspace(
     session,
     session_id: str,
     is_new_session: bool,
+    backend: str,
 ) -> Path:
     if not is_new_session and session.user != body.user:
         raise HTTPException(
@@ -356,7 +370,11 @@ async def _resolve_response_workspace(
 
     if is_new_session:
         try:
-            workspace = workspace_manager.resolve(body.user, sync_template=True)
+            workspace = workspace_manager.resolve(
+                body.user,
+                sync_template=True,
+                backend=backend,
+            )
         except ValueError as e:
             await session_manager.delete_session_async(session_id)
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -368,7 +386,11 @@ async def _resolve_response_workspace(
         return Path(session.workspace)
 
     try:
-        workspace = workspace_manager.resolve(body.user, sync_template=False)
+        workspace = workspace_manager.resolve(
+            body.user,
+            sync_template=False,
+            backend=backend,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     session.workspace = str(workspace)
@@ -745,8 +767,10 @@ async def create_response(
     # Moved earlier — needed for workspace sync_template decision
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
-    session_id, session = _resolve_response_session(body)
-    workspace = await _resolve_response_workspace(body, session, session_id, is_new_session)
+    session_id, session = _resolve_response_session(body, resolved.backend)
+    workspace = await _resolve_response_workspace(
+        body, session, session_id, is_new_session, resolved.backend
+    )
     workspace_str = str(workspace)
 
     # ------------------------------------------------------------------
