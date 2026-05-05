@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 from src.session_manager import Session
-from src.workspace_manager import WorkspaceManager, _resolve_project_root
+from src.workspace_manager import WorkspaceManager, _resolve_project_root, _resolve_template_source
 
 
 @pytest.fixture
@@ -204,6 +204,43 @@ class TestResolve:
 
         assert (workspace / ".agents" / "config.json").is_file()
 
+    def test_codex_mirror_replaces_symlinked_agents_dir(self, tmp_base, tmp_path):
+        template = tmp_path / "template"
+        skill = template / ".claude" / "skills" / "shared-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: shared-skill\ndescription: Claude skill\n---\nClaude"
+        )
+        target = tmp_path / "outside"
+        target.mkdir()
+
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=template)
+        workspace = mgr.resolve("alice", backend="codex", sync_template=False)
+        (workspace / ".agents").symlink_to(target, target_is_directory=True)
+
+        mgr.resolve("alice", backend="codex", sync_template=True)
+
+        assert (workspace / ".agents").is_dir()
+        assert not (workspace / ".agents").is_symlink()
+        assert (workspace / ".agents" / "skills" / "shared-skill" / "SKILL.md").is_file()
+        assert not (target / "skills").exists()
+
+    def test_skill_dirs_containing_symlinks_are_not_mirrored(self, tmp_base, tmp_path):
+        template = tmp_path / "template"
+        skill = template / ".claude" / "skills" / "unsafe-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text(
+            "---\nname: unsafe-skill\ndescription: Unsafe skill\n---\nUnsafe"
+        )
+        linked = tmp_path / "linked.txt"
+        linked.write_text("secret")
+        (skill / "linked.txt").symlink_to(linked)
+
+        mgr = WorkspaceManager(base_path=tmp_base, template_source=template)
+        workspace = mgr.resolve("alice", backend="codex", sync_template=True)
+
+        assert not (workspace / ".agents" / "skills" / "unsafe-skill").exists()
+
     def test_sync_template_false_skips_copy(self, manager, tmp_base):
         workspace = manager.resolve("carol", sync_template=False)
         assert not (workspace / ".claude").exists()
@@ -274,6 +311,16 @@ class TestSessionUserField:
 
 
 class TestResolveProjectRoot:
+    def test_resolve_template_source_returns_directory_without_claude_dir(
+        self, tmp_path, monkeypatch
+    ):
+        claude_cwd = tmp_path / "repo"
+        claude_cwd.mkdir()
+
+        monkeypatch.setenv("CLAUDE_CWD", str(claude_cwd))
+
+        assert _resolve_template_source() == claude_cwd
+
     def test_prefers_claude_cwd_when_it_has_pyproject(self, tmp_path, monkeypatch):
         claude_cwd = tmp_path / "repo"
         claude_cwd.mkdir()

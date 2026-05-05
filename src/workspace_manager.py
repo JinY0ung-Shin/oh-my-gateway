@@ -103,12 +103,15 @@ class WorkspaceManager:
 
     _PROJECT_FILES = ("pyproject.toml", "uv.lock")
 
+    def _remove_path(self, path: Path) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+
     def _replace_tree(self, src: Path, dst: Path) -> None:
-        if dst.exists():
-            if dst.is_symlink():
-                dst.unlink()
-            else:
-                shutil.rmtree(dst)
+        if dst.exists() or dst.is_symlink():
+            self._remove_path(dst)
         shutil.copytree(src, dst)
 
     def _copy_template_file(self, name: str, workspace: Path) -> None:
@@ -119,7 +122,7 @@ class WorkspaceManager:
             return
         dst = workspace / name
         if dst.exists() or dst.is_symlink():
-            dst.unlink()
+            self._remove_path(dst)
         shutil.copy2(src, dst)
 
     def _copy_template_dir(self, name: str, workspace: Path) -> bool:
@@ -131,13 +134,30 @@ class WorkspaceManager:
         self._replace_tree(src, workspace / name)
         return True
 
+    def _ensure_real_dir_path(self, root: Path, dst: Path) -> None:
+        current = root
+        current.mkdir(parents=True, exist_ok=True)
+        for part in dst.relative_to(root).parts:
+            current = current / part
+            if current.exists() or current.is_symlink():
+                if current.is_dir() and not current.is_symlink():
+                    continue
+                self._remove_path(current)
+            current.mkdir()
+
+    def _contains_symlink(self, path: Path) -> bool:
+        return path.is_symlink() or any(child.is_symlink() for child in path.rglob("*"))
+
     def _mirror_skill_dirs(self, sources: tuple[Path, ...], dst: Path) -> None:
         for src in sources:
             if not src.is_dir():
                 continue
-            dst.mkdir(parents=True, exist_ok=True)
+            self._ensure_real_dir_path(dst.parent.parent, dst)
             for child in sorted(src.iterdir()):
                 if not child.is_dir() or child.is_symlink():
+                    continue
+                if self._contains_symlink(child):
+                    logger.debug("Skipping skill template with symlink: %s", child)
                     continue
                 skill_file = child / "SKILL.md"
                 if not skill_file.is_file() or skill_file.is_symlink():
