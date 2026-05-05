@@ -433,6 +433,47 @@ async def _validate_backend_prompt(
         ) from e
 
 
+async def _ensure_response_session_client(
+    body: ResponseCreateRequest,
+    resolved: ResolvedModel,
+    backend: "BackendClient",
+    session,
+    session_id: str,
+    is_new_session: bool,
+    system_prompt: Optional[str],
+    workspace_str: str,
+) -> None:
+    """Create the persistent backend client after session preflight has passed."""
+    if session.client is not None:
+        return
+
+    from src.system_prompt import get_system_prompt, resolve_request_placeholders
+
+    if session.base_system_prompt is not None:
+        resolved_base = session.base_system_prompt
+    else:
+        resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
+    try:
+        session.client = await backend.create_client(
+            session=session,
+            model=resolved.provider_model,
+            system_prompt=system_prompt if is_new_session else None,
+            permission_mode=PERMISSION_MODE_BYPASS,
+            allowed_tools=body.allowed_tools,
+            mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
+            cwd=workspace_str,
+            extra_env=body.metadata,
+            _custom_base=resolved_base,
+        )
+    except Exception:
+        logger.error("create_client failed", exc_info=True)
+        await session_manager.delete_session_async(session_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"{resolved.backend} backend unavailable; retry shortly",
+        )
+
+
 async def _unblock_pending_tool_call(
     session, backend: "BackendClient", fc_output: Dict[str, str]
 ) -> None:
@@ -787,50 +828,6 @@ async def create_response(
     # backend; other backends pass through unchanged.
     await _validate_backend_prompt(resolved, prompt, workspace_str)
 
-    # ------------------------------------------------------------------
-    # Create the persistent ClaudeSDKClient.  Every turn flows through it
-    # so PreToolUse hooks (AskUserQuestion) fire reliably and the on-disk
-    # transcript stays in lockstep with session.session_id.  If creation
-    # fails the request returns 503 — there is no longer a degraded
-    # query() fallback.
-    # bypassPermissions avoids workspace-level settings.local.json checks
-    # (temp workspaces lack shell command allow-lists).
-    # ------------------------------------------------------------------
-    if session.client is None:
-        # Pre-resolve {{WORKING_DIRECTORY}} so the persistent client's
-        # frozen system_prompt matches the cwd the SDK will actually use.
-        #
-        # Reconnect case: when an existing session lost its persistent client
-        # (e.g. SDK error/disconnect), prefer the prompt frozen at session
-        # start so admin-side prompt changes mid-conversation don't leak
-        # into in-flight sessions.
-        from src.system_prompt import get_system_prompt, resolve_request_placeholders
-
-        resolved_base: Optional[str]
-        if session.base_system_prompt is not None:
-            resolved_base = session.base_system_prompt
-        else:
-            resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
-        try:
-            session.client = await backend.create_client(
-                session=session,
-                model=resolved.provider_model,
-                system_prompt=system_prompt if is_new_session else None,
-                permission_mode=PERMISSION_MODE_BYPASS,
-                allowed_tools=body.allowed_tools,
-                mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-                cwd=workspace_str,
-                extra_env=body.metadata,
-                _custom_base=resolved_base,
-            )
-        except Exception:
-            logger.error("create_client failed", exc_info=True)
-            await session_manager.delete_session_async(session_id)
-            raise HTTPException(
-                status_code=503,
-                detail=f"{resolved.backend} backend unavailable; retry shortly",
-            )
-
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
         # proper HTTP error status codes (not swallowed inside the generator).
@@ -842,6 +839,21 @@ async def create_response(
             is_new_session,
             workspace_str=workspace_str,
         )
+        try:
+            await _ensure_response_session_client(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                is_new_session,
+                system_prompt,
+                workspace_str,
+            )
+        except Exception:
+            if preflight["lock_acquired"]:
+                session.lock.release()
+            raise
 
         next_turn = preflight["next_turn"]
         resp_id = _make_response_id(session_id, next_turn)
@@ -987,6 +999,16 @@ async def create_response(
             turn=_turn,
             workspace=workspace_str,
         ) as pf:
+            await _ensure_response_session_client(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                is_new_session,
+                system_prompt,
+                workspace_str,
+            )
             # Execute backend through the persistent client.
             chunks = []
             active_client = session.client

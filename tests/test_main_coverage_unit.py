@@ -203,6 +203,7 @@ class TestResponsesApiSessionValidation:
             yield {"subtype": "success", "result": "Hi"}
 
         with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(return_value=object())
             mock_cli.run_completion_with_client = fake_run
             mock_cli.parse_message.return_value = "Hi"
 
@@ -218,6 +219,7 @@ class TestResponsesApiSessionValidation:
 
         assert response.status_code == 409
         assert "Stale" in response.json()["error"]["message"]
+        mock_cli.create_client.assert_not_called()
 
     def test_future_turn_response_id_returns_404(self):
         """Future turn previous_response_id."""
@@ -228,7 +230,8 @@ class TestResponsesApiSessionValidation:
 
         future_resp_id = f"resp_{session_id}_5"
 
-        with client_context() as (client, _mock_cli):
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(return_value=object())
             response = client.post(
                 "/v1/responses",
                 json={
@@ -241,6 +244,7 @@ class TestResponsesApiSessionValidation:
 
         assert response.status_code == 404
         assert "future turn" in response.json()["error"]["message"]
+        mock_cli.create_client.assert_not_called()
 
     def test_backend_mismatch_returns_400(self):
         """Backend mismatch on follow-up."""
@@ -252,7 +256,8 @@ class TestResponsesApiSessionValidation:
 
         resp_id = f"resp_{session_id}_1"
 
-        with client_context() as (client, _mock_cli):
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(return_value=object())
             response = client.post(
                 "/v1/responses",
                 json={
@@ -265,6 +270,7 @@ class TestResponsesApiSessionValidation:
 
         assert response.status_code == 400
         assert "Cannot mix backends" in response.json()["error"]["message"]
+        mock_cli.create_client.assert_not_called()
 
     def test_create_client_failure_returns_503_and_deletes_session(self):
         """When backend.create_client raises, the route returns 503 and clears the session."""
@@ -485,7 +491,8 @@ class TestResponsesStreamingValidationViaEndpoint:
 
         stale_resp_id = f"resp_{session_id}_2"
 
-        with client_context() as (client, _mock_cli):
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(return_value=object())
             response = client.post(
                 "/v1/responses",
                 json={
@@ -497,6 +504,31 @@ class TestResponsesStreamingValidationViaEndpoint:
             )
 
         assert response.status_code == 409
+        mock_cli.create_client.assert_not_called()
+
+    def test_streaming_future_response_id_returns_404(self):
+        """Future previous_response_id in streaming mode returns 404."""
+        session_id = str(uuid.uuid4())
+        session = session_manager.get_or_create_session(session_id)
+        session.turn_counter = 1
+        session.backend = "claude"
+
+        future_resp_id = f"resp_{session_id}_5"
+
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(return_value=object())
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "Hi",
+                    "previous_response_id": future_resp_id,
+                    "stream": True,
+                },
+            )
+
+        assert response.status_code == 404
+        mock_cli.create_client.assert_not_called()
 
     def test_streaming_backend_mismatch_returns_400(self):
         """Backend mismatch in streaming mode returns 400."""
@@ -507,7 +539,8 @@ class TestResponsesStreamingValidationViaEndpoint:
 
         resp_id = f"resp_{session_id}_1"
 
-        with client_context() as (client, _mock_cli):
+        with client_context() as (client, mock_cli):
+            mock_cli.create_client = AsyncMock(return_value=object())
             response = client.post(
                 "/v1/responses",
                 json={
@@ -519,6 +552,7 @@ class TestResponsesStreamingValidationViaEndpoint:
             )
 
         assert response.status_code == 400
+        mock_cli.create_client.assert_not_called()
 
 
 # ===========================================================================
