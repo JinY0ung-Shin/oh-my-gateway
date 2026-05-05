@@ -1,7 +1,7 @@
 """Integration tests for user parameter in /v1/responses."""
 
 from contextlib import contextmanager
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -263,3 +263,119 @@ class TestUserSessionBinding:
         )
         # cwd should be the stored workspace path (from session.workspace, not the early resolve)
         assert create_calls[0]["cwd"] == "/tmp/ws/alice"
+
+    def test_claude_followup_falls_back_to_legacy_workspace_lookup(
+        self, isolated_session_manager
+    ):
+        """Claude continuations can rehydrate sessions from the legacy user workspace."""
+        existing_session_id = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
+        session = isolated_session_manager.get_or_create_session(existing_session_id)
+        session.user = "alice"
+        session.workspace = "/tmp/ws/alice"
+        session.turn_counter = 1
+
+        mock_wm = MagicMock()
+        create_calls = []
+
+        def fake_resolve(user, *, sync_template, backend=None):
+            assert user == "alice"
+            assert sync_template is False
+            if backend == "claude":
+                return Path("/tmp/ws/alice/claude")
+            assert backend is None
+            return Path("/tmp/ws/alice")
+
+        async def fake_create_client(**kwargs):
+            create_calls.append(kwargs)
+            return object()
+
+        async def fake_run_completion(client, prompt, session):
+            yield {"subtype": "success", "result": "Legacy follow-up answer"}
+
+        with (
+            patch.object(
+                isolated_session_manager,
+                "get_session",
+                side_effect=[None, session, session],
+            ) as mock_get_session,
+            client_context_with_workspace(mock_wm) as (client, mock_cli),
+        ):
+            mock_wm.resolve.side_effect = fake_resolve
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion
+            mock_cli.parse_message = MagicMock(return_value="Legacy follow-up answer")
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "follow up",
+                    "user": "alice",
+                    "previous_response_id": f"resp_{existing_session_id}_1",
+                },
+            )
+
+        assert resp.status_code == 200
+        assert mock_wm.resolve.call_args_list == [
+            call("alice", sync_template=False, backend="claude"),
+            call("alice", sync_template=False),
+        ]
+        assert mock_get_session.call_args_list == [
+            call(existing_session_id, user="alice", cwd="/tmp/ws/alice/claude"),
+            call(existing_session_id, user="alice", cwd="/tmp/ws/alice"),
+            call(existing_session_id),
+        ]
+        assert create_calls[0]["cwd"] == "/tmp/ws/alice"
+
+    def test_codex_followup_rehydrate_uses_backend_specific_workspace(
+        self, isolated_session_manager
+    ):
+        existing_session_id = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
+        session = isolated_session_manager.get_or_create_session(existing_session_id)
+        session.backend = "codex"
+        session.user = "alice"
+        session.workspace = "/tmp/ws/alice/codex"
+        session.turn_counter = 1
+
+        mock_wm = MagicMock()
+        mock_wm.resolve.return_value = Path("/tmp/ws/alice/codex")
+        create_calls = []
+
+        async def fake_create_client(**kwargs):
+            create_calls.append(kwargs)
+            return object()
+
+        async def fake_run_completion(client, prompt, session):
+            yield {"subtype": "success", "result": "Codex follow-up answer"}
+
+        with (
+            patch.object(
+                isolated_session_manager,
+                "get_session",
+                return_value=session,
+            ) as mock_get_session,
+            client_context_with_workspace(mock_wm) as (client, mock_cli),
+        ):
+            BackendRegistry.unregister("claude")
+            BackendRegistry.register("codex", mock_cli)
+            mock_cli.create_client = fake_create_client
+            mock_cli.run_completion_with_client = fake_run_completion
+            mock_cli.parse_message = MagicMock(return_value="Codex follow-up answer")
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": "codex/gpt-5.5",
+                    "input": "follow up",
+                    "user": "alice",
+                    "previous_response_id": f"resp_{existing_session_id}_1",
+                },
+            )
+
+        assert resp.status_code == 200
+        mock_wm.resolve.assert_called_once_with(
+            "alice", sync_template=False, backend="codex"
+        )
+        assert mock_get_session.call_args_list == [
+            call(existing_session_id, user="alice", cwd="/tmp/ws/alice/codex"),
+            call(existing_session_id),
+        ]
+        assert create_calls[0]["cwd"] == "/tmp/ws/alice/codex"
