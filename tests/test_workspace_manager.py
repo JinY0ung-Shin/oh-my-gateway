@@ -269,7 +269,7 @@ class TestResolve:
         assert (skills / "shared-skill" / "SKILL.md").is_file()
         assert not (target / "shared-skill").exists()
 
-    def test_skill_dirs_containing_symlinks_are_not_mirrored(self, tmp_base, tmp_path):
+    def test_skill_dirs_containing_symlinks_are_not_mirrored(self, tmp_base, tmp_path, caplog):
         template = tmp_path / "template"
         skill = template / ".claude" / "skills" / "unsafe-skill"
         skill.mkdir(parents=True)
@@ -281,9 +281,11 @@ class TestResolve:
         (skill / "linked.txt").symlink_to(linked)
 
         mgr = WorkspaceManager(base_path=tmp_base, template_source=template)
-        workspace = mgr.resolve("alice", backend="codex", sync_template=True)
+        with caplog.at_level("WARNING", logger="src.workspace_manager"):
+            workspace = mgr.resolve("alice", backend="codex", sync_template=True)
 
         assert not (workspace / ".agents" / "skills" / "unsafe-skill").exists()
+        assert "Skipping skill template with symlink" in caplog.text
 
     def test_sync_template_false_skips_copy(self, manager, tmp_base):
         workspace = manager.resolve("carol", sync_template=False)

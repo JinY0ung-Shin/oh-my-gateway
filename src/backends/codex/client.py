@@ -537,7 +537,11 @@ class CodexClient:
             except Exception as exc:
                 await self._close_rpc_locked()
                 logger.error("Codex app-server turn failed: %s", exc, exc_info=True)
-                yield {"type": "error", "is_error": True, "error_message": str(exc)}
+                yield {
+                    "type": "error",
+                    "is_error": True,
+                    "error_message": self._public_error_message(exc),
+                }
 
     async def resume_approval_with_client(
         self,
@@ -605,7 +609,17 @@ class CodexClient:
             except Exception as exc:
                 await self._close_rpc_locked()
                 logger.error("Codex approval continuation failed: %s", exc, exc_info=True)
-                yield {"type": "error", "is_error": True, "error_message": str(exc)}
+                yield {
+                    "type": "error",
+                    "is_error": True,
+                    "error_message": self._public_error_message(exc),
+                }
+
+    def _public_error_message(self, exc: Exception) -> str:
+        message = str(exc)
+        if isinstance(exc, CodexAppServerError):
+            message = message.split("stderr_tail=", 1)[0].rstrip()
+        return message or "Codex app-server error"
 
     @staticmethod
     def _next_chunk(iterator: Iterator[Dict[str, Any]]) -> tuple[bool, Optional[Dict[str, Any]]]:
@@ -988,6 +1002,7 @@ class CodexClient:
                 "item/fileChange/requestApproval",
             }:
                 return {"decision": parsed}
+            logger.warning("Unrecognized Codex approval output: %r", parsed)
 
         decision = self._normalize_approval_decision(parsed if parsed is not None else output)
         if method == "item/permissions/requestApproval":

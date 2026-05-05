@@ -552,6 +552,24 @@ def test_codex_client_maps_permission_approval_outputs():
     ) == {"permissions": {}, "scope": "turn"}
 
 
+def test_codex_client_logs_unrecognized_structured_approval_output(caplog):
+    """Unknown structured approval outputs fail closed but leave an operator breadcrumb."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+
+    with caplog.at_level("WARNING", logger="src.backends.codex.client"):
+        result = backend._approval_result_from_output(
+            "item/permissions/requestApproval",
+            '{"foo": 1}',
+            {"permissions": {"fileSystem": {"read": ["/repo"]}}},
+        )
+
+    assert result == {"permissions": {}, "scope": "turn"}
+    assert "Unrecognized Codex approval output" in caplog.text
+    assert "{'foo': 1}" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_codex_client_resumes_command_approval_and_continues_turn(monkeypatch):
     """Codex approval continuation responds to app-server and reads remaining events."""
@@ -635,6 +653,43 @@ async def test_codex_client_resumes_command_approval_and_continues_turn(monkeypa
     } in chunks
     assert chunks[-2]["content"] == [{"type": "text", "text": "Tests passed."}]
     assert chunks[-1]["result"] == "Tests passed."
+
+
+@pytest.mark.asyncio
+async def test_codex_run_completion_redacts_stderr_tail_from_public_error(monkeypatch):
+    """Transport details are logged internally but not returned to API clients."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient, CodexSessionClient
+
+    backend = CodexClient()
+
+    async def fail_ensure_rpc(_env):
+        raise CodexAppServerError("Timed out waiting. stderr_tail=/repo/secret-token")
+
+    monkeypatch.setattr(backend, "_ensure_rpc_locked", fail_ensure_rpc)
+    monkeypatch.setattr(backend, "_close_rpc_locked", AsyncMock())
+
+    chunks = [
+        chunk
+        async for chunk in backend.run_completion_with_client(
+            CodexSessionClient(
+                rpc=FakeRpc(),
+                thread_id="thr_codex",
+                model=None,
+                cwd="/repo",
+                env={},
+            ),
+            "hello",
+            SimpleNamespace(session_id="gw-session"),
+        )
+    ]
+
+    assert chunks == [
+        {
+            "type": "error",
+            "is_error": True,
+            "error_message": "Timed out waiting.",
+        }
+    ]
 
 
 @pytest.mark.asyncio

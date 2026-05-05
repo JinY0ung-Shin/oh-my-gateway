@@ -71,5 +71,7 @@ JSON-RPC client instead of adding an unavailable package dependency.
   Codex request multiplexing is not implemented yet.
 - The shared Codex app-server is restarted when the metadata-derived allowlisted
   environment changes between requests.
+- A Codex turn or approval transport error closes the shared app-server so the
+  next request starts from a fresh process.
 - Image input is not exposed through the gateway Codex backend yet, even though
   Codex app-server models may support images.

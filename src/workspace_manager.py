@@ -155,7 +155,7 @@ class WorkspaceManager:
                 if not child.is_dir() or child.is_symlink():
                     continue
                 if self._contains_symlink(child):
-                    logger.debug("Skipping skill template with symlink: %s", child)
+                    logger.warning("Skipping skill template with symlink: %s", child)
                     continue
                 skill_file = child / "SKILL.md"
                 if not skill_file.is_file() or skill_file.is_symlink():
@@ -183,6 +183,8 @@ class WorkspaceManager:
             self._copy_template_dir(".opencode", workspace)
             skills_dst = workspace / ".opencode" / "skills"
             if skills_dst.is_symlink() or not skills_dst.exists():
+                # Compatibility mirrors prefer Claude skills over Agents skills
+                # when both sources contain the same skill name.
                 self._mirror_skill_dirs(
                     (
                         self.template_source / ".claude" / "skills",
