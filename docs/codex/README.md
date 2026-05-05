@@ -53,13 +53,21 @@ JSON-RPC client instead of adding an unavailable package dependency.
 | `CODEX_SANDBOX` | Thread-level Codex sandbox mode. Default: `danger-full-access` for local experimental use |
 | `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |
 
-## MVP Limits
+## Supported Behavior
 
 - Text prompts and text responses are supported.
+- Codex app-server command, file-change, and permission approval requests are
+  exposed as Responses `requires_action` entries with the existing
+  `AskUserQuestion` function-call shape. Send a matching
+  `function_call_output` with the previous response id to continue the paused
+  Codex turn.
+- Command/file approvals accept Codex decision strings such as `accept`,
+  `acceptForSession`, `decline`, and `cancel`. Short aliases like `yes`,
+  `no`, and `always` are normalized by the gateway.
+
+## Current Limits
+
 - Codex turns are serialized through one shared app-server process; concurrent
   Codex request multiplexing is not implemented yet.
-- OpenAI Responses API function-call continuations are not mapped to Codex
-  approval flows yet. Codex app-server approval requests are cancelled until
-  the gateway has an explicit approval UI.
 - Image input is not exposed through the gateway Codex backend yet, even though
   Codex app-server models may support images.

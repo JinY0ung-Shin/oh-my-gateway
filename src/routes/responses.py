@@ -516,6 +516,53 @@ async def _prepare_opencode_tool_continuation(
         raise
 
 
+async def _prepare_codex_approval_continuation(
+    session, backend: "BackendClient", fc_output: Dict[str, str]
+) -> None:
+    """Validate and reserve a Codex app-server approval continuation."""
+    await session.lock.acquire()
+    try:
+        if session.pending_tool_call is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but no pending tool call in session",
+            )
+
+        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"call_id mismatch: pending tool call has "
+                    f"'{session.pending_tool_call['call_id']}', "
+                    f"but received '{fc_output['call_id']}'"
+                ),
+            )
+
+        if session.pending_tool_call.get("codex_resume") != "approval":
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported Codex continuation type",
+            )
+
+        resume = getattr(backend, "resume_approval_with_client", None)
+        if not callable(resume):
+            raise HTTPException(
+                status_code=400,
+                detail="Codex approval continuation is not supported by this backend",
+            )
+
+        if session.client is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no active SDK client",
+            )
+
+        session.pending_tool_call = None
+    except Exception:
+        session.lock.release()
+        raise
+
+
 def _normalize_opencode_question_arguments(input_value: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Return OpenCode question input in the public AskUserQuestion argument shape."""
     question = input_value.get("question")
@@ -620,8 +667,39 @@ def _store_opencode_pending_tool_call(
     return False
 
 
-async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
+def _is_codex_pending_approval_chunk(
+    resolved: ResolvedModel,
+    session,
+    chunk: Dict[str, Any],
+) -> bool:
+    """Return True when a Codex approval chunk already populated pending_tool_call."""
+    if resolved.backend != "codex" or not isinstance(chunk, dict):
+        return False
+    pending = getattr(session, "pending_tool_call", None)
+    if not isinstance(pending, dict) or pending.get("codex_resume") != "approval":
+        return False
+    content = chunk.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use" or block.get("name") != "codex_approval":
+            continue
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        request_id = metadata.get("codex_approval_request_id") or block.get("id")
+        if str(request_id or "") == str(pending.get("call_id") or ""):
+            return True
+    return False
+
+
+async def _capture_pending_tool_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
+        if _is_codex_pending_approval_chunk(resolved, session, chunk):
+            close = getattr(chunk_source, "aclose", None)
+            if callable(close):
+                await close()
+            return
         if resolved.backend == "opencode" and isinstance(chunk, dict):
             content = chunk.get("content")
             if isinstance(content, list) and any(
@@ -758,9 +836,7 @@ async def create_response(
 
                 _configure_client_streaming(session.client, True)
                 backend_source = backend.run_completion_with_client(session.client, prompt, session)
-                chunk_source = _capture_opencode_pending_questions(
-                    backend_source, resolved, session
-                )
+                chunk_source = _capture_pending_tool_questions(backend_source, resolved, session)
 
                 # Bridge SDK iteration through a background task to keep
                 # anyio cancel scopes task-local.
@@ -896,9 +972,7 @@ async def create_response(
             active_client = session.client
             _configure_client_streaming(active_client, False)
             backend_source = backend.run_completion_with_client(active_client, prompt, session)
-            async for chunk in _capture_opencode_pending_questions(
-                backend_source, resolved, session
-            ):
+            async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
                 chunks.append(chunk)
 
             # Check for backend errors (run_completion wraps exceptions as error chunks)
@@ -1019,6 +1093,8 @@ async def _handle_function_call_output(
         opencode_resume_kind = await _prepare_opencode_tool_continuation(
             session, backend, fc_output
         )
+    elif resolved.backend == "codex":
+        await _prepare_codex_approval_continuation(session, backend, fc_output)
     else:
         await _unblock_pending_tool_call(session, backend, fc_output)
 
@@ -1053,6 +1129,13 @@ async def _handle_function_call_output(
                             fc_output["output"],
                             session,
                         )
+                elif resolved.backend == "codex":
+                    backend_source = backend.resume_approval_with_client(
+                        active_client,
+                        fc_output["call_id"],
+                        fc_output["output"],
+                        session,
+                    )
                 else:
                     receiver = getattr(backend, "receive_response_from_client", None)
                     if receiver is not None:
@@ -1061,9 +1144,7 @@ async def _handle_function_call_output(
                         backend_source = backend.run_completion_with_client(
                             active_client, "", session
                         )
-                chunk_source = _capture_opencode_pending_questions(
-                    backend_source, resolved, session
-                )
+                chunk_source = _capture_pending_tool_questions(backend_source, resolved, session)
 
                 sse_source = streaming_utils.stream_response_chunks(
                     chunk_source=chunk_source,
@@ -1159,13 +1240,20 @@ async def _handle_function_call_output(
                     fc_output["output"],
                     session,
                 )
+        elif resolved.backend == "codex":
+            backend_source = backend.resume_approval_with_client(
+                active_client,
+                fc_output["call_id"],
+                fc_output["output"],
+                session,
+            )
         else:
             receiver = getattr(backend, "receive_response_from_client", None)
             if receiver is not None:
                 backend_source = receiver(active_client, session)
             else:
                 backend_source = backend.run_completion_with_client(active_client, "", session)
-        async for chunk in _capture_opencode_pending_questions(backend_source, resolved, session):
+        async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
             chunks.append(chunk)
 
         # Check for another pending_tool_call

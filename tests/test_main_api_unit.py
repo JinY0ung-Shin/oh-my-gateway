@@ -925,9 +925,7 @@ async def test_opencode_question_capture_stops_waiting_for_stream_end():
         finally:
             source_closed = True
 
-    captured = responses_module._capture_opencode_pending_questions(
-        chunk_source(), resolved, session
-    )
+    captured = responses_module._capture_pending_tool_questions(chunk_source(), resolved, session)
 
     try:
         await asyncio.wait_for(captured.__anext__(), timeout=0.05)
