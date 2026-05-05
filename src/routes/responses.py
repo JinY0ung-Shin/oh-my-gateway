@@ -1,6 +1,7 @@
 """Responses API endpoint (/v1/responses)."""
 
 import asyncio
+import contextlib
 import json
 import logging
 import secrets
@@ -33,7 +34,7 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.rate_limiter import rate_limit_endpoint
-from src.constants import PERMISSION_MODE_BYPASS
+from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
 from src.usage_logger import usage_logger
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_MS / 1000
 
 
 def _generate_msg_id() -> str:
@@ -306,7 +308,7 @@ def _validate_response_continuation(body: ResponseCreateRequest) -> None:
                 )
 
 
-def _resolve_response_session(body: ResponseCreateRequest) -> tuple[str, Any]:
+def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tuple[str, Any]:
     if not body.previous_response_id:
         session_id = str(uuid.uuid4())
         return session_id, session_manager.get_or_create_session(session_id)
@@ -318,13 +320,37 @@ def _resolve_response_session(body: ResponseCreateRequest) -> tuple[str, Any]:
             detail=f"previous_response_id '{body.previous_response_id}' is invalid",
         )
     session_id, turn = parsed
+    session = session_manager.get_session(session_id)
+    if session is not None:
+        if session.user != body.user:
+            raise HTTPException(
+                status_code=400,
+                detail=f"User mismatch: session belongs to {session.user!r}, "
+                f"but request specifies {body.user!r}",
+            )
+        if turn > session.turn_counter:
+            raise HTTPException(
+                status_code=404,
+                detail=f"previous_response_id '{body.previous_response_id}' references a future turn",
+            )
+        return session_id, session
+
     _early_cwd: Optional[str] = None
     if body.user:
         try:
-            _early_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+            _early_cwd = str(
+                workspace_manager.resolve(body.user, sync_template=False, backend=backend)
+            )
         except (ValueError, OSError):
             pass
     session = session_manager.get_session(session_id, user=body.user, cwd=_early_cwd)
+    if session is None and backend == "claude" and body.user:
+        try:
+            legacy_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+        except (ValueError, OSError):
+            legacy_cwd = None
+        if legacy_cwd and legacy_cwd != _early_cwd:
+            session = session_manager.get_session(session_id, user=body.user, cwd=legacy_cwd)
     if not session:
         raise HTTPException(
             status_code=404,
@@ -332,6 +358,12 @@ def _resolve_response_session(body: ResponseCreateRequest) -> tuple[str, Any]:
                 f"Session for previous_response_id "
                 f"'{body.previous_response_id}' not found or expired"
             ),
+        )
+    if session.user != body.user:
+        raise HTTPException(
+            status_code=400,
+            detail=f"User mismatch: session belongs to {session.user!r}, "
+            f"but request specifies {body.user!r}",
         )
     if turn > session.turn_counter:
         raise HTTPException(
@@ -346,6 +378,7 @@ async def _resolve_response_workspace(
     session,
     session_id: str,
     is_new_session: bool,
+    backend: str,
 ) -> Path:
     if not is_new_session and session.user != body.user:
         raise HTTPException(
@@ -356,7 +389,11 @@ async def _resolve_response_workspace(
 
     if is_new_session:
         try:
-            workspace = workspace_manager.resolve(body.user, sync_template=True)
+            workspace = workspace_manager.resolve(
+                body.user,
+                sync_template=True,
+                backend=backend,
+            )
         except ValueError as e:
             await session_manager.delete_session_async(session_id)
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -368,7 +405,11 @@ async def _resolve_response_workspace(
         return Path(session.workspace)
 
     try:
-        workspace = workspace_manager.resolve(body.user, sync_template=False)
+        workspace = workspace_manager.resolve(
+            body.user,
+            sync_template=False,
+            backend=backend,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     session.workspace = str(workspace)
@@ -413,6 +454,47 @@ async def _validate_backend_prompt(
                 }
             },
         ) from e
+
+
+async def _ensure_response_session_client(
+    body: ResponseCreateRequest,
+    resolved: ResolvedModel,
+    backend: "BackendClient",
+    session,
+    session_id: str,
+    is_new_session: bool,
+    system_prompt: Optional[str],
+    workspace_str: str,
+) -> None:
+    """Create the persistent backend client after session preflight has passed."""
+    if session.client is not None:
+        return
+
+    from src.system_prompt import get_system_prompt, resolve_request_placeholders
+
+    if session.base_system_prompt is not None:
+        resolved_base = session.base_system_prompt
+    else:
+        resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
+    try:
+        session.client = await backend.create_client(
+            session=session,
+            model=resolved.provider_model,
+            system_prompt=system_prompt if is_new_session else None,
+            permission_mode=PERMISSION_MODE_BYPASS,
+            allowed_tools=body.allowed_tools,
+            mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
+            cwd=workspace_str,
+            extra_env=body.metadata,
+            _custom_base=resolved_base,
+        )
+    except Exception:
+        logger.error("create_client failed", exc_info=True)
+        await session_manager.delete_session_async(session_id)
+        raise HTTPException(
+            status_code=503,
+            detail=f"{resolved.backend} backend unavailable; retry shortly",
+        )
 
 
 async def _unblock_pending_tool_call(
@@ -511,6 +593,53 @@ async def _prepare_opencode_tool_continuation(
 
         session.pending_tool_call = None
         return resume_kind
+    except Exception:
+        session.lock.release()
+        raise
+
+
+async def _prepare_codex_approval_continuation(
+    session, backend: "BackendClient", fc_output: Dict[str, str]
+) -> None:
+    """Validate and reserve a Codex app-server approval continuation."""
+    await session.lock.acquire()
+    try:
+        if session.pending_tool_call is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but no pending tool call in session",
+            )
+
+        if session.pending_tool_call["call_id"] != fc_output["call_id"]:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"call_id mismatch: pending tool call has "
+                    f"'{session.pending_tool_call['call_id']}', "
+                    f"but received '{fc_output['call_id']}'"
+                ),
+            )
+
+        if session.pending_tool_call.get("codex_resume") != "approval":
+            raise HTTPException(
+                status_code=400,
+                detail="Unsupported Codex continuation type",
+            )
+
+        resume = getattr(backend, "resume_approval_with_client", None)
+        if not callable(resume):
+            raise HTTPException(
+                status_code=400,
+                detail="Codex approval continuation is not supported by this backend",
+            )
+
+        if session.client is None:
+            raise HTTPException(
+                status_code=400,
+                detail="function_call_output received but session has no active SDK client",
+            )
+
+        session.pending_tool_call = None
     except Exception:
         session.lock.release()
         raise
@@ -620,8 +749,39 @@ def _store_opencode_pending_tool_call(
     return False
 
 
-async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedModel, session):
+def _is_codex_pending_approval_chunk(
+    resolved: ResolvedModel,
+    session,
+    chunk: Dict[str, Any],
+) -> bool:
+    """Return True when a Codex approval chunk already populated pending_tool_call."""
+    if resolved.backend != "codex" or not isinstance(chunk, dict):
+        return False
+    pending = getattr(session, "pending_tool_call", None)
+    if not isinstance(pending, dict) or pending.get("codex_resume") != "approval":
+        return False
+    content = chunk.get("content")
+    if not isinstance(content, list):
+        return False
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") != "tool_use" or block.get("name") != "codex_approval":
+            continue
+        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        request_id = metadata.get("codex_approval_request_id") or block.get("id")
+        if str(request_id or "") == str(pending.get("call_id") or ""):
+            return True
+    return False
+
+
+async def _capture_pending_tool_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
+        if _is_codex_pending_approval_chunk(resolved, session, chunk):
+            close = getattr(chunk_source, "aclose", None)
+            if callable(close):
+                await close()
+            return
         if resolved.backend == "opencode" and isinstance(chunk, dict):
             content = chunk.get("content")
             if isinstance(content, list) and any(
@@ -637,6 +797,30 @@ async def _capture_opencode_pending_questions(chunk_source, resolved: ResolvedMo
                     return
                 continue
         yield chunk
+
+
+async def _collect_non_stream_continuation_chunks(chunk_source):
+    chunks = []
+
+    async def _consume():
+        async for chunk in chunk_source:
+            chunks.append(chunk)
+
+    try:
+        await asyncio.wait_for(
+            _consume(),
+            timeout=NON_STREAM_CONTINUATION_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        close = getattr(chunk_source, "aclose", None)
+        if callable(close):
+            with contextlib.suppress(Exception):
+                await close()
+        raise HTTPException(
+            status_code=504,
+            detail=(f"Continuation timed out after {NON_STREAM_CONTINUATION_TIMEOUT_SECONDS:.3g}s"),
+        ) from exc
+    return chunks
 
 
 @router.post("/v1/responses")
@@ -667,8 +851,10 @@ async def create_response(
     # Moved earlier — needed for workspace sync_template decision
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
-    session_id, session = _resolve_response_session(body)
-    workspace = await _resolve_response_workspace(body, session, session_id, is_new_session)
+    session_id, session = _resolve_response_session(body, resolved.backend)
+    workspace = await _resolve_response_workspace(
+        body, session, session_id, is_new_session, resolved.backend
+    )
     workspace_str = str(workspace)
 
     # ------------------------------------------------------------------
@@ -689,50 +875,6 @@ async def create_response(
     # backend; other backends pass through unchanged.
     await _validate_backend_prompt(resolved, prompt, workspace_str)
 
-    # ------------------------------------------------------------------
-    # Create the persistent ClaudeSDKClient.  Every turn flows through it
-    # so PreToolUse hooks (AskUserQuestion) fire reliably and the on-disk
-    # transcript stays in lockstep with session.session_id.  If creation
-    # fails the request returns 503 — there is no longer a degraded
-    # query() fallback.
-    # bypassPermissions avoids workspace-level settings.local.json checks
-    # (temp workspaces lack shell command allow-lists).
-    # ------------------------------------------------------------------
-    if session.client is None:
-        # Pre-resolve {{WORKING_DIRECTORY}} so the persistent client's
-        # frozen system_prompt matches the cwd the SDK will actually use.
-        #
-        # Reconnect case: when an existing session lost its persistent client
-        # (e.g. SDK error/disconnect), prefer the prompt frozen at session
-        # start so admin-side prompt changes mid-conversation don't leak
-        # into in-flight sessions.
-        from src.system_prompt import get_system_prompt, resolve_request_placeholders
-
-        resolved_base: Optional[str]
-        if session.base_system_prompt is not None:
-            resolved_base = session.base_system_prompt
-        else:
-            resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
-        try:
-            session.client = await backend.create_client(
-                session=session,
-                model=resolved.provider_model,
-                system_prompt=system_prompt if is_new_session else None,
-                permission_mode=PERMISSION_MODE_BYPASS,
-                allowed_tools=body.allowed_tools,
-                mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
-                cwd=workspace_str,
-                extra_env=body.metadata,
-                _custom_base=resolved_base,
-            )
-        except Exception:
-            logger.error("create_client failed", exc_info=True)
-            await session_manager.delete_session_async(session_id)
-            raise HTTPException(
-                status_code=503,
-                detail=f"{resolved.backend} backend unavailable; retry shortly",
-            )
-
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
         # proper HTTP error status codes (not swallowed inside the generator).
@@ -744,6 +886,21 @@ async def create_response(
             is_new_session,
             workspace_str=workspace_str,
         )
+        try:
+            await _ensure_response_session_client(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                is_new_session,
+                system_prompt,
+                workspace_str,
+            )
+        except Exception:
+            if preflight["lock_acquired"]:
+                session.lock.release()
+            raise
 
         next_turn = preflight["next_turn"]
         resp_id = _make_response_id(session_id, next_turn)
@@ -758,9 +915,7 @@ async def create_response(
 
                 _configure_client_streaming(session.client, True)
                 backend_source = backend.run_completion_with_client(session.client, prompt, session)
-                chunk_source = _capture_opencode_pending_questions(
-                    backend_source, resolved, session
-                )
+                chunk_source = _capture_pending_tool_questions(backend_source, resolved, session)
 
                 # Bridge SDK iteration through a background task to keep
                 # anyio cancel scopes task-local.
@@ -891,14 +1046,22 @@ async def create_response(
             turn=_turn,
             workspace=workspace_str,
         ) as pf:
+            await _ensure_response_session_client(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                is_new_session,
+                system_prompt,
+                workspace_str,
+            )
             # Execute backend through the persistent client.
             chunks = []
             active_client = session.client
             _configure_client_streaming(active_client, False)
             backend_source = backend.run_completion_with_client(active_client, prompt, session)
-            async for chunk in _capture_opencode_pending_questions(
-                backend_source, resolved, session
-            ):
+            async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
                 chunks.append(chunk)
 
             # Check for backend errors (run_completion wraps exceptions as error chunks)
@@ -1001,12 +1164,12 @@ async def _handle_function_call_output(
     """Handle a function_call_output continuation request.
 
     Validates that the session has a pending tool call with a matching
-    ``call_id``, unblocks the SDK's PreToolUse hook, and then streams
-    the continuation response from the existing :class:`ClaudeSDKClient`.
+    ``call_id``, reserves the backend-specific continuation, and then reads
+    the continuation response from the existing backend session client.
 
-    The validation and event-unblock are performed atomically under the
+    The validation and continuation preparation are performed atomically under the
     session lock to prevent races where concurrent requests could read
-    stale ``pending_tool_call`` / ``input_event`` state.
+    stale ``pending_tool_call`` / backend resume state.
     """
     import time as _time
 
@@ -1019,6 +1182,8 @@ async def _handle_function_call_output(
         opencode_resume_kind = await _prepare_opencode_tool_continuation(
             session, backend, fc_output
         )
+    elif resolved.backend == "codex":
+        await _prepare_codex_approval_continuation(session, backend, fc_output)
     else:
         await _unblock_pending_tool_call(session, backend, fc_output)
 
@@ -1035,9 +1200,8 @@ async def _handle_function_call_output(
             try:
                 chunks_buffer = []
                 _configure_client_streaming(active_client, True)
-                # After the hook returns deny+reason, the SDK continues
-                # processing from where it left off.  Use receive_response_from_client
-                # when available; do not start a new prompt.
+                # Resume the backend-specific pending tool request; do not
+                # start a new prompt for continuation turns.
                 if resolved.backend == "opencode":
                     if opencode_resume_kind == "permission":
                         backend_source = backend.resume_permission_with_client(
@@ -1053,6 +1217,13 @@ async def _handle_function_call_output(
                             fc_output["output"],
                             session,
                         )
+                elif resolved.backend == "codex":
+                    backend_source = backend.resume_approval_with_client(
+                        active_client,
+                        fc_output["call_id"],
+                        fc_output["output"],
+                        session,
+                    )
                 else:
                     receiver = getattr(backend, "receive_response_from_client", None)
                     if receiver is not None:
@@ -1061,9 +1232,7 @@ async def _handle_function_call_output(
                         backend_source = backend.run_completion_with_client(
                             active_client, "", session
                         )
-                chunk_source = _capture_opencode_pending_questions(
-                    backend_source, resolved, session
-                )
+                chunk_source = _capture_pending_tool_questions(backend_source, resolved, session)
 
                 sse_source = streaming_utils.stream_response_chunks(
                     chunk_source=chunk_source,
@@ -1140,9 +1309,8 @@ async def _handle_function_call_output(
     # --- Non-streaming continuation ---
     continuation_success = False
     try:
-        chunks = []
-        # After the hook returns deny+reason, the SDK continues
-        # processing from where it left off — no new query needed.
+        # Resume the backend-specific pending tool request; do not start a
+        # new prompt for continuation turns.
         _configure_client_streaming(active_client, False)
         if resolved.backend == "opencode":
             if opencode_resume_kind == "permission":
@@ -1159,14 +1327,22 @@ async def _handle_function_call_output(
                     fc_output["output"],
                     session,
                 )
+        elif resolved.backend == "codex":
+            backend_source = backend.resume_approval_with_client(
+                active_client,
+                fc_output["call_id"],
+                fc_output["output"],
+                session,
+            )
         else:
             receiver = getattr(backend, "receive_response_from_client", None)
             if receiver is not None:
                 backend_source = receiver(active_client, session)
             else:
                 backend_source = backend.run_completion_with_client(active_client, "", session)
-        async for chunk in _capture_opencode_pending_questions(backend_source, resolved, session):
-            chunks.append(chunk)
+        chunks = await _collect_non_stream_continuation_chunks(
+            _capture_pending_tool_questions(backend_source, resolved, session)
+        )
 
         # Check for another pending_tool_call
         if session.pending_tool_call is not None:

@@ -14,6 +14,7 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 _USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
+_BACKEND_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
 
 class WorkspaceManager:
@@ -35,24 +36,30 @@ class WorkspaceManager:
         self.template_source = Path(template_source) if template_source else None
         self.project_root = Path(project_root) if project_root else None
 
-    def resolve(self, user: Optional[str] = None, sync_template: bool = False) -> Path:
+    def resolve(
+        self,
+        user: Optional[str] = None,
+        sync_template: bool = False,
+        backend: Optional[str] = None,
+    ) -> Path:
         """Return the workspace path for *user*, creating it if necessary.
 
-        When *user* is ``None``, a temporary directory (``_tmp_{uuid}``) is
-        created under *base_path*.  When *sync_template* is ``True`` and a
-        template source is configured, the ``.claude/`` directory is copied
-        (overwriting existing files).
+        Named users use ``base_path/user/backend`` when *backend* is provided.
+        Anonymous workspaces remain session-scoped ``_tmp_{uuid}`` directories.
         """
+        backend_name = self._sanitize_backend(backend)
         if user is not None:
             sanitized = self._sanitize(user)
             workspace = self.base_path / sanitized
+            if backend_name:
+                workspace = workspace / backend_name
         else:
             workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
 
         workspace.mkdir(parents=True, exist_ok=True)
 
         if sync_template:
-            self._sync_template(workspace)
+            self._sync_template(workspace, backend=backend_name)
             self._sync_project_files(workspace)
 
         return workspace
@@ -84,24 +91,113 @@ class WorkspaceManager:
             )
         return user
 
+    def _sanitize_backend(self, backend: Optional[str]) -> Optional[str]:
+        """Validate and return a backend directory name."""
+        if backend is None:
+            return None
+        if not backend or not _BACKEND_PATTERN.match(backend):
+            raise ValueError(f"Invalid backend: {backend!r}. Must match ^[a-z][a-z0-9_-]{{0,31}}$")
+        return backend
+
     _PROJECT_FILES = ("pyproject.toml", "uv.lock")
 
-    def _sync_template(self, workspace: Path) -> None:
-        """Copy ``.claude/`` from template source into *workspace*."""
+    def _remove_path(self, path: Path) -> None:
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.exists():
+            shutil.rmtree(path)
+
+    def _replace_tree(self, src: Path, dst: Path) -> None:
+        if dst.exists() or dst.is_symlink():
+            self._remove_path(dst)
+        shutil.copytree(src, dst)
+
+    def _copy_template_file(self, name: str, workspace: Path) -> None:
         if self.template_source is None:
             return
-        src = self.template_source / ".claude"
-        if not src.is_dir():
-            logger.debug("Template source .claude/ not found at %s, skipping sync", src)
+        src = self.template_source / name
+        if not src.is_file():
             return
-        dst = workspace / ".claude"
-        if dst.exists():
-            if dst.is_symlink():
-                dst.unlink()
-            else:
-                shutil.rmtree(dst)
-        shutil.copytree(src, dst)
-        logger.debug("Synced .claude/ template to %s", dst)
+        dst = workspace / name
+        if dst.exists() or dst.is_symlink():
+            self._remove_path(dst)
+        shutil.copy2(src, dst)
+
+    def _copy_template_dir(self, name: str, workspace: Path) -> bool:
+        if self.template_source is None:
+            return False
+        src = self.template_source / name
+        if not src.is_dir():
+            return False
+        self._replace_tree(src, workspace / name)
+        return True
+
+    def _ensure_real_dir_path(self, root: Path, dst: Path) -> None:
+        current = root
+        current.mkdir(parents=True, exist_ok=True)
+        for part in dst.relative_to(root).parts:
+            current = current / part
+            if current.exists() or current.is_symlink():
+                if current.is_dir() and not current.is_symlink():
+                    continue
+                self._remove_path(current)
+            current.mkdir()
+
+    def _contains_symlink(self, path: Path) -> bool:
+        return path.is_symlink() or any(child.is_symlink() for child in path.rglob("*"))
+
+    def _mirror_skill_dirs(self, sources: tuple[Path, ...], dst: Path) -> None:
+        for src in sources:
+            if not src.is_dir():
+                continue
+            self._ensure_real_dir_path(dst.parent.parent, dst)
+            for child in sorted(src.iterdir()):
+                if not child.is_dir() or child.is_symlink():
+                    continue
+                if self._contains_symlink(child):
+                    logger.warning("Skipping skill template with symlink: %s", child)
+                    continue
+                skill_file = child / "SKILL.md"
+                if not skill_file.is_file() or skill_file.is_symlink():
+                    continue
+                target = dst / child.name
+                if target.exists():
+                    continue
+                shutil.copytree(child, target)
+
+    def _sync_template(self, workspace: Path, backend: Optional[str] = None) -> None:
+        """Copy backend-native templates into *workspace*."""
+        if self.template_source is None:
+            return
+
+        if backend == "codex":
+            self._copy_template_dir(".agents", workspace)
+            self._copy_template_file("AGENTS.md", workspace)
+            skills_dst = workspace / ".agents" / "skills"
+            if skills_dst.is_symlink() or not skills_dst.exists():
+                self._mirror_skill_dirs((self.template_source / ".claude" / "skills",), skills_dst)
+            logger.debug("Synced Codex template to %s", workspace)
+            return
+
+        if backend == "opencode":
+            self._copy_template_dir(".opencode", workspace)
+            skills_dst = workspace / ".opencode" / "skills"
+            if skills_dst.is_symlink() or not skills_dst.exists():
+                # Compatibility mirrors prefer Claude skills over Agents skills
+                # when both sources contain the same skill name.
+                self._mirror_skill_dirs(
+                    (
+                        self.template_source / ".claude" / "skills",
+                        self.template_source / ".agents" / "skills",
+                    ),
+                    skills_dst,
+                )
+            logger.debug("Synced OpenCode template to %s", workspace)
+            return
+
+        self._copy_template_dir(".claude", workspace)
+        self._copy_template_file("CLAUDE.md", workspace)
+        logger.debug("Synced Claude template to %s", workspace)
 
     def _sync_project_files(self, workspace: Path) -> None:
         """Symlink project files (pyproject.toml, uv.lock) into *workspace*.
@@ -143,11 +239,11 @@ def _resolve_base_path() -> Path:
 
 
 def _resolve_template_source() -> Optional[Path]:
-    """Determine the .claude template source directory."""
+    """Determine the agent template source directory."""
     claude_cwd = os.getenv("CLAUDE_CWD", "")
     if claude_cwd:
         p = Path(claude_cwd)
-        if (p / ".claude").is_dir():
+        if p.is_dir():
             return p
     return None
 
