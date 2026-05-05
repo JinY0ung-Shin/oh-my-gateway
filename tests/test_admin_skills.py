@@ -217,12 +217,8 @@ class TestBackendSkillRoots:
 
     def test_delete_skill_uses_opencode_root(self, multi_backend_workspace):
         delete_skill("hello-world", backend="opencode")
-        assert not (
-            multi_backend_workspace / ".opencode" / "skills" / "hello-world"
-        ).exists()
-        assert (
-            multi_backend_workspace / ".claude" / "skills" / "hello-world"
-        ).exists()
+        assert not (multi_backend_workspace / ".opencode" / "skills" / "hello-world").exists()
+        assert (multi_backend_workspace / ".claude" / "skills" / "hello-world").exists()
 
     def test_rejects_unknown_skill_backend(self, workspace):
         with pytest.raises(ValueError, match="Unsupported skill backend"):
@@ -409,9 +405,7 @@ class TestSkillsAPI:
             json={"content": "---\nname: open-skill\ndescription: OpenCode\n---\nBody"},
         )
         assert r.status_code == 201
-        assert (
-            workspace / ".opencode" / "skills" / "open-skill" / "SKILL.md"
-        ).is_file()
+        assert (workspace / ".opencode" / "skills" / "open-skill" / "SKILL.md").is_file()
 
     def test_invalid_skill_backend_query_param(self, admin_client):
         r = admin_client.get("/admin/api/skills?backend=invalid")

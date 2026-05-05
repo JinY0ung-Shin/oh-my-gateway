@@ -96,9 +96,7 @@ class WorkspaceManager:
         if backend is None:
             return None
         if not backend or not _BACKEND_PATTERN.match(backend):
-            raise ValueError(
-                f"Invalid backend: {backend!r}. Must match ^[a-z][a-z0-9_-]{{0,31}}$"
-            )
+            raise ValueError(f"Invalid backend: {backend!r}. Must match ^[a-z][a-z0-9_-]{{0,31}}$")
         return backend
 
     _PROJECT_FILES = ("pyproject.toml", "uv.lock")
@@ -177,9 +175,7 @@ class WorkspaceManager:
             self._copy_template_file("AGENTS.md", workspace)
             skills_dst = workspace / ".agents" / "skills"
             if skills_dst.is_symlink() or not skills_dst.exists():
-                self._mirror_skill_dirs(
-                    (self.template_source / ".claude" / "skills",), skills_dst
-                )
+                self._mirror_skill_dirs((self.template_source / ".claude" / "skills",), skills_dst)
             logger.debug("Synced Codex template to %s", workspace)
             return
 

@@ -180,9 +180,7 @@ class TestResolve:
         skill = workspace / ".agents" / "skills" / "shared-skill" / "SKILL.md"
         assert skill.read_text().endswith("Codex")
 
-    def test_opencode_claude_compatibility_wins_over_agents_duplicate(
-        self, tmp_base, tmp_template
-    ):
+    def test_opencode_claude_compatibility_wins_over_agents_duplicate(self, tmp_base, tmp_template):
         agent_skill = tmp_template / ".agents" / "skills" / "shared-skill"
         agent_skill.mkdir(parents=True)
         (agent_skill / "SKILL.md").write_text(

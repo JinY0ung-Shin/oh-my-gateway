@@ -322,9 +322,7 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
     if body.user:
         try:
             _early_cwd = str(
-                workspace_manager.resolve(
-                    body.user, sync_template=False, backend=backend
-                )
+                workspace_manager.resolve(body.user, sync_template=False, backend=backend)
             )
         except (ValueError, OSError):
             pass
@@ -335,9 +333,7 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
         except (ValueError, OSError):
             legacy_cwd = None
         if legacy_cwd and legacy_cwd != _early_cwd:
-            session = session_manager.get_session(
-                session_id, user=body.user, cwd=legacy_cwd
-            )
+            session = session_manager.get_session(session_id, user=body.user, cwd=legacy_cwd)
     if not session:
         raise HTTPException(
             status_code=404,
