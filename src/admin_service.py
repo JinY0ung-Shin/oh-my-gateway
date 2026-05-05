@@ -28,6 +28,8 @@ _ALLOWED_DIRS: Tuple[str, ...] = (
     ".claude/agents/",
     ".claude/skills/",
     ".claude/commands/",
+    ".agents/skills/",
+    ".opencode/skills/",
 )
 _ALLOWED_FILES: Tuple[str, ...] = (
     ".claude/settings.json",
@@ -657,7 +659,26 @@ def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
 # Valid skill name: lowercase alphanumeric + hyphens, must start with a letter/digit
 _SKILL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 
-_SKILL_DIR_PREFIX = ".claude/skills/"
+_SKILL_DIR_BY_BACKEND = {
+    "claude": ".claude/skills",
+    "codex": ".agents/skills",
+    "opencode": ".opencode/skills",
+}
+
+
+def _skill_dir_prefix(backend: str = "claude") -> str:
+    try:
+        return _SKILL_DIR_BY_BACKEND[backend]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported skill backend: {backend}") from exc
+
+
+def _skill_rel_path(name: str, backend: str = "claude") -> str:
+    return f"{_skill_dir_prefix(backend)}/{name}/SKILL.md"
+
+
+def _skill_dir(root: Path, name: str, backend: str = "claude") -> Path:
+    return root / _skill_dir_prefix(backend) / name
 
 
 def _parse_skill_frontmatter(content: str) -> Dict[str, Any]:
@@ -677,14 +698,14 @@ def _parse_skill_frontmatter(content: str) -> Dict[str, Any]:
         return {}
 
 
-def list_skills() -> List[Dict[str, Any]]:
-    """List all skills in ``.claude/skills/``.
+def list_skills(backend: str = "claude") -> List[Dict[str, Any]]:
+    """List all skills for a backend.
 
     Scans for ``SKILL.md`` files inside each subdirectory and parses their
     YAML frontmatter for metadata.
     """
     root = get_workspace_root()
-    skills_dir = root / ".claude" / "skills"
+    skills_dir = root / _skill_dir_prefix(backend)
     result: List[Dict[str, Any]] = []
 
     if not skills_dir.is_dir():
@@ -727,7 +748,7 @@ def list_skills() -> List[Dict[str, Any]]:
     return result
 
 
-def get_skill(name: str) -> Tuple[Dict[str, Any], str, str]:
+def get_skill(name: str, backend: str = "claude") -> Tuple[Dict[str, Any], str, str]:
     """Read a single skill.
 
     Returns ``(metadata, content, etag)`` where *metadata* is the parsed
@@ -737,7 +758,7 @@ def get_skill(name: str) -> Tuple[Dict[str, Any], str, str]:
     Raises ``ValueError`` for invalid skill names.
     """
     _validate_skill_name(name)
-    rel_path = f"{_SKILL_DIR_PREFIX}{name}/SKILL.md"
+    rel_path = _skill_rel_path(name, backend)
     target = validate_file_path(rel_path)
     validate_file_for_read(target)
 
@@ -752,6 +773,7 @@ def create_or_update_skill(
     name: str,
     content: str,
     expected_etag: Optional[str] = None,
+    backend: str = "claude",
 ) -> Tuple[str, bool]:
     """Create or update a skill.
 
@@ -762,7 +784,7 @@ def create_or_update_skill(
     mismatches.
     """
     _validate_skill_name(name)
-    rel_path = f"{_SKILL_DIR_PREFIX}{name}/SKILL.md"
+    rel_path = _skill_rel_path(name, backend)
     target = validate_file_path(rel_path)
 
     created = not target.is_file()
@@ -770,7 +792,7 @@ def create_or_update_skill(
     return new_etag, created
 
 
-def delete_skill(name: str) -> None:
+def delete_skill(name: str, backend: str = "claude") -> None:
     """Delete a skill directory and all its contents.
 
     Raises ``FileNotFoundError`` if the skill does not exist.
@@ -778,7 +800,7 @@ def delete_skill(name: str) -> None:
     """
     _validate_skill_name(name)
     root = get_workspace_root()
-    skill_dir = root / ".claude" / "skills" / name
+    skill_dir = _skill_dir(root, name, backend)
 
     # Security: reject symlink ancestors (.claude or .claude/skills being symlinks)
     if _has_symlink_ancestor(skill_dir, root):

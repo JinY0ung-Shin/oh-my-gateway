@@ -50,6 +50,22 @@ def empty_workspace(tmp_path):
         yield tmp_path
 
 
+@pytest.fixture
+def multi_backend_workspace(tmp_path):
+    for root_name, body in [
+        (".claude", "Claude body"),
+        (".agents", "Codex body"),
+        (".opencode", "OpenCode body"),
+    ]:
+        skill_dir = tmp_path / root_name / "skills" / "hello-world"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\nname: hello-world\ndescription: Backend skill\n---\n" + body
+        )
+    with patch("src.admin_service.get_workspace_root", return_value=tmp_path):
+        yield tmp_path
+
+
 # ---------------------------------------------------------------------------
 # Frontmatter parsing
 # ---------------------------------------------------------------------------
@@ -171,6 +187,46 @@ class TestListSkills:
         with patch("src.admin_service.get_workspace_root", return_value=tmp_path):
             skills = list_skills()
         assert skills == []
+
+
+# ---------------------------------------------------------------------------
+# Backend skill roots
+# ---------------------------------------------------------------------------
+
+
+class TestBackendSkillRoots:
+    def test_list_skills_uses_codex_agents_root(self, multi_backend_workspace):
+        skills = list_skills(backend="codex")
+        assert [s["name"] for s in skills] == ["hello-world"]
+
+    def test_get_skill_uses_opencode_root(self, multi_backend_workspace):
+        meta, content, etag = get_skill("hello-world", backend="opencode")
+        assert meta["description"] == "Backend skill"
+        assert content.endswith("OpenCode body")
+        assert etag
+
+    def test_create_skill_uses_codex_root(self, empty_workspace):
+        etag, created = create_or_update_skill(
+            "codex-only",
+            "---\nname: codex-only\ndescription: Codex\n---\nBody",
+            backend="codex",
+        )
+        assert created is True
+        assert etag
+        assert (empty_workspace / ".agents" / "skills" / "codex-only" / "SKILL.md").is_file()
+
+    def test_delete_skill_uses_opencode_root(self, multi_backend_workspace):
+        delete_skill("hello-world", backend="opencode")
+        assert not (
+            multi_backend_workspace / ".opencode" / "skills" / "hello-world"
+        ).exists()
+        assert (
+            multi_backend_workspace / ".claude" / "skills" / "hello-world"
+        ).exists()
+
+    def test_rejects_unknown_skill_backend(self, workspace):
+        with pytest.raises(ValueError, match="Unsupported skill backend"):
+            list_skills(backend="bad-backend")
 
 
 # ---------------------------------------------------------------------------
