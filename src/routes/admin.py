@@ -33,7 +33,7 @@ Blocklist:      GET  /admin/api/plugins/blocklist
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -554,19 +554,28 @@ async def reset_runtime_config(
 
 
 @router.get("/api/skills")
-async def list_skills_endpoint(_=Depends(require_admin)):
+async def list_skills_endpoint(
+    backend: str = Query("claude"),
+    _=Depends(require_admin),
+):
     """List all skills with parsed metadata."""
     try:
-        return {"skills": list_skills()}
+        return {"skills": list_skills(backend=backend)}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
     except RuntimeError as e:
         return JSONResponse(status_code=503, content={"error": str(e)})
 
 
 @router.get("/api/skills/{name}")
-async def get_skill_endpoint(name: str, _=Depends(require_admin)):
+async def get_skill_endpoint(
+    name: str,
+    backend: str = Query("claude"),
+    _=Depends(require_admin),
+):
     """Read a skill's SKILL.md content and parsed metadata."""
     try:
-        meta, content, etag = get_skill(name)
+        meta, content, etag = get_skill(name, backend=backend)
         return {"name": name, "metadata": meta, "content": content, "etag": etag}
     except FileNotFoundError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
@@ -578,13 +587,19 @@ async def get_skill_endpoint(name: str, _=Depends(require_admin)):
 async def put_skill_endpoint(
     name: str,
     body: SkillWriteRequest,
+    backend: str = Query("claude"),
     _=Depends(require_admin),
     if_match: Optional[str] = Header(None),
 ):
     """Create or update a skill. Supports If-Match for optimistic concurrency."""
     expected_etag = body.etag or if_match
     try:
-        new_etag, created = create_or_update_skill(name, body.content, expected_etag)
+        new_etag, created = create_or_update_skill(
+            name,
+            body.content,
+            expected_etag,
+            backend=backend,
+        )
         return JSONResponse(
             status_code=201 if created else 200,
             content={"name": name, "etag": new_etag, "status": "created" if created else "updated"},
@@ -597,10 +612,14 @@ async def put_skill_endpoint(
 
 
 @router.delete("/api/skills/{name}")
-async def delete_skill_endpoint(name: str, _=Depends(require_admin)):
+async def delete_skill_endpoint(
+    name: str,
+    backend: str = Query("claude"),
+    _=Depends(require_admin),
+):
     """Delete a skill and its directory."""
     try:
-        delete_skill(name)
+        delete_skill(name, backend=backend)
         return {"name": name, "status": "deleted"}
     except FileNotFoundError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})

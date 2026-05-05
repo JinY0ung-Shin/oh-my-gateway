@@ -392,6 +392,32 @@ class TestSkillsAPI:
         assert data["status"] == "created"
         assert data["etag"]
 
+    def test_list_codex_skills_query_param(self, admin_client, workspace):
+        codex_skill = workspace / ".agents" / "skills" / "codex-skill"
+        codex_skill.mkdir(parents=True)
+        (codex_skill / "SKILL.md").write_text(
+            "---\nname: codex-skill\ndescription: Codex\n---\nBody"
+        )
+        r = admin_client.get("/admin/api/skills?backend=codex")
+        assert r.status_code == 200
+        names = {s["name"] for s in r.json()["skills"]}
+        assert names == {"codex-skill"}
+
+    def test_put_opencode_skill_query_param(self, admin_client, workspace):
+        r = admin_client.put(
+            "/admin/api/skills/open-skill?backend=opencode",
+            json={"content": "---\nname: open-skill\ndescription: OpenCode\n---\nBody"},
+        )
+        assert r.status_code == 201
+        assert (
+            workspace / ".opencode" / "skills" / "open-skill" / "SKILL.md"
+        ).is_file()
+
+    def test_invalid_skill_backend_query_param(self, admin_client):
+        r = admin_client.get("/admin/api/skills?backend=invalid")
+        assert r.status_code == 400
+        assert "Unsupported skill backend" in r.json()["error"]
+
     def test_update_skill(self, admin_client):
         # Get current etag
         r = admin_client.get("/admin/api/skills/hello-world")
