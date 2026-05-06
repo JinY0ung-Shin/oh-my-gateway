@@ -57,6 +57,13 @@ services:
       # falls back to ./working_dir. Container path stays fixed so the
       # CLAUDE_CWD override below is always valid.
       - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
+      # Auto-memory storage. Claude writes per-project memory under
+      # ``<autoMemoryDirectory>/<slug>/memory/MEMORY.md`` and reads back the
+      # first 200 lines / 25KB at every session start. Persisting on the host
+      # so cross-restart continuity works for every gateway-served user;
+      # entrypoint.py drops the autoMemoryDirectory setting into
+      # ~/.claude/settings.json on each boot.
+      - ./memory:/workspace/memory
       # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
     # All runtime configuration comes from .env (see .env.example for the full list).
@@ -70,6 +77,13 @@ services:
       # Docker installs optional plugins into the container user's ~/.claude,
       # so include user-scope config when the Claude SDK starts.
       - CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}
+      # Auto-memory base directory baked into ~/.claude/settings.json by the
+      # entrypoint. Must live outside any path matching the SDK's sensitive
+      # file regex (.claude/, .env, .ssh/, etc.) - those paths are auto-denied
+      # by the SDK guardrail regardless of permission_mode or PreToolUse hooks.
+      # Set to empty string to skip the rewrite (e.g. when supplying your own
+      # ~/.claude/settings.json via volume).
+      - CLAUDE_AUTO_MEMORY_DIR=${CLAUDE_AUTO_MEMORY_DIR:-/workspace/memory}
 
   # Optional MySQL sidecar that persists per-turn usage logs (token counts,
   # tool-call stats).  Activated only when the `logging` compose profile is

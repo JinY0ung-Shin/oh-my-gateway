@@ -134,27 +134,6 @@ METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
 # call and the SDK resumes.  Set via ASK_USER_TIMEOUT_SECONDS env var.
 ASK_USER_TIMEOUT_SECONDS = int(os.environ.get("ASK_USER_TIMEOUT_SECONDS", "300"))
 
-# ---------------------------------------------------------------------------
-# Sensitive-file PreToolUse hook
-# ---------------------------------------------------------------------------
-# The Claude Agent SDK's internal sensitive-file guardrail auto-denies edits
-# whose path matches certain patterns (``.claude/``, ``.env``, ``.ssh/``,
-# ``id_rsa``, ``credentials*``, ``secrets*``, ``*.pem``, ``*.key``) even when
-# ``permission_mode="bypassPermissions"`` is set, returning a synthetic
-# tool_result reading ``Claude requested permissions to edit … which is a
-# sensitive file``.  The model treats this as a refusal and gives up.
-#
-# Setting this env var to a regex enables a PreToolUse hook that overrides
-# the guardrail for matching paths, returning ``permissionDecision: allow``.
-# Default is empty — hook disabled, SDK behaviour preserved.  Examples::
-#
-#     # Allow the workspace's .claude/ files (CLAUDE.md, MEMORY.md, …)
-#     SENSITIVE_FILE_ALLOW_PATTERN=(?:^|/)\.claude(?:/|$)
-#
-#     # Allow .claude/ and a custom sandbox directory
-#     SENSITIVE_FILE_ALLOW_PATTERN=(?:^|/)\.claude(?:/|$)|(?:^|/)workspace_data/
-SENSITIVE_FILE_ALLOW_PATTERN = os.environ.get("SENSITIVE_FILE_ALLOW_PATTERN", "").strip()
-
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")
