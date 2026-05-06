@@ -6,6 +6,7 @@ implementation registered as the ``claude`` backend.
 
 import asyncio
 import os
+import re
 import tempfile
 import atexit
 import shutil
@@ -42,13 +43,40 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
-from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
+from src.constants import (
+    ASK_USER_TIMEOUT_SECONDS,
+    DEFAULT_TIMEOUT_MS,
+    SENSITIVE_FILE_ALLOW_PATTERN,
+)
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns
 from src.runtime_config import get_default_max_turns
 
 logger = logging.getLogger(__name__)
+
+# Sensitive-file PreToolUse hook configuration.  When
+# ``SENSITIVE_FILE_ALLOW_PATTERN`` is set to a valid regex, file edits whose
+# path matches it are auto-allowed, overriding the SDK's internal guardrail
+# that auto-denies edits to ``.claude/``, ``.env``, ssh keys, etc. even with
+# ``permission_mode=bypassPermissions``.  Empty pattern (the default) keeps
+# the SDK's original behaviour.
+_SENSITIVE_FILE_TOOLS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+_SENSITIVE_FILE_TOOLS_MATCHER = "|".join(_SENSITIVE_FILE_TOOLS)
+_SENSITIVE_FILE_ALLOW_RE: Optional[re.Pattern] = None
+if SENSITIVE_FILE_ALLOW_PATTERN:
+    try:
+        _SENSITIVE_FILE_ALLOW_RE = re.compile(SENSITIVE_FILE_ALLOW_PATTERN)
+        logger.info(
+            "Sensitive-file allow hook enabled (pattern=%r)",
+            SENSITIVE_FILE_ALLOW_PATTERN,
+        )
+    except re.error as _exc:
+        logger.warning(
+            "Invalid SENSITIVE_FILE_ALLOW_PATTERN=%r: %s. Hook disabled.",
+            SENSITIVE_FILE_ALLOW_PATTERN,
+            _exc,
+        )
 
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
@@ -513,6 +541,45 @@ class ClaudeCodeCLI:
     # ClaudeSDKClient lifecycle (persistent, bidirectional sessions)
     # ------------------------------------------------------------------
 
+    def _make_sensitive_file_allow_hook(self, _session):
+        """PreToolUse hook that auto-allows file edits whose path matches
+        ``SENSITIVE_FILE_ALLOW_PATTERN``.
+
+        Overrides the SDK's internal sensitive-file guardrail for matched
+        paths only.  Other tools and unmatched paths return ``{}`` (no
+        decision) so the SDK's default behaviour applies.
+        """
+        pattern = _SENSITIVE_FILE_ALLOW_RE
+
+        async def hook(input_data, _tool_use_id, _context):
+            if pattern is None:
+                return {}
+            tool_name = (
+                input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
+            )
+            if tool_name not in _SENSITIVE_FILE_TOOLS:
+                return {}
+            tool_input = (
+                input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
+            )
+            if not isinstance(tool_input, dict):
+                return {}
+            for key in ("file_path", "notebook_path", "path"):
+                value = tool_input.get(key)
+                if isinstance(value, str) and pattern.search(value):
+                    logger.debug(
+                        "Sensitive-file allow hook matched %s on %s", tool_name, value
+                    )
+                    return {
+                        "hookSpecificOutput": {
+                            "hookEventName": "PreToolUse",
+                            "permissionDecision": "allow",
+                        }
+                    }
+            return {}
+
+        return hook
+
     def _make_ask_user_hook(self, session):
         """Create a PreToolUse hook that intercepts AskUserQuestion.
 
@@ -633,14 +700,20 @@ class ClaudeCodeCLI:
             extra_env=extra_env,
             _custom_base=_custom_base,
         )
-        options.hooks = {
-            "PreToolUse": [
+        hook_matchers = [
+            HookMatcher(
+                matcher="AskUserQuestion",
+                hooks=[self._make_ask_user_hook(session)],
+            )
+        ]
+        if _SENSITIVE_FILE_ALLOW_RE is not None:
+            hook_matchers.append(
                 HookMatcher(
-                    matcher="AskUserQuestion",
-                    hooks=[self._make_ask_user_hook(session)],
+                    matcher=_SENSITIVE_FILE_TOOLS_MATCHER,
+                    hooks=[self._make_sensitive_file_allow_hook(session)],
                 )
-            ]
-        }
+            )
+        options.hooks = {"PreToolUse": hook_matchers}
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
