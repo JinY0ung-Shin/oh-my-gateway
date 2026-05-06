@@ -79,20 +79,26 @@ COPY docs/*system-prompt*.md ./docs/
 COPY docker/install_plugins.sh /usr/local/bin/install_plugins.sh
 RUN chmod +x /usr/local/bin/install_plugins.sh
 
-# Run as non-root. The Claude CLI refuses --dangerously-skip-permissions under
-# root, and the gateway always opens sessions with permission_mode=bypassPermissions
-# (see src/routes/responses.py), so the container must run as a regular user.
-# uid 1000 matches the typical host developer uid so bind-mounted ./data and
-# ./working_dir stay writable without extra chown on the host.
+# Startup shim repairs writable bind mounts while still root, then drops to the
+# unprivileged app uid before running the server.
+COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py
+
+# The Claude CLI refuses --dangerously-skip-permissions under root, and the
+# gateway always opens sessions with permission_mode=bypassPermissions (see
+# src/routes/responses.py), so the server process must run as a regular user.
+# The entrypoint starts as root only long enough to repair Docker bind-mount
+# permissions for gateway-owned data, then drops to APP_UID/APP_GID.
 RUN useradd -m -u 1000 -s /bin/bash app \
     && mkdir -p /app/data /app/working_dir /home/app/.claude \
     && chown -R app:app /app /home/app
-ENV HOME=/home/app
-USER app
+ENV HOME=/home/app \
+    APP_UID=1000 \
+    APP_GID=1000
 
 # Expose the port (default 8000; overridable via PORT env var at runtime).
 EXPOSE 8000
 
 # Run the app with Uvicorn and honor PORT env var.
 # exec ensures SIGTERM from docker stop reaches uvicorn.
+ENTRYPOINT ["python", "/usr/local/bin/docker-entrypoint.py"]
 CMD ["sh", "-c", "/usr/local/bin/install_plugins.sh && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

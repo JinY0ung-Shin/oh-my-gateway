@@ -1,9 +1,12 @@
 """Docker packaging expectations."""
 
 import os
+import importlib.util
 from pathlib import Path
 import subprocess
 import textwrap
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +28,17 @@ APT_SOURCES = textwrap.dedent(
 
 def _final_docker_stage(dockerfile: str) -> str:
     return "FROM " + dockerfile.rsplit("\nFROM ", 1)[1]
+
+
+def _load_docker_entrypoint():
+    spec = importlib.util.spec_from_file_location(
+        "docker_entrypoint", ROOT / "docker" / "entrypoint.py"
+    )
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _rewrite_apt_sources(tmp_path: Path, **env_overrides: str) -> str:
@@ -61,6 +75,71 @@ def test_dockerfile_installs_opencode_binary_for_managed_mode():
     )
     assert "https://opencode.ai/install" not in dockerfile
     assert "opencode --version" in dockerfile
+
+
+def test_dockerfile_uses_entrypoint_for_bind_mount_permissions():
+    """Docker startup should repair writable bind mounts before dropping privileges."""
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    final_stage = _final_docker_stage(dockerfile)
+
+    assert "COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py" in final_stage
+    assert 'ENTRYPOINT ["python", "/usr/local/bin/docker-entrypoint.py"]' in final_stage
+    assert "USER app" not in final_stage
+
+
+def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
+    tmp_path, monkeypatch
+):
+    """Gateway permission repair must not chown the MySQL sidecar data directory."""
+    entrypoint = _load_docker_entrypoint()
+    data_dir = tmp_path / "data"
+    prompts_dir = data_dir / "prompts"
+    mysql_dir = data_dir / "mysql_data"
+    claude_home = tmp_path / ".claude"
+
+    prompts_dir.mkdir(parents=True)
+    mysql_dir.mkdir()
+    prompt_file = prompts_dir / "saved.json"
+    prompt_file.write_text("{}", encoding="utf-8")
+    persisted_prompt = data_dir / "system_prompt.json"
+    persisted_prompt.write_text("{}", encoding="utf-8")
+    mysql_file = mysql_dir / "ibdata1"
+    mysql_file.write_text("mysql", encoding="utf-8")
+
+    chowned: list[Path] = []
+
+    def fake_chown(path, uid, gid):
+        assert uid == 123
+        assert gid == 456
+        chowned.append(Path(path))
+
+    monkeypatch.setattr(entrypoint.os, "chown", fake_chown)
+
+    entrypoint.prepare_writable_paths(
+        uid=123,
+        gid=456,
+        data_dir=data_dir,
+        claude_home=claude_home,
+    )
+
+    assert data_dir in chowned
+    assert prompts_dir in chowned
+    assert prompt_file in chowned
+    assert persisted_prompt in chowned
+    assert claude_home.parent in chowned
+    assert claude_home in chowned
+    assert mysql_dir not in chowned
+    assert mysql_file not in chowned
+
+
+def test_docker_entrypoint_rejects_root_runtime_uid(monkeypatch):
+    """The gateway server must not run as root because Claude refuses that mode."""
+    entrypoint = _load_docker_entrypoint()
+
+    monkeypatch.setenv("APP_UID", "0")
+
+    with pytest.raises(SystemExit, match="APP_UID must be positive"):
+        entrypoint._parse_id("APP_UID", 1000)
 
 
 def test_final_docker_stage_does_not_keep_node_or_npm():

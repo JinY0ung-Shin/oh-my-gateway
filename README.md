@@ -150,6 +150,11 @@ cp .env.example .env
 docker compose up -d
 ```
 
+On startup the Compose image repairs gateway-owned bind-mount permissions for
+`./data` and then runs the server as a non-root user. If your host user is not
+uid/gid 1000, set `APP_UID=$(id -u)` and `APP_GID=$(id -g)` in `.env` before
+starting Compose.
+
 For corporate networks, Compose forwards build-time mirror settings from the
 host environment or `.env`:
 
