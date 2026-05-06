@@ -564,6 +564,19 @@ class TestBuildSdkOptions:
         opts = cli_instance._build_sdk_options(permission_mode="bypassPermissions")
         assert opts.permission_mode == "bypassPermissions"
 
+    def test_setting_sources_default_to_project_and_local(self, cli_instance):
+        """Non-Docker/default runtime keeps user settings out of SDK options."""
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_SETTING_SOURCES", None)
+            opts = cli_instance._build_sdk_options()
+            assert opts.setting_sources == ["project", "local"]
+
+    def test_setting_sources_can_include_user_from_env(self, cli_instance):
+        """CLAUDE_SETTING_SOURCES controls SDK setting source precedence."""
+        with patch.dict(os.environ, {"CLAUDE_SETTING_SOURCES": "user,project,local"}):
+            opts = cli_instance._build_sdk_options()
+            assert opts.setting_sources == ["user", "project", "local"]
+
     def test_task_budget_per_request(self, cli_instance):
         """Per-request task_budget is forwarded as SDK TaskBudget dict."""
         opts = cli_instance._build_sdk_options(task_budget=50000)

@@ -50,6 +50,39 @@ from src.runtime_config import get_default_max_turns
 
 logger = logging.getLogger(__name__)
 
+_DEFAULT_SETTING_SOURCES = ["project", "local"]
+_VALID_SETTING_SOURCES = {"user", "project", "local"}
+
+
+def _get_setting_sources() -> List[str]:
+    """Return Claude config sources for SDK calls.
+
+    By default the gateway keeps user-level Claude config out of non-Docker
+    runs. Docker Compose sets CLAUDE_SETTING_SOURCES=user,project,local so
+    user-scope plugins installed at container startup are visible to Claude.
+    """
+    raw = os.getenv("CLAUDE_SETTING_SOURCES")
+    if raw is None or not raw.strip():
+        return list(_DEFAULT_SETTING_SOURCES)
+
+    sources = [part.strip() for part in raw.split(",") if part.strip()]
+    invalid = [source for source in sources if source not in _VALID_SETTING_SOURCES]
+    if invalid or not sources:
+        logger.warning(
+            "Invalid CLAUDE_SETTING_SOURCES=%r; using default %s",
+            raw,
+            ",".join(_DEFAULT_SETTING_SOURCES),
+        )
+        return list(_DEFAULT_SETTING_SOURCES)
+
+    deduped = []
+    seen = set()
+    for source in sources:
+        if source not in seen:
+            deduped.append(source)
+            seen.add(source)
+    return deduped
+
 
 class ClaudeCodeCLI:
     """Gateway for Claude Agent SDK queries.
@@ -313,7 +346,9 @@ class ClaudeCodeCLI:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
         options = ClaudeAgentOptions(
-            max_turns=max_turns, cwd=effective_cwd, setting_sources=["project", "local"]
+            max_turns=max_turns,
+            cwd=effective_cwd,
+            setting_sources=_get_setting_sources(),
         )
 
         self._configure_thinking(options)

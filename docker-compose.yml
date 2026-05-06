@@ -67,6 +67,9 @@ services:
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
       # Override .env CLAUDE_CWD (host path) with the in-container mount target.
       - CLAUDE_CWD=/app/working_dir
+      # Docker installs optional plugins into the container user's ~/.claude,
+      # so include user-scope config when the Claude SDK starts.
+      - CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}
 
   # Optional MySQL sidecar that persists per-turn usage logs (token counts,
   # tool-call stats).  Activated only when the `logging` compose profile is

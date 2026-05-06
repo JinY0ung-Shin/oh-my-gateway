@@ -148,6 +148,13 @@ def test_compose_mounts_host_ca_bundle_with_debian_default_path():
     assert "HOST_CA_CERTIFICATES_PATH=/etc/ssl/certs/ca-certificates.crt" in env_example
 
 
+def test_compose_defaults_claude_setting_sources_to_user_scope():
+    """Docker should read user-scope Claude config so installed plugins load."""
+    compose = (ROOT / "docker-compose.yml").read_text()
+
+    assert "CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}" in compose
+
+
 def test_compose_does_not_configure_external_opencode_server():
     """Compose should not point the gateway at a separate OpenCode service."""
     compose = (ROOT / "docker-compose.yml").read_text()
