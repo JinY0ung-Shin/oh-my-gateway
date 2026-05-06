@@ -73,10 +73,11 @@ def _make_marketplace_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def test_plugin_installer_uses_claude_marketplace_commands_with_git_credentials(tmp_path):
+def test_plugin_installer_clones_remote_marketplace_then_adds_local_path_with_token(tmp_path):
     home = tmp_path / "home"
     bin_dir = tmp_path / "bin"
     log = tmp_path / "claude.log"
+    git_log = tmp_path / "git.log"
     bin_dir.mkdir()
 
     fake_claude = bin_dir / "claude"
@@ -85,36 +86,54 @@ def test_plugin_installer_uses_claude_marketplace_commands_with_git_credentials(
 set -eu
 
 printf '%s\\n' "$*" >> "$FAKE_CLAUDE_LOG"
-
-if [ "${1:-}" = "plugin" ] && [ "${2:-}" = "marketplace" ] && [ "${3:-}" = "add" ]; then
-    "$GIT_ASKPASS" "Username for 'https://github.example'" >> "$FAKE_CLAUDE_LOG"
-    "$GIT_ASKPASS" "Password for 'https://bot@github.example'" >> "$FAKE_CLAUDE_LOG"
-fi
 """
     )
     fake_claude.chmod(0o755)
+
+    fake_git = bin_dir / "git"
+    fake_git.write_text(
+        """#!/bin/sh
+set -eu
+
+printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
+
+if [ "${1:-}" = "clone" ]; then
+    if [ -n "${GIT_ASKPASS:-}" ]; then
+    "$GIT_ASKPASS" "Username for 'https://github.example'" >> "$FAKE_CLAUDE_LOG"
+        "$GIT_ASKPASS" "Password for 'https://x-access-token@github.example'" >> "$FAKE_CLAUDE_LOG"
+    fi
+    mkdir -p "$5/.git"
+fi
+"""
+    )
+    fake_git.chmod(0o755)
 
     env = {
         **os.environ,
         "HOME": str(home),
         "PATH": f"{bin_dir}:{os.environ['PATH']}",
         "FAKE_CLAUDE_LOG": str(log),
+        "FAKE_GIT_LOG": str(git_log),
         "CLAUDE_PLUGIN_REPO": "https://github.example/acme/marketplace.git",
         "CLAUDE_PLUGIN_NAME": "MonSemi",
         "CLAUDE_PLUGIN_MARKETPLACE": "monsemi",
-        "CLAUDE_PLUGIN_GIT_USERNAME": "bot",
         "CLAUDE_PLUGIN_GIT_TOKEN": "secret-token",
     }
 
     _run(["sh", str(SCRIPT)], env=env)
 
-    claude_log = log.read_text()
+    local_repo = home / ".claude" / "plugin-marketplaces" / "marketplace"
+    git_output = git_log.read_text()
     assert (
-        "plugin marketplace add https://github.example/acme/marketplace.git "
-        "--scope user --sparse .claude-plugin plugins\n"
-    ) in claude_log
+        f"clone --depth 1 https://github.example/acme/marketplace.git {local_repo}\n"
+        in git_output
+    )
+
+    claude_log = log.read_text()
+    assert f"plugin marketplace add {local_repo} --scope user\n" in claude_log
+    assert "https://github.example/acme/marketplace.git" not in claude_log
     assert "plugin install MonSemi@monsemi --scope user\n" in claude_log
-    assert "bot\n" in claude_log
+    assert "x-access-token\n" in claude_log
     assert "secret-token\n" in claude_log
 
 
@@ -123,6 +142,7 @@ def test_plugin_installer_falls_back_to_sdk_bundled_claude(tmp_path):
     bin_dir = tmp_path / "bin"
     bundled_dir = tmp_path / "sdk" / "_bundled"
     log = tmp_path / "claude.log"
+    repo = _make_marketplace_repo(tmp_path)
     bin_dir.mkdir()
     bundled_dir.mkdir(parents=True)
 
@@ -149,16 +169,16 @@ printf '%s\\n' "$*" >> "$FAKE_CLAUDE_LOG"
         "PATH": f"{bin_dir}:/usr/bin:/bin",
         "FAKE_BUNDLED_CLAUDE": str(fake_claude),
         "FAKE_CLAUDE_LOG": str(log),
-        "CLAUDE_PLUGIN_REPO": "https://github.example/acme/marketplace.git",
-        "CLAUDE_PLUGIN_NAME": "MonSemi",
-        "CLAUDE_PLUGIN_MARKETPLACE": "monsemi",
+        "CLAUDE_PLUGIN_REPO": str(repo),
+        "CLAUDE_PLUGIN_NAME": "demo",
+        "CLAUDE_PLUGIN_MARKETPLACE": "external",
     }
 
     _run(["sh", str(SCRIPT)], env=env)
 
     claude_log = log.read_text()
-    assert "plugin marketplace add https://github.example/acme/marketplace.git" in claude_log
-    assert "plugin install MonSemi@monsemi --scope user\n" in claude_log
+    assert f"plugin marketplace add {repo} --scope user\n" in claude_log
+    assert "plugin install demo@external --scope user\n" in claude_log
 
 
 def test_marketplace_install_registers_cli_usable_plugin_from_local_directory(tmp_path):

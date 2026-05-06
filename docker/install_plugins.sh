@@ -8,8 +8,8 @@
 #   CLAUDE_PLUGIN_MARKETPLACE  marketplace name from marketplace.json (optional)
 #   CLAUDE_PLUGIN_SCOPE        install scope: user, project, or local (default: user)
 #   CLAUDE_PLUGIN_CLAUDE_BIN   Claude CLI path override (optional)
-#   CLAUDE_PLUGIN_GIT_USERNAME HTTPS git username for private repos (optional)
 #   CLAUDE_PLUGIN_GIT_TOKEN    HTTPS git token/password for private repos (optional)
+#   CLAUDE_PLUGIN_CLONE_ROOT   local clone root for remote marketplace repos (optional)
 set -eu
 
 REPO="${CLAUDE_PLUGIN_REPO:-}"
@@ -23,8 +23,8 @@ NAME="${CLAUDE_PLUGIN_NAME:-$DEFAULT_NAME}"
 MARKETPLACE="${CLAUDE_PLUGIN_MARKETPLACE:-}"
 SCOPE="${CLAUDE_PLUGIN_SCOPE:-user}"
 CLAUDE_BIN="${CLAUDE_PLUGIN_CLAUDE_BIN:-}"
-GIT_USERNAME="${CLAUDE_PLUGIN_GIT_USERNAME:-}"
 GIT_TOKEN="${CLAUDE_PLUGIN_GIT_TOKEN:-}"
+CLONE_ROOT="${CLAUDE_PLUGIN_CLONE_ROOT:-}"
 
 [ -n "$NAME" ] || {
     echo "[install_plugins] CLAUDE_PLUGIN_NAME is required when it cannot be inferred from CLAUDE_PLUGIN_REPO" >&2
@@ -32,17 +32,12 @@ GIT_TOKEN="${CLAUDE_PLUGIN_GIT_TOKEN:-}"
 }
 
 GIT_ASKPASS_FILE=""
-if [ -n "$GIT_USERNAME$GIT_TOKEN" ]; then
-    if [ -z "$GIT_USERNAME" ] || [ -z "$GIT_TOKEN" ]; then
-        echo "[install_plugins] CLAUDE_PLUGIN_GIT_USERNAME and CLAUDE_PLUGIN_GIT_TOKEN must be set together" >&2
-        exit 1
-    fi
-
+if [ -n "$GIT_TOKEN" ]; then
     GIT_ASKPASS_FILE="$(mktemp)"
     cat > "$GIT_ASKPASS_FILE" <<'EOF'
 #!/bin/sh
 case "$1" in
-    *Username*) printf '%s\n' "$CLAUDE_PLUGIN_GIT_USERNAME" ;;
+    *Username*) printf '%s\n' "x-access-token" ;;
     *Password*) printf '%s\n' "$CLAUDE_PLUGIN_GIT_TOKEN" ;;
     *) printf '\n' ;;
 esac
@@ -94,12 +89,32 @@ if [ -n "$MARKETPLACE" ]; then
     PLUGIN_SPEC="$NAME@$MARKETPLACE"
 fi
 
+LOCAL_REPO="$REPO"
 if [ -e "$REPO" ]; then
-    "$CLAUDE_BIN" plugin marketplace add "$REPO" --scope "$SCOPE"
+    LOCAL_REPO="$REPO"
 else
-    "$CLAUDE_BIN" plugin marketplace add "$REPO" --scope "$SCOPE" --sparse .claude-plugin plugins
+    if [ -z "$CLONE_ROOT" ]; then
+        [ -n "${HOME:-}" ] || {
+            echo "[install_plugins] HOME or CLAUDE_PLUGIN_CLONE_ROOT is required for remote plugin repos" >&2
+            exit 1
+        }
+        CLONE_ROOT="$HOME/.claude/plugin-marketplaces"
+    fi
+    mkdir -p "$CLONE_ROOT"
+    LOCAL_REPO="$CLONE_ROOT/$DEFAULT_NAME"
+    if [ -d "$LOCAL_REPO/.git" ]; then
+        git -C "$LOCAL_REPO" fetch --depth 1 origin
+        git -C "$LOCAL_REPO" reset --hard FETCH_HEAD
+    else
+        if [ -e "$LOCAL_REPO" ]; then
+            echo "[install_plugins] plugin clone path exists but is not a git repo: $LOCAL_REPO" >&2
+            exit 1
+        fi
+        git clone --depth 1 "$REPO" "$LOCAL_REPO"
+    fi
 fi
 
+"$CLAUDE_BIN" plugin marketplace add "$LOCAL_REPO" --scope "$SCOPE"
 "$CLAUDE_BIN" plugin install "$PLUGIN_SPEC" --scope "$SCOPE"
 
-echo "[install_plugins] installed $PLUGIN_SPEC from marketplace source $REPO (scope: $SCOPE)"
+echo "[install_plugins] installed $PLUGIN_SPEC from marketplace source $LOCAL_REPO (scope: $SCOPE)"
