@@ -51,6 +51,14 @@ MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))  # 
 # Permission Modes
 PERMISSION_MODE_BYPASS = "bypassPermissions"
 
+# Default permission_mode applied when an inbound request does not specify one.
+# Recognised SDK values: ``default``, ``acceptEdits``, ``bypassPermissions``,
+# ``plan``.  Empty (the default here) keeps the previous behaviour where the
+# SDK uses its own default mode.  Setting ``PERMISSION_MODE=bypassPermissions``
+# matches the gateway's pre-opencode-merge default and is required for tools
+# to be invoked without per-call user prompts in non-interactive deployments.
+DEFAULT_PERMISSION_MODE = os.environ.get("PERMISSION_MODE", "").strip()
+
 # Session Management
 SESSION_CLEANUP_INTERVAL_MINUTES = int(os.getenv("SESSION_CLEANUP_INTERVAL_MINUTES", "5"))
 SESSION_MAX_AGE_MINUTES = int(os.getenv("SESSION_MAX_AGE_MINUTES", "60"))

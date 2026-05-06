@@ -45,6 +45,7 @@ from src.backends.claude.constants import (
 )
 from src.constants import (
     ASK_USER_TIMEOUT_SECONDS,
+    DEFAULT_PERMISSION_MODE,
     DEFAULT_TIMEOUT_MS,
     SENSITIVE_FILE_ALLOW_PATTERN,
 )
@@ -54,6 +55,12 @@ from src.mcp_config import get_mcp_tool_patterns
 from src.runtime_config import get_default_max_turns
 
 logger = logging.getLogger(__name__)
+
+if DEFAULT_PERMISSION_MODE:
+    logger.info(
+        "Default permission_mode set via PERMISSION_MODE env: %r",
+        DEFAULT_PERMISSION_MODE,
+    )
 
 # Sensitive-file PreToolUse hook configuration.  When
 # ``SENSITIVE_FILE_ALLOW_PATTERN`` is set to a valid regex, file edits whose
@@ -395,8 +402,11 @@ class ClaudeCodeCLI:
 
         custom_base = self._resolve_custom_base_prompt(_custom_base, effective_cwd)
         self._configure_system_prompt(options, custom_base, system_prompt)
-        if permission_mode:
-            options.permission_mode = cast(Any, permission_mode)
+        # Per-request permission_mode wins; otherwise fall back to the
+        # PERMISSION_MODE env default (empty -> let SDK decide).
+        effective_permission_mode = permission_mode or DEFAULT_PERMISSION_MODE
+        if effective_permission_mode:
+            options.permission_mode = cast(Any, effective_permission_mode)
         if output_format:
             options.output_format = output_format
         self._configure_mcp_servers(options, mcp_servers, allowed_tools)
