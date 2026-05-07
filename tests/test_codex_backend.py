@@ -1751,3 +1751,202 @@ def test_codex_rpc_model_list_raises_when_response_not_dict(monkeypatch):
 
     with pytest.raises(CodexAppServerError, match="model/list"):
         rpc.model_list()
+
+
+# ---------------------------------------------------------------------------
+# Group 6: CodexClient async error paths and simple accessors
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_codex_verify_returns_false_when_model_list_raises(monkeypatch):
+    """If the live process rejects model/list, verify() reports failure."""
+    from src.backends.codex.client import CodexClient
+
+    class ExplodingRpc:
+        def start(self):
+            return None
+
+        def model_list(self):
+            raise RuntimeError("nope")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: ExplodingRpc()
+    )
+
+    backend = CodexClient()
+    assert await backend.verify() is False
+
+
+@pytest.mark.asyncio
+async def test_codex_verify_returns_false_when_data_not_list(monkeypatch):
+    """A model/list response missing the 'data' list also yields False."""
+    from src.backends.codex.client import CodexClient
+
+    class WrongShapeRpc:
+        def start(self):
+            return None
+
+        def model_list(self):
+            return {"data": "not a list"}
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        "src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: WrongShapeRpc()
+    )
+
+    backend = CodexClient()
+    assert await backend.verify() is False
+
+
+def test_codex_runtime_metadata_includes_expected_keys():
+    """runtime_metadata returns a stable dict shape for diagnostics."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    metadata = backend.runtime_metadata()
+
+    assert metadata["mode"] == "app-server"
+    assert isinstance(metadata["models"], list)
+    assert "approval_policy" in metadata
+    assert "sandbox" in metadata
+    assert metadata["shared_process"] is False
+
+
+def test_codex_client_simple_accessors():
+    """name, supported_models, get_auth_provider expose the expected types."""
+    from src.backends.codex.auth import CodexAuthProvider
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+
+    assert backend.name == "codex"
+    assert isinstance(backend.supported_models(), list)
+    assert isinstance(backend.get_auth_provider(), CodexAuthProvider)
+
+
+@pytest.mark.asyncio
+async def test_codex_run_completion_yields_error_when_turn_id_missing(monkeypatch):
+    """A turn/start response without turn.id surfaces as an error chunk."""
+    from src.backends.codex.client import CodexClient
+
+    class TurnLessRpc:
+        def __init__(self):
+            self.closed = False
+
+        def is_running(self):
+            return not self.closed
+
+        def start(self):
+            return None
+
+        def close(self):
+            self.closed = True
+
+        def thread_start(self, params):
+            return {"thread": {"id": "thr_1"}}
+
+        def thread_resume(self, thread_id, params):
+            return {"thread": {"id": thread_id}}
+
+        def turn_start(self, thread_id, input_items, params):
+            return {"turn": {}}
+
+        def next_notification(self):
+            raise AssertionError("should not be reached")
+
+    monkeypatch.setattr(
+        "src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: TurnLessRpc()
+    )
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw")
+    client = await backend.create_client(session=session)
+
+    chunks = [
+        chunk async for chunk in backend.run_completion_with_client(client, "hi", session)
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0]["type"] == "error"
+    assert chunks[0]["is_error"] is True
+    assert "turn.id" in chunks[0]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_approval_errors_when_request_id_missing(monkeypatch):
+    """resume_approval rejects a session whose pending request_id was never set."""
+    from src.backends.codex.client import (
+        CodexClient,
+        CodexJsonRpcClient,
+        CodexSessionClient,
+    )
+
+    backend = CodexClient()
+
+    rpc = CodexJsonRpcClient()
+    monkeypatch.setattr(backend, "_ensure_rpc_locked", AsyncMock(return_value=rpc))
+    monkeypatch.setattr(backend, "_close_rpc_locked", AsyncMock())
+
+    session_client = CodexSessionClient(
+        rpc=rpc,
+        thread_id="thr_1",
+        model=None,
+        cwd=None,
+        env={},
+    )
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            session_client, "call_xyz", "accept", session=SimpleNamespace()
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0]["type"] == "error"
+    assert "request id" in chunks[0]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_approval_errors_when_turn_id_missing(monkeypatch):
+    """resume_approval rejects a session whose turn id was lost."""
+    from src.backends.codex.client import (
+        CodexClient,
+        CodexJsonRpcClient,
+        CodexSessionClient,
+    )
+
+    backend = CodexClient()
+
+    rpc = CodexJsonRpcClient()
+    monkeypatch.setattr(backend, "_ensure_rpc_locked", AsyncMock(return_value=rpc))
+    monkeypatch.setattr(backend, "_close_rpc_locked", AsyncMock())
+
+    session_client = CodexSessionClient(
+        rpc=rpc,
+        thread_id="thr_1",
+        model=None,
+        cwd=None,
+        env={},
+        pending_approval_request_id="req_1",
+        pending_approval_method="item/commandExecution/requestApproval",
+        pending_approval_turn_id=None,
+        pending_approval_params={},
+    )
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            session_client, "req_1", "accept", session=SimpleNamespace()
+        )
+    ]
+
+    assert len(chunks) == 1
+    assert chunks[0]["type"] == "error"
+    assert "turn id" in chunks[0]["error_message"]
