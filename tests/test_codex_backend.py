@@ -1630,3 +1630,124 @@ def test_codex_estimate_token_usage_uses_length_heuristic():
     floor = client.estimate_token_usage("", "")
     assert floor["prompt_tokens"] >= 1
     assert floor["completion_tokens"] >= 1
+
+
+# ---------------------------------------------------------------------------
+# Group 5: CodexJsonRpcClient I/O error branches
+# ---------------------------------------------------------------------------
+
+
+def _make_rpc_with_queued_line(line: str):
+    """Construct an RPC instance whose stdout queue has one preloaded line."""
+    import queue as queue_module
+
+    from src.backends.codex.client import CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+    rpc._proc = SimpleNamespace(stdout=SimpleNamespace())
+    rpc._stdout_queue = queue_module.Queue()
+    rpc._stdout_queue.put(line)
+    return rpc
+
+
+def test_codex_rpc_read_message_raises_on_invalid_json():
+    """Garbage on the wire becomes a CodexAppServerError."""
+    from src.backends.codex.client import CodexAppServerError
+
+    rpc = _make_rpc_with_queued_line("not valid json\n")
+
+    with pytest.raises(CodexAppServerError, match="Invalid Codex JSON-RPC line"):
+        rpc._read_message()
+
+
+def test_codex_rpc_read_message_raises_on_non_dict_payload():
+    """A JSON array (or other non-object) is also rejected."""
+    from src.backends.codex.client import CodexAppServerError
+
+    rpc = _make_rpc_with_queued_line('["array", "not dict"]\n')
+
+    with pytest.raises(CodexAppServerError, match="Invalid Codex JSON-RPC payload"):
+        rpc._read_message()
+
+
+def test_codex_rpc_read_message_raises_when_stdout_closed():
+    """Sentinel None from the drain thread surfaces as 'closed stdout'."""
+    from src.backends.codex.client import CodexAppServerError
+
+    rpc = _make_rpc_with_queued_line(None)
+
+    with pytest.raises(CodexAppServerError, match="closed stdout"):
+        rpc._read_message()
+
+
+def test_codex_rpc_read_message_raises_when_proc_missing():
+    """An unstarted RPC instance refuses to read."""
+    from src.backends.codex.client import CodexAppServerError, CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+
+    with pytest.raises(CodexAppServerError, match="not running"):
+        rpc._read_message()
+
+
+def test_codex_rpc_write_message_raises_when_proc_missing():
+    """An unstarted RPC instance refuses to write."""
+    from src.backends.codex.client import CodexAppServerError, CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+
+    with pytest.raises(CodexAppServerError, match="not running"):
+        rpc._write_message({"id": "x", "method": "ping"})
+
+
+def test_codex_rpc_close_is_noop_when_proc_missing():
+    """close() on a never-started client is a no-op and idempotent."""
+    from src.backends.codex.client import CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+    rpc.close()
+    rpc.close()
+
+
+def test_codex_rpc_thread_start_raises_when_response_not_dict(monkeypatch):
+    """Bare list / string responses for thread/start raise CodexAppServerError."""
+    from src.backends.codex.client import CodexAppServerError, CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+    monkeypatch.setattr(rpc, "request", lambda method, params=None: ["not", "dict"])
+
+    with pytest.raises(CodexAppServerError, match="thread/start"):
+        rpc.thread_start({})
+
+
+def test_codex_rpc_thread_resume_raises_when_response_not_dict(monkeypatch):
+    """Bare list / string responses for thread/resume raise CodexAppServerError."""
+    from src.backends.codex.client import CodexAppServerError, CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+    monkeypatch.setattr(rpc, "request", lambda method, params=None: "string")
+
+    with pytest.raises(CodexAppServerError, match="thread/resume"):
+        rpc.thread_resume("thr_1", {})
+
+
+def test_codex_rpc_turn_start_raises_when_response_not_dict(monkeypatch):
+    """Bare list / string responses for turn/start raise CodexAppServerError."""
+    from src.backends.codex.client import CodexAppServerError, CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+    monkeypatch.setattr(rpc, "request", lambda method, params=None: "string")
+
+    with pytest.raises(CodexAppServerError, match="turn/start"):
+        rpc.turn_start("thr_1", [], {})
+
+
+def test_codex_rpc_model_list_raises_when_response_not_dict(monkeypatch):
+    """Bare list / string responses for model/list raise CodexAppServerError."""
+    from src.backends.codex.client import CodexAppServerError, CodexJsonRpcClient
+
+    rpc = CodexJsonRpcClient()
+    monkeypatch.setattr(rpc, "request", lambda method, params=None: None)
+
+    with pytest.raises(CodexAppServerError, match="model/list"):
+        rpc.model_list()
