@@ -1,4 +1,18 @@
 services:
+  # One-shot init that fixes ownership of the per-user workspaces bind mount.
+  # Docker auto-creates ./workspaces as root:root on first ``up``; the gateway
+  # runs as appuser (uid 1001) and would fail to create per-user subdirectories
+  # under it. Running ``chown`` here keeps the fix declarative — no host-side
+  # setup step, no container code change — and is idempotent on subsequent
+  # ``up`` calls.
+  workspaces-init:
+    image: alpine:3
+    user: "0:0"
+    command: chown ${APP_UID:-1001}:${APP_GID:-1001} /workspaces
+    volumes:
+      - ./workspaces:/workspaces
+    restart: "no"
+
   gateway:
     build:
       context: .
@@ -27,10 +41,15 @@ services:
     # before starting the gateway, so the usage-log engine can connect on first
     # try.  ``required: false`` (Compose v2.20+) keeps the gateway runnable
     # when the ``logging`` profile is off and gateway-log isn't created.
+    #
+    # workspaces-init has no profile, so it always runs and chowns the bind
+    # mount root before the gateway tries to create per-user subdirectories.
     depends_on:
       gateway-log:
         condition: service_healthy
         required: false
+      workspaces-init:
+        condition: service_completed_successfully
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
@@ -57,6 +76,11 @@ services:
       # falls back to ./working_dir. Container path stays fixed so the
       # CLAUDE_CWD override below is always valid.
       - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
+      # Per-user workspaces (one subdirectory per gateway user). Bind-mounted
+      # to the host so memory files (./workspaces/<user>/<backend>/MEMORY.md)
+      # survive ``down -v`` and are inspectable/backupable from the host.
+      # Ownership is normalised by the workspaces-init service above.
+      - ./workspaces:/tmp/workspaces
       # Optional: Mount a specific workspace directory
       # - ./workspace:/workspace
     # All runtime configuration comes from .env (see .env.example for the full list).
