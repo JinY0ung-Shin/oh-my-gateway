@@ -1147,3 +1147,154 @@ def test_codex_register_logs_error_when_client_init_fails(monkeypatch, caplog):
     assert descriptors == [codex_pkg.CODEX_DESCRIPTOR]
     assert registered == []
     assert "Codex backend client creation failed" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Group 2: pure helpers — approval decisions, kinds, options
+# ---------------------------------------------------------------------------
+
+
+def test_codex_normalize_approval_decision_aliases():
+    """All alias strings map to canonical decisions."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    for value in ["yes", "y", "allow", "approve", "approved", "once"]:
+        assert client._normalize_approval_decision(value) == "accept", value
+    for value in ["no", "n", "deny", "denied", "reject", "rejected", ""]:
+        assert client._normalize_approval_decision(value) == "decline", value
+    for value in ["always", "session"]:
+        assert client._normalize_approval_decision(value) == "acceptForSession", value
+    assert client._normalize_approval_decision("stop") == "cancel"
+
+    # Canonical values pass through unchanged.
+    for value in ["accept", "acceptForSession", "decline", "cancel"]:
+        assert client._normalize_approval_decision(value) == value, value
+
+    # Unknown value falls through to decline.
+    assert client._normalize_approval_decision("unknown_value") == "decline"
+
+
+def test_codex_normalize_approval_decision_handles_list_and_none():
+    """Non-string inputs go through string coercion / list head extraction."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._normalize_approval_decision(["yes", "no"]) == "accept"
+    assert client._normalize_approval_decision([]) == "decline"
+    assert client._normalize_approval_decision(None) == "decline"
+
+
+def test_codex_approval_kind_falls_back_for_unknown_method():
+    """Known methods map to known kinds; everything else is generic 'approval'."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._approval_kind("item/commandExecution/requestApproval") == "command"
+    assert client._approval_kind("item/fileChange/requestApproval") == "file_change"
+    assert client._approval_kind("item/permissions/requestApproval") == "permissions"
+    assert client._approval_kind("item/newFeature/requestApproval") == "approval"
+
+
+def test_codex_approval_question_covers_all_kinds():
+    """Each approval kind produces a human-readable question."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._approval_question("command", {"command": "ls"}) == (
+        "Codex requests approval to run command: ls"
+    )
+    assert client._approval_question("command", {}) == (
+        "Codex requests approval to run a command."
+    )
+    assert client._approval_question("command", {"command": ""}) == (
+        "Codex requests approval to run a command."
+    )
+    assert client._approval_question("file_change", {}) == (
+        "Codex requests approval to apply file changes."
+    )
+    assert client._approval_question("permissions", {}) == "Codex requests additional permissions."
+    assert client._approval_question("approval", {}) == "Codex requests approval."
+
+
+def test_codex_approval_decision_label_handles_dict_decisions():
+    """Dict-shaped decisions produce labels covering every supported branch."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    # Plain string passes through.
+    assert client._approval_decision_label("accept") == "accept"
+
+    # Empty / non-dict / non-string return "".
+    assert client._approval_decision_label({}) == ""
+    assert client._approval_decision_label(None) == ""
+    assert client._approval_decision_label(123) == ""
+
+    # acceptWithExecpolicyAmendment.
+    assert (
+        client._approval_decision_label({"acceptWithExecpolicyAmendment": {}})
+        == "acceptWithExecpolicyAmendment"
+    )
+
+    # applyNetworkPolicyAmendment with full action+host returns enriched label.
+    full = {
+        "applyNetworkPolicyAmendment": {
+            "network_policy_amendment": {"action": "allow", "host": "api.example.com"},
+        }
+    }
+    assert (
+        client._approval_decision_label(full)
+        == "applyNetworkPolicyAmendment:allow:api.example.com"
+    )
+
+    # applyNetworkPolicyAmendment missing host falls back to bare name.
+    partial = {"applyNetworkPolicyAmendment": {"network_policy_amendment": {"action": "allow"}}}
+    assert client._approval_decision_label(partial) == "applyNetworkPolicyAmendment"
+
+    # applyNetworkPolicyAmendment with non-dict body falls back to bare name.
+    bare = {"applyNetworkPolicyAmendment": "raw"}
+    assert client._approval_decision_label(bare) == "applyNetworkPolicyAmendment"
+
+    # Other dict shapes return the first key.
+    assert client._approval_decision_label({"customDecision": {}}) == "customDecision"
+
+
+def test_codex_approval_decision_from_available_options_matches_dict_decision():
+    """Dict decisions can be selected by their generated label."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    decisions = ["accept", {"acceptWithExecpolicyAmendment": {"foo": "bar"}}]
+
+    matched = client._approval_decision_from_available_options(
+        "acceptWithExecpolicyAmendment",
+        {"availableDecisions": decisions},
+    )
+    assert matched == {"acceptWithExecpolicyAmendment": {"foo": "bar"}}
+
+
+def test_codex_approval_decision_from_available_options_returns_none_when_no_match():
+    """Non-matching label or missing/invalid availableDecisions returns None."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert (
+        client._approval_decision_from_available_options(
+            "nothing", {"availableDecisions": ["accept"]}
+        )
+        is None
+    )
+    assert client._approval_decision_from_available_options("accept", {}) is None
+    assert (
+        client._approval_decision_from_available_options(
+            "accept", {"availableDecisions": "not-a-list"}
+        )
+        is None
+    )
