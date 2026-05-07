@@ -1065,3 +1065,85 @@ async def test_codex_function_call_output_uses_approval_resume_without_input_eve
     assert session.turn_counter == 2
     assert session.pending_tool_call is None
     assert calls == [(session.client, "approval_1", "accept", session)]
+
+
+# ---------------------------------------------------------------------------
+# Group 1: src/backends/codex/__init__.py lazy imports and register failure
+# ---------------------------------------------------------------------------
+
+
+def test_codex_init_lazy_imports_codex_client():
+    """Accessing CodexClient on the package triggers lazy import."""
+    import src.backends.codex as codex_pkg
+    from src.backends.codex.client import CodexClient
+
+    assert codex_pkg.CodexClient is CodexClient
+
+
+def test_codex_init_lazy_imports_codex_auth_provider():
+    """Accessing CodexAuthProvider on the package triggers lazy import."""
+    import src.backends.codex as codex_pkg
+    from src.backends.codex.auth import CodexAuthProvider
+
+    assert codex_pkg.CodexAuthProvider is CodexAuthProvider
+
+
+def test_codex_init_unknown_attribute_raises_attribute_error():
+    """Unknown package attributes raise AttributeError with helpful message."""
+    import src.backends.codex as codex_pkg
+
+    with pytest.raises(AttributeError, match="DoesNotExist"):
+        codex_pkg.DoesNotExist  # noqa: B018
+
+
+def test_codex_register_records_descriptor_and_live_client():
+    """register() registers the descriptor and a CodexClient instance."""
+    import src.backends.codex as codex_pkg
+
+    descriptors = []
+    registered = []
+
+    class FakeRegistry:
+        @classmethod
+        def register_descriptor(cls, descriptor):
+            descriptors.append(descriptor)
+
+        @classmethod
+        def register(cls, name, client):
+            registered.append((name, client))
+
+    codex_pkg.register(FakeRegistry)
+
+    assert descriptors == [codex_pkg.CODEX_DESCRIPTOR]
+    assert len(registered) == 1
+    assert registered[0][0] == "codex"
+
+
+def test_codex_register_logs_error_when_client_init_fails(monkeypatch, caplog):
+    """If CodexClient() raises, register() still installs the descriptor and logs."""
+    import src.backends.codex as codex_pkg
+
+    class BoomClient:
+        def __init__(self):
+            raise RuntimeError("boom from CodexClient init")
+
+    monkeypatch.setattr("src.backends.codex.client.CodexClient", BoomClient)
+
+    descriptors = []
+    registered = []
+
+    class FakeRegistry:
+        @classmethod
+        def register_descriptor(cls, descriptor):
+            descriptors.append(descriptor)
+
+        @classmethod
+        def register(cls, name, client):
+            registered.append((name, client))
+
+    with caplog.at_level("ERROR", logger="src.backends.codex"):
+        codex_pkg.register(FakeRegistry)
+
+    assert descriptors == [codex_pkg.CODEX_DESCRIPTOR]
+    assert registered == []
+    assert "Codex backend client creation failed" in caplog.text
