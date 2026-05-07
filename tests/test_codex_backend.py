@@ -1478,3 +1478,155 @@ def test_codex_turn_error_message_uses_default_when_missing():
     assert client._turn_error_message({"error": None}) == "Codex turn failed"
     assert client._turn_error_message({"error": {}}) == "Codex turn failed"
     assert client._turn_error_message({"error": {"message": "oops"}}) == "oops"
+
+
+# ---------------------------------------------------------------------------
+# Group 4: pure helpers — small utilities (params, message parsing, env, errors)
+# ---------------------------------------------------------------------------
+
+
+def test_codex_public_error_message_strips_stderr_tail_for_app_server_error():
+    """CodexAppServerError messages drop the verbose stderr_tail suffix."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    client = CodexClient()
+
+    exc = CodexAppServerError("Timed out. stderr_tail=verbose internal logs")
+    assert client._public_error_message(exc) == "Timed out."
+
+    # Empty message returns generic fallback.
+    assert client._public_error_message(CodexAppServerError("")) == "Codex app-server error"
+
+
+def test_codex_public_error_message_passes_through_other_exceptions():
+    """Non CodexAppServerError exceptions retain their str() form."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._public_error_message(ValueError("bad input")) == "bad input"
+
+
+def test_codex_combine_system_prompt_combinations():
+    """All four combinations of (custom_base, system_prompt) produce the right output."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._combine_system_prompt(None, None) is None
+    assert client._combine_system_prompt("base", None) == "base"
+    assert client._combine_system_prompt(None, "user") == "user"
+    assert client._combine_system_prompt("base", "user") == "base\n\nuser"
+
+
+def test_codex_thread_params_includes_only_set_fields():
+    """Optional thread params are omitted when their inputs are None / empty."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    bare = client._thread_params(model=None, cwd=None, system_prompt=None)
+    assert "model" not in bare
+    assert "cwd" not in bare
+    assert "developerInstructions" not in bare
+    assert "approvalPolicy" in bare
+    assert "sandbox" in bare
+
+    full = client._thread_params(model="gpt-5", cwd="/tmp", system_prompt="hello")
+    assert full["model"] == "gpt-5"
+    assert full["cwd"] == "/tmp"
+    assert full["developerInstructions"] == "hello"
+
+
+def test_codex_turn_params_uses_session_client_fields():
+    """Turn params reflect the session client's model/cwd, including 'unset' case."""
+    from src.backends.codex.client import CodexClient, CodexJsonRpcClient, CodexSessionClient
+
+    client = CodexClient()
+    rpc = CodexJsonRpcClient()
+    session_client = CodexSessionClient(rpc=rpc, thread_id="t", model=None, cwd=None)
+
+    bare = client._turn_params(session_client)
+    assert "model" not in bare
+    assert "cwd" not in bare
+    assert "approvalPolicy" in bare
+
+    session_client.model = "gpt-5"
+    session_client.cwd = "/tmp"
+    full = client._turn_params(session_client)
+    assert full["model"] == "gpt-5"
+    assert full["cwd"] == "/tmp"
+
+
+def test_codex_metadata_env_filters_by_allowlist(monkeypatch):
+    """Only allowlisted metadata keys are forwarded as env vars; None becomes {}."""
+    from src import constants as constants_module
+    from src.backends.codex.client import CodexClient
+
+    monkeypatch.setattr(
+        constants_module, "METADATA_ENV_ALLOWLIST", frozenset({"ALLOWED_KEY"})
+    )
+
+    client = CodexClient()
+
+    assert client._metadata_env(None) == {}
+    assert client._metadata_env({}) == {}
+    assert client._metadata_env({"ALLOWED_KEY": "value", "BLOCKED_KEY": "no"}) == {
+        "ALLOWED_KEY": "value"
+    }
+
+
+def test_codex_parse_message_prefers_success_result():
+    """The newest success/result string wins over assistant content blocks."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    messages = [
+        {"type": "assistant", "content": [{"type": "text", "text": "fallback"}]},
+        {"subtype": "success", "result": "winning result"},
+    ]
+
+    assert client.parse_message(messages) == "winning result"
+
+
+def test_codex_parse_message_falls_back_to_assistant_content():
+    """Without a success/result, parse_message stitches assistant text blocks."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    messages = [
+        {"type": "assistant", "content": [{"type": "text", "text": "first"}]},
+        {"type": "assistant", "content": [{"type": "text", "text": "second"}]},
+    ]
+
+    result = client.parse_message(messages)
+
+    assert result is not None
+    assert "first" in result
+    assert "second" in result
+
+
+def test_codex_parse_message_returns_none_for_empty_inputs():
+    """Empty list and whitespace-only success result both yield None."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client.parse_message([]) is None
+    assert client.parse_message([{"subtype": "success", "result": "   "}]) is None
+
+
+def test_codex_estimate_token_usage_uses_length_heuristic():
+    """Token estimate is ceil(len/4) with a floor of 1 each."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    usage = client.estimate_token_usage("a" * 40, "b" * 80)
+    assert usage == {"prompt_tokens": 10, "completion_tokens": 20, "total_tokens": 30}
+
+    floor = client.estimate_token_usage("", "")
+    assert floor["prompt_tokens"] >= 1
+    assert floor["completion_tokens"] >= 1
