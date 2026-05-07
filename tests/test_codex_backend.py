@@ -1298,3 +1298,183 @@ def test_codex_approval_decision_from_available_options_returns_none_when_no_mat
         )
         is None
     )
+
+
+# ---------------------------------------------------------------------------
+# Group 3: pure helpers — item parsing, token usage, final-response selection
+# ---------------------------------------------------------------------------
+
+
+def test_codex_tool_use_from_item_returns_none_for_invalid_inputs():
+    """Non-dict / unknown type / missing or non-string id all skip tool_use conversion."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._tool_use_from_item(None) is None
+    assert client._tool_use_from_item("string") is None
+    assert client._tool_use_from_item({"type": "agentMessage", "id": "x"}) is None
+    assert client._tool_use_from_item({"type": "commandExecution"}) is None
+    assert client._tool_use_from_item({"type": "commandExecution", "id": 123}) is None
+    assert client._tool_use_from_item({"type": "commandExecution", "id": ""}) is None
+
+
+def test_codex_tool_use_from_item_strips_meta_fields():
+    """Valid items are converted, dropping id / type / aggregatedOutput from input."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    item = {
+        "type": "commandExecution",
+        "id": "tool_1",
+        "command": "ls",
+        "aggregatedOutput": "should be dropped",
+    }
+
+    assert client._tool_use_from_item(item) == {
+        "type": "tool_use",
+        "id": "tool_1",
+        "name": "commandExecution",
+        "input": {"command": "ls"},
+    }
+
+
+def test_codex_tool_result_from_item_command_with_non_zero_exit_is_error():
+    """commandExecution items with a non-zero exitCode flip is_error to True."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    item = {
+        "type": "commandExecution",
+        "id": "tool_1",
+        "status": "completed",
+        "exitCode": 1,
+        "aggregatedOutput": "boom",
+    }
+
+    assert client._tool_result_from_item(item) == {
+        "type": "tool_result",
+        "tool_use_id": "tool_1",
+        "content": "boom",
+        "is_error": True,
+    }
+
+
+def test_codex_tool_result_from_item_declined_status_is_error():
+    """Declined / failed status flags is_error and falls back to JSON dump when output is empty."""
+    import json
+
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    item = {
+        "type": "commandExecution",
+        "id": "tool_1",
+        "status": "declined",
+        "exitCode": 0,
+        "aggregatedOutput": "",
+        "command": "rm -rf /",
+    }
+
+    result = client._tool_result_from_item(item)
+
+    assert result["is_error"] is True
+    parsed = json.loads(result["content"])
+    assert parsed == {"status": "declined", "exitCode": 0, "command": "rm -rf /"}
+
+
+def test_codex_tool_result_from_item_non_command_uses_json_dump():
+    """Non-command tool items dump remaining fields as JSON content."""
+    import json
+
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    item = {
+        "type": "fileChange",
+        "id": "tool_2",
+        "status": "completed",
+        "path": "/tmp/file.txt",
+        "patch": "diff --git",
+    }
+
+    result = client._tool_result_from_item(item)
+
+    assert result["tool_use_id"] == "tool_2"
+    assert result["is_error"] is False
+    assert json.loads(result["content"]) == {
+        "status": "completed",
+        "path": "/tmp/file.txt",
+        "patch": "diff --git",
+    }
+
+
+def test_codex_tool_result_from_item_returns_none_for_invalid_inputs():
+    """Mirror of tool_use_from_item: filters non-dict / unknown type / bad id."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._tool_result_from_item(None) is None
+    assert client._tool_result_from_item({"type": "agentMessage", "id": "x"}) is None
+    assert client._tool_result_from_item({"type": "commandExecution"}) is None
+    assert client._tool_result_from_item({"type": "commandExecution", "id": 123}) is None
+
+
+def test_codex_extract_usage_returns_none_for_invalid_inputs():
+    """Non-dict tokenUsage and missing / non-dict 'last' return None."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._extract_usage(None) is None
+    assert client._extract_usage("string") is None
+    assert client._extract_usage({}) is None
+    assert client._extract_usage({"last": "not-a-dict"}) is None
+
+
+def test_codex_final_response_falls_back_to_unknown_phase():
+    """When no item has phase=final_answer, fall back to the most recent unknown-phase agentMessage."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    items = [
+        {"type": "agentMessage", "phase": None, "text": "thinking out loud"},
+        {"type": "agentMessage", "phase": "intermediate", "text": "skipped"},
+        {"type": "commandExecution", "phase": None, "text": "ignored"},
+    ]
+
+    assert client._final_response_from_items(items) == "thinking out loud"
+
+
+def test_codex_final_response_returns_none_for_no_match():
+    """Empty input or items lacking string text return None."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._final_response_from_items([]) is None
+    assert client._final_response_from_items([{"type": "commandExecution"}]) is None
+    assert (
+        client._final_response_from_items(
+            [{"type": "agentMessage", "phase": "final_answer", "text": None}]
+        )
+        is None
+    )
+
+
+def test_codex_turn_error_message_uses_default_when_missing():
+    """Missing or message-less turn errors fall back to a default string."""
+    from src.backends.codex.client import CodexClient
+
+    client = CodexClient()
+
+    assert client._turn_error_message({}) == "Codex turn failed"
+    assert client._turn_error_message({"error": None}) == "Codex turn failed"
+    assert client._turn_error_message({"error": {}}) == "Codex turn failed"
+    assert client._turn_error_message({"error": {"message": "oops"}}) == "oops"
