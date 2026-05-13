@@ -35,6 +35,7 @@ from src.backends.claude.constants import (
     DEFAULT_TASK_BUDGET,
     THINKING_BUDGET_TOKENS,
     DISALLOWED_SUBAGENT_TYPES,
+    DISALLOWED_TOOLS,
     CLAUDE_SANDBOX_ENABLED,
     CLAUDE_SANDBOX_AUTO_ALLOW_BASH,
     CLAUDE_SANDBOX_EXCLUDED_COMMANDS,
@@ -183,12 +184,13 @@ class ClaudeCodeCLI:
     ) -> None:
         """Apply tool allow/disallow lists to *options*."""
         if allowed_tools:
-            options.allowed_tools = allowed_tools
-        base_disallowed = list(DISALLOWED_SUBAGENT_TYPES)
+            options.allowed_tools = [t for t in allowed_tools if t not in DISALLOWED_TOOLS]
+        base_disallowed = list(DISALLOWED_SUBAGENT_TYPES) + list(DISALLOWED_TOOLS)
         if disallowed_tools:
             base_disallowed.extend(disallowed_tools)
         if base_disallowed:
-            options.disallowed_tools = base_disallowed
+            seen: set[str] = set()
+            options.disallowed_tools = [t for t in base_disallowed if not (t in seen or seen.add(t))]
 
     def _configure_sandbox(self, options: ClaudeAgentOptions) -> None:
         """Apply bash sandbox configuration to *options*.
