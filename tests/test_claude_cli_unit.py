@@ -878,6 +878,39 @@ class TestConfigureHelpers:
         assert opts.allowed_tools == [] or opts.allowed_tools is None
         assert "Agent(statusline-setup)" in opts.disallowed_tools
 
+    def test_configure_tools_blocks_web_tools_by_default(self, cli_instance):
+        """DISALLOWED_TOOLS is merged into options.disallowed_tools."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch(
+            "src.backends.claude.client.DISALLOWED_TOOLS", ["WebFetch", "WebSearch"]
+        ):
+            cli_instance._configure_tools(opts, None, None)
+        assert "WebFetch" in opts.disallowed_tools
+        assert "WebSearch" in opts.disallowed_tools
+
+    def test_configure_tools_strips_disallowed_from_allowed(self, cli_instance):
+        """Request-supplied allowed_tools cannot re-enable a globally blocked tool."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.DISALLOWED_TOOLS", ["WebFetch"]):
+            cli_instance._configure_tools(opts, ["Bash", "WebFetch", "Read"], None)
+        assert "WebFetch" not in opts.allowed_tools
+        assert opts.allowed_tools == ["Bash", "Read"]
+        assert "WebFetch" in opts.disallowed_tools
+
+    def test_configure_tools_dedupes_disallowed(self, cli_instance):
+        """Overlap between base/request disallowed lists is de-duplicated."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.DISALLOWED_TOOLS", ["WebFetch"]):
+            cli_instance._configure_tools(opts, None, ["WebFetch", "Write"])
+        assert opts.disallowed_tools.count("WebFetch") == 1
+        assert "Write" in opts.disallowed_tools
+
     def test_configure_sandbox_enabled(self, cli_instance):
         """_configure_sandbox sets sandbox when CLAUDE_SANDBOX_ENABLED=True."""
         from claude_agent_sdk import ClaudeAgentOptions
