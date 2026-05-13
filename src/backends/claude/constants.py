@@ -93,8 +93,9 @@ DISALLOWED_SUBAGENT_TYPES = [f"Agent({t.strip()})" for t in _raw_disallowed.spli
 # Comma-separated list of Claude SDK tool names to always block. These are
 # merged into the SDK ``disallowed_tools`` option so they remain blocked even
 # under ``bypassPermissions``, where ``allowed_tools`` is only an auto-approve
-# hint and does not strictly restrict tool use.
-_raw_disallowed_tools = os.getenv("DISALLOWED_TOOLS", "WebFetch,WebSearch")
+# hint and does not strictly restrict tool use. Unset by default (no extra
+# blocking); set explicitly to enforce a deny-list, e.g. ``WebFetch,WebSearch``.
+_raw_disallowed_tools = os.getenv("DISALLOWED_TOOLS", "")
 DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.strip()]
 
 # ---------------------------------------------------------------------------
