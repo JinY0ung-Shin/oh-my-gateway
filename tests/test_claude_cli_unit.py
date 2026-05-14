@@ -1048,3 +1048,77 @@ class TestCreateClientSessionId:
 
         assert captured["session_id"] is None
         assert captured["resume"] == gateway_session.session_id
+
+
+# ---------------------------------------------------------------------------
+# Group: update_request_policy (mid-session policy refresh — Codex parity)
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateRequestPolicy:
+    """Mirror Codex Step 1: continuation requests must refresh policy mid-session.
+
+    The Claude SDK only exposes ``set_permission_mode`` for mid-session
+    changes; the other tool-policy fields are baked into ``ClaudeAgentOptions``
+    at create_client time and cannot be retro-actively updated by the SDK.
+    """
+
+    @pytest.mark.asyncio
+    async def test_permission_mode_calls_sdk_set_permission_mode(self, cli_instance):
+        from unittest.mock import AsyncMock
+
+        sdk_client = MagicMock()
+        sdk_client.set_permission_mode = AsyncMock()
+
+        await cli_instance.update_request_policy(
+            sdk_client, permission_mode="acceptEdits"
+        )
+
+        sdk_client.set_permission_mode.assert_awaited_once_with("acceptEdits")
+
+    @pytest.mark.asyncio
+    async def test_omitted_permission_mode_does_not_touch_sdk(self, cli_instance):
+        from unittest.mock import AsyncMock
+
+        sdk_client = MagicMock()
+        sdk_client.set_permission_mode = AsyncMock()
+
+        await cli_instance.update_request_policy(sdk_client)
+
+        sdk_client.set_permission_mode.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_set_permission_mode_failure_propagates(self, cli_instance):
+        """SDK rejection of a permission_mode change is *not* swallowed — running
+        the next turn under the old mode could be a silent privilege downgrade,
+        so the exception bubbles up for the route to fail closed.
+        """
+        from unittest.mock import AsyncMock
+
+        sdk_client = MagicMock()
+        sdk_client.set_permission_mode = AsyncMock(
+            side_effect=RuntimeError("not connected")
+        )
+
+        with pytest.raises(RuntimeError, match="not connected"):
+            await cli_instance.update_request_policy(
+                sdk_client, permission_mode="acceptEdits"
+            )
+
+    @pytest.mark.asyncio
+    async def test_tool_list_change_raises_unsupported(self, cli_instance):
+        """Tool list change on a continuation is rejected — the SDK has no
+        runtime API for it, and silently dropping a disallowed_tools hard-block
+        would be a security gap.
+        """
+        from src.backends.claude.client import UnsupportedContinuationPolicy
+
+        sdk_client = MagicMock()
+        with pytest.raises(UnsupportedContinuationPolicy):
+            await cli_instance.update_request_policy(
+                sdk_client, disallowed_tools=["Bash"]
+            )
+        with pytest.raises(UnsupportedContinuationPolicy):
+            await cli_instance.update_request_policy(
+                sdk_client, allowed_tools=["Read"]
+            )

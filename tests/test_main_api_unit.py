@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -1042,6 +1043,315 @@ def test_opencode_function_call_output_rejects_unknown_resume_kind(isolated_sess
 
     assert response.status_code == 400
     assert "Unsupported OpenCode resume kind" in response.json()["error"]["message"]
+
+
+def test_claude_previous_response_id_refreshes_permission_mode(isolated_session_manager):
+    """A Claude continuation with new permission_mode applies via update_request_policy."""
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    update_calls = []
+
+    async def fake_update_request_policy(
+        client,
+        *,
+        allowed_tools=None,
+        disallowed_tools=None,
+        permission_mode=None,
+        model_params=None,
+    ):
+        update_calls.append(
+            {
+                "client": client,
+                "allowed_tools": allowed_tools,
+                "disallowed_tools": disallowed_tools,
+                "permission_mode": permission_mode,
+                "model_params": model_params,
+            }
+        )
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "continued"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = fake_update_request_policy
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "continued"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert response.status_code == 200
+    assert update_calls
+    call = update_calls[0]
+    assert call["client"] is session.client
+    assert call["permission_mode"] == "acceptEdits"
+    # No tool list change requested -> backend sees None and is happy.
+    assert call["allowed_tools"] is None
+    assert call["disallowed_tools"] is None
+
+
+def test_claude_continuation_rejects_tool_list_change_with_400(isolated_session_manager):
+    """Claude can't apply mid-session tool list changes; reject with 400 (no silent drop)."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def reject_tool_list(client, *, allowed_tools=None, disallowed_tools=None, **_):
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy("tool list change not supported mid-session")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = reject_tool_list
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    payload_text = json.dumps(body)
+    assert "tool" in payload_text.lower()
+
+
+def test_claude_continuation_rejects_allowed_tools_change_with_400(isolated_session_manager):
+    """Same rejection applies to allowed_tools, not just disallowed_tools."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def reject_tool_list(client, *, allowed_tools=None, disallowed_tools=None, **_):
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy("tool list change not supported mid-session")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = reject_tool_list
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "allowed_tools": ["Read"],
+            },
+        )
+
+    assert response.status_code == 400
+
+
+def test_claude_function_call_output_rejects_tool_list_change_with_400(isolated_session_manager):
+    """function_call_output continuation rejects tool-list changes with 400.
+
+    Verifies the policy-rejection path actually fires (the helper validates
+    successfully, update_request_policy raises, the route surfaces 400, and
+    the SDK is NOT woken up — pending_tool_call remains set and the lock is
+    released so the session isn't wedged).
+    """
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+    session.input_event = asyncio.Event()
+    session.pending_tool_call = {
+        "call_id": "q1",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Continue?"},
+        "backend": "claude",
+    }
+
+    update_calls = []
+
+    async def reject_tool_list(client, *, allowed_tools=None, disallowed_tools=None, **_):
+        update_calls.append((allowed_tools, disallowed_tools))
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy("tool list change not supported mid-session")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = reject_tool_list
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "input": [{"type": "function_call_output", "call_id": "q1", "output": "yes"}],
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "tool" in json.dumps(body).lower()
+    # The policy update was actually invoked (not short-circuited by an
+    # earlier 400 such as "no pending input event").
+    assert update_calls, "update_request_policy was never called"
+    # The lock must be released so subsequent requests on this session work.
+    assert not session.lock.locked(), "session lock leaked after policy rejection"
+    # SDK must NOT have been woken with the rejected request.
+    assert not session.input_event.is_set(), "SDK was resumed despite rejected policy"
+    # Pending tool call should still be set — the continuation was aborted.
+    assert session.pending_tool_call is not None
+
+
+def test_claude_function_call_output_unrelated_exception_releases_lock(isolated_session_manager):
+    """A non-UnsupportedContinuationPolicy raise still releases the session lock and is not 400.
+
+    The Starlette TestClient re-raises uncaught exceptions out of ``client.post``,
+    so we wrap the call to confirm: the exception propagates (i.e. NOT
+    swallowed as 400) and the session lock + input_event are clean afterward.
+    """
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+    session.input_event = asyncio.Event()
+    session.pending_tool_call = {
+        "call_id": "q1",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Continue?"},
+        "backend": "claude",
+    }
+
+    async def boom(client, **kwargs):
+        raise RuntimeError("transient SDK failure")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = boom
+        with pytest.raises(RuntimeError, match="transient SDK failure"):
+            client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "previous_response_id": responses_module._make_response_id(session_id, 1),
+                    "input": [{"type": "function_call_output", "call_id": "q1", "output": "yes"}],
+                    "permission_mode": "acceptEdits",
+                },
+            )
+
+    assert not session.lock.locked(), "session lock leaked after SDK failure"
+    assert not session.input_event.is_set()
+
+
+def test_claude_continuation_sdk_value_error_is_not_misclassified_as_400(isolated_session_manager):
+    """An unrelated ValueError from the SDK propagates as 5xx, not a 400 misclassification."""
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def sdk_value_error(client, **kwargs):
+        # Some unrelated ValueError from deeper in the SDK — must NOT be
+        # mistaken for an "unsupported policy" client error.
+        raise ValueError("internal SDK invariant violated")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = sdk_value_error
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    # Not a client-side limitation; should surface as a server error, not 400.
+    assert response.status_code >= 500
+    assert response.status_code != 400
+
+
+def test_claude_continuation_permission_mode_sdk_failure_fails_closed(isolated_session_manager):
+    """When the Claude SDK rejects a permission_mode update, the request fails closed (400/503),
+    not silently runs with the old (potentially weaker) mode.
+    """
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def failing_update_request_policy(client, **kwargs):
+        # Simulate Claude SDK rejecting the mid-session update.
+        raise RuntimeError("Claude SDK refused permission_mode change")
+
+    async def fake_run_with_client(client, prompt, session):
+        # Should never run if update fails closed.
+        yield {"subtype": "success", "result": "should-not-appear"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = failing_update_request_policy
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "should-not-appear"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    # Either 400 (client-facing limitation) or 5xx (backend error) is fine —
+    # what matters is it does NOT return 200 with stale-mode output.
+    assert response.status_code >= 400
 
 
 def test_opencode_permission_arguments_describe_empty_patterns_and_always():

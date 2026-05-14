@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import secrets
@@ -18,6 +19,7 @@ from src.message_adapter import MessageAdapter
 from src.auth import verify_api_key, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, ResolvedModel
+from src.backends.claude.client import UnsupportedContinuationPolicy
 from src.backends.claude.slash_commands import (
     SlashCommandError,
     validate_prompt as validate_slash_prompt,
@@ -486,13 +488,25 @@ async def _ensure_response_session_client(
     if session.client is not None:
         update_policy = getattr(backend, "update_request_policy", None)
         if callable(update_policy):
-            update_policy(
-                session.client,
-                allowed_tools=body.allowed_tools,
-                disallowed_tools=body.disallowed_tools,
-                permission_mode=body.permission_mode,
-                model_params=_response_model_params(body),
-            )
+            try:
+                result = update_policy(
+                    session.client,
+                    allowed_tools=body.allowed_tools,
+                    disallowed_tools=body.disallowed_tools,
+                    permission_mode=body.permission_mode,
+                    model_params=_response_model_params(body),
+                )
+                # Backends may implement update_request_policy as either a sync
+                # call (Codex) or an async one (Claude — needs SDK await). Await
+                # whichever shape comes back.
+                if inspect.iscoroutine(result):
+                    await result
+            except UnsupportedContinuationPolicy as exc:
+                # Backend explicitly signaled the continuation can't honor the
+                # requested policy change. Fail closed at the API boundary.
+                # Other exceptions (e.g. an SDK ValueError) propagate so they
+                # surface as 5xx instead of being misclassified as 400.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         return
 
     from src.system_prompt import get_system_prompt, resolve_request_placeholders
@@ -529,6 +543,17 @@ async def _ensure_response_session_client(
 async def _unblock_pending_tool_call(
     session, backend: "BackendClient", fc_output: Dict[str, str]
 ) -> None:
+    """Validate the function_call_output and reserve the continuation.
+
+    On success the session lock is held by the caller and ``session
+    .input_response`` is stashed, but the SDK has NOT been woken yet —
+    ``pending_tool_call`` is still set and ``input_event`` has not been
+    fired. The caller is expected to call
+    :func:`_commit_pending_tool_call_locked` once any follow-up
+    invariants (e.g. mid-session policy refresh) have passed. This
+    split lets a rejected policy change fail closed before the SDK is
+    irreversibly resumed under the old policy.
+    """
     await session.lock.acquire()
     try:
         if session.pending_tool_call is None:
@@ -559,18 +584,29 @@ async def _unblock_pending_tool_call(
                 detail="function_call_output received but session has no active SDK client",
             )
 
-        session.input_response = fc_output["output"]
-        pending_event = session.input_event
-        if pending_event is None:
+        if session.input_event is None:
             raise HTTPException(
                 status_code=400,
                 detail="function_call_output received but session has no pending input event",
             )
-        pending_event.set()
-        session.pending_tool_call = None
+
+        session.input_response = fc_output["output"]
     except Exception:
         session.lock.release()
         raise
+
+
+def _commit_pending_tool_call_locked(session) -> None:
+    """Wake the SDK and clear pending state for a Claude continuation.
+
+    Caller must hold ``session.lock``. Pair with
+    :func:`_unblock_pending_tool_call` once mid-session policy refresh has
+    been accepted.
+    """
+    pending_event = session.input_event
+    if pending_event is not None:
+        pending_event.set()
+    session.pending_tool_call = None
 
 
 async def _prepare_opencode_tool_continuation(
@@ -1214,22 +1250,50 @@ async def _handle_function_call_output(
     elif resolved.backend == "codex":
         await _prepare_codex_approval_continuation(session, backend, fc_output)
     else:
+        # Claude path: validate + reserve, but DO NOT wake the SDK yet. We
+        # need to run policy refresh first so a rejected change can fail
+        # closed before the SDK is irreversibly resumed.
         await _unblock_pending_tool_call(session, backend, fc_output)
 
     # Refresh per-request tool policy on the existing session client *after*
     # validation has accepted the function_call_output, so an invalid
-    # continuation can't mutate session state. The continuation chunk source
-    # (built below from session.client) will see the refreshed policy.
+    # continuation can't mutate session state. The prepare/unblock helpers
+    # above hand the session lock off to us on success, so any failure here
+    # must release it before raising — otherwise the lock leaks for the rest
+    # of the session.
+    policy_refresh_failed = False
     if session.client is not None:
         update_policy = getattr(backend, "update_request_policy", None)
         if callable(update_policy):
-            update_policy(
-                session.client,
-                allowed_tools=body.allowed_tools,
-                disallowed_tools=body.disallowed_tools,
-                permission_mode=body.permission_mode,
-                model_params=_response_model_params(body),
-            )
+            try:
+                result = update_policy(
+                    session.client,
+                    allowed_tools=body.allowed_tools,
+                    disallowed_tools=body.disallowed_tools,
+                    permission_mode=body.permission_mode,
+                    model_params=_response_model_params(body),
+                )
+                if inspect.iscoroutine(result):
+                    await result
+            except UnsupportedContinuationPolicy as exc:
+                policy_refresh_failed = True
+                if session.lock.locked():
+                    session.lock.release()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception:
+                policy_refresh_failed = True
+                if session.lock.locked():
+                    session.lock.release()
+                raise
+
+    # All policy invariants passed — fire the irreversible Claude wake-up now
+    # that we know the next turn won't run under a rejected policy. OpenCode
+    # and Codex paths already committed their state inside their respective
+    # prepare/unblock helpers (their continuations don't carry
+    # UnsupportedContinuationPolicy semantics, so there's nothing to roll
+    # back).
+    if not policy_refresh_failed and resolved.backend not in {"opencode", "codex"}:
+        _commit_pending_tool_call_locked(session)
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1

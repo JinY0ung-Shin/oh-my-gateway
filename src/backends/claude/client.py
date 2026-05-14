@@ -85,6 +85,15 @@ def _get_setting_sources() -> List[str]:
     return deduped
 
 
+class UnsupportedContinuationPolicy(ValueError):
+    """Raised when a continuation request asks for a policy change the SDK can't apply mid-session.
+
+    The Claude SDK has no runtime API for swapping ``allowed_tools`` /
+    ``disallowed_tools``; route handlers should surface this as a 400 so the
+    caller can either drop the tool change or start a fresh session.
+    """
+
+
 class ClaudeCodeCLI:
     """Gateway for Claude Agent SDK queries.
 
@@ -588,6 +597,51 @@ class ClaudeCodeCLI:
             }
 
         return hook
+
+    async def update_request_policy(
+        self,
+        client: ClaudeSDKClient,
+        *,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        permission_mode: Optional[str] = None,
+        model_params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Refresh per-request policy on an existing Claude SDK client.
+
+        Mirrors the Codex backend's contract (added in Step 1 of the Codex
+        parity work) so the gateway's continuation paths apply per-request
+        policy changes for Claude sessions, too — but fails closed when the
+        request asks for changes Claude cannot honor mid-session.
+
+        ``permission_mode`` is delegated to the SDK's
+        ``client.set_permission_mode``. If the SDK rejects the update, the
+        exception propagates so the route can surface the failure rather than
+        running the turn with the previous (potentially weaker) mode.
+
+        ``allowed_tools`` / ``disallowed_tools`` raise
+        :class:`UnsupportedContinuationPolicy` because the SDK has no runtime
+        API to swap them: silently dropping a ``disallowed_tools`` hard-block
+        on a continuation would be a security gap. Callers should surface
+        this as a 400 to the client and (if needed) start a fresh session
+        with the new tool lists.
+
+        ``model_params`` is accepted for contract parity with the Codex
+        backend but ignored — the SDK bakes model params at create time and
+        does not expose a mid-session update.
+        """
+        _ = model_params
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy(
+                "Claude does not support changing allowed_tools / disallowed_tools "
+                "on a continuation turn; start a new session to apply the new "
+                "tool policy."
+            )
+        if permission_mode is not None:
+            # Let SDK exceptions propagate so the route can fail closed —
+            # silently running the next turn under the old mode could be a
+            # downgrade (e.g. from acceptEdits back to default).
+            await client.set_permission_mode(permission_mode)
 
     async def create_client(
         self,
