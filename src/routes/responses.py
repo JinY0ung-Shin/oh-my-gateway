@@ -449,6 +449,81 @@ def _response_prompt_and_system(
     return MessageAdapter.filter_content(prompt), system_prompt
 
 
+_CODEX_SUPPORTED_INPUT_PART_TYPES = frozenset({"input_image"})
+
+
+def _has_multimodal_input(body: ResponseCreateRequest) -> bool:
+    """True when the request carries an input part Codex can carry natively
+    (currently only ``input_image``).
+
+    Narrow on purpose: an unknown type alone would otherwise route us into
+    the multimodal branch and then drop out as an empty items list.
+    """
+    if isinstance(body.input, str):
+        return False
+    for item in body.input:
+        content = getattr(item, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            ptype = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if ptype in _CODEX_SUPPORTED_INPUT_PART_TYPES:
+                return True
+    return False
+
+
+def _response_input_to_codex_items(
+    body: ResponseCreateRequest,
+) -> tuple[list[Dict[str, Any]], Optional[str]]:
+    """Build a Codex turn-input items list from a Responses request.
+
+    Preserves the order of ``input_text`` and ``input_image`` parts inside
+    each message so multimodal turns keep the user's intended sequence. Plain
+    string inputs become a single text item. Unknown part types are skipped
+    (forward-compat with new Responses fields).
+    """
+    system_prompt, input_for_prompt = _split_response_input(body)
+
+    if isinstance(input_for_prompt, str):
+        text = input_for_prompt.strip()
+        items: list[Dict[str, Any]] = []
+        if text:
+            items.append({"type": "text", "text": text})
+        return items, system_prompt
+
+    items = []
+    for input_item in input_for_prompt:
+        content = getattr(input_item, "content", None)
+        if isinstance(content, str):
+            if content:
+                items.append({"type": "text", "text": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            ptype = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if ptype == "input_text":
+                text_value = (
+                    part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+                )
+                if text_value:
+                    items.append({"type": "text", "text": text_value})
+            elif ptype == "input_image":
+                image_url = (
+                    part.get("image_url")
+                    if isinstance(part, dict)
+                    else getattr(part, "image_url", None)
+                )
+                if image_url:
+                    # Use the Codex-native shape (``type=image`` / ``url``)
+                    # matching the in-tree fixture
+                    # tests/test_codex_backend.py multi-item case.
+                    items.append({"type": "image", "url": image_url})
+            # Other / unknown part types are ignored — they'll be added as
+            # explicit cases when their Codex item shape is known.
+    return items, system_prompt
+
+
 async def _validate_backend_prompt(
     resolved: ResolvedModel,
     prompt: str,
@@ -933,12 +1008,30 @@ async def create_response(
             body, resolved, backend, session, session_id, workspace_str, fc_output
         )
 
-    prompt, system_prompt = _response_prompt_and_system(body, workspace)
+    # Codex carries multimodal turns as a list of input items rather than a
+    # single collapsed text prompt. Build the list directly from the request
+    # body so we don't run through the disk-saving image_handler path (which
+    # rejects non-``data:`` URLs and would collapse the image into a text
+    # placeholder anyway).
+    if resolved.backend == "codex" and _has_multimodal_input(body):
+        codex_items, system_prompt = _response_input_to_codex_items(body)
+        if not codex_items:
+            # Defensive — _has_multimodal_input said yes but conversion
+            # produced nothing (e.g. an empty image_url). Fail at the API
+            # boundary instead of letting the backend reject an empty turn.
+            raise HTTPException(
+                status_code=400,
+                detail="Codex multimodal input produced no usable items",
+            )
+        prompt: Any = codex_items
+    else:
+        prompt, system_prompt = _response_prompt_and_system(body, workspace)
 
     # Reject slash-prefixed prompts that would be intercepted by the SDK as
     # unknown skills or run destructive built-ins.  Only applies to the Claude
     # backend; other backends pass through unchanged.
-    await _validate_backend_prompt(resolved, prompt, workspace_str)
+    if isinstance(prompt, str):
+        await _validate_backend_prompt(resolved, prompt, workspace_str)
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce

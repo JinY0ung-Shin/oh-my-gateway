@@ -1045,6 +1045,383 @@ def test_opencode_function_call_output_rejects_unknown_resume_kind(isolated_sess
     assert "Unsupported OpenCode resume kind" in response.json()["error"]["message"]
 
 
+def test_codex_responses_input_image_passes_multimodal_items_to_backend(
+    isolated_session_manager,
+):
+    """Codex requests with input_image must hand a multimodal items list to the backend,
+    not a single collapsed-string prompt.
+    """
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "look at this"},
+                            {
+                                "type": "input_image",
+                                "image_url": "https://example.com/foo.png",
+                            },
+                            {"type": "input_text", "text": "any thoughts?"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = calls.get("prompt")
+    assert isinstance(prompt, list), f"Codex should receive a list, got {type(prompt).__name__}"
+    # Order must be preserved (text, image, text).
+    assert prompt[0]["type"] == "text"
+    assert prompt[0]["text"] == "look at this"
+    assert prompt[1]["type"] in {"image", "input_image"}
+    assert prompt[1].get("image_url") == "https://example.com/foo.png" or prompt[1].get("url") == "https://example.com/foo.png"
+    assert prompt[2]["type"] == "text"
+    assert prompt[2]["text"] == "any thoughts?"
+
+
+def test_codex_responses_input_image_uses_image_url_codex_item_shape(
+    isolated_session_manager,
+):
+    """Locked-in schema: route emits ``{type: image, url: ...}`` for Codex."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "see"},
+                            {
+                                "type": "input_image",
+                                "image_url": "https://example.com/x.png",
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = calls["prompt"]
+    # Codex-native shape — matches the in-tree fixture in test_codex_backend.py.
+    image_items = [item for item in prompt if item["type"] == "image"]
+    assert image_items, f"no image item in {prompt!r}"
+    assert image_items[0]["url"] == "https://example.com/x.png"
+
+
+def test_codex_responses_unknown_only_input_part_does_not_take_multimodal_path(
+    isolated_session_manager,
+):
+    """If the only non-text part is an unknown type, fall back to the string path
+    (so we don't end up routing nothing to the backend).
+    """
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "hello"},
+                            {"type": "input_file", "file_id": "file_xyz"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    # No input_image part → fell back to string path.
+    assert isinstance(calls["prompt"], str)
+
+
+def test_codex_responses_empty_image_url_returns_400(isolated_session_manager):
+    """Multimodal request whose image_url is empty produces no items → 400 from the route.
+
+    Also locks in: the backend is never reached (no create_client / run call)
+    and the response message names the problem.
+    """
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    create_calls: list = []
+    run_calls: list = []
+
+    async def create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        run_calls.append(prompt)
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_image", "image_url": ""},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "Codex multimodal input produced no usable items" in json.dumps(body)
+    assert not run_calls, "backend.run_completion_with_client was called for a 400 request"
+
+
+def test_codex_responses_input_file_only_falls_back_to_string_prompt(
+    isolated_session_manager,
+):
+    """A request whose only non-text part is unknown (e.g. input_file) takes the string path.
+
+    Regression guard for Bug #1: ``_has_multimodal_input`` must not return
+    True for unknown types, otherwise the request would go through the
+    Codex item branch and then be rejected as "no usable items".
+    """
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_id": "file_xyz"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert isinstance(calls["prompt"], str)
+
+
+def test_codex_responses_text_only_input_still_passes_string_prompt(
+    isolated_session_manager,
+):
+    """Codex text-only requests can stay as a string — no forced multimodal upgrade."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    prompt = calls.get("prompt")
+    # Plain string input → backend still receives the original string. Codex's
+    # backend layer wraps it into a single text item internally.
+    assert isinstance(prompt, str)
+    assert prompt == "hi"
+
+
 def test_claude_previous_response_id_refreshes_permission_mode(isolated_session_manager):
     """A Claude continuation with new permission_mode applies via update_request_policy."""
     session_id = str(uuid.uuid4())
