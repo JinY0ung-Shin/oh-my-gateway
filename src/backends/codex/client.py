@@ -26,6 +26,7 @@ from src.backends.codex.constants import (
     approval_policy,
     codex_bin,
     configured_config_overrides,
+    disallowed_tools_from_env,
     sandbox_mode,
 )
 from src.constants import DEFAULT_TIMEOUT_MS
@@ -37,9 +38,68 @@ CODEX_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
     "item/permissions/requestApproval",
+    "item/mcpToolCall/requestApproval",
+    "item/dynamicToolCall/requestApproval",
 }
 
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+
+# Gateway tool names (Claude-style) mapped to the Codex item type they map onto.
+# ``allowed_tools``/``disallowed_tools`` may use either the Claude alias or the
+# Codex-native name; both resolve to the same enforcement bucket.
+CODEX_TOOL_NAME_ALIASES: Dict[str, str] = {
+    "Bash": "commandExecution",
+    "BashOutput": "commandExecution",
+    "KillShell": "commandExecution",
+    "Edit": "fileChange",
+    "Write": "fileChange",
+    "NotebookEdit": "fileChange",
+}
+
+_APPROVAL_METHOD_TO_TOOL: Dict[str, str] = {
+    "item/commandExecution/requestApproval": "commandExecution",
+    "item/fileChange/requestApproval": "fileChange",
+    "item/mcpToolCall/requestApproval": "mcpToolCall",
+    "item/dynamicToolCall/requestApproval": "dynamicToolCall",
+}
+
+# Gateway permission_mode (Claude vocabulary) -> Codex approvalPolicy.
+# ``bypassPermissions`` translates to ``never`` (skip approvals); the remaining
+# modes default to ``on-request`` so risky operations still pause for review.
+CODEX_PERMISSION_MODE_TO_APPROVAL: Dict[str, str] = {
+    "bypassPermissions": "never",
+    "default": "on-request",
+    "acceptEdits": "on-request",
+    "plan": "on-request",
+}
+
+
+def _resolve_approval_policy(
+    permission_mode: Optional[str],
+    *,
+    has_tool_policy: bool = False,
+) -> str:
+    """Map gateway permission_mode onto Codex approvalPolicy.
+
+    Falls back to the ``CODEX_APPROVAL_POLICY`` env when no override is given.
+
+    When ``has_tool_policy`` is set (the caller has allowed_tools/disallowed_tools
+    or a global DISALLOWED_TOOLS env), a resolved ``never`` is upgraded to
+    ``on-request`` so Codex actually emits approval requests; otherwise the
+    gateway's auto-deny hook never runs and the tool policy is silently bypassed.
+    """
+    if permission_mode is not None:
+        mapped = CODEX_PERMISSION_MODE_TO_APPROVAL.get(permission_mode)
+        if mapped is not None:
+            resolved = mapped
+        else:
+            resolved = approval_policy()
+    else:
+        resolved = approval_policy()
+
+    if has_tool_policy and resolved == "never":
+        return "on-request"
+    return resolved
 
 
 class CodexAppServerError(RuntimeError):
@@ -298,6 +358,9 @@ class CodexSessionClient:
     stream_events: bool = False
     env: Optional[Dict[str, str]] = None
     owns_rpc: bool = False
+    allowed_tools: Optional[List[str]] = None
+    disallowed_tools: Optional[List[str]] = None
+    permission_mode: Optional[str] = None
     pending_approval_request_id: Optional[Any] = None
     pending_approval_method: Optional[str] = None
     pending_approval_turn_id: Optional[str] = None
@@ -326,6 +389,28 @@ class CodexClient:
 
     def get_auth_provider(self) -> CodexAuthProvider:
         return CodexAuthProvider()
+
+    def update_request_policy(
+        self,
+        client: CodexSessionClient,
+        *,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+    ) -> None:
+        """Replace the per-request tool policy stored on an existing session client.
+
+        Codex reuses one persistent ``CodexSessionClient`` for the lifetime of a
+        gateway session, but the gateway's tool-policy fields (``allowed_tools``
+        / ``disallowed_tools``) are per-request. Continuation requests must be
+        able to refresh those fields so each turn honors its own body.
+
+        An explicit empty list ``[]`` is preserved as a block-all policy; only
+        ``None`` clears the field.
+        """
+        client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
+        client.disallowed_tools = (
+            list(disallowed_tools) if disallowed_tools is not None else None
+        )
 
     def runtime_metadata(self) -> Dict[str, Any]:
         return {
@@ -375,7 +460,7 @@ class CodexClient:
         extra_env: Optional[Dict[str, str]] = None,
         _custom_base: Any = None,
     ) -> CodexSessionClient:
-        _ = (allowed_tools, disallowed_tools, permission_mode, mcp_servers, task_budget)
+        _ = (mcp_servers, task_budget)
         env = self._metadata_env(extra_env)
         async with self._rpc_lock:
             try:
@@ -385,6 +470,8 @@ class CodexClient:
                     model=model,
                     cwd=cwd,
                     system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+                    permission_mode=permission_mode,
+                    has_tool_policy=self._has_tool_policy(allowed_tools, disallowed_tools),
                 )
                 thread_id = getattr(session, "codex_thread_id", None)
                 if thread_id:
@@ -410,6 +497,13 @@ class CodexClient:
             cwd=cwd,
             env=env,
             owns_rpc=False,
+            # Preserve an explicit empty list as a block-all policy; only ``None``
+            # means "no per-request allow-list / disallow-list was set."
+            allowed_tools=list(allowed_tools) if allowed_tools is not None else None,
+            disallowed_tools=(
+                list(disallowed_tools) if disallowed_tools is not None else None
+            ),
+            permission_mode=permission_mode,
         )
 
     async def _ensure_rpc_locked(self, env: Dict[str, str]) -> CodexJsonRpcClient:
@@ -474,9 +568,13 @@ class CodexClient:
         model: Optional[str],
         cwd: Optional[str],
         system_prompt: Optional[str],
+        permission_mode: Optional[str] = None,
+        has_tool_policy: bool = False,
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {
-            "approvalPolicy": approval_policy(),
+            "approvalPolicy": _resolve_approval_policy(
+                permission_mode, has_tool_policy=has_tool_policy
+            ),
             "sandbox": sandbox_mode(),
         }
         if model:
@@ -488,12 +586,32 @@ class CodexClient:
         return params
 
     def _turn_params(self, client: CodexSessionClient) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"approvalPolicy": approval_policy()}
+        params: Dict[str, Any] = {
+            "approvalPolicy": _resolve_approval_policy(
+                client.permission_mode,
+                has_tool_policy=self._client_has_tool_policy(client),
+            ),
+        }
         if client.model:
             params["model"] = client.model
         if client.cwd:
             params["cwd"] = client.cwd
         return params
+
+    @staticmethod
+    def _has_tool_policy(
+        allowed_tools: Optional[List[str]],
+        disallowed_tools: Optional[List[str]],
+    ) -> bool:
+        # ``allowed_tools is not None`` matters because ``[]`` is a real
+        # block-all policy that must still flip approvalPolicy off ``never``.
+        if allowed_tools is not None or disallowed_tools:
+            return True
+        return bool(disallowed_tools_from_env())
+
+    @classmethod
+    def _client_has_tool_policy(cls, client: CodexSessionClient) -> bool:
+        return cls._has_tool_policy(client.allowed_tools, client.disallowed_tools)
 
     async def run_completion_with_client(
         self,
@@ -520,7 +638,9 @@ class CodexClient:
                     }
                     return
                 turn_id = str(turn_obj["id"])
-                notification_iter = self._notification_iterator(rpc, client.thread_id, turn_id)
+                notification_iter = self._notification_iterator(
+                    rpc, client.thread_id, turn_id, client=client
+                )
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -592,7 +712,9 @@ class CodexClient:
                 client.pending_approval_turn_id = None
                 client.pending_approval_params = None
 
-                notification_iter = self._notification_iterator(rpc, client.thread_id, turn_id)
+                notification_iter = self._notification_iterator(
+                    rpc, client.thread_id, turn_id, client=client
+                )
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -633,11 +755,17 @@ class CodexClient:
         rpc: CodexJsonRpcClient,
         thread_id: str,
         turn_id: str,
+        *,
+        client: Optional["CodexSessionClient"] = None,
     ) -> Iterator[Dict[str, Any]]:
         items: list[dict[str, Any]] = []
         usage_box: dict[str, Optional[dict[str, int]]] = {"usage": None}
         while True:
             notification = rpc.next_notification()
+            if client is not None and self._is_approval_request(notification):
+                if self._should_auto_deny_approval(client, notification):
+                    self._auto_deny_approval(rpc, notification)
+                    continue
             yield from self._chunks_from_notification(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -651,6 +779,54 @@ class CodexClient:
                 notification=notification,
             ):
                 break
+
+    def _should_auto_deny_approval(
+        self,
+        client: "CodexSessionClient",
+        notification: Dict[str, Any],
+    ) -> bool:
+        method = str(notification.get("method") or "")
+        codex_tool = _APPROVAL_METHOD_TO_TOOL.get(method)
+        if codex_tool is None:
+            return False
+        request_disallowed = list(client.disallowed_tools or [])
+        env_disallowed = disallowed_tools_from_env()
+        disallowed = self._normalize_tool_names(request_disallowed + env_disallowed)
+        if codex_tool in disallowed:
+            return True
+        # ``allowed_tools is not None`` distinguishes an explicit policy (even
+        # an empty block-all list) from "no allow-list set".
+        if client.allowed_tools is not None:
+            allowed = self._normalize_tool_names(client.allowed_tools)
+            if codex_tool not in allowed:
+                return True
+        return False
+
+    @staticmethod
+    def _normalize_tool_names(names: Optional[List[str]]) -> set[str]:
+        if not names:
+            return set()
+        return {CODEX_TOOL_NAME_ALIASES.get(name, name) for name in names}
+
+    def _auto_deny_approval(
+        self,
+        rpc: CodexJsonRpcClient,
+        notification: Dict[str, Any],
+    ) -> None:
+        request_id = notification.get("id")
+        if request_id is None:
+            return
+        method = str(notification.get("method") or "")
+        if method == "item/permissions/requestApproval":
+            result: Dict[str, Any] = {"permissions": {}, "scope": "turn"}
+        else:
+            result = {"decision": "decline"}
+        logger.info(
+            "Codex auto-denied approval: method=%s request_id=%s",
+            method,
+            request_id,
+        )
+        rpc.respond(request_id, result)
 
     def _chunks_from_notifications(
         self,

@@ -1775,6 +1775,39 @@ def test_responses_create_client_forwards_allowed_tools(isolated_session_manager
     assert create_calls[0]["allowed_tools"] == ["Read"]
 
 
+def test_responses_create_client_forwards_disallowed_tools(isolated_session_manager):
+    """disallowed_tools from the request body flows through to create_client."""
+    create_calls = []
+
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "ok"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "ok"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello",
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert create_calls[0]["disallowed_tools"] == ["Bash"]
+
+
 def test_responses_streaming_error_disconnects_persistent_client(isolated_session_manager):
     """Streaming failures discard the session SDK client."""
     sdk_client = AsyncMock()

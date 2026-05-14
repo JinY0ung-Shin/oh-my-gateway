@@ -468,6 +468,13 @@ async def _ensure_response_session_client(
 ) -> None:
     """Create the persistent backend client after session preflight has passed."""
     if session.client is not None:
+        update_policy = getattr(backend, "update_request_policy", None)
+        if callable(update_policy):
+            update_policy(
+                session.client,
+                allowed_tools=body.allowed_tools,
+                disallowed_tools=body.disallowed_tools,
+            )
         return
 
     from src.system_prompt import get_system_prompt, resolve_request_placeholders
@@ -483,6 +490,7 @@ async def _ensure_response_session_client(
             system_prompt=system_prompt if is_new_session else None,
             permission_mode=PERMISSION_MODE_BYPASS,
             allowed_tools=body.allowed_tools,
+            disallowed_tools=body.disallowed_tools,
             mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
             cwd=workspace_str,
             extra_env=body.metadata,
@@ -1186,6 +1194,19 @@ async def _handle_function_call_output(
         await _prepare_codex_approval_continuation(session, backend, fc_output)
     else:
         await _unblock_pending_tool_call(session, backend, fc_output)
+
+    # Refresh per-request tool policy on the existing session client *after*
+    # validation has accepted the function_call_output, so an invalid
+    # continuation can't mutate session state. The continuation chunk source
+    # (built below from session.client) will see the refreshed policy.
+    if session.client is not None:
+        update_policy = getattr(backend, "update_request_policy", None)
+        if callable(update_policy):
+            update_policy(
+                session.client,
+                allowed_tools=body.allowed_tools,
+                disallowed_tools=body.disallowed_tools,
+            )
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1

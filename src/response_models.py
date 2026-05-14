@@ -91,6 +91,13 @@ class ResponseCreateRequest(BaseModel):
         default=None,
         description="Explicit list of allowed tools. Overrides default tool list.",
     )
+    disallowed_tools: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Tools that must be blocked for this request. Hard-blocked even when "
+            "permission_mode bypasses checks. Merged with the DISALLOWED_TOOLS env var."
+        ),
+    )
     user: Optional[str] = Field(
         default=None,
         description="Unique user identifier for workspace isolation",
