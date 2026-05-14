@@ -372,6 +372,91 @@ def test_codex_request_body_disallowed_tools_blocks_command_approval_e2e(tmp_pat
     assert body["output"][0]["content"][0]["text"] == "Codex stopped: approval was declined."
 
 
+def test_codex_accept_edits_auto_accepts_file_change_e2e(tmp_path):
+    """permission_mode='acceptEdits' on the Responses body auto-accepts fileChange.
+
+    With acceptEdits, the fake's fileChange approval flow runs to completion
+    without surfacing a requires_action response.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": "request file change approval",
+                "stream": False,
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"][0]["content"][0]["text"] == "Codex e2e approved."
+
+
+def test_codex_continuation_request_switches_permission_mode_to_accept_edits(tmp_path):
+    """A continuation request can flip permission_mode to acceptEdits and have the next turn auto-accept fileChange.
+
+    Scenario:
+      1. First request: permission_mode default-equivalent (bypass) -> fake codex emits a command
+         approval -> requires_action.
+      2. Second request: function_call_output 'accept' to advance the first turn ->
+         turn completes.
+      3. Third request: same session, ``permission_mode='acceptEdits'`` + prompt that
+         routes the fake to fileChange approval. The route's update_request_policy
+         must propagate the new mode so the gateway auto-accepts fileChange
+         without surfacing a requires_action response.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin) as client:
+        first = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "run a command", "stream": False},
+        )
+        assert first.status_code == 200
+        assert first.json()["status"] == "requires_action"
+        first_body = first.json()
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "previous_response_id": first_body["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "approval_1",
+                        "output": "accept",
+                    }
+                ],
+                "stream": False,
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["status"] == "completed"
+
+        third = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "previous_response_id": second.json()["id"],
+                "input": "request file change approval",
+                "stream": False,
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["status"] == "completed"
+    # The fake's "approved" branch fires when our auto-accept reaches it.
+    assert third_body["output"][0]["content"][0]["text"] == "Codex e2e approved."
+
+
 def test_codex_continuation_request_refreshes_disallowed_tools(tmp_path):
     """A continuation request's disallowed_tools applies even when the session client already exists.
 

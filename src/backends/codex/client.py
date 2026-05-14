@@ -74,6 +74,9 @@ CODEX_PERMISSION_MODE_TO_APPROVAL: Dict[str, str] = {
 }
 
 
+_UNKNOWN_PERMISSION_MODE_FALLBACK = "on-request"
+
+
 def _resolve_approval_policy(
     permission_mode: Optional[str],
     *,
@@ -81,21 +84,29 @@ def _resolve_approval_policy(
 ) -> str:
     """Map gateway permission_mode onto Codex approvalPolicy.
 
-    Falls back to the ``CODEX_APPROVAL_POLICY`` env when no override is given.
+    When ``permission_mode`` is ``None``, fall back to the operator's
+    ``CODEX_APPROVAL_POLICY`` env (defaults to ``never``). When it is set to
+    an *unknown* value, fall back to a safe ``on-request`` rather than the env,
+    so a typo or invalid mode can't silently bypass approval-time enforcement.
 
     When ``has_tool_policy`` is set (the caller has allowed_tools/disallowed_tools
     or a global DISALLOWED_TOOLS env), a resolved ``never`` is upgraded to
     ``on-request`` so Codex actually emits approval requests; otherwise the
     gateway's auto-deny hook never runs and the tool policy is silently bypassed.
     """
-    if permission_mode is not None:
-        mapped = CODEX_PERMISSION_MODE_TO_APPROVAL.get(permission_mode)
-        if mapped is not None:
-            resolved = mapped
-        else:
-            resolved = approval_policy()
-    else:
+    if permission_mode is None:
         resolved = approval_policy()
+    else:
+        mapped = CODEX_PERMISSION_MODE_TO_APPROVAL.get(permission_mode)
+        if mapped is None:
+            logger.warning(
+                "Codex received unknown permission_mode %r; falling back to %s",
+                permission_mode,
+                _UNKNOWN_PERMISSION_MODE_FALLBACK,
+            )
+            resolved = _UNKNOWN_PERMISSION_MODE_FALLBACK
+        else:
+            resolved = mapped
 
     if has_tool_policy and resolved == "never":
         return "on-request"
@@ -396,6 +407,7 @@ class CodexClient:
         *,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
+        permission_mode: Optional[str] = None,
     ) -> None:
         """Replace the per-request tool policy stored on an existing session client.
 
@@ -404,13 +416,19 @@ class CodexClient:
         / ``disallowed_tools``) are per-request. Continuation requests must be
         able to refresh those fields so each turn honors its own body.
 
-        An explicit empty list ``[]`` is preserved as a block-all policy; only
-        ``None`` clears the field.
+        An explicit empty list ``[]`` for tool fields is preserved as a
+        block-all policy; only ``None`` clears them.
+
+        ``permission_mode`` is session-level (acceptEdits / bypassPermissions /
+        ...). ``None`` here means "no override sent by this request"; the
+        existing value is preserved. Pass an explicit string to change it.
         """
         client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
         client.disallowed_tools = (
             list(disallowed_tools) if disallowed_tools is not None else None
         )
+        if permission_mode is not None:
+            client.permission_mode = permission_mode
 
     def runtime_metadata(self) -> Dict[str, Any]:
         return {
@@ -763,8 +781,14 @@ class CodexClient:
         while True:
             notification = rpc.next_notification()
             if client is not None and self._is_approval_request(notification):
+                # Disallow / allowlist policies always take precedence over
+                # ``acceptEdits`` auto-accept so an explicit block can't be
+                # silently turned into an accept.
                 if self._should_auto_deny_approval(client, notification):
                     self._auto_deny_approval(rpc, notification)
+                    continue
+                if self._should_auto_accept_approval(client, notification):
+                    self._auto_accept_approval(rpc, notification)
                     continue
             yield from self._chunks_from_notification(
                 thread_id=thread_id,
@@ -827,6 +851,34 @@ class CodexClient:
             request_id,
         )
         rpc.respond(request_id, result)
+
+    def _should_auto_accept_approval(
+        self,
+        client: "CodexSessionClient",
+        notification: Dict[str, Any],
+    ) -> bool:
+        # ``acceptEdits`` mirrors Claude's permission_mode: only file edits are
+        # auto-accepted; commands and other approvals still need explicit user
+        # consent.
+        if client.permission_mode != "acceptEdits":
+            return False
+        return notification.get("method") == "item/fileChange/requestApproval"
+
+    def _auto_accept_approval(
+        self,
+        rpc: CodexJsonRpcClient,
+        notification: Dict[str, Any],
+    ) -> None:
+        request_id = notification.get("id")
+        if request_id is None:
+            return
+        method = str(notification.get("method") or "")
+        logger.info(
+            "Codex auto-accepted approval (acceptEdits): method=%s request_id=%s",
+            method,
+            request_id,
+        )
+        rpc.respond(request_id, {"decision": "accept"})
 
     def _chunks_from_notifications(
         self,

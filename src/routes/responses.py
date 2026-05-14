@@ -474,6 +474,7 @@ async def _ensure_response_session_client(
                 session.client,
                 allowed_tools=body.allowed_tools,
                 disallowed_tools=body.disallowed_tools,
+                permission_mode=body.permission_mode,
             )
         return
 
@@ -488,7 +489,7 @@ async def _ensure_response_session_client(
             session=session,
             model=resolved.provider_model,
             system_prompt=system_prompt if is_new_session else None,
-            permission_mode=PERMISSION_MODE_BYPASS,
+            permission_mode=body.permission_mode or PERMISSION_MODE_BYPASS,
             allowed_tools=body.allowed_tools,
             disallowed_tools=body.disallowed_tools,
             mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
@@ -1206,6 +1207,7 @@ async def _handle_function_call_output(
                 session.client,
                 allowed_tools=body.allowed_tools,
                 disallowed_tools=body.disallowed_tools,
+                permission_mode=body.permission_mode,
             )
 
     # --- Stream continuation from the client ---
