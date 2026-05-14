@@ -2256,6 +2256,131 @@ async def test_codex_client_does_not_retry_when_retry_also_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_codex_client_forwards_response_model_params_to_turn_start(monkeypatch):
+    """temperature and max_output_tokens flow into the Codex turn/start payload."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        model_params={"temperature": 0.3, "max_output_tokens": 1024},
+    )
+
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert fake_rpc.turn_start_calls
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert turn_params.get("temperature") == 0.3
+    assert turn_params.get("maxOutputTokens") == 1024
+
+
+@pytest.mark.asyncio
+async def test_codex_client_omits_model_params_when_unset(monkeypatch):
+    """When no model_params are provided, turn/start payload stays minimal (no defaults injected)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert "temperature" not in turn_params
+    assert "maxOutputTokens" not in turn_params
+
+
+@pytest.mark.asyncio
+async def test_codex_client_translates_legacy_max_tokens_alias(monkeypatch):
+    """The OpenAI 'max_tokens' alias maps to Codex maxOutputTokens for compatibility."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        model_params={"max_tokens": 512},
+    )
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert turn_params.get("maxOutputTokens") == 512
+
+
+@pytest.mark.asyncio
+async def test_codex_client_drops_none_model_param_values(monkeypatch):
+    """None values in model_params are skipped (so Responses bodies with unset fields are safe)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        model_params={"temperature": None, "max_output_tokens": 100},
+    )
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert "temperature" not in turn_params
+    assert turn_params.get("maxOutputTokens") == 100
+
+
+@pytest.mark.asyncio
 async def test_codex_client_filters_metadata_env(monkeypatch):
     """Only allowlisted metadata keys are passed to the Codex subprocess env."""
     fake_rpc = FakeRpc()
@@ -2522,12 +2647,16 @@ async def test_codex_function_call_output_refreshes_session_tool_policy(monkeypa
             allowed_tools=None,
             disallowed_tools=None,
             permission_mode=None,
+            model_params=None,
         ):
-            update_calls.append((client, allowed_tools, disallowed_tools, permission_mode))
+            update_calls.append(
+                (client, allowed_tools, disallowed_tools, permission_mode, model_params)
+            )
             client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
             client.disallowed_tools = (
                 list(disallowed_tools) if disallowed_tools is not None else None
             )
+            client.model_params = dict(model_params) if model_params else None
             if permission_mode is not None:
                 client.permission_mode = permission_mode
 
@@ -2555,7 +2684,7 @@ async def test_codex_function_call_output_refreshes_session_tool_policy(monkeypa
         {"call_id": "approval_1", "output": "accept"},
     )
 
-    assert update_calls == [(session.client, None, ["Bash"], None)]
+    assert update_calls == [(session.client, None, ["Bash"], None, None)]
     assert session.client.disallowed_tools == ["Bash"]
 
 

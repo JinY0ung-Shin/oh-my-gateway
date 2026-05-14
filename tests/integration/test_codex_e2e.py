@@ -17,15 +17,29 @@ from src.backends.base import BackendRegistry
 
 FAKE_CODEX_APP_SERVER = r"""#!/usr/bin/env python3
 import json
+import os
 import sys
 
 thread_id = "thr_e2e"
 turn_id = "turn_1"
 approval_mode = "command"
+# Tests can point FAKE_CODEX_TURN_START_LOG at a file to capture every
+# turn/start payload as JSONL for later assertions.
+turn_start_log = os.environ.get("FAKE_CODEX_TURN_START_LOG")
 
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def record_turn_start(params):
+    if not turn_start_log:
+        return
+    try:
+        with open(turn_start_log, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(params, sort_keys=True) + "\n")
+    except OSError:
+        pass
 
 
 def send(payload):
@@ -55,6 +69,7 @@ for raw in sys.stdin:
         send({"id": msg_id, "result": {"thread": {"id": params.get("threadId", thread_id)}}})
         continue
     if method == "turn/start":
+        record_turn_start(params)
         input_items = params.get("input") or []
         prompt = ""
         if input_items and isinstance(input_items[0], dict):
@@ -395,6 +410,44 @@ def test_codex_accept_edits_auto_accepts_file_change_e2e(tmp_path):
     body = response.json()
     assert body["status"] == "completed"
     assert body["output"][0]["content"][0]["text"] == "Codex e2e approved."
+
+
+def test_codex_request_body_model_params_flow_through_to_turn_start_e2e(tmp_path):
+    """temperature / max_output_tokens from the body reach Codex turn/start params.
+
+    The fake codex app-server logs every received turn/start payload to a file
+    pointed to by FAKE_CODEX_TURN_START_LOG. The test then reads the file and
+    confirms the gateway forwarded the sampling overrides under the expected
+    Codex keys.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+    turn_log = tmp_path / "turn-start.jsonl"
+
+    with codex_client_context(
+        fake_bin, extra_env={"FAKE_CODEX_TURN_START_LOG": str(turn_log)}
+    ) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": "request file change approval",
+                "stream": False,
+                "temperature": 0.25,
+                "max_output_tokens": 64,
+                # acceptEdits lets the fake's fileChange branch run to
+                # completion so the e2e finishes cleanly.
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert response.status_code == 200
+
+    assert turn_log.exists(), "fake codex did not record any turn/start params"
+    lines = [json.loads(line) for line in turn_log.read_text().splitlines() if line.strip()]
+    assert lines, "turn/start log is empty"
+    first = lines[0]
+    assert first.get("temperature") == 0.25
+    assert first.get("maxOutputTokens") == 64
 
 
 def test_codex_continuation_request_switches_permission_mode_to_accept_edits(tmp_path):

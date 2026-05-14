@@ -73,6 +73,37 @@ CODEX_PERMISSION_MODE_TO_APPROVAL: Dict[str, str] = {
     "plan": "on-request",
 }
 
+# OpenAI Responses-style sampling/control field -> Codex app-server payload key.
+# Used by ``_translate_model_params`` so request bodies can carry the standard
+# OpenAI names (temperature, max_output_tokens, ...) while we forward them in
+# the Codex camelCase convention.
+CODEX_MODEL_PARAM_KEY_MAP: Dict[str, str] = {
+    "temperature": "temperature",
+    "top_p": "topP",
+    "max_output_tokens": "maxOutputTokens",
+    # Legacy alias from the chat-completions era; treat the same as the new name.
+    "max_tokens": "maxOutputTokens",
+}
+
+
+def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Translate OpenAI-style model params into the Codex turn/start vocabulary.
+
+    - ``None`` or empty dict yields ``{}`` (no payload pollution when the
+      request didn't ask for overrides).
+    - Unknown keys are passed through unchanged so future params can be added
+      without code changes here.
+    - ``None`` values are skipped (Pydantic optional fields default to None).
+    """
+    if not model_params:
+        return {}
+    out: Dict[str, Any] = {}
+    for key, value in model_params.items():
+        if value is None:
+            continue
+        out[CODEX_MODEL_PARAM_KEY_MAP.get(key, key)] = value
+    return out
+
 
 _UNKNOWN_PERMISSION_MODE_FALLBACK = "on-request"
 
@@ -372,6 +403,7 @@ class CodexSessionClient:
     allowed_tools: Optional[List[str]] = None
     disallowed_tools: Optional[List[str]] = None
     permission_mode: Optional[str] = None
+    model_params: Optional[Dict[str, Any]] = None
     pending_approval_request_id: Optional[Any] = None
     pending_approval_method: Optional[str] = None
     pending_approval_turn_id: Optional[str] = None
@@ -412,6 +444,7 @@ class CodexClient:
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
         permission_mode: Optional[str] = None,
+        model_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Replace the per-request tool policy stored on an existing session client.
 
@@ -431,6 +464,9 @@ class CodexClient:
         client.disallowed_tools = (
             list(disallowed_tools) if disallowed_tools is not None else None
         )
+        # ``model_params`` is per-request like tool lists; ``None`` resets so the
+        # next turn doesn't inherit a previous request's sampling overrides.
+        client.model_params = dict(model_params) if model_params else None
         if permission_mode is not None:
             client.permission_mode = permission_mode
 
@@ -480,6 +516,7 @@ class CodexClient:
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
     ) -> CodexSessionClient:
         _ = (mcp_servers, task_budget)
@@ -526,6 +563,7 @@ class CodexClient:
                 list(disallowed_tools) if disallowed_tools is not None else None
             ),
             permission_mode=permission_mode,
+            model_params=dict(model_params) if model_params else None,
         )
 
     async def _ensure_rpc_locked(self, env: Dict[str, str]) -> CodexJsonRpcClient:
@@ -618,6 +656,12 @@ class CodexClient:
             params["model"] = client.model
         if client.cwd:
             params["cwd"] = client.cwd
+        # Sampling / output-control overrides (temperature, max_output_tokens, ...)
+        # supplied by the request body. Unset request fields stay absent from the
+        # payload so the app-server's defaults still apply.
+        translated = _translate_model_params(client.model_params)
+        if translated:
+            params.update(translated)
         return params
 
     @staticmethod

@@ -1775,6 +1775,72 @@ def test_responses_create_client_forwards_allowed_tools(isolated_session_manager
     assert create_calls[0]["allowed_tools"] == ["Read"]
 
 
+def test_responses_create_client_forwards_model_params(isolated_session_manager):
+    """temperature and max_output_tokens from the request body land in model_params."""
+    create_calls = []
+
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "ok"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "ok"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello",
+                "temperature": 0.42,
+                "max_output_tokens": 256,
+            },
+        )
+
+    assert response.status_code == 200
+    assert create_calls[0]["model_params"] == {
+        "temperature": 0.42,
+        "max_output_tokens": 256,
+    }
+
+
+def test_responses_create_client_omits_model_params_when_unset(isolated_session_manager):
+    """Bodies without sampling overrides pass model_params=None (backend defaults stand)."""
+    create_calls = []
+
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "ok"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "ok"
+
+        response = client.post(
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "Hello"},
+        )
+
+    assert response.status_code == 200
+    assert create_calls[0]["model_params"] is None
+
+
 def test_responses_create_client_forwards_disallowed_tools(isolated_session_manager):
     """disallowed_tools from the request body flows through to create_client."""
     create_calls = []

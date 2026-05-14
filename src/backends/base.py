@@ -93,6 +93,7 @@ class BackendClient(Protocol):
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
     ) -> Any: ...
 

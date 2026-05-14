@@ -416,6 +416,22 @@ async def _resolve_response_workspace(
     return workspace
 
 
+def _response_model_params(body: ResponseCreateRequest) -> Optional[Dict[str, Any]]:
+    """Collect OpenAI-style model overrides from the request body.
+
+    Returns ``None`` when the caller supplied no sampling/output-control
+    overrides so backends keep their existing defaults. Only fields the
+    Responses API natively exposes are forwarded; backends that can't honor
+    a given key are expected to ignore it.
+    """
+    params: Dict[str, Any] = {}
+    if body.temperature is not None:
+        params["temperature"] = body.temperature
+    if body.max_output_tokens is not None:
+        params["max_output_tokens"] = body.max_output_tokens
+    return params or None
+
+
 def _response_prompt_and_system(
     body: ResponseCreateRequest,
     workspace: Path,
@@ -475,6 +491,7 @@ async def _ensure_response_session_client(
                 allowed_tools=body.allowed_tools,
                 disallowed_tools=body.disallowed_tools,
                 permission_mode=body.permission_mode,
+                model_params=_response_model_params(body),
             )
         return
 
@@ -495,6 +512,7 @@ async def _ensure_response_session_client(
             mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
             cwd=workspace_str,
             extra_env=body.metadata,
+            model_params=_response_model_params(body),
             _custom_base=resolved_base,
         )
     except Exception:
@@ -1208,6 +1226,7 @@ async def _handle_function_call_output(
                 allowed_tools=body.allowed_tools,
                 disallowed_tools=body.disallowed_tools,
                 permission_mode=body.permission_mode,
+                model_params=_response_model_params(body),
             )
 
     # --- Stream continuation from the client ---
