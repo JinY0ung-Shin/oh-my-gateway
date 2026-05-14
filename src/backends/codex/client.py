@@ -651,6 +651,15 @@ class CodexClient:
             # calls to the configured upstream MCP servers. An empty dict
             # behaves like "no servers" and the key is left out so the
             # app-server keeps its defaults.
+            #
+            # Filtering note: unlike the Claude backend (which narrows
+            # ``mcp_servers`` against the per-request ``allowed_tools``
+            # patterns via ``mcp__<server>__*`` — see
+            # ``src/backends/claude/client.py::_configure_mcp_servers``),
+            # Codex forwards the full server set and enforces per-tool policy
+            # at approval time via ``item/mcpToolCall/requestApproval``. The
+            # net effect is the same (disallowed MCP tools never execute) but
+            # the enforcement point differs.
             params["mcpServers"] = dict(mcp_servers)
         return params
 
