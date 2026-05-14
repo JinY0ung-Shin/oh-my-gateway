@@ -397,7 +397,6 @@ class CodexSessionClient:
     thread_id: str
     model: Optional[str]
     cwd: Optional[str]
-    stream_events: bool = False
     env: Optional[Dict[str, str]] = None
     owns_rpc: bool = False
     allowed_tools: Optional[List[str]] = None
