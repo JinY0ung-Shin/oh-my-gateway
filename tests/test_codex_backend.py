@@ -2381,6 +2381,89 @@ async def test_codex_client_drops_none_model_param_values(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_codex_create_client_forwards_mcp_servers_to_thread_params(monkeypatch):
+    """mcp_servers passed to create_client lands in the Codex thread/start payload."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    mcp = {
+        "fs": {"type": "stdio", "command": "fs-server", "args": []},
+        "web": {"type": "http", "url": "http://localhost:9000"},
+    }
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        mcp_servers=mcp,
+    )
+
+    assert fake_rpc.thread_start_calls
+    sent_params = fake_rpc.thread_start_calls[0]
+    assert sent_params.get("mcpServers") == mcp
+
+
+@pytest.mark.asyncio
+async def test_codex_create_client_omits_mcp_servers_when_unset(monkeypatch):
+    """No mcp_servers -> no mcpServers key in the payload (backend defaults stand)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(session=session, model="gpt-5.5")
+
+    assert fake_rpc.thread_start_calls
+    assert "mcpServers" not in fake_rpc.thread_start_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_codex_create_client_omits_mcp_servers_when_empty_dict(monkeypatch):
+    """An empty dict is treated as "no servers" and the key is omitted."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(session=session, model="gpt-5.5", mcp_servers={})
+
+    assert fake_rpc.thread_start_calls
+    assert "mcpServers" not in fake_rpc.thread_start_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_resume_includes_mcp_servers(monkeypatch):
+    """Resuming a thread also re-asserts the mcp_servers config (so reconnects don't lose it)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(
+        session_id="gw-session",
+        pending_tool_call=None,
+        codex_thread_id="thr_existing",
+    )
+    mcp = {"fs": {"type": "stdio", "command": "fs-server"}}
+    await backend.create_client(session=session, model="gpt-5.5", mcp_servers=mcp)
+
+    assert fake_rpc.thread_resume_calls
+    _, resume_params = fake_rpc.thread_resume_calls[0]
+    assert resume_params.get("mcpServers") == mcp
+
+
+@pytest.mark.asyncio
 async def test_codex_client_filters_metadata_env(monkeypatch):
     """Only allowlisted metadata keys are passed to the Codex subprocess env."""
     fake_rpc = FakeRpc()

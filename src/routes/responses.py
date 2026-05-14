@@ -509,7 +509,9 @@ async def _ensure_response_session_client(
             permission_mode=body.permission_mode or PERMISSION_MODE_BYPASS,
             allowed_tools=body.allowed_tools,
             disallowed_tools=body.disallowed_tools,
-            mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
+            mcp_servers=(
+                get_mcp_servers() if resolved.backend in {"claude", "codex"} else None
+            ),
             cwd=workspace_str,
             extra_env=body.metadata,
             model_params=_response_model_params(body),

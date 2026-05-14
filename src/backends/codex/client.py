@@ -404,6 +404,7 @@ class CodexSessionClient:
     disallowed_tools: Optional[List[str]] = None
     permission_mode: Optional[str] = None
     model_params: Optional[Dict[str, Any]] = None
+    mcp_servers: Optional[Dict[str, Any]] = None
     pending_approval_request_id: Optional[Any] = None
     pending_approval_method: Optional[str] = None
     pending_approval_turn_id: Optional[str] = None
@@ -519,7 +520,7 @@ class CodexClient:
         model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
     ) -> CodexSessionClient:
-        _ = (mcp_servers, task_budget)
+        _ = (task_budget,)
         env = self._metadata_env(extra_env)
         async with self._rpc_lock:
             try:
@@ -531,6 +532,7 @@ class CodexClient:
                     system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
                     permission_mode=permission_mode,
                     has_tool_policy=self._has_tool_policy(allowed_tools, disallowed_tools),
+                    mcp_servers=mcp_servers,
                 )
                 thread_id = getattr(session, "codex_thread_id", None)
                 if thread_id:
@@ -564,6 +566,7 @@ class CodexClient:
             ),
             permission_mode=permission_mode,
             model_params=dict(model_params) if model_params else None,
+            mcp_servers=dict(mcp_servers) if mcp_servers else None,
         )
 
     async def _ensure_rpc_locked(self, env: Dict[str, str]) -> CodexJsonRpcClient:
@@ -630,6 +633,7 @@ class CodexClient:
         system_prompt: Optional[str],
         permission_mode: Optional[str] = None,
         has_tool_policy: bool = False,
+        mcp_servers: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {
             "approvalPolicy": _resolve_approval_policy(
@@ -643,6 +647,12 @@ class CodexClient:
             params["cwd"] = cwd
         if system_prompt:
             params["developerInstructions"] = system_prompt
+        if mcp_servers:
+            # Forward server-level MCP configuration so Codex can route tool
+            # calls to the configured upstream MCP servers. An empty dict
+            # behaves like "no servers" and the key is left out so the
+            # app-server keeps its defaults.
+            params["mcpServers"] = dict(mcp_servers)
         return params
 
     def _turn_params(self, client: CodexSessionClient) -> Dict[str, Any]:
@@ -710,6 +720,7 @@ class CodexClient:
             system_prompt=None,
             permission_mode=client.permission_mode,
             has_tool_policy=self._client_has_tool_policy(client),
+            mcp_servers=client.mcp_servers,
         )
 
         last_exc: Optional[BaseException] = None

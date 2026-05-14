@@ -249,8 +249,60 @@ def test_responses_dispatches_to_codex_backend_without_mcp():
 
     assert response.status_code == 200
     assert calls["create_client"]["model"] == "gpt-5.5"
-    assert calls["create_client"]["mcp_servers"] is None
+    # Codex now also receives the gateway MCP config; with no MCP_CONFIG env,
+    # the helper returns an empty dict (no servers configured).
+    assert calls["create_client"]["mcp_servers"] == {}
     assert calls["prompt"] == "hi"
+
+
+def test_responses_dispatches_to_codex_backend_with_configured_mcp_servers():
+    """A non-empty server MCP config is forwarded to the Codex backend."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {"type": "result", "subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    configured = {"fs": {"type": "stdio", "command": "fs-server"}}
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(responses_module, "get_mcp_servers", return_value=configured),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert calls["create_client"]["mcp_servers"] == configured
 
 
 def test_responses_streaming_enables_opencode_event_streaming():
