@@ -692,9 +692,15 @@ class CodexClient:
     async def _start_turn_with_retry(
         self,
         client: CodexSessionClient,
-        prompt: str,
+        prompt: Any,
     ) -> tuple[CodexJsonRpcClient, Dict[str, Any]]:
         """Run turn/start with a single conservative retry on transport failure.
+
+        ``prompt`` may be either a plain string (wrapped into a single
+        ``{"type": "text"}`` item for backward compatibility) or a
+        pre-normalized list of Codex input items (text plus image/file
+        attachments). Invalid item shapes raise ``ValueError`` before any
+        side effect on the app-server side.
 
         ``turn/start`` is idempotent only until the app-server accepts it. We
         detect "accepted" two ways:
@@ -712,7 +718,7 @@ class CodexClient:
 
         Callers must hold ``self._rpc_lock``.
         """
-        input_items = [{"type": "text", "text": prompt}]
+        input_items = self._coerce_turn_input_items(prompt)
         turn_params = self._turn_params(client)
         thread_params = self._thread_params(
             model=client.model,
@@ -763,6 +769,34 @@ class CodexClient:
         raise last_exc
 
     @staticmethod
+    def _coerce_turn_input_items(prompt: Any) -> list[Dict[str, Any]]:
+        """Normalize the run_completion ``prompt`` argument into Codex input items.
+
+        - ``str``: wrapped into a single ``{"type": "text", "text": ...}`` item
+          so existing string callers stay unchanged.
+        - ``list``: must contain only dicts; each is forwarded verbatim so
+          callers can express multimodal payloads (text + image/file). Order
+          and metadata are preserved.
+        - anything else: ``ValueError`` (the route catches this and surfaces a
+          clean error chunk).
+        """
+        if isinstance(prompt, str):
+            return [{"type": "text", "text": prompt}]
+        if isinstance(prompt, list):
+            if not prompt:
+                raise ValueError("Codex turn input list must contain at least one item")
+            for index, item in enumerate(prompt):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"Codex turn input item at index {index} must be a dict, "
+                        f"got {type(item).__name__}"
+                    )
+            return [dict(item) for item in prompt]
+        raise ValueError(
+            f"Codex turn input must be a string or list of dicts, got {type(prompt).__name__}"
+        )
+
+    @staticmethod
     def _pending_notification_count(rpc: CodexJsonRpcClient) -> int:
         """Number of inbound notifications buffered by the JSON-RPC client.
 
@@ -781,7 +815,7 @@ class CodexClient:
     async def run_completion_with_client(
         self,
         client: CodexSessionClient,
-        prompt: str,
+        prompt: Any,
         session: Any,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         _ = session

@@ -2464,6 +2464,115 @@ async def test_codex_thread_resume_includes_mcp_servers(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_codex_turn_preserves_multimodal_items(monkeypatch):
+    """Codex turn/start carries a multi-item payload (text + image) verbatim."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    items = [
+        {"type": "text", "text": "look at this"},
+        {"type": "image", "url": "https://example.com/foo.png"},
+        {"type": "text", "text": "any thoughts?"},
+    ]
+
+    [chunk async for chunk in backend.run_completion_with_client(client, items, session)]
+
+    assert fake_rpc.turn_start_calls
+    _, sent_items, _ = fake_rpc.turn_start_calls[0]
+    assert sent_items == items
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_wraps_string_prompt_into_text_item(monkeypatch):
+    """Plain-string prompts stay compatible: they're wrapped into a single text item."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    [chunk async for chunk in backend.run_completion_with_client(client, "hello there", session)]
+
+    _, sent_items, _ = fake_rpc.turn_start_calls[0]
+    assert sent_items == [{"type": "text", "text": "hello there"}]
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_rejects_empty_input_list(monkeypatch):
+    """Empty input list is rejected — Codex won't accept a turn with no content."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, [], session)]
+    assert fake_rpc.turn_start_calls == []
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_rejects_invalid_input_item_shape(monkeypatch):
+    """Non-text/non-dict items in the input list surface a clear error."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    bad_items = [
+        {"type": "text", "text": "ok"},
+        "this should be a dict, not a string",
+    ]
+    chunks = [
+        chunk async for chunk in backend.run_completion_with_client(client, bad_items, session)
+    ]
+    # No turn/start was reached for an invalid payload.
+    assert fake_rpc.turn_start_calls == []
+    assert chunks
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+
+
+@pytest.mark.asyncio
 async def test_codex_client_filters_metadata_env(monkeypatch):
     """Only allowlisted metadata keys are passed to the Codex subprocess env."""
     fake_rpc = FakeRpc()
