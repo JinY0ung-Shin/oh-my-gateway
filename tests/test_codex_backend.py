@@ -228,7 +228,8 @@ async def test_codex_client_starts_thread_and_converts_completed_turn(monkeypatc
         },
     }
     assert chunks[-2]["content"] == [{"type": "text", "text": "Hello from Codex"}]
-    assert chunks[-2]["usage"] == {"input_tokens": 3, "output_tokens": 4}
+    # outputTokens=4 + reasoningOutputTokens=1; reasoning tokens are rolled into output.
+    assert chunks[-2]["usage"] == {"input_tokens": 3, "output_tokens": 5}
     assert chunks[-1]["type"] == "result"
     assert chunks[-1]["result"] == "Hello from Codex"
     assert backend.parse_message(chunks) == "Hello from Codex"
@@ -2248,6 +2249,51 @@ def test_codex_tool_result_from_item_returns_none_for_invalid_inputs():
     assert client._tool_result_from_item({"type": "agentMessage", "id": "x"}) is None
     assert client._tool_result_from_item({"type": "commandExecution"}) is None
     assert client._tool_result_from_item({"type": "commandExecution", "id": 123}) is None
+
+
+def test_codex_extract_usage_includes_reasoning_output_tokens():
+    """Reasoning output tokens are part of the model's output and must be reported."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    usage = backend._extract_usage(
+        {
+            "last": {
+                "inputTokens": 10,
+                "cachedInputTokens": 2,
+                "outputTokens": 5,
+                "reasoningOutputTokens": 7,
+            }
+        }
+    )
+    assert usage == {"input_tokens": 12, "output_tokens": 12}
+
+
+def test_codex_extract_usage_handles_missing_reasoning_tokens():
+    """Notifications without reasoningOutputTokens fall back to outputTokens only."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    usage = backend._extract_usage(
+        {"last": {"inputTokens": 3, "outputTokens": 4}}
+    )
+    assert usage == {"input_tokens": 3, "output_tokens": 4}
+
+
+def test_codex_extract_usage_total_matches_total_tokens():
+    """Reported (input + output) equals notification totalTokens, so totals reconcile."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    last = {
+        "inputTokens": 6,
+        "cachedInputTokens": 4,
+        "outputTokens": 8,
+        "reasoningOutputTokens": 3,
+        "totalTokens": 21,
+    }
+    usage = backend._extract_usage({"last": last})
+    assert usage["input_tokens"] + usage["output_tokens"] == last["totalTokens"]
 
 
 def test_codex_extract_usage_returns_none_for_invalid_inputs():

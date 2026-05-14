@@ -1281,7 +1281,12 @@ class CodexClient:
         if not isinstance(last, dict):
             return None
         input_tokens = int(last.get("inputTokens") or 0) + int(last.get("cachedInputTokens") or 0)
-        output_tokens = int(last.get("outputTokens") or 0)
+        # Reasoning tokens are emitted by the model alongside visible output;
+        # OpenAI-compatible usage reporting rolls them into output_tokens so
+        # totals match (input + output == totalTokens).
+        output_tokens = int(last.get("outputTokens") or 0) + int(
+            last.get("reasoningOutputTokens") or 0
+        )
         return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
     def _turn_error_message(self, turn: dict[str, Any]) -> str:

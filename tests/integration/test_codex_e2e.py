@@ -186,7 +186,12 @@ for raw in sys.stdin:
                 "threadId": thread_id,
                 "turnId": turn_id,
                 "tokenUsage": {
-                    "last": {"inputTokens": 2, "cachedInputTokens": 0, "outputTokens": 3}
+                    "last": {
+                        "inputTokens": 2,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 3,
+                        "reasoningOutputTokens": 2,
+                    }
                 },
             },
         })
@@ -305,7 +310,8 @@ def test_codex_responses_e2e_approval_continuation(tmp_path, prompt, expected_ki
         second_body = second.json()
         assert second_body["status"] == "completed"
         assert second_body["output"][0]["content"][0]["text"] == "Codex e2e approved."
-        assert second_body["usage"] == {"input_tokens": 2, "output_tokens": 3}
+        # Reasoning tokens (2) roll into output (3) for OpenAI-compatible usage reporting.
+        assert second_body["usage"] == {"input_tokens": 2, "output_tokens": 5}
 
 
 def test_codex_streaming_approval_exposes_only_ask_user_question(tmp_path):
