@@ -1818,7 +1818,12 @@ async def test_codex_client_closes_rpc_when_thread_start_fails(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
-    """Transport failures close the shared app-server so the next request restarts it."""
+    """If turn/start fails on every attempt, the shared RPC is left closed so the next request restarts it.
+
+    With the conservative in-request retry path, a persistent transport failure
+    burns through both attempts and surfaces an error chunk; the dead shared
+    RPC must still be cleared so a *subsequent* request brings up a fresh one.
+    """
 
     class FailingTurnRpc(FakeRpc):
         def turn_start(self, thread_id, input_items, params):
@@ -1828,7 +1833,7 @@ async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
     created = []
 
     def fake_factory(**kwargs):
-        rpc = FailingTurnRpc() if not created else FakeRpc()
+        rpc = FailingTurnRpc()
         created.append(rpc)
         return rpc
 
@@ -1842,13 +1847,412 @@ async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
 
     chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
 
-    assert chunks == [{"type": "error", "is_error": True, "error_message": "transport failed"}]
-    assert created[0].closed is True
+    # The user sees a final error chunk after retry exhausts.
+    assert chunks[-1] == {
+        "type": "error",
+        "is_error": True,
+        "error_message": "transport failed",
+    }
+    # Each failing RPC instance was closed.
+    for rpc in created:
+        assert rpc.closed is True
 
+    # A subsequent create_client constructs a fresh RPC (the dead shared one was cleared).
+    fresh_count_before = len(created)
     await backend.create_client(session=SimpleNamespace(session_id="gw-session-2"), model="gpt-5.5")
+    assert len(created) == fresh_count_before + 1
 
-    assert len(created) == 2
-    assert created[1].closed is False
+
+@pytest.mark.asyncio
+async def test_codex_client_retries_turn_start_once_after_rpc_transport_error_before_turn_is_accepted(
+    monkeypatch,
+):
+    """A transport error on turn/start (before any output is yielded) triggers exactly one retry.
+
+    Scenario:
+      1. First RPC accepts thread_start during create_client.
+      2. turn_start raises a transport error.
+      3. The first RPC is closed; a fresh RPC is started.
+      4. The new RPC restores the same thread via thread_resume, then turn_start
+         succeeds and the turn completes normally — the user sees a successful
+         result, not an error chunk.
+    """
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingTurnStartRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise CodexAppServerError("transport failed during turn/start")
+
+    def factory(**kwargs):
+        if not rpcs:
+            rpc = FailingTurnStartRpc()
+        else:
+            rpc = FakeRpc()
+            rpc.notifications = [
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "turn": {"id": "turn_1", "status": "completed", "items": []},
+                    },
+                },
+            ]
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # Two RPCs were created total (initial + retry).
+    assert len(rpcs) == 2
+    # First RPC was closed when its turn_start failed.
+    assert rpcs[0].closed is True
+    # Second RPC re-established the same thread before retrying turn_start.
+    assert rpcs[1].thread_resume_calls
+    assert rpcs[1].thread_resume_calls[0][0] == "thr_codex"
+    assert len(rpcs[1].turn_start_calls) == 1
+    # The user-visible output is a normal result, not an error chunk.
+    assert not any(c.get("is_error") for c in chunks)
+    assert chunks[-1]["type"] == "result"
+
+
+@pytest.mark.asyncio
+async def test_codex_client_does_not_retry_after_partial_output(monkeypatch):
+    """Once any chunk has been yielded for a turn, errors no longer trigger a retry.
+
+    The first RPC accepts turn_start and emits one delta; the next read raises
+    a transport error. Because output was already sent to the user, the gateway
+    must surface an error chunk rather than silently re-running the turn (which
+    would risk duplicate side effects on the app-server side).
+    """
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+    consume_count = [0]
+
+    class FailingMidStreamRpc(FakeRpc):
+        def next_notification(self):
+            consume_count[0] += 1
+            if consume_count[0] == 1:
+                return {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "itemId": "item_1",
+                        "delta": "partial",
+                    },
+                }
+            raise CodexAppServerError("transport failed mid-stream")
+
+    def factory(**kwargs):
+        if not rpcs:
+            rpc = FailingMidStreamRpc()
+        else:
+            # If we did retry, the second RPC would be used here.
+            rpc = FakeRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # No retry: only one RPC was ever created.
+    assert len(rpcs) == 1
+    # The partial delta was delivered, then an error chunk closes the turn.
+    assert any(c.get("type") == "stream_event" for c in chunks)
+    assert chunks[-1] == {
+        "type": "error",
+        "is_error": True,
+        "error_message": "transport failed mid-stream",
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_client_does_not_retry_when_turn_start_queued_notifications_before_failing(
+    monkeypatch,
+):
+    """If the app-server queued a notification for this turn before the transport
+    error, treat the turn as possibly accepted and skip retry to avoid duplicate
+    side effects on the app-server side.
+    """
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class QueuesThenFailsRpc(FakeRpc):
+        def __init__(self):
+            super().__init__()
+            self._pending_notifications: list = []
+
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            # Simulate the JSON-RPC client having buffered an inbound notification
+            # for this turn before the transport went down.
+            self._pending_notifications.append(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "item": {"type": "commandExecution", "id": "cmd_1"},
+                    },
+                }
+            )
+            raise CodexAppServerError("transport failed after queuing notification")
+
+    def factory(**kwargs):
+        rpc = QueuesThenFailsRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # Only the original RPC was used — no retry, because queuing implies the
+    # app-server may have already started executing the turn.
+    assert len(rpcs) == 1
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_client_thread_resume_failure_on_retry_surfaces_error(monkeypatch):
+    """thread_resume failing on the retry attempt is treated as the retry failure."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingRpc(FakeRpc):
+        def __init__(self, fail_turn_start=False, fail_resume=False):
+            super().__init__()
+            self._fail_turn_start = fail_turn_start
+            self._fail_resume = fail_resume
+
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            if self._fail_turn_start:
+                raise CodexAppServerError("turn/start transport failed")
+            return {"turn": {"id": "turn_1", "status": "inProgress"}}
+
+        def thread_resume(self, thread_id, params):
+            self.thread_resume_calls.append((thread_id, params))
+            if self._fail_resume:
+                raise CodexAppServerError("thread/resume transport failed")
+            return {"thread": {"id": thread_id}}
+
+    def factory(**kwargs):
+        if not rpcs:
+            # initial RPC: thread_start fine (FakeRpc default), turn/start blows up.
+            rpc = FailingRpc(fail_turn_start=True)
+        else:
+            # retry RPC: thread/resume also blows up before we even reach turn/start.
+            rpc = FailingRpc(fail_resume=True)
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert len(rpcs) == 2
+    assert rpcs[1].thread_resume_calls  # we tried to recover, but resume blew up
+    assert chunks[-1]["type"] == "error"
+    assert "thread/resume transport failed" in chunks[-1]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_client_session_rpc_field_is_refreshed_after_successful_retry(monkeypatch):
+    """``CodexSessionClient.rpc`` points at the live RPC after retry recovery."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingFirstTurnRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise CodexAppServerError("first attempt failed")
+
+    def factory(**kwargs):
+        if not rpcs:
+            rpc = FailingFirstTurnRpc()
+        else:
+            rpc = FakeRpc()
+            rpc.notifications = [
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "turn": {"id": "turn_1", "status": "completed", "items": []},
+                    },
+                }
+            ]
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    assert client.rpc is rpcs[0]
+
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # After successful retry, the session client should track the live RPC.
+    assert client.rpc is rpcs[1]
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_approval_fails_fast_through_full_approval_flow(monkeypatch):
+    """End-to-end variant: the pending RPC field is populated by the real
+    ``_store_pending_approval`` path (not test-set), then a transport reset
+    swaps the shared RPC. resume_approval must surface a transport-lost error.
+    """
+    from src.backends.codex.client import CodexClient
+
+    rpcs = []
+
+    def factory(**kwargs):
+        rpc = FakeRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    # Run a turn whose only notification is a command approval; this exercises
+    # the real _store_pending_approval path (including pending_approval_rpc).
+    rpcs[0].notifications = _command_approval_notifications()
+    [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+    assert client.pending_approval_rpc is rpcs[0]
+    assert session.pending_tool_call is not None
+
+    # Simulate a transport reset between approval and user response.
+    await backend._close_rpc_locked()
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            client, "approval_1", "accept", session
+        )
+    ]
+
+    assert chunks
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+    assert "transport" in chunks[-1]["error_message"].lower()
+    # Pending state is cleared so subsequent operations don't see stale data.
+    assert client.pending_approval_rpc is None
+    assert client.pending_approval_request_id is None
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_approval_fails_fast_when_pending_rpc_is_gone(monkeypatch):
+    """If the RPC that received the approval request is gone, fail fast with a clear error.
+
+    A transport-level reset between an approval being surfaced and the user's
+    response means the new RPC has no record of the pending approval; trying
+    to ``rpc.respond`` would either silently drop the message or hit a server
+    that has no idea what we're talking about.
+    """
+    from src.backends.codex.client import CodexClient
+
+    fake_rpc_a = FakeRpc()
+    fake_rpc_b = FakeRpc()
+    rpcs = [fake_rpc_a, fake_rpc_b]
+
+    def factory(**kwargs):
+        # Pop in order: A for create_client, B for the post-failure recovery.
+        if rpcs:
+            return rpcs.pop(0)
+        return FakeRpc()
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    # Pretend an approval was surfaced on the original RPC.
+    client.pending_approval_request_id = "approval_1"
+    client.pending_approval_method = "item/commandExecution/requestApproval"
+    client.pending_approval_turn_id = "turn_1"
+    client.pending_approval_params = {"turnId": "turn_1"}
+    client.pending_approval_rpc = fake_rpc_a
+
+    # Simulate transport reset between approval and user response: shared RPC
+    # was closed and replaced by ``fake_rpc_b``.
+    await backend._close_rpc_locked()
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            client, "approval_1", "accept", session
+        )
+    ]
+
+    assert chunks
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+    assert "transport" in chunks[-1]["error_message"].lower() or "lost" in chunks[-1]["error_message"].lower()
+
+
+@pytest.mark.asyncio
+async def test_codex_client_does_not_retry_when_retry_also_fails(monkeypatch):
+    """If the retry also raises, the gateway gives up and surfaces an error."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingTurnStartRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise CodexAppServerError("transport failed again")
+
+    def factory(**kwargs):
+        rpc = FailingTurnStartRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # Initial RPC + one retry attempt = 2 RPCs created.
+    assert len(rpcs) == 2
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
 
 
 @pytest.mark.asyncio

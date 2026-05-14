@@ -376,6 +376,10 @@ class CodexSessionClient:
     pending_approval_method: Optional[str] = None
     pending_approval_turn_id: Optional[str] = None
     pending_approval_params: Optional[Dict[str, Any]] = None
+    # Identity of the RPC instance that surfaced the pending approval, used to
+    # fail-fast if a transport reset replaces the shared RPC between the
+    # approval being shown and the user responding.
+    pending_approval_rpc: Optional[CodexJsonRpcClient] = None
 
     async def disconnect(self) -> None:
         if self.owns_rpc:
@@ -631,6 +635,94 @@ class CodexClient:
     def _client_has_tool_policy(cls, client: CodexSessionClient) -> bool:
         return cls._has_tool_policy(client.allowed_tools, client.disallowed_tools)
 
+    async def _start_turn_with_retry(
+        self,
+        client: CodexSessionClient,
+        prompt: str,
+    ) -> tuple[CodexJsonRpcClient, Dict[str, Any]]:
+        """Run turn/start with a single conservative retry on transport failure.
+
+        ``turn/start`` is idempotent only until the app-server accepts it. We
+        detect "accepted" two ways:
+
+        - The call returns normally → accepted, no retry needed.
+        - Any inbound notification for this turn lands in the RPC's pending
+          queue while the request was in flight → the app-server is already
+          executing the turn. Retrying could double-run a command/edit, so
+          we surface the error instead.
+
+        Otherwise, on transport failure, we close the dead shared RPC, bring
+        up a fresh one, re-establish the gateway session's Codex thread via
+        ``thread/resume``, and try ``turn/start`` once more. The retry budget
+        is intentionally exactly one attempt.
+
+        Callers must hold ``self._rpc_lock``.
+        """
+        input_items = [{"type": "text", "text": prompt}]
+        turn_params = self._turn_params(client)
+        thread_params = self._thread_params(
+            model=client.model,
+            cwd=client.cwd,
+            system_prompt=None,
+            permission_mode=client.permission_mode,
+            has_tool_policy=self._client_has_tool_policy(client),
+        )
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(2):
+            rpc = await self._ensure_rpc_locked(client.env or {})
+            queued_before = self._pending_notification_count(rpc)
+            try:
+                if attempt > 0 and client.thread_id:
+                    # New RPC instance has no thread context; re-establish before
+                    # the retried turn/start so the app-server recognizes the id.
+                    await asyncio.to_thread(rpc.thread_resume, client.thread_id, thread_params)
+                turn = await asyncio.to_thread(rpc.turn_start, client.thread_id, input_items, turn_params)
+                return rpc, turn
+            except Exception as exc:
+                last_exc = exc
+                if attempt > 0:
+                    break
+                # Did the app-server queue any inbound notification for this
+                # turn while turn/start was in flight? If yes, retrying risks
+                # duplicating the turn's side effects on the app-server side.
+                queued_after = self._pending_notification_count(rpc)
+                if queued_after > queued_before:
+                    logger.warning(
+                        "Codex turn/start failed but app-server queued %d notification(s) "
+                        "while turn/start was in flight; skipping retry to avoid duplicate "
+                        "side effects: %s",
+                        queued_after - queued_before,
+                        exc,
+                    )
+                    break
+                logger.warning(
+                    "Codex turn/start failed before turn was accepted, "
+                    "restarting RPC and retrying once: %s",
+                    exc,
+                )
+                await self._close_rpc_locked()
+                continue
+
+        assert last_exc is not None
+        raise last_exc
+
+    @staticmethod
+    def _pending_notification_count(rpc: CodexJsonRpcClient) -> int:
+        """Number of inbound notifications buffered by the JSON-RPC client.
+
+        ``_pending_notifications`` is the real client's queue; fakes used in
+        tests may expose the same attribute as a plain list. Treat missing
+        attributes as zero (acts as a no-op for legacy transports).
+        """
+        pending = getattr(rpc, "_pending_notifications", None)
+        if pending is None:
+            return 0
+        try:
+            return len(pending)
+        except TypeError:
+            return 0
+
     async def run_completion_with_client(
         self,
         client: CodexSessionClient,
@@ -640,13 +732,10 @@ class CodexClient:
         _ = session
         async with self._rpc_lock:
             try:
-                rpc = await self._ensure_rpc_locked(client.env or {})
-                turn = await asyncio.to_thread(
-                    rpc.turn_start,
-                    client.thread_id,
-                    [{"type": "text", "text": prompt}],
-                    self._turn_params(client),
-                )
+                rpc, turn = await self._start_turn_with_retry(client, prompt)
+                # Keep the session client's RPC reference in sync with the live
+                # shared RPC; retry may have swapped to a fresh instance.
+                client.rpc = rpc
                 turn_obj = turn.get("turn")
                 if not isinstance(turn_obj, dict) or not turn_obj.get("id"):
                     yield {
@@ -668,7 +757,9 @@ class CodexClient:
                         break
                     if chunk is not None:
                         if chunk.get("type") == "codex_approval_request":
-                            tool_chunk = self._store_pending_approval(session, client, chunk)
+                            tool_chunk = self._store_pending_approval(
+                                session, client, chunk, rpc=rpc
+                            )
                             yield tool_chunk
                             return
                         yield chunk
@@ -714,6 +805,25 @@ class CodexClient:
                     logger.error(message)
                     yield {"type": "error", "is_error": True, "error_message": message}
                     return
+                pending_rpc = client.pending_approval_rpc
+                if pending_rpc is not None and pending_rpc is not rpc:
+                    # The RPC that surfaced this approval is gone (likely a
+                    # transport reset between the approval being shown and the
+                    # user's response). The new RPC has no record of the
+                    # pending request, so responding now would be a no-op or
+                    # confuse the app-server. Surface a clear error instead.
+                    message = (
+                        "Codex approval transport was lost before the response "
+                        "arrived; please retry the original request"
+                    )
+                    logger.error(message + " (call_id=%r)", call_id)
+                    client.pending_approval_request_id = None
+                    client.pending_approval_method = None
+                    client.pending_approval_turn_id = None
+                    client.pending_approval_params = None
+                    client.pending_approval_rpc = None
+                    yield {"type": "error", "is_error": True, "error_message": message}
+                    return
                 turn_id = client.pending_approval_turn_id or str(params.get("turnId") or "")
                 if not turn_id:
                     yield {
@@ -729,6 +839,7 @@ class CodexClient:
                 client.pending_approval_method = None
                 client.pending_approval_turn_id = None
                 client.pending_approval_params = None
+                client.pending_approval_rpc = None
 
                 notification_iter = self._notification_iterator(
                     rpc, client.thread_id, turn_id, client=client
@@ -742,7 +853,9 @@ class CodexClient:
                         break
                     if chunk is not None:
                         if chunk.get("type") == "codex_approval_request":
-                            tool_chunk = self._store_pending_approval(session, client, chunk)
+                            tool_chunk = self._store_pending_approval(
+                                session, client, chunk, rpc=rpc
+                            )
                             yield tool_chunk
                             return
                         yield chunk
@@ -1137,6 +1250,8 @@ class CodexClient:
         session: Any,
         client: CodexSessionClient,
         chunk: Dict[str, Any],
+        *,
+        rpc: Optional[CodexJsonRpcClient] = None,
     ) -> Dict[str, Any]:
         tool_chunk = chunk["tool_chunk"]
         tool_block = tool_chunk["content"][0]
@@ -1147,6 +1262,9 @@ class CodexClient:
             chunk.get("params") if isinstance(chunk.get("params"), dict) else {}
         )
         client.pending_approval_turn_id = metadata.get("codex_turn_id")
+        # Remember which RPC instance owns this pending request so resume can
+        # fail fast if a transport reset replaces the shared RPC underneath us.
+        client.pending_approval_rpc = rpc
         session.pending_tool_call = {
             "call_id": metadata["codex_approval_request_id"],
             "name": ASK_USER_QUESTION_TOOL_NAME,
