@@ -5,6 +5,7 @@ import contextlib
 import inspect
 import json
 import logging
+import os
 import secrets
 import uuid
 from pathlib import Path
@@ -41,7 +42,7 @@ from src.response_models import (
 )
 from src.rate_limiter import rate_limit_endpoint
 from src.chunk_processing import classify_error_chunk
-from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
+from src.constants import DEFAULT_TIMEOUT_MS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
 from src.usage_logger import usage_logger
@@ -822,7 +823,7 @@ async def _ensure_response_session_client(
             session=session,
             model=resolved.provider_model,
             system_prompt=system_prompt if is_new_session else None,
-            permission_mode=body.permission_mode or PERMISSION_MODE_BYPASS,
+            permission_mode=body.permission_mode or os.getenv("PERMISSION_MODE") or None,
             allowed_tools=body.allowed_tools,
             disallowed_tools=body.disallowed_tools,
             mcp_servers=(get_mcp_servers() if resolved.backend in {"claude", "codex"} else None),
