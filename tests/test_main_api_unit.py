@@ -1114,7 +1114,10 @@ def test_codex_responses_input_image_passes_multimodal_items_to_backend(
     assert prompt[0]["type"] == "text"
     assert prompt[0]["text"] == "look at this"
     assert prompt[1]["type"] in {"image", "input_image"}
-    assert prompt[1].get("image_url") == "https://example.com/foo.png" or prompt[1].get("url") == "https://example.com/foo.png"
+    assert (
+        prompt[1].get("image_url") == "https://example.com/foo.png"
+        or prompt[1].get("url") == "https://example.com/foo.png"
+    )
     assert prompt[2]["type"] == "text"
     assert prompt[2]["text"] == "any thoughts?"
 
@@ -1247,8 +1250,18 @@ def test_codex_responses_unknown_only_input_part_does_not_take_multimodal_path(
     assert isinstance(calls["prompt"], str)
 
 
-def test_codex_responses_empty_image_url_returns_400(isolated_session_manager):
-    """Multimodal request whose image_url is empty produces no items → 400 from the route.
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "input_image", "image_url": ""}],
+        [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": ""},
+        ],
+    ],
+)
+def test_codex_responses_empty_image_url_returns_400(isolated_session_manager, content):
+    """Multimodal request whose image_url is empty returns 400 from the route.
 
     Also locks in: the backend is never reached (no create_client / run call)
     and the response message names the problem.
@@ -1292,9 +1305,7 @@ def test_codex_responses_empty_image_url_returns_400(isolated_session_manager):
                 "input": [
                     {
                         "role": "user",
-                        "content": [
-                            {"type": "input_image", "image_url": ""},
-                        ],
+                        "content": content,
                     }
                 ],
             },
@@ -1302,7 +1313,7 @@ def test_codex_responses_empty_image_url_returns_400(isolated_session_manager):
 
     assert response.status_code == 400
     body = response.json()
-    assert "Codex multimodal input produced no usable items" in json.dumps(body)
+    assert "empty image_url" in json.dumps(body)
     assert not run_calls, "backend.run_completion_with_client was called for a 400 request"
 
 

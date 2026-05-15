@@ -794,6 +794,30 @@ async def test_codex_allowed_tools_whitelist_lets_listed_approval_bubble(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_codex_allowed_tools_global_glob_does_not_bypass_whitelist(monkeypatch):
+    """Only MCP policy names support glob matching; '*' must not allow every tool."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["*"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
 async def test_codex_permission_mode_bypass_overrides_thread_approval_policy(monkeypatch):
     """permission_mode='bypassPermissions' sets Codex approvalPolicy='never' at thread start."""
     fake_rpc = FakeRpc()
@@ -808,7 +832,9 @@ async def test_codex_permission_mode_bypass_overrides_thread_approval_policy(mon
         }
     ]
     monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
-    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "on-request")  # env says ask; permission_mode overrides
+    monkeypatch.setenv(
+        "CODEX_APPROVAL_POLICY", "on-request"
+    )  # env says ask; permission_mode overrides
 
     from src.backends.codex.client import CodexClient
 
@@ -1160,7 +1186,12 @@ async def test_codex_global_disallowed_tools_merges_with_per_request(monkeypatch
     assert _collect_approval_tool_uses(chunks) == []
 
 
-def _mcp_tool_call_approval_notifications(*, request_id: str = "approval_1"):
+def _mcp_tool_call_approval_notifications(
+    *,
+    request_id: str = "approval_1",
+    server_label: str = "fs",
+    tool_name: str = "read_file",
+):
     return [
         {
             "id": request_id,
@@ -1169,8 +1200,8 @@ def _mcp_tool_call_approval_notifications(*, request_id: str = "approval_1"):
                 "threadId": "thr_codex",
                 "turnId": "turn_1",
                 "itemId": "mcp_1",
-                "serverLabel": "fs",
-                "toolName": "read_file",
+                "serverLabel": server_label,
+                "toolName": tool_name,
                 "availableDecisions": ["accept", "decline"],
             },
         },
@@ -1234,6 +1265,30 @@ async def test_codex_disallowed_tools_blocks_mcp_tool_call_approval(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_codex_disallowed_tools_blocks_mcp_exact_tool_pattern(monkeypatch):
+    """Claude-style MCP tool names must block matching Codex MCP approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["mcp__fs__read_file"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
 async def test_codex_disallowed_tools_blocks_dynamic_tool_call_approval(monkeypatch):
     """disallowed_tools containing 'dynamicToolCall' auto-denies dynamic tool approvals."""
     fake_rpc = FakeRpc()
@@ -1277,6 +1332,53 @@ async def test_codex_allowed_tools_whitelist_blocks_mcp_when_not_listed(monkeypa
 
     assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
     assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_mcp_server_pattern_allows_matching_approval(monkeypatch):
+    """Claude-style MCP server wildcards should allow matching Codex MCP approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["mcp__fs__*"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
+    assert session.pending_tool_call is not None
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_mcp_pattern_normalizes_hyphenated_server(monkeypatch):
+    """MCP patterns use Claude's hyphen-to-underscore server-name convention."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications(server_label="my-server")
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["mcp__my_server__*"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
 
 
 @pytest.mark.asyncio
@@ -2221,7 +2323,10 @@ async def test_codex_resume_approval_fails_fast_when_pending_rpc_is_gone(monkeyp
     assert chunks
     assert chunks[-1]["type"] == "error"
     assert chunks[-1]["is_error"] is True
-    assert "transport" in chunks[-1]["error_message"].lower() or "lost" in chunks[-1]["error_message"].lower()
+    assert (
+        "transport" in chunks[-1]["error_message"].lower()
+        or "lost" in chunks[-1]["error_message"].lower()
+    )
 
 
 @pytest.mark.asyncio
@@ -3021,9 +3126,7 @@ def test_codex_approval_question_covers_all_kinds():
     assert client._approval_question("command", {"command": "ls"}) == (
         "Codex requests approval to run command: ls"
     )
-    assert client._approval_question("command", {}) == (
-        "Codex requests approval to run a command."
-    )
+    assert client._approval_question("command", {}) == ("Codex requests approval to run a command.")
     assert client._approval_question("command", {"command": ""}) == (
         "Codex requests approval to run a command."
     )
@@ -3061,8 +3164,7 @@ def test_codex_approval_decision_label_handles_dict_decisions():
         }
     }
     assert (
-        client._approval_decision_label(full)
-        == "applyNetworkPolicyAmendment:allow:api.example.com"
+        client._approval_decision_label(full) == "applyNetworkPolicyAmendment:allow:api.example.com"
     )
 
     # applyNetworkPolicyAmendment missing host falls back to bare name.
@@ -3261,9 +3363,7 @@ def test_codex_extract_usage_handles_missing_reasoning_tokens():
     from src.backends.codex.client import CodexClient
 
     backend = CodexClient()
-    usage = backend._extract_usage(
-        {"last": {"inputTokens": 3, "outputTokens": 4}}
-    )
+    usage = backend._extract_usage({"last": {"inputTokens": 3, "outputTokens": 4}})
     assert usage == {"input_tokens": 3, "output_tokens": 4}
 
 
@@ -3421,9 +3521,7 @@ def test_codex_metadata_env_filters_by_allowlist(monkeypatch):
     from src import constants as constants_module
     from src.backends.codex.client import CodexClient
 
-    monkeypatch.setattr(
-        constants_module, "METADATA_ENV_ALLOWLIST", frozenset({"ALLOWED_KEY"})
-    )
+    monkeypatch.setattr(constants_module, "METADATA_ENV_ALLOWLIST", frozenset({"ALLOWED_KEY"}))
 
     client = CodexClient()
 
@@ -3726,9 +3824,7 @@ async def test_codex_run_completion_yields_error_when_turn_id_missing(monkeypatc
     session = SimpleNamespace(session_id="gw")
     client = await backend.create_client(session=session)
 
-    chunks = [
-        chunk async for chunk in backend.run_completion_with_client(client, "hi", session)
-    ]
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
 
     assert len(chunks) == 1
     assert chunks[0]["type"] == "error"

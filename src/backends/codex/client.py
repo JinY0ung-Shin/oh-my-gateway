@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import json
 import logging
 import os
@@ -461,9 +462,7 @@ class CodexClient:
         existing value is preserved. Pass an explicit string to change it.
         """
         client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
-        client.disallowed_tools = (
-            list(disallowed_tools) if disallowed_tools is not None else None
-        )
+        client.disallowed_tools = list(disallowed_tools) if disallowed_tools is not None else None
         # ``model_params`` is per-request like tool lists; ``None`` resets so the
         # next turn doesn't inherit a previous request's sampling overrides.
         client.model_params = dict(model_params) if model_params else None
@@ -560,9 +559,7 @@ class CodexClient:
             # Preserve an explicit empty list as a block-all policy; only ``None``
             # means "no per-request allow-list / disallow-list was set."
             allowed_tools=list(allowed_tools) if allowed_tools is not None else None,
-            disallowed_tools=(
-                list(disallowed_tools) if disallowed_tools is not None else None
-            ),
+            disallowed_tools=(list(disallowed_tools) if disallowed_tools is not None else None),
             permission_mode=permission_mode,
             model_params=dict(model_params) if model_params else None,
             mcp_servers=dict(mcp_servers) if mcp_servers else None,
@@ -746,7 +743,9 @@ class CodexClient:
                     # New RPC instance has no thread context; re-establish before
                     # the retried turn/start so the app-server recognizes the id.
                     await asyncio.to_thread(rpc.thread_resume, client.thread_id, thread_params)
-                turn = await asyncio.to_thread(rpc.turn_start, client.thread_id, input_items, turn_params)
+                turn = await asyncio.to_thread(
+                    rpc.turn_start, client.thread_id, input_items, turn_params
+                )
                 return rpc, turn
             except Exception as exc:
                 last_exc = exc
@@ -1019,28 +1018,63 @@ class CodexClient:
         client: "CodexSessionClient",
         notification: Dict[str, Any],
     ) -> bool:
-        method = str(notification.get("method") or "")
-        codex_tool = _APPROVAL_METHOD_TO_TOOL.get(method)
-        if codex_tool is None:
+        tool_identities = self._approval_tool_identities(notification)
+        if not tool_identities:
             return False
         request_disallowed = list(client.disallowed_tools or [])
         env_disallowed = disallowed_tools_from_env()
         disallowed = self._normalize_tool_names(request_disallowed + env_disallowed)
-        if codex_tool in disallowed:
+        if self._tool_policy_matches(disallowed, tool_identities):
             return True
         # ``allowed_tools is not None`` distinguishes an explicit policy (even
         # an empty block-all list) from "no allow-list set".
         if client.allowed_tools is not None:
             allowed = self._normalize_tool_names(client.allowed_tools)
-            if codex_tool not in allowed:
+            if not self._tool_policy_matches(allowed, tool_identities):
                 return True
         return False
+
+    @staticmethod
+    def _approval_tool_identities(notification: Dict[str, Any]) -> set[str]:
+        method = str(notification.get("method") or "")
+        codex_tool = _APPROVAL_METHOD_TO_TOOL.get(method)
+        if codex_tool is None:
+            return set()
+
+        identities = {codex_tool}
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            return identities
+
+        if codex_tool == "mcpToolCall":
+            server_label = params.get("serverLabel") or params.get("serverName")
+            tool_name = params.get("toolName")
+            if isinstance(server_label, str) and server_label:
+                server_names = {server_label, "_".join(server_label.split("-"))}
+                if isinstance(tool_name, str) and tool_name:
+                    for server_name in server_names:
+                        identities.add(f"mcp__{server_name}__{tool_name}")
+                else:
+                    for server_name in server_names:
+                        identities.add(f"mcp__{server_name}__*")
+
+        return identities
 
     @staticmethod
     def _normalize_tool_names(names: Optional[List[str]]) -> set[str]:
         if not names:
             return set()
         return {CODEX_TOOL_NAME_ALIASES.get(name, name) for name in names}
+
+    @staticmethod
+    def _tool_policy_matches(policy_names: set[str], tool_identities: set[str]) -> bool:
+        for policy_name in policy_names:
+            for identity in tool_identities:
+                if policy_name == identity:
+                    return True
+                if policy_name.startswith("mcp__") and fnmatch.fnmatchcase(identity, policy_name):
+                    return True
+        return False
 
     def _auto_deny_approval(
         self,
@@ -1314,7 +1348,7 @@ class CodexClient:
             label = self._approval_decision_label(decision)
             if not label:
                 continue
-            option = {
+            option: Dict[str, Any] = {
                 "label": label,
                 "description": descriptions.get(label, f"Choose {label}."),
             }

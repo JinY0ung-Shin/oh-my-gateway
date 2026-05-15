@@ -8,7 +8,7 @@ import logging
 import secrets
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
@@ -514,11 +514,15 @@ def _response_input_to_codex_items(
                     if isinstance(part, dict)
                     else getattr(part, "image_url", None)
                 )
-                if image_url:
-                    # Use the Codex-native shape (``type=image`` / ``url``)
-                    # matching the in-tree fixture
-                    # tests/test_codex_backend.py multi-item case.
-                    items.append({"type": "image", "url": image_url})
+                if not isinstance(image_url, str) or not image_url.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Codex multimodal input contains an empty image_url",
+                    )
+                # Use the Codex-native shape (``type=image`` / ``url``)
+                # matching the in-tree fixture
+                # tests/test_codex_backend.py multi-item case.
+                items.append({"type": "image", "url": image_url})
             # Other / unknown part types are ignored — they'll be added as
             # explicit cases when their Codex item shape is known.
     return items, system_prompt
@@ -598,9 +602,7 @@ async def _ensure_response_session_client(
             permission_mode=body.permission_mode or PERMISSION_MODE_BYPASS,
             allowed_tools=body.allowed_tools,
             disallowed_tools=body.disallowed_tools,
-            mcp_servers=(
-                get_mcp_servers() if resolved.backend in {"claude", "codex"} else None
-            ),
+            mcp_servers=(get_mcp_servers() if resolved.backend in {"claude", "codex"} else None),
             cwd=workspace_str,
             extra_env=body.metadata,
             model_params=_response_model_params(body),
@@ -854,8 +856,14 @@ def _store_opencode_pending_tool_call(
         if block.get("type") != "tool_use":
             continue
         tool_name = block.get("name")
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-        input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
+        metadata = cast(
+            Dict[str, Any],
+            block.get("metadata") if isinstance(block.get("metadata"), dict) else {},
+        )
+        input_value = cast(
+            Dict[str, Any],
+            block.get("input") if isinstance(block.get("input"), dict) else {},
+        )
         if tool_name == "question":
             request_id = metadata.get("opencode_question_request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -908,7 +916,10 @@ def _is_codex_pending_approval_chunk(
             continue
         if block.get("type") != "tool_use" or block.get("name") != "codex_approval":
             continue
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        metadata = cast(
+            Dict[str, Any],
+            block.get("metadata") if isinstance(block.get("metadata"), dict) else {},
+        )
         request_id = metadata.get("codex_approval_request_id") or block.get("id")
         if str(request_id or "") == str(pending.get("call_id") or ""):
             return True
@@ -1513,23 +1524,24 @@ async def _handle_function_call_output(
         # Resume the backend-specific pending tool request; do not start a
         # new prompt for continuation turns.
         _configure_client_streaming(active_client, False)
+        backend_with_resume = cast(Any, backend)
         if resolved.backend == "opencode":
             if opencode_resume_kind == "permission":
-                backend_source = backend.resume_permission_with_client(
+                backend_source = backend_with_resume.resume_permission_with_client(
                     active_client,
                     fc_output["call_id"],
                     fc_output["output"],
                     session,
                 )
             else:
-                backend_source = backend.resume_question_with_client(
+                backend_source = backend_with_resume.resume_question_with_client(
                     active_client,
                     fc_output["call_id"],
                     fc_output["output"],
                     session,
                 )
         elif resolved.backend == "codex":
-            backend_source = backend.resume_approval_with_client(
+            backend_source = backend_with_resume.resume_approval_with_client(
                 active_client,
                 fc_output["call_id"],
                 fc_output["output"],

@@ -225,10 +225,13 @@ Effective `/v1/responses` request fields:
 - `previous_response_id`: continue the latest turn of an existing session.
 - `stream`: emit Responses-style SSE events.
 - `metadata`: stored on responses; allowlisted keys can be forwarded to Claude with `METADATA_ENV_ALLOWLIST`.
-- `allowed_tools`: explicit Claude tool allowlist.
+- `allowed_tools`: explicit tool allowlist for backends that support tool policy enforcement.
+- `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
+- `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
+- `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key.
 
-The request model also accepts `store`, `temperature`, and `max_output_tokens` for client compatibility, but those fields are not currently forwarded as generation controls.
+The request model also accepts `store` for client compatibility.
 
 Notable deviations from OpenAI Responses API behavior:
 

@@ -103,8 +103,9 @@ class ResponseCreateRequest(BaseModel):
     permission_mode: Optional[PermissionMode] = Field(
         default=None,
         description=(
-            "Per-request permission mode override. One of: default, acceptEdits, "
-            "bypassPermissions, plan. Falls back to the gateway default when not set."
+            "Session permission mode override. One of: default, acceptEdits, "
+            "bypassPermissions, plan. Continuation requests that omit this field "
+            "keep the current session mode."
         ),
     )
     user: Optional[str] = Field(
