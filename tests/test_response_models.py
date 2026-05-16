@@ -102,6 +102,19 @@ def test_response_create_request_rejects_non_string_input_image_url():
         )
 
 
+def test_response_create_request_accepts_valid_permission_modes():
+    """All four documented permission_mode values must be accepted."""
+    for mode in ("default", "acceptEdits", "bypassPermissions", "plan"):
+        req = ResponseCreateRequest(model="sonnet", input="hi", permission_mode=mode)
+        assert req.permission_mode == mode
+
+
+def test_response_create_request_rejects_invalid_permission_mode():
+    """Typos / unknown permission_mode strings are rejected at the API boundary."""
+    with pytest.raises(ValidationError):
+        ResponseCreateRequest(model="sonnet", input="hi", permission_mode="definitely-invalid")
+
+
 def test_response_create_request_accepts_unknown_part_type_as_dict():
     """Forward-compat: unknown part types (e.g., input_file) are kept as dicts."""
     req = ResponseCreateRequest(

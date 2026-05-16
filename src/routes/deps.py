@@ -83,7 +83,10 @@ def validate_image_request(request: Any, backend: BackendClient) -> None:
     if not request_has_images(request):
         return
 
-    if getattr(backend, "name", None) == "opencode":
+    backend_name = getattr(backend, "name", None)
+    # OpenCode and Codex both accept multimodal input via their own paths
+    # (Codex turn input items in `run_completion_with_client`).
+    if backend_name in {"opencode", "codex"}:
         return
 
     # Check backend supports images

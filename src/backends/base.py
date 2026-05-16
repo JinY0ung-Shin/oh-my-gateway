@@ -15,6 +15,7 @@ from typing import (
     List,
     Optional,
     Protocol,
+    Union,
     runtime_checkable,
 )
 
@@ -93,15 +94,25 @@ class BackendClient(Protocol):
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
     ) -> Any: ...
 
     def run_completion_with_client(
         self,
         client: Any,
-        prompt: str,
+        prompt: Union[str, List[Dict[str, Any]]],
         session: Any,
-    ) -> AsyncIterator[Dict[str, Any]]: ...
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Execute a turn against an existing backend client.
+
+        ``prompt`` may be either a plain string or a list of backend-native
+        input items. Backends that don't carry multimodal payloads natively
+        (Claude, OpenCode) should ignore the list shape; only Codex emits a
+        list, and only when the request body carried Codex-supported
+        multimodal parts.
+        """
+        ...
 
     def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]: ...
 

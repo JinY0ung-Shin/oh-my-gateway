@@ -56,6 +56,12 @@ JSON-RPC client instead of adding an unavailable package dependency.
 ## Supported Behavior
 
 - Text prompts and text responses are supported.
+- Responses `input_image` parts are forwarded to Codex as native image input
+  items when the request uses a Codex model.
+- `temperature` and `max_output_tokens` are forwarded to Codex `turn/start`
+  params as generation controls.
+- Gateway `allowed_tools`, `disallowed_tools`, `permission_mode`, and the
+  global `DISALLOWED_TOOLS` setting are enforced at Codex approval time.
 - Codex app-server command, file-change, and permission approval requests are
   exposed as Responses `requires_action` entries with the existing
   `AskUserQuestion` function-call shape. Send a matching
@@ -64,6 +70,9 @@ JSON-RPC client instead of adding an unavailable package dependency.
 - Command/file approvals accept Codex decision strings such as `accept`,
   `acceptForSession`, `decline`, and `cancel`. Short aliases like `yes`,
   `no`, and `always` are normalized by the gateway.
+- MCP server configuration is forwarded to Codex thread params; MCP approvals
+  honor both the `mcpToolCall` bucket and Claude-style
+  `mcp__<server>__*` / `mcp__<server>__<tool>` policy names.
 
 ## Current Limits
 
@@ -73,5 +82,6 @@ JSON-RPC client instead of adding an unavailable package dependency.
   environment changes between requests.
 - A Codex turn or approval transport error closes the shared app-server so the
   next request starts from a fresh process.
-- Image input is not exposed through the gateway Codex backend yet, even though
-  Codex app-server models may support images.
+- Codex app-server payload field names follow the current in-tree fixtures and
+  local CLI conventions; they should be rechecked when the Codex app-server
+  protocol changes.

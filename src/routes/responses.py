@@ -2,12 +2,13 @@
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import secrets
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
@@ -18,6 +19,7 @@ from src.message_adapter import MessageAdapter
 from src.auth import verify_api_key, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, ResolvedModel
+from src.backends.claude.client import UnsupportedContinuationPolicy
 from src.backends.claude.slash_commands import (
     SlashCommandError,
     validate_prompt as validate_slash_prompt,
@@ -416,6 +418,22 @@ async def _resolve_response_workspace(
     return workspace
 
 
+def _response_model_params(body: ResponseCreateRequest) -> Optional[Dict[str, Any]]:
+    """Collect OpenAI-style model overrides from the request body.
+
+    Returns ``None`` when the caller supplied no sampling/output-control
+    overrides so backends keep their existing defaults. Only fields the
+    Responses API natively exposes are forwarded; backends that can't honor
+    a given key are expected to ignore it.
+    """
+    params: Dict[str, Any] = {}
+    if body.temperature is not None:
+        params["temperature"] = body.temperature
+    if body.max_output_tokens is not None:
+        params["max_output_tokens"] = body.max_output_tokens
+    return params or None
+
+
 def _response_prompt_and_system(
     body: ResponseCreateRequest,
     workspace: Path,
@@ -429,6 +447,85 @@ def _response_prompt_and_system(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     return MessageAdapter.filter_content(prompt), system_prompt
+
+
+_CODEX_SUPPORTED_INPUT_PART_TYPES = frozenset({"input_image"})
+
+
+def _has_multimodal_input(body: ResponseCreateRequest) -> bool:
+    """True when the request carries an input part Codex can carry natively
+    (currently only ``input_image``).
+
+    Narrow on purpose: an unknown type alone would otherwise route us into
+    the multimodal branch and then drop out as an empty items list.
+    """
+    if isinstance(body.input, str):
+        return False
+    for item in body.input:
+        content = getattr(item, "content", None)
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            ptype = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if ptype in _CODEX_SUPPORTED_INPUT_PART_TYPES:
+                return True
+    return False
+
+
+def _response_input_to_codex_items(
+    body: ResponseCreateRequest,
+) -> tuple[list[Dict[str, Any]], Optional[str]]:
+    """Build a Codex turn-input items list from a Responses request.
+
+    Preserves the order of ``input_text`` and ``input_image`` parts inside
+    each message so multimodal turns keep the user's intended sequence. Plain
+    string inputs become a single text item. Unknown part types are skipped
+    (forward-compat with new Responses fields).
+    """
+    system_prompt, input_for_prompt = _split_response_input(body)
+
+    if isinstance(input_for_prompt, str):
+        text = input_for_prompt.strip()
+        items: list[Dict[str, Any]] = []
+        if text:
+            items.append({"type": "text", "text": text})
+        return items, system_prompt
+
+    items = []
+    for input_item in input_for_prompt:
+        content = getattr(input_item, "content", None)
+        if isinstance(content, str):
+            if content:
+                items.append({"type": "text", "text": content})
+            continue
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            ptype = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+            if ptype == "input_text":
+                text_value = (
+                    part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+                )
+                if text_value:
+                    items.append({"type": "text", "text": text_value})
+            elif ptype == "input_image":
+                image_url = (
+                    part.get("image_url")
+                    if isinstance(part, dict)
+                    else getattr(part, "image_url", None)
+                )
+                if not isinstance(image_url, str) or not image_url.strip():
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Codex multimodal input contains an empty image_url",
+                    )
+                # Use the Codex-native shape (``type=image`` / ``url``)
+                # matching the in-tree fixture
+                # tests/test_codex_backend.py multi-item case.
+                items.append({"type": "image", "url": image_url})
+            # Other / unknown part types are ignored — they'll be added as
+            # explicit cases when their Codex item shape is known.
+    return items, system_prompt
 
 
 async def _validate_backend_prompt(
@@ -468,6 +565,27 @@ async def _ensure_response_session_client(
 ) -> None:
     """Create the persistent backend client after session preflight has passed."""
     if session.client is not None:
+        update_policy = getattr(backend, "update_request_policy", None)
+        if callable(update_policy):
+            try:
+                result = update_policy(
+                    session.client,
+                    allowed_tools=body.allowed_tools,
+                    disallowed_tools=body.disallowed_tools,
+                    permission_mode=body.permission_mode,
+                    model_params=_response_model_params(body),
+                )
+                # Backends may implement update_request_policy as either a sync
+                # call (Codex) or an async one (Claude — needs SDK await). Await
+                # whichever shape comes back.
+                if inspect.iscoroutine(result):
+                    await result
+            except UnsupportedContinuationPolicy as exc:
+                # Backend explicitly signaled the continuation can't honor the
+                # requested policy change. Fail closed at the API boundary.
+                # Other exceptions (e.g. an SDK ValueError) propagate so they
+                # surface as 5xx instead of being misclassified as 400.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
         return
 
     from src.system_prompt import get_system_prompt, resolve_request_placeholders
@@ -481,11 +599,13 @@ async def _ensure_response_session_client(
             session=session,
             model=resolved.provider_model,
             system_prompt=system_prompt if is_new_session else None,
-            permission_mode=PERMISSION_MODE_BYPASS,
+            permission_mode=body.permission_mode or PERMISSION_MODE_BYPASS,
             allowed_tools=body.allowed_tools,
-            mcp_servers=get_mcp_servers() if resolved.backend == "claude" else None,
+            disallowed_tools=body.disallowed_tools,
+            mcp_servers=(get_mcp_servers() if resolved.backend in {"claude", "codex"} else None),
             cwd=workspace_str,
             extra_env=body.metadata,
+            model_params=_response_model_params(body),
             _custom_base=resolved_base,
         )
     except Exception:
@@ -500,6 +620,17 @@ async def _ensure_response_session_client(
 async def _unblock_pending_tool_call(
     session, backend: "BackendClient", fc_output: Dict[str, str]
 ) -> None:
+    """Validate the function_call_output and reserve the continuation.
+
+    On success the session lock is held by the caller and ``session
+    .input_response`` is stashed, but the SDK has NOT been woken yet —
+    ``pending_tool_call`` is still set and ``input_event`` has not been
+    fired. The caller is expected to call
+    :func:`_commit_pending_tool_call_locked` once any follow-up
+    invariants (e.g. mid-session policy refresh) have passed. This
+    split lets a rejected policy change fail closed before the SDK is
+    irreversibly resumed under the old policy.
+    """
     await session.lock.acquire()
     try:
         if session.pending_tool_call is None:
@@ -530,18 +661,29 @@ async def _unblock_pending_tool_call(
                 detail="function_call_output received but session has no active SDK client",
             )
 
-        session.input_response = fc_output["output"]
-        pending_event = session.input_event
-        if pending_event is None:
+        if session.input_event is None:
             raise HTTPException(
                 status_code=400,
                 detail="function_call_output received but session has no pending input event",
             )
-        pending_event.set()
-        session.pending_tool_call = None
+
+        session.input_response = fc_output["output"]
     except Exception:
         session.lock.release()
         raise
+
+
+def _commit_pending_tool_call_locked(session) -> None:
+    """Wake the SDK and clear pending state for a Claude continuation.
+
+    Caller must hold ``session.lock``. Pair with
+    :func:`_unblock_pending_tool_call` once mid-session policy refresh has
+    been accepted.
+    """
+    pending_event = session.input_event
+    if pending_event is not None:
+        pending_event.set()
+    session.pending_tool_call = None
 
 
 async def _prepare_opencode_tool_continuation(
@@ -714,8 +856,14 @@ def _store_opencode_pending_tool_call(
         if block.get("type") != "tool_use":
             continue
         tool_name = block.get("name")
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
-        input_value = block.get("input") if isinstance(block.get("input"), dict) else {}
+        metadata = cast(
+            Dict[str, Any],
+            block.get("metadata") if isinstance(block.get("metadata"), dict) else {},
+        )
+        input_value = cast(
+            Dict[str, Any],
+            block.get("input") if isinstance(block.get("input"), dict) else {},
+        )
         if tool_name == "question":
             request_id = metadata.get("opencode_question_request_id")
             if not isinstance(request_id, str) or not request_id:
@@ -768,7 +916,10 @@ def _is_codex_pending_approval_chunk(
             continue
         if block.get("type") != "tool_use" or block.get("name") != "codex_approval":
             continue
-        metadata = block.get("metadata") if isinstance(block.get("metadata"), dict) else {}
+        metadata = cast(
+            Dict[str, Any],
+            block.get("metadata") if isinstance(block.get("metadata"), dict) else {},
+        )
         request_id = metadata.get("codex_approval_request_id") or block.get("id")
         if str(request_id or "") == str(pending.get("call_id") or ""):
             return True
@@ -868,12 +1019,30 @@ async def create_response(
             body, resolved, backend, session, session_id, workspace_str, fc_output
         )
 
-    prompt, system_prompt = _response_prompt_and_system(body, workspace)
+    # Codex carries multimodal turns as a list of input items rather than a
+    # single collapsed text prompt. Build the list directly from the request
+    # body so we don't run through the disk-saving image_handler path (which
+    # rejects non-``data:`` URLs and would collapse the image into a text
+    # placeholder anyway).
+    if resolved.backend == "codex" and _has_multimodal_input(body):
+        codex_items, system_prompt = _response_input_to_codex_items(body)
+        if not codex_items:
+            # Defensive — _has_multimodal_input said yes but conversion
+            # produced nothing (e.g. an empty image_url). Fail at the API
+            # boundary instead of letting the backend reject an empty turn.
+            raise HTTPException(
+                status_code=400,
+                detail="Codex multimodal input produced no usable items",
+            )
+        prompt: Any = codex_items
+    else:
+        prompt, system_prompt = _response_prompt_and_system(body, workspace)
 
     # Reject slash-prefixed prompts that would be intercepted by the SDK as
     # unknown skills or run destructive built-ins.  Only applies to the Claude
     # backend; other backends pass through unchanged.
-    await _validate_backend_prompt(resolved, prompt, workspace_str)
+    if isinstance(prompt, str):
+        await _validate_backend_prompt(resolved, prompt, workspace_str)
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
@@ -1185,7 +1354,50 @@ async def _handle_function_call_output(
     elif resolved.backend == "codex":
         await _prepare_codex_approval_continuation(session, backend, fc_output)
     else:
+        # Claude path: validate + reserve, but DO NOT wake the SDK yet. We
+        # need to run policy refresh first so a rejected change can fail
+        # closed before the SDK is irreversibly resumed.
         await _unblock_pending_tool_call(session, backend, fc_output)
+
+    # Refresh per-request tool policy on the existing session client *after*
+    # validation has accepted the function_call_output, so an invalid
+    # continuation can't mutate session state. The prepare/unblock helpers
+    # above hand the session lock off to us on success, so any failure here
+    # must release it before raising — otherwise the lock leaks for the rest
+    # of the session.
+    policy_refresh_failed = False
+    if session.client is not None:
+        update_policy = getattr(backend, "update_request_policy", None)
+        if callable(update_policy):
+            try:
+                result = update_policy(
+                    session.client,
+                    allowed_tools=body.allowed_tools,
+                    disallowed_tools=body.disallowed_tools,
+                    permission_mode=body.permission_mode,
+                    model_params=_response_model_params(body),
+                )
+                if inspect.iscoroutine(result):
+                    await result
+            except UnsupportedContinuationPolicy as exc:
+                policy_refresh_failed = True
+                if session.lock.locked():
+                    session.lock.release()
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except Exception:
+                policy_refresh_failed = True
+                if session.lock.locked():
+                    session.lock.release()
+                raise
+
+    # All policy invariants passed — fire the irreversible Claude wake-up now
+    # that we know the next turn won't run under a rejected policy. OpenCode
+    # and Codex paths already committed their state inside their respective
+    # prepare/unblock helpers (their continuations don't carry
+    # UnsupportedContinuationPolicy semantics, so there's nothing to roll
+    # back).
+    if not policy_refresh_failed and resolved.backend not in {"opencode", "codex"}:
+        _commit_pending_tool_call_locked(session)
 
     # --- Stream continuation from the client ---
     next_turn = session.turn_counter + 1
@@ -1312,23 +1524,24 @@ async def _handle_function_call_output(
         # Resume the backend-specific pending tool request; do not start a
         # new prompt for continuation turns.
         _configure_client_streaming(active_client, False)
+        backend_with_resume = cast(Any, backend)
         if resolved.backend == "opencode":
             if opencode_resume_kind == "permission":
-                backend_source = backend.resume_permission_with_client(
+                backend_source = backend_with_resume.resume_permission_with_client(
                     active_client,
                     fc_output["call_id"],
                     fc_output["output"],
                     session,
                 )
             else:
-                backend_source = backend.resume_question_with_client(
+                backend_source = backend_with_resume.resume_question_with_client(
                     active_client,
                     fc_output["call_id"],
                     fc_output["output"],
                     session,
                 )
         elif resolved.backend == "codex":
-            backend_source = backend.resume_approval_with_client(
+            backend_source = backend_with_resume.resume_approval_with_client(
                 active_client,
                 fc_output["call_id"],
                 fc_output["output"],

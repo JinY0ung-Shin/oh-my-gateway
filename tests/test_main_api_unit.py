@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
@@ -249,8 +250,60 @@ def test_responses_dispatches_to_codex_backend_without_mcp():
 
     assert response.status_code == 200
     assert calls["create_client"]["model"] == "gpt-5.5"
-    assert calls["create_client"]["mcp_servers"] is None
+    # Codex now also receives the gateway MCP config; with no MCP_CONFIG env,
+    # the helper returns an empty dict (no servers configured).
+    assert calls["create_client"]["mcp_servers"] == {}
     assert calls["prompt"] == "hi"
+
+
+def test_responses_dispatches_to_codex_backend_with_configured_mcp_servers():
+    """A non-empty server MCP config is forwarded to the Codex backend."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {"type": "result", "subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    configured = {"fs": {"type": "stdio", "command": "fs-server"}}
+    with (
+        client_context() as (client, _mock_cli),
+        patch.object(responses_module, "get_mcp_servers", return_value=configured),
+    ):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    assert calls["create_client"]["mcp_servers"] == configured
 
 
 def test_responses_streaming_enables_opencode_event_streaming():
@@ -990,6 +1043,703 @@ def test_opencode_function_call_output_rejects_unknown_resume_kind(isolated_sess
 
     assert response.status_code == 400
     assert "Unsupported OpenCode resume kind" in response.json()["error"]["message"]
+
+
+def test_codex_responses_input_image_passes_multimodal_items_to_backend(
+    isolated_session_manager,
+):
+    """Codex requests with input_image must hand a multimodal items list to the backend,
+    not a single collapsed-string prompt.
+    """
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "look at this"},
+                            {
+                                "type": "input_image",
+                                "image_url": "https://example.com/foo.png",
+                            },
+                            {"type": "input_text", "text": "any thoughts?"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = calls.get("prompt")
+    assert isinstance(prompt, list), f"Codex should receive a list, got {type(prompt).__name__}"
+    # Order must be preserved (text, image, text).
+    assert prompt[0]["type"] == "text"
+    assert prompt[0]["text"] == "look at this"
+    assert prompt[1]["type"] in {"image", "input_image"}
+    assert (
+        prompt[1].get("image_url") == "https://example.com/foo.png"
+        or prompt[1].get("url") == "https://example.com/foo.png"
+    )
+    assert prompt[2]["type"] == "text"
+    assert prompt[2]["text"] == "any thoughts?"
+
+
+def test_codex_responses_input_image_uses_image_url_codex_item_shape(
+    isolated_session_manager,
+):
+    """Locked-in schema: route emits ``{type: image, url: ...}`` for Codex."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "see"},
+                            {
+                                "type": "input_image",
+                                "image_url": "https://example.com/x.png",
+                            },
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    prompt = calls["prompt"]
+    # Codex-native shape — matches the in-tree fixture in test_codex_backend.py.
+    image_items = [item for item in prompt if item["type"] == "image"]
+    assert image_items, f"no image item in {prompt!r}"
+    assert image_items[0]["url"] == "https://example.com/x.png"
+
+
+def test_codex_responses_unknown_only_input_part_does_not_take_multimodal_path(
+    isolated_session_manager,
+):
+    """If the only non-text part is an unknown type, fall back to the string path
+    (so we don't end up routing nothing to the backend).
+    """
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "hello"},
+                            {"type": "input_file", "file_id": "file_xyz"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    # No input_image part → fell back to string path.
+    assert isinstance(calls["prompt"], str)
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        [{"type": "input_image", "image_url": ""}],
+        [
+            {"type": "input_text", "text": "look"},
+            {"type": "input_image", "image_url": ""},
+        ],
+    ],
+)
+def test_codex_responses_empty_image_url_returns_400(isolated_session_manager, content):
+    """Multimodal request whose image_url is empty returns 400 from the route.
+
+    Also locks in: the backend is never reached (no create_client / run call)
+    and the response message names the problem.
+    """
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    create_calls: list = []
+    run_calls: list = []
+
+    async def create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        run_calls.append(prompt)
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": content,
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "empty image_url" in json.dumps(body)
+    assert not run_calls, "backend.run_completion_with_client was called for a 400 request"
+
+
+def test_codex_responses_input_file_only_falls_back_to_string_prompt(
+    isolated_session_manager,
+):
+    """A request whose only non-text part is unknown (e.g. input_file) takes the string path.
+
+    Regression guard for Bug #1: ``_has_multimodal_input`` must not return
+    True for unknown types, otherwise the request would go through the
+    Codex item branch and then be rejected as "no usable items".
+    """
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "input_file", "file_id": "file_xyz"},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 200
+    assert isinstance(calls["prompt"], str)
+
+
+def test_codex_responses_text_only_input_still_passes_string_prompt(
+    isolated_session_manager,
+):
+    """Codex text-only requests can stay as a string — no forced multimodal upgrade."""
+    calls = {}
+
+    def resolve(model):
+        if model == "codex/gpt-5.5":
+            return ResolvedModel(model, "codex", "gpt-5.5")
+        return None
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        calls["prompt"] = prompt
+        yield {"subtype": "success", "result": "ok"}
+
+    backend = MagicMock()
+    backend.name = "codex"
+    backend.create_client = create_client
+    backend.run_completion_with_client = run_completion_with_client
+    backend.parse_message.return_value = "ok"
+    backend.estimate_token_usage.return_value = {
+        "prompt_tokens": 1,
+        "completion_tokens": 1,
+        "total_tokens": 2,
+    }
+    BackendRegistry.register_descriptor(
+        BackendDescriptor(
+            name="codex",
+            owned_by="openai",
+            models=["codex/gpt-5.5"],
+            resolve_fn=resolve,
+        )
+    )
+    BackendRegistry.register("codex", backend)
+
+    with client_context() as (client, _mock_cli):
+        response = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "hi"},
+        )
+
+    assert response.status_code == 200
+    prompt = calls.get("prompt")
+    # Plain string input → backend still receives the original string. Codex's
+    # backend layer wraps it into a single text item internally.
+    assert isinstance(prompt, str)
+    assert prompt == "hi"
+
+
+def test_claude_previous_response_id_refreshes_permission_mode(isolated_session_manager):
+    """A Claude continuation with new permission_mode applies via update_request_policy."""
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    update_calls = []
+
+    async def fake_update_request_policy(
+        client,
+        *,
+        allowed_tools=None,
+        disallowed_tools=None,
+        permission_mode=None,
+        model_params=None,
+    ):
+        update_calls.append(
+            {
+                "client": client,
+                "allowed_tools": allowed_tools,
+                "disallowed_tools": disallowed_tools,
+                "permission_mode": permission_mode,
+                "model_params": model_params,
+            }
+        )
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "continued"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = fake_update_request_policy
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "continued"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert response.status_code == 200
+    assert update_calls
+    call = update_calls[0]
+    assert call["client"] is session.client
+    assert call["permission_mode"] == "acceptEdits"
+    # No tool list change requested -> backend sees None and is happy.
+    assert call["allowed_tools"] is None
+    assert call["disallowed_tools"] is None
+
+
+def test_claude_continuation_rejects_tool_list_change_with_400(isolated_session_manager):
+    """Claude can't apply mid-session tool list changes; reject with 400 (no silent drop)."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def reject_tool_list(client, *, allowed_tools=None, disallowed_tools=None, **_):
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy("tool list change not supported mid-session")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = reject_tool_list
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    payload_text = json.dumps(body)
+    assert "tool" in payload_text.lower()
+
+
+def test_claude_continuation_rejects_allowed_tools_change_with_400(isolated_session_manager):
+    """Same rejection applies to allowed_tools, not just disallowed_tools."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def reject_tool_list(client, *, allowed_tools=None, disallowed_tools=None, **_):
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy("tool list change not supported mid-session")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = reject_tool_list
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "allowed_tools": ["Read"],
+            },
+        )
+
+    assert response.status_code == 400
+
+
+def test_claude_function_call_output_rejects_tool_list_change_with_400(isolated_session_manager):
+    """function_call_output continuation rejects tool-list changes with 400.
+
+    Verifies the policy-rejection path actually fires (the helper validates
+    successfully, update_request_policy raises, the route surfaces 400, and
+    the SDK is NOT woken up — pending_tool_call remains set and the lock is
+    released so the session isn't wedged).
+    """
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+    session.input_event = asyncio.Event()
+    session.pending_tool_call = {
+        "call_id": "q1",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Continue?"},
+        "backend": "claude",
+    }
+
+    update_calls = []
+
+    async def reject_tool_list(client, *, allowed_tools=None, disallowed_tools=None, **_):
+        update_calls.append((allowed_tools, disallowed_tools))
+        if allowed_tools is not None or disallowed_tools is not None:
+            raise UnsupportedContinuationPolicy("tool list change not supported mid-session")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = reject_tool_list
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "input": [{"type": "function_call_output", "call_id": "q1", "output": "yes"}],
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert "tool" in json.dumps(body).lower()
+    # The policy update was actually invoked (not short-circuited by an
+    # earlier 400 such as "no pending input event").
+    assert update_calls, "update_request_policy was never called"
+    # The lock must be released so subsequent requests on this session work.
+    assert not session.lock.locked(), "session lock leaked after policy rejection"
+    # SDK must NOT have been woken with the rejected request.
+    assert not session.input_event.is_set(), "SDK was resumed despite rejected policy"
+    # Pending tool call should still be set — the continuation was aborted.
+    assert session.pending_tool_call is not None
+
+
+def test_claude_function_call_output_unrelated_exception_releases_lock(isolated_session_manager):
+    """A non-UnsupportedContinuationPolicy raise still releases the session lock and is not 400.
+
+    The Starlette TestClient re-raises uncaught exceptions out of ``client.post``,
+    so we wrap the call to confirm: the exception propagates (i.e. NOT
+    swallowed as 400) and the session lock + input_event are clean afterward.
+    """
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+    session.input_event = asyncio.Event()
+    session.pending_tool_call = {
+        "call_id": "q1",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Continue?"},
+        "backend": "claude",
+    }
+
+    async def boom(client, **kwargs):
+        raise RuntimeError("transient SDK failure")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = boom
+        with pytest.raises(RuntimeError, match="transient SDK failure"):
+            client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "previous_response_id": responses_module._make_response_id(session_id, 1),
+                    "input": [{"type": "function_call_output", "call_id": "q1", "output": "yes"}],
+                    "permission_mode": "acceptEdits",
+                },
+            )
+
+    assert not session.lock.locked(), "session lock leaked after SDK failure"
+    assert not session.input_event.is_set()
+
+
+def test_claude_continuation_sdk_value_error_is_not_misclassified_as_400(isolated_session_manager):
+    """An unrelated ValueError from the SDK propagates as 5xx, not a 400 misclassification."""
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def sdk_value_error(client, **kwargs):
+        # Some unrelated ValueError from deeper in the SDK — must NOT be
+        # mistaken for an "unsupported policy" client error.
+        raise ValueError("internal SDK invariant violated")
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = sdk_value_error
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    # Not a client-side limitation; should surface as a server error, not 400.
+    assert response.status_code >= 500
+    assert response.status_code != 400
+
+
+def test_claude_continuation_permission_mode_sdk_failure_fails_closed(isolated_session_manager):
+    """When the Claude SDK rejects a permission_mode update, the request fails closed (400/503),
+    not silently runs with the old (potentially weaker) mode.
+    """
+    session_id = str(uuid.uuid4())
+    session = isolated_session_manager.get_or_create_session(session_id)
+    session.backend = "claude"
+    session.turn_counter = 1
+    session.client = object()
+
+    async def failing_update_request_policy(client, **kwargs):
+        # Simulate Claude SDK rejecting the mid-session update.
+        raise RuntimeError("Claude SDK refused permission_mode change")
+
+    async def fake_run_with_client(client, prompt, session):
+        # Should never run if update fails closed.
+        yield {"subtype": "success", "result": "should-not-appear"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.update_request_policy = failing_update_request_policy
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "should-not-appear"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "follow up",
+                "previous_response_id": responses_module._make_response_id(session_id, 1),
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    # Either 400 (client-facing limitation) or 5xx (backend error) is fine —
+    # what matters is it does NOT return 200 with stale-mode output.
+    assert response.status_code >= 400
 
 
 def test_opencode_permission_arguments_describe_empty_patterns_and_always():
@@ -1773,6 +2523,105 @@ def test_responses_create_client_forwards_allowed_tools(isolated_session_manager
 
     assert response.status_code == 200
     assert create_calls[0]["allowed_tools"] == ["Read"]
+
+
+def test_responses_create_client_forwards_model_params(isolated_session_manager):
+    """temperature and max_output_tokens from the request body land in model_params."""
+    create_calls = []
+
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "ok"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "ok"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello",
+                "temperature": 0.42,
+                "max_output_tokens": 256,
+            },
+        )
+
+    assert response.status_code == 200
+    assert create_calls[0]["model_params"] == {
+        "temperature": 0.42,
+        "max_output_tokens": 256,
+    }
+
+
+def test_responses_create_client_omits_model_params_when_unset(isolated_session_manager):
+    """Bodies without sampling overrides pass model_params=None (backend defaults stand)."""
+    create_calls = []
+
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "ok"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "ok"
+
+        response = client.post(
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "Hello"},
+        )
+
+    assert response.status_code == 200
+    assert create_calls[0]["model_params"] is None
+
+
+def test_responses_create_client_forwards_disallowed_tools(isolated_session_manager):
+    """disallowed_tools from the request body flows through to create_client."""
+    create_calls = []
+
+    async def fake_create_client(**kwargs):
+        create_calls.append(kwargs)
+        return object()
+
+    async def fake_run_with_client(client, prompt, session):
+        yield {"subtype": "success", "result": "ok"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = fake_create_client
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "ok"
+
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "Hello",
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 200
+    assert create_calls[0]["disallowed_tools"] == ["Bash"]
 
 
 def test_responses_streaming_error_disconnects_persistent_client(isolated_session_manager):

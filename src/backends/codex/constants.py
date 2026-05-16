@@ -48,5 +48,10 @@ def sandbox_mode() -> str:
     return legacy_aliases.get(raw, raw)
 
 
+def disallowed_tools_from_env() -> list[str]:
+    """Read DISALLOWED_TOOLS env (shared with Claude backend) for hard-block tool names."""
+    return _parse_csv(os.getenv("DISALLOWED_TOOLS", ""))
+
+
 CODEX_PROVIDER_MODELS = configured_provider_models()
 CODEX_MODELS = configured_public_models()

@@ -228,7 +228,8 @@ async def test_codex_client_starts_thread_and_converts_completed_turn(monkeypatc
         },
     }
     assert chunks[-2]["content"] == [{"type": "text", "text": "Hello from Codex"}]
-    assert chunks[-2]["usage"] == {"input_tokens": 3, "output_tokens": 4}
+    # outputTokens=4 + reasoningOutputTokens=1; reasoning tokens are rolled into output.
+    assert chunks[-2]["usage"] == {"input_tokens": 3, "output_tokens": 5}
     assert chunks[-1]["type"] == "result"
     assert chunks[-1]["result"] == "Hello from Codex"
     assert backend.parse_message(chunks) == "Hello from Codex"
@@ -570,6 +571,1110 @@ def test_codex_client_logs_unrecognized_structured_approval_output(caplog):
     assert "{'foo': 1}" in caplog.text
 
 
+def _command_approval_notifications(*, request_id: str = "approval_1", command: str = "ls"):
+    return [
+        {
+            "id": request_id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "cmd_1",
+                "command": command,
+                "availableDecisions": ["accept", "decline"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+
+def _file_change_approval_notifications(*, request_id: str = "approval_1"):
+    return [
+        {
+            "id": request_id,
+            "method": "item/fileChange/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "file_1",
+                "grantRoot": "/repo",
+                "availableDecisions": ["accept", "decline"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+
+def _collect_approval_tool_uses(chunks):
+    return [
+        block
+        for chunk in chunks
+        if chunk.get("type") == "assistant"
+        for block in chunk.get("content", [])
+        if block.get("type") == "tool_use" and block.get("name") == "codex_approval"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_blocks_bash_command_approval(monkeypatch):
+    """When ``Bash`` is in disallowed_tools, commandExecution approvals are auto-denied."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications(command="rm -rf /")
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["Bash"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_accepts_codex_native_command_name(monkeypatch):
+    """``commandExecution`` (Codex-native name) in disallowed_tools auto-denies command approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["commandExecution"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("alias", ["Edit", "Write", "NotebookEdit", "fileChange"])
+async def test_codex_disallowed_tools_blocks_file_change_approval(monkeypatch, alias):
+    """Any of Edit/Write/NotebookEdit (or Codex-native fileChange) auto-denies fileChange approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _file_change_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=[alias],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_does_not_affect_permissions_approval(monkeypatch):
+    """Permissions approvals are not gated by tool name lists (they request scope, not tools)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "id": "approval_1",
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "perm_1",
+                "permissions": {"fileSystem": {"read": ["/repo"]}},
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["Bash", "Edit"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    # Permission approval bubbles to user — no auto-deny via respond_calls
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
+    assert session.pending_tool_call is not None
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_whitelist_blocks_unlisted_command(monkeypatch):
+    """allowed_tools whitelist mode auto-denies approvals not in the list."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    # allowed contains only Edit (fileChange) — command should be blocked.
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["Edit"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_whitelist_lets_listed_approval_bubble(monkeypatch):
+    """allowed_tools whitelist mode still lets listed tools surface as user approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["Bash"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
+    assert session.pending_tool_call is not None
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_global_glob_does_not_bypass_whitelist(monkeypatch):
+    """Only MCP policy names support glob matching; '*' must not allow every tool."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["*"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
+async def test_codex_permission_mode_bypass_overrides_thread_approval_policy(monkeypatch):
+    """permission_mode='bypassPermissions' sets Codex approvalPolicy='never' at thread start."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv(
+        "CODEX_APPROVAL_POLICY", "on-request"
+    )  # env says ask; permission_mode overrides
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+    )
+
+    assert fake_rpc.thread_start_calls
+    assert fake_rpc.thread_start_calls[0]["approvalPolicy"] == "never"
+
+
+@pytest.mark.asyncio
+async def test_codex_permission_mode_default_maps_to_on_request(monkeypatch):
+    """permission_mode='default' maps to Codex approvalPolicy='on-request' even if env says 'never'."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="default",
+    )
+
+    assert fake_rpc.thread_start_calls
+    assert fake_rpc.thread_start_calls[0]["approvalPolicy"] == "on-request"
+
+
+@pytest.mark.asyncio
+async def test_codex_permission_mode_propagates_to_turn_params(monkeypatch):
+    """permission_mode affects turn/start approvalPolicy too (per-turn override)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "on-request")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+    )
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert fake_rpc.turn_start_calls
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert turn_params["approvalPolicy"] == "never"
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_forces_approval_policy_off_never(monkeypatch):
+    """Setting disallowed_tools must upgrade approvalPolicy=never to on-request so Codex emits approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.delenv("CODEX_APPROVAL_POLICY", raising=False)  # defaults to "never"
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+        disallowed_tools=["Bash"],
+    )
+
+    assert fake_rpc.thread_start_calls
+    policy = fake_rpc.thread_start_calls[0]["approvalPolicy"]
+    assert policy != "never", (
+        f"approvalPolicy must not be 'never' when disallowed_tools is set "
+        f"(otherwise Codex skips approval emission and enforcement is bypassed); got {policy!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_forces_approval_policy_off_never(monkeypatch):
+    """allowed_tools whitelist also upgrades approvalPolicy off 'never' so enforcement runs."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+        allowed_tools=["Edit"],
+    )
+
+    assert fake_rpc.thread_start_calls
+    policy = fake_rpc.thread_start_calls[0]["approvalPolicy"]
+    assert policy != "never", (
+        f"approvalPolicy must not be 'never' when allowed_tools is set; got {policy!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_env_forces_approval_policy_off_never(monkeypatch):
+    """Global DISALLOWED_TOOLS env also upgrades approvalPolicy so enforcement runs."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")
+    monkeypatch.setenv("DISALLOWED_TOOLS", "Bash")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+    )
+
+    assert fake_rpc.thread_start_calls
+    policy = fake_rpc.thread_start_calls[0]["approvalPolicy"]
+    assert policy != "never", f"got {policy!r}"
+
+
+@pytest.mark.asyncio
+async def test_codex_no_tool_policy_keeps_never_approval_policy(monkeypatch):
+    """Without any tool policy, approvalPolicy still resolves to 'never' (no unsolicited upgrade)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+    )
+
+    assert fake_rpc.thread_start_calls
+    assert fake_rpc.thread_start_calls[0]["approvalPolicy"] == "never"
+
+
+@pytest.mark.asyncio
+async def test_codex_accept_edits_auto_accepts_file_change_approval(monkeypatch):
+    """permission_mode='acceptEdits' auto-accepts fileChange approvals (Claude parity)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _file_change_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="acceptEdits",
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "accept"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
+async def test_codex_accept_edits_still_bubbles_command_approval(monkeypatch):
+    """acceptEdits only auto-accepts fileChange; commandExecution still asks the user."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="acceptEdits",
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    # No auto-respond; the command approval bubbles to the user as a tool_use.
+    assert fake_rpc.respond_calls == []
+    approvals = _collect_approval_tool_uses(chunks)
+    assert len(approvals) == 1
+    assert session.pending_tool_call is not None
+
+
+@pytest.mark.asyncio
+async def test_codex_accept_edits_respects_disallowed_file_change(monkeypatch):
+    """Disallowing fileChange takes precedence over acceptEdits (deny > accept)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _file_change_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="acceptEdits",
+        disallowed_tools=["fileChange"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    # Disallowed wins; reject even though acceptEdits would normally accept.
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_accept_edits_does_not_accept_permissions_approval(monkeypatch):
+    """acceptEdits is fileChange-specific; permissions approvals still bubble."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "id": "approval_1",
+            "method": "item/permissions/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "perm_1",
+                "permissions": {"fileSystem": {"read": ["/repo"]}},
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="acceptEdits",
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_no_permission_mode_falls_back_to_env(monkeypatch):
+    """When permission_mode is None, approvalPolicy still comes from CODEX_APPROVAL_POLICY env."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "on-request")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(session=session, model="gpt-5.5")
+
+    assert fake_rpc.thread_start_calls
+    assert fake_rpc.thread_start_calls[0]["approvalPolicy"] == "on-request"
+
+
+@pytest.mark.asyncio
+async def test_codex_global_disallowed_tools_env_blocks_command(monkeypatch):
+    """The DISALLOWED_TOOLS env var hard-blocks approvals even without per-request setting."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("DISALLOWED_TOOLS", "Bash")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_global_disallowed_tools_merges_with_per_request(monkeypatch):
+    """env DISALLOWED_TOOLS and per-request disallowed_tools both apply (union semantics)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _file_change_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("DISALLOWED_TOOLS", "Bash")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    # Env blocks Bash; per-request blocks Edit. The file change request should be auto-denied
+    # because Edit is listed per-request.
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["Edit"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+def _mcp_tool_call_approval_notifications(
+    *,
+    request_id: str = "approval_1",
+    server_label: str = "fs",
+    tool_name: str = "read_file",
+):
+    return [
+        {
+            "id": request_id,
+            "method": "item/mcpToolCall/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "mcp_1",
+                "serverLabel": server_label,
+                "toolName": tool_name,
+                "availableDecisions": ["accept", "decline"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+
+def _dynamic_tool_call_approval_notifications(*, request_id: str = "approval_1"):
+    return [
+        {
+            "id": request_id,
+            "method": "item/dynamicToolCall/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "dyn_1",
+                "toolName": "search",
+                "availableDecisions": ["accept", "decline"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_blocks_mcp_tool_call_approval(monkeypatch):
+    """disallowed_tools containing 'mcpToolCall' auto-denies MCP tool approval requests."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["mcpToolCall"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_blocks_mcp_exact_tool_pattern(monkeypatch):
+    """Claude-style MCP tool names must block matching Codex MCP approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["mcp__fs__read_file"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_blocks_dynamic_tool_call_approval(monkeypatch):
+    """disallowed_tools containing 'dynamicToolCall' auto-denies dynamic tool approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _dynamic_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["dynamicToolCall"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_whitelist_blocks_mcp_when_not_listed(monkeypatch):
+    """allowed_tools whitelist auto-denies MCP approvals that aren't listed."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["Bash"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_mcp_server_pattern_allows_matching_approval(monkeypatch):
+    """Claude-style MCP server wildcards should allow matching Codex MCP approvals."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["mcp__fs__*"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
+    assert session.pending_tool_call is not None
+
+
+@pytest.mark.asyncio
+async def test_codex_allowed_tools_mcp_pattern_normalizes_hyphenated_server(monkeypatch):
+    """MCP patterns use Claude's hyphen-to-underscore server-name convention."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _mcp_tool_call_approval_notifications(server_label="my-server")
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=["mcp__my_server__*"],
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    assert len(_collect_approval_tool_uses(chunks)) == 1
+
+
+@pytest.mark.asyncio
+async def test_codex_empty_allowed_tools_blocks_all_command_approvals(monkeypatch):
+    """allowed_tools=[] is an explicit block-all whitelist (distinct from None / unset)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = _command_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        allowed_tools=[],  # explicit empty list = block everything
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "decline"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_empty_allowed_tools_forces_approval_policy_off_never(monkeypatch):
+    """allowed_tools=[] is a real policy and upgrades approvalPolicy off 'never'."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="bypassPermissions",
+        allowed_tools=[],
+    )
+
+    assert fake_rpc.thread_start_calls
+    assert fake_rpc.thread_start_calls[0]["approvalPolicy"] != "never"
+
+
+@pytest.mark.asyncio
+async def test_codex_permission_mode_update_takes_effect_on_next_turn(monkeypatch):
+    """Updating permission_mode mid-session changes the next turn's approval semantics."""
+    fake_rpc = FakeRpc()
+    # First call: no notifications needed (we just construct the client).
+    # Second call: fileChange approval that should be auto-accepted after switch.
+    fake_rpc.notifications = _file_change_approval_notifications()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="default",  # initially: bubble approvals
+    )
+
+    backend.update_request_policy(client, permission_mode="acceptEdits")
+    assert client.permission_mode == "acceptEdits"
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == [("approval_1", {"decision": "accept"})]
+    assert _collect_approval_tool_uses(chunks) == []
+
+
+@pytest.mark.asyncio
+async def test_codex_update_request_policy_replaces_permission_mode(monkeypatch):
+    """update_request_policy refreshes permission_mode so continuation requests can change it."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session")
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="default",
+    )
+    assert client.permission_mode == "default"
+
+    backend.update_request_policy(client, permission_mode="acceptEdits")
+    assert client.permission_mode == "acceptEdits"
+
+
+@pytest.mark.asyncio
+async def test_codex_update_request_policy_preserves_permission_mode_when_omitted(monkeypatch):
+    """Omitting permission_mode in update_request_policy keeps the existing value."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session")
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="acceptEdits",
+    )
+
+    backend.update_request_policy(client, disallowed_tools=["Bash"])
+    assert client.permission_mode == "acceptEdits"
+
+
+@pytest.mark.asyncio
+async def test_codex_unknown_permission_mode_uses_safe_on_request(monkeypatch, caplog):
+    """Unknown permission_mode strings fall back to a safe ``on-request``, not env=never.
+
+    Falling back to env=never would let a typo silently disable approval-time
+    enforcement. Use a safe explicit default instead, and warn so operators see
+    the malformed input.
+    """
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+    monkeypatch.setenv("CODEX_APPROVAL_POLICY", "never")  # operator default
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    with caplog.at_level("WARNING", logger="src.backends.codex.client"):
+        await backend.create_client(
+            session=session,
+            model="gpt-5.5",
+            permission_mode="definitely-invalid-mode",
+        )
+
+    assert fake_rpc.thread_start_calls
+    assert fake_rpc.thread_start_calls[0]["approvalPolicy"] == "on-request"
+    assert "unknown permission_mode" in caplog.text.lower()
+    assert "definitely-invalid-mode" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("expected_method", "notifications_fn"),
+    [
+        ("item/mcpToolCall/requestApproval", _mcp_tool_call_approval_notifications),
+        ("item/dynamicToolCall/requestApproval", _dynamic_tool_call_approval_notifications),
+    ],
+)
+async def test_codex_accept_edits_does_not_accept_non_file_tool_calls(
+    monkeypatch, expected_method, notifications_fn
+):
+    """acceptEdits is fileChange-only; mcpToolCall and dynamicToolCall still bubble."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = notifications_fn()
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        permission_mode="acceptEdits",
+    )
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+
+    assert fake_rpc.respond_calls == []
+    approvals = _collect_approval_tool_uses(chunks)
+    assert len(approvals) == 1
+    # Anchor the regression: the bubbled tool_use must come from the expected method.
+    assert approvals[0]["metadata"]["codex_approval_method"] == expected_method
+
+
+@pytest.mark.asyncio
+async def test_codex_update_request_policy_replaces_session_tool_lists(monkeypatch):
+    """update_request_policy() lets continuation requests refresh per-request tool policy."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session")
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["Bash"],
+    )
+    assert client.disallowed_tools == ["Bash"]
+    assert client.allowed_tools is None
+
+    backend.update_request_policy(
+        client,
+        allowed_tools=["Edit"],
+        disallowed_tools=["Write"],
+    )
+    assert client.allowed_tools == ["Edit"]
+    assert client.disallowed_tools == ["Write"]
+
+
+@pytest.mark.asyncio
+async def test_codex_update_request_policy_clears_with_none(monkeypatch):
+    """Passing None explicitly clears a previously-set policy field."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session")
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["Bash"],
+        allowed_tools=["Edit"],
+    )
+
+    backend.update_request_policy(client, allowed_tools=None, disallowed_tools=None)
+    assert client.allowed_tools is None
+    assert client.disallowed_tools is None
+
+
+@pytest.mark.asyncio
+async def test_codex_disallowed_tools_applies_on_approval_resume(monkeypatch):
+    """Auto-deny policy applies to approvals surfaced during approval-resume turns."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "serverRequest/resolved",
+            "params": {"threadId": "thr_codex", "requestId": "approval_0"},
+        },
+        {
+            "id": "approval_1",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "itemId": "cmd_2",
+                "command": "rm -rf /",
+                "availableDecisions": ["accept", "decline"],
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        disallowed_tools=["Bash"],
+    )
+    client.pending_approval_request_id = "approval_0"
+    client.pending_approval_method = "item/commandExecution/requestApproval"
+    client.pending_approval_turn_id = "turn_1"
+    client.pending_approval_params = {"turnId": "turn_1"}
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            client, "approval_0", "accept", session
+        )
+    ]
+
+    # First respond is the user's "accept" for approval_0; second is the auto-deny for approval_1.
+    assert fake_rpc.respond_calls == [
+        ("approval_0", {"decision": "accept"}),
+        ("approval_1", {"decision": "decline"}),
+    ]
+    assert _collect_approval_tool_uses(chunks) == []
+    assert session.pending_tool_call is None
+
+
 @pytest.mark.asyncio
 async def test_codex_client_resumes_command_approval_and_continues_turn(monkeypatch):
     """Codex approval continuation responds to app-server and reads remaining events."""
@@ -815,7 +1920,12 @@ async def test_codex_client_closes_rpc_when_thread_start_fails(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
-    """Transport failures close the shared app-server so the next request restarts it."""
+    """If turn/start fails on every attempt, the shared RPC is left closed so the next request restarts it.
+
+    With the conservative in-request retry path, a persistent transport failure
+    burns through both attempts and surfaces an error chunk; the dead shared
+    RPC must still be cleared so a *subsequent* request brings up a fresh one.
+    """
 
     class FailingTurnRpc(FakeRpc):
         def turn_start(self, thread_id, input_items, params):
@@ -825,7 +1935,7 @@ async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
     created = []
 
     def fake_factory(**kwargs):
-        rpc = FailingTurnRpc() if not created else FakeRpc()
+        rpc = FailingTurnRpc()
         created.append(rpc)
         return rpc
 
@@ -839,13 +1949,732 @@ async def test_codex_client_restarts_shared_rpc_after_turn_error(monkeypatch):
 
     chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
 
-    assert chunks == [{"type": "error", "is_error": True, "error_message": "transport failed"}]
-    assert created[0].closed is True
+    # The user sees a final error chunk after retry exhausts.
+    assert chunks[-1] == {
+        "type": "error",
+        "is_error": True,
+        "error_message": "transport failed",
+    }
+    # Each failing RPC instance was closed.
+    for rpc in created:
+        assert rpc.closed is True
 
+    # A subsequent create_client constructs a fresh RPC (the dead shared one was cleared).
+    fresh_count_before = len(created)
     await backend.create_client(session=SimpleNamespace(session_id="gw-session-2"), model="gpt-5.5")
+    assert len(created) == fresh_count_before + 1
 
-    assert len(created) == 2
-    assert created[1].closed is False
+
+@pytest.mark.asyncio
+async def test_codex_client_retries_turn_start_once_after_rpc_transport_error_before_turn_is_accepted(
+    monkeypatch,
+):
+    """A transport error on turn/start (before any output is yielded) triggers exactly one retry.
+
+    Scenario:
+      1. First RPC accepts thread_start during create_client.
+      2. turn_start raises a transport error.
+      3. The first RPC is closed; a fresh RPC is started.
+      4. The new RPC restores the same thread via thread_resume, then turn_start
+         succeeds and the turn completes normally — the user sees a successful
+         result, not an error chunk.
+    """
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingTurnStartRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise CodexAppServerError("transport failed during turn/start")
+
+    def factory(**kwargs):
+        if not rpcs:
+            rpc = FailingTurnStartRpc()
+        else:
+            rpc = FakeRpc()
+            rpc.notifications = [
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "turn": {"id": "turn_1", "status": "completed", "items": []},
+                    },
+                },
+            ]
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # Two RPCs were created total (initial + retry).
+    assert len(rpcs) == 2
+    # First RPC was closed when its turn_start failed.
+    assert rpcs[0].closed is True
+    # Second RPC re-established the same thread before retrying turn_start.
+    assert rpcs[1].thread_resume_calls
+    assert rpcs[1].thread_resume_calls[0][0] == "thr_codex"
+    assert len(rpcs[1].turn_start_calls) == 1
+    # The user-visible output is a normal result, not an error chunk.
+    assert not any(c.get("is_error") for c in chunks)
+    assert chunks[-1]["type"] == "result"
+
+
+@pytest.mark.asyncio
+async def test_codex_client_does_not_retry_after_partial_output(monkeypatch):
+    """Once any chunk has been yielded for a turn, errors no longer trigger a retry.
+
+    The first RPC accepts turn_start and emits one delta; the next read raises
+    a transport error. Because output was already sent to the user, the gateway
+    must surface an error chunk rather than silently re-running the turn (which
+    would risk duplicate side effects on the app-server side).
+    """
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+    consume_count = [0]
+
+    class FailingMidStreamRpc(FakeRpc):
+        def next_notification(self):
+            consume_count[0] += 1
+            if consume_count[0] == 1:
+                return {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "itemId": "item_1",
+                        "delta": "partial",
+                    },
+                }
+            raise CodexAppServerError("transport failed mid-stream")
+
+    def factory(**kwargs):
+        if not rpcs:
+            rpc = FailingMidStreamRpc()
+        else:
+            # If we did retry, the second RPC would be used here.
+            rpc = FakeRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # No retry: only one RPC was ever created.
+    assert len(rpcs) == 1
+    # The partial delta was delivered, then an error chunk closes the turn.
+    assert any(c.get("type") == "stream_event" for c in chunks)
+    assert chunks[-1] == {
+        "type": "error",
+        "is_error": True,
+        "error_message": "transport failed mid-stream",
+    }
+
+
+@pytest.mark.asyncio
+async def test_codex_client_does_not_retry_when_turn_start_queued_notifications_before_failing(
+    monkeypatch,
+):
+    """If the app-server queued a notification for this turn before the transport
+    error, treat the turn as possibly accepted and skip retry to avoid duplicate
+    side effects on the app-server side.
+    """
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class QueuesThenFailsRpc(FakeRpc):
+        def __init__(self):
+            super().__init__()
+            self._pending_notifications: list = []
+
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            # Simulate the JSON-RPC client having buffered an inbound notification
+            # for this turn before the transport went down.
+            self._pending_notifications.append(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "item": {"type": "commandExecution", "id": "cmd_1"},
+                    },
+                }
+            )
+            raise CodexAppServerError("transport failed after queuing notification")
+
+    def factory(**kwargs):
+        rpc = QueuesThenFailsRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # Only the original RPC was used — no retry, because queuing implies the
+    # app-server may have already started executing the turn.
+    assert len(rpcs) == 1
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_client_thread_resume_failure_on_retry_surfaces_error(monkeypatch):
+    """thread_resume failing on the retry attempt is treated as the retry failure."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingRpc(FakeRpc):
+        def __init__(self, fail_turn_start=False, fail_resume=False):
+            super().__init__()
+            self._fail_turn_start = fail_turn_start
+            self._fail_resume = fail_resume
+
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            if self._fail_turn_start:
+                raise CodexAppServerError("turn/start transport failed")
+            return {"turn": {"id": "turn_1", "status": "inProgress"}}
+
+        def thread_resume(self, thread_id, params):
+            self.thread_resume_calls.append((thread_id, params))
+            if self._fail_resume:
+                raise CodexAppServerError("thread/resume transport failed")
+            return {"thread": {"id": thread_id}}
+
+    def factory(**kwargs):
+        if not rpcs:
+            # initial RPC: thread_start fine (FakeRpc default), turn/start blows up.
+            rpc = FailingRpc(fail_turn_start=True)
+        else:
+            # retry RPC: thread/resume also blows up before we even reach turn/start.
+            rpc = FailingRpc(fail_resume=True)
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert len(rpcs) == 2
+    assert rpcs[1].thread_resume_calls  # we tried to recover, but resume blew up
+    assert chunks[-1]["type"] == "error"
+    assert "thread/resume transport failed" in chunks[-1]["error_message"]
+
+
+@pytest.mark.asyncio
+async def test_codex_client_session_rpc_field_is_refreshed_after_successful_retry(monkeypatch):
+    """``CodexSessionClient.rpc`` points at the live RPC after retry recovery."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingFirstTurnRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise CodexAppServerError("first attempt failed")
+
+    def factory(**kwargs):
+        if not rpcs:
+            rpc = FailingFirstTurnRpc()
+        else:
+            rpc = FakeRpc()
+            rpc.notifications = [
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thr_codex",
+                        "turnId": "turn_1",
+                        "turn": {"id": "turn_1", "status": "completed", "items": []},
+                    },
+                }
+            ]
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    assert client.rpc is rpcs[0]
+
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # After successful retry, the session client should track the live RPC.
+    assert client.rpc is rpcs[1]
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_approval_fails_fast_through_full_approval_flow(monkeypatch):
+    """End-to-end variant: the pending RPC field is populated by the real
+    ``_store_pending_approval`` path (not test-set), then a transport reset
+    swaps the shared RPC. resume_approval must surface a transport-lost error.
+    """
+    from src.backends.codex.client import CodexClient
+
+    rpcs = []
+
+    def factory(**kwargs):
+        rpc = FakeRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    # Run a turn whose only notification is a command approval; this exercises
+    # the real _store_pending_approval path (including pending_approval_rpc).
+    rpcs[0].notifications = _command_approval_notifications()
+    [chunk async for chunk in backend.run_completion_with_client(client, "test", session)]
+    assert client.pending_approval_rpc is rpcs[0]
+    assert session.pending_tool_call is not None
+
+    # Simulate a transport reset between approval and user response.
+    await backend._close_rpc_locked()
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            client, "approval_1", "accept", session
+        )
+    ]
+
+    assert chunks
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+    assert "transport" in chunks[-1]["error_message"].lower()
+    # Pending state is cleared so subsequent operations don't see stale data.
+    assert client.pending_approval_rpc is None
+    assert client.pending_approval_request_id is None
+
+
+@pytest.mark.asyncio
+async def test_codex_resume_approval_fails_fast_when_pending_rpc_is_gone(monkeypatch):
+    """If the RPC that received the approval request is gone, fail fast with a clear error.
+
+    A transport-level reset between an approval being surfaced and the user's
+    response means the new RPC has no record of the pending approval; trying
+    to ``rpc.respond`` would either silently drop the message or hit a server
+    that has no idea what we're talking about.
+    """
+    from src.backends.codex.client import CodexClient
+
+    fake_rpc_a = FakeRpc()
+    fake_rpc_b = FakeRpc()
+    rpcs = [fake_rpc_a, fake_rpc_b]
+
+    def factory(**kwargs):
+        # Pop in order: A for create_client, B for the post-failure recovery.
+        if rpcs:
+            return rpcs.pop(0)
+        return FakeRpc()
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    # Pretend an approval was surfaced on the original RPC.
+    client.pending_approval_request_id = "approval_1"
+    client.pending_approval_method = "item/commandExecution/requestApproval"
+    client.pending_approval_turn_id = "turn_1"
+    client.pending_approval_params = {"turnId": "turn_1"}
+    client.pending_approval_rpc = fake_rpc_a
+
+    # Simulate transport reset between approval and user response: shared RPC
+    # was closed and replaced by ``fake_rpc_b``.
+    await backend._close_rpc_locked()
+
+    chunks = [
+        chunk
+        async for chunk in backend.resume_approval_with_client(
+            client, "approval_1", "accept", session
+        )
+    ]
+
+    assert chunks
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+    assert (
+        "transport" in chunks[-1]["error_message"].lower()
+        or "lost" in chunks[-1]["error_message"].lower()
+    )
+
+
+@pytest.mark.asyncio
+async def test_codex_client_does_not_retry_when_retry_also_fails(monkeypatch):
+    """If the retry also raises, the gateway gives up and surfaces an error."""
+    from src.backends.codex.client import CodexAppServerError, CodexClient
+
+    rpcs = []
+
+    class FailingTurnStartRpc(FakeRpc):
+        def turn_start(self, thread_id, input_items, params):
+            self.turn_start_calls.append((thread_id, input_items, params))
+            raise CodexAppServerError("transport failed again")
+
+    def factory(**kwargs):
+        rpc = FailingTurnStartRpc()
+        rpcs.append(rpc)
+        return rpc
+
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", factory)
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    # Initial RPC + one retry attempt = 2 RPCs created.
+    assert len(rpcs) == 2
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_client_forwards_response_model_params_to_turn_start(monkeypatch):
+    """temperature and max_output_tokens flow into the Codex turn/start payload."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        model_params={"temperature": 0.3, "max_output_tokens": 1024},
+    )
+
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    assert fake_rpc.turn_start_calls
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert turn_params.get("temperature") == 0.3
+    assert turn_params.get("maxOutputTokens") == 1024
+
+
+@pytest.mark.asyncio
+async def test_codex_client_omits_model_params_when_unset(monkeypatch):
+    """When no model_params are provided, turn/start payload stays minimal (no defaults injected)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert "temperature" not in turn_params
+    assert "maxOutputTokens" not in turn_params
+
+
+@pytest.mark.asyncio
+async def test_codex_client_translates_legacy_max_tokens_alias(monkeypatch):
+    """The OpenAI 'max_tokens' alias maps to Codex maxOutputTokens for compatibility."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        model_params={"max_tokens": 512},
+    )
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert turn_params.get("maxOutputTokens") == 512
+
+
+@pytest.mark.asyncio
+async def test_codex_client_drops_none_model_param_values(monkeypatch):
+    """None values in model_params are skipped (so Responses bodies with unset fields are safe)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        model_params={"temperature": None, "max_output_tokens": 100},
+    )
+    [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+
+    _, _, turn_params = fake_rpc.turn_start_calls[0]
+    assert "temperature" not in turn_params
+    assert turn_params.get("maxOutputTokens") == 100
+
+
+@pytest.mark.asyncio
+async def test_codex_create_client_forwards_mcp_servers_to_thread_params(monkeypatch):
+    """mcp_servers passed to create_client lands in the Codex thread/start payload."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    mcp = {
+        "fs": {"type": "stdio", "command": "fs-server", "args": []},
+        "web": {"type": "http", "url": "http://localhost:9000"},
+    }
+    await backend.create_client(
+        session=session,
+        model="gpt-5.5",
+        mcp_servers=mcp,
+    )
+
+    assert fake_rpc.thread_start_calls
+    sent_params = fake_rpc.thread_start_calls[0]
+    assert sent_params.get("mcpServers") == mcp
+
+
+@pytest.mark.asyncio
+async def test_codex_create_client_omits_mcp_servers_when_unset(monkeypatch):
+    """No mcp_servers -> no mcpServers key in the payload (backend defaults stand)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(session=session, model="gpt-5.5")
+
+    assert fake_rpc.thread_start_calls
+    assert "mcpServers" not in fake_rpc.thread_start_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_codex_create_client_omits_mcp_servers_when_empty_dict(monkeypatch):
+    """An empty dict is treated as "no servers" and the key is omitted."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    await backend.create_client(session=session, model="gpt-5.5", mcp_servers={})
+
+    assert fake_rpc.thread_start_calls
+    assert "mcpServers" not in fake_rpc.thread_start_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_codex_thread_resume_includes_mcp_servers(monkeypatch):
+    """Resuming a thread also re-asserts the mcp_servers config (so reconnects don't lose it)."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(
+        session_id="gw-session",
+        pending_tool_call=None,
+        codex_thread_id="thr_existing",
+    )
+    mcp = {"fs": {"type": "stdio", "command": "fs-server"}}
+    await backend.create_client(session=session, model="gpt-5.5", mcp_servers=mcp)
+
+    assert fake_rpc.thread_resume_calls
+    _, resume_params = fake_rpc.thread_resume_calls[0]
+    assert resume_params.get("mcpServers") == mcp
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_preserves_multimodal_items(monkeypatch):
+    """Codex turn/start carries a multi-item payload (text + image) verbatim."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    items = [
+        {"type": "text", "text": "look at this"},
+        {"type": "image", "url": "https://example.com/foo.png"},
+        {"type": "text", "text": "any thoughts?"},
+    ]
+
+    [chunk async for chunk in backend.run_completion_with_client(client, items, session)]
+
+    assert fake_rpc.turn_start_calls
+    _, sent_items, _ = fake_rpc.turn_start_calls[0]
+    assert sent_items == items
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_wraps_string_prompt_into_text_item(monkeypatch):
+    """Plain-string prompts stay compatible: they're wrapped into a single text item."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = [
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        }
+    ]
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    [chunk async for chunk in backend.run_completion_with_client(client, "hello there", session)]
+
+    _, sent_items, _ = fake_rpc.turn_start_calls[0]
+    assert sent_items == [{"type": "text", "text": "hello there"}]
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_rejects_empty_input_list(monkeypatch):
+    """Empty input list is rejected — Codex won't accept a turn with no content."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, [], session)]
+    assert fake_rpc.turn_start_calls == []
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+
+
+@pytest.mark.asyncio
+async def test_codex_turn_rejects_invalid_input_item_shape(monkeypatch):
+    """Non-text/non-dict items in the input list surface a clear error."""
+    fake_rpc = FakeRpc()
+    fake_rpc.notifications = []
+    monkeypatch.setattr("src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: fake_rpc)
+
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    bad_items = [
+        {"type": "text", "text": "ok"},
+        "this should be a dict, not a string",
+    ]
+    chunks = [
+        chunk async for chunk in backend.run_completion_with_client(client, bad_items, session)
+    ]
+    # No turn/start was reached for an invalid payload.
+    assert fake_rpc.turn_start_calls == []
+    assert chunks
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
 
 
 @pytest.mark.asyncio
@@ -1067,6 +2896,95 @@ async def test_codex_function_call_output_uses_approval_resume_without_input_eve
     assert calls == [(session.client, "approval_1", "accept", session)]
 
 
+@pytest.mark.asyncio
+async def test_codex_function_call_output_refreshes_session_tool_policy(monkeypatch):
+    """A function_call_output body with new disallowed_tools updates the session client policy."""
+    from src.backends import ResolvedModel
+    from src.response_models import ResponseCreateRequest
+    from src.routes.responses import _handle_function_call_output
+    from src.session_manager import Session
+
+    session = Session(session_id="00000000-0000-0000-0000-000000000001", backend="codex")
+    session.client = SimpleNamespace(allowed_tools=None, disallowed_tools=None)
+    session.workspace = "/tmp/ws/test"
+    session.turn_counter = 1
+    session.pending_tool_call = {
+        "call_id": "approval_1",
+        "name": "AskUserQuestion",
+        "arguments": {"question": "Approve?"},
+        "backend": "codex",
+        "codex_resume": "approval",
+    }
+    session.input_event = None
+
+    body = ResponseCreateRequest(
+        model="codex/gpt-5.5",
+        input=[
+            {
+                "type": "function_call_output",
+                "call_id": "approval_1",
+                "output": "accept",
+            }
+        ],
+        previous_response_id="resp_00000000-0000-0000-0000-000000000001_1",
+        stream=False,
+        disallowed_tools=["Bash"],
+    )
+    resolved = ResolvedModel("codex/gpt-5.5", "codex", "gpt-5.5")
+
+    update_calls = []
+
+    class FakeBackend:
+        name = "codex"
+
+        def update_request_policy(
+            self,
+            client,
+            *,
+            allowed_tools=None,
+            disallowed_tools=None,
+            permission_mode=None,
+            model_params=None,
+        ):
+            update_calls.append(
+                (client, allowed_tools, disallowed_tools, permission_mode, model_params)
+            )
+            client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
+            client.disallowed_tools = (
+                list(disallowed_tools) if disallowed_tools is not None else None
+            )
+            client.model_params = dict(model_params) if model_params else None
+            if permission_mode is not None:
+                client.permission_mode = permission_mode
+
+        async def resume_approval_with_client(self, client, call_id, output, sess):
+            yield {"type": "result", "subtype": "success", "result": "approved"}
+
+        def parse_message(self, chunks):
+            return "approved"
+
+        def estimate_token_usage(self, prompt, completion, model=None):
+            return {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+
+    monkeypatch.setattr(
+        "src.routes.responses.usage_logger.log_turn_from_context",
+        AsyncMock(),
+    )
+
+    await _handle_function_call_output(
+        body,
+        resolved,
+        FakeBackend(),
+        session,
+        session.session_id,
+        "/tmp/ws/test",
+        {"call_id": "approval_1", "output": "accept"},
+    )
+
+    assert update_calls == [(session.client, None, ["Bash"], None, None)]
+    assert session.client.disallowed_tools == ["Bash"]
+
+
 # ---------------------------------------------------------------------------
 # Group 1: src/backends/codex/__init__.py lazy imports and register failure
 # ---------------------------------------------------------------------------
@@ -1208,9 +3126,7 @@ def test_codex_approval_question_covers_all_kinds():
     assert client._approval_question("command", {"command": "ls"}) == (
         "Codex requests approval to run command: ls"
     )
-    assert client._approval_question("command", {}) == (
-        "Codex requests approval to run a command."
-    )
+    assert client._approval_question("command", {}) == ("Codex requests approval to run a command.")
     assert client._approval_question("command", {"command": ""}) == (
         "Codex requests approval to run a command."
     )
@@ -1248,8 +3164,7 @@ def test_codex_approval_decision_label_handles_dict_decisions():
         }
     }
     assert (
-        client._approval_decision_label(full)
-        == "applyNetworkPolicyAmendment:allow:api.example.com"
+        client._approval_decision_label(full) == "applyNetworkPolicyAmendment:allow:api.example.com"
     )
 
     # applyNetworkPolicyAmendment missing host falls back to bare name.
@@ -1425,6 +3340,49 @@ def test_codex_tool_result_from_item_returns_none_for_invalid_inputs():
     assert client._tool_result_from_item({"type": "commandExecution", "id": 123}) is None
 
 
+def test_codex_extract_usage_includes_reasoning_output_tokens():
+    """Reasoning output tokens are part of the model's output and must be reported."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    usage = backend._extract_usage(
+        {
+            "last": {
+                "inputTokens": 10,
+                "cachedInputTokens": 2,
+                "outputTokens": 5,
+                "reasoningOutputTokens": 7,
+            }
+        }
+    )
+    assert usage == {"input_tokens": 12, "output_tokens": 12}
+
+
+def test_codex_extract_usage_handles_missing_reasoning_tokens():
+    """Notifications without reasoningOutputTokens fall back to outputTokens only."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    usage = backend._extract_usage({"last": {"inputTokens": 3, "outputTokens": 4}})
+    assert usage == {"input_tokens": 3, "output_tokens": 4}
+
+
+def test_codex_extract_usage_total_matches_total_tokens():
+    """Reported (input + output) equals notification totalTokens, so totals reconcile."""
+    from src.backends.codex.client import CodexClient
+
+    backend = CodexClient()
+    last = {
+        "inputTokens": 6,
+        "cachedInputTokens": 4,
+        "outputTokens": 8,
+        "reasoningOutputTokens": 3,
+        "totalTokens": 21,
+    }
+    usage = backend._extract_usage({"last": last})
+    assert usage["input_tokens"] + usage["output_tokens"] == last["totalTokens"]
+
+
 def test_codex_extract_usage_returns_none_for_invalid_inputs():
     """Non-dict tokenUsage and missing / non-dict 'last' return None."""
     from src.backends.codex.client import CodexClient
@@ -1563,9 +3521,7 @@ def test_codex_metadata_env_filters_by_allowlist(monkeypatch):
     from src import constants as constants_module
     from src.backends.codex.client import CodexClient
 
-    monkeypatch.setattr(
-        constants_module, "METADATA_ENV_ALLOWLIST", frozenset({"ALLOWED_KEY"})
-    )
+    monkeypatch.setattr(constants_module, "METADATA_ENV_ALLOWLIST", frozenset({"ALLOWED_KEY"}))
 
     client = CodexClient()
 
@@ -1868,9 +3824,7 @@ async def test_codex_run_completion_yields_error_when_turn_id_missing(monkeypatc
     session = SimpleNamespace(session_id="gw")
     client = await backend.create_client(session=session)
 
-    chunks = [
-        chunk async for chunk in backend.run_completion_with_client(client, "hi", session)
-    ]
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
 
     assert len(chunks) == 1
     assert chunks[0]["type"] == "error"

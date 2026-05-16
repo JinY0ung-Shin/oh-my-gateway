@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import fnmatch
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from src.backends.codex.constants import (
     approval_policy,
     codex_bin,
     configured_config_overrides,
+    disallowed_tools_from_env,
     sandbox_mode,
 )
 from src.constants import DEFAULT_TIMEOUT_MS
@@ -37,9 +39,110 @@ CODEX_APPROVAL_METHODS = {
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
     "item/permissions/requestApproval",
+    "item/mcpToolCall/requestApproval",
+    "item/dynamicToolCall/requestApproval",
 }
 
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
+
+# Gateway tool names (Claude-style) mapped to the Codex item type they map onto.
+# ``allowed_tools``/``disallowed_tools`` may use either the Claude alias or the
+# Codex-native name; both resolve to the same enforcement bucket.
+CODEX_TOOL_NAME_ALIASES: Dict[str, str] = {
+    "Bash": "commandExecution",
+    "BashOutput": "commandExecution",
+    "KillShell": "commandExecution",
+    "Edit": "fileChange",
+    "Write": "fileChange",
+    "NotebookEdit": "fileChange",
+}
+
+_APPROVAL_METHOD_TO_TOOL: Dict[str, str] = {
+    "item/commandExecution/requestApproval": "commandExecution",
+    "item/fileChange/requestApproval": "fileChange",
+    "item/mcpToolCall/requestApproval": "mcpToolCall",
+    "item/dynamicToolCall/requestApproval": "dynamicToolCall",
+}
+
+# Gateway permission_mode (Claude vocabulary) -> Codex approvalPolicy.
+# ``bypassPermissions`` translates to ``never`` (skip approvals); the remaining
+# modes default to ``on-request`` so risky operations still pause for review.
+CODEX_PERMISSION_MODE_TO_APPROVAL: Dict[str, str] = {
+    "bypassPermissions": "never",
+    "default": "on-request",
+    "acceptEdits": "on-request",
+    "plan": "on-request",
+}
+
+# OpenAI Responses-style sampling/control field -> Codex app-server payload key.
+# Used by ``_translate_model_params`` so request bodies can carry the standard
+# OpenAI names (temperature, max_output_tokens, ...) while we forward them in
+# the Codex camelCase convention.
+CODEX_MODEL_PARAM_KEY_MAP: Dict[str, str] = {
+    "temperature": "temperature",
+    "top_p": "topP",
+    "max_output_tokens": "maxOutputTokens",
+    # Legacy alias from the chat-completions era; treat the same as the new name.
+    "max_tokens": "maxOutputTokens",
+}
+
+
+def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Translate OpenAI-style model params into the Codex turn/start vocabulary.
+
+    - ``None`` or empty dict yields ``{}`` (no payload pollution when the
+      request didn't ask for overrides).
+    - Unknown keys are passed through unchanged so future params can be added
+      without code changes here.
+    - ``None`` values are skipped (Pydantic optional fields default to None).
+    """
+    if not model_params:
+        return {}
+    out: Dict[str, Any] = {}
+    for key, value in model_params.items():
+        if value is None:
+            continue
+        out[CODEX_MODEL_PARAM_KEY_MAP.get(key, key)] = value
+    return out
+
+
+_UNKNOWN_PERMISSION_MODE_FALLBACK = "on-request"
+
+
+def _resolve_approval_policy(
+    permission_mode: Optional[str],
+    *,
+    has_tool_policy: bool = False,
+) -> str:
+    """Map gateway permission_mode onto Codex approvalPolicy.
+
+    When ``permission_mode`` is ``None``, fall back to the operator's
+    ``CODEX_APPROVAL_POLICY`` env (defaults to ``never``). When it is set to
+    an *unknown* value, fall back to a safe ``on-request`` rather than the env,
+    so a typo or invalid mode can't silently bypass approval-time enforcement.
+
+    When ``has_tool_policy`` is set (the caller has allowed_tools/disallowed_tools
+    or a global DISALLOWED_TOOLS env), a resolved ``never`` is upgraded to
+    ``on-request`` so Codex actually emits approval requests; otherwise the
+    gateway's auto-deny hook never runs and the tool policy is silently bypassed.
+    """
+    if permission_mode is None:
+        resolved = approval_policy()
+    else:
+        mapped = CODEX_PERMISSION_MODE_TO_APPROVAL.get(permission_mode)
+        if mapped is None:
+            logger.warning(
+                "Codex received unknown permission_mode %r; falling back to %s",
+                permission_mode,
+                _UNKNOWN_PERMISSION_MODE_FALLBACK,
+            )
+            resolved = _UNKNOWN_PERMISSION_MODE_FALLBACK
+        else:
+            resolved = mapped
+
+    if has_tool_policy and resolved == "never":
+        return "on-request"
+    return resolved
 
 
 class CodexAppServerError(RuntimeError):
@@ -295,13 +398,21 @@ class CodexSessionClient:
     thread_id: str
     model: Optional[str]
     cwd: Optional[str]
-    stream_events: bool = False
     env: Optional[Dict[str, str]] = None
     owns_rpc: bool = False
+    allowed_tools: Optional[List[str]] = None
+    disallowed_tools: Optional[List[str]] = None
+    permission_mode: Optional[str] = None
+    model_params: Optional[Dict[str, Any]] = None
+    mcp_servers: Optional[Dict[str, Any]] = None
     pending_approval_request_id: Optional[Any] = None
     pending_approval_method: Optional[str] = None
     pending_approval_turn_id: Optional[str] = None
     pending_approval_params: Optional[Dict[str, Any]] = None
+    # Identity of the RPC instance that surfaced the pending approval, used to
+    # fail-fast if a transport reset replaces the shared RPC between the
+    # approval being shown and the user responding.
+    pending_approval_rpc: Optional[CodexJsonRpcClient] = None
 
     async def disconnect(self) -> None:
         if self.owns_rpc:
@@ -326,6 +437,37 @@ class CodexClient:
 
     def get_auth_provider(self) -> CodexAuthProvider:
         return CodexAuthProvider()
+
+    def update_request_policy(
+        self,
+        client: CodexSessionClient,
+        *,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        permission_mode: Optional[str] = None,
+        model_params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Replace the per-request tool policy stored on an existing session client.
+
+        Codex reuses one persistent ``CodexSessionClient`` for the lifetime of a
+        gateway session, but the gateway's tool-policy fields (``allowed_tools``
+        / ``disallowed_tools``) are per-request. Continuation requests must be
+        able to refresh those fields so each turn honors its own body.
+
+        An explicit empty list ``[]`` for tool fields is preserved as a
+        block-all policy; only ``None`` clears them.
+
+        ``permission_mode`` is session-level (acceptEdits / bypassPermissions /
+        ...). ``None`` here means "no override sent by this request"; the
+        existing value is preserved. Pass an explicit string to change it.
+        """
+        client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
+        client.disallowed_tools = list(disallowed_tools) if disallowed_tools is not None else None
+        # ``model_params`` is per-request like tool lists; ``None`` resets so the
+        # next turn doesn't inherit a previous request's sampling overrides.
+        client.model_params = dict(model_params) if model_params else None
+        if permission_mode is not None:
+            client.permission_mode = permission_mode
 
     def runtime_metadata(self) -> Dict[str, Any]:
         return {
@@ -373,9 +515,10 @@ class CodexClient:
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
     ) -> CodexSessionClient:
-        _ = (allowed_tools, disallowed_tools, permission_mode, mcp_servers, task_budget)
+        _ = (task_budget,)
         env = self._metadata_env(extra_env)
         async with self._rpc_lock:
             try:
@@ -385,6 +528,9 @@ class CodexClient:
                     model=model,
                     cwd=cwd,
                     system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+                    permission_mode=permission_mode,
+                    has_tool_policy=self._has_tool_policy(allowed_tools, disallowed_tools),
+                    mcp_servers=mcp_servers,
                 )
                 thread_id = getattr(session, "codex_thread_id", None)
                 if thread_id:
@@ -410,6 +556,13 @@ class CodexClient:
             cwd=cwd,
             env=env,
             owns_rpc=False,
+            # Preserve an explicit empty list as a block-all policy; only ``None``
+            # means "no per-request allow-list / disallow-list was set."
+            allowed_tools=list(allowed_tools) if allowed_tools is not None else None,
+            disallowed_tools=(list(disallowed_tools) if disallowed_tools is not None else None),
+            permission_mode=permission_mode,
+            model_params=dict(model_params) if model_params else None,
+            mcp_servers=dict(mcp_servers) if mcp_servers else None,
         )
 
     async def _ensure_rpc_locked(self, env: Dict[str, str]) -> CodexJsonRpcClient:
@@ -474,9 +627,14 @@ class CodexClient:
         model: Optional[str],
         cwd: Optional[str],
         system_prompt: Optional[str],
+        permission_mode: Optional[str] = None,
+        has_tool_policy: bool = False,
+        mcp_servers: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {
-            "approvalPolicy": approval_policy(),
+            "approvalPolicy": _resolve_approval_policy(
+                permission_mode, has_tool_policy=has_tool_policy
+            ),
             "sandbox": sandbox_mode(),
         }
         if model:
@@ -485,32 +643,195 @@ class CodexClient:
             params["cwd"] = cwd
         if system_prompt:
             params["developerInstructions"] = system_prompt
+        if mcp_servers:
+            # Forward server-level MCP configuration so Codex can route tool
+            # calls to the configured upstream MCP servers. An empty dict
+            # behaves like "no servers" and the key is left out so the
+            # app-server keeps its defaults.
+            #
+            # Filtering note: unlike the Claude backend (which narrows
+            # ``mcp_servers`` against the per-request ``allowed_tools``
+            # patterns via ``mcp__<server>__*`` — see
+            # ``src/backends/claude/client.py::_configure_mcp_servers``),
+            # Codex forwards the full server set and enforces per-tool policy
+            # at approval time via ``item/mcpToolCall/requestApproval``. The
+            # net effect is the same (disallowed MCP tools never execute) but
+            # the enforcement point differs.
+            params["mcpServers"] = dict(mcp_servers)
         return params
 
     def _turn_params(self, client: CodexSessionClient) -> Dict[str, Any]:
-        params: Dict[str, Any] = {"approvalPolicy": approval_policy()}
+        params: Dict[str, Any] = {
+            "approvalPolicy": _resolve_approval_policy(
+                client.permission_mode,
+                has_tool_policy=self._client_has_tool_policy(client),
+            ),
+        }
         if client.model:
             params["model"] = client.model
         if client.cwd:
             params["cwd"] = client.cwd
+        # Sampling / output-control overrides (temperature, max_output_tokens, ...)
+        # supplied by the request body. Unset request fields stay absent from the
+        # payload so the app-server's defaults still apply.
+        translated = _translate_model_params(client.model_params)
+        if translated:
+            params.update(translated)
         return params
+
+    @staticmethod
+    def _has_tool_policy(
+        allowed_tools: Optional[List[str]],
+        disallowed_tools: Optional[List[str]],
+    ) -> bool:
+        # ``allowed_tools is not None`` matters because ``[]`` is a real
+        # block-all policy that must still flip approvalPolicy off ``never``.
+        if allowed_tools is not None or disallowed_tools:
+            return True
+        return bool(disallowed_tools_from_env())
+
+    @classmethod
+    def _client_has_tool_policy(cls, client: CodexSessionClient) -> bool:
+        return cls._has_tool_policy(client.allowed_tools, client.disallowed_tools)
+
+    async def _start_turn_with_retry(
+        self,
+        client: CodexSessionClient,
+        prompt: Any,
+    ) -> tuple[CodexJsonRpcClient, Dict[str, Any]]:
+        """Run turn/start with a single conservative retry on transport failure.
+
+        ``prompt`` may be either a plain string (wrapped into a single
+        ``{"type": "text"}`` item for backward compatibility) or a
+        pre-normalized list of Codex input items (text plus image/file
+        attachments). Invalid item shapes raise ``ValueError`` before any
+        side effect on the app-server side.
+
+        ``turn/start`` is idempotent only until the app-server accepts it. We
+        detect "accepted" two ways:
+
+        - The call returns normally → accepted, no retry needed.
+        - Any inbound notification for this turn lands in the RPC's pending
+          queue while the request was in flight → the app-server is already
+          executing the turn. Retrying could double-run a command/edit, so
+          we surface the error instead.
+
+        Otherwise, on transport failure, we close the dead shared RPC, bring
+        up a fresh one, re-establish the gateway session's Codex thread via
+        ``thread/resume``, and try ``turn/start`` once more. The retry budget
+        is intentionally exactly one attempt.
+
+        Callers must hold ``self._rpc_lock``.
+        """
+        input_items = self._coerce_turn_input_items(prompt)
+        turn_params = self._turn_params(client)
+        thread_params = self._thread_params(
+            model=client.model,
+            cwd=client.cwd,
+            system_prompt=None,
+            permission_mode=client.permission_mode,
+            has_tool_policy=self._client_has_tool_policy(client),
+            mcp_servers=client.mcp_servers,
+        )
+
+        last_exc: Optional[BaseException] = None
+        for attempt in range(2):
+            rpc = await self._ensure_rpc_locked(client.env or {})
+            queued_before = self._pending_notification_count(rpc)
+            try:
+                if attempt > 0 and client.thread_id:
+                    # New RPC instance has no thread context; re-establish before
+                    # the retried turn/start so the app-server recognizes the id.
+                    await asyncio.to_thread(rpc.thread_resume, client.thread_id, thread_params)
+                turn = await asyncio.to_thread(
+                    rpc.turn_start, client.thread_id, input_items, turn_params
+                )
+                return rpc, turn
+            except Exception as exc:
+                last_exc = exc
+                if attempt > 0:
+                    break
+                # Did the app-server queue any inbound notification for this
+                # turn while turn/start was in flight? If yes, retrying risks
+                # duplicating the turn's side effects on the app-server side.
+                queued_after = self._pending_notification_count(rpc)
+                if queued_after > queued_before:
+                    logger.warning(
+                        "Codex turn/start failed but app-server queued %d notification(s) "
+                        "while turn/start was in flight; skipping retry to avoid duplicate "
+                        "side effects: %s",
+                        queued_after - queued_before,
+                        exc,
+                    )
+                    break
+                logger.warning(
+                    "Codex turn/start failed before turn was accepted, "
+                    "restarting RPC and retrying once: %s",
+                    exc,
+                )
+                await self._close_rpc_locked()
+                continue
+
+        assert last_exc is not None
+        raise last_exc
+
+    @staticmethod
+    def _coerce_turn_input_items(prompt: Any) -> list[Dict[str, Any]]:
+        """Normalize the run_completion ``prompt`` argument into Codex input items.
+
+        - ``str``: wrapped into a single ``{"type": "text", "text": ...}`` item
+          so existing string callers stay unchanged.
+        - ``list``: must contain only dicts; each is forwarded verbatim so
+          callers can express multimodal payloads (text + image/file). Order
+          and metadata are preserved.
+        - anything else: ``ValueError`` (the route catches this and surfaces a
+          clean error chunk).
+        """
+        if isinstance(prompt, str):
+            return [{"type": "text", "text": prompt}]
+        if isinstance(prompt, list):
+            if not prompt:
+                raise ValueError("Codex turn input list must contain at least one item")
+            for index, item in enumerate(prompt):
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        f"Codex turn input item at index {index} must be a dict, "
+                        f"got {type(item).__name__}"
+                    )
+            return [dict(item) for item in prompt]
+        raise ValueError(
+            f"Codex turn input must be a string or list of dicts, got {type(prompt).__name__}"
+        )
+
+    @staticmethod
+    def _pending_notification_count(rpc: CodexJsonRpcClient) -> int:
+        """Number of inbound notifications buffered by the JSON-RPC client.
+
+        ``_pending_notifications`` is the real client's queue; fakes used in
+        tests may expose the same attribute as a plain list. Treat missing
+        attributes as zero (acts as a no-op for legacy transports).
+        """
+        pending = getattr(rpc, "_pending_notifications", None)
+        if pending is None:
+            return 0
+        try:
+            return len(pending)
+        except TypeError:
+            return 0
 
     async def run_completion_with_client(
         self,
         client: CodexSessionClient,
-        prompt: str,
+        prompt: Any,
         session: Any,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         _ = session
         async with self._rpc_lock:
             try:
-                rpc = await self._ensure_rpc_locked(client.env or {})
-                turn = await asyncio.to_thread(
-                    rpc.turn_start,
-                    client.thread_id,
-                    [{"type": "text", "text": prompt}],
-                    self._turn_params(client),
-                )
+                rpc, turn = await self._start_turn_with_retry(client, prompt)
+                # Keep the session client's RPC reference in sync with the live
+                # shared RPC; retry may have swapped to a fresh instance.
+                client.rpc = rpc
                 turn_obj = turn.get("turn")
                 if not isinstance(turn_obj, dict) or not turn_obj.get("id"):
                     yield {
@@ -520,7 +841,9 @@ class CodexClient:
                     }
                     return
                 turn_id = str(turn_obj["id"])
-                notification_iter = self._notification_iterator(rpc, client.thread_id, turn_id)
+                notification_iter = self._notification_iterator(
+                    rpc, client.thread_id, turn_id, client=client
+                )
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -530,7 +853,9 @@ class CodexClient:
                         break
                     if chunk is not None:
                         if chunk.get("type") == "codex_approval_request":
-                            tool_chunk = self._store_pending_approval(session, client, chunk)
+                            tool_chunk = self._store_pending_approval(
+                                session, client, chunk, rpc=rpc
+                            )
                             yield tool_chunk
                             return
                         yield chunk
@@ -576,6 +901,25 @@ class CodexClient:
                     logger.error(message)
                     yield {"type": "error", "is_error": True, "error_message": message}
                     return
+                pending_rpc = client.pending_approval_rpc
+                if pending_rpc is not None and pending_rpc is not rpc:
+                    # The RPC that surfaced this approval is gone (likely a
+                    # transport reset between the approval being shown and the
+                    # user's response). The new RPC has no record of the
+                    # pending request, so responding now would be a no-op or
+                    # confuse the app-server. Surface a clear error instead.
+                    message = (
+                        "Codex approval transport was lost before the response "
+                        "arrived; please retry the original request"
+                    )
+                    logger.error(message + " (call_id=%r)", call_id)
+                    client.pending_approval_request_id = None
+                    client.pending_approval_method = None
+                    client.pending_approval_turn_id = None
+                    client.pending_approval_params = None
+                    client.pending_approval_rpc = None
+                    yield {"type": "error", "is_error": True, "error_message": message}
+                    return
                 turn_id = client.pending_approval_turn_id or str(params.get("turnId") or "")
                 if not turn_id:
                     yield {
@@ -591,8 +935,11 @@ class CodexClient:
                 client.pending_approval_method = None
                 client.pending_approval_turn_id = None
                 client.pending_approval_params = None
+                client.pending_approval_rpc = None
 
-                notification_iter = self._notification_iterator(rpc, client.thread_id, turn_id)
+                notification_iter = self._notification_iterator(
+                    rpc, client.thread_id, turn_id, client=client
+                )
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -602,7 +949,9 @@ class CodexClient:
                         break
                     if chunk is not None:
                         if chunk.get("type") == "codex_approval_request":
-                            tool_chunk = self._store_pending_approval(session, client, chunk)
+                            tool_chunk = self._store_pending_approval(
+                                session, client, chunk, rpc=rpc
+                            )
                             yield tool_chunk
                             return
                         yield chunk
@@ -633,11 +982,23 @@ class CodexClient:
         rpc: CodexJsonRpcClient,
         thread_id: str,
         turn_id: str,
+        *,
+        client: Optional["CodexSessionClient"] = None,
     ) -> Iterator[Dict[str, Any]]:
         items: list[dict[str, Any]] = []
         usage_box: dict[str, Optional[dict[str, int]]] = {"usage": None}
         while True:
             notification = rpc.next_notification()
+            if client is not None and self._is_approval_request(notification):
+                # Disallow / allowlist policies always take precedence over
+                # ``acceptEdits`` auto-accept so an explicit block can't be
+                # silently turned into an accept.
+                if self._should_auto_deny_approval(client, notification):
+                    self._auto_deny_approval(rpc, notification)
+                    continue
+                if self._should_auto_accept_approval(client, notification):
+                    self._auto_accept_approval(rpc, notification)
+                    continue
             yield from self._chunks_from_notification(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -651,6 +1012,117 @@ class CodexClient:
                 notification=notification,
             ):
                 break
+
+    def _should_auto_deny_approval(
+        self,
+        client: "CodexSessionClient",
+        notification: Dict[str, Any],
+    ) -> bool:
+        tool_identities = self._approval_tool_identities(notification)
+        if not tool_identities:
+            return False
+        request_disallowed = list(client.disallowed_tools or [])
+        env_disallowed = disallowed_tools_from_env()
+        disallowed = self._normalize_tool_names(request_disallowed + env_disallowed)
+        if self._tool_policy_matches(disallowed, tool_identities):
+            return True
+        # ``allowed_tools is not None`` distinguishes an explicit policy (even
+        # an empty block-all list) from "no allow-list set".
+        if client.allowed_tools is not None:
+            allowed = self._normalize_tool_names(client.allowed_tools)
+            if not self._tool_policy_matches(allowed, tool_identities):
+                return True
+        return False
+
+    @staticmethod
+    def _approval_tool_identities(notification: Dict[str, Any]) -> set[str]:
+        method = str(notification.get("method") or "")
+        codex_tool = _APPROVAL_METHOD_TO_TOOL.get(method)
+        if codex_tool is None:
+            return set()
+
+        identities = {codex_tool}
+        params = notification.get("params")
+        if not isinstance(params, dict):
+            return identities
+
+        if codex_tool == "mcpToolCall":
+            server_label = params.get("serverLabel") or params.get("serverName")
+            tool_name = params.get("toolName")
+            if isinstance(server_label, str) and server_label:
+                server_names = {server_label, "_".join(server_label.split("-"))}
+                if isinstance(tool_name, str) and tool_name:
+                    for server_name in server_names:
+                        identities.add(f"mcp__{server_name}__{tool_name}")
+                else:
+                    for server_name in server_names:
+                        identities.add(f"mcp__{server_name}__*")
+
+        return identities
+
+    @staticmethod
+    def _normalize_tool_names(names: Optional[List[str]]) -> set[str]:
+        if not names:
+            return set()
+        return {CODEX_TOOL_NAME_ALIASES.get(name, name) for name in names}
+
+    @staticmethod
+    def _tool_policy_matches(policy_names: set[str], tool_identities: set[str]) -> bool:
+        for policy_name in policy_names:
+            for identity in tool_identities:
+                if policy_name == identity:
+                    return True
+                if policy_name.startswith("mcp__") and fnmatch.fnmatchcase(identity, policy_name):
+                    return True
+        return False
+
+    def _auto_deny_approval(
+        self,
+        rpc: CodexJsonRpcClient,
+        notification: Dict[str, Any],
+    ) -> None:
+        request_id = notification.get("id")
+        if request_id is None:
+            return
+        method = str(notification.get("method") or "")
+        if method == "item/permissions/requestApproval":
+            result: Dict[str, Any] = {"permissions": {}, "scope": "turn"}
+        else:
+            result = {"decision": "decline"}
+        logger.info(
+            "Codex auto-denied approval: method=%s request_id=%s",
+            method,
+            request_id,
+        )
+        rpc.respond(request_id, result)
+
+    def _should_auto_accept_approval(
+        self,
+        client: "CodexSessionClient",
+        notification: Dict[str, Any],
+    ) -> bool:
+        # ``acceptEdits`` mirrors Claude's permission_mode: only file edits are
+        # auto-accepted; commands and other approvals still need explicit user
+        # consent.
+        if client.permission_mode != "acceptEdits":
+            return False
+        return notification.get("method") == "item/fileChange/requestApproval"
+
+    def _auto_accept_approval(
+        self,
+        rpc: CodexJsonRpcClient,
+        notification: Dict[str, Any],
+    ) -> None:
+        request_id = notification.get("id")
+        if request_id is None:
+            return
+        method = str(notification.get("method") or "")
+        logger.info(
+            "Codex auto-accepted approval (acceptEdits): method=%s request_id=%s",
+            method,
+            request_id,
+        )
+        rpc.respond(request_id, {"decision": "accept"})
 
     def _chunks_from_notifications(
         self,
@@ -876,7 +1348,7 @@ class CodexClient:
             label = self._approval_decision_label(decision)
             if not label:
                 continue
-            option = {
+            option: Dict[str, Any] = {
                 "label": label,
                 "description": descriptions.get(label, f"Choose {label}."),
             }
@@ -909,6 +1381,8 @@ class CodexClient:
         session: Any,
         client: CodexSessionClient,
         chunk: Dict[str, Any],
+        *,
+        rpc: Optional[CodexJsonRpcClient] = None,
     ) -> Dict[str, Any]:
         tool_chunk = chunk["tool_chunk"]
         tool_block = tool_chunk["content"][0]
@@ -919,6 +1393,9 @@ class CodexClient:
             chunk.get("params") if isinstance(chunk.get("params"), dict) else {}
         )
         client.pending_approval_turn_id = metadata.get("codex_turn_id")
+        # Remember which RPC instance owns this pending request so resume can
+        # fail fast if a transport reset replaces the shared RPC underneath us.
+        client.pending_approval_rpc = rpc
         session.pending_tool_call = {
             "call_id": metadata["codex_approval_request_id"],
             "name": ASK_USER_QUESTION_TOOL_NAME,
@@ -1105,7 +1582,12 @@ class CodexClient:
         if not isinstance(last, dict):
             return None
         input_tokens = int(last.get("inputTokens") or 0) + int(last.get("cachedInputTokens") or 0)
-        output_tokens = int(last.get("outputTokens") or 0)
+        # Reasoning tokens are emitted by the model alongside visible output;
+        # OpenAI-compatible usage reporting rolls them into output_tokens so
+        # totals match (input + output == totalTokens).
+        output_tokens = int(last.get("outputTokens") or 0) + int(
+            last.get("reasoningOutputTokens") or 0
+        )
         return {"input_tokens": input_tokens, "output_tokens": output_tokens}
 
     def _turn_error_message(self, turn: dict[str, Any]) -> str:

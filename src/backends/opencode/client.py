@@ -293,9 +293,18 @@ class OpenCodeClient:
         task_budget: Optional[int] = None,
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
+        model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
     ) -> OpenCodeSessionClient:
-        _ = (allowed_tools, disallowed_tools, permission_mode, mcp_servers, task_budget, extra_env)
+        _ = (
+            allowed_tools,
+            disallowed_tools,
+            permission_mode,
+            mcp_servers,
+            task_budget,
+            extra_env,
+            model_params,
+        )
         opencode_session_id = getattr(session, "opencode_session_id", None)
         if opencode_session_id is None:
             async with httpx.AsyncClient(**self._client_kwargs()) as client:

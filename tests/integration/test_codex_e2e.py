@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
+import src.admin_auth as admin_auth_module
 import src.main as main
 import src.routes.general as general_module
 import src.routes.responses as responses_module
@@ -16,15 +17,29 @@ from src.backends.base import BackendRegistry
 
 FAKE_CODEX_APP_SERVER = r"""#!/usr/bin/env python3
 import json
+import os
 import sys
 
 thread_id = "thr_e2e"
 turn_id = "turn_1"
 approval_mode = "command"
+# Tests can point FAKE_CODEX_TURN_START_LOG at a file to capture every
+# turn/start payload as JSONL for later assertions.
+turn_start_log = os.environ.get("FAKE_CODEX_TURN_START_LOG")
 
 
 def log(message):
     print(message, file=sys.stderr, flush=True)
+
+
+def record_turn_start(params):
+    if not turn_start_log:
+        return
+    try:
+        with open(turn_start_log, "a", encoding="utf-8") as fp:
+            fp.write(json.dumps(params, sort_keys=True) + "\n")
+    except OSError:
+        pass
 
 
 def send(payload):
@@ -54,6 +69,7 @@ for raw in sys.stdin:
         send({"id": msg_id, "result": {"thread": {"id": params.get("threadId", thread_id)}}})
         continue
     if method == "turn/start":
+        record_turn_start(params)
         input_items = params.get("input") or []
         prompt = ""
         if input_items and isinstance(input_items[0], dict):
@@ -100,6 +116,34 @@ for raw in sys.stdin:
         continue
 
     if msg_id == "approval_1":
+        decision = ""
+        result_payload = msg.get("result") or {}
+        if isinstance(result_payload, dict):
+            decision_field = result_payload.get("decision")
+            if isinstance(decision_field, str):
+                decision = decision_field
+        if decision == "decline":
+            send({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "type": "agentMessage",
+                        "id": "msg_decline",
+                        "phase": "final_answer",
+                        "text": "Codex stopped: approval was declined.",
+                    },
+                },
+            })
+            send({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": {"id": turn_id, "status": "completed", "items": []},
+                },
+            })
+            continue
         if approval_mode == "file_change":
             completed_item = {
                 "type": "fileChange",
@@ -157,7 +201,12 @@ for raw in sys.stdin:
                 "threadId": thread_id,
                 "turnId": turn_id,
                 "tokenUsage": {
-                    "last": {"inputTokens": 2, "cachedInputTokens": 0, "outputTokens": 3}
+                    "last": {
+                        "inputTokens": 2,
+                        "cachedInputTokens": 0,
+                        "outputTokens": 3,
+                        "reasoningOutputTokens": 2,
+                    }
                 },
             },
         })
@@ -180,7 +229,7 @@ def _write_fake_codex(tmp_path: Path) -> Path:
 
 
 @contextmanager
-def codex_client_context(fake_bin: Path):
+def codex_client_context(fake_bin: Path, extra_env: dict | None = None):
     """Create a TestClient with the real Codex backend and fake app-server binary."""
 
     def _mock_discover():
@@ -193,16 +242,17 @@ def codex_client_context(fake_bin: Path):
     if main.limiter and hasattr(main.limiter, "_storage"):
         main.limiter._storage.reset()
 
+    env_overrides = {
+        "CODEX_BIN": str(fake_bin),
+        "CODEX_MODELS": "gpt-5.5",
+        "BACKENDS": "codex",
+    }
+    if extra_env:
+        env_overrides.update(extra_env)
+
     with (
-        patch.dict(
-            "os.environ",
-            {
-                "CODEX_BIN": str(fake_bin),
-                "CODEX_MODELS": "gpt-5.5",
-                "BACKENDS": "codex",
-            },
-            clear=False,
-        ),
+        patch.dict("os.environ", env_overrides, clear=False),
+        patch.object(admin_auth_module, "ADMIN_API_KEY", "test-admin-key"),
         patch.object(main, "discover_backends", _mock_discover),
         patch.object(responses_module, "verify_api_key", new=AsyncMock(return_value=True)),
         patch.object(general_module, "verify_api_key", new=AsyncMock(return_value=True)),
@@ -275,7 +325,8 @@ def test_codex_responses_e2e_approval_continuation(tmp_path, prompt, expected_ki
         second_body = second.json()
         assert second_body["status"] == "completed"
         assert second_body["output"][0]["content"][0]["text"] == "Codex e2e approved."
-        assert second_body["usage"] == {"input_tokens": 2, "output_tokens": 3}
+        # Reasoning tokens (2) roll into output (3) for OpenAI-compatible usage reporting.
+        assert second_body["usage"] == {"input_tokens": 2, "output_tokens": 5}
 
 
 def test_codex_streaming_approval_exposes_only_ask_user_question(tmp_path):
@@ -295,3 +346,221 @@ def test_codex_streaming_approval_exposes_only_ask_user_question(tmp_path):
     assert '"status": "requires_action"' in response.text
     assert '"name": "AskUserQuestion"' in response.text
     assert "codex_approval" not in response.text
+
+
+def test_codex_global_disallowed_tools_blocks_command_approval_e2e(tmp_path):
+    """DISALLOWED_TOOLS=Bash auto-denies commandExecution approvals at the route level."""
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin, extra_env={"DISALLOWED_TOOLS": "Bash"}) as client:
+        response = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "run a command", "stream": False},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    # No requires_action: the approval was auto-denied and the turn completed without prompting.
+    assert body["status"] == "completed"
+    # The fake server's decline branch emits this exact final message.
+    assert body["output"][0]["content"][0]["text"] == "Codex stopped: approval was declined."
+
+
+def test_codex_request_body_disallowed_tools_blocks_command_approval_e2e(tmp_path):
+    """Per-request ``disallowed_tools`` in the Responses API body reaches Codex enforcement."""
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": "run a command",
+                "stream": False,
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"][0]["content"][0]["text"] == "Codex stopped: approval was declined."
+
+
+def test_codex_accept_edits_auto_accepts_file_change_e2e(tmp_path):
+    """permission_mode='acceptEdits' on the Responses body auto-accepts fileChange.
+
+    With acceptEdits, the fake's fileChange approval flow runs to completion
+    without surfacing a requires_action response.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": "request file change approval",
+                "stream": False,
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "completed"
+    assert body["output"][0]["content"][0]["text"] == "Codex e2e approved."
+
+
+def test_codex_request_body_model_params_flow_through_to_turn_start_e2e(tmp_path):
+    """temperature / max_output_tokens from the body reach Codex turn/start params.
+
+    The fake codex app-server logs every received turn/start payload to a file
+    pointed to by FAKE_CODEX_TURN_START_LOG. The test then reads the file and
+    confirms the gateway forwarded the sampling overrides under the expected
+    Codex keys.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+    turn_log = tmp_path / "turn-start.jsonl"
+
+    with codex_client_context(
+        fake_bin, extra_env={"FAKE_CODEX_TURN_START_LOG": str(turn_log)}
+    ) as client:
+        response = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "input": "request file change approval",
+                "stream": False,
+                "temperature": 0.25,
+                "max_output_tokens": 64,
+                # acceptEdits lets the fake's fileChange branch run to
+                # completion so the e2e finishes cleanly.
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert response.status_code == 200
+
+    assert turn_log.exists(), "fake codex did not record any turn/start params"
+    lines = [json.loads(line) for line in turn_log.read_text().splitlines() if line.strip()]
+    assert lines, "turn/start log is empty"
+    first = lines[0]
+    assert first.get("temperature") == 0.25
+    assert first.get("maxOutputTokens") == 64
+
+
+def test_codex_continuation_request_switches_permission_mode_to_accept_edits(tmp_path):
+    """A continuation request can flip permission_mode to acceptEdits and have the next turn auto-accept fileChange.
+
+    Scenario:
+      1. First request: permission_mode default-equivalent (bypass) -> fake codex emits a command
+         approval -> requires_action.
+      2. Second request: function_call_output 'accept' to advance the first turn ->
+         turn completes.
+      3. Third request: same session, ``permission_mode='acceptEdits'`` + prompt that
+         routes the fake to fileChange approval. The route's update_request_policy
+         must propagate the new mode so the gateway auto-accepts fileChange
+         without surfacing a requires_action response.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin) as client:
+        first = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "run a command", "stream": False},
+        )
+        assert first.status_code == 200
+        assert first.json()["status"] == "requires_action"
+        first_body = first.json()
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "previous_response_id": first_body["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "approval_1",
+                        "output": "accept",
+                    }
+                ],
+                "stream": False,
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["status"] == "completed"
+
+        third = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "previous_response_id": second.json()["id"],
+                "input": "request file change approval",
+                "stream": False,
+                "permission_mode": "acceptEdits",
+            },
+        )
+
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["status"] == "completed"
+    # The fake's "approved" branch fires when our auto-accept reaches it.
+    assert third_body["output"][0]["content"][0]["text"] == "Codex e2e approved."
+
+
+def test_codex_continuation_request_refreshes_disallowed_tools(tmp_path):
+    """A continuation request's disallowed_tools applies even when the session client already exists.
+
+    Scenario:
+      1. First request has no tool policy -> Codex emits approval -> requires_action.
+      2. Second request (continuation) provides function_call_output "accept" -> turn completes.
+      3. Third request (new turn, same session) adds ``disallowed_tools=['Bash']``.
+         The gateway must auto-deny that turn's command approval instead of
+         silently dropping the new policy.
+    """
+    fake_bin = _write_fake_codex(tmp_path)
+
+    with codex_client_context(fake_bin) as client:
+        first = client.post(
+            "/v1/responses",
+            json={"model": "codex/gpt-5.5", "input": "run a command", "stream": False},
+        )
+        assert first.status_code == 200
+        first_body = first.json()
+        assert first_body["status"] == "requires_action"
+
+        second = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "previous_response_id": first_body["id"],
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "approval_1",
+                        "output": "accept",
+                    }
+                ],
+                "stream": False,
+            },
+        )
+        assert second.status_code == 200
+        assert second.json()["status"] == "completed"
+
+        third = client.post(
+            "/v1/responses",
+            json={
+                "model": "codex/gpt-5.5",
+                "previous_response_id": second.json()["id"],
+                "input": "run another command",
+                "stream": False,
+                "disallowed_tools": ["Bash"],
+            },
+        )
+
+    assert third.status_code == 200
+    third_body = third.json()
+    assert third_body["status"] == "completed"
+    assert third_body["output"][0]["content"][0]["text"] == "Codex stopped: approval was declined."

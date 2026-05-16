@@ -7,6 +7,8 @@ from pydantic import BaseModel, Discriminator, Field, Tag
 
 from src.runtime_config import get_default_model
 
+PermissionMode = Literal["default", "acceptEdits", "bypassPermissions", "plan"]
+
 
 class ResponseInputTextPart(BaseModel):
     """A text content part within a Responses API input item."""
@@ -90,6 +92,21 @@ class ResponseCreateRequest(BaseModel):
     allowed_tools: Optional[List[str]] = Field(
         default=None,
         description="Explicit list of allowed tools. Overrides default tool list.",
+    )
+    disallowed_tools: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Tools that must be blocked for this request. Hard-blocked even when "
+            "permission_mode bypasses checks. Merged with the DISALLOWED_TOOLS env var."
+        ),
+    )
+    permission_mode: Optional[PermissionMode] = Field(
+        default=None,
+        description=(
+            "Session permission mode override. One of: default, acceptEdits, "
+            "bypassPermissions, plan. Continuation requests that omit this field "
+            "keep the current session mode."
+        ),
     )
     user: Optional[str] = Field(
         default=None,
