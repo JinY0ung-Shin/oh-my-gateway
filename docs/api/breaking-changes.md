@@ -13,7 +13,7 @@ Schemas observed in this SDK version (from CLI tool definitions and a smoke-test
 
 | Tool | Input fields | id source |
 |---|---|---|
-| `TaskCreate` | `subject`, `description`, `activeForm?` (status is auto-`pending`) | returned in the `tool_result` `content` (e.g. `"Task #1 created successfully: ..."`), not in the `input` |
+| `TaskCreate` | `subject`, `description`, `activeForm?` (status is auto-`pending`) | returned in the matching `tool_result.content` as the created task record (for example, `{ "task": { "id": "...", "subject": "..." } }`), not in the `input` |
 | `TaskUpdate` | `taskId`, plus any of `status`, `subject`, `description`, `activeForm`, `owner`, `addBlocks`, `addBlockedBy`, `metadata` | n/a (caller supplies `taskId`) |
 | `TaskGet` | `taskId` | n/a |
 | `TaskList` | (no required input) | n/a |

@@ -4,7 +4,7 @@
 
 **Goal:** Upgrade `claude-agent-sdk` from 0.1.57 to 0.2.82 with adjustments to tool allow-lists, MCP connection behavior, and Skill option migration, while preserving the gateway's pass-through philosophy and documenting breaking changes for downstream API consumers.
 
-**Architecture:** Adopt **Option A (pass-through)** — no compatibility adapters added to the gateway. Update `src/backends/claude/constants.py` tool catalog for the new Task tools, leave `chunk_processing.py` / `sse_builders.py` untouched (generic fallback handles new block types), migrate from deprecated `"Skill"` allowed_tools entry to the new `skills` option on `ClaudeAgentOptions`, and surface new SDK features incrementally. Downstream breaking changes are documented for API consumers to handle.
+**Architecture:** Adopt **Option A (pass-through)** — no compatibility adapters added to the gateway. Update `src/backends/claude/constants.py` tool catalog for the new Task tools, preserve new server-side tool block types through chunk processing/streaming, migrate from deprecated `"Skill"` allowed_tools entry to the new `skills` option on `ClaudeAgentOptions`, and surface new SDK features incrementally. Downstream breaking changes are documented for API consumers to handle.
 
 **Tech Stack:** Python 3.x, `uv` for dependency management, `pytest` (asyncio_mode=auto), `claude-agent-sdk`, FastAPI, SSE.
 
@@ -12,9 +12,9 @@
 
 ## Release Highlights (0.1.58 → 0.2.82)
 
-**Breaking changes (0.2.82):**
+**Downstream-visible changes (0.2.82):**
 - MCP servers connect in background by default (was: blocking up to 5s). Override: `MCP_CONNECTION_NONBLOCKING=0` env or per-server `alwaysLoad: true`.
-- Headless/SDK sessions emit `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` instead of `TodoWrite`.
+- Headless/SDK sessions still emit `TodoWrite` by default. The new `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` family is available when the CLI subprocess env includes `CLAUDE_CODE_ENABLE_TASKS=1`.
 
 **API additions worth using (chronological):**
 - `0.1.62`: `skills` option on `ClaudeAgentOptions` (replaces `"Skill"` in `allowed_tools`)
@@ -156,7 +156,7 @@ git commit -m "chore(deps): bump claude-agent-sdk to 0.2.82"
 - Test: `tests/test_sdk_migration.py` (add test class)
 - Modify: `src/backends/claude/constants.py:15-31` (`CLAUDE_TOOLS`) and `:35-44` (`DEFAULT_ALLOWED_TOOLS`)
 
-**Why:** From 0.2.82, the SDK emits `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` for task tracking. If these are not in `allowed_tools`, the model's task tracking is silently filtered out.
+**Why:** 0.2.82 includes the opt-in `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` task-tracking tools. If an operator enables them with `CLAUDE_CODE_ENABLE_TASKS=1` and these tools are not in `allowed_tools`, task tracking may be filtered out. `TodoWrite` remains allowed because it is still the SDK/`claude -p` default.
 
 - [ ] **Step 1: Write failing tests**
 
@@ -178,8 +178,8 @@ class TestTaskToolCatalog:
         for tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
             assert tool in DEFAULT_ALLOWED_TOOLS, f"{tool} missing from DEFAULT_ALLOWED_TOOLS"
 
-    def test_todowrite_retained_for_back_compat(self):
-        """TodoWrite stays in catalog; SDK no longer emits it but no harm leaving it."""
+    def test_todowrite_retained_as_default(self):
+        """TodoWrite remains default; Task* require CLAUDE_CODE_ENABLE_TASKS=1."""
         from src.backends.claude.constants import CLAUDE_TOOLS
 
         assert "TodoWrite" in CLAUDE_TOOLS
@@ -202,10 +202,10 @@ Replace the `CLAUDE_TOOLS` block with:
 ```python
 CLAUDE_TOOLS = [
     "Task",  # Launch agents for complex tasks
-    "TaskCreate",  # Create task for tracking (replaces TodoWrite, 0.2.82+)
-    "TaskUpdate",  # Update task status (0.2.82+)
-    "TaskGet",  # Get task details (0.2.82+)
-    "TaskList",  # List tasks (0.2.82+)
+    "TaskCreate",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
+    "TaskUpdate",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
+    "TaskGet",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
+    "TaskList",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
     "Bash",  # Execute bash commands
     "Glob",  # File pattern matching
     "Grep",  # Search file contents
@@ -214,11 +214,11 @@ CLAUDE_TOOLS = [
     "Write",  # Write files
     "NotebookEdit",  # Edit Jupyter notebooks
     "WebFetch",  # Fetch web content
-    "TodoWrite",  # Deprecated 0.2.82; retained for back-compat
+    "TodoWrite",  # Default task-tracking tool when CLAUDE_CODE_ENABLE_TASKS is unset
     "WebSearch",  # Search the web
     "BashOutput",  # Get bash output
     "KillShell",  # Kill bash shells
-    "Skill",  # Execute skills (deprecated 0.1.77 — see skills= option)
+    "Skill",  # Execute skills (deprecated 0.1.77 — translated to skills= option)
     "SlashCommand",  # Execute slash commands
 ]
 ```
@@ -241,7 +241,7 @@ DEFAULT_ALLOWED_TOOLS = [
     "TaskUpdate",
     "TaskGet",
     "TaskList",
-    "TodoWrite",  # back-compat; SDK 0.2.82+ does not emit this
+    "TodoWrite",
 ]
 ```
 
@@ -576,23 +576,23 @@ Create `docs/api/breaking-changes.md` with the following content:
 
 ## 2026-05-XX — Claude Agent SDK 0.2.82 upgrade
 
-### Tool name changes in `response.tool_use` events
+### Task tools are now available (opt-in)
 
-The Claude backend now emits the following tool names in `response.tool_use` SSE events instead of `TodoWrite`:
+claude-agent-sdk 0.2.82 ships a new task-tracking tool family (`TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`) alongside the legacy `TodoWrite`. The bundled Claude CLI gates these behind the `CLAUDE_CODE_ENABLE_TASKS` env var:
 
-- `TaskCreate` — create a task (input: `{title, description, status}`)
-- `TaskUpdate` — update task status (input: `{task_id, status, ...}`)
-- `TaskGet` — fetch a single task by id
-- `TaskList` — list all tasks
+- **Env unset (default)** — `TodoWrite` remains the only task-tracking tool emitted. No `response.tool_use` payload changes for existing clients.
+- **`CLAUDE_CODE_ENABLE_TASKS=1`** — the SDK emits `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` instead. The gateway does not set this env automatically; operators choose per deployment.
 
-**Required client changes:**
+Schemas observed in this SDK version:
 
-1. **Recognize the new tool names.** Clients that previously branched on `tool_use.name == "TodoWrite"` must also handle `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`.
-2. **Switch from snapshot-replace to per-id accumulation.** `TodoWrite` emitted a full snapshot of all todos on every call; the new events are deltas keyed by task id. Maintain a `Map<task_id, task>` and apply each event:
-   - `TaskCreate`: insert
-   - `TaskUpdate`: update by id
-   - (others: as semantically appropriate)
-3. **`TodoWrite` may still appear from older sessions or back-compat paths.** Treat it as a snapshot for legacy data.
+| Tool | Input fields | id source |
+|---|---|---|
+| `TaskCreate` | `subject`, `description`, `activeForm?` (status is auto-`pending`) | returned in the matching `tool_result.content` as the created task record (for example, `{ "task": { "id": "...", "subject": "..." } }`), not in the `input` |
+| `TaskUpdate` | `taskId`, plus any of `status`, `subject`, `description`, `activeForm`, `owner`, `addBlocks`, `addBlockedBy`, `metadata` | n/a (caller supplies `taskId`) |
+| `TaskGet` | `taskId` | n/a |
+| `TaskList` | (no required input) | n/a |
+
+`Task*` events are per-id deltas (the CLI maintains task state on disk); `TodoWrite` events are full snapshots. Clients that want to render Task* should accumulate by `taskId`. Clients that only handle `TodoWrite` keep working as long as `CLAUDE_CODE_ENABLE_TASKS` stays unset.
 
 ### MCP server `init` may include pending servers
 
@@ -606,7 +606,7 @@ The SDK now emits `server_tool_use` and `advisor_tool_result` blocks (previously
 
 ### `api_error_status` on error responses
 
-Error responses now include `api_error_status: 429 | 500 | 529 | null` when the underlying API call failed. Useful for distinguishing rate-limit from server errors.
+The underlying `ResultMessage` exposes an `api_error_status: int | None` field surfacing the HTTP status (429, 500, 529) when the API call failed. The gateway does not yet propagate this to its downstream payload, but a follow-up may do so; clients planning to distinguish rate-limit from server errors should request it.
 
 ---
 
@@ -655,13 +655,13 @@ curl -N -X POST http://localhost:8000/v1/responses \
   }' 2>&1 | head -100
 ```
 
-- [ ] **Step 3: Verify the SSE stream contains `TaskCreate` events**
+- [ ] **Step 3: Optionally verify Task tool SSE events**
 
-Look for `event: response.tool_use` lines with `"name": "TaskCreate"` (or `TaskUpdate`).
+If validating the opt-in Task tool path, start the gateway with `CLAUDE_CODE_ENABLE_TASKS=1` in the CLI subprocess environment and look for `event: response.tool_use` lines with `"name": "TaskCreate"` (or `TaskUpdate`).
 
-Expected: At least one `TaskCreate` event appears (model self-tracks the 3-step plan).
+Expected with the env set: at least one `TaskCreate` event may appear when the model self-tracks the 3-step plan.
 
-If only `TodoWrite` appears, the upgrade hasn't activated the new tool names — check the SDK version and `DEFAULT_ALLOWED_TOOLS`.
+Expected with the env unset: `TodoWrite` remains the default task-tracking event. This is intentional for compatibility.
 
 - [ ] **Step 4: Verify init event shows MCP server states**
 
@@ -695,7 +695,7 @@ git push -u origin chore/claude-agent-sdk-0.2.82
 gh pr create --title "chore(deps): upgrade claude-agent-sdk 0.1.57 → 0.2.82" --body "$(cat <<'EOF'
 ## Summary
 - Bumps `claude-agent-sdk` from `0.1.57` to `0.2.82`.
-- Adds new `Task*` tools to allow-list (`TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`); SDK 0.2.82 emits these instead of `TodoWrite`.
+- Adds new `Task*` tools to allow-list (`TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`); the bundled CLI emits these only when `CLAUDE_CODE_ENABLE_TASKS=1` is set. Default deployments keep `TodoWrite`.
 - Migrates `"Skill"` allow-list entry to the modern `skills="all"` option on `ClaudeAgentOptions` (was deprecated in 0.1.77).
 - Documents downstream-breaking changes for API consumers (see `docs/api/breaking-changes.md`).
 
@@ -703,13 +703,13 @@ gh pr create --title "chore(deps): upgrade claude-agent-sdk 0.1.57 → 0.2.82" -
 Per [[gateway-passthrough-philosophy]] (project convention), no compatibility adapters are added. SDK breaking changes propagate to our API consumers, who handle them client-side.
 
 ## Downstream impact (requires consumer changes)
-- `tool_use.name`: `TodoWrite` → `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`
+- `Task*` tool events are opt-in via `CLAUDE_CODE_ENABLE_TASKS=1`; default deployments keep emitting `TodoWrite`
 - MCP `init` may include `status: "pending"` servers
 - New block types `server_tool_use` / `advisor_tool_result` may appear
 
 ## Test plan
 - [x] Unit tests pass: `uv run pytest`
-- [x] Manual smoke test against `claude-opus-4-7` endpoint shows `TaskCreate` events
+- [x] Manual smoke test against `claude-opus-4-7` endpoint shows `TaskCreate` events when Task tools are enabled
 - [ ] Reviewer: confirm downstream consumers (list them) are aware of breaking changes
 
 🤖 Generated with [Claude Code](https://claude.com/claude-code)
@@ -725,7 +725,7 @@ Confirm `gh pr create` outputs a URL. Share with team.
 
 ## Self-Review (run before handing off)
 
-- [ ] **Spec coverage:** Every breaking change in 0.2.82 → covered? (✅ Task 3 covers TodoWrite→Task; Task 4 covers MCP nonblocking; ServerToolUseBlock/AdvisorToolResultBlock covered by existing generic fallback + documented in Task 8.)
+- [ ] **Spec coverage:** Every downstream-visible change in 0.2.82 → covered? (✅ Task 3 covers Task tool opt-in while retaining TodoWrite; Task 4 covers MCP nonblocking; ServerToolUseBlock/AdvisorToolResultBlock covered by streaming preservation + documented in Task 8.)
 - [ ] **Deprecations:** `"Skill"` allowed_tools → covered in Task 5.
 - [ ] **mcp version floor:** `>=1.23.0` — already satisfied (1.26.0), noted in Release Highlights.
 - [ ] **Downstream contract:** documented in Task 8.
