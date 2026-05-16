@@ -165,3 +165,18 @@ CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL: bool = _parse_sandbox_bool(
 )
 
 CLAUDE_SANDBOX_WEAKER_NESTED: bool = _parse_sandbox_bool("CLAUDE_SANDBOX_WEAKER_NESTED", "false")
+
+# ---------------------------------------------------------------------------
+# MCP Connection Behavior (claude-agent-sdk 0.2.82+)
+# ---------------------------------------------------------------------------
+# By default, MCP servers connect in the background; sessions start
+# immediately and slow servers report ``status: "pending"`` in init.
+#
+# To restore pre-0.2.82 behavior (wait up to 5s before first query), set:
+#     MCP_CONNECTION_NONBLOCKING=0
+#
+# Alternative: mark a specific server with ``alwaysLoad: true`` in the
+# mcp_servers config so the SDK waits for that server in turn 1.
+#
+# We accept the new default; downstream consumers must handle ``pending``
+# server state in init messages. See docs/api/breaking-changes.md.
