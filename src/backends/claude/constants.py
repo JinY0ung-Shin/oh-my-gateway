@@ -14,6 +14,10 @@ from src.env_utils import parse_bool_env
 # See: https://docs.anthropic.com/en/docs/claude-code/sdk
 CLAUDE_TOOLS = [
     "Task",  # Launch agents for complex tasks
+    "TaskCreate",  # Create task for tracking (replaces TodoWrite, 0.2.82+)
+    "TaskUpdate",  # Update task status (0.2.82+)
+    "TaskGet",  # Get task details (0.2.82+)
+    "TaskList",  # List tasks (0.2.82+)
     "Bash",  # Execute bash commands
     "Glob",  # File pattern matching
     "Grep",  # Search file contents
@@ -22,11 +26,11 @@ CLAUDE_TOOLS = [
     "Write",  # Write files
     "NotebookEdit",  # Edit Jupyter notebooks
     "WebFetch",  # Fetch web content
-    "TodoWrite",  # Manage todo lists
+    "TodoWrite",  # Deprecated 0.2.82; retained for back-compat
     "WebSearch",  # Search the web
     "BashOutput",  # Get bash output
     "KillShell",  # Kill bash shells
-    "Skill",  # Execute skills
+    "Skill",  # Execute skills (deprecated 0.1.77 — see skills= option)
     "SlashCommand",  # Execute slash commands
 ]
 
@@ -40,7 +44,11 @@ DEFAULT_ALLOWED_TOOLS = [
     "Write",
     "Edit",
     "Skill",
-    "TodoWrite",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
+    "TodoWrite",  # back-compat; SDK 0.2.82+ does not emit this
 ]
 
 # Claude Models

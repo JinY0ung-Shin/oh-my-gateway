@@ -282,6 +282,28 @@ class TestMessageAdapterFormatBlocks:
         assert result is None
 
 
+class TestTaskToolCatalog:
+    """Task tools must be present in tool catalog after 0.2.82 upgrade."""
+
+    def test_claude_tools_contains_task_tools(self):
+        from src.backends.claude.constants import CLAUDE_TOOLS
+
+        for tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
+            assert tool in CLAUDE_TOOLS, f"{tool} missing from CLAUDE_TOOLS"
+
+    def test_default_allowed_tools_contains_task_tools(self):
+        from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS
+
+        for tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
+            assert tool in DEFAULT_ALLOWED_TOOLS, f"{tool} missing from DEFAULT_ALLOWED_TOOLS"
+
+    def test_todowrite_retained_for_back_compat(self):
+        """TodoWrite stays in catalog; SDK no longer emits it but no harm leaving it."""
+        from src.backends.claude.constants import CLAUDE_TOOLS
+
+        assert "TodoWrite" in CLAUDE_TOOLS
+
+
 if __name__ == "__main__":
     # Run tests with pytest
     pytest.main([__file__, "-v"])
