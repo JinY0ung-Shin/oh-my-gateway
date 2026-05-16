@@ -191,9 +191,17 @@ class ClaudeCodeCLI:
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]],
     ) -> None:
-        """Apply tool allow/disallow lists to *options*."""
+        """Apply tool allow/disallow lists to *options*.
+
+        Translates the deprecated ``"Skill"`` entry in ``allowed_tools`` into
+        the modern ``skills="all"`` option (claude-agent-sdk 0.1.62+).
+        """
         if allowed_tools:
-            options.allowed_tools = [t for t in allowed_tools if t not in DISALLOWED_TOOLS]
+            filtered = [t for t in allowed_tools if t not in DISALLOWED_TOOLS]
+            if "Skill" in filtered:
+                filtered = [t for t in filtered if t != "Skill"]
+                options.skills = "all"
+            options.allowed_tools = filtered
         base_disallowed = list(DISALLOWED_SUBAGENT_TYPES) + list(DISALLOWED_TOOLS)
         if disallowed_tools:
             base_disallowed.extend(disallowed_tools)

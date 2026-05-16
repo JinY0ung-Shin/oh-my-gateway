@@ -304,6 +304,39 @@ class TestTaskToolCatalog:
         assert "TodoWrite" in CLAUDE_TOOLS
 
 
+class TestSkillsOptionMigration:
+    """`Skill` allowed_tools entry should be transformed into `skills="all"`."""
+
+    def test_skill_in_allowed_tools_sets_skills_all(self):
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)  # avoid __init__ side effects
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert "Skill" not in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) == "all"
+
+    def test_no_skill_keeps_skills_unset(self):
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) is None
+
+
 if __name__ == "__main__":
     # Run tests with pytest
     pytest.main([__file__, "-v"])
