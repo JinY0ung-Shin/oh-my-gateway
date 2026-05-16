@@ -8,6 +8,7 @@ import logging
 
 import pytest
 
+from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 from src.response_models import OutputItem, ResponseObject
 from src.streaming_utils import (
     CollabJsonStreamFilter,
@@ -300,6 +301,7 @@ async def test_stream_response_chunks_signals_empty_without_yielding_failed():
     """When no content is produced, signal via stream_result["empty"] rather
     than yielding response.failed directly. The route decides whether to emit
     a failed event or a function_call (AskUserQuestion hook path)."""
+
     async def empty_source():
         yield {"type": "metadata"}
 
@@ -844,6 +846,54 @@ async def test_stream_response_chunks_emits_embedded_tool_blocks_as_structured_s
 
     assert stream_result["success"] is True
     assert parsed[-1][0] == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_stream_response_chunks_preserves_server_tool_block_types():
+    """SDK server/advisor blocks emit as distinct structured SSE events."""
+
+    async def embedded_server_tool_source():
+        yield {
+            "type": "assistant",
+            "content": [
+                ServerToolUseBlock(id="srv_xyz", name="web_search", input={"query": "docs"}),
+                ServerToolResultBlock(tool_use_id="srv_xyz", content="Found docs"),
+                {"type": "text", "text": "Done."},
+            ],
+        }
+
+    chunks_buffer = []
+    stream_result = {}
+    lines = [
+        line
+        async for line in stream_response_chunks(
+            chunk_source=embedded_server_tool_source(),
+            model="claude-test",
+            response_id="resp-server-tool",
+            output_item_id="msg-server-tool",
+            chunks_buffer=chunks_buffer,
+            logger=logging.getLogger("test-server-tool-blocks"),
+            stream_result=stream_result,
+        )
+    ]
+    parsed = [_parse_response_sse(line) for line in lines]
+
+    server_event = next(p for et, p in parsed if et == "response.server_tool_use")
+    assert server_event["block"] == {
+        "type": "server_tool_use",
+        "id": "srv_xyz",
+        "name": "web_search",
+        "input": {"query": "docs"},
+    }
+
+    result_event = next(p for et, p in parsed if et == "response.advisor_tool_result")
+    assert result_event["block"] == {
+        "type": "advisor_tool_result",
+        "tool_use_id": "srv_xyz",
+        "content": "Found docs",
+    }
+    assert not any(et == "response.tool_use" for et, _ in parsed)
+    assert stream_result["success"] is True
 
 
 # ---------------------------------------------------------------------------

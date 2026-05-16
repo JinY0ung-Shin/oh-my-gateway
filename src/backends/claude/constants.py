@@ -14,6 +14,10 @@ from src.env_utils import parse_bool_env
 # See: https://docs.anthropic.com/en/docs/claude-code/sdk
 CLAUDE_TOOLS = [
     "Task",  # Launch agents for complex tasks
+    "TaskCreate",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
+    "TaskUpdate",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
+    "TaskGet",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
+    "TaskList",  # Task tracking (0.2.82+, opt-in via CLAUDE_CODE_ENABLE_TASKS=1)
     "Bash",  # Execute bash commands
     "Glob",  # File pattern matching
     "Grep",  # Search file contents
@@ -22,16 +26,18 @@ CLAUDE_TOOLS = [
     "Write",  # Write files
     "NotebookEdit",  # Edit Jupyter notebooks
     "WebFetch",  # Fetch web content
-    "TodoWrite",  # Manage todo lists
+    "TodoWrite",  # Default task-tracking tool when CLAUDE_CODE_ENABLE_TASKS is unset
     "WebSearch",  # Search the web
     "BashOutput",  # Get bash output
     "KillShell",  # Kill bash shells
-    "Skill",  # Execute skills
+    "Skill",  # Execute skills (deprecated 0.1.77 — translated to skills= option)
     "SlashCommand",  # Execute slash commands
 ]
 
 # Default tools to allow when tools are enabled
-# Subset of CLAUDE_TOOLS that are safe and commonly used
+# Subset of CLAUDE_TOOLS that are safe and commonly used.
+# Includes both TodoWrite (default) and Task* (active only when
+# CLAUDE_CODE_ENABLE_TASKS=1 is set on the CLI subprocess env).
 DEFAULT_ALLOWED_TOOLS = [
     "Read",
     "Glob",
@@ -40,6 +46,10 @@ DEFAULT_ALLOWED_TOOLS = [
     "Write",
     "Edit",
     "Skill",
+    "TaskCreate",
+    "TaskUpdate",
+    "TaskGet",
+    "TaskList",
     "TodoWrite",
 ]
 
@@ -157,3 +167,18 @@ CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL: bool = _parse_sandbox_bool(
 )
 
 CLAUDE_SANDBOX_WEAKER_NESTED: bool = _parse_sandbox_bool("CLAUDE_SANDBOX_WEAKER_NESTED", "false")
+
+# ---------------------------------------------------------------------------
+# MCP Connection Behavior (claude-agent-sdk 0.2.82+)
+# ---------------------------------------------------------------------------
+# By default, MCP servers connect in the background; sessions start
+# immediately and slow servers report ``status: "pending"`` in init.
+#
+# To restore pre-0.2.82 behavior (wait up to 5s before first query), set:
+#     MCP_CONNECTION_NONBLOCKING=0
+#
+# Alternative: mark a specific server with ``alwaysLoad: true`` in the
+# mcp_servers config so the SDK waits for that server in turn 1.
+#
+# We accept the new default; downstream consumers must handle ``pending``
+# server state in init messages. See docs/api/breaking-changes.md.

@@ -191,15 +191,29 @@ class ClaudeCodeCLI:
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]],
     ) -> None:
-        """Apply tool allow/disallow lists to *options*."""
+        """Apply tool allow/disallow lists to *options*.
+
+        Translates the deprecated ``"Skill"`` entry in ``allowed_tools`` into
+        the modern ``skills="all"`` option (claude-agent-sdk 0.1.62+).
+        """
         if allowed_tools:
-            options.allowed_tools = [t for t in allowed_tools if t not in DISALLOWED_TOOLS]
+            self._set_allowed_tools(options, allowed_tools)
         base_disallowed = list(DISALLOWED_SUBAGENT_TYPES) + list(DISALLOWED_TOOLS)
         if disallowed_tools:
             base_disallowed.extend(disallowed_tools)
         if base_disallowed:
             seen: set[str] = set()
-            options.disallowed_tools = [t for t in base_disallowed if not (t in seen or seen.add(t))]
+            options.disallowed_tools = [
+                t for t in base_disallowed if not (t in seen or seen.add(t))
+            ]
+
+    def _set_allowed_tools(self, options: ClaudeAgentOptions, tools: List[str]) -> None:
+        """Set allowed_tools while translating deprecated Skill access."""
+        filtered = [t for t in tools if t not in DISALLOWED_TOOLS]
+        if "Skill" in filtered:
+            filtered = [t for t in filtered if t != "Skill"]
+            options.skills = "all"
+        options.allowed_tools = filtered
 
     def _configure_sandbox(self, options: ClaudeAgentOptions) -> None:
         """Apply bash sandbox configuration to *options*.
@@ -299,7 +313,7 @@ class ClaudeCodeCLI:
         options.mcp_servers = mcp_servers
         mcp_patterns = get_mcp_tool_patterns(mcp_servers)
         if not options.allowed_tools:
-            options.allowed_tools = list(DEFAULT_ALLOWED_TOOLS)
+            self._set_allowed_tools(options, list(DEFAULT_ALLOWED_TOOLS))
         options.allowed_tools.extend(mcp_patterns)
         logger.debug(f"MCP tools enabled: {mcp_patterns}")
 

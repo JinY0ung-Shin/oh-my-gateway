@@ -282,6 +282,97 @@ class TestMessageAdapterFormatBlocks:
         assert result is None
 
 
+class TestTaskToolCatalog:
+    """Task tools must be present in tool catalog after 0.2.82 upgrade."""
+
+    def test_claude_tools_contains_task_tools(self):
+        from src.backends.claude.constants import CLAUDE_TOOLS
+
+        for tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
+            assert tool in CLAUDE_TOOLS, f"{tool} missing from CLAUDE_TOOLS"
+
+    def test_default_allowed_tools_contains_task_tools(self):
+        from src.backends.claude.constants import DEFAULT_ALLOWED_TOOLS
+
+        for tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
+            assert tool in DEFAULT_ALLOWED_TOOLS, f"{tool} missing from DEFAULT_ALLOWED_TOOLS"
+
+    def test_todowrite_retained_as_default(self):
+        """TodoWrite remains the default task-tracking tool; Task* require CLAUDE_CODE_ENABLE_TASKS=1 on the CLI subprocess env."""
+        from src.backends.claude.constants import CLAUDE_TOOLS
+
+        assert "TodoWrite" in CLAUDE_TOOLS
+
+
+class TestSkillsOptionMigration:
+    """`Skill` allowed_tools entry should be transformed into `skills="all"`."""
+
+    def test_skill_in_allowed_tools_sets_skills_all(self):
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)  # avoid __init__ side effects
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert "Skill" not in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) == "all"
+
+    def test_no_skill_keeps_skills_unset(self):
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) is None
+
+    def test_skill_in_disallowed_tools_skips_skills_translation(self, monkeypatch):
+        """DISALLOWED_TOOLS filter must win over the Skill→skills translation."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        # Operator-configured deny-list takes precedence over the Skill translation.
+        monkeypatch.setattr("src.backends.claude.client.DISALLOWED_TOOLS", ["Skill"])
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert "Skill" not in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) is None
+
+    def test_mcp_default_allowed_tools_translates_skill(self):
+        """MCP default allow-list path should not reintroduce deprecated Skill."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_mcp_servers(
+            options,
+            mcp_servers={"fs": {"type": "stdio", "command": "server"}},
+            allowed_tools=None,
+        )
+
+        assert "Skill" not in (options.allowed_tools or [])
+        assert "mcp__fs__*" in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) == "all"
+
+
 if __name__ == "__main__":
     # Run tests with pytest
     pytest.main([__file__, "-v"])

@@ -3,7 +3,12 @@
 import json
 from typing import Any, Dict, Optional
 
-from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
+from claude_agent_sdk.types import (
+    ServerToolResultBlock,
+    ServerToolUseBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 
 from src.collab_filter import strip_collab_json
 from src.constants import (
@@ -11,6 +16,14 @@ from src.constants import (
 )
 from src.message_adapter import MessageAdapter
 from src.sse_builders import _normalize_tool_result
+
+
+_TOOL_CONTENT_BLOCK_TYPES = {
+    "tool_use",
+    "tool_result",
+    "server_tool_use",
+    "advisor_tool_result",
+}
 
 
 def _extract_tool_blocks(content) -> tuple[list, list]:
@@ -25,11 +38,13 @@ def _extract_tool_blocks(content) -> tuple[list, list]:
     tool_blocks: list[Any] = []
     non_tool: list[Any] = []
     for b in content:
-        if isinstance(b, (ToolUseBlock, ToolResultBlock)):
+        if isinstance(
+            b, (ToolUseBlock, ToolResultBlock, ServerToolUseBlock, ServerToolResultBlock)
+        ):
             tool_blocks.append(b)
-        elif isinstance(b, dict) and b.get("type") in ("tool_use", "tool_result"):
+        elif isinstance(b, dict) and b.get("type") in _TOOL_CONTENT_BLOCK_TYPES:
             tool_blocks.append(b)
-        elif hasattr(b, "type") and getattr(b, "type", None) in ("tool_use", "tool_result"):
+        elif hasattr(b, "type") and getattr(b, "type", None) in _TOOL_CONTENT_BLOCK_TYPES:
             tool_blocks.append(b)
         else:
             non_tool.append(b)
@@ -131,6 +146,23 @@ def extract_embedded_tool_blocks(chunk: Dict[str, Any]) -> list:
             )
         elif isinstance(tb, ToolResultBlock):
             normalized.append(_normalize_tool_result(tb))
+        elif isinstance(tb, ServerToolUseBlock):
+            normalized.append(
+                {
+                    "type": "server_tool_use",
+                    "id": getattr(tb, "id", ""),
+                    "name": getattr(tb, "name", ""),
+                    "input": getattr(tb, "input", {}),
+                }
+            )
+        elif isinstance(tb, ServerToolResultBlock):
+            normalized.append(
+                {
+                    "type": "advisor_tool_result",
+                    "tool_use_id": getattr(tb, "tool_use_id", ""),
+                    "content": getattr(tb, "content", ""),
+                }
+            )
         elif hasattr(tb, "type"):
             # Generic SDK object fallback
             d: Dict[str, Any] = {"type": getattr(tb, "type", "")}
