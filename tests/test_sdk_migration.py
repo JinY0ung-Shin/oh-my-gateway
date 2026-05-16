@@ -336,6 +336,25 @@ class TestSkillsOptionMigration:
 
         assert getattr(options, "skills", None) is None
 
+    def test_skill_in_disallowed_tools_skips_skills_translation(self, monkeypatch):
+        """DISALLOWED_TOOLS filter must win over the Skill→skills translation."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        # Operator-configured deny-list takes precedence over the Skill translation.
+        monkeypatch.setattr("src.backends.claude.client.DISALLOWED_TOOLS", ["Skill"])
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert "Skill" not in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) is None
+
 
 if __name__ == "__main__":
     # Run tests with pytest
