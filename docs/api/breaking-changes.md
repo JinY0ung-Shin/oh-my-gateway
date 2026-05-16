@@ -2,23 +2,23 @@
 
 ## 2026-05-16 — Claude Agent SDK 0.2.82 upgrade
 
-### Tool name changes in `response.tool_use` events
+### Task tools are now available (opt-in)
 
-The Claude backend now emits the following tool names in `response.tool_use` SSE events instead of `TodoWrite`:
+claude-agent-sdk 0.2.82 ships a new task-tracking tool family (`TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`) alongside the legacy `TodoWrite`. The bundled Claude CLI gates these behind the `CLAUDE_CODE_ENABLE_TASKS` env var:
 
-- `TaskCreate` — create a task (input: `{title, description, status}`)
-- `TaskUpdate` — update task status (input: `{task_id, status, ...}`)
-- `TaskGet` — fetch a single task by id
-- `TaskList` — list all tasks
+- **Env unset (default)** — `TodoWrite` remains the only task-tracking tool emitted. No `response.tool_use` payload changes for existing clients.
+- **`CLAUDE_CODE_ENABLE_TASKS=1`** — the SDK emits `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList` instead. The gateway does not set this env automatically; operators choose per deployment.
 
-**Required client changes:**
+Schemas observed in this SDK version (from CLI tool definitions and a smoke-test run):
 
-1. **Recognize the new tool names.** Clients that previously branched on `tool_use.name == "TodoWrite"` must also handle `TaskCreate` / `TaskUpdate` / `TaskGet` / `TaskList`.
-2. **Switch from snapshot-replace to per-id accumulation.** `TodoWrite` emitted a full snapshot of all todos on every call; the new events are deltas keyed by task id. Maintain a `Map<task_id, task>` and apply each event:
-   - `TaskCreate`: insert
-   - `TaskUpdate`: update by id
-   - (others: as semantically appropriate)
-3. **`TodoWrite` may still appear from older sessions or back-compat paths.** Treat it as a snapshot for legacy data.
+| Tool | Input fields | id source |
+|---|---|---|
+| `TaskCreate` | `subject`, `description`, `activeForm?` (status is auto-`pending`) | returned in the `tool_result` `content` (e.g. `"Task #1 created successfully: ..."`), not in the `input` |
+| `TaskUpdate` | `taskId`, plus any of `status`, `subject`, `description`, `activeForm`, `owner`, `addBlocks`, `addBlockedBy`, `metadata` | n/a (caller supplies `taskId`) |
+| `TaskGet` | `taskId` | n/a |
+| `TaskList` | (no required input) | n/a |
+
+`Task*` events are per-id deltas (the CLI maintains task state on disk); `TodoWrite` events are full snapshots. Clients that want to render Task* should accumulate by `taskId`. Clients that only handle `TodoWrite` keep working as long as `CLAUDE_CODE_ENABLE_TASKS` stays unset.
 
 ### MCP server `init` may include pending servers
 

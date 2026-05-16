@@ -122,6 +122,49 @@ reconcile their buffered content.
 If the tool call/result comes from a subagent, the event includes
 `parent_tool_use_id`.
 
+### Server-side tool events
+
+claude-agent-sdk 0.2.82+ surfaces tools that the Anthropic API executes
+server-side (e.g. `web_search`, `web_fetch`, `code_execution`, `advisor`).
+These were silently dropped before 0.2.82.
+
+`response.server_tool_use` is emitted when the model invokes a server-side
+tool. The full SDK content block (preserving its `type` discriminator) is
+passed through under `block`:
+
+```json
+{
+  "type": "response.server_tool_use",
+  "block": {
+    "type": "server_tool_use",
+    "id": "srv_01ABC",
+    "name": "web_search",
+    "input": { "query": "claude agent sdk release notes" }
+  },
+  "sequence_number": 9
+}
+```
+
+`response.advisor_tool_result` is emitted when the API returns the result
+for a server-side tool call. `block.content` is the raw dict from the API
+— callers that care about a specific server tool's result schema inspect
+`block.content["type"]`:
+
+```json
+{
+  "type": "response.advisor_tool_result",
+  "block": {
+    "type": "advisor_tool_result",
+    "tool_use_id": "srv_01ABC",
+    "content": { "type": "web_search_result", "results": [...] }
+  },
+  "sequence_number": 10
+}
+```
+
+Clients are not expected to return anything for server-side tool calls —
+the API executes them itself and delivers the result in the same stream.
+
 ## Subagent Events
 
 Subagent task system messages are forwarded as structured progress events:

@@ -297,8 +297,8 @@ class TestTaskToolCatalog:
         for tool in ("TaskCreate", "TaskUpdate", "TaskGet", "TaskList"):
             assert tool in DEFAULT_ALLOWED_TOOLS, f"{tool} missing from DEFAULT_ALLOWED_TOOLS"
 
-    def test_todowrite_retained_for_back_compat(self):
-        """TodoWrite stays in catalog; SDK no longer emits it but no harm leaving it."""
+    def test_todowrite_retained_as_default(self):
+        """TodoWrite remains the default task-tracking tool; Task* require CLAUDE_CODE_ENABLE_TASKS=1 on the CLI subprocess env."""
         from src.backends.claude.constants import CLAUDE_TOOLS
 
         assert "TodoWrite" in CLAUDE_TOOLS
