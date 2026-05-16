@@ -8,6 +8,8 @@ These are pure unit tests that don't require a running server.
 
 from types import SimpleNamespace
 
+from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
+
 from src.message_adapter import MessageAdapter
 from src.response_models import ResponseInputItem
 
@@ -160,6 +162,22 @@ class TestBlockFormatting:
             "tool_use_id": "tool-1",
             "content": "result",
             "is_error": True,
+        }
+
+    def test_block_to_dict_preserves_server_tool_block_types(self):
+        server_use = ServerToolUseBlock(id="srv-1", name="web_search", input={"query": "x"})
+        advisor_result = ServerToolResultBlock(tool_use_id="srv-1", content="done")
+
+        assert MessageAdapter._block_to_dict(server_use) == {
+            "type": "server_tool_use",
+            "id": "srv-1",
+            "name": "web_search",
+            "input": {"query": "x"},
+        }
+        assert MessageAdapter._block_to_dict(advisor_result) == {
+            "type": "advisor_tool_result",
+            "tool_use_id": "srv-1",
+            "content": "done",
         }
 
     def test_block_to_dict_supports_dict_and_string_variants(self):

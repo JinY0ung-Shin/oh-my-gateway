@@ -461,9 +461,7 @@ def _user_tool_result_events(
     normalized_results = [_normalize_tool_result(tr_block) for tr_block in tool_results]
     visible_results = []
     for tr_block in normalized_results:
-        if _is_synthetic_ask_user_response_result(
-            tr_block, tool_names_by_id, request_context
-        ):
+        if _is_synthetic_ask_user_response_result(tr_block, tool_names_by_id, request_context):
             tr_block["is_error"] = False
             _record_tool_result(tool_stats, tr_block)
             continue
@@ -506,6 +504,11 @@ def _embedded_tool_events(
             if suppress_result:
                 result_block["is_error"] = False
             _record_tool_result(tool_stats, result_block)
+        elif block_type == "server_tool_use":
+            _remember_tool_use(tool_names_by_id, tool_block)
+            _record_tool_use(tool_stats, tool_block)
+        elif block_type == "advisor_tool_result":
+            _record_tool_result(tool_stats, tool_block)
 
         is_subagent_block = tool_block.get("parent_tool_use_id") is not None
         if is_subagent_block and not SUBAGENT_STREAM_TOOL_BLOCKS:
@@ -526,6 +529,14 @@ def _embedded_tool_events(
                     result_block if result_block is not None else tool_block,
                     sequence_number=next_seq(),
                     parent_tool_use_id=tool_block.get("parent_tool_use_id"),
+                )
+            )
+        elif block_type in {"server_tool_use", "advisor_tool_result"}:
+            events.append(
+                make_response_sse(
+                    f"response.{block_type}",
+                    block=tool_block,
+                    sequence_number=next_seq(),
                 )
             )
     return events

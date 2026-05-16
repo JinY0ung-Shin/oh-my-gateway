@@ -12,7 +12,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from claude_agent_sdk.types import ToolResultBlock, ToolUseBlock
+from claude_agent_sdk.types import (
+    ServerToolResultBlock,
+    ServerToolUseBlock,
+    ToolResultBlock,
+    ToolUseBlock,
+)
 from src.streaming_utils import (
     CollabJsonStreamFilter,
     ToolUseAccumulator,
@@ -394,6 +399,27 @@ class TestExtractEmbeddedToolBlocksSDKNormalization:
         assert blocks[0]["type"] == "tool_result"
         assert blocks[0]["tool_use_id"] == "sdk-t1"
         assert blocks[0]["content"] == "file data"
+
+    def test_sdk_server_tool_blocks_preserve_wire_types(self):
+        """Server tool blocks keep their SDK 0.2.82 content block types."""
+        use = ServerToolUseBlock(id="srv-t1", name="web_search", input={"query": "x"})
+        result = ServerToolResultBlock(tool_use_id="srv-t1", content="done")
+        chunk = {"type": "assistant", "content": [use, result]}
+        blocks = extract_embedded_tool_blocks(chunk)
+
+        assert blocks == [
+            {
+                "type": "server_tool_use",
+                "id": "srv-t1",
+                "name": "web_search",
+                "input": {"query": "x"},
+            },
+            {
+                "type": "advisor_tool_result",
+                "tool_use_id": "srv-t1",
+                "content": "done",
+            },
+        ]
 
     def test_generic_sdk_object_with_type_attr_fallback(self):
         """Lines 498-504: generic SDK object with type attribute uses fallback."""

@@ -28,7 +28,7 @@ To force the previous behavior (block on MCP connect), set `MCP_CONNECTION_NONBL
 
 ### New block types may appear in assistant content
 
-The SDK now emits `server_tool_use` and `advisor_tool_result` blocks (previously silently dropped). These pass through to clients unchanged. Clients that exhaustively switch on block `type` should add cases for these (or use a default fallback).
+The SDK now emits `server_tool_use` and `advisor_tool_result` blocks (previously silently dropped). Streaming responses expose these as `response.server_tool_use` and `response.advisor_tool_result` SSE events with the original content block under `block`. Clients that exhaustively switch on `block.type` should add cases for these (or use a default fallback).
 
 ### `api_error_status` field available on error results
 

@@ -355,6 +355,23 @@ class TestSkillsOptionMigration:
         assert "Skill" not in (options.allowed_tools or [])
         assert getattr(options, "skills", None) is None
 
+    def test_mcp_default_allowed_tools_translates_skill(self):
+        """MCP default allow-list path should not reintroduce deprecated Skill."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_mcp_servers(
+            options,
+            mcp_servers={"fs": {"type": "stdio", "command": "server"}},
+            allowed_tools=None,
+        )
+
+        assert "Skill" not in (options.allowed_tools or [])
+        assert "mcp__fs__*" in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) == "all"
+
 
 if __name__ == "__main__":
     # Run tests with pytest

@@ -3,6 +3,8 @@ import os
 import re
 import json
 
+from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
+
 
 class MessageAdapter:
     """Converts between OpenAI message format and Claude Code prompts."""
@@ -34,6 +36,33 @@ class MessageAdapter:
         # ThinkingBlock (dict)
         if isinstance(block, dict) and block.get("type") == "thinking":
             return block
+
+        # ServerToolUseBlock (object)
+        if isinstance(block, ServerToolUseBlock):
+            return {
+                "type": "server_tool_use",
+                "id": getattr(block, "id", ""),
+                "name": block.name,
+                "input": block.input if isinstance(block.input, dict) else str(block.input),
+            }
+
+        # ServerToolUseBlock (dict)
+        if isinstance(block, dict) and block.get("type") == "server_tool_use":
+            return block
+
+        # ServerToolResultBlock / advisor_tool_result (object)
+        if isinstance(block, ServerToolResultBlock):
+            return {
+                "type": "advisor_tool_result",
+                "tool_use_id": block.tool_use_id,
+                "content": MessageAdapter._truncate_tool_content(block.content),
+            }
+
+        # ServerToolResultBlock / advisor_tool_result (dict)
+        if isinstance(block, dict) and block.get("type") == "advisor_tool_result":
+            result = dict(block)
+            result["content"] = MessageAdapter._truncate_tool_content(result.get("content", ""))
+            return result
 
         # ToolUseBlock (object)
         if hasattr(block, "name") and hasattr(block, "input"):
