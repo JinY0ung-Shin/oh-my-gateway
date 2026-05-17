@@ -226,8 +226,8 @@ def test_client_authorization_is_not_forwarded_upstream(monkeypatch):
     assert "authorization" not in {k.lower() for k in captured["request"].headers.keys()}
 
 
-def test_disabled_via_runtime_config_returns_503():
-    """Admin toggle sets sanitizer_enabled=False → route short-circuits to 503."""
+def test_disabled_via_runtime_config_returns_404():
+    """Admin toggle off → route must look exactly absent to clients (404)."""
 
     def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
         raise AssertionError("upstream was contacted despite sanitizer being disabled")
@@ -239,8 +239,7 @@ def test_disabled_via_runtime_config_returns_503():
         "/v1/messages",
         json={"model": "x", "stream": False, "messages": []},
     )
-    assert resp.status_code == 503
-    assert json.loads(resp.content)["error"]["type"] == "service_unavailable"
+    assert resp.status_code == 404
 
 
 def test_accept_encoding_is_not_forwarded_upstream():

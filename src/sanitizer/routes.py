@@ -52,8 +52,8 @@ _HOP_BY_HOP = frozenset(
 )
 
 # Stripped from the request before forwarding to upstream:
-# - ``authorization``: the gateway has its own API key; upstream is a different
-#   trust boundary and gets its bearer from SANITIZER_UPSTREAM_API_KEY.
+# - ``authorization``: the gateway has its own API key; we don't want it
+#   leaking onto the loopback port as a de-facto upstream credential.
 # - ``accept-encoding``: httpx negotiates and auto-decompresses internally; if
 #   we forwarded the client's value, upstream would compress and we'd decode
 #   anyway — wasted upstream CPU.
@@ -131,12 +131,14 @@ async def sanitize_messages(
 ) -> Response:
     """Proxy ``/v1/messages`` to the upstream and rewrite the SSE stream."""
     if not is_enabled():
-        # The route is always mounted so admins can flip it on/off at runtime;
-        # when disabled it should look effectively absent to the client.
+        # The route is always mounted so admins can flip it on/off at runtime,
+        # but to the outside world a disabled sanitizer must look exactly as if
+        # ``/v1/messages`` were never registered. This preserves the legacy
+        # contract that tests/clients depend on (``status in (404, 405)``).
         return Response(
-            status_code=503,
+            status_code=404,
             content=json.dumps(
-                {"error": {"type": "service_unavailable", "message": "sanitizer is disabled"}}
+                {"error": {"type": "not_found", "message": "Not Found"}}
             ).encode("utf-8"),
             media_type="application/json",
         )
