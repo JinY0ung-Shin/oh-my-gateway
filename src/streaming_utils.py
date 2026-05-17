@@ -728,28 +728,6 @@ async def stream_response_chunks(
                         yield make_task_response_sse(task_event, sequence_number=_next_seq())
                 continue
 
-            # [STREAM_DEBUG] temporary diagnostic for unclosed <think> investigation
-            if chunk.get("type") == "stream_event":
-                _ev = chunk.get("event", {}) or {}
-                _et = _ev.get("type")
-                if _et in ("content_block_start", "content_block_stop", "content_block_delta"):
-                    _payload = _ev.get("content_block") or _ev.get("delta") or {}
-                    logger.info("[STREAM_DEBUG] %s: %r", _et, _payload)
-            elif chunk.get("type") in ("assistant",) or isinstance(chunk.get("content"), list):
-                _content = chunk.get("content") or (chunk.get("message") or {}).get("content")
-                if isinstance(_content, list):
-                    logger.info(
-                        "[STREAM_DEBUG] assistant_chunk block_types=%r",
-                        [
-                            (
-                                type(b).__name__
-                                if not isinstance(b, dict)
-                                else b.get("type", "dict?")
-                            )
-                            for b in _content
-                        ],
-                    )
-
             # Token-level streaming (text/thinking deltas)
             was_thinking = in_thinking
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
