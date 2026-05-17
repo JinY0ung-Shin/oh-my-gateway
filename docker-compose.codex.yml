@@ -1,0 +1,75 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.codex
+      args:
+        - HTTP_PROXY
+        - HTTPS_PROXY
+        - NO_PROXY
+        - http_proxy
+        - https_proxy
+        - no_proxy
+        - APT_MIRROR_URL
+        - APT_SECURITY_MIRROR_URL
+        - NPM_CONFIG_REGISTRY
+        - CODEX_VERSION
+        - PIP_INDEX_URL
+        - PIP_EXTRA_INDEX_URL
+        - PIP_TRUSTED_HOST
+    depends_on:
+      gateway-log:
+        condition: service_healthy
+        required: false
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      # Persist Codex CLI/app-server auth, config, and session state.
+      - codex_home:/home/app/.codex
+      # Share the host CA bundle with the container for corporate roots.
+      - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
+      # Persist admin overrides across restarts.
+      - ./data:/app/data
+      # Gateway workspaces. This still uses CLAUDE_CWD internally because the
+      # workspace manager is shared across Claude/OpenCode/Codex backends.
+      - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
+    env_file:
+      - .env
+    environment:
+      - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
+      - BACKENDS=codex
+      - DEFAULT_MODEL=${CODEX_DEFAULT_GATEWAY_MODEL:-codex/gpt-5.5}
+      - CODEX_BIN=codex
+      - CODEX_HOME=/home/app/.codex
+      - CODEX_MODELS=${CODEX_MODELS:-gpt-5.5}
+      - CODEX_APPROVAL_POLICY=${CODEX_APPROVAL_POLICY:-never}
+      - CODEX_SANDBOX=${CODEX_SANDBOX:-danger-full-access}
+      - CODEX_CONFIG_OVERRIDES=${CODEX_CONFIG_OVERRIDES:-}
+      - CLAUDE_CWD=/app/working_dir
+
+  gateway-log:
+    profiles: ["logging"]
+    image: mysql:8.0
+    container_name: gateway-log
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${GATEWAY_LOG_PORT:-3306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GATEWAY_LOG_MYSQL_ROOT_PASSWORD:-gateway_root}
+      MYSQL_DATABASE: ${GATEWAY_LOG_MYSQL_DATABASE:-gateway_log}
+      MYSQL_USER: ${GATEWAY_LOG_MYSQL_USER:-gateway}
+      MYSQL_PASSWORD: ${GATEWAY_LOG_MYSQL_PASSWORD:-gateway}
+    volumes:
+      - ./data/mysql_data:/var/lib/mysql
+      - ./docker/mysql_init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${GATEWAY_LOG_MYSQL_ROOT_PASSWORD:-gateway_root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  codex_home:

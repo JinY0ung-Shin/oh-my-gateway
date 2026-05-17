@@ -12,6 +12,7 @@ DEFAULT_UID = 1000
 DEFAULT_GID = 1000
 DEFAULT_DATA_DIR = Path("/app/data")
 DEFAULT_CLAUDE_HOME = Path("/home/app/.claude")
+DEFAULT_CODEX_HOME = Path("/home/app/.codex")
 MYSQL_DATA_DIR_NAME = "mysql_data"
 
 
@@ -55,17 +56,20 @@ def prepare_writable_paths(
     gid: int,
     data_dir: Path = DEFAULT_DATA_DIR,
     claude_home: Path = DEFAULT_CLAUDE_HOME,
+    codex_home: Path = DEFAULT_CODEX_HOME,
 ) -> None:
     """Ensure gateway-owned writable paths are usable by the app process."""
     data_dir = Path(data_dir)
     prompts_dir = data_dir / "prompts"
     claude_home = Path(claude_home)
+    codex_home = Path(codex_home)
     home_dir = claude_home.parent
 
     data_dir.mkdir(parents=True, exist_ok=True)
     prompts_dir.mkdir(parents=True, exist_ok=True)
     home_dir.mkdir(parents=True, exist_ok=True)
     claude_home.mkdir(parents=True, exist_ok=True)
+    codex_home.mkdir(parents=True, exist_ok=True)
 
     _chown(data_dir, uid, gid)
     for child in data_dir.iterdir():
@@ -78,6 +82,7 @@ def prepare_writable_paths(
 
     _chown(home_dir, uid, gid)
     _chown_tree(claude_home, uid, gid)
+    _chown_tree(codex_home, uid, gid)
 
 
 def drop_privileges(uid: int, gid: int) -> None:

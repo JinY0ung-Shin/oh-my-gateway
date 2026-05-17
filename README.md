@@ -171,6 +171,14 @@ The Docker image is pinned to Debian trixie. OpenCode is installed from npm as
 matching platform package such as `opencode-linux-x64` or
 `opencode-linux-arm64`.
 
+For a Codex-only deployment, use the separate Compose file. It builds a
+Codex-specific image, installs `@openai/codex`, forces `BACKENDS=codex`, and
+persists Codex CLI state in a named Docker volume:
+
+```bash
+docker compose -f docker-compose.codex.yml up -d --build
+```
+
 The Compose service is named `gateway`. Optional usage logging is available through the `logging` profile:
 
 ```bash

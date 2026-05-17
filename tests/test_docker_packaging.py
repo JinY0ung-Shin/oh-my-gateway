@@ -96,6 +96,7 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     prompts_dir = data_dir / "prompts"
     mysql_dir = data_dir / "mysql_data"
     claude_home = tmp_path / ".claude"
+    codex_home = tmp_path / ".codex"
 
     prompts_dir.mkdir(parents=True)
     mysql_dir.mkdir()
@@ -120,6 +121,7 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
         gid=456,
         data_dir=data_dir,
         claude_home=claude_home,
+        codex_home=codex_home,
     )
 
     assert data_dir in chowned
@@ -128,6 +130,7 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     assert persisted_prompt in chowned
     assert claude_home.parent in chowned
     assert claude_home in chowned
+    assert codex_home in chowned
     assert mysql_dir not in chowned
     assert mysql_file not in chowned
 
@@ -239,3 +242,28 @@ def test_compose_does_not_configure_external_opencode_server():
     compose = (ROOT / "docker-compose.yml").read_text()
 
     assert "OPENCODE_BASE_URL" not in compose
+
+
+def test_codex_dockerfile_installs_codex_cli_runtime():
+    """The Codex image should install the Codex app-server CLI."""
+    dockerfile = (ROOT / "Dockerfile.codex").read_text()
+
+    assert "FROM python:3.12-slim-trixie AS codex-builder" in dockerfile
+    assert "ARG CODEX_VERSION=" in dockerfile
+    assert '"@openai/codex@${CODEX_VERSION}"' in dockerfile
+    assert "codex --version" in dockerfile
+    assert "CODEX_HOME=/home/app/.codex" in dockerfile
+    assert "ENTRYPOINT [\"python\", \"/usr/local/bin/docker-entrypoint.py\"]" in dockerfile
+
+
+def test_codex_compose_enables_codex_backend_and_state_volume():
+    """Codex Compose should run a Codex-only gateway with persistent Codex state."""
+    compose = (ROOT / "docker-compose.codex.yml").read_text()
+
+    assert "dockerfile: Dockerfile.codex" in compose
+    assert "- CODEX_VERSION" in compose
+    assert "- BACKENDS=codex" in compose
+    assert "- DEFAULT_MODEL=${CODEX_DEFAULT_GATEWAY_MODEL:-codex/gpt-5.5}" in compose
+    assert "- CODEX_HOME=/home/app/.codex" in compose
+    assert "- codex_home:/home/app/.codex" in compose
+    assert "codex_home:" in compose

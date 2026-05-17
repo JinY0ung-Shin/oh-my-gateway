@@ -53,6 +53,31 @@ JSON-RPC client instead of adding an unavailable package dependency.
 | `CODEX_SANDBOX` | Thread-level Codex sandbox mode. Default: `danger-full-access` for local experimental use |
 | `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |
 
+## Docker Compose
+
+Use the Codex-specific Compose file when the gateway container should own the
+Codex backend runtime:
+
+```bash
+cp .env.example .env
+# set ADMIN_API_KEY and either OPENAI_API_KEY/CODEX_API_KEY, or run codex login
+docker compose -f docker-compose.codex.yml up -d --build
+```
+
+`docker-compose.codex.yml` builds `Dockerfile.codex`, installs
+`@openai/codex@${CODEX_VERSION:-0.130.0}`, forces `BACKENDS=codex`, and stores
+Codex CLI state in the `codex_home` named volume mounted at `/home/app/.codex`.
+
+For ChatGPT/Codex CLI login instead of API-key auth:
+
+```bash
+docker compose -f docker-compose.codex.yml run --rm gateway codex login
+docker compose -f docker-compose.codex.yml up -d
+```
+
+Use `CODEX_DEFAULT_GATEWAY_MODEL` to change the container's gateway default
+model without reusing a Claude-oriented `DEFAULT_MODEL` from `.env`.
+
 ## Supported Behavior
 
 - Text prompts and text responses are supported.
