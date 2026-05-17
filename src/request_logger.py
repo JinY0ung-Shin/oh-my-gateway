@@ -90,6 +90,9 @@ DEFAULT_EXCLUDE_PREFIXES: Tuple[str, ...] = (
     "/docs",
     "/openapi.json",
     "/favicon.ico",
+    # The sanitizer proxy is a pure pass-through for Claude Code ↔ LiteLLM; its
+    # requests belong to the upstream model traffic, not gateway observability.
+    "/v1/messages",
 )
 
 
