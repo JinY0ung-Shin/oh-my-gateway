@@ -13,7 +13,7 @@ from typing import AsyncIterator, Iterable, List
 
 import pytest
 
-from src.sanitizer.stream_sanitizer import DELTA_TO_BLOCK_TYPE, sanitize_events
+from src.sanitizer.stream_sanitizer import DELTA_COMPATIBLE_BLOCKS, sanitize_events
 
 
 # ---------------------------------------------------------------------------
@@ -51,10 +51,11 @@ def assert_spec_conforming(events: List[dict]) -> None:
             idx, block_type = open_block
             assert evt["index"] == idx, f"delta index {evt['index']} != open {idx}"
             delta_type = evt["delta"]["type"]
-            expected = DELTA_TO_BLOCK_TYPE.get(delta_type, block_type)
-            assert expected == block_type, (
-                f"delta type {delta_type} in {block_type} block (idx={idx})"
-            )
+            compatible = DELTA_COMPATIBLE_BLOCKS.get(delta_type)
+            if compatible is not None:
+                assert block_type in compatible, (
+                    f"delta type {delta_type} in {block_type} block (idx={idx})"
+                )
         elif t == "content_block_stop":
             assert open_block is not None, f"stop with no open block: {evt}"
             assert evt["index"] == open_block[0]
@@ -238,6 +239,39 @@ class TestSanitizerSpecCompliance:
         out = await _collect(sanitize_events(_as_async(events)))
         assert any(e["type"] == "ping" for e in out)
         assert_spec_conforming(out)
+
+    async def test_input_json_delta_inside_server_tool_use_does_not_split(self):
+        """server_tool_use blocks (e.g. web_search) emit input_json_delta too.
+
+        The sanitizer must treat the existing server_tool_use as compatible and
+        leave the upstream id/name/type intact, instead of closing it and
+        synthesizing an empty tool_use block.
+        """
+        events = [
+            {"type": "message_start", "message": {"id": "msg_1"}},
+            {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "server_tool_use",
+                    "id": "srvtoolu_abc",
+                    "name": "web_search",
+                    "input": {},
+                },
+            },
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"q\":"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"x\"}"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_stop"},
+        ]
+        out = await _collect(sanitize_events(_as_async(events)))
+        assert_spec_conforming(out)
+        starts = [e for e in out if e["type"] == "content_block_start"]
+        # Exactly one block, the original server_tool_use — no synthetic split.
+        assert len(starts) == 1
+        assert starts[0]["content_block"]["type"] == "server_tool_use"
+        assert starts[0]["content_block"]["id"] == "srvtoolu_abc"
+        assert starts[0]["content_block"]["name"] == "web_search"
 
     async def test_explicit_block_start_after_synthetic_split_remains_consistent(self):
         """Upstream emits content_block_start mid-stream after we've already split."""

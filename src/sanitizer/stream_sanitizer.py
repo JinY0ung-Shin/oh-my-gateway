@@ -7,17 +7,35 @@ serialization.
 
 from __future__ import annotations
 
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, FrozenSet, Optional
 
 
-# Mapping from a delta event's ``delta.type`` to the ``content_block.type`` it
-# must live inside, per the Anthropic Messages stream spec.
-DELTA_TO_BLOCK_TYPE: Dict[str, str] = {
+# Block types a given ``delta.type`` is allowed to appear inside. The Anthropic
+# Messages stream emits ``input_json_delta`` for both regular ``tool_use`` and
+# server-side variants (e.g. ``server_tool_use`` for web search), so the
+# compatibility is a set rather than a single type.
+DELTA_COMPATIBLE_BLOCKS: Dict[str, FrozenSet[str]] = {
+    "text_delta": frozenset({"text"}),
+    "thinking_delta": frozenset({"thinking"}),
+    "signature_delta": frozenset({"thinking"}),
+    "input_json_delta": frozenset({"tool_use", "server_tool_use"}),
+}
+
+# When the sanitizer must synthesize a new ``content_block_start`` for a delta
+# that has no compatible open block, this is the block type it picks. Falls
+# back to a regular ``tool_use`` for tool deltas since synthesizing a
+# ``server_tool_use`` without an id/name is even less useful.
+DELTA_PRIMARY_BLOCK: Dict[str, str] = {
     "text_delta": "text",
     "thinking_delta": "thinking",
-    "input_json_delta": "tool_use",
     "signature_delta": "thinking",
+    "input_json_delta": "tool_use",
 }
+
+# Backward-compatible alias: external callers (tests, etc.) may still reference
+# the old single-value mapping. The new compatibility set above is the source
+# of truth for the sanitizer's split decision.
+DELTA_TO_BLOCK_TYPE: Dict[str, str] = dict(DELTA_PRIMARY_BLOCK)
 
 
 def _synthetic_block(block_type: str) -> Dict[str, Any]:
@@ -77,16 +95,23 @@ async def sanitize_events(
 
         if etype == "content_block_delta":
             delta_type = evt.get("delta", {}).get("type")
-            expected = DELTA_TO_BLOCK_TYPE.get(delta_type)
-            if expected is not None and expected != current_block_type:
+            compatible = DELTA_COMPATIBLE_BLOCKS.get(delta_type)
+            if compatible is not None and current_block_type not in compatible:
+                # Current block can't validly hold this delta — close it and
+                # open a synthetic block of the delta's primary type. This is
+                # the LiteLLM #21128 path (text block opened, thinking_delta
+                # arrives) but it must NOT fire when an already-compatible
+                # block (e.g. server_tool_use receiving input_json_delta) is
+                # open, since that would strip the upstream id/name/type.
                 if current_block_type is not None:
                     yield _close_current()
                 current_index += 1
-                current_block_type = expected
+                primary = DELTA_PRIMARY_BLOCK[delta_type]
+                current_block_type = primary
                 yield {
                     "type": "content_block_start",
                     "index": current_index,
-                    "content_block": _synthetic_block(expected),
+                    "content_block": _synthetic_block(primary),
                 }
             new_evt = dict(evt)
             new_evt["index"] = current_index

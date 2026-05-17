@@ -176,3 +176,104 @@ def test_verify_api_key_accepts_correct_bearer(monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.content == body
+
+
+def _capture_request_handler(response: httpx.Response):
+    """Return (handler, captured) where captured["request"] holds the last call."""
+    captured: dict[str, httpx.Request] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["request"] = request
+        return response
+
+    return handler, captured
+
+
+def test_client_authorization_is_not_forwarded_upstream(monkeypatch):
+    """Client bearer authenticates the gateway; upstream is a different trust boundary."""
+    from src.auth import auth_manager
+
+    monkeypatch.setattr(auth_manager, "runtime_api_key", "secret-key")
+    monkeypatch.delenv("SANITIZER_UPSTREAM_API_KEY", raising=False)
+
+    handler, captured = _capture_request_handler(
+        httpx.Response(200, headers={"content-type": "application/json"}, content=b"{}")
+    )
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+        headers={"Authorization": "Bearer secret-key"},
+    )
+    assert resp.status_code == 200
+    assert "authorization" not in {k.lower() for k in captured["request"].headers.keys()}
+
+
+def test_upstream_api_key_replaces_authorization(monkeypatch):
+    """When SANITIZER_UPSTREAM_API_KEY is set, upstream sees that bearer instead."""
+    from src.auth import auth_manager
+
+    monkeypatch.setattr(auth_manager, "runtime_api_key", "secret-key")
+    monkeypatch.setenv("SANITIZER_UPSTREAM_API_KEY", "upstream-key")
+
+    handler, captured = _capture_request_handler(
+        httpx.Response(200, headers={"content-type": "application/json"}, content=b"{}")
+    )
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+        headers={"Authorization": "Bearer secret-key"},
+    )
+    assert resp.status_code == 200
+    assert captured["request"].headers.get("authorization") == "Bearer upstream-key"
+
+
+def test_accept_encoding_is_not_forwarded_upstream():
+    """We re-serialize SSE as plain UTF-8, so requesting compression upstream is wasteful."""
+    handler, captured = _capture_request_handler(
+        httpx.Response(200, headers={"content-type": "application/json"}, content=b"{}")
+    )
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+        headers={"Accept-Encoding": "gzip, deflate, br"},
+    )
+    assert resp.status_code == 200
+    # httpx may add its own default accept-encoding; the important contract is
+    # that the *client's* value did not bleed through verbatim.
+    forwarded = captured["request"].headers.get("accept-encoding", "")
+    assert "br" not in forwarded
+
+
+def test_content_encoding_stripped_from_response():
+    """httpx auto-decodes bodies; passing content-encoding to the client would mislead it."""
+    import gzip
+
+    body = json.dumps({"id": "msg_1"}).encode()
+    gz_body = gzip.compress(body)
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "content-encoding": "gzip",
+            },
+            content=gz_body,
+        )
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+    )
+    assert resp.status_code == 200
+    # httpx auto-decoded the body; we must not advertise it as still encoded.
+    assert "content-encoding" not in {k.lower() for k in resp.headers.keys()}
+    assert resp.content == body

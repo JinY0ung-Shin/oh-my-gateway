@@ -18,7 +18,11 @@ from fastapi.responses import Response, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 
 from src.auth import security, verify_api_key
-from src.sanitizer.config import get_request_timeout_seconds, get_upstream_url
+from src.sanitizer.config import (
+    get_request_timeout_seconds,
+    get_upstream_api_key,
+    get_upstream_url,
+)
 from src.sanitizer.stream_sanitizer import sanitize_events
 
 logger = logging.getLogger(__name__)
@@ -30,9 +34,8 @@ def _make_client(timeout: float | None) -> httpx.AsyncClient:
     """AsyncClient factory; tests monkeypatch this to inject a MockTransport."""
     return httpx.AsyncClient(timeout=timeout)
 
-# Headers that must not be forwarded upstream or back to the client because
-# they describe the *transport* (length, encoding, host) rather than the
-# request/response itself. ``httpx`` and ``Starlette`` set them automatically.
+# Hop-by-hop headers (RFC 7230 §6.1) plus transport-framing headers set by
+# httpx/Starlette automatically. Never forwarded in either direction.
 _HOP_BY_HOP = frozenset(
     {
         "host",
@@ -48,9 +51,24 @@ _HOP_BY_HOP = frozenset(
     }
 )
 
+# Stripped from the request before forwarding to upstream:
+# - ``authorization``: the gateway has its own API key; upstream is a different
+#   trust boundary and gets its bearer from SANITIZER_UPSTREAM_API_KEY.
+# - ``accept-encoding``: httpx negotiates and auto-decompresses internally; if
+#   we forwarded the client's value, upstream would compress and we'd decode
+#   anyway — wasted upstream CPU.
+_DROP_FROM_REQUEST = _HOP_BY_HOP | frozenset({"authorization", "accept-encoding"})
 
-def _filter_headers(items) -> Dict[str, str]:
-    return {k: v for k, v in items if k.lower() not in _HOP_BY_HOP}
+# Stripped from the upstream response before returning to the client:
+# - ``content-encoding``: httpx returns decoded bytes from .content/.aread()/
+#   .aiter_lines(), and the SSE branch re-serializes events as plain UTF-8.
+#   Forwarding the original encoding would mislead the client into decompressing
+#   already-decoded data.
+_DROP_FROM_RESPONSE = _HOP_BY_HOP | frozenset({"content-encoding"})
+
+
+def _filter_headers(items, drop: frozenset) -> Dict[str, str]:
+    return {k: v for k, v in items if k.lower() not in drop}
 
 
 async def _iter_sse_events(
@@ -115,7 +133,10 @@ async def sanitize_messages(
     await verify_api_key(request, credentials)
 
     body = await request.body()
-    fwd_headers = _filter_headers(request.headers.items())
+    fwd_headers = _filter_headers(request.headers.items(), _DROP_FROM_REQUEST)
+    upstream_key = get_upstream_api_key()
+    if upstream_key is not None:
+        fwd_headers["Authorization"] = f"Bearer {upstream_key}"
 
     # Decide stream vs non-stream from the request body, falling back to
     # non-stream on parse failure (matches Anthropic API behavior).
@@ -142,7 +163,7 @@ async def sanitize_messages(
         try:
             upstream = await client.send(upstream_req)
             content = upstream.content
-            resp_headers = _filter_headers(upstream.headers.items())
+            resp_headers = _filter_headers(upstream.headers.items(), _DROP_FROM_RESPONSE)
             return Response(
                 content=content,
                 status_code=upstream.status_code,
@@ -162,7 +183,7 @@ async def sanitize_messages(
     if not upstream_ctype.lower().startswith("text/event-stream"):
         try:
             content = await upstream.aread()
-            resp_headers = _filter_headers(upstream.headers.items())
+            resp_headers = _filter_headers(upstream.headers.items(), _DROP_FROM_RESPONSE)
             return Response(
                 content=content,
                 status_code=upstream.status_code,
@@ -181,7 +202,7 @@ async def sanitize_messages(
             await upstream.aclose()
             await client.aclose()
 
-    resp_headers = _filter_headers(upstream.headers.items())
+    resp_headers = _filter_headers(upstream.headers.items(), _DROP_FROM_RESPONSE)
     # Streaming-specific headers must not be cached or buffered by proxies.
     resp_headers["Cache-Control"] = "no-cache"
     resp_headers["X-Accel-Buffering"] = "no"

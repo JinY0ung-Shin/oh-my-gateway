@@ -34,3 +34,16 @@ def is_enabled() -> bool:
     Disabled by default so operators must opt in via ``SANITIZER_ENABLED=true``.
     """
     return parse_bool_env("SANITIZER_ENABLED", "false")
+
+
+def get_upstream_api_key() -> str | None:
+    """Bearer token to present to the upstream service, if any.
+
+    The client's ``Authorization`` header authenticates against the gateway and
+    is **not** forwarded — upstream lives in a different trust boundary and
+    typically has its own credential. Operators set ``SANITIZER_UPSTREAM_API_KEY``
+    to inject the upstream bearer; if unset, the upstream request goes out
+    without an ``Authorization`` header.
+    """
+    raw = os.getenv("SANITIZER_UPSTREAM_API_KEY")
+    return raw if raw else None
