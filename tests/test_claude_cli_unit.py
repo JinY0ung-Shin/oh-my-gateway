@@ -642,6 +642,23 @@ class TestBuildSdkOptions:
         finally:
             runtime_config.reset("sanitizer_enabled")
 
+    def test_sdk_options_do_not_route_to_sanitizer_without_base_url(
+        self, cli_instance, monkeypatch
+    ):
+        """SANITIZER_ENABLED has no SDK effect unless ANTHROPIC_BASE_URL is explicit."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+        monkeypatch.setenv("PORT", "8765")
+        runtime_config.set("sanitizer_enabled", True)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert "ANTHROPIC_BASE_URL" not in opts.env
+            assert opts.env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
+            assert "ANTHROPIC_BASE_URL" not in os.environ
+        finally:
+            runtime_config.reset("sanitizer_enabled")
+
     def test_sdk_options_preserve_base_url_when_sanitizer_disabled(
         self, cli_instance, monkeypatch
     ):
