@@ -1,21 +1,23 @@
 """FastAPI route that proxies ``POST /v1/messages`` to an upstream LiteLLM-like
 service and sanitizes the SSE response stream.
 
-This module is intentionally self-contained: it does **not** import from the
-rest of the gateway (auth, sessions, rate limiter, logging adapters) so it can
-be excised into its own service later without untangling dependencies.
+The module only takes one gateway-side dependency — ``verify_api_key`` — so the
+endpoint participates in the same ``API_KEY`` protection as the rest of the
+``/v1/*`` surface. All sanitizer-specific logic stays self-contained.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator, Dict, Optional
 
 import httpx
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import Response, StreamingResponse
+from fastapi.security import HTTPAuthorizationCredentials
 
+from src.auth import security, verify_api_key
 from src.sanitizer.config import get_request_timeout_seconds, get_upstream_url
 from src.sanitizer.stream_sanitizer import sanitize_events
 
@@ -105,8 +107,13 @@ def _format_sse(evt: Dict[str, Any]) -> bytes:
 
 
 @router.post("/v1/messages")
-async def sanitize_messages(request: Request) -> Response:
+async def sanitize_messages(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> Response:
     """Proxy ``/v1/messages`` to the upstream and rewrite the SSE stream."""
+    await verify_api_key(request, credentials)
+
     body = await request.body()
     fwd_headers = _filter_headers(request.headers.items())
 
@@ -146,6 +153,25 @@ async def sanitize_messages(request: Request) -> Response:
             await client.aclose()
 
     upstream = await client.send(upstream_req, stream=True)
+
+    # The sanitizer only knows how to rewrite Anthropic-style SSE. If upstream
+    # returned a JSON/HTML error (or anything else), passing it through the
+    # SSE parser would silently drop the body and leave the client with an
+    # empty event stream — so we forward non-SSE responses verbatim.
+    upstream_ctype = upstream.headers.get("content-type", "")
+    if not upstream_ctype.lower().startswith("text/event-stream"):
+        try:
+            content = await upstream.aread()
+            resp_headers = _filter_headers(upstream.headers.items())
+            return Response(
+                content=content,
+                status_code=upstream.status_code,
+                headers=resp_headers,
+                media_type=upstream_ctype or None,
+            )
+        finally:
+            await upstream.aclose()
+            await client.aclose()
 
     async def body_iter() -> AsyncIterator[bytes]:
         try:

@@ -114,3 +114,65 @@ def test_non_streaming_passes_through_verbatim():
     )
     assert resp.status_code == 200
     assert resp.content == body
+
+
+def test_streaming_upstream_returns_json_error_is_passed_through_verbatim():
+    """Upstream may return a JSON error even when client asked for SSE.
+
+    The sanitizer must forward the raw payload (not silently drop it through
+    the SSE parser), so the client can see the real error.
+    """
+    err_body = json.dumps({"error": {"message": "model not found", "type": "not_found_error"}}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, headers={"content-type": "application/json"}, content=err_body)
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "missing", "stream": True, "messages": []},
+    )
+    assert resp.status_code == 404
+    assert resp.headers["content-type"].startswith("application/json")
+    assert resp.content == err_body
+
+
+def test_verify_api_key_rejects_unauthorized_request(monkeypatch):
+    """When API_KEY is configured, /v1/messages must require Bearer auth."""
+    from src.auth import auth_manager
+
+    monkeypatch.setattr(auth_manager, "runtime_api_key", "secret-key")
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        # Should never be called — auth must reject before forwarding.
+        raise AssertionError("upstream was contacted despite missing API key")
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+    )
+    assert resp.status_code == 401
+
+
+def test_verify_api_key_accepts_correct_bearer(monkeypatch):
+    from src.auth import auth_manager
+
+    monkeypatch.setattr(auth_manager, "runtime_api_key", "secret-key")
+
+    body = json.dumps({"id": "msg_1"}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=body)
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+        headers={"Authorization": "Bearer secret-key"},
+    )
+    assert resp.status_code == 200
+    assert resp.content == body
