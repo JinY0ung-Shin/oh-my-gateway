@@ -51,6 +51,11 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "type": "bool",
         "description": "Stream individual tokens vs batched chunks",
     },
+    "sanitizer_enabled": {
+        "label": "Sanitizer (/v1/messages)",
+        "type": "bool",
+        "description": "Anthropic SSE sanitizer in front of ANTHROPIC_BASE_URL",
+    },
 }
 
 
@@ -134,12 +139,17 @@ class RuntimeConfig:
             TOKEN_STREAMING,
         )
 
+        # Lazy import to avoid a circular dependency: sanitizer.config imports
+        # back from runtime_config to honor admin overrides.
+        from src.sanitizer.config import _env_enabled as _sanitizer_env_enabled
+
         _map = {
             "default_model": DEFAULT_MODEL,
             "default_max_turns": DEFAULT_MAX_TURNS,
             "session_max_age_minutes": SESSION_MAX_AGE_MINUTES,
             "thinking_mode": THINKING_MODE,
             "token_streaming": TOKEN_STREAMING,
+            "sanitizer_enabled": _sanitizer_env_enabled(),
         }
         return _map.get(key)
 
