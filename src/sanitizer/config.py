@@ -1,10 +1,10 @@
 """Configuration for the Anthropic Messages sanitizer proxy.
 
 ``ANTHROPIC_BASE_URL`` keeps its normal meaning: the Anthropic-compatible
-upstream Claude Code would have called directly. When the sanitizer is enabled,
-the Claude SDK environment is rewritten to call this gateway's local
-``/v1/messages`` route instead, and the route forwards to the original
-``ANTHROPIC_BASE_URL`` value.
+upstream Claude Code would have called directly. When the sanitizer toggle is
+enabled and ``ANTHROPIC_BASE_URL`` is explicitly configured, the Claude SDK
+environment is rewritten to call this gateway's local ``/v1/messages`` route
+instead, and the route forwards to the original ``ANTHROPIC_BASE_URL`` value.
 """
 
 from __future__ import annotations
@@ -22,7 +22,16 @@ def get_upstream_url() -> str:
     in the usual place; the gateway only overrides Claude's view of that env
     var while launching the SDK subprocess.
     """
-    return os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+    raw = os.getenv("ANTHROPIC_BASE_URL")
+    if raw is None or not raw.strip():
+        raise RuntimeError("ANTHROPIC_BASE_URL is required when the sanitizer is enabled")
+    return raw.strip().rstrip("/")
+
+
+def has_upstream_url() -> bool:
+    """Whether a sanitizer upstream was explicitly configured."""
+    raw = os.getenv("ANTHROPIC_BASE_URL")
+    return raw is not None and bool(raw.strip())
 
 
 def get_gateway_base_url() -> str:
@@ -52,10 +61,11 @@ def is_enabled() -> bool:
 
     The admin panel may override the boot-time env value at runtime via
     ``runtime_config.set("sanitizer_enabled", ...)``. Restarting reverts to
-    the ``SANITIZER_ENABLED`` env value.
+    the ``SANITIZER_ENABLED`` env value. A configured upstream is also required;
+    if ``ANTHROPIC_BASE_URL`` is unset, enabling the toggle has no effect.
     """
     # Local import avoids a circular dependency: ``runtime_config._get_original``
     # imports from this module to resolve the boot default.
     from src.runtime_config import runtime_config
 
-    return bool(runtime_config.get("sanitizer_enabled"))
+    return bool(runtime_config.get("sanitizer_enabled")) and has_upstream_url()

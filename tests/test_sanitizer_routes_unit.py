@@ -24,6 +24,7 @@ def _enable_sanitizer(monkeypatch):
     overrides this with its own ``runtime_config.set(..., False)`` call.
     """
     monkeypatch.setenv("SANITIZER_ENABLED", "true")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://upstream.test")
     runtime_config.reset("sanitizer_enabled")
     yield
     runtime_config.reset("sanitizer_enabled")
@@ -145,6 +146,22 @@ def test_upstream_uses_anthropic_base_url(monkeypatch):
     )
     assert resp.status_code == 200
     assert resp.content == body
+
+
+def test_enabled_without_anthropic_base_url_returns_404(monkeypatch):
+    """SANITIZER_ENABLED alone should not route traffic without an explicit upstream."""
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        raise AssertionError("upstream was contacted without ANTHROPIC_BASE_URL")
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+    )
+    assert resp.status_code == 404
 
 
 def test_streaming_upstream_returns_json_error_is_passed_through_verbatim():
