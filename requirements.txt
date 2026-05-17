@@ -24,7 +24,7 @@ certifi==2026.2.25
     #   httpx
 cffi==2.0.0 ; platform_python_implementation != 'PyPy'
     # via cryptography
-claude-agent-sdk==0.1.57
+claude-agent-sdk==0.2.82
     # via oh-my-gateway
 click==8.3.1
     # via uvicorn
@@ -111,6 +111,8 @@ rpds-py==0.30.0
     #   referencing
 slowapi==0.1.9
     # via oh-my-gateway
+sniffio==1.3.1
+    # via claude-agent-sdk
 sqlalchemy==2.0.49
     # via oh-my-gateway
 sse-starlette==3.3.2
