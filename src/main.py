@@ -568,15 +568,13 @@ app.include_router(sessions_router)
 app.include_router(general_router)
 app.include_router(admin_router)
 
-# Optional: Anthropic Messages SSE sanitizer for upstream LiteLLM-like proxies
-# that emit non-spec-conforming streams (LiteLLM #21128). Opt-in via
-# SANITIZER_ENABLED=true.
-from src.sanitizer.config import is_enabled as _sanitizer_enabled  # noqa: E402
+# Anthropic Messages SSE sanitizer for upstream LiteLLM-like proxies that emit
+# non-spec-conforming streams (LiteLLM #21128). The route is always mounted so
+# the admin panel can flip it on/off at runtime; the handler short-circuits to
+# 503 when disabled. The boot-time default is SANITIZER_ENABLED.
+from src.sanitizer.routes import router as sanitizer_router  # noqa: E402
 
-if _sanitizer_enabled():
-    from src.sanitizer.routes import router as sanitizer_router  # noqa: E402
-
-    app.include_router(sanitizer_router)
+app.include_router(sanitizer_router)
 
 
 # ==================== Backward-compat re-exports ====================

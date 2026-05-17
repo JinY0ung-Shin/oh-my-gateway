@@ -1,20 +1,32 @@
-"""Configuration for the Anthropic Messages sanitizer proxy."""
+"""Configuration for the Anthropic Messages sanitizer proxy.
+
+The upstream is intentionally locked to ``127.0.0.1`` — the sanitizer is meant
+to sit in front of a co-located LiteLLM (or similar) instance, not to proxy
+to arbitrary remote endpoints. This keeps the security model simple: same
+trust boundary, no leaked credentials, no SSRF surface from the gateway.
+"""
 
 from __future__ import annotations
-
-import os
 
 from src.env_utils import parse_bool_env, parse_int_env
 
 
-def get_upstream_url() -> str:
-    """URL of the upstream service that speaks Anthropic Messages API.
+# Host portion of the upstream URL — fixed by design.
+UPSTREAM_HOST = "127.0.0.1"
 
-    Typically a LiteLLM ``--port 4000`` instance. The sanitizer forwards
-    ``POST /v1/messages`` to ``{upstream}/v1/messages`` verbatim and post-
-    processes the SSE stream.
+
+def get_upstream_port() -> int:
+    """TCP port of the upstream Anthropic Messages service on localhost.
+
+    Defaults to a high port (54000) since the upstream LiteLLM is expected to
+    be bound to loopback only — it is not a service users hit directly.
     """
-    return os.getenv("SANITIZER_UPSTREAM_URL", "http://localhost:4000").rstrip("/")
+    return parse_int_env("SANITIZER_UPSTREAM_PORT", 54000)
+
+
+def get_upstream_url() -> str:
+    """Full upstream base URL (``http://127.0.0.1:<port>``)."""
+    return f"http://{UPSTREAM_HOST}:{get_upstream_port()}"
 
 
 def get_request_timeout_seconds() -> float | None:
@@ -28,22 +40,20 @@ def get_request_timeout_seconds() -> float | None:
     return None if raw <= 0 else float(raw)
 
 
-def is_enabled() -> bool:
-    """Whether the sanitizer route should be mounted on the gateway.
-
-    Disabled by default so operators must opt in via ``SANITIZER_ENABLED=true``.
-    """
+def _env_enabled() -> bool:
+    """Boot-time default from ``SANITIZER_ENABLED``."""
     return parse_bool_env("SANITIZER_ENABLED", "false")
 
 
-def get_upstream_api_key() -> str | None:
-    """Bearer token to present to the upstream service, if any.
+def is_enabled() -> bool:
+    """Whether the sanitizer should accept requests right now.
 
-    The client's ``Authorization`` header authenticates against the gateway and
-    is **not** forwarded — upstream lives in a different trust boundary and
-    typically has its own credential. Operators set ``SANITIZER_UPSTREAM_API_KEY``
-    to inject the upstream bearer; if unset, the upstream request goes out
-    without an ``Authorization`` header.
+    The admin panel may override the boot-time env value at runtime via
+    ``runtime_config.set("sanitizer_enabled", ...)``. Restarting reverts to
+    the ``SANITIZER_ENABLED`` env value.
     """
-    raw = os.getenv("SANITIZER_UPSTREAM_API_KEY")
-    return raw if raw else None
+    # Local import avoids a circular dependency: ``runtime_config._get_original``
+    # imports from this module to resolve the boot default.
+    from src.runtime_config import runtime_config
+
+    return bool(runtime_config.get("sanitizer_enabled"))

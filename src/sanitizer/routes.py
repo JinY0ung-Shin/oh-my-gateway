@@ -20,8 +20,8 @@ from fastapi.security import HTTPAuthorizationCredentials
 from src.auth import security, verify_api_key
 from src.sanitizer.config import (
     get_request_timeout_seconds,
-    get_upstream_api_key,
     get_upstream_url,
+    is_enabled,
 )
 from src.sanitizer.stream_sanitizer import sanitize_events
 
@@ -130,13 +130,21 @@ async def sanitize_messages(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> Response:
     """Proxy ``/v1/messages`` to the upstream and rewrite the SSE stream."""
+    if not is_enabled():
+        # The route is always mounted so admins can flip it on/off at runtime;
+        # when disabled it should look effectively absent to the client.
+        return Response(
+            status_code=503,
+            content=json.dumps(
+                {"error": {"type": "service_unavailable", "message": "sanitizer is disabled"}}
+            ).encode("utf-8"),
+            media_type="application/json",
+        )
+
     await verify_api_key(request, credentials)
 
     body = await request.body()
     fwd_headers = _filter_headers(request.headers.items(), _DROP_FROM_REQUEST)
-    upstream_key = get_upstream_api_key()
-    if upstream_key is not None:
-        fwd_headers["Authorization"] = f"Bearer {upstream_key}"
 
     # Decide stream vs non-stream from the request body, falling back to
     # non-stream on parse failure (matches Anthropic API behavior).

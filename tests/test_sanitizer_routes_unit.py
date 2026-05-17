@@ -15,6 +15,18 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import src.sanitizer.routes as sanitizer_routes
+from src.runtime_config import runtime_config
+
+
+@pytest.fixture(autouse=True)
+def _enable_sanitizer(monkeypatch):
+    """Most tests assume the sanitizer accepts requests; the disabled-path test
+    overrides this with its own ``runtime_config.set(..., False)`` call.
+    """
+    monkeypatch.setenv("SANITIZER_ENABLED", "true")
+    runtime_config.reset("sanitizer_enabled")
+    yield
+    runtime_config.reset("sanitizer_enabled")
 
 
 def _sse_payload(events: Iterable[dict]) -> bytes:
@@ -190,11 +202,15 @@ def _capture_request_handler(response: httpx.Response):
 
 
 def test_client_authorization_is_not_forwarded_upstream(monkeypatch):
-    """Client bearer authenticates the gateway; upstream is a different trust boundary."""
+    """Client bearer authenticates the gateway; localhost upstream gets no bearer.
+
+    Even though localhost is the same trust boundary, we still strip the
+    client's Authorization so the gateway key doesn't accidentally become a
+    de-facto credential for whatever runs on the loopback port.
+    """
     from src.auth import auth_manager
 
     monkeypatch.setattr(auth_manager, "runtime_api_key", "secret-key")
-    monkeypatch.delenv("SANITIZER_UPSTREAM_API_KEY", raising=False)
 
     handler, captured = _capture_request_handler(
         httpx.Response(200, headers={"content-type": "application/json"}, content=b"{}")
@@ -210,25 +226,21 @@ def test_client_authorization_is_not_forwarded_upstream(monkeypatch):
     assert "authorization" not in {k.lower() for k in captured["request"].headers.keys()}
 
 
-def test_upstream_api_key_replaces_authorization(monkeypatch):
-    """When SANITIZER_UPSTREAM_API_KEY is set, upstream sees that bearer instead."""
-    from src.auth import auth_manager
+def test_disabled_via_runtime_config_returns_503():
+    """Admin toggle sets sanitizer_enabled=False → route short-circuits to 503."""
 
-    monkeypatch.setattr(auth_manager, "runtime_api_key", "secret-key")
-    monkeypatch.setenv("SANITIZER_UPSTREAM_API_KEY", "upstream-key")
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        raise AssertionError("upstream was contacted despite sanitizer being disabled")
 
-    handler, captured = _capture_request_handler(
-        httpx.Response(200, headers={"content-type": "application/json"}, content=b"{}")
-    )
     app = _make_app(handler)
+    runtime_config.set("sanitizer_enabled", False)
     client = TestClient(app)
     resp = client.post(
         "/v1/messages",
         json={"model": "x", "stream": False, "messages": []},
-        headers={"Authorization": "Bearer secret-key"},
     )
-    assert resp.status_code == 200
-    assert captured["request"].headers.get("authorization") == "Bearer upstream-key"
+    assert resp.status_code == 503
+    assert json.loads(resp.content)["error"]["type"] == "service_unavailable"
 
 
 def test_accept_encoding_is_not_forwarded_upstream():
