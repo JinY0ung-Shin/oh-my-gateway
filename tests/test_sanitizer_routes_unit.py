@@ -128,6 +128,25 @@ def test_non_streaming_passes_through_verbatim():
     assert resp.content == body
 
 
+def test_upstream_uses_anthropic_base_url(monkeypatch):
+    """ANTHROPIC_BASE_URL remains the real upstream the sanitizer forwards to."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
+    body = json.dumps({"id": "msg_1"}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "http://litellm:4000/v1/messages"
+        return httpx.Response(200, headers={"content-type": "application/json"}, content=body)
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "GLM-5.1-FP8", "stream": False, "messages": []},
+    )
+    assert resp.status_code == 200
+    assert resp.content == body
+
+
 def test_streaming_upstream_returns_json_error_is_passed_through_verbatim():
     """Upstream may return a JSON error even when client asked for SSE.
 
@@ -202,11 +221,10 @@ def _capture_request_handler(response: httpx.Response):
 
 
 def test_client_authorization_is_not_forwarded_upstream(monkeypatch):
-    """Client bearer authenticates the gateway; localhost upstream gets no bearer.
+    """External client bearer authenticates the gateway, not the upstream.
 
-    Even though localhost is the same trust boundary, we still strip the
-    client's Authorization so the gateway key doesn't accidentally become a
-    de-facto credential for whatever runs on the loopback port.
+    Non-loopback requests use gateway auth, so that credential must not become
+    a de-facto upstream credential.
     """
     from src.auth import auth_manager
 
@@ -224,6 +242,24 @@ def test_client_authorization_is_not_forwarded_upstream(monkeypatch):
     )
     assert resp.status_code == 200
     assert "authorization" not in {k.lower() for k in captured["request"].headers.keys()}
+
+
+def test_loopback_authorization_is_forwarded_to_upstream(monkeypatch):
+    """Claude SDK self-calls carry the real Anthropic/LiteLLM bearer upstream."""
+    monkeypatch.setattr(sanitizer_routes, "_is_loopback_request", lambda request: True)
+
+    handler, captured = _capture_request_handler(
+        httpx.Response(200, headers={"content-type": "application/json"}, content=b"{}")
+    )
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={"model": "x", "stream": False, "messages": []},
+        headers={"Authorization": "Bearer upstream-key"},
+    )
+    assert resp.status_code == 200
+    assert captured["request"].headers.get("authorization") == "Bearer upstream-key"
 
 
 def test_disabled_via_runtime_config_returns_404():

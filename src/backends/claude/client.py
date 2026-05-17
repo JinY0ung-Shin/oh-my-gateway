@@ -473,6 +473,16 @@ class ClaudeCodeCLI:
                 original[key] = os.environ.get(key)
                 os.environ[key] = value
 
+            # Keep the process-level ANTHROPIC_BASE_URL as the real upstream
+            # for the sanitizer, but point the Claude SDK subprocess at the
+            # gateway's local /v1/messages route when the sanitizer is enabled.
+            from src.sanitizer.config import get_gateway_base_url, is_enabled as sanitizer_enabled
+
+            if sanitizer_enabled():
+                key = "ANTHROPIC_BASE_URL"
+                original[key] = os.environ.get(key)
+                os.environ[key] = get_gateway_base_url()
+
             # Remove other backends' credentials (cross-isolation)
             for key in self._ISOLATION_VARS:
                 if key in os.environ:

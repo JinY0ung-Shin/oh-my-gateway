@@ -804,6 +804,34 @@ class TestSdkEnvContextManager:
         else:
             assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original
 
+    def test_sdk_env_routes_base_url_to_sanitizer_when_enabled(self, cli_instance, monkeypatch):
+        """Sanitizer keeps global ANTHROPIC_BASE_URL as upstream and rewrites only SDK env."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
+        monkeypatch.setenv("PORT", "8765")
+        runtime_config.set("sanitizer_enabled", True)
+        try:
+            with cli_instance._sdk_env():
+                assert os.environ.get("ANTHROPIC_BASE_URL") == "http://127.0.0.1:8765"
+                assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
+
+            assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+        finally:
+            runtime_config.reset("sanitizer_enabled")
+
+    def test_sdk_env_preserves_base_url_when_sanitizer_disabled(self, cli_instance, monkeypatch):
+        """Disabled sanitizer should leave Claude's upstream base URL untouched."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
+        runtime_config.set("sanitizer_enabled", False)
+        try:
+            with cli_instance._sdk_env():
+                assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+        finally:
+            runtime_config.reset("sanitizer_enabled")
+
     def test_sdk_env_noop_when_no_vars(self):
         """_sdk_env is a no-op when no auth env vars configured."""
         with tempfile.TemporaryDirectory() as temp_dir:

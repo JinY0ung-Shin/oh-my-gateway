@@ -1,32 +1,34 @@
 """Configuration for the Anthropic Messages sanitizer proxy.
 
-The upstream is intentionally locked to ``127.0.0.1`` — the sanitizer is meant
-to sit in front of a co-located LiteLLM (or similar) instance, not to proxy
-to arbitrary remote endpoints. This keeps the security model simple: same
-trust boundary, no leaked credentials, no SSRF surface from the gateway.
+``ANTHROPIC_BASE_URL`` keeps its normal meaning: the Anthropic-compatible
+upstream Claude Code would have called directly. When the sanitizer is enabled,
+the Claude SDK environment is rewritten to call this gateway's local
+``/v1/messages`` route instead, and the route forwards to the original
+``ANTHROPIC_BASE_URL`` value.
 """
 
 from __future__ import annotations
 
+import os
+
 from src.env_utils import parse_bool_env, parse_int_env
 
 
-# Host portion of the upstream URL — fixed by design.
-UPSTREAM_HOST = "127.0.0.1"
-
-
-def get_upstream_port() -> int:
-    """TCP port of the upstream Anthropic Messages service on localhost.
-
-    Defaults to a high port (54000) since the upstream LiteLLM is expected to
-    be bound to loopback only — it is not a service users hit directly.
-    """
-    return parse_int_env("SANITIZER_UPSTREAM_PORT", 54000)
-
-
 def get_upstream_url() -> str:
-    """Full upstream base URL (``http://127.0.0.1:<port>``)."""
-    return f"http://{UPSTREAM_HOST}:{get_upstream_port()}"
+    """Original Anthropic-compatible upstream base URL.
+
+    This intentionally reads ``ANTHROPIC_BASE_URL`` rather than a sanitizer-
+    specific env var. Operators keep configuring Claude Code's real upstream
+    in the usual place; the gateway only overrides Claude's view of that env
+    var while launching the SDK subprocess.
+    """
+    return os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+
+
+def get_gateway_base_url() -> str:
+    """Local base URL Claude SDK should call when the sanitizer is enabled."""
+    port = parse_int_env("PORT", 8000)
+    return f"http://127.0.0.1:{port}"
 
 
 def get_request_timeout_seconds() -> float | None:

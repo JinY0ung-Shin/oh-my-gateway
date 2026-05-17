@@ -51,13 +51,12 @@ _HOP_BY_HOP = frozenset(
     }
 )
 
-# Stripped from the request before forwarding to upstream:
-# - ``authorization``: the gateway has its own API key; we don't want it
-#   leaking onto the loopback port as a de-facto upstream credential.
+# Stripped from requests before forwarding to upstream:
 # - ``accept-encoding``: httpx negotiates and auto-decompresses internally; if
 #   we forwarded the client's value, upstream would compress and we'd decode
 #   anyway — wasted upstream CPU.
-_DROP_FROM_REQUEST = _HOP_BY_HOP | frozenset({"authorization", "accept-encoding"})
+_DROP_FROM_REQUEST = _HOP_BY_HOP | frozenset({"accept-encoding"})
+_DROP_FROM_EXTERNAL_REQUEST = _DROP_FROM_REQUEST | frozenset({"authorization"})
 
 # Stripped from the upstream response before returning to the client:
 # - ``content-encoding``: httpx returns decoded bytes from .content/.aread()/
@@ -69,6 +68,12 @@ _DROP_FROM_RESPONSE = _HOP_BY_HOP | frozenset({"content-encoding"})
 
 def _filter_headers(items, drop: frozenset) -> Dict[str, str]:
     return {k: v for k, v in items if k.lower() not in drop}
+
+
+def _is_loopback_request(request: Request) -> bool:
+    """Return True for SDK self-calls from the same host/container."""
+    host = request.client.host if request.client else ""
+    return host in {"127.0.0.1", "::1", "localhost"}
 
 
 async def _iter_sse_events(
@@ -143,10 +148,13 @@ async def sanitize_messages(
             media_type="application/json",
         )
 
-    await verify_api_key(request, credentials)
+    is_loopback = _is_loopback_request(request)
+    if not is_loopback:
+        await verify_api_key(request, credentials)
 
     body = await request.body()
-    fwd_headers = _filter_headers(request.headers.items(), _DROP_FROM_REQUEST)
+    drop_headers = _DROP_FROM_REQUEST if is_loopback else _DROP_FROM_EXTERNAL_REQUEST
+    fwd_headers = _filter_headers(request.headers.items(), drop_headers)
 
     # Decide stream vs non-stream from the request body, falling back to
     # non-stream on parse failure (matches Anthropic API behavior).

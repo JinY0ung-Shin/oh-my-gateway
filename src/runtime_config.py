@@ -54,7 +54,7 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
     "sanitizer_enabled": {
         "label": "Sanitizer (/v1/messages)",
         "type": "bool",
-        "description": "Anthropic SSE sanitizer in front of localhost LiteLLM",
+        "description": "Anthropic SSE sanitizer in front of ANTHROPIC_BASE_URL",
     },
 }
 
