@@ -348,7 +348,18 @@ class ClaudeCodeCLI:
 
         env_map = {k: v for k, v in extra_env.items() if k in METADATA_ENV_ALLOWLIST}
         if env_map:
-            options.env = env_map
+            options.env.update(env_map)
+
+    def _configure_sdk_env(self, options: ClaudeAgentOptions) -> None:
+        sdk_env = dict(self.claude_env_vars or {})
+
+        from src.sanitizer.config import get_gateway_base_url, is_enabled as sanitizer_enabled
+
+        if sanitizer_enabled():
+            sdk_env["ANTHROPIC_BASE_URL"] = get_gateway_base_url()
+
+        if sdk_env:
+            options.env.update(sdk_env)
 
     def _build_sdk_options(
         self,
@@ -405,6 +416,7 @@ class ClaudeCodeCLI:
         self._configure_session_identity(options, session_id, resume)
         self._configure_task_budget(options, task_budget)
         self._configure_metadata_env(options, extra_env)
+        self._configure_sdk_env(options)
 
         return options
 
@@ -473,16 +485,6 @@ class ClaudeCodeCLI:
                 original[key] = os.environ.get(key)
                 os.environ[key] = value
 
-            # Keep the process-level ANTHROPIC_BASE_URL as the real upstream
-            # for the sanitizer, but point the Claude SDK subprocess at the
-            # gateway's local /v1/messages route when the sanitizer is enabled.
-            from src.sanitizer.config import get_gateway_base_url, is_enabled as sanitizer_enabled
-
-            if sanitizer_enabled():
-                key = "ANTHROPIC_BASE_URL"
-                original[key] = os.environ.get(key)
-                os.environ[key] = get_gateway_base_url()
-
             # Remove other backends' credentials (cross-isolation)
             for key in self._ISOLATION_VARS:
                 if key in os.environ:
@@ -510,14 +512,11 @@ class ClaudeCodeCLI:
         try:
             logger.info("Testing Claude Agent SDK...")
 
+            options = self._build_sdk_options(max_turns=1)
             messages = []
             async for message in query(
                 prompt="Hello",
-                options=ClaudeAgentOptions(
-                    max_turns=1,
-                    cwd=self.cwd,
-                    system_prompt={"type": "preset", "preset": "claude_code"},
-                ),
+                options=options,
             ):
                 messages.append(message)
                 msg_type = getattr(message, "type", None) or (

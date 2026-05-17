@@ -405,6 +405,31 @@ class TestClaudeCodeCLIVerifyCLI:
             assert result is True
 
     @pytest.mark.asyncio
+    async def test_verify_cli_uses_sdk_options_env(self, cli_instance, monkeypatch):
+        """Health checks should use the same SDK env routing as real sessions."""
+        from src.runtime_config import runtime_config
+
+        captured = {}
+        mock_message = {"type": "assistant", "content": [{"type": "text", "text": "Hello"}]}
+
+        async def mock_query(*args, **kwargs):
+            captured.update(kwargs)
+            yield mock_message
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
+        monkeypatch.setenv("PORT", "8765")
+        runtime_config.set("sanitizer_enabled", True)
+        try:
+            with patch("src.backends.claude.client.query", mock_query):
+                result = await cli_instance.verify_cli()
+            assert result is True
+            assert captured["options"].env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8765"
+            assert captured["options"].env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
+            assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+        finally:
+            runtime_config.reset("sanitizer_enabled")
+
+    @pytest.mark.asyncio
     async def test_verify_cli_no_messages(self, cli_instance):
         """verify_cli returns False when no messages returned."""
 
@@ -599,6 +624,38 @@ class TestBuildSdkOptions:
         with patch("src.backends.claude.client.DEFAULT_TASK_BUDGET", 100000):
             opts = cli_instance._build_sdk_options(task_budget=25000)
             assert opts.task_budget == {"total": 25000}
+
+    def test_sdk_options_routes_base_url_to_sanitizer_when_enabled(
+        self, cli_instance, monkeypatch
+    ):
+        """Only the SDK subprocess env should point at the local sanitizer."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
+        monkeypatch.setenv("PORT", "8765")
+        runtime_config.set("sanitizer_enabled", True)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert opts.env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8765"
+            assert opts.env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
+            assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+        finally:
+            runtime_config.reset("sanitizer_enabled")
+
+    def test_sdk_options_preserve_base_url_when_sanitizer_disabled(
+        self, cli_instance, monkeypatch
+    ):
+        """Disabled sanitizer leaves Claude's upstream base URL untouched."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
+        runtime_config.set("sanitizer_enabled", False)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert "ANTHROPIC_BASE_URL" not in opts.env
+            assert opts.env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
+        finally:
+            runtime_config.reset("sanitizer_enabled")
 
 
 class TestConvertMessageTypeMap:
@@ -804,8 +861,11 @@ class TestSdkEnvContextManager:
         else:
             assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original
 
-    def test_sdk_env_routes_base_url_to_sanitizer_when_enabled(self, cli_instance, monkeypatch):
-        """Sanitizer keeps global ANTHROPIC_BASE_URL as upstream and rewrites only SDK env."""
+    def test_sdk_env_does_not_mutate_base_url_when_sanitizer_enabled(
+        self, cli_instance, monkeypatch
+    ):
+        """Sanitizer upstream must remain readable while SDK env is active."""
+        from src.sanitizer.config import get_upstream_url
         from src.runtime_config import runtime_config
 
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
@@ -813,7 +873,8 @@ class TestSdkEnvContextManager:
         runtime_config.set("sanitizer_enabled", True)
         try:
             with cli_instance._sdk_env():
-                assert os.environ.get("ANTHROPIC_BASE_URL") == "http://127.0.0.1:8765"
+                assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+                assert get_upstream_url() == "http://litellm:4000"
                 assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
 
             assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
