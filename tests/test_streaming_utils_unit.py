@@ -1655,3 +1655,71 @@ async def test_response_completed_payload_includes_reasoning_items():
     assert output[0]["summary"][0]["text"] == "reasoning..."
     assert output[0]["content"][0]["text"] == "reasoning..."
     assert output[1]["content"][0]["text"] == "answer"
+
+
+async def test_stream_second_thinking_after_text_is_silently_dropped_not_leaked():
+    """text → thinking → text: the second thinking must not leak into output_text.delta
+    or into response.completed.response.output."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        # First a tiny text block so message_item gets opened.
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "first text"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        # Then a thinking block (post-message). Must be dropped from output_text.
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "thinking_delta", "thinking": "SECRET_REASONING"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}}
+        # More visible text.
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 2,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 2,
+            "delta": {"type": "text_delta", "text": "second text"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 2}}
+        yield {"subtype": "success", "result": "first textsecond text"}
+
+    text_deltas = []
+    completed_event = None
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        t, p = _parse_response_sse(line)
+        if t == "response.output_text.delta":
+            text_deltas.append(p.get("delta", ""))
+        if t == "response.completed":
+            completed_event = p
+
+    joined = "".join(text_deltas)
+    assert "SECRET_REASONING" not in joined, \
+        f"Thinking content leaked into output_text.delta: {joined!r}"
+
+    # Also assert against response.completed.response.output
+    assert completed_event is not None
+    for item in completed_event["response"]["output"]:
+        if item["type"] == "message":
+            for part in item.get("content", []):
+                assert "SECRET_REASONING" not in part.get("text", ""), \
+                    f"Thinking leaked into completed message: {part!r}"

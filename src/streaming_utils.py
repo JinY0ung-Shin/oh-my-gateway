@@ -891,6 +891,11 @@ async def stream_response_chunks(
                         sequence_number=_next_seq(),
                     )
                     continue
+                # We're inside a thinking block but couldn't open a reasoning item
+                # (message item already opened — OpenAI Responses contract doesn't support
+                # reopening reasoning). Drop these deltas so they don't leak as message text.
+                if in_thinking:
+                    continue
                 # If reasoning was open and we just exited it, close it now.
                 if reasoning_open and not in_thinking:
                     for line in _close_reasoning():
