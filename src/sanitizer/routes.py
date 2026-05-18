@@ -105,6 +105,10 @@ async def _iter_sse_events(
                 logger.warning("sanitizer: skipping non-JSON SSE payload: %r", payload[:200])
                 continue
             if isinstance(evt, dict):
+                # TEMP DIAG: capture raw upstream events to keep verifying the
+                # zero-payload delta fix in production traffic. Remove once the
+                # behavior is fully confirmed.
+                logger.warning("sanitizer raw upstream evt: %s", json.dumps(evt, ensure_ascii=False)[:500])
                 yield evt
             continue
         if line.startswith("data:"):
@@ -118,6 +122,7 @@ async def _iter_sse_events(
         try:
             evt = json.loads(payload)
             if isinstance(evt, dict):
+                logger.warning("sanitizer raw upstream evt (trailing): %s", json.dumps(evt, ensure_ascii=False)[:500])
                 yield evt
         except json.JSONDecodeError:
             logger.warning("sanitizer: dropping trailing non-JSON SSE payload")
