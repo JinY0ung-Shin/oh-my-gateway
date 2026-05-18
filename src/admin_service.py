@@ -391,6 +391,16 @@ def get_session_messages(
             }
         )
 
+    thinking_message_count = sum(1 for msg in messages if getattr(msg, "thinking", []))
+    logger.info(
+        "Admin session messages returned: session_id=%s total=%d "
+        "thinking_messages=%d truncate=%d",
+        session_id,
+        len(messages),
+        thinking_message_count,
+        truncate,
+    )
+
     return result
 
 

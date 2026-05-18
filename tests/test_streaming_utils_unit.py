@@ -1658,10 +1658,12 @@ async def test_response_completed_payload_includes_reasoning_items():
 
 
 @pytest.mark.asyncio
-async def test_stream_result_captures_thinking_texts_for_session_history():
+async def test_stream_result_captures_thinking_texts_for_session_history(caplog):
     """The route uses stream_result to persist thinking in admin session history."""
     import logging
     from src.streaming_utils import stream_response_chunks
+
+    caplog.set_level("INFO")
 
     async def chunk_source():
         yield {"type": "stream_event", "event": {
@@ -1698,6 +1700,39 @@ async def test_stream_result_captures_thinking_texts_for_session_history():
     assert stream_result["success"] is True
     assert stream_result["assistant_text"] == "answer"
     assert stream_result["thinking_texts"] == ["reasoning..."]
+    assert "Responses stream captured thinking block" in caplog.text
+    assert "thinking_blocks=1" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_stream_warns_when_thinking_delta_arrives_outside_thinking_block(caplog):
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    caplog.set_level("WARNING")
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "misframed"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+
+    async for _ in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        pass
+
+    assert "thinking_delta outside a thinking block" in caplog.text
 
 
 async def test_stream_second_thinking_after_text_is_silently_dropped_not_leaked():

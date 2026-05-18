@@ -626,11 +626,12 @@ class TestBuildSdkOptions:
             assert opts.task_budget == {"total": 25000}
 
     def test_sdk_options_routes_base_url_to_sanitizer_when_enabled(
-        self, cli_instance, monkeypatch
+        self, cli_instance, monkeypatch, caplog
     ):
         """Only the SDK subprocess env should point at the local sanitizer."""
         from src.runtime_config import runtime_config
 
+        caplog.set_level("INFO")
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
         monkeypatch.setenv("PORT", "8765")
         runtime_config.set("sanitizer_enabled", True)
@@ -639,15 +640,17 @@ class TestBuildSdkOptions:
             assert opts.env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8765"
             assert opts.env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
             assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+            assert "Claude SDK sanitizer routing enabled" in caplog.text
         finally:
             runtime_config.reset("sanitizer_enabled")
 
     def test_sdk_options_do_not_route_to_sanitizer_without_base_url(
-        self, cli_instance, monkeypatch
+        self, cli_instance, monkeypatch, caplog
     ):
         """SANITIZER_ENABLED has no SDK effect unless ANTHROPIC_BASE_URL is explicit."""
         from src.runtime_config import runtime_config
 
+        caplog.set_level("WARNING")
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
         monkeypatch.setenv("PORT", "8765")
         runtime_config.set("sanitizer_enabled", True)
@@ -656,6 +659,7 @@ class TestBuildSdkOptions:
             assert "ANTHROPIC_BASE_URL" not in opts.env
             assert opts.env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
             assert "ANTHROPIC_BASE_URL" not in os.environ
+            assert "sanitizer requested but inactive" in caplog.text
         finally:
             runtime_config.reset("sanitizer_enabled")
 

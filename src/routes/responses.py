@@ -252,6 +252,27 @@ def _build_session_assistant_message(
     return Message(role="assistant", content=visible_text, thinking=non_empty_thinking)
 
 
+def _log_session_assistant_write(
+    *,
+    path: str,
+    session_id: str,
+    turn: int,
+    visible_text: str,
+    thinking_texts: Optional[List[str]] = None,
+) -> None:
+    non_empty_thinking = [text for text in thinking_texts or [] if text]
+    logger.info(
+        "Responses session assistant stored: path=%s session_id=%s turn=%d "
+        "visible_chars=%d thinking_blocks=%d thinking_chars=%s",
+        path,
+        session_id,
+        turn,
+        len(visible_text),
+        len(non_empty_thinking),
+        [len(text) for text in non_empty_thinking],
+    )
+
+
 async def _disconnect_session_client(session, reason: str, client=None) -> None:
     """Drop and disconnect a persistent SDK client after stream failure/cancel."""
     if client is None:
@@ -1206,6 +1227,13 @@ async def create_response(
                         session.turn_counter = next_turn
                         session.add_messages([Message(role="user", content=prompt)])
                         session_manager.add_assistant_response(session_id, assistant_message)
+                        _log_session_assistant_write(
+                            path="responses.stream",
+                            session_id=session_id,
+                            turn=next_turn,
+                            visible_text=assistant_text,
+                            thinking_texts=stream_result.get("thinking_texts"),
+                        )
 
             except Exception as e:
                 logger.error("Responses API Stream: setup error: %s", e, exc_info=True)
@@ -1307,6 +1335,13 @@ async def create_response(
             session.turn_counter = pf.next_turn
             session.add_messages([Message(role="user", content=prompt)])
             session_manager.add_assistant_response(session_id, assistant_message)
+            _log_session_assistant_write(
+                path="responses.non_stream",
+                session_id=session_id,
+                turn=pf.next_turn,
+                visible_text=visible_text,
+                thinking_texts=thinking_texts,
+            )
 
     except HTTPException:
         if active_client is not None:
@@ -1545,6 +1580,13 @@ async def _handle_function_call_output(
                     if assistant_message is not None:
                         session.turn_counter = next_turn
                         session_manager.add_assistant_response(session_id, assistant_message)
+                        _log_session_assistant_write(
+                            path="responses.continuation_stream",
+                            session_id=session_id,
+                            turn=next_turn,
+                            visible_text=assistant_text,
+                            thinking_texts=stream_result.get("thinking_texts"),
+                        )
 
             except Exception as e:
                 logger.error("Responses API Stream: continuation error: %s", e, exc_info=True)
@@ -1629,6 +1671,13 @@ async def _handle_function_call_output(
 
         session.turn_counter = next_turn
         session_manager.add_assistant_response(session_id, assistant_message)
+        _log_session_assistant_write(
+            path="responses.continuation_non_stream",
+            session_id=session_id,
+            turn=next_turn,
+            visible_text=visible_text,
+            thinking_texts=thinking_texts,
+        )
         continuation_success = True
     finally:
         if not continuation_success:

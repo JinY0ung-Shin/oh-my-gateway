@@ -780,6 +780,13 @@ async def stream_response_chunks(
         full_text = "".join(thinking_capture_buf)
         if full_text:
             thinking_texts.append(full_text)
+            logger.info(
+                "Responses stream captured thinking block: response_id=%s "
+                "block_index=%d chars=%d",
+                response_id,
+                len(thinking_texts) - 1,
+                len(full_text),
+            )
         thinking_capture_buf = []
 
     def _close_reasoning() -> list[str]:
@@ -895,6 +902,15 @@ async def stream_response_chunks(
 
             # Token-level streaming (text/thinking deltas)
             was_thinking = in_thinking
+            event = chunk.get("event", {}) if chunk.get("type") == "stream_event" else {}
+            delta = event.get("delta", {}) if isinstance(event, dict) else {}
+            if delta.get("type") == "thinking_delta" and not in_thinking:
+                logger.warning(
+                    "Responses stream received thinking_delta outside a thinking block: "
+                    "response_id=%s event_type=%s. Check sanitizer routing/upstream SSE shape.",
+                    response_id,
+                    event.get("type"),
+                )
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
             if text_delta is not None:
                 token_streaming = True
@@ -1143,6 +1159,14 @@ async def stream_response_chunks(
     stream_result["success"] = True
     stream_result["assistant_text"] = final_text
     stream_result["thinking_texts"] = thinking_texts
+    logger.info(
+        "Responses stream completed: response_id=%s assistant_chars=%d "
+        "thinking_blocks=%d thinking_chars=%s",
+        response_id,
+        len(final_text),
+        len(thinking_texts),
+        [len(text) for text in thinking_texts],
+    )
     yield make_response_sse(
         "response.completed", response_obj=final_resp, sequence_number=_next_seq()
     )

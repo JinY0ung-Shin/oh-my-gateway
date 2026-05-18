@@ -353,10 +353,24 @@ class ClaudeCodeCLI:
     def _configure_sdk_env(self, options: ClaudeAgentOptions) -> None:
         sdk_env = dict(self.claude_env_vars or {})
 
-        from src.sanitizer.config import get_gateway_base_url, is_enabled as sanitizer_enabled
+        from src.runtime_config import runtime_config
+        from src.sanitizer.config import (
+            get_gateway_base_url,
+            has_upstream_url,
+            is_enabled as sanitizer_enabled,
+        )
 
         if sanitizer_enabled():
-            sdk_env["ANTHROPIC_BASE_URL"] = get_gateway_base_url()
+            gateway_base_url = get_gateway_base_url()
+            sdk_env["ANTHROPIC_BASE_URL"] = gateway_base_url
+            logger.info(
+                "Claude SDK sanitizer routing enabled: sdk_anthropic_base_url=%s",
+                gateway_base_url,
+            )
+        elif runtime_config.get("sanitizer_enabled") is True and not has_upstream_url():
+            logger.warning(
+                "Claude SDK sanitizer requested but inactive: ANTHROPIC_BASE_URL is not set"
+            )
 
         if sdk_env:
             options.env.update(sdk_env)
