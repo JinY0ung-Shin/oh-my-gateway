@@ -609,7 +609,6 @@ async def stream_response_chunks(
     reasoning_item_id: Optional[str] = None
     reasoning_text_buf: list[str] = []
     thinking_seen = False
-    text_delta_buffer: list[str] = []
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -831,8 +830,13 @@ async def stream_response_chunks(
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
             if text_delta is not None:
                 token_streaming = True
-                # Open reasoning output_item on first thinking delta of a block.
-                if in_thinking and not was_thinking:
+                # Open reasoning output_item on first thinking delta of a block,
+                # but only if the message item is not already open. The OpenAI
+                # Responses API contract does not support interleaving reasoning
+                # back in after a message item has started emitting text; if a
+                # second thinking block arrives after text in the rare
+                # think→text→think case, those thinking deltas are dropped.
+                if in_thinking and not was_thinking and not message_item_opened:
                     reasoning_item_id = _generate_rs_id()
                     reasoning_open = True
                     reasoning_text_buf = []
@@ -892,21 +896,12 @@ async def stream_response_chunks(
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)
                     if cleaned:
-                        # When any reasoning has been emitted, buffer text
-                        # deltas until the message item opens at end-of-stream.
-                        # This guarantees the message lands AFTER all reasoning
-                        # items, including ones that may still arrive later.
-                        if thinking_seen:
-                            text_delta_buffer.append(cleaned)
-                            full_text.append(cleaned)
-                            content_sent = True
-                        else:
-                            if not message_item_opened:
-                                for line in _open_message_item():
-                                    yield line
-                            yield _emit_delta(cleaned)
-                            full_text.append(cleaned)
-                            content_sent = True
+                        if not message_item_opened:
+                            for line in _open_message_item():
+                                yield line
+                        yield _emit_delta(cleaned)
+                        full_text.append(cleaned)
+                        content_sent = True
                 continue
 
             # Accumulate tool_use blocks from stream events
@@ -951,17 +946,12 @@ async def stream_response_chunks(
             chunks_buffer.append(chunk)
             text = format_chunk_content(chunk, content_sent)
             if text:
-                if thinking_seen:
-                    text_delta_buffer.append(text)
-                    full_text.append(text)
-                    content_sent = True
-                else:
-                    if not message_item_opened:
-                        for line in _open_message_item():
-                            yield line
-                    yield _emit_delta(text)
-                    full_text.append(text)
-                    content_sent = True
+                if not message_item_opened:
+                    for line in _open_message_item():
+                        yield line
+                yield _emit_delta(text)
+                full_text.append(text)
+                content_sent = True
 
     except Exception as e:
         logger.error(
@@ -979,17 +969,12 @@ async def stream_response_chunks(
     # Flush remaining buffered chars from collab filter
     remaining_collab = collab_filter.flush()
     if remaining_collab:
-        if thinking_seen:
-            text_delta_buffer.append(remaining_collab)
-            full_text.append(remaining_collab)
-            content_sent = True
-        else:
-            if not message_item_opened:
-                for line in _open_message_item():
-                    yield line
-            yield _emit_delta(remaining_collab)
-            full_text.append(remaining_collab)
-            content_sent = True
+        if not message_item_opened:
+            for line in _open_message_item():
+                yield line
+        yield _emit_delta(remaining_collab)
+        full_text.append(remaining_collab)
+        content_sent = True
 
     if tool_acc.has_incomplete:
         logger.warning("Incomplete tool_use blocks at stream end: %s", tool_acc.incomplete_keys)
@@ -1019,11 +1004,6 @@ async def stream_response_chunks(
     if not message_item_opened:
         for line in _open_message_item():
             yield line
-
-    # Flush any text deltas that were buffered while reasoning was in flight.
-    for delta in text_delta_buffer:
-        yield _emit_delta(delta)
-    text_delta_buffer.clear()
 
     # response.output_text.done
     yield make_response_sse(
