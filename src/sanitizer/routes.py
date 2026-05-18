@@ -235,6 +235,13 @@ async def sanitize_messages(
         bridge_headers = dict(fwd_headers)
         bridge_headers["content-type"] = "application/json"
         upstream_url = f"{get_upstream_url()}/v1/chat/completions"
+        # TEMP DIAG: log the outgoing OpenAI body so we can diagnose 5xx
+        # responses from the upstream (LiteLLM/vLLM rejecting specific
+        # message shapes). Remove once the bridge is stable in production.
+        logger.warning(
+            "sanitizer bridge OpenAI request body: %s",
+            json.dumps(openai_body, ensure_ascii=False)[:4000],
+        )
         upstream_req = client.build_request(
             "POST",
             upstream_url,
@@ -295,6 +302,15 @@ async def sanitize_messages(
     if not upstream_ctype.lower().startswith("text/event-stream"):
         try:
             content = await upstream.aread()
+            # TEMP DIAG: surface upstream error bodies so 5xx responses can
+            # be diagnosed from a single log line instead of needing a tcpdump.
+            if upstream.status_code >= 400:
+                logger.warning(
+                    "sanitizer upstream error %s ctype=%s body=%s",
+                    upstream.status_code,
+                    upstream_ctype,
+                    (content[:2000].decode("utf-8", errors="replace") if content else "<empty>"),
+                )
             resp_headers = _filter_headers(upstream.headers.items(), _DROP_FROM_RESPONSE)
             return Response(
                 content=content,
