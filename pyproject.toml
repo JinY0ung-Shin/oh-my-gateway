@@ -1,6 +1,6 @@
 [project]
 name = "oh-my-gateway"
-version = "2.2.0"
+version = "2.3.0"
 description = "OpenAI-compatible gateway for Claude Agent SDK, OpenCode, and Codex"
 readme = "README.md"
 license = "MIT"
