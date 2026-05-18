@@ -51,6 +51,29 @@ def get_request_timeout_seconds() -> float | None:
     return None if raw <= 0 else float(raw)
 
 
+def get_tls_verify() -> bool | str:
+    """TLS verification setting for the upstream httpx client.
+
+    Controlled by ``SANITIZER_TLS_VERIFY``:
+    - unset / ``true`` / ``1`` / ``yes`` / ``on`` → verify with system CAs (default)
+    - ``false`` / ``0`` / ``no`` / ``off`` → disable verification (INSECURE; only
+      for trusted networks where the upstream uses a private/self-signed cert
+      and you accept MITM risk)
+    - any other non-empty value → treat as a CA bundle file path
+    """
+    raw = os.getenv("SANITIZER_TLS_VERIFY")
+    if raw is None:
+        return True
+    stripped = raw.strip()
+    if not stripped:
+        return True
+    if stripped.lower() in {"false", "0", "no", "off"}:
+        return False
+    if stripped.lower() in {"true", "1", "yes", "on"}:
+        return True
+    return stripped
+
+
 def _env_enabled() -> bool:
     """Boot-time default from ``SANITIZER_ENABLED``."""
     return parse_bool_env("SANITIZER_ENABLED", "false")

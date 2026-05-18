@@ -20,6 +20,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from src.auth import security, verify_api_key
 from src.sanitizer.config import (
     get_request_timeout_seconds,
+    get_tls_verify,
     get_upstream_url,
     is_enabled,
 )
@@ -32,7 +33,7 @@ router = APIRouter()
 
 def _make_client(timeout: float | None) -> httpx.AsyncClient:
     """AsyncClient factory; tests monkeypatch this to inject a MockTransport."""
-    return httpx.AsyncClient(timeout=timeout)
+    return httpx.AsyncClient(timeout=timeout, verify=get_tls_verify())
 
 # Hop-by-hop headers (RFC 7230 §6.1) plus transport-framing headers set by
 # httpx/Starlette automatically. Never forwarded in either direction.
