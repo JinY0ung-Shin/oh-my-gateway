@@ -273,6 +273,89 @@ class TestSanitizerSpecCompliance:
         assert starts[0]["content_block"]["id"] == "srvtoolu_abc"
         assert starts[0]["content_block"]["name"] == "web_search"
 
+    async def test_empty_text_delta_interleaved_in_thinking_does_not_split(self):
+        """LiteLLM-family bug: zero-payload ``text_delta`` events appear inside
+        a thinking stream. Naively they would trigger text↔thinking thrashing
+        because each empty ``text_delta`` looks like a switch back to text.
+
+        The sanitizer must drop the empty deltas before split logic runs so the
+        thinking block stays a single coherent block.
+        """
+        events = [
+            {"type": "message_start", "message": {"id": "msg_1"}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "The user"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " is asking"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": " about X"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_stop"},
+        ]
+        out = await _collect(sanitize_events(_as_async(events)))
+        assert_spec_conforming(out)
+        starts = [e for e in out if e["type"] == "content_block_start"]
+        # Exactly two blocks: the original empty text, then one thinking block.
+        # Without the empty-delta drop, this would be 6+ blocks (thrashing).
+        assert [s["content_block"]["type"] for s in starts] == ["text", "thinking"]
+        thinking_deltas = [e for e in out if e.get("delta", {}).get("type") == "thinking_delta"]
+        assert len(thinking_deltas) == 3
+        # All thinking deltas live in the single thinking block (idx=1).
+        assert {e["index"] for e in thinking_deltas} == {1}
+
+    async def test_empty_input_json_deltas_do_not_synthesize_empty_tool_use(self):
+        """LiteLLM-family bug: tool call meta (name/id) is lost — the only
+        signal is a long run of ``input_json_delta`` events with empty
+        ``partial_json``. Synthesizing a ``tool_use(name="", id="")`` block
+        causes downstream SDKs to reject the call as ``No such tool available``
+        and the model loops on the error.
+
+        The sanitizer must drop the empty deltas so no broken tool_use block
+        is fabricated and downstream sees a clean (tool-less) turn.
+        """
+        events = [
+            {"type": "message_start", "message": {"id": "msg_1"}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "I'll call a tool"}},
+            # A burst of empty partial_json — upstream's broken serialization of
+            # a tool call. No name/id ever arrives.
+            *[
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": ""}}
+                for _ in range(8)
+            ],
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "end_turn"}},
+            {"type": "message_stop"},
+        ]
+        out = await _collect(sanitize_events(_as_async(events)))
+        assert_spec_conforming(out)
+        starts = [e for e in out if e["type"] == "content_block_start"]
+        block_types = [s["content_block"]["type"] for s in starts]
+        # No tool_use must appear — it would carry name="" and break downstream.
+        assert "tool_use" not in block_types
+        # No input_json_delta should survive either.
+        assert not any(
+            e.get("delta", {}).get("type") == "input_json_delta" for e in out
+        )
+
+    async def test_non_empty_deltas_still_pass_through(self):
+        """Sanity check: empty-delta drop must not swallow real content."""
+        events = [
+            {"type": "message_start", "message": {"id": "msg_1"}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Hello"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": ""}},  # dropped
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": " world"}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_stop"},
+        ]
+        out = await _collect(sanitize_events(_as_async(events)))
+        assert_spec_conforming(out)
+        text_deltas = [e for e in out if e.get("delta", {}).get("type") == "text_delta"]
+        assert len(text_deltas) == 2
+        assert [d["delta"]["text"] for d in text_deltas] == ["Hello", " world"]
+
     async def test_explicit_block_start_after_synthetic_split_remains_consistent(self):
         """Upstream emits content_block_start mid-stream after we've already split."""
         events = [

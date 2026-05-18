@@ -38,6 +38,34 @@ DELTA_PRIMARY_BLOCK: Dict[str, str] = {
 DELTA_TO_BLOCK_TYPE: Dict[str, str] = dict(DELTA_PRIMARY_BLOCK)
 
 
+def _is_empty_delta(delta: Dict[str, Any]) -> bool:
+    """Return True when a ``content_block_delta`` carries no payload.
+
+    Some upstreams (notably LiteLLM in the #21128 family) interleave zero-byte
+    deltas — empty ``text_delta`` events scattered through a thinking stream,
+    or a run of ``input_json_delta`` events whose ``partial_json`` is ``""``
+    with no preceding ``content_block_start(type=tool_use, ...)`` so the tool
+    name/id are unrecoverable.
+
+    Such events carry no content and can only do harm: they trigger spurious
+    block splits (text↔thinking thrashing) or cause the sanitizer to
+    synthesize a placeholder ``tool_use`` block with empty ``name``/``id``,
+    which downstream SDKs reject as ``No such tool available``. Dropping them
+    is always safe — adjacent non-empty deltas of the same type concatenate as
+    if the empty one were never there.
+    """
+    dt = delta.get("type")
+    if dt == "text_delta":
+        return not delta.get("text")
+    if dt == "thinking_delta":
+        return not delta.get("thinking")
+    if dt == "signature_delta":
+        return not delta.get("signature")
+    if dt == "input_json_delta":
+        return not delta.get("partial_json")
+    return False
+
+
 def _synthetic_block(block_type: str) -> Dict[str, Any]:
     """Build a minimal ``content_block`` payload for a synthesized start event."""
     if block_type == "text":
@@ -94,7 +122,12 @@ async def sanitize_events(
             continue
 
         if etype == "content_block_delta":
-            delta_type = evt.get("delta", {}).get("type")
+            delta = evt.get("delta", {}) or {}
+            if _is_empty_delta(delta):
+                # Drop zero-payload deltas before any split logic runs. See
+                # ``_is_empty_delta`` for why this is unconditionally safe.
+                continue
+            delta_type = delta.get("type")
             compatible = DELTA_COMPATIBLE_BLOCKS.get(delta_type)
             if compatible is not None and current_block_type not in compatible:
                 # Current block can't validly hold this delta — close it and
