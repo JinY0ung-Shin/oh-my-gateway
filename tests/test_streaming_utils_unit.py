@@ -1791,3 +1791,39 @@ class TestExtractVisibleAssistantText:
         out = extract_visible_assistant_text(chunks)
         assert "hidden" not in out
         assert "visible" in out
+
+    def test_consecutive_text_blocks_in_same_message_join_without_separator(self):
+        """Mirrors MessageAdapter.format_blocks join: same-message text blocks
+        are concatenated with no separator. Crossing chunk boundaries still
+        uses '\\n' (matches parse_message)."""
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "text", "text": "Hello"},
+                {"type": "text", "text": " world"},
+            ]},
+        ]
+        assert extract_visible_assistant_text(chunks) == "Hello world"
+
+    def test_thinking_between_text_blocks_in_same_message_does_not_add_separator(self):
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "text", "text": "ab"},
+                {"type": "thinking", "thinking": "hidden"},
+                {"type": "text", "text": "cd"},
+            ]},
+        ]
+        # The two text blocks are concatenated as if the thinking weren't there.
+        assert extract_visible_assistant_text(chunks) == "abcd"
+
+    def test_separate_messages_joined_with_newline(self):
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [{"type": "text", "text": "first"}]},
+            {"type": "assistant", "content": [{"type": "text", "text": "second"}]},
+        ]
+        assert extract_visible_assistant_text(chunks) == "first\nsecond"

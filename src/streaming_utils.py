@@ -250,10 +250,15 @@ def extract_thinking_texts(chunks: list) -> list[str]:
 def extract_visible_assistant_text(chunks: list) -> Optional[str]:
     """Return the visible assistant text from SDK chunks, excluding thinking blocks.
 
-    Mirrors ``backend.parse_message()`` but the AssistantMessage-content path
-    skips ``ThinkingBlock`` entries instead of wrapping them in ``<think>...</think>``
-    markers. ``ResultMessage.result`` is preferred as-is (the SDK's final-text
-    field — we trust it to already be visible-only).
+    Matches ``backend.parse_message()``'s join structure exactly:
+    - prefer ``ResultMessage.result`` when present
+    - otherwise, for each assistant chunk, filter out ``ThinkingBlock`` entries
+      from its content list and pass the rest to ``MessageAdapter.format_blocks``
+      (which concatenates with no separator)
+    - join the per-chunk strings with ``"\\n"``
+
+    The only behavioral difference from ``parse_message`` is that ThinkingBlock
+    contents do not appear as ``<think>...</think>`` text in the result.
     """
     # First pass: prefer ResultMessage.result, as SDK collapses content to it.
     result_text: Optional[str] = None
@@ -267,8 +272,8 @@ def extract_visible_assistant_text(chunks: list) -> Optional[str]:
     if result_text is not None:
         return result_text
 
-    # Second pass: walk content blocks, joining only non-thinking text.
-    parts: list[str] = []
+    # Second pass: per-message, filter out ThinkingBlocks then format_blocks.
+    all_parts: list[str] = []
     for chunk in chunks:
         if not isinstance(chunk, dict):
             continue
@@ -279,24 +284,24 @@ def extract_visible_assistant_text(chunks: list) -> Optional[str]:
                 content = inner.get("content")
         if not isinstance(content, list):
             continue
+
+        filtered = []
         for block in content:
-            # Skip thinking blocks via either attribute or dict shape.
             is_thinking = False
             if hasattr(block, "thinking") and not hasattr(block, "text"):
                 is_thinking = True
             elif isinstance(block, dict) and block.get("type") == "thinking":
                 is_thinking = True
-            if is_thinking:
-                continue
-            # Collect text blocks.
-            text: Optional[str] = None
-            if hasattr(block, "text"):
-                text = getattr(block, "text", None)
-            elif isinstance(block, dict) and block.get("type") == "text":
-                text = block.get("text")
-            if text:
-                parts.append(text)
-    return "\n".join(parts) if parts else None
+            if not is_thinking:
+                filtered.append(block)
+
+        if not filtered:
+            continue
+        formatted = MessageAdapter.format_blocks(filtered)
+        if formatted:
+            all_parts.append(formatted)
+
+    return "\n".join(all_parts) if all_parts else None
 
 
 def resolve_token_usage(
