@@ -314,6 +314,159 @@ def test_accept_encoding_is_not_forwarded_upstream():
     assert "br" not in forwarded
 
 
+def test_bridge_streaming_translates_openai_to_anthropic(monkeypatch):
+    """When ``SANITIZER_USE_OPENAI_BRIDGE`` is on, the route must hit the
+    upstream's OpenAI chat-completions endpoint and translate the resulting
+    SSE back into Anthropic shape end-to-end.
+
+    Verifies the integration glue: upstream URL switch, request body
+    rewrite, and OpenAI → Anthropic SSE conversion all wired together.
+    """
+    monkeypatch.setenv("SANITIZER_USE_OPENAI_BRIDGE", "true")
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+
+        # Mimic a vLLM-style OpenAI streaming response with reasoning_content
+        # and a tool call — the exact pattern LiteLLM's Anthropic adapter
+        # mishandles.
+        chunks = [
+            {"choices": [{"delta": {"role": "assistant", "content": ""}}]},
+            {"choices": [{"delta": {"reasoning_content": "thinking..."}}]},
+            {"choices": [{"delta": {"content": "Hello"}}]},
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "Bash",
+                                        "arguments": '{"command":"ls"}',
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            {"choices": [{"delta": {}, "finish_reason": "tool_calls"}]},
+            {"choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 10}},
+        ]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body.encode(),
+        )
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "GaussO3.2-260402-vllm",
+            "stream": True,
+            "max_tokens": 1024,
+            "tools": [
+                {
+                    "name": "Bash",
+                    "description": "shell",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"command": {"type": "string"}},
+                        "required": ["command"],
+                    },
+                }
+            ],
+            "messages": [{"role": "user", "content": "ls"}],
+        },
+    )
+
+    # The upstream call must target the OpenAI route — not /v1/messages.
+    assert captured["url"].endswith("/v1/chat/completions")
+    # The body must have been translated to OpenAI shape.
+    assert captured["body"]["messages"] == [{"role": "user", "content": "ls"}]
+    assert captured["body"]["tools"][0]["type"] == "function"
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/event-stream")
+    events = _parse_sse(resp.text)
+    types = [e["type"] for e in events]
+    # Expect proper Anthropic SSE structure: message_start, thinking block,
+    # text block, tool_use block (with real id/name), message_delta, stop.
+    assert types[0] == "message_start"
+    assert types[-1] == "message_stop"
+
+    starts = [e for e in events if e["type"] == "content_block_start"]
+    block_types = [s["content_block"]["type"] for s in starts]
+    assert block_types == ["thinking", "text", "tool_use"]
+    assert starts[2]["content_block"]["id"] == "call_1"
+    assert starts[2]["content_block"]["name"] == "Bash"
+
+    md = next(e for e in events if e["type"] == "message_delta")
+    assert md["delta"]["stop_reason"] == "tool_use"
+
+
+def test_bridge_non_streaming_translates_response_body(monkeypatch):
+    """Non-streaming bridge path: upstream returns an OpenAI completion, the
+    route must rewrite it to Anthropic shape before returning."""
+    monkeypatch.setenv("SANITIZER_USE_OPENAI_BRIDGE", "true")
+
+    captured: dict = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["url"] = str(request.url)
+        captured["body"] = json.loads(request.content)
+        openai_body = {
+            "id": "chatcmpl-x",
+            "model": "GaussO3.2-260402-vllm",
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "Let me think.",
+                        "content": "Hello!",
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+        }
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            content=json.dumps(openai_body).encode(),
+        )
+
+    app = _make_app(handler)
+    client = TestClient(app)
+    resp = client.post(
+        "/v1/messages",
+        json={
+            "model": "GaussO3.2-260402-vllm",
+            "stream": False,
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert captured["url"].endswith("/v1/chat/completions")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["type"] == "message"
+    assert body["role"] == "assistant"
+    assert body["stop_reason"] == "end_turn"
+    assert body["usage"] == {"input_tokens": 12, "output_tokens": 3}
+    types = [b["type"] for b in body["content"]]
+    assert types == ["thinking", "text"]
+
+
 def test_content_encoding_stripped_from_response():
     """httpx auto-decodes bodies; passing content-encoding to the client would mislead it."""
     import gzip

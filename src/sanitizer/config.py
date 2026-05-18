@@ -74,6 +74,19 @@ def get_tls_verify() -> bool | str:
     return stripped
 
 
+def is_openai_bridge_enabled() -> bool:
+    """Whether to translate Anthropic ↔ OpenAI in-process instead of relying
+    on the upstream's Anthropic adapter.
+
+    Controlled by ``SANITIZER_USE_OPENAI_BRIDGE``. When enabled, the sanitizer
+    route forwards to ``{ANTHROPIC_BASE_URL}/v1/chat/completions`` and
+    rewrites both directions itself. Use when the upstream's own Anthropic
+    adapter mis-serializes tool calls or reasoning content (the GaussO3.2 /
+    LiteLLM cases this gateway was built to work around).
+    """
+    return parse_bool_env("SANITIZER_USE_OPENAI_BRIDGE", "false")
+
+
 def _env_enabled() -> bool:
     """Boot-time default from ``SANITIZER_ENABLED``."""
     return parse_bool_env("SANITIZER_ENABLED", "false")
