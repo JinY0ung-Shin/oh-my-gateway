@@ -366,3 +366,80 @@ class TestUserSessionBinding:
             call(existing_session_id),
         ]
         assert create_calls[0]["cwd"] == "/tmp/ws/alice/codex"
+
+
+def test_build_completed_response_prepends_reasoning_items_per_thinking_block():
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        "resp_1",
+        "m",
+        "hi",
+        {},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=["first thought", "second thought"],
+    )
+    assert [item.type for item in resp.output] == ["reasoning", "reasoning", "message"]
+    r0, r1, msg = resp.output
+    assert r0.summary[0].text == "first thought"
+    assert r0.content[0].text == "first thought"
+    assert r1.summary[0].text == "second thought"
+    assert msg.content[0].text == "hi"
+
+
+def test_build_completed_response_no_thinking_texts_preserves_existing_shape():
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        "resp_1",
+        "m",
+        "hello",
+        {},
+        output_tokens=1,
+        input_tokens=1,
+    )
+    assert [item.type for item in resp.output] == ["message"]
+    assert resp.output[0].content[0].text == "hello"
+
+
+def test_build_completed_response_preserves_literal_think_tags_in_assistant_text():
+    """If the visible model output legitimately contains '<think>' substrings
+    (e.g. tutorial text about XML tags), they MUST be preserved. Stripping is
+    not the right approach — visible text comes from non-thinking content blocks."""
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        response_id="resp_1",
+        model="m",
+        assistant_text="use the <think>foo</think> tag",
+        metadata={},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=None,
+    )
+    msg = [it for it in resp.output if it.type == "message"][0]
+    assert msg.content[0].text == "use the <think>foo</think> tag"
+
+
+def test_build_completed_response_uses_caller_supplied_visible_text():
+    """_build_completed_response is a pure assembler — visibility filtering is
+    the caller's job (extract_visible_assistant_text). The function must trust
+    its inputs and not strip anything from assistant_text."""
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        response_id="resp_1",
+        model="m",
+        assistant_text="the answer",
+        metadata={},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=["my reasoning"],
+    )
+    types = [it.type for it in resp.output]
+    assert types == ["reasoning", "message"]
+    reasoning = [it for it in resp.output if it.type == "reasoning"][0]
+    msg = [it for it in resp.output if it.type == "message"][0]
+    assert reasoning.summary[0].text == "my reasoning"
+    assert msg.content[0].text == "the answer"

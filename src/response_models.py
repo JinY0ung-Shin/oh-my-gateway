@@ -132,6 +132,30 @@ class OutputItem(BaseModel):
     content: List[ResponseContentPart] = Field(default_factory=list)
 
 
+class ReasoningSummary(BaseModel):
+    """A summary part inside a reasoning output item."""
+
+    type: Literal["summary_text"] = "summary_text"
+    text: str = ""
+
+
+class ReasoningContent(BaseModel):
+    """A raw reasoning text part inside a reasoning output item."""
+
+    type: Literal["reasoning_text"] = "reasoning_text"
+    text: str = ""
+
+
+class ReasoningOutputItem(BaseModel):
+    """A reasoning output item (Anthropic ThinkingBlock → OpenAI reasoning)."""
+
+    id: str
+    type: Literal["reasoning"] = "reasoning"
+    status: Literal["completed", "in_progress", "incomplete"] = "completed"
+    summary: List[ReasoningSummary] = Field(default_factory=list)
+    content: Optional[List[ReasoningContent]] = None
+
+
 class ResponseUsage(BaseModel):
     """Token usage for a response."""
 
@@ -165,7 +189,7 @@ class ResponseObject(BaseModel):
     created_at: int = Field(default_factory=lambda: int(time.time()))
     status: Literal["completed", "in_progress", "failed", "requires_action"] = "completed"
     model: str = ""
-    output: List[Union[OutputItem, FunctionCallOutputItem]] = Field(default_factory=list)
+    output: List[Union[OutputItem, FunctionCallOutputItem, ReasoningOutputItem]] = Field(default_factory=list)
     usage: ResponseUsage = Field(default_factory=ResponseUsage)
     metadata: Dict[str, str] = Field(default_factory=dict)
     error: Optional[ResponseErrorDetail] = None

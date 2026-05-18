@@ -12,6 +12,9 @@ from src.message_adapter import MessageAdapter
 from src.response_models import (
     ResponseContentPart,
     OutputItem,
+    ReasoningContent,
+    ReasoningOutputItem,
+    ReasoningSummary,
     ResponseErrorDetail,
     ResponseObject,
     ResponseUsage,
@@ -221,6 +224,86 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     return None
 
 
+def extract_thinking_texts(chunks: list) -> list[str]:
+    """Return thinking-block texts in the order they appear in the chunk list.
+
+    Walks ``assistant`` chunks and pulls out every ``ThinkingBlock``'s text.
+    Tolerates both SDK dataclass objects (``block.thinking``) and dict form
+    (``{"type": "thinking", "thinking": "..."}``).
+    """
+    out: list[str] = []
+    for chunk in chunks:
+        content = chunk.get("content") if isinstance(chunk, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            text = None
+            if hasattr(block, "thinking"):
+                text = getattr(block, "thinking", None)
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                text = block.get("thinking")
+            if text:
+                out.append(text)
+    return out
+
+
+def extract_visible_assistant_text(chunks: list) -> Optional[str]:
+    """Return the visible assistant text from SDK chunks, excluding thinking blocks.
+
+    Matches ``backend.parse_message()``'s join structure exactly:
+    - prefer ``ResultMessage.result`` when present
+    - otherwise, for each assistant chunk, filter out ``ThinkingBlock`` entries
+      from its content list and pass the rest to ``MessageAdapter.format_blocks``
+      (which concatenates with no separator)
+    - join the per-chunk strings with ``"\\n"``
+
+    The only behavioral difference from ``parse_message`` is that ThinkingBlock
+    contents do not appear as ``<think>...</think>`` text in the result.
+    """
+    # First pass: prefer ResultMessage.result, as SDK collapses content to it.
+    result_text: Optional[str] = None
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("subtype") == "success" and "result" in chunk:
+            r = chunk["result"]
+            if r and r.strip():
+                result_text = r
+    if result_text is not None:
+        return result_text
+
+    # Second pass: per-message, filter out ThinkingBlocks then format_blocks.
+    all_parts: list[str] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        content = chunk.get("content")
+        if not isinstance(content, list):
+            inner = chunk.get("message")
+            if isinstance(inner, dict):
+                content = inner.get("content")
+        if not isinstance(content, list):
+            continue
+
+        filtered = []
+        for block in content:
+            is_thinking = False
+            if hasattr(block, "thinking") and not hasattr(block, "text"):
+                is_thinking = True
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                is_thinking = True
+            if not is_thinking:
+                filtered.append(block)
+
+        if not filtered:
+            continue
+        formatted = MessageAdapter.format_blocks(filtered)
+        if formatted:
+            all_parts.append(formatted)
+
+    return "\n".join(all_parts) if all_parts else None
+
+
 def resolve_token_usage(
     chunks: list,
     prompt: str,
@@ -409,6 +492,11 @@ def _remember_tool_use(tool_names_by_id: Dict[str, str], tool_block: Dict[str, A
         tool_names_by_id[tool_use_id] = name
 
 
+def _generate_rs_id() -> str:
+    import uuid
+    return f"rs_{uuid.uuid4().hex[:24]}"
+
+
 def _is_synthetic_ask_user_response_result(
     result_block: Dict[str, Any],
     tool_names_by_id: Dict[str, str],
@@ -572,6 +660,13 @@ async def stream_response_chunks(
     collab_filter = CollabJsonStreamFilter()
     full_text = []
     seq = 0
+    message_item_opened = False
+    output_index = 0
+    reasoning_open = False
+    reasoning_item_id: Optional[str] = None
+    reasoning_text_buf: list[str] = []
+    thinking_seen = False
+    completed_reasoning_items: list[ReasoningOutputItem] = []
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -637,36 +732,97 @@ async def stream_response_chunks(
         "response.in_progress", response_obj=resp_in_progress, sequence_number=_next_seq()
     )
 
-    # 3. response.output_item.added
-    output_item = OutputItem(id=output_item_id, status="in_progress")
-    yield make_response_sse(
-        "response.output_item.added",
-        output_index=0,
-        item=output_item,
-        sequence_number=_next_seq(),
-    )
+    # NOTE: response.output_item.added + response.content_part.added for the
+    # message item are DEFERRED until the first text delta arrives (or the
+    # stream closes without text). This leaves room for reasoning output
+    # items to be emitted before the message item in future tasks.
 
-    # 4. response.content_part.added
-    content_part = ResponseContentPart(type="output_text", text="")
-    yield make_response_sse(
-        "response.content_part.added",
-        item_id=output_item_id,
-        output_index=0,
-        content_index=0,
-        part=content_part,
-        sequence_number=_next_seq(),
-    )
+    def _open_message_item() -> list[str]:
+        """Emit message output_item.added + content_part.added. Idempotent."""
+        nonlocal message_item_opened
+        if message_item_opened:
+            return []
+        message_item_opened = True
+        out_item = OutputItem(id=output_item_id, status="in_progress")
+        content_part = ResponseContentPart(type="output_text", text="")
+        return [
+            make_response_sse(
+                "response.output_item.added",
+                output_index=output_index,
+                item=out_item,
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.content_part.added",
+                item_id=output_item_id,
+                output_index=output_index,
+                content_index=0,
+                part=content_part,
+                sequence_number=_next_seq(),
+            ),
+        ]
 
     def _emit_delta(text: str) -> str:
         return make_response_sse(
             "response.output_text.delta",
             item_id=output_item_id,
-            output_index=0,
+            output_index=output_index,
             content_index=0,
             delta=text,
             logprobs=[],
             sequence_number=_next_seq(),
         )
+
+    def _close_reasoning() -> list[str]:
+        """Emit the four close events for the open reasoning item, bump output_index."""
+        nonlocal reasoning_open, reasoning_item_id, reasoning_text_buf, output_index
+        if not reasoning_open:
+            return []
+        full_text = "".join(reasoning_text_buf)
+        item = ReasoningOutputItem(
+            id=reasoning_item_id,
+            status="completed",
+            summary=[ReasoningSummary(text=full_text)],
+            content=[ReasoningContent(text=full_text)],
+        )
+        completed_reasoning_items.append(item)
+        lines = [
+            make_response_sse(
+                "response.reasoning_summary_text.done",
+                item_id=reasoning_item_id,
+                output_index=output_index,
+                summary_index=0,
+                text=full_text,
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.reasoning_text.done",
+                item_id=reasoning_item_id,
+                output_index=output_index,
+                content_index=0,
+                text=full_text,
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.reasoning_summary_part.done",
+                item_id=reasoning_item_id,
+                output_index=output_index,
+                summary_index=0,
+                part={"type": "summary_text", "text": full_text},
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+                sequence_number=_next_seq(),
+            ),
+        ]
+        reasoning_open = False
+        reasoning_item_id = None
+        reasoning_text_buf = []
+        output_index += 1
+        return lines
 
     # --- Main streaming loop ---
 
@@ -733,12 +889,80 @@ async def stream_response_chunks(
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
             if text_delta is not None:
                 token_streaming = True
-                # Suppress thinking content in Responses API
-                if was_thinking or in_thinking or text_delta in ("<think>", "</think>"):
+                # Open reasoning output_item on first thinking delta of a block,
+                # but only if the message item is not already open. The OpenAI
+                # Responses API contract does not support interleaving reasoning
+                # back in after a message item has started emitting text; if a
+                # second thinking block arrives after text in the rare
+                # think→text→think case, those thinking deltas are dropped.
+                if in_thinking and not was_thinking and not message_item_opened:
+                    reasoning_item_id = _generate_rs_id()
+                    reasoning_open = True
+                    reasoning_text_buf = []
+                    thinking_seen = True
+                    reasoning_item = ReasoningOutputItem(
+                        id=reasoning_item_id, status="in_progress"
+                    )
+                    yield make_response_sse(
+                        "response.output_item.added",
+                        output_index=output_index,
+                        item=reasoning_item,
+                        sequence_number=_next_seq(),
+                    )
+                    yield make_response_sse(
+                        "response.reasoning_summary_part.added",
+                        item_id=reasoning_item_id,
+                        output_index=output_index,
+                        summary_index=0,
+                        part={"type": "summary_text", "text": ""},
+                        sequence_number=_next_seq(),
+                    )
+
+                # Drop synthetic markers, which are state-only.  When </think>
+                # arrives (content_block_stop while in_thinking), close the
+                # reasoning item immediately so any new thinking block that
+                # follows gets a fresh output_index.
+                if text_delta in ("<think>", "</think>"):
+                    if text_delta == "</think>" and reasoning_open:
+                        for line in _close_reasoning():
+                            yield line
                     continue
+
+                # Inside a reasoning block: emit summary_text + reasoning_text deltas.
+                if reasoning_open and in_thinking:
+                    reasoning_text_buf.append(text_delta)
+                    yield make_response_sse(
+                        "response.reasoning_summary_text.delta",
+                        item_id=reasoning_item_id,
+                        output_index=output_index,
+                        summary_index=0,
+                        delta=text_delta,
+                        sequence_number=_next_seq(),
+                    )
+                    yield make_response_sse(
+                        "response.reasoning_text.delta",
+                        item_id=reasoning_item_id,
+                        output_index=output_index,
+                        content_index=0,
+                        delta=text_delta,
+                        sequence_number=_next_seq(),
+                    )
+                    continue
+                # We're inside a thinking block but couldn't open a reasoning item
+                # (message item already opened — OpenAI Responses contract doesn't support
+                # reopening reasoning). Drop these deltas so they don't leak as message text.
+                if in_thinking:
+                    continue
+                # If reasoning was open and we just exited it, close it now.
+                if reasoning_open and not in_thinking:
+                    for line in _close_reasoning():
+                        yield line
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)
                     if cleaned:
+                        if not message_item_opened:
+                            for line in _open_message_item():
+                                yield line
                         yield _emit_delta(cleaned)
                         full_text.append(cleaned)
                         content_sent = True
@@ -786,6 +1010,9 @@ async def stream_response_chunks(
             chunks_buffer.append(chunk)
             text = format_chunk_content(chunk, content_sent)
             if text:
+                if not message_item_opened:
+                    for line in _open_message_item():
+                        yield line
                 yield _emit_delta(text)
                 full_text.append(text)
                 content_sent = True
@@ -806,6 +1033,9 @@ async def stream_response_chunks(
     # Flush remaining buffered chars from collab filter
     remaining_collab = collab_filter.flush()
     if remaining_collab:
+        if not message_item_opened:
+            for line in _open_message_item():
+                yield line
         yield _emit_delta(remaining_collab)
         full_text.append(remaining_collab)
         content_sent = True
@@ -815,23 +1045,35 @@ async def stream_response_chunks(
 
     # --- Finalization ---
 
-    # No content received.  Don't yield a failed event here: the caller may
-    # still need to emit function_call + requires_action (AskUserQuestion hook
-    # path).  Signal "empty" via stream_result and let the route decide.
-    if not content_sent:
+    # No content received AND no reasoning emitted.  Don't yield a failed event
+    # here: the caller may still need to emit function_call + requires_action
+    # (AskUserQuestion hook path).  Signal "empty" via stream_result and let
+    # the route decide.  When reasoning was emitted (thinking-only response),
+    # we still need to close the stream cleanly with an empty message item.
+    if not content_sent and not thinking_seen:
         logger.info("Responses stream: no text content yielded")
         stream_result["success"] = False
         stream_result["empty"] = True
         return
 
+    # Close reasoning if it's still open (stream ended without exiting thinking).
+    if reasoning_open:
+        for line in _close_reasoning():
+            yield line
+
     # Emit closing events for successful stream
     final_text = "".join(full_text)
+
+    # Ensure the message item has been announced (consumer always sees one).
+    if not message_item_opened:
+        for line in _open_message_item():
+            yield line
 
     # response.output_text.done
     yield make_response_sse(
         "response.output_text.done",
         item_id=output_item_id,
-        output_index=0,
+        output_index=output_index,
         content_index=0,
         text=final_text,
         logprobs=[],
@@ -842,7 +1084,7 @@ async def stream_response_chunks(
     yield make_response_sse(
         "response.content_part.done",
         item_id=output_item_id,
-        output_index=0,
+        output_index=output_index,
         content_index=0,
         part=ResponseContentPart(text=final_text),
         sequence_number=_next_seq(),
@@ -851,7 +1093,7 @@ async def stream_response_chunks(
     # response.output_item.done
     yield make_response_sse(
         "response.output_item.done",
-        output_index=0,
+        output_index=output_index,
         item=OutputItem(
             id=output_item_id,
             status="completed",
@@ -869,11 +1111,12 @@ async def stream_response_chunks(
         model=model,
         status="completed",
         output=[
+            *completed_reasoning_items,
             OutputItem(
                 id=output_item_id,
                 status="completed",
                 content=[ResponseContentPart(text=final_text)],
-            )
+            ),
         ],
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
