@@ -1139,6 +1139,10 @@ async function streamRequest(body) {
   let reasoningText = '';
   let reasoningTextDeltaSeen = false;
   let responseId = null;
+  // When a tool call/result lands between two text deltas the model has
+  // semantically resumed in a fresh paragraph; render that as a blank-line
+  // break instead of letting the second sentence concatenate onto the first.
+  let pendingTextSeparator = false;
 
   try {
     currentAbortController = new AbortController();
@@ -1192,6 +1196,10 @@ async function streamRequest(body) {
 
         // --- Text delta ---
         if (type === 'response.output_text.delta' && evt.delta) {
+          if (pendingTextSeparator && fullText && !fullText.endsWith('\n\n')) {
+            fullText += '\n\n';
+          }
+          pendingTextSeparator = false;
           fullText += evt.delta;
           bubble.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
           scrollToBottom();
@@ -1221,6 +1229,7 @@ async function streamRequest(body) {
           setStatus('streaming', 'Tool: ' + name);
           addToolEvent('tool-use', 'TOOL', name + (summary ? ' — ' + summary.substring(0, 60) : ''),
             JSON.stringify(input, null, 2));
+          pendingTextSeparator = true;
         }
 
         // --- Tool result ---
@@ -1235,6 +1244,7 @@ async function streamRequest(body) {
             content || '(no content)'
           );
           setStatus('streaming', '스트리밍중...');
+          pendingTextSeparator = true;
         }
 
         // --- Task events ---
