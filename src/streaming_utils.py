@@ -12,6 +12,7 @@ from src.message_adapter import MessageAdapter
 from src.response_models import (
     ResponseContentPart,
     OutputItem,
+    ReasoningOutputItem,
     ResponseErrorDetail,
     ResponseObject,
     ResponseUsage,
@@ -432,6 +433,11 @@ def _remember_tool_use(tool_names_by_id: Dict[str, str], tool_block: Dict[str, A
         tool_names_by_id[tool_use_id] = name
 
 
+def _generate_rs_id() -> str:
+    import uuid
+    return f"rs_{uuid.uuid4().hex[:24]}"
+
+
 def _is_synthetic_ask_user_response_result(
     result_block: Dict[str, Any],
     tool_names_by_id: Dict[str, str],
@@ -597,6 +603,9 @@ async def stream_response_chunks(
     seq = 0
     message_item_opened = False
     output_index = 0
+    reasoning_open = False
+    reasoning_item_id: Optional[str] = None
+    reasoning_text_buf: list[str] = []
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -768,8 +777,37 @@ async def stream_response_chunks(
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
             if text_delta is not None:
                 token_streaming = True
-                # Suppress thinking content in Responses API
-                if was_thinking or in_thinking or text_delta in ("<think>", "</think>"):
+                # Open reasoning output_item on first thinking delta of a block.
+                if in_thinking and not was_thinking:
+                    reasoning_item_id = _generate_rs_id()
+                    reasoning_open = True
+                    reasoning_text_buf = []
+                    reasoning_item = ReasoningOutputItem(
+                        id=reasoning_item_id, status="in_progress"
+                    )
+                    yield make_response_sse(
+                        "response.output_item.added",
+                        output_index=output_index,
+                        item=reasoning_item,
+                        sequence_number=_next_seq(),
+                    )
+                    yield make_response_sse(
+                        "response.reasoning_summary_part.added",
+                        item_id=reasoning_item_id,
+                        output_index=output_index,
+                        summary_index=0,
+                        part={"type": "summary_text", "text": ""},
+                        sequence_number=_next_seq(),
+                    )
+
+                # Drop synthetic markers, which are state-only.
+                if text_delta in ("<think>", "</think>"):
+                    continue
+
+                # Skip the rest of this block while inside a thinking block —
+                # reasoning delta emission lands in Task 5; for now we just
+                # stop the message delta path from firing on thinking content.
+                if in_thinking:
                     continue
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)

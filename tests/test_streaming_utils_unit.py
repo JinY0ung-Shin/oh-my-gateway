@@ -1282,3 +1282,41 @@ async def test_stream_emits_message_item_after_first_text_when_no_thinking():
     assert added_idx < first_delta_idx
     assert "response.output_item.done" in types
     assert types[-1] == "response.completed"
+
+
+async def test_stream_opens_reasoning_on_first_thinking_delta():
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "hmm"},
+        }}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    types = [t for t, _ in events]
+    # output_item.added for reasoning
+    assert "response.output_item.added" in types
+    added_idx = types.index("response.output_item.added")
+    _, added_payload = events[added_idx]
+    assert added_payload["item"]["type"] == "reasoning"
+    assert added_payload["output_index"] == 0
+    # reasoning_summary_part.added present
+    assert "response.reasoning_summary_part.added" in types
