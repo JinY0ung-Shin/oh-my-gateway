@@ -82,6 +82,16 @@ item with the next ``output_index``. The message item's ``output_index`` is
 Reasoning items are flushed as soon as their ``content_block_stop`` arrives —
 they are never held open across other blocks.
 
+**Known divergence (live-streaming tradeoff).** The implementation guards
+reasoning-open with ``not message_item_opened``. Once the message output_item
+is opened (on the first text delta), any subsequent ``thinking`` blocks are
+silently dropped rather than emitted as additional reasoning items. This
+preserves real-time text streaming for the common case (think → text). The
+alternative — buffering text until all thinking completes — would break live
+token streaming for every response with extended thinking. Claude in practice
+emits a single thinking block followed by text, so interleaved think → text →
+think is essentially nonexistent in production traffic.
+
 ## Non-Streaming Response Shape
 
 ``src/routes/responses.py`` builds the final response from the SDK's terminal
