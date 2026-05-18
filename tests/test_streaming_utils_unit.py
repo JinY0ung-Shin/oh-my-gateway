@@ -1514,3 +1514,95 @@ async def test_stream_thinking_only_emits_empty_message_item():
                     if t == "response.output_item.done" and p["item"]["type"] == "message")
     assert msg_done is not None
     assert types[-1] == "response.completed"
+
+
+async def test_full_reasoning_lifecycle_streaming():
+    """End-to-end: think -> text stream produces a complete OpenAI Responses sequence.
+
+    Reasoning item open -> deltas -> done -> message item open -> text delta -> message close -> completed.
+    """
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "I should "},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "say hello"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "Hi!"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}}
+        yield {"subtype": "success", "result": "Hi!"}
+
+    types = []
+    payloads = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        t, p = _parse_response_sse(line)
+        types.append(t)
+        payloads.append(p)
+
+    # Required event types in any order:
+    required = {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",      # reasoning + message (2 occurrences)
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_text.delta",
+        "response.reasoning_text.delta",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_text.done",
+        "response.reasoning_summary_part.done",
+        "response.output_item.done",       # reasoning + message (2 occurrences)
+        "response.content_part.added",
+        "response.output_text.delta",
+        "response.output_text.done",
+        "response.content_part.done",
+        "response.completed",
+    }
+    missing = required - set(types)
+    assert not missing, f"missing event types: {missing}"
+
+    # Ordering: reasoning output_item.added must be BEFORE message output_item.added
+    reasoning_added_idx = next(i for i, (t, p) in enumerate(zip(types, payloads))
+                               if t == "response.output_item.added" and p["item"]["type"] == "reasoning")
+    message_added_idx = next(i for i, (t, p) in enumerate(zip(types, payloads))
+                             if t == "response.output_item.added" and p["item"]["type"] == "message")
+    assert reasoning_added_idx < message_added_idx
+
+    # Reasoning done text equals concatenated thinking
+    summary_done = next(p for t, p in zip(types, payloads) if t == "response.reasoning_summary_text.done")
+    assert summary_done["text"] == "I should say hello"
+
+    # Text delta carried "Hi!"
+    text_delta = next(p for t, p in zip(types, payloads) if t == "response.output_text.delta")
+    assert text_delta["delta"] == "Hi!"
+
+    # Sequence_number monotonic across events
+    seqs = [p["sequence_number"] for p in payloads if "sequence_number" in p]
+    assert seqs == sorted(seqs)
+    assert len(set(seqs)) == len(seqs)
+
+    # Completed last
+    assert types[-1] == "response.completed"
