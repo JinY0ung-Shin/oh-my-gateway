@@ -70,6 +70,15 @@ class TestAdminChatPage:
         assert "questions = [argsObj]" in r.text
         assert "JSON.stringify(answersByQuestion)" in r.text
 
+    def test_admin_chat_page_renders_reasoning_stream_events(self, admin_client):
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "thinking-panel" in r.text
+        assert "response.reasoning_text.delta" in r.text
+        assert "response.reasoning_summary_text.delta" in r.text
+        assert "extractReasoningTexts" in r.text
+
     def test_admin_chat_page_serves_login_gate_to_unauthenticated_clients(self):
         """Anonymous GET /admin/chat should return 200 with the inline auth gate."""
         with patch.dict(os.environ, {"ADMIN_API_KEY": "test-key"}):

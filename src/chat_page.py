@@ -264,6 +264,45 @@ body::after {
   color: var(--amber);
   font-size: var(--fs-xs);
 }
+.thinking-panel {
+  margin-bottom: 0.4rem;
+  border: 1px solid var(--amber-dim);
+  background: var(--amber-subtle);
+}
+.thinking-panel summary {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 4px 8px;
+  cursor: pointer;
+  color: var(--amber);
+  font-size: var(--fs-xs);
+  list-style: none;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+.thinking-panel summary::-webkit-details-marker { display: none; }
+.thinking-panel summary::after {
+  content: '>';
+  margin-left: auto;
+  color: var(--amber-dim);
+  transition: transform 0.15s;
+}
+.thinking-panel[open] summary::after { transform: rotate(90deg); }
+.thinking-panel[open] summary { border-bottom: 1px solid var(--amber-dim); }
+.thinking-meta {
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.thinking-content {
+  padding: 6px 8px;
+  color: var(--text);
+  font-size: var(--fs-xs);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* Streaming cursor */
 .bubble .cursor {
@@ -857,10 +896,50 @@ function addStreamingMessage() {
   welcomeEl.style.display = 'none';
   const div = document.createElement('div');
   div.className = 'message assistant';
-  div.innerHTML = '<div class="role">assistant</div><div class="bubble"><span class="cursor"></span></div>';
+  div.innerHTML =
+    '<div class="role">assistant</div>' +
+    '<details class="thinking-panel" open style="display:none">' +
+    '<summary><span>THINKING</span><span class="thinking-meta"></span></summary>' +
+    '<div class="thinking-content"></div>' +
+    '</details>' +
+    '<div class="bubble"><span class="cursor"></span></div>';
   chatEl.appendChild(div);
   scrollToBottom();
   return div.querySelector('.bubble');
+}
+
+function updateThinkingPanel(messageEl, text) {
+  if (!messageEl) return;
+  const panel = messageEl.querySelector('.thinking-panel');
+  const content = messageEl.querySelector('.thinking-content');
+  const meta = messageEl.querySelector('.thinking-meta');
+  if (!panel || !content) return;
+  panel.style.display = 'block';
+  content.textContent = text || '(empty)';
+  if (meta) meta.textContent = String(text || '').length + ' chars';
+  scrollToBottom();
+}
+
+function extractReasoningTexts(response) {
+  const out = [];
+  const items = response && Array.isArray(response.output) ? response.output : [];
+  for (const item of items) {
+    if (!item || item.type !== 'reasoning') continue;
+    const parts = [];
+    if (Array.isArray(item.content)) {
+      for (const part of item.content) {
+        if (part && typeof part.text === 'string' && part.text) parts.push(part.text);
+      }
+    }
+    if (parts.length === 0 && Array.isArray(item.summary)) {
+      for (const part of item.summary) {
+        if (part && typeof part.text === 'string' && part.text) parts.push(part.text);
+      }
+    }
+    const text = parts.join('\n');
+    if (text) out.push(text);
+  }
+  return out;
 }
 
 function addToolEvent(badgeClass, badgeText, title, bodyContent) {
@@ -1054,7 +1133,11 @@ async function sendMessage() {
 async function streamRequest(body) {
   setStreaming(true);
   const bubble = addStreamingMessage();
+  const messageEl = bubble.closest('.message');
   let fullText = '';
+  let reasoningSummaryText = '';
+  let reasoningText = '';
+  let reasoningTextDeltaSeen = false;
   let responseId = null;
 
   try {
@@ -1112,6 +1195,20 @@ async function streamRequest(body) {
           fullText += evt.delta;
           bubble.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
           scrollToBottom();
+        }
+
+        // --- Reasoning / thinking delta ---
+        if (type === 'response.reasoning_summary_text.delta' && evt.delta && !reasoningTextDeltaSeen) {
+          reasoningSummaryText += evt.delta;
+          updateThinkingPanel(messageEl, reasoningSummaryText);
+        }
+        if (type === 'response.reasoning_text.delta' && evt.delta) {
+          if (!reasoningTextDeltaSeen) {
+            reasoningTextDeltaSeen = true;
+            reasoningText = '';
+          }
+          reasoningText += evt.delta;
+          updateThinkingPanel(messageEl, reasoningText);
         }
 
         // --- Tool use ---
@@ -1179,6 +1276,10 @@ async function streamRequest(body) {
         // --- response.completed ---
         if (type === 'response.completed' && evt.response) {
           if (evt.response.id) previousResponseId = evt.response.id;
+          const completedReasoning = extractReasoningTexts(evt.response);
+          if (completedReasoning.length && !reasoningText && !reasoningSummaryText) {
+            updateThinkingPanel(messageEl, completedReasoning.join('\n\n'));
+          }
           if (evt.response.usage) {
             const u = evt.response.usage;
             tokenInfo.textContent = 'IN: ' + (u.input_tokens || 0) + '  OUT: ' + (u.output_tokens || 0);
