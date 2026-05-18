@@ -247,6 +247,58 @@ def extract_thinking_texts(chunks: list) -> list[str]:
     return out
 
 
+def extract_visible_assistant_text(chunks: list) -> Optional[str]:
+    """Return the visible assistant text from SDK chunks, excluding thinking blocks.
+
+    Mirrors ``backend.parse_message()`` but the AssistantMessage-content path
+    skips ``ThinkingBlock`` entries instead of wrapping them in ``<think>...</think>``
+    markers. ``ResultMessage.result`` is preferred as-is (the SDK's final-text
+    field — we trust it to already be visible-only).
+    """
+    # First pass: prefer ResultMessage.result, as SDK collapses content to it.
+    result_text: Optional[str] = None
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if chunk.get("subtype") == "success" and "result" in chunk:
+            r = chunk["result"]
+            if r and r.strip():
+                result_text = r
+    if result_text is not None:
+        return result_text
+
+    # Second pass: walk content blocks, joining only non-thinking text.
+    parts: list[str] = []
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        content = chunk.get("content")
+        if not isinstance(content, list):
+            inner = chunk.get("message")
+            if isinstance(inner, dict):
+                content = inner.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            # Skip thinking blocks via either attribute or dict shape.
+            is_thinking = False
+            if hasattr(block, "thinking") and not hasattr(block, "text"):
+                is_thinking = True
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                is_thinking = True
+            if is_thinking:
+                continue
+            # Collect text blocks.
+            text: Optional[str] = None
+            if hasattr(block, "text"):
+                text = getattr(block, "text", None)
+            elif isinstance(block, dict) and block.get("type") == "text":
+                text = block.get("text")
+            if text:
+                parts.append(text)
+    return "\n".join(parts) if parts else None
+
+
 def resolve_token_usage(
     chunks: list,
     prompt: str,

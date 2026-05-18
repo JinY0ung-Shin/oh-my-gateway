@@ -1723,3 +1723,71 @@ async def test_stream_second_thinking_after_text_is_silently_dropped_not_leaked(
             for part in item.get("content", []):
                 assert "SECRET_REASONING" not in part.get("text", ""), \
                     f"Thinking leaked into completed message: {part!r}"
+
+
+class TestExtractVisibleAssistantText:
+    def test_prefers_result_message_when_present(self):
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "thinking", "thinking": "hidden reasoning"},
+                {"type": "text", "text": "the answer"},
+            ]},
+            {"subtype": "success", "result": "the answer"},
+        ]
+        assert extract_visible_assistant_text(chunks) == "the answer"
+
+    def test_falls_back_to_text_blocks_excluding_thinking(self):
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "thinking", "thinking": "hidden reasoning"},
+                {"type": "text", "text": "visible part 1"},
+                {"type": "thinking", "thinking": "more hidden"},
+                {"type": "text", "text": "visible part 2"},
+            ]},
+        ]
+        out = extract_visible_assistant_text(chunks)
+        assert "hidden reasoning" not in out
+        assert "more hidden" not in out
+        assert "visible part 1" in out
+        assert "visible part 2" in out
+
+    def test_returns_none_when_no_text_content(self):
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "thinking", "thinking": "only thinking"},
+            ]},
+        ]
+        assert extract_visible_assistant_text(chunks) is None
+
+    def test_preserves_literal_think_tags_in_text_blocks(self):
+        """A text block whose .text contains literal '<think>...</think>' must be preserved."""
+        from src.streaming_utils import extract_visible_assistant_text
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "text", "text": "use the <think>foo</think> tag for X"},
+            ]},
+        ]
+        assert extract_visible_assistant_text(chunks) == "use the <think>foo</think> tag for X"
+
+    def test_handles_object_blocks_with_attributes(self):
+        from src.streaming_utils import extract_visible_assistant_text
+
+        class _ThinkingBlock:
+            def __init__(self, t):
+                self.thinking = t
+
+        class _TextBlock:
+            def __init__(self, t):
+                self.text = t
+
+        chunks = [{"content": [_ThinkingBlock("hidden"), _TextBlock("visible")]}]
+        out = extract_visible_assistant_text(chunks)
+        assert "hidden" not in out
+        assert "visible" in out

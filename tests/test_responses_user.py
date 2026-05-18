@@ -403,32 +403,43 @@ def test_build_completed_response_no_thinking_texts_preserves_existing_shape():
     assert resp.output[0].content[0].text == "hello"
 
 
-def test_build_completed_response_strips_think_tags_from_message_text():
-    """Even if assistant_text contains <think>...</think> wrappers (from the
-    parse_message fallback), the message output_item must not include them.
-    Thinking content belongs only in the reasoning items."""
+def test_build_completed_response_preserves_literal_think_tags_in_assistant_text():
+    """If the visible model output legitimately contains '<think>' substrings
+    (e.g. tutorial text about XML tags), they MUST be preserved. Stripping is
+    not the right approach — visible text comes from non-thinking content blocks."""
     from src.routes.responses import _build_completed_response
 
-    raw_text = "<think>SECRET_REASONING</think>The answer is 42."
     resp = _build_completed_response(
-        "resp_1",
-        "m",
-        raw_text,
-        {},
+        response_id="resp_1",
+        model="m",
+        assistant_text="use the <think>foo</think> tag",
+        metadata={},
         output_tokens=1,
         input_tokens=1,
-        thinking_texts=["SECRET_REASONING"],
+        thinking_texts=None,
     )
+    msg = [it for it in resp.output if it.type == "message"][0]
+    assert msg.content[0].text == "use the <think>foo</think> tag"
 
-    # The reasoning item carries the thinking.
-    reasoning_items = [it for it in resp.output if it.type == "reasoning"]
-    assert reasoning_items and reasoning_items[0].summary[0].text == "SECRET_REASONING"
 
-    # The message item must NOT carry <think>...</think> or its inner content.
-    message_items = [it for it in resp.output if it.type == "message"]
-    assert message_items
-    msg_text = message_items[0].content[0].text
-    assert "<think>" not in msg_text
-    assert "</think>" not in msg_text
-    assert "SECRET_REASONING" not in msg_text
-    assert "The answer is 42." in msg_text
+def test_build_completed_response_uses_caller_supplied_visible_text():
+    """_build_completed_response is a pure assembler — visibility filtering is
+    the caller's job (extract_visible_assistant_text). The function must trust
+    its inputs and not strip anything from assistant_text."""
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        response_id="resp_1",
+        model="m",
+        assistant_text="the answer",
+        metadata={},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=["my reasoning"],
+    )
+    types = [it.type for it in resp.output]
+    assert types == ["reasoning", "message"]
+    reasoning = [it for it in resp.output if it.type == "reasoning"][0]
+    msg = [it for it in resp.output if it.type == "message"][0]
+    assert reasoning.summary[0].text == "my reasoning"
+    assert msg.content[0].text == "the answer"

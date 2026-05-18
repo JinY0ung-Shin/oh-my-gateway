@@ -5,7 +5,6 @@ import contextlib
 import inspect
 import json
 import logging
-import re
 import secrets
 import uuid
 from pathlib import Path
@@ -67,19 +66,6 @@ def _generate_msg_id() -> str:
 def _generate_rs_id() -> str:
     """Generate a reasoning output item ID: rs_<hex>."""
     return f"rs_{uuid.uuid4().hex[:24]}"
-
-
-_THINK_TAG_PATTERN = re.compile(r"<think>.*?</think>", flags=re.DOTALL)
-
-
-def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> wrappers (used by MessageAdapter for thinking
-    blocks) from rendered assistant text. Thinking belongs in reasoning items,
-    not in the message output_item's visible content.
-    """
-    if not text:
-        return text
-    return _THINK_TAG_PATTERN.sub("", text)
 
 
 def _make_response_id(session_id: str, turn: int) -> str:
@@ -208,7 +194,7 @@ def _build_failed_response(
 
 
 def _build_completed_response(
-    resp_id: str,
+    response_id: str,
     model: str,
     assistant_text: str,
     metadata: Optional[dict],
@@ -226,15 +212,14 @@ def _build_completed_response(
                 content=[ReasoningContent(text=t)],
             )
         )
-    visible_text = _strip_think_tags(assistant_text)
     output_items.append(
         OutputItem(
             id=_generate_msg_id(),
-            content=[ResponseContentPart(text=visible_text)],
+            content=[ResponseContentPart(text=assistant_text)],
         )
     )
     return ResponseObject(
-        id=resp_id,
+        id=response_id,
         status="completed",
         model=model,
         output=output_items,
@@ -1323,10 +1308,11 @@ async def create_response(
     # Build response object
     resp_id = _make_response_id(session_id, session.turn_counter)
 
+    visible_text = streaming_utils.extract_visible_assistant_text(chunks) or assistant_text
     response_obj = _build_completed_response(
         resp_id,
         body.model,
-        assistant_text,
+        visible_text,
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
@@ -1629,10 +1615,11 @@ async def _handle_function_call_output(
         chunks, "", assistant_text, body.model, backend=backend
     )
 
+    visible_text = streaming_utils.extract_visible_assistant_text(chunks) or assistant_text
     response_obj = _build_completed_response(
         resp_id,
         body.model,
-        assistant_text,
+        visible_text,
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
