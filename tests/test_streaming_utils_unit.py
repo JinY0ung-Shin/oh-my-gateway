@@ -1320,3 +1320,40 @@ async def test_stream_opens_reasoning_on_first_thinking_delta():
     assert added_payload["output_index"] == 0
     # reasoning_summary_part.added present
     assert "response.reasoning_summary_part.added" in types
+
+
+async def test_stream_emits_summary_and_reasoning_text_deltas_with_same_text():
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        for piece in ("abc", "def"):
+            yield {"type": "stream_event", "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": piece},
+            }}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    summary_deltas = [p for t, p in events if t == "response.reasoning_summary_text.delta"]
+    reasoning_deltas = [p for t, p in events if t == "response.reasoning_text.delta"]
+    assert [d["delta"] for d in summary_deltas] == ["abc", "def"]
+    assert [d["delta"] for d in reasoning_deltas] == ["abc", "def"]
+    assert all(d["output_index"] == 0 for d in summary_deltas + reasoning_deltas)
+    assert all(d["summary_index"] == 0 for d in summary_deltas)
+    assert all(d["content_index"] == 0 for d in reasoning_deltas)

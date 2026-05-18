@@ -780,8 +780,8 @@ async def stream_response_chunks(
                 # Open reasoning output_item on first thinking delta of a block.
                 if in_thinking and not was_thinking:
                     reasoning_item_id = _generate_rs_id()
-                    reasoning_open = True  # noqa: F841
-                    reasoning_text_buf = []  # noqa: F841
+                    reasoning_open = True
+                    reasoning_text_buf = []
                     reasoning_item = ReasoningOutputItem(
                         id=reasoning_item_id, status="in_progress"
                     )
@@ -804,10 +804,25 @@ async def stream_response_chunks(
                 if text_delta in ("<think>", "</think>"):
                     continue
 
-                # Skip the rest of this block while inside a thinking block —
-                # reasoning delta emission lands in Task 5; for now we just
-                # stop the message delta path from firing on thinking content.
-                if in_thinking:
+                # Inside a reasoning block: emit summary_text + reasoning_text deltas.
+                if reasoning_open and in_thinking:
+                    reasoning_text_buf.append(text_delta)
+                    yield make_response_sse(
+                        "response.reasoning_summary_text.delta",
+                        item_id=reasoning_item_id,
+                        output_index=output_index,
+                        summary_index=0,
+                        delta=text_delta,
+                        sequence_number=_next_seq(),
+                    )
+                    yield make_response_sse(
+                        "response.reasoning_text.delta",
+                        item_id=reasoning_item_id,
+                        output_index=output_index,
+                        content_index=0,
+                        delta=text_delta,
+                        sequence_number=_next_seq(),
+                    )
                     continue
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)
