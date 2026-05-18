@@ -1606,3 +1606,52 @@ async def test_full_reasoning_lifecycle_streaming():
 
     # Completed last
     assert types[-1] == "response.completed"
+
+
+@pytest.mark.asyncio
+async def test_response_completed_payload_includes_reasoning_items():
+    """response.completed.response.output must include reasoning items emitted earlier in the stream."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "reasoning..."},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "answer"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}}
+        yield {"subtype": "success", "result": "answer"}
+
+    completed_event = None
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        t, p = _parse_response_sse(line)
+        if t == "response.completed":
+            completed_event = p
+
+    assert completed_event is not None
+    output = completed_event["response"]["output"]
+    item_types = [item["type"] for item in output]
+    assert item_types == ["reasoning", "message"]
+    assert output[0]["summary"][0]["text"] == "reasoning..."
+    assert output[0]["content"][0]["text"] == "reasoning..."
+    assert output[1]["content"][0]["text"] == "answer"

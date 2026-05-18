@@ -609,6 +609,7 @@ async def stream_response_chunks(
     reasoning_item_id: Optional[str] = None
     reasoning_text_buf: list[str] = []
     thinking_seen = False
+    completed_reasoning_items: list[ReasoningOutputItem] = []
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -727,6 +728,7 @@ async def stream_response_chunks(
             summary=[ReasoningSummary(text=full_text)],
             content=[ReasoningContent(text=full_text)],
         )
+        completed_reasoning_items.append(item)
         lines = [
             make_response_sse(
                 "response.reasoning_summary_text.done",
@@ -1047,11 +1049,12 @@ async def stream_response_chunks(
         model=model,
         status="completed",
         output=[
+            *completed_reasoning_items,
             OutputItem(
                 id=output_item_id,
                 status="completed",
                 content=[ResponseContentPart(text=final_text)],
-            )
+            ),
         ],
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
