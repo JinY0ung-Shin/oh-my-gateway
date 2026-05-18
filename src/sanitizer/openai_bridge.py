@@ -289,7 +289,7 @@ class _StreamState:
     __slots__ = (
         "open_kind",
         "open_index",
-        "tool_block_index",
+        "pending_tool_calls",
         "model",
         "message_id",
         "input_tokens",
@@ -301,15 +301,32 @@ class _StreamState:
     def __init__(self, model: str) -> None:
         self.open_kind: Optional[str] = None  # "thinking" | "text" | tool_call_index (str)
         self.open_index: int = -1
-        # OpenAI tool_calls are keyed by their own ``index`` field; we map
-        # each to the Anthropic content-block index we assigned it.
-        self.tool_block_index: Dict[int, int] = {}
+        # OpenAI may stream multiple tool calls in parallel, with argument
+        # fragments interleaved by ``index``. Anthropic content blocks are
+        # contiguous, so we buffer each OpenAI tool call and flush it as one
+        # complete Anthropic block before ``message_delta``.
+        self.pending_tool_calls: Dict[int, _PendingToolCall] = {}
         self.model = model
         self.message_id = f"msg_{uuid.uuid4().hex[:24]}"
         self.input_tokens = 0
         self.output_tokens = 0
         self.finish_reason: Optional[str] = None
         self.started = False
+
+
+class _PendingToolCall:
+    __slots__ = ("id", "name", "argument_parts")
+
+    def __init__(self, call_id: Optional[str], name: Optional[str]) -> None:
+        self.id = call_id or f"toolu_{uuid.uuid4().hex[:24]}"
+        self.name = name or ""
+        self.argument_parts: List[str] = []
+
+    def update_metadata(self, call_id: Optional[str], name: Optional[str]) -> None:
+        if call_id:
+            self.id = call_id
+        if name:
+            self.name = name
 
 
 def _message_start_event(state: _StreamState) -> Dict[str, Any]:
@@ -345,6 +362,61 @@ def _open_block(state: _StreamState, kind: str, content_block: Dict[str, Any]) -
         "index": state.open_index,
         "content_block": content_block,
     }
+
+
+def _record_tool_call_delta(
+    state: _StreamState,
+    tc_index: int,
+    call_id: Optional[str],
+    name: Optional[str],
+    arguments: Optional[str],
+) -> None:
+    pending = state.pending_tool_calls.get(tc_index)
+    if pending is None:
+        pending = _PendingToolCall(call_id, name)
+        state.pending_tool_calls[tc_index] = pending
+    else:
+        pending.update_metadata(call_id, name)
+
+    if isinstance(arguments, str) and arguments:
+        pending.argument_parts.append(arguments)
+
+
+def _flush_tool_calls(state: _StreamState) -> List[Dict[str, Any]]:
+    """Emit buffered OpenAI tool calls as contiguous Anthropic blocks."""
+    if not state.pending_tool_calls:
+        return []
+
+    events: List[Dict[str, Any]] = []
+    if state.open_kind is not None:
+        events.append(_close_block(state))
+
+    for tc_index in sorted(state.pending_tool_calls):
+        pending = state.pending_tool_calls[tc_index]
+        events.append(
+            _open_block(
+                state,
+                f"tool:{tc_index}",
+                {
+                    "type": "tool_use",
+                    "id": pending.id,
+                    "name": pending.name,
+                    "input": {},
+                },
+            )
+        )
+        for arguments in pending.argument_parts:
+            events.append(
+                {
+                    "type": "content_block_delta",
+                    "index": state.open_index,
+                    "delta": {"type": "input_json_delta", "partial_json": arguments},
+                }
+            )
+        events.append(_close_block(state))
+
+    state.pending_tool_calls.clear()
+    return events
 
 
 async def openai_stream_to_anthropic_events(
@@ -394,6 +466,8 @@ async def openai_stream_to_anthropic_events(
         # as canonical and ignore the duplicate to avoid double-emitting.
         reasoning = delta.get("reasoning_content")
         if isinstance(reasoning, str) and reasoning:
+            for event in _flush_tool_calls(state):
+                yield event
             if state.open_kind != "thinking":
                 if state.open_kind is not None:
                     yield _close_block(state)
@@ -409,6 +483,8 @@ async def openai_stream_to_anthropic_events(
         # Plain assistant text.
         content = delta.get("content")
         if isinstance(content, str) and content:
+            for event in _flush_tool_calls(state):
+                yield event
             if state.open_kind != "text":
                 if state.open_kind is not None:
                     yield _close_block(state)
@@ -422,7 +498,8 @@ async def openai_stream_to_anthropic_events(
         # Tool calls. The OpenAI streaming protocol delivers each tool call
         # as a series of deltas keyed by the call's own ``index`` field —
         # the first occurrence carries ``id``/``name``, subsequent ones
-        # only append to ``arguments``.
+        # only append to ``arguments``. Buffer by index because parallel
+        # calls can interleave argument chunks, while Anthropic blocks cannot.
         tool_calls = delta.get("tool_calls") or []
         for tc in tool_calls:
             if not isinstance(tc, dict):
@@ -435,52 +512,7 @@ async def openai_stream_to_anthropic_events(
             tc_name = fn.get("name") if isinstance(fn, dict) else None
             tc_args = fn.get("arguments") if isinstance(fn, dict) else None
 
-            kind_key = f"tool:{tc_index}"
-
-            if tc_index not in state.tool_block_index:
-                # First time we see this tool call — open a new content block.
-                if state.open_kind is not None:
-                    yield _close_block(state)
-                yield _open_block(
-                    state,
-                    kind_key,
-                    {
-                        "type": "tool_use",
-                        "id": tc_id or f"toolu_{uuid.uuid4().hex[:24]}",
-                        "name": tc_name or "",
-                        "input": {},
-                    },
-                )
-                state.tool_block_index[tc_index] = state.open_index
-            else:
-                # Continuation of an existing tool call. Switch back to its
-                # block if a different block intervened (e.g. text mixed in).
-                target = state.tool_block_index[tc_index]
-                if state.open_index != target or state.open_kind != kind_key:
-                    if state.open_kind is not None:
-                        yield _close_block(state)
-                    # Re-open the same block — we can't "reopen" semantically,
-                    # so emit a fresh start with the same metadata if we have
-                    # to. In practice OpenAI never interleaves blocks, so this
-                    # branch is defensive only.
-                    yield _open_block(
-                        state,
-                        kind_key,
-                        {
-                            "type": "tool_use",
-                            "id": tc_id or f"toolu_{uuid.uuid4().hex[:24]}",
-                            "name": tc_name or "",
-                            "input": {},
-                        },
-                    )
-                    state.tool_block_index[tc_index] = state.open_index
-
-            if isinstance(tc_args, str) and tc_args:
-                yield {
-                    "type": "content_block_delta",
-                    "index": state.open_index,
-                    "delta": {"type": "input_json_delta", "partial_json": tc_args},
-                }
+            _record_tool_call_delta(state, tc_index, tc_id, tc_name, tc_args)
 
         fr = choice.get("finish_reason")
         if isinstance(fr, str) and fr:
@@ -492,6 +524,8 @@ async def openai_stream_to_anthropic_events(
         # so the SDK doesn't get a dangling response.
         yield _message_start_event(state)
         state.started = True
+    for event in _flush_tool_calls(state):
+        yield event
     if state.open_kind is not None:
         yield _close_block(state)
 

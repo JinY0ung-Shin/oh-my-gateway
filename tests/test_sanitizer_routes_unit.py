@@ -7,6 +7,7 @@ SSE stream is rewritten so block-type/delta-type pairs are consistent.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Iterable
 
 import httpx
@@ -184,6 +185,60 @@ def test_streaming_upstream_returns_json_error_is_passed_through_verbatim():
     assert resp.status_code == 404
     assert resp.headers["content-type"].startswith("application/json")
     assert resp.content == err_body
+
+
+def test_streaming_upstream_error_log_omits_response_body(caplog):
+    secret = "secret upstream prompt fragment"
+    err_body = json.dumps({"error": {"message": secret}}).encode()
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(500, headers={"content-type": "application/json"}, content=err_body)
+
+    app = _make_app(handler)
+    client = TestClient(app)
+
+    with caplog.at_level(logging.WARNING, logger="src.sanitizer.routes"):
+        resp = client.post(
+            "/v1/messages",
+            json={"model": "x", "stream": True, "messages": []},
+        )
+
+    assert resp.status_code == 500
+    assert secret in resp.text
+    assert "body_bytes=" in caplog.text
+    assert secret not in caplog.text
+
+
+def test_streaming_sanitizer_does_not_log_raw_sse_payload(caplog):
+    secret = "secret streamed assistant text"
+    events = [
+        {"type": "message_start", "message": {"id": "msg_1", "role": "assistant"}},
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": secret}},
+        {"type": "content_block_stop", "index": 0},
+        {"type": "message_stop"},
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=_sse_payload(events),
+        )
+
+    app = _make_app(handler)
+    client = TestClient(app)
+
+    with caplog.at_level(logging.WARNING, logger="src.sanitizer.routes"):
+        resp = client.post(
+            "/v1/messages",
+            json={"model": "x", "stream": True, "messages": []},
+        )
+
+    assert resp.status_code == 200
+    assert secret in resp.text
+    assert "raw upstream evt" not in caplog.text
+    assert secret not in caplog.text
 
 
 def test_verify_api_key_rejects_unauthorized_request(monkeypatch):
@@ -412,6 +467,40 @@ def test_bridge_streaming_translates_openai_to_anthropic(monkeypatch):
 
     md = next(e for e in events if e["type"] == "message_delta")
     assert md["delta"]["stop_reason"] == "tool_use"
+
+
+def test_bridge_request_log_omits_prompt_body(monkeypatch, caplog):
+    monkeypatch.setenv("SANITIZER_USE_OPENAI_BRIDGE", "true")
+    secret = "secret user prompt"
+
+    def handler(request: httpx.Request) -> httpx.Response:  # noqa: ARG001
+        chunks = [
+            {"choices": [{"delta": {"content": "ok"}}]},
+            {"choices": [{"delta": {}, "finish_reason": "stop"}]},
+        ]
+        body = "".join(f"data: {json.dumps(c)}\n\n" for c in chunks) + "data: [DONE]\n\n"
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=body.encode(),
+        )
+
+    app = _make_app(handler)
+    client = TestClient(app)
+
+    with caplog.at_level(logging.DEBUG, logger="src.sanitizer.routes"):
+        resp = client.post(
+            "/v1/messages",
+            json={
+                "model": "GaussO3.2-260402-vllm",
+                "stream": True,
+                "messages": [{"role": "user", "content": secret}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert "sanitizer bridge request:" in caplog.text
+    assert secret not in caplog.text
 
 
 def test_bridge_non_streaming_translates_response_body(monkeypatch):

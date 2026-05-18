@@ -111,10 +111,6 @@ async def _iter_sse_events(
                 logger.warning("sanitizer: skipping non-JSON SSE payload: %r", payload[:200])
                 continue
             if isinstance(evt, dict):
-                # TEMP DIAG: capture raw upstream events to keep verifying the
-                # zero-payload delta fix in production traffic. Remove once the
-                # behavior is fully confirmed.
-                logger.warning("sanitizer raw upstream evt: %s", json.dumps(evt, ensure_ascii=False)[:500])
                 yield evt
             continue
         if line.startswith("data:"):
@@ -128,7 +124,6 @@ async def _iter_sse_events(
         try:
             evt = json.loads(payload)
             if isinstance(evt, dict):
-                logger.warning("sanitizer raw upstream evt (trailing): %s", json.dumps(evt, ensure_ascii=False)[:500])
                 yield evt
         except json.JSONDecodeError:
             logger.warning("sanitizer: dropping trailing non-JSON SSE payload")
@@ -235,12 +230,12 @@ async def sanitize_messages(
         bridge_headers = dict(fwd_headers)
         bridge_headers["content-type"] = "application/json"
         upstream_url = f"{get_upstream_url()}/v1/chat/completions"
-        # TEMP DIAG: log the outgoing OpenAI body so we can diagnose 5xx
-        # responses from the upstream (LiteLLM/vLLM rejecting specific
-        # message shapes). Remove once the bridge is stable in production.
-        logger.warning(
-            "sanitizer bridge OpenAI request body: %s",
-            json.dumps(openai_body, ensure_ascii=False)[:4000],
+        logger.debug(
+            "sanitizer bridge request: upstream=%s stream=%s messages=%d tools=%d",
+            upstream_url,
+            bool(openai_body.get("stream")),
+            len(openai_body.get("messages") or []),
+            len(openai_body.get("tools") or []),
         )
         upstream_req = client.build_request(
             "POST",
@@ -302,14 +297,12 @@ async def sanitize_messages(
     if not upstream_ctype.lower().startswith("text/event-stream"):
         try:
             content = await upstream.aread()
-            # TEMP DIAG: surface upstream error bodies so 5xx responses can
-            # be diagnosed from a single log line instead of needing a tcpdump.
             if upstream.status_code >= 400:
                 logger.warning(
-                    "sanitizer upstream error %s ctype=%s body=%s",
+                    "sanitizer upstream error %s ctype=%s body_bytes=%d",
                     upstream.status_code,
                     upstream_ctype,
-                    (content[:2000].decode("utf-8", errors="replace") if content else "<empty>"),
+                    len(content),
                 )
             resp_headers = _filter_headers(upstream.headers.items(), _DROP_FROM_RESPONSE)
             return Response(

@@ -435,6 +435,72 @@ class TestStreamConversion:
         assert starts[1]["content_block"]["name"] == "ToolB"
         assert starts[1]["content_block"]["id"] == "call_b"
 
+    async def test_interleaved_parallel_tool_call_arguments_keep_metadata(self):
+        chunks = [
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_a",
+                                    "function": {"name": "ToolA", "arguments": ""},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_b",
+                                    "function": {"name": "ToolB", "arguments": ""},
+                                },
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": '{"a":'}},
+                                {"index": 1, "function": {"arguments": '{"b":'}},
+                            ]
+                        }
+                    }
+                ]
+            },
+            {
+                "choices": [
+                    {
+                        "delta": {
+                            "tool_calls": [
+                                {"index": 0, "function": {"arguments": "1}"}},
+                                {"index": 1, "function": {"arguments": "2}"}},
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }
+                ]
+            },
+        ]
+
+        out = await _collect(openai_stream_to_anthropic_events(_as_async(chunks), model="m"))
+        starts = [e for e in out if e["type"] == "content_block_start"]
+        assert [s["content_block"]["id"] for s in starts] == ["call_a", "call_b"]
+        assert [s["content_block"]["name"] for s in starts] == ["ToolA", "ToolB"]
+
+        args_by_index = {}
+        for start in starts:
+            idx = start["index"]
+            args_by_index[start["content_block"]["id"]] = "".join(
+                e["delta"]["partial_json"]
+                for e in out
+                if e["type"] == "content_block_delta"
+                and e["index"] == idx
+                and e["delta"]["type"] == "input_json_delta"
+            )
+        assert args_by_index == {"call_a": '{"a":1}', "call_b": '{"b":2}'}
+
 
 # ---------------------------------------------------------------------------
 # Non-streaming response: OpenAI body → Anthropic body
