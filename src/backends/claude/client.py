@@ -50,6 +50,10 @@ from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns
 from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
+from src.backends.claude.workspace_sandbox import (
+    make_workspace_sandbox_hook,
+    sandbox_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -743,14 +747,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             extra_env=extra_env,
             _custom_base=_custom_base,
         )
-        options.hooks = {
-            "PreToolUse": [
+        pre_tool_use = [
+            HookMatcher(
+                matcher="AskUserQuestion",
+                hooks=[self._make_ask_user_hook(session)],
+            )
+        ]
+        if cwd and sandbox_enabled():
+            pre_tool_use.append(
                 HookMatcher(
-                    matcher="AskUserQuestion",
-                    hooks=[self._make_ask_user_hook(session)],
+                    matcher="",
+                    hooks=[make_workspace_sandbox_hook(Path(cwd))],
                 )
-            ]
-        }
+            )
+        options.hooks = {"PreToolUse": pre_tool_use}
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
