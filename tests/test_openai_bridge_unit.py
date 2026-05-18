@@ -128,7 +128,12 @@ class TestRequestConversion:
             {"role": "tool", "tool_call_id": "tu_1", "content": "file1\nfile2"},
         ]
 
-    def test_assistant_message_with_only_tool_use_has_null_content(self):
+    def test_assistant_message_with_only_tool_use_has_empty_string_content(self):
+        # vLLM (via LiteLLM ``hosted_vllm``) rejects assistant messages whose
+        # ``content`` key is missing with a 422 "field required" — even when
+        # ``tool_calls`` is set. ``None`` round-trips through LiteLLM's
+        # pydantic ``exclude_none`` serialization as a missing key, so the
+        # bridge sends an empty string instead.
         body = {
             "model": "m",
             "messages": [
@@ -146,8 +151,12 @@ class TestRequestConversion:
             ],
         }
         out = anthropic_request_to_openai_body(body)
-        assert out["messages"][0]["content"] is None
-        assert "tool_calls" in out["messages"][0]
+        msg = out["messages"][0]
+        assert "content" in msg
+        assert msg["content"] == ""
+        assert "tool_calls" in msg
+        # The whole point of this test: the key survives JSON round-trip.
+        assert "content" in json.loads(json.dumps(msg))
 
     def test_tool_result_structured_content_flattened(self):
         body = {

@@ -116,9 +116,13 @@ def _convert_assistant_message(content: Any) -> Dict[str, Any]:
             # ``thinking`` and any unknown block types are dropped.
 
     msg: Dict[str, Any] = {"role": "assistant"}
-    # OpenAI requires content to be present even when tool_calls are set;
-    # ``None`` is the conventional empty placeholder accepted by vLLM/OpenAI.
-    msg["content"] = "".join(text_parts) if text_parts else None
+    # OpenAI requires ``content`` to be present even when ``tool_calls`` is
+    # set. ``null`` is allowed in spec but the LiteLLM ``hosted_vllm`` adapter
+    # serializes assistant messages through a Pydantic model that drops the
+    # key entirely when the value is ``None``; vLLM then rejects the request
+    # with a 422 "content field required". An empty string survives that
+    # round-trip and is equally valid under the OpenAI schema.
+    msg["content"] = "".join(text_parts) if text_parts else ""
     if tool_calls:
         msg["tool_calls"] = tool_calls
     return msg
