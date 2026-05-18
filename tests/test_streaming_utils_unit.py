@@ -1657,6 +1657,49 @@ async def test_response_completed_payload_includes_reasoning_items():
     assert output[1]["content"][0]["text"] == "answer"
 
 
+@pytest.mark.asyncio
+async def test_stream_result_captures_thinking_texts_for_session_history():
+    """The route uses stream_result to persist thinking in admin session history."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "reasoning..."},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "answer"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}}
+
+    stream_result = {}
+    async for _ in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+        stream_result=stream_result,
+    ):
+        pass
+
+    assert stream_result["success"] is True
+    assert stream_result["assistant_text"] == "answer"
+    assert stream_result["thinking_texts"] == ["reasoning..."]
+
+
 async def test_stream_second_thinking_after_text_is_silently_dropped_not_leaked():
     """text → thinking → text: the second thinking must not leak into output_text.delta
     or into response.completed.response.output."""

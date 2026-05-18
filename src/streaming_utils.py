@@ -666,6 +666,8 @@ async def stream_response_chunks(
     reasoning_item_id: Optional[str] = None
     reasoning_text_buf: list[str] = []
     thinking_seen = False
+    thinking_texts: list[str] = []
+    thinking_capture_buf: list[str] = []
     completed_reasoning_items: list[ReasoningOutputItem] = []
     _metadata = metadata or {}
     if stream_result is None:
@@ -772,6 +774,13 @@ async def stream_response_chunks(
             logprobs=[],
             sequence_number=_next_seq(),
         )
+
+    def _close_thinking_capture() -> None:
+        nonlocal thinking_capture_buf
+        full_text = "".join(thinking_capture_buf)
+        if full_text:
+            thinking_texts.append(full_text)
+        thinking_capture_buf = []
 
     def _close_reasoning() -> list[str]:
         """Emit the four close events for the open reasoning item, bump output_index."""
@@ -922,13 +931,19 @@ async def stream_response_chunks(
                 # arrives (content_block_stop while in_thinking), close the
                 # reasoning item immediately so any new thinking block that
                 # follows gets a fresh output_index.
-                if text_delta in ("<think>", "</think>"):
-                    if text_delta == "</think>" and reasoning_open:
+                if text_delta == "<think>":
+                    _close_thinking_capture()
+                    continue
+                if text_delta == "</think>":
+                    _close_thinking_capture()
+                    if reasoning_open:
                         for line in _close_reasoning():
                             yield line
                     continue
 
                 # Inside a reasoning block: emit summary_text + reasoning_text deltas.
+                if in_thinking:
+                    thinking_capture_buf.append(text_delta)
                 if reasoning_open and in_thinking:
                     reasoning_text_buf.append(text_delta)
                     yield make_response_sse(
@@ -1057,6 +1072,7 @@ async def stream_response_chunks(
         return
 
     # Close reasoning if it's still open (stream ended without exiting thinking).
+    _close_thinking_capture()
     if reasoning_open:
         for line in _close_reasoning():
             yield line
@@ -1126,6 +1142,7 @@ async def stream_response_chunks(
     )
     stream_result["success"] = True
     stream_result["assistant_text"] = final_text
+    stream_result["thinking_texts"] = thinking_texts
     yield make_response_sse(
         "response.completed", response_obj=final_resp, sequence_number=_next_seq()
     )

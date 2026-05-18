@@ -364,11 +364,20 @@ def get_session_messages(
     for idx, msg in enumerate(messages):
         content = msg.content
         display = str(content) if content else ""
+        thinking = [str(text) for text in getattr(msg, "thinking", []) if text]
 
         truncated = False
         if truncate > 0 and len(display) > truncate:
             display = display[:truncate]
             truncated = True
+        thinking_truncated = False
+        display_thinking: List[str] = []
+        for text in thinking:
+            if truncate > 0 and len(text) > truncate:
+                display_thinking.append(text[:truncate])
+                thinking_truncated = True
+            else:
+                display_thinking.append(text)
 
         result.append(
             {
@@ -376,6 +385,8 @@ def get_session_messages(
                 "role": msg.role,
                 "content": display,
                 "truncated": truncated,
+                "thinking": display_thinking,
+                "thinking_truncated": thinking_truncated,
                 "name": msg.name,
             }
         )
@@ -640,8 +651,12 @@ def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
     for msg in session.get_all_messages():
         content = msg.content
         display = str(content) if content else ""
+        thinking = [str(text) for text in getattr(msg, "thinking", []) if text]
 
-        messages.append({"role": msg.role, "content": display, "name": msg.name})
+        item = {"role": msg.role, "content": display, "name": msg.name}
+        if thinking:
+            item["thinking"] = thinking
+        messages.append(item)
 
     return {
         "session_id": session.session_id,

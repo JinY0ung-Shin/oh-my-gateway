@@ -41,6 +41,12 @@ class TestMessage:
         msg = Message(role="user", content="Hello", name="alice")
         assert msg.name == "alice"
 
+    def test_message_with_thinking(self):
+        """Assistant messages can carry hidden thinking for admin display."""
+        msg = Message(role="assistant", content="Answer", thinking=["Reasoning"])
+        assert msg.content == "Answer"
+        assert msg.thinking == ["Reasoning"]
+
     def test_message_normalizes_array_content(self):
         """Array content is normalized to string."""
         content_parts = [

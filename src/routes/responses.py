@@ -231,6 +231,27 @@ def _build_completed_response(
     )
 
 
+def _split_assistant_text_and_thinking(
+    chunks: list,
+    fallback_text: Optional[str],
+) -> tuple[str, List[str]]:
+    thinking_texts = streaming_utils.extract_thinking_texts(chunks)
+    visible_text = streaming_utils.extract_visible_assistant_text(chunks)
+    if visible_text is None:
+        visible_text = "" if thinking_texts else (fallback_text or "")
+    return visible_text, thinking_texts
+
+
+def _build_session_assistant_message(
+    visible_text: str,
+    thinking_texts: Optional[List[str]] = None,
+) -> Optional[Message]:
+    non_empty_thinking = [text for text in thinking_texts or [] if text]
+    if not visible_text and not non_empty_thinking:
+        return None
+    return Message(role="assistant", content=visible_text, thinking=non_empty_thinking)
+
+
 async def _disconnect_session_client(session, reason: str, client=None) -> None:
     """Drop and disconnect a persistent SDK client after stream failure/cancel."""
     if client is None:
@@ -1177,12 +1198,14 @@ async def create_response(
                 elif stream_result.get("success"):
                     # SUCCESS-ONLY: commit turn counter and session messages.
                     assistant_text = stream_result.get("assistant_text") or ""
-                    if assistant_text:
+                    assistant_message = _build_session_assistant_message(
+                        assistant_text,
+                        stream_result.get("thinking_texts"),
+                    )
+                    if assistant_message is not None:
                         session.turn_counter = next_turn
                         session.add_messages([Message(role="user", content=prompt)])
-                        session_manager.add_assistant_response(
-                            session_id, Message(role="assistant", content=assistant_text)
-                        )
+                        session_manager.add_assistant_response(session_id, assistant_message)
 
             except Exception as e:
                 logger.error("Responses API Stream: setup error: %s", e, exc_info=True)
@@ -1272,16 +1295,18 @@ async def create_response(
                 ).model_dump()
 
             # Extract assistant text
-            assistant_text = backend.parse_message(chunks)
-            if not assistant_text:
+            assistant_text = backend.parse_message(chunks) or ""
+            visible_text, thinking_texts = _split_assistant_text_and_thinking(
+                chunks, assistant_text
+            )
+            assistant_message = _build_session_assistant_message(visible_text, thinking_texts)
+            if assistant_message is None:
                 raise HTTPException(status_code=502, detail="No response from backend")
 
             # SUCCESS-ONLY: commit turn counter and session messages
             session.turn_counter = pf.next_turn
             session.add_messages([Message(role="user", content=prompt)])
-            session_manager.add_assistant_response(
-                session_id, Message(role="assistant", content=assistant_text)
-            )
+            session_manager.add_assistant_response(session_id, assistant_message)
 
     except HTTPException:
         if active_client is not None:
@@ -1301,14 +1326,14 @@ async def create_response(
         raise HTTPException(status_code=502, detail="Backend error") from e
 
     # Token usage (prefer real SDK values)
+    usage_text = assistant_text or visible_text or "\n".join(thinking_texts)
     prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
-        chunks, prompt, assistant_text, body.model, backend=backend
+        chunks, prompt, usage_text, body.model, backend=backend
     )
 
     # Build response object
     resp_id = _make_response_id(session_id, session.turn_counter)
 
-    visible_text = streaming_utils.extract_visible_assistant_text(chunks) or assistant_text
     response_obj = _build_completed_response(
         resp_id,
         body.model,
@@ -1316,7 +1341,7 @@ async def create_response(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
-        thinking_texts=streaming_utils.extract_thinking_texts(chunks),
+        thinking_texts=thinking_texts,
     )
 
     try:
@@ -1513,12 +1538,13 @@ async def _handle_function_call_output(
                     stream_result["success"] = True
                 elif stream_result.get("success"):
                     assistant_text = stream_result.get("assistant_text") or ""
-                    if assistant_text:
+                    assistant_message = _build_session_assistant_message(
+                        assistant_text,
+                        stream_result.get("thinking_texts"),
+                    )
+                    if assistant_message is not None:
                         session.turn_counter = next_turn
-                        session_manager.add_assistant_response(
-                            session_id,
-                            Message(role="assistant", content=assistant_text),
-                        )
+                        session_manager.add_assistant_response(session_id, assistant_message)
 
             except Exception as e:
                 logger.error("Responses API Stream: continuation error: %s", e, exc_info=True)
@@ -1595,14 +1621,14 @@ async def _handle_function_call_output(
                 error_msg = chunk.get("error_message", "Unknown backend error")
                 raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
 
-        assistant_text = backend.parse_message(chunks)
-        if not assistant_text:
+        assistant_text = backend.parse_message(chunks) or ""
+        visible_text, thinking_texts = _split_assistant_text_and_thinking(chunks, assistant_text)
+        assistant_message = _build_session_assistant_message(visible_text, thinking_texts)
+        if assistant_message is None:
             raise HTTPException(status_code=502, detail="No response from backend")
 
         session.turn_counter = next_turn
-        session_manager.add_assistant_response(
-            session_id, Message(role="assistant", content=assistant_text)
-        )
+        session_manager.add_assistant_response(session_id, assistant_message)
         continuation_success = True
     finally:
         if not continuation_success:
@@ -1611,11 +1637,11 @@ async def _handle_function_call_output(
             )
         session.lock.release()
 
+    usage_text = assistant_text or visible_text or "\n".join(thinking_texts)
     prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
-        chunks, "", assistant_text, body.model, backend=backend
+        chunks, "", usage_text, body.model, backend=backend
     )
 
-    visible_text = streaming_utils.extract_visible_assistant_text(chunks) or assistant_text
     response_obj = _build_completed_response(
         resp_id,
         body.model,
@@ -1623,7 +1649,7 @@ async def _handle_function_call_output(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
-        thinking_texts=streaming_utils.extract_thinking_texts(chunks),
+        thinking_texts=thinking_texts,
     )
 
     try:

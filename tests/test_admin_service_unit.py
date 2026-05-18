@@ -429,7 +429,34 @@ class TestGetSessionMessages:
             assert result[0]["index"] == 0
             assert result[1]["role"] == "assistant"
             assert result[1]["content"] == "Hi there!"
+            assert result[1]["thinking"] == []
             assert result[1]["index"] == 1
+        finally:
+            session_manager.delete_session(sid)
+
+    def test_returns_assistant_thinking(self):
+        """Assistant thinking is returned separately from visible content."""
+        from src.session_manager import session_manager
+        from src.models import Message
+
+        sid = "test-admin-history-thinking"
+        try:
+            session = session_manager.get_or_create_session(sid)
+            session.add_messages(
+                [
+                    Message(
+                        role="assistant",
+                        content="Visible answer",
+                        thinking=["Hidden reasoning"],
+                    )
+                ]
+            )
+
+            result = get_session_messages(sid)
+            assert result is not None
+            assert result[0]["content"] == "Visible answer"
+            assert result[0]["thinking"] == ["Hidden reasoning"]
+            assert result[0]["thinking_truncated"] is False
         finally:
             session_manager.delete_session(sid)
 
@@ -442,17 +469,24 @@ class TestGetSessionMessages:
         try:
             session = session_manager.get_or_create_session(sid)
             long_msg = "x" * 1000
-            session.add_messages([Message(role="user", content=long_msg)])
+            long_thinking = "y" * 1000
+            session.add_messages(
+                [Message(role="assistant", content=long_msg, thinking=[long_thinking])]
+            )
 
             result = get_session_messages(sid, truncate=100)
             assert result is not None
             assert len(result[0]["content"]) == 100
             assert result[0]["truncated"] is True
+            assert len(result[0]["thinking"][0]) == 100
+            assert result[0]["thinking_truncated"] is True
 
             # No truncation
             result_full = get_session_messages(sid, truncate=0)
             assert len(result_full[0]["content"]) == 1000
             assert result_full[0]["truncated"] is False
+            assert len(result_full[0]["thinking"][0]) == 1000
+            assert result_full[0]["thinking_truncated"] is False
         finally:
             session_manager.delete_session(sid)
 

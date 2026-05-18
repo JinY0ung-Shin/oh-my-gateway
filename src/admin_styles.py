@@ -641,6 +641,22 @@ details.config-section .config-body { padding: var(--gap-lg); }
   text-transform: uppercase;
   letter-spacing: 0.1em;
 }
+.msg-thinking {
+  margin: 4px 0 8px;
+  padding: 6px 8px;
+  border-left: 2px solid var(--amber);
+  background: rgba(255, 184, 77, 0.08);
+}
+.msg-thinking-label {
+  margin-bottom: 4px;
+  color: var(--amber);
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+}
+.msg-thinking-text {
+  color: var(--text-bright);
+}
 
 /* === Read-only Editor === */
 .readonly-editor {

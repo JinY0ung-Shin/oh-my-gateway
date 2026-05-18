@@ -2035,6 +2035,41 @@ def test_create_response_non_streaming_success_uses_array_system_prompt(isolated
     assert [message.content for message in session.messages] == ["Hi", "Responses answer"]
 
 
+def test_create_response_non_streaming_commits_visible_text_and_thinking(
+    isolated_session_manager,
+):
+    async def fake_run_with_client(client, prompt, session):
+        yield {
+            "content": [
+                {"type": "thinking", "thinking": "hidden reasoning"},
+                {"type": "text", "text": "visible answer"},
+            ]
+        }
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.run_completion_with_client = fake_run_with_client
+        mock_cli.parse_message.return_value = "<think>hidden reasoning</think>visible answer"
+
+        response = client.post(
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "Hi"},
+        )
+
+    body = response.json()
+    session_id, _ = main._parse_response_id(body["id"])
+    session = isolated_session_manager.get_session(session_id)
+
+    assert response.status_code == 200
+    assert [item["type"] for item in body["output"]] == ["reasoning", "message"]
+    assert body["output"][0]["content"][0]["text"] == "hidden reasoning"
+    assert body["output"][1]["content"][0]["text"] == "visible answer"
+    assert session.messages[-1].content == "visible answer"
+    assert session.messages[-1].thinking == ["hidden reasoning"]
+
+
 def test_create_response_rejects_invalid_or_future_previous_response_ids(isolated_session_manager):
     existing_session_id = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
     session = isolated_session_manager.get_or_create_session(existing_session_id)
@@ -2241,6 +2276,46 @@ def test_create_response_streaming_success_commits_session_state(isolated_sessio
         "Stream this",
         "streamed assistant",
     ]
+
+
+def test_create_response_streaming_success_commits_thinking_to_session_state(
+    isolated_session_manager,
+):
+    def fake_run_with_client(client, prompt, session):
+        async def empty_source():
+            if False:
+                yield None
+
+        return empty_source()
+
+    async def fake_stream_response_chunks(**kwargs):
+        kwargs["stream_result"]["success"] = True
+        kwargs["stream_result"]["assistant_text"] = "visible answer"
+        kwargs["stream_result"]["thinking_texts"] = ["hidden reasoning"]
+        yield 'event: response.created\ndata: {"type":"response.created","sequence_number":0}\n\n'
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(
+            main.streaming_utils, "stream_response_chunks", new=fake_stream_response_chunks
+        ),
+    ):
+        mock_cli.run_completion_with_client = fake_run_with_client
+
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "Stream this", "stream": True},
+        ) as response:
+            body = "".join(response.iter_text())
+
+    session = next(iter(isolated_session_manager.sessions.values()))
+
+    assert response.status_code == 200
+    assert "response.created" in body
+    assert session.messages[-1].content == "visible answer"
+    assert session.messages[-1].thinking == ["hidden reasoning"]
 
 
 def test_create_response_streaming_empty_result_emits_failed_event(isolated_session_manager):

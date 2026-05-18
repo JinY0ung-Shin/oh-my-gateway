@@ -69,8 +69,16 @@ def get_sessions_html() -> str:
                 <div class="msg-role"
                   :class="m.role === 'user' ? 'text-info' : m.role === 'assistant' ? 'text-success' : 'text-warning'"
                   x-text="m.role.toUpperCase() + (m.name ? ' (' + m.name + ')' : '')"></div>
+                <template x-if="(m.thinking ?? []).length > 0">
+                  <div class="msg-thinking">
+                    <div class="msg-thinking-label">THINKING</div>
+                    <template x-for="(t, i) in m.thinking" :key="i">
+                      <div class="msg-thinking-text" x-text="t"></div>
+                    </template>
+                  </div>
+                </template>
                 <div x-text="m.content || '(empty)'"></div>
-                <span x-show="m.truncated" class="text-xs" style="cursor:pointer; color:var(--cyan)"
+                <span x-show="m.truncated || m.thinking_truncated" class="text-xs" style="cursor:pointer; color:var(--cyan)"
                   @click.stop="loadFullMessage(expandedSession, m.index)">[...truncated — click to expand]</span>
               </div>
             </template>

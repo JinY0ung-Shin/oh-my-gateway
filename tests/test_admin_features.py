@@ -215,7 +215,9 @@ class TestSessionDetail:
         session = session_manager.get_or_create_session("export-test")
         session.backend = "claude"
         session.add_messages([Message(role="user", content="hello")])
-        session.add_messages([Message(role="assistant", content="hi there")])
+        session.add_messages(
+            [Message(role="assistant", content="hi there", thinking=["plan"])]
+        )
 
         data = export_session_json("export-test")
         assert data is not None
@@ -224,6 +226,7 @@ class TestSessionDetail:
         assert len(data["messages"]) == 2
         assert data["messages"][0]["role"] == "user"
         assert data["messages"][0]["content"] == "hello"
+        assert data["messages"][1]["thinking"] == ["plan"]
 
 
 # ---------------------------------------------------------------------------

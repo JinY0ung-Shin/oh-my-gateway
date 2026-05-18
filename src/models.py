@@ -1,5 +1,5 @@
 from typing import Literal
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, Field, model_validator
 from datetime import datetime
 
 
@@ -7,6 +7,7 @@ class Message(BaseModel):
     role: Literal["system", "user", "assistant"]
     content: str | list
     name: str | None = None
+    thinking: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def normalize_content(self):
