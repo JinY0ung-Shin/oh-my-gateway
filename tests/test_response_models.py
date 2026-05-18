@@ -137,3 +137,49 @@ def test_response_create_request_accepts_unknown_part_type_as_dict():
     assert isinstance(unknown_part, dict)
     assert unknown_part["type"] == "input_file"
     assert unknown_part["file_id"] == "file_abc123"
+
+
+def test_reasoning_output_item_serializes_per_openai_spec():
+    from src.response_models import (
+        ReasoningOutputItem,
+        ReasoningSummary,
+        ReasoningContent,
+    )
+
+    item = ReasoningOutputItem(
+        id="rs_abc",
+        summary=[ReasoningSummary(text="thinking...")],
+        content=[ReasoningContent(text="thinking...")],
+    )
+    dumped = item.model_dump(mode="json", exclude_none=True)
+    assert dumped == {
+        "id": "rs_abc",
+        "type": "reasoning",
+        "status": "completed",
+        "summary": [{"type": "summary_text", "text": "thinking..."}],
+        "content": [{"type": "reasoning_text", "text": "thinking..."}],
+    }
+
+
+def test_response_object_accepts_reasoning_in_output():
+    from src.response_models import (
+        ResponseObject,
+        OutputItem,
+        ReasoningOutputItem,
+        ReasoningSummary,
+    )
+
+    resp = ResponseObject(
+        id="resp_1",
+        model="m",
+        output=[
+            ReasoningOutputItem(
+                id="rs_1",
+                summary=[ReasoningSummary(text="x")],
+            ),
+            OutputItem(id="msg_1"),
+        ],
+    )
+    items = resp.model_dump(mode="json", exclude_none=True)["output"]
+    assert items[0]["type"] == "reasoning"
+    assert items[1]["type"] == "message"
