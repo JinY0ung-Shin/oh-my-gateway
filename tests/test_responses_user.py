@@ -366,3 +366,38 @@ class TestUserSessionBinding:
             call(existing_session_id),
         ]
         assert create_calls[0]["cwd"] == "/tmp/ws/alice/codex"
+
+
+def test_build_completed_response_prepends_reasoning_items_per_thinking_block():
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        "resp_1",
+        "m",
+        "hi",
+        {},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=["first thought", "second thought"],
+    )
+    assert [item.type for item in resp.output] == ["reasoning", "reasoning", "message"]
+    r0, r1, msg = resp.output
+    assert r0.summary[0].text == "first thought"
+    assert r0.content[0].text == "first thought"
+    assert r1.summary[0].text == "second thought"
+    assert msg.content[0].text == "hi"
+
+
+def test_build_completed_response_no_thinking_texts_preserves_existing_shape():
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        "resp_1",
+        "m",
+        "hello",
+        {},
+        output_tokens=1,
+        input_tokens=1,
+    )
+    assert [item.type for item in resp.output] == ["message"]
+    assert resp.output[0].content[0].text == "hello"

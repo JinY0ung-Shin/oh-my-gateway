@@ -8,7 +8,7 @@ import logging
 import secrets
 import uuid
 from pathlib import Path
-from typing import Optional, Dict, Any, cast
+from typing import Optional, Dict, Any, List, cast
 
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
@@ -33,6 +33,9 @@ from src.response_models import (
     FunctionCallOutputItem,
     ResponseObject,
     OutputItem,
+    ReasoningContent,
+    ReasoningOutputItem,
+    ReasoningSummary,
     ResponseUsage,
 )
 from src.rate_limiter import rate_limit_endpoint
@@ -58,6 +61,11 @@ NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_MS / 1000
 def _generate_msg_id() -> str:
     """Generate an output item ID: msg_<hex>."""
     return f"msg_{secrets.token_hex(12)}"
+
+
+def _generate_rs_id() -> str:
+    """Generate a reasoning output item ID: rs_<hex>."""
+    return f"rs_{uuid.uuid4().hex[:24]}"
 
 
 def _make_response_id(session_id: str, turn: int) -> str:
@@ -193,17 +201,28 @@ def _build_completed_response(
     *,
     input_tokens: int,
     output_tokens: int,
+    thinking_texts: Optional[List[str]] = None,
 ) -> ResponseObject:
+    output_items: List[Any] = []
+    for t in thinking_texts or []:
+        output_items.append(
+            ReasoningOutputItem(
+                id=_generate_rs_id(),
+                summary=[ReasoningSummary(text=t)],
+                content=[ReasoningContent(text=t)],
+            )
+        )
+    output_items.append(
+        OutputItem(
+            id=_generate_msg_id(),
+            content=[ResponseContentPart(text=assistant_text)],
+        )
+    )
     return ResponseObject(
         id=resp_id,
         status="completed",
         model=model,
-        output=[
-            OutputItem(
-                id=_generate_msg_id(),
-                content=[ResponseContentPart(text=assistant_text)],
-            )
-        ],
+        output=output_items,
         usage=ResponseUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
@@ -1296,6 +1315,7 @@ async def create_response(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
+        thinking_texts=streaming_utils.extract_thinking_texts(chunks),
     )
 
     try:
@@ -1601,6 +1621,7 @@ async def _handle_function_call_output(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
+        thinking_texts=streaming_utils.extract_thinking_texts(chunks),
     )
 
     try:
