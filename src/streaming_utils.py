@@ -221,6 +221,29 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     return None
 
 
+def extract_thinking_texts(chunks: list) -> list[str]:
+    """Return thinking-block texts in the order they appear in the chunk list.
+
+    Walks ``assistant`` chunks and pulls out every ``ThinkingBlock``'s text.
+    Tolerates both SDK dataclass objects (``block.thinking``) and dict form
+    (``{"type": "thinking", "thinking": "..."}``).
+    """
+    out: list[str] = []
+    for chunk in chunks:
+        content = chunk.get("content") if isinstance(chunk, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            text = None
+            if hasattr(block, "thinking"):
+                text = getattr(block, "thinking", None)
+            elif isinstance(block, dict) and block.get("type") == "thinking":
+                text = block.get("thinking")
+            if text:
+                out.append(text)
+    return out
+
+
 def resolve_token_usage(
     chunks: list,
     prompt: str,

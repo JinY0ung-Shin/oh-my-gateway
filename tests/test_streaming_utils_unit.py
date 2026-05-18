@@ -1213,3 +1213,33 @@ class TestBridgeSSEStream:
         lines = [line async for line in bridge_sse_stream(empty_source(), cs)]
         assert lines == []
         assert cs.closed is True
+
+
+class TestExtractThinkingTexts:
+    def test_returns_thinking_block_text_in_order(self):
+        from src.streaming_utils import extract_thinking_texts
+
+        chunks = [
+            {"type": "assistant", "content": [
+                {"type": "thinking", "thinking": "first"},
+                {"type": "text", "text": "hi"},
+                {"type": "thinking", "thinking": "second"},
+            ]},
+        ]
+        assert extract_thinking_texts(chunks) == ["first", "second"]
+
+    def test_returns_empty_when_no_thinking(self):
+        from src.streaming_utils import extract_thinking_texts
+
+        chunks = [{"type": "assistant", "content": [{"type": "text", "text": "hi"}]}]
+        assert extract_thinking_texts(chunks) == []
+
+    def test_handles_object_blocks_with_attributes(self):
+        from src.streaming_utils import extract_thinking_texts
+
+        class _ThinkingBlock:
+            def __init__(self, t):
+                self.thinking = t
+
+        chunks = [{"content": [_ThinkingBlock("hidden")]}]
+        assert extract_thinking_texts(chunks) == ["hidden"]
