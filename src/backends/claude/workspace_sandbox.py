@@ -47,7 +47,7 @@ def _env_flag(name: str, default: bool) -> bool:
 
 
 def sandbox_enabled() -> bool:
-    return _env_flag("WORKSPACE_SANDBOX_ENABLED", True)
+    return _env_flag("WORKSPACE_SANDBOX_ENABLED", False)
 
 
 def _allow_outside() -> Set[str]:

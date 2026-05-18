@@ -41,9 +41,9 @@ def _is_deny(result: dict) -> bool:
 
 
 class TestEnabledFlag:
-    def test_default_enabled(self, monkeypatch):
+    def test_default_disabled(self, monkeypatch):
         monkeypatch.delenv("WORKSPACE_SANDBOX_ENABLED", raising=False)
-        assert sandbox_enabled() is True
+        assert sandbox_enabled() is False
 
     @pytest.mark.parametrize("value", ["false", "0", "no", "off", "FALSE"])
     def test_explicit_disable(self, monkeypatch, value):
