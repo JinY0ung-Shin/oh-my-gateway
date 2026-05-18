@@ -780,8 +780,8 @@ async def stream_response_chunks(
                 # Open reasoning output_item on first thinking delta of a block.
                 if in_thinking and not was_thinking:
                     reasoning_item_id = _generate_rs_id()
-                    reasoning_open = True
-                    reasoning_text_buf = []
+                    reasoning_open = True  # noqa: F841
+                    reasoning_text_buf = []  # noqa: F841
                     reasoning_item = ReasoningOutputItem(
                         id=reasoning_item_id, status="in_progress"
                     )
