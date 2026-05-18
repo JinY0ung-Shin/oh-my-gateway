@@ -12,7 +12,9 @@ from src.message_adapter import MessageAdapter
 from src.response_models import (
     ResponseContentPart,
     OutputItem,
+    ReasoningContent,
     ReasoningOutputItem,
+    ReasoningSummary,
     ResponseErrorDetail,
     ResponseObject,
     ResponseUsage,
@@ -712,6 +714,56 @@ async def stream_response_chunks(
             sequence_number=_next_seq(),
         )
 
+    def _close_reasoning() -> list[str]:
+        """Emit the four close events for the open reasoning item, bump output_index."""
+        nonlocal reasoning_open, reasoning_item_id, reasoning_text_buf, output_index
+        if not reasoning_open:
+            return []
+        full_text = "".join(reasoning_text_buf)
+        item = ReasoningOutputItem(
+            id=reasoning_item_id,
+            status="completed",
+            summary=[ReasoningSummary(text=full_text)],
+            content=[ReasoningContent(text=full_text)],
+        )
+        lines = [
+            make_response_sse(
+                "response.reasoning_summary_text.done",
+                item_id=reasoning_item_id,
+                output_index=output_index,
+                summary_index=0,
+                text=full_text,
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.reasoning_text.done",
+                item_id=reasoning_item_id,
+                output_index=output_index,
+                content_index=0,
+                text=full_text,
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.reasoning_summary_part.done",
+                item_id=reasoning_item_id,
+                output_index=output_index,
+                summary_index=0,
+                part={"type": "summary_text", "text": full_text},
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+                sequence_number=_next_seq(),
+            ),
+        ]
+        reasoning_open = False
+        reasoning_item_id = None
+        reasoning_text_buf = []
+        output_index += 1
+        return lines
+
     # --- Main streaming loop ---
 
     try:
@@ -824,6 +876,10 @@ async def stream_response_chunks(
                         sequence_number=_next_seq(),
                     )
                     continue
+                # If reasoning was open and we just exited it, close it now.
+                if reasoning_open and not in_thinking:
+                    for line in _close_reasoning():
+                        yield line
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)
                     if cleaned:
@@ -923,6 +979,11 @@ async def stream_response_chunks(
 
     # Emit closing events for successful stream
     final_text = "".join(full_text)
+
+    # Close reasoning if it's still open (stream ended without exiting thinking).
+    if reasoning_open:
+        for line in _close_reasoning():
+            yield line
 
     # Ensure the message item has been announced (consumer always sees one).
     if not message_item_opened:

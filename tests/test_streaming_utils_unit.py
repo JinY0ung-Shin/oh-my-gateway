@@ -144,10 +144,13 @@ async def test_stream_response_chunks_success_suppresses_thinking_and_formats_to
     assert event_types.index("response.output_text.done") < event_types.index(
         "response.content_part.done"
     )
-    assert event_types.index("response.content_part.done") < event_types.index(
-        "response.output_item.done"
+    # Message output_item.done (skip any reasoning output_item.done that precedes it).
+    msg_item_done_idx = next(
+        i for i, (et, p) in enumerate(parsed)
+        if et == "response.output_item.done" and p["item"]["type"] == "message"
     )
-    assert event_types.index("response.output_item.done") < event_types.index("response.completed")
+    assert event_types.index("response.content_part.done") < msg_item_done_idx
+    assert msg_item_done_idx < event_types.index("response.completed")
 
     deltas = [
         payload["delta"]
@@ -1357,3 +1360,54 @@ async def test_stream_emits_summary_and_reasoning_text_deltas_with_same_text():
     assert all(d["output_index"] == 0 for d in summary_deltas + reasoning_deltas)
     assert all(d["summary_index"] == 0 for d in summary_deltas)
     assert all(d["content_index"] == 0 for d in reasoning_deltas)
+
+
+async def test_stream_closes_reasoning_with_accumulated_text():
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "hello"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 1,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "world"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 1}}
+        yield {"subtype": "success", "result": "world"}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    done_summary = next(p for t, p in events if t == "response.reasoning_summary_text.done")
+    assert done_summary["text"] == "hello"
+    done_reasoning = next(p for t, p in events if t == "response.reasoning_text.done")
+    assert done_reasoning["text"] == "hello"
+    # reasoning output_item.done must come BEFORE message output_item.added
+    r_done_idx = next(i for i, (t, p) in enumerate(events)
+                      if t == "response.output_item.done" and p["item"]["type"] == "reasoning")
+    msg_added_idx = next(i for i, (t, p) in enumerate(events)
+                         if t == "response.output_item.added" and p["item"]["type"] == "message")
+    assert r_done_idx < msg_added_idx
+    # Message lands at output_index=1 (reasoning was at 0)
+    _, msg_added = events[msg_added_idx]
+    assert msg_added["output_index"] == 1
