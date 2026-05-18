@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 import pytest
 
+from src.backends.common import combine_system_prompt
 from src.backends.opencode.client import OpenCodeClient, OpenCodeSessionClient
 
 
@@ -119,17 +120,17 @@ def test_directory_params_returns_dict_when_cwd_set(client):
     assert client._directory_params("/work") == {"directory": "/work"}
 
 
-def test_combine_system_prompt_both_present(client):
-    assert client._combine_system_prompt("base", "extra") == "base\n\nextra"
+def test_combine_system_prompt_both_present():
+    assert combine_system_prompt("base", "extra") == "base\n\nextra"
 
 
-def test_combine_system_prompt_only_one_present(client):
-    assert client._combine_system_prompt("base", None) == "base"
-    assert client._combine_system_prompt(None, "extra") == "extra"
+def test_combine_system_prompt_only_one_present():
+    assert combine_system_prompt("base", None) == "base"
+    assert combine_system_prompt(None, "extra") == "extra"
 
 
-def test_combine_system_prompt_neither_present(client):
-    assert client._combine_system_prompt(None, None) is None
+def test_combine_system_prompt_neither_present():
+    assert combine_system_prompt(None, None) is None
 
 
 def test_split_provider_model_returns_none_for_unsplittable(client):

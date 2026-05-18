@@ -4,26 +4,22 @@ import json
 from typing import Any, Dict, Optional
 
 from claude_agent_sdk.types import (
-    ServerToolResultBlock,
-    ServerToolUseBlock,
     ToolResultBlock,
-    ToolUseBlock,
 )
 
 from src.collab_filter import strip_collab_json
 from src.constants import (
     SUBAGENT_STREAM_TEXT,
 )
+from src.content_blocks import (
+    TOOL_CONTENT_BLOCK_TYPES,
+    is_tool_content_block,
+    normalize_embedded_tool_block,
+)
 from src.message_adapter import MessageAdapter
-from src.sse_builders import _normalize_tool_result
 
 
-_TOOL_CONTENT_BLOCK_TYPES = {
-    "tool_use",
-    "tool_result",
-    "server_tool_use",
-    "advisor_tool_result",
-}
+_TOOL_CONTENT_BLOCK_TYPES = TOOL_CONTENT_BLOCK_TYPES
 
 
 def _extract_tool_blocks(content) -> tuple[list, list]:
@@ -38,13 +34,7 @@ def _extract_tool_blocks(content) -> tuple[list, list]:
     tool_blocks: list[Any] = []
     non_tool: list[Any] = []
     for b in content:
-        if isinstance(
-            b, (ToolUseBlock, ToolResultBlock, ServerToolUseBlock, ServerToolResultBlock)
-        ):
-            tool_blocks.append(b)
-        elif isinstance(b, dict) and b.get("type") in _TOOL_CONTENT_BLOCK_TYPES:
-            tool_blocks.append(b)
-        elif hasattr(b, "type") and getattr(b, "type", None) in _TOOL_CONTENT_BLOCK_TYPES:
+        if is_tool_content_block(b):
             tool_blocks.append(b)
         else:
             non_tool.append(b)
@@ -129,50 +119,8 @@ def extract_embedded_tool_blocks(chunk: Dict[str, Any]) -> list:
     if not isinstance(content, list):
         return []
     tool_blocks, _ = _extract_tool_blocks(content)
-    # Normalize SDK objects (ToolUseBlock, ToolResultBlock) to plain dicts
-    # so callers can safely use .get() on every returned block.
-    normalized: list[Dict[str, Any]] = []
-    for tb in tool_blocks:
-        if isinstance(tb, dict):
-            normalized.append(tb)
-        elif isinstance(tb, ToolUseBlock):
-            normalized.append(
-                {
-                    "type": "tool_use",
-                    "id": getattr(tb, "id", ""),
-                    "name": getattr(tb, "name", ""),
-                    "input": getattr(tb, "input", {}),
-                }
-            )
-        elif isinstance(tb, ToolResultBlock):
-            normalized.append(_normalize_tool_result(tb))
-        elif isinstance(tb, ServerToolUseBlock):
-            normalized.append(
-                {
-                    "type": "server_tool_use",
-                    "id": getattr(tb, "id", ""),
-                    "name": getattr(tb, "name", ""),
-                    "input": getattr(tb, "input", {}),
-                }
-            )
-        elif isinstance(tb, ServerToolResultBlock):
-            normalized.append(
-                {
-                    "type": "advisor_tool_result",
-                    "tool_use_id": getattr(tb, "tool_use_id", ""),
-                    "content": getattr(tb, "content", ""),
-                }
-            )
-        elif hasattr(tb, "type"):
-            # Generic SDK object fallback
-            d: Dict[str, Any] = {"type": getattr(tb, "type", "")}
-            for attr in ("id", "name", "input", "tool_use_id", "content", "is_error"):
-                if hasattr(tb, attr):
-                    d[attr] = getattr(tb, attr)
-            normalized.append(d)
-        else:
-            normalized.append(tb)
-    return normalized
+    # Normalize SDK objects to plain dicts so callers can safely use .get().
+    return [normalize_embedded_tool_block(tb) for tb in tool_blocks]
 
 
 class ToolUseAccumulator:

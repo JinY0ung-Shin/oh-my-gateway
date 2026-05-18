@@ -3467,14 +3467,12 @@ def test_codex_public_error_message_passes_through_other_exceptions():
 
 def test_codex_combine_system_prompt_combinations():
     """All four combinations of (custom_base, system_prompt) produce the right output."""
-    from src.backends.codex.client import CodexClient
+    from src.backends.common import combine_system_prompt
 
-    client = CodexClient()
-
-    assert client._combine_system_prompt(None, None) is None
-    assert client._combine_system_prompt("base", None) == "base"
-    assert client._combine_system_prompt(None, "user") == "user"
-    assert client._combine_system_prompt("base", "user") == "base\n\nuser"
+    assert combine_system_prompt(None, None) is None
+    assert combine_system_prompt("base", None) == "base"
+    assert combine_system_prompt(None, "user") == "user"
+    assert combine_system_prompt("base", "user") == "base\n\nuser"
 
 
 def test_codex_thread_params_includes_only_set_fields():

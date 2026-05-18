@@ -3,7 +3,7 @@
 import json
 from typing import Any, Dict, Optional
 
-from claude_agent_sdk.types import ToolResultBlock
+from src.content_blocks import normalize_tool_result_for_sse
 
 
 def make_response_sse(
@@ -93,33 +93,7 @@ def make_tool_use_response_sse(
 
 def _normalize_tool_result(result_block) -> Dict[str, Any]:
     """Normalize a ToolResultBlock or dict into a plain tool_result dict."""
-    if isinstance(result_block, ToolResultBlock):
-        return {
-            "type": "tool_result",
-            "tool_use_id": result_block.tool_use_id or "",
-            "content": result_block.content or "",
-            "is_error": bool(result_block.is_error),
-        }
-    if hasattr(result_block, "tool_use_id"):
-        return {
-            "type": "tool_result",
-            "tool_use_id": getattr(result_block, "tool_use_id", "") or "",
-            "content": getattr(result_block, "content", "") or "",
-            "is_error": bool(getattr(result_block, "is_error", False)),
-        }
-    if isinstance(result_block, dict):
-        return {
-            "type": "tool_result",
-            "tool_use_id": result_block.get("tool_use_id", ""),
-            "content": result_block.get("content", ""),
-            "is_error": bool(result_block.get("is_error", False)),
-        }
-    return {
-        "type": "tool_result",
-        "tool_use_id": "",
-        "content": str(result_block),
-        "is_error": False,
-    }
+    return normalize_tool_result_for_sse(result_block)
 
 
 def make_tool_result_response_sse(

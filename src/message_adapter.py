@@ -5,6 +5,12 @@ import json
 
 from claude_agent_sdk.types import ServerToolResultBlock, ServerToolUseBlock
 
+from src.content_blocks import (
+    normalize_advisor_tool_result_block,
+    normalize_tool_result_block,
+    normalize_tool_use_block,
+)
+
 
 class MessageAdapter:
     """Converts between OpenAI message format and Claude Code prompts."""
@@ -39,12 +45,11 @@ class MessageAdapter:
 
         # ServerToolUseBlock (object)
         if isinstance(block, ServerToolUseBlock):
-            return {
-                "type": "server_tool_use",
-                "id": getattr(block, "id", ""),
-                "name": block.name,
-                "input": block.input if isinstance(block.input, dict) else str(block.input),
-            }
+            return normalize_tool_use_block(
+                block,
+                block_type="server_tool_use",
+                stringify_non_dict_input=True,
+            )
 
         # ServerToolUseBlock (dict)
         if isinstance(block, dict) and block.get("type") == "server_tool_use":
@@ -52,26 +57,22 @@ class MessageAdapter:
 
         # ServerToolResultBlock / advisor_tool_result (object)
         if isinstance(block, ServerToolResultBlock):
-            return {
-                "type": "advisor_tool_result",
-                "tool_use_id": block.tool_use_id,
-                "content": MessageAdapter._truncate_tool_content(block.content),
-            }
+            return normalize_advisor_tool_result_block(
+                block,
+                truncate_content=MessageAdapter._truncate_tool_content,
+            )
 
         # ServerToolResultBlock / advisor_tool_result (dict)
         if isinstance(block, dict) and block.get("type") == "advisor_tool_result":
-            result = dict(block)
-            result["content"] = MessageAdapter._truncate_tool_content(result.get("content", ""))
-            return result
+            return normalize_advisor_tool_result_block(
+                block,
+                truncate_content=MessageAdapter._truncate_tool_content,
+                preserve_extra_fields=True,
+            )
 
         # ToolUseBlock (object)
         if hasattr(block, "name") and hasattr(block, "input"):
-            return {
-                "type": "tool_use",
-                "id": getattr(block, "id", ""),
-                "name": block.name,
-                "input": block.input if isinstance(block.input, dict) else str(block.input),
-            }
+            return normalize_tool_use_block(block, stringify_non_dict_input=True)
 
         # ToolUseBlock (dict)
         if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -79,18 +80,18 @@ class MessageAdapter:
 
         # ToolResultBlock (object)
         if hasattr(block, "tool_use_id") and hasattr(block, "content"):
-            return {
-                "type": "tool_result",
-                "tool_use_id": block.tool_use_id,
-                "content": MessageAdapter._truncate_tool_content(block.content),
-                "is_error": bool(getattr(block, "is_error", False)),
-            }
+            return normalize_tool_result_block(
+                block,
+                truncate_content=MessageAdapter._truncate_tool_content,
+            )
 
         # ToolResultBlock (dict)
         if isinstance(block, dict) and block.get("type") == "tool_result":
-            result = dict(block)
-            result["content"] = MessageAdapter._truncate_tool_content(result.get("content", ""))
-            return result
+            return normalize_tool_result_block(
+                block,
+                truncate_content=MessageAdapter._truncate_tool_content,
+                preserve_extra_fields=True,
+            )
 
         # Plain string
         if isinstance(block, str):

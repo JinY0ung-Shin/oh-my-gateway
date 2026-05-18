@@ -43,6 +43,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
+from src.backends.common import estimate_token_usage as estimate_backend_token_usage
 from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
@@ -878,14 +879,7 @@ class ClaudeCodeCLI:
         self, prompt: str, completion: str, _model: Optional[str] = None
     ) -> Dict[str, int]:
         """Estimate token usage (~4 characters per token)."""
-        prompt_tokens = max(1, len(prompt) // 4)
-        completion_tokens = max(1, len(completion) // 4)
-
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+        return estimate_backend_token_usage(prompt, completion)
 
     def _cleanup_temp_dir(self):
         """Clean up temporary directory on exit."""

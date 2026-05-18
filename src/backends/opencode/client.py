@@ -39,6 +39,10 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 import httpx
 
 import src.mcp_config as mcp_config
+from src.backends.common import (
+    combine_system_prompt,
+    estimate_token_usage as estimate_backend_token_usage,
+)
 from src.backends.opencode.auth import OpenCodeAuthProvider, normalize_opencode_base_url
 from src.backends.opencode.config import build_opencode_config, parse_opencode_config_content
 from src.backends.opencode.constants import OPENCODE_MODELS, use_wrapper_mcp_config
@@ -97,6 +101,8 @@ class OpenCodeSessionClient:
 
 class OpenCodeClient:
     """BackendClient implementation for OpenCode."""
+
+    _combine_system_prompt = staticmethod(combine_system_prompt)
 
     def __init__(
         self,
@@ -254,15 +260,6 @@ class OpenCodeClient:
             return None
         return {"directory": cwd}
 
-    def _combine_system_prompt(
-        self,
-        custom_base: Optional[str],
-        system_prompt: Optional[str],
-    ) -> Optional[str]:
-        if custom_base and system_prompt:
-            return f"{custom_base}\n\n{system_prompt}"
-        return custom_base or system_prompt
-
     def _split_provider_model(self, model: Optional[str]) -> Optional[Dict[str, str]]:
         if not model or "/" not in model:
             return None
@@ -322,7 +319,7 @@ class OpenCodeClient:
             session_id=opencode_session_id,
             cwd=str(Path(cwd)) if cwd else None,
             model=model,
-            system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+            system_prompt=combine_system_prompt(_custom_base, system_prompt),
             base_url=self.base_url,
             timeout=self.timeout,
             auth=self._auth(),
@@ -764,10 +761,4 @@ class OpenCodeClient:
         model: Optional[str] = None,
     ) -> Dict[str, int]:
         _ = model
-        prompt_tokens = max(1, len(prompt) // 4)
-        completion_tokens = max(1, len(completion) // 4)
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+        return estimate_backend_token_usage(prompt, completion)

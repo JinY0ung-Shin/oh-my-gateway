@@ -30,6 +30,10 @@ from src.backends.codex.constants import (
     disallowed_tools_from_env,
     sandbox_mode,
 )
+from src.backends.common import (
+    combine_system_prompt,
+    estimate_token_usage as estimate_backend_token_usage,
+)
 from src.constants import DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 
@@ -422,6 +426,8 @@ class CodexSessionClient:
 class CodexClient:
     """BackendClient implementation for local Codex app-server."""
 
+    _combine_system_prompt = staticmethod(combine_system_prompt)
+
     def __init__(self, timeout: Optional[int] = None) -> None:
         self.timeout = (timeout if timeout is not None else DEFAULT_TIMEOUT_MS) / 1000
         self._rpc: Optional[CodexJsonRpcClient] = None
@@ -527,7 +533,7 @@ class CodexClient:
                 params = self._thread_params(
                     model=model,
                     cwd=cwd,
-                    system_prompt=self._combine_system_prompt(_custom_base, system_prompt),
+                    system_prompt=combine_system_prompt(_custom_base, system_prompt),
                     permission_mode=permission_mode,
                     has_tool_policy=self._has_tool_policy(allowed_tools, disallowed_tools),
                     mcp_servers=mcp_servers,
@@ -611,15 +617,6 @@ class CodexClient:
         from src.constants import METADATA_ENV_ALLOWLIST
 
         return {k: v for k, v in extra_env.items() if k in METADATA_ENV_ALLOWLIST}
-
-    def _combine_system_prompt(
-        self,
-        custom_base: Optional[str],
-        system_prompt: Optional[str],
-    ) -> Optional[str]:
-        if custom_base and system_prompt:
-            return f"{custom_base}\n\n{system_prompt}"
-        return custom_base or system_prompt
 
     def _thread_params(
         self,
@@ -1631,10 +1628,4 @@ class CodexClient:
         model: Optional[str] = None,
     ) -> Dict[str, int]:
         _ = model
-        prompt_tokens = max(1, len(prompt) // 4)
-        completion_tokens = max(1, len(completion) // 4)
-        return {
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "total_tokens": prompt_tokens + completion_tokens,
-        }
+        return estimate_backend_token_usage(prompt, completion)

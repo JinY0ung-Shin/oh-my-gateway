@@ -4,20 +4,12 @@ from __future__ import annotations
 
 import os
 
-
-def _parse_csv(value: str) -> list[str]:
-    """Parse comma-separated environment values, preserving order."""
-    items: list[str] = []
-    for raw_item in value.split(","):
-        item = raw_item.strip()
-        if item and item not in items:
-            items.append(item)
-    return items
+from src.backends.common import parse_csv
 
 
 def configured_provider_models() -> list[str]:
     """Return Codex model IDs configured for model listing."""
-    return _parse_csv(os.getenv("CODEX_MODELS", "gpt-5.5"))
+    return parse_csv(os.getenv("CODEX_MODELS", "gpt-5.5"))
 
 
 def configured_public_models() -> list[str]:
@@ -27,7 +19,7 @@ def configured_public_models() -> list[str]:
 
 def configured_config_overrides() -> list[str]:
     """Return Codex CLI ``--config`` overrides from CODEX_CONFIG_OVERRIDES."""
-    return _parse_csv(os.getenv("CODEX_CONFIG_OVERRIDES", ""))
+    return parse_csv(os.getenv("CODEX_CONFIG_OVERRIDES", ""))
 
 
 def codex_bin() -> str:
@@ -50,7 +42,7 @@ def sandbox_mode() -> str:
 
 def disallowed_tools_from_env() -> list[str]:
     """Read DISALLOWED_TOOLS env (shared with Claude backend) for hard-block tool names."""
-    return _parse_csv(os.getenv("DISALLOWED_TOOLS", ""))
+    return parse_csv(os.getenv("DISALLOWED_TOOLS", ""))
 
 
 CODEX_PROVIDER_MODELS = configured_provider_models()

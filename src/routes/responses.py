@@ -614,6 +614,36 @@ async def _validate_backend_prompt(
         ) from e
 
 
+async def _refresh_existing_client_policy(
+    body: ResponseCreateRequest,
+    backend: "BackendClient",
+    client: Any,
+) -> None:
+    """Apply per-request policy overrides to an existing backend client."""
+    update_policy = getattr(backend, "update_request_policy", None)
+    if not callable(update_policy):
+        return
+
+    try:
+        result = update_policy(
+            client,
+            allowed_tools=body.allowed_tools,
+            disallowed_tools=body.disallowed_tools,
+            permission_mode=body.permission_mode,
+            model_params=_response_model_params(body),
+        )
+        # Backends may implement update_request_policy as either a sync call
+        # (Codex) or an async one (Claude — needs SDK await). Await whichever
+        # shape comes back.
+        if inspect.iscoroutine(result):
+            await result
+    except UnsupportedContinuationPolicy as exc:
+        # Backend explicitly signaled the continuation can't honor the requested
+        # policy change. Fail closed at the API boundary. Other exceptions
+        # propagate so they surface as 5xx instead of being misclassified as 400.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 async def _ensure_response_session_client(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
@@ -626,27 +656,7 @@ async def _ensure_response_session_client(
 ) -> None:
     """Create the persistent backend client after session preflight has passed."""
     if session.client is not None:
-        update_policy = getattr(backend, "update_request_policy", None)
-        if callable(update_policy):
-            try:
-                result = update_policy(
-                    session.client,
-                    allowed_tools=body.allowed_tools,
-                    disallowed_tools=body.disallowed_tools,
-                    permission_mode=body.permission_mode,
-                    model_params=_response_model_params(body),
-                )
-                # Backends may implement update_request_policy as either a sync
-                # call (Codex) or an async one (Claude — needs SDK await). Await
-                # whichever shape comes back.
-                if inspect.iscoroutine(result):
-                    await result
-            except UnsupportedContinuationPolicy as exc:
-                # Backend explicitly signaled the continuation can't honor the
-                # requested policy change. Fail closed at the API boundary.
-                # Other exceptions (e.g. an SDK ValueError) propagate so they
-                # surface as 5xx instead of being misclassified as 400.
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await _refresh_existing_client_policy(body, backend, session.client)
         return
 
     from src.system_prompt import get_system_prompt, resolve_request_placeholders
@@ -745,6 +755,44 @@ def _commit_pending_tool_call_locked(session) -> None:
     if pending_event is not None:
         pending_event.set()
     session.pending_tool_call = None
+
+
+def _resume_backend_continuation(
+    resolved: ResolvedModel,
+    backend: "BackendClient",
+    active_client: Any,
+    session,
+    fc_output: Dict[str, str],
+    opencode_resume_kind: str,
+):
+    """Return the backend stream for a function_call_output continuation."""
+    backend_with_resume = cast(Any, backend)
+    if resolved.backend == "opencode":
+        if opencode_resume_kind == "permission":
+            return backend_with_resume.resume_permission_with_client(
+                active_client,
+                fc_output["call_id"],
+                fc_output["output"],
+                session,
+            )
+        return backend_with_resume.resume_question_with_client(
+            active_client,
+            fc_output["call_id"],
+            fc_output["output"],
+            session,
+        )
+    if resolved.backend == "codex":
+        return backend_with_resume.resume_approval_with_client(
+            active_client,
+            fc_output["call_id"],
+            fc_output["output"],
+            session,
+        )
+
+    receiver = getattr(backend, "receive_response_from_client", None)
+    if receiver is not None:
+        return receiver(active_client, session)
+    return backend.run_completion_with_client(active_client, "", session)
 
 
 async def _prepare_opencode_tool_continuation(
@@ -1446,30 +1494,13 @@ async def _handle_function_call_output(
     # above hand the session lock off to us on success, so any failure here
     # must release it before raising — otherwise the lock leaks for the rest
     # of the session.
-    policy_refresh_failed = False
     if session.client is not None:
-        update_policy = getattr(backend, "update_request_policy", None)
-        if callable(update_policy):
-            try:
-                result = update_policy(
-                    session.client,
-                    allowed_tools=body.allowed_tools,
-                    disallowed_tools=body.disallowed_tools,
-                    permission_mode=body.permission_mode,
-                    model_params=_response_model_params(body),
-                )
-                if inspect.iscoroutine(result):
-                    await result
-            except UnsupportedContinuationPolicy as exc:
-                policy_refresh_failed = True
-                if session.lock.locked():
-                    session.lock.release()
-                raise HTTPException(status_code=400, detail=str(exc)) from exc
-            except Exception:
-                policy_refresh_failed = True
-                if session.lock.locked():
-                    session.lock.release()
-                raise
+        try:
+            await _refresh_existing_client_policy(body, backend, session.client)
+        except Exception:
+            if session.lock.locked():
+                session.lock.release()
+            raise
 
     # All policy invariants passed — fire the irreversible Claude wake-up now
     # that we know the next turn won't run under a rejected policy. OpenCode
@@ -1477,7 +1508,7 @@ async def _handle_function_call_output(
     # prepare/unblock helpers (their continuations don't carry
     # UnsupportedContinuationPolicy semantics, so there's nothing to roll
     # back).
-    if not policy_refresh_failed and resolved.backend not in {"opencode", "codex"}:
+    if resolved.backend not in {"opencode", "codex"}:
         _commit_pending_tool_call_locked(session)
 
     # --- Stream continuation from the client ---
@@ -1495,36 +1526,14 @@ async def _handle_function_call_output(
                 _configure_client_streaming(active_client, True)
                 # Resume the backend-specific pending tool request; do not
                 # start a new prompt for continuation turns.
-                if resolved.backend == "opencode":
-                    if opencode_resume_kind == "permission":
-                        backend_source = backend.resume_permission_with_client(
-                            active_client,
-                            fc_output["call_id"],
-                            fc_output["output"],
-                            session,
-                        )
-                    else:
-                        backend_source = backend.resume_question_with_client(
-                            active_client,
-                            fc_output["call_id"],
-                            fc_output["output"],
-                            session,
-                        )
-                elif resolved.backend == "codex":
-                    backend_source = backend.resume_approval_with_client(
-                        active_client,
-                        fc_output["call_id"],
-                        fc_output["output"],
-                        session,
-                    )
-                else:
-                    receiver = getattr(backend, "receive_response_from_client", None)
-                    if receiver is not None:
-                        backend_source = receiver(active_client, session)
-                    else:
-                        backend_source = backend.run_completion_with_client(
-                            active_client, "", session
-                        )
+                backend_source = _resume_backend_continuation(
+                    resolved,
+                    backend,
+                    active_client,
+                    session,
+                    fc_output,
+                    opencode_resume_kind,
+                )
                 chunk_source = _capture_pending_tool_questions(backend_source, resolved, session)
 
                 sse_source = streaming_utils.stream_response_chunks(
@@ -1613,35 +1622,14 @@ async def _handle_function_call_output(
         # Resume the backend-specific pending tool request; do not start a
         # new prompt for continuation turns.
         _configure_client_streaming(active_client, False)
-        backend_with_resume = cast(Any, backend)
-        if resolved.backend == "opencode":
-            if opencode_resume_kind == "permission":
-                backend_source = backend_with_resume.resume_permission_with_client(
-                    active_client,
-                    fc_output["call_id"],
-                    fc_output["output"],
-                    session,
-                )
-            else:
-                backend_source = backend_with_resume.resume_question_with_client(
-                    active_client,
-                    fc_output["call_id"],
-                    fc_output["output"],
-                    session,
-                )
-        elif resolved.backend == "codex":
-            backend_source = backend_with_resume.resume_approval_with_client(
-                active_client,
-                fc_output["call_id"],
-                fc_output["output"],
-                session,
-            )
-        else:
-            receiver = getattr(backend, "receive_response_from_client", None)
-            if receiver is not None:
-                backend_source = receiver(active_client, session)
-            else:
-                backend_source = backend.run_completion_with_client(active_client, "", session)
+        backend_source = _resume_backend_continuation(
+            resolved,
+            backend,
+            active_client,
+            session,
+            fc_output,
+            opencode_resume_kind,
+        )
         chunks = await _collect_non_stream_continuation_chunks(
             _capture_pending_tool_questions(backend_source, resolved, session)
         )
