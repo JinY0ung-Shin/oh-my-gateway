@@ -1243,3 +1243,42 @@ class TestExtractThinkingTexts:
 
         chunks = [{"content": [_ThinkingBlock("hidden")]}]
         assert extract_thinking_texts(chunks) == ["hidden"]
+
+
+async def test_stream_emits_message_item_after_first_text_when_no_thinking():
+    """No thinking → message output_item.added still fires, just deferred until first text."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"subtype": "success", "result": "hi"}
+
+    events: list[tuple[str, dict]] = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    types = [t for t, _ in events]
+    # response.output_item.added must come BEFORE response.output_text.delta
+    first_delta_idx = types.index("response.output_text.delta")
+    added_idx = types.index("response.output_item.added")
+    assert added_idx < first_delta_idx
+    assert "response.output_item.done" in types
+    assert types[-1] == "response.completed"

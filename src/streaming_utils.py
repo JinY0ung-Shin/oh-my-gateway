@@ -595,6 +595,8 @@ async def stream_response_chunks(
     collab_filter = CollabJsonStreamFilter()
     full_text = []
     seq = 0
+    message_item_opened = False
+    output_index = 0
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -660,31 +662,41 @@ async def stream_response_chunks(
         "response.in_progress", response_obj=resp_in_progress, sequence_number=_next_seq()
     )
 
-    # 3. response.output_item.added
-    output_item = OutputItem(id=output_item_id, status="in_progress")
-    yield make_response_sse(
-        "response.output_item.added",
-        output_index=0,
-        item=output_item,
-        sequence_number=_next_seq(),
-    )
+    # NOTE: response.output_item.added + response.content_part.added for the
+    # message item are DEFERRED until the first text delta arrives (or the
+    # stream closes without text). This leaves room for reasoning output
+    # items to be emitted before the message item in future tasks.
 
-    # 4. response.content_part.added
-    content_part = ResponseContentPart(type="output_text", text="")
-    yield make_response_sse(
-        "response.content_part.added",
-        item_id=output_item_id,
-        output_index=0,
-        content_index=0,
-        part=content_part,
-        sequence_number=_next_seq(),
-    )
+    def _open_message_item() -> list[str]:
+        """Emit message output_item.added + content_part.added. Idempotent."""
+        nonlocal message_item_opened
+        if message_item_opened:
+            return []
+        message_item_opened = True
+        out_item = OutputItem(id=output_item_id, status="in_progress")
+        content_part = ResponseContentPart(type="output_text", text="")
+        return [
+            make_response_sse(
+                "response.output_item.added",
+                output_index=output_index,
+                item=out_item,
+                sequence_number=_next_seq(),
+            ),
+            make_response_sse(
+                "response.content_part.added",
+                item_id=output_item_id,
+                output_index=output_index,
+                content_index=0,
+                part=content_part,
+                sequence_number=_next_seq(),
+            ),
+        ]
 
     def _emit_delta(text: str) -> str:
         return make_response_sse(
             "response.output_text.delta",
             item_id=output_item_id,
-            output_index=0,
+            output_index=output_index,
             content_index=0,
             delta=text,
             logprobs=[],
@@ -762,6 +774,9 @@ async def stream_response_chunks(
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)
                     if cleaned:
+                        if not message_item_opened:
+                            for line in _open_message_item():
+                                yield line
                         yield _emit_delta(cleaned)
                         full_text.append(cleaned)
                         content_sent = True
@@ -809,6 +824,9 @@ async def stream_response_chunks(
             chunks_buffer.append(chunk)
             text = format_chunk_content(chunk, content_sent)
             if text:
+                if not message_item_opened:
+                    for line in _open_message_item():
+                        yield line
                 yield _emit_delta(text)
                 full_text.append(text)
                 content_sent = True
@@ -829,6 +847,9 @@ async def stream_response_chunks(
     # Flush remaining buffered chars from collab filter
     remaining_collab = collab_filter.flush()
     if remaining_collab:
+        if not message_item_opened:
+            for line in _open_message_item():
+                yield line
         yield _emit_delta(remaining_collab)
         full_text.append(remaining_collab)
         content_sent = True
@@ -850,11 +871,16 @@ async def stream_response_chunks(
     # Emit closing events for successful stream
     final_text = "".join(full_text)
 
+    # Ensure the message item has been announced (consumer always sees one).
+    if not message_item_opened:
+        for line in _open_message_item():
+            yield line
+
     # response.output_text.done
     yield make_response_sse(
         "response.output_text.done",
         item_id=output_item_id,
-        output_index=0,
+        output_index=output_index,
         content_index=0,
         text=final_text,
         logprobs=[],
@@ -865,7 +891,7 @@ async def stream_response_chunks(
     yield make_response_sse(
         "response.content_part.done",
         item_id=output_item_id,
-        output_index=0,
+        output_index=output_index,
         content_index=0,
         part=ResponseContentPart(text=final_text),
         sequence_number=_next_seq(),
@@ -874,7 +900,7 @@ async def stream_response_chunks(
     # response.output_item.done
     yield make_response_sse(
         "response.output_item.done",
-        output_index=0,
+        output_index=output_index,
         item=OutputItem(
             id=output_item_id,
             status="completed",
