@@ -79,6 +79,24 @@ class TestAdminChatPage:
         assert "response.reasoning_summary_text.delta" in r.text
         assert "extractReasoningTexts" in r.text
 
+    def test_admin_chat_page_splits_text_bubbles_around_tool_events(self, admin_client):
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "pendingTextSeparator" not in r.text
+        assert "let activeBubble = null" in r.text
+        assert "activeBubbleText += evt.delta" in r.text
+
+        tool_use_idx = r.text.index("if (type === 'response.tool_use')")
+        tool_use_finalize_idx = r.text.index("finalizeActiveBubble();", tool_use_idx)
+        tool_use_append_idx = r.text.index("addToolEvent('tool-use'", tool_use_idx)
+        assert tool_use_finalize_idx < tool_use_append_idx
+
+        tool_result_idx = r.text.index("if (type === 'response.tool_result')")
+        tool_result_finalize_idx = r.text.index("finalizeActiveBubble();", tool_result_idx)
+        tool_result_append_idx = r.text.index("addToolEvent(", tool_result_idx)
+        assert tool_result_finalize_idx < tool_result_append_idx
+
     def test_admin_chat_page_serves_login_gate_to_unauthenticated_clients(self):
         """Anonymous GET /admin/chat should return 200 with the inline auth gate."""
         with patch.dict(os.environ, {"ADMIN_API_KEY": "test-key"}):

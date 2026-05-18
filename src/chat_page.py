@@ -1132,17 +1132,54 @@ async function sendMessage() {
 
 async function streamRequest(body) {
   setStreaming(true);
-  const bubble = addStreamingMessage();
-  const messageEl = bubble.closest('.message');
+  let activeBubble = null;
+  let activeBubbleText = '';
+  let thinkingMessageEl = null;
   let fullText = '';
   let reasoningSummaryText = '';
   let reasoningText = '';
   let reasoningTextDeltaSeen = false;
   let responseId = null;
-  // When a tool call/result lands between two text deltas the model has
-  // semantically resumed in a fresh paragraph; render that as a blank-line
-  // break instead of letting the second sentence concatenate onto the first.
-  let pendingTextSeparator = false;
+
+  function messageHasThinking(messageEl) {
+    const panel = messageEl && messageEl.querySelector('.thinking-panel');
+    return !!(panel && panel.style.display !== 'none');
+  }
+
+  function ensureActiveBubble() {
+    if (!activeBubble) {
+      activeBubble = addStreamingMessage();
+      activeBubbleText = '';
+      if (!thinkingMessageEl || !thinkingMessageEl.isConnected) {
+        thinkingMessageEl = activeBubble.closest('.message');
+      }
+    }
+    return activeBubble;
+  }
+
+  function ensureThinkingMessageEl() {
+    if (thinkingMessageEl && thinkingMessageEl.isConnected) return thinkingMessageEl;
+    return ensureActiveBubble().closest('.message');
+  }
+
+  function finalizeActiveBubble() {
+    if (!activeBubble) return;
+    const messageEl = activeBubble.closest('.message');
+    if (!messageEl) {
+      activeBubble = null;
+      activeBubbleText = '';
+      return;
+    }
+    if (activeBubbleText) {
+      activeBubble.innerHTML = renderMarkdown(activeBubbleText);
+    } else if (messageHasThinking(messageEl)) {
+      activeBubble.remove();
+    } else {
+      messageEl.remove();
+    }
+    activeBubble = null;
+    activeBubbleText = '';
+  }
 
   try {
     currentAbortController = new AbortController();
@@ -1155,6 +1192,7 @@ async function streamRequest(body) {
 
     if (!resp.ok) {
       const err = await resp.text();
+      const bubble = ensureActiveBubble();
       bubble.innerHTML = renderMarkdown('Error: ' + resp.status + ' — ' + err);
       setStatus('error', '오류 발생');
       setStreaming(false);
@@ -1196,19 +1234,17 @@ async function streamRequest(body) {
 
         // --- Text delta ---
         if (type === 'response.output_text.delta' && evt.delta) {
-          if (pendingTextSeparator && fullText && !fullText.endsWith('\n\n')) {
-            fullText += '\n\n';
-          }
-          pendingTextSeparator = false;
+          const bubble = ensureActiveBubble();
           fullText += evt.delta;
-          bubble.innerHTML = renderMarkdown(fullText) + '<span class="cursor"></span>';
+          activeBubbleText += evt.delta;
+          bubble.innerHTML = renderMarkdown(activeBubbleText) + '<span class="cursor"></span>';
           scrollToBottom();
         }
 
         // --- Reasoning / thinking delta ---
         if (type === 'response.reasoning_summary_text.delta' && evt.delta && !reasoningTextDeltaSeen) {
           reasoningSummaryText += evt.delta;
-          updateThinkingPanel(messageEl, reasoningSummaryText);
+          updateThinkingPanel(ensureThinkingMessageEl(), reasoningSummaryText);
         }
         if (type === 'response.reasoning_text.delta' && evt.delta) {
           if (!reasoningTextDeltaSeen) {
@@ -1216,11 +1252,12 @@ async function streamRequest(body) {
             reasoningText = '';
           }
           reasoningText += evt.delta;
-          updateThinkingPanel(messageEl, reasoningText);
+          updateThinkingPanel(ensureThinkingMessageEl(), reasoningText);
         }
 
         // --- Tool use ---
         if (type === 'response.tool_use') {
+          finalizeActiveBubble();
           const name = evt.name || 'unknown';
           const input = evt.input || {};
           const summary = typeof input === 'object'
@@ -1229,11 +1266,11 @@ async function streamRequest(body) {
           setStatus('streaming', 'Tool: ' + name);
           addToolEvent('tool-use', 'TOOL', name + (summary ? ' — ' + summary.substring(0, 60) : ''),
             JSON.stringify(input, null, 2));
-          pendingTextSeparator = true;
         }
 
         // --- Tool result ---
         if (type === 'response.tool_result') {
+          finalizeActiveBubble();
           const isError = evt.is_error;
           const content = typeof evt.content === 'string' ? evt.content : JSON.stringify(evt.content, null, 2);
           const preview = (content || '').substring(0, 80).replace(/\n/g, ' ');
@@ -1244,7 +1281,6 @@ async function streamRequest(body) {
             content || '(no content)'
           );
           setStatus('streaming', '스트리밍중...');
-          pendingTextSeparator = true;
         }
 
         // --- Task events ---
@@ -1275,8 +1311,7 @@ async function streamRequest(body) {
               if (item.type === 'function_call' && item.name === 'AskUserQuestion') {
                 let args = {};
                 try { args = JSON.parse(item.arguments); } catch {}
-                if (!fullText) bubble.parentElement.remove();
-                else { bubble.innerHTML = renderMarkdown(fullText); }
+                finalizeActiveBubble();
                 showAskPrompt(args, item.call_id, r.id);
               }
             }
@@ -1288,7 +1323,7 @@ async function streamRequest(body) {
           if (evt.response.id) previousResponseId = evt.response.id;
           const completedReasoning = extractReasoningTexts(evt.response);
           if (completedReasoning.length && !reasoningText && !reasoningSummaryText) {
-            updateThinkingPanel(messageEl, completedReasoning.join('\n\n'));
+            updateThinkingPanel(ensureThinkingMessageEl(), completedReasoning.join('\n\n'));
           }
           if (evt.response.usage) {
             const u = evt.response.usage;
@@ -1306,12 +1341,14 @@ async function streamRequest(body) {
 
   } catch (err) {
     if (err.name !== 'AbortError') {
-      bubble.innerHTML = renderMarkdown('Error: ' + err.message);
+      const bubble = ensureActiveBubble();
+      activeBubbleText = 'Error: ' + err.message;
+      bubble.innerHTML = renderMarkdown(activeBubbleText);
       setStatus('error', '연결 오류');
     }
   }
 
-  if (fullText) bubble.innerHTML = renderMarkdown(fullText);
+  finalizeActiveBubble();
   setStreaming(false);
   if (!pendingAsk) inputEl.focus();
 }
