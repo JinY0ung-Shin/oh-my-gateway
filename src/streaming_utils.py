@@ -608,6 +608,8 @@ async def stream_response_chunks(
     reasoning_open = False
     reasoning_item_id: Optional[str] = None
     reasoning_text_buf: list[str] = []
+    thinking_seen = False
+    text_delta_buffer: list[str] = []
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -834,6 +836,7 @@ async def stream_response_chunks(
                     reasoning_item_id = _generate_rs_id()
                     reasoning_open = True
                     reasoning_text_buf = []
+                    thinking_seen = True
                     reasoning_item = ReasoningOutputItem(
                         id=reasoning_item_id, status="in_progress"
                     )
@@ -852,8 +855,14 @@ async def stream_response_chunks(
                         sequence_number=_next_seq(),
                     )
 
-                # Drop synthetic markers, which are state-only.
+                # Drop synthetic markers, which are state-only.  When </think>
+                # arrives (content_block_stop while in_thinking), close the
+                # reasoning item immediately so any new thinking block that
+                # follows gets a fresh output_index.
                 if text_delta in ("<think>", "</think>"):
+                    if text_delta == "</think>" and reasoning_open:
+                        for line in _close_reasoning():
+                            yield line
                     continue
 
                 # Inside a reasoning block: emit summary_text + reasoning_text deltas.
@@ -883,12 +892,21 @@ async def stream_response_chunks(
                 if text_delta:
                     cleaned = collab_filter.feed(text_delta)
                     if cleaned:
-                        if not message_item_opened:
-                            for line in _open_message_item():
-                                yield line
-                        yield _emit_delta(cleaned)
-                        full_text.append(cleaned)
-                        content_sent = True
+                        # When any reasoning has been emitted, buffer text
+                        # deltas until the message item opens at end-of-stream.
+                        # This guarantees the message lands AFTER all reasoning
+                        # items, including ones that may still arrive later.
+                        if thinking_seen:
+                            text_delta_buffer.append(cleaned)
+                            full_text.append(cleaned)
+                            content_sent = True
+                        else:
+                            if not message_item_opened:
+                                for line in _open_message_item():
+                                    yield line
+                            yield _emit_delta(cleaned)
+                            full_text.append(cleaned)
+                            content_sent = True
                 continue
 
             # Accumulate tool_use blocks from stream events
@@ -933,12 +951,17 @@ async def stream_response_chunks(
             chunks_buffer.append(chunk)
             text = format_chunk_content(chunk, content_sent)
             if text:
-                if not message_item_opened:
-                    for line in _open_message_item():
-                        yield line
-                yield _emit_delta(text)
-                full_text.append(text)
-                content_sent = True
+                if thinking_seen:
+                    text_delta_buffer.append(text)
+                    full_text.append(text)
+                    content_sent = True
+                else:
+                    if not message_item_opened:
+                        for line in _open_message_item():
+                            yield line
+                    yield _emit_delta(text)
+                    full_text.append(text)
+                    content_sent = True
 
     except Exception as e:
         logger.error(
@@ -956,39 +979,51 @@ async def stream_response_chunks(
     # Flush remaining buffered chars from collab filter
     remaining_collab = collab_filter.flush()
     if remaining_collab:
-        if not message_item_opened:
-            for line in _open_message_item():
-                yield line
-        yield _emit_delta(remaining_collab)
-        full_text.append(remaining_collab)
-        content_sent = True
+        if thinking_seen:
+            text_delta_buffer.append(remaining_collab)
+            full_text.append(remaining_collab)
+            content_sent = True
+        else:
+            if not message_item_opened:
+                for line in _open_message_item():
+                    yield line
+            yield _emit_delta(remaining_collab)
+            full_text.append(remaining_collab)
+            content_sent = True
 
     if tool_acc.has_incomplete:
         logger.warning("Incomplete tool_use blocks at stream end: %s", tool_acc.incomplete_keys)
 
     # --- Finalization ---
 
-    # No content received.  Don't yield a failed event here: the caller may
-    # still need to emit function_call + requires_action (AskUserQuestion hook
-    # path).  Signal "empty" via stream_result and let the route decide.
-    if not content_sent:
+    # No content received AND no reasoning emitted.  Don't yield a failed event
+    # here: the caller may still need to emit function_call + requires_action
+    # (AskUserQuestion hook path).  Signal "empty" via stream_result and let
+    # the route decide.  When reasoning was emitted (thinking-only response),
+    # we still need to close the stream cleanly with an empty message item.
+    if not content_sent and not thinking_seen:
         logger.info("Responses stream: no text content yielded")
         stream_result["success"] = False
         stream_result["empty"] = True
         return
-
-    # Emit closing events for successful stream
-    final_text = "".join(full_text)
 
     # Close reasoning if it's still open (stream ended without exiting thinking).
     if reasoning_open:
         for line in _close_reasoning():
             yield line
 
+    # Emit closing events for successful stream
+    final_text = "".join(full_text)
+
     # Ensure the message item has been announced (consumer always sees one).
     if not message_item_opened:
         for line in _open_message_item():
             yield line
+
+    # Flush any text deltas that were buffered while reasoning was in flight.
+    for delta in text_delta_buffer:
+        yield _emit_delta(delta)
+    text_delta_buffer.clear()
 
     # response.output_text.done
     yield make_response_sse(

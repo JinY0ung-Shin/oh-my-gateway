@@ -1411,3 +1411,113 @@ async def test_stream_closes_reasoning_with_accumulated_text():
     # Message lands at output_index=1 (reasoning was at 0)
     _, msg_added = events[msg_added_idx]
     assert msg_added["output_index"] == 1
+
+
+async def test_stream_two_thinking_blocks_get_separate_reasoning_items():
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    def think_start(idx):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+
+    def think_delta(idx, t):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": idx,
+            "delta": {"type": "thinking_delta", "thinking": t},
+        }}
+
+    def text_start(idx):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "text", "text": ""},
+        }}
+
+    def text_delta(idx, t):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": idx,
+            "delta": {"type": "text_delta", "text": t},
+        }}
+
+    def stop(idx):
+        return {"type": "stream_event", "event": {"type": "content_block_stop", "index": idx}}
+
+    async def chunk_source():
+        yield think_start(0)
+        yield think_delta(0, "a")
+        yield stop(0)
+        yield text_start(1)
+        yield text_delta(1, "X")
+        yield stop(1)
+        yield think_start(2)
+        yield think_delta(2, "b")
+        yield stop(2)
+        yield text_start(3)
+        yield text_delta(3, "Y")
+        yield stop(3)
+        yield {"subtype": "success", "result": "XY"}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    reasoning_added = [p for t, p in events
+                       if t == "response.output_item.added" and p["item"]["type"] == "reasoning"]
+    assert len(reasoning_added) == 2
+    # The two reasoning items must have DIFFERENT output_index values.
+    indices = [p["output_index"] for p in reasoning_added]
+    assert indices[0] != indices[1]
+    # Message item must come after both reasoning items.
+    msg_added = next(p for t, p in events
+                     if t == "response.output_item.added" and p["item"]["type"] == "message")
+    assert msg_added["output_index"] > max(indices)
+
+
+async def test_stream_thinking_only_emits_empty_message_item():
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "thoughts"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"subtype": "success", "result": ""}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    types = [t for t, _ in events]
+    # Reasoning item should be closed (output_item.done with item.type=reasoning).
+    assert any(t == "response.output_item.done" and p["item"]["type"] == "reasoning"
+               for t, p in events)
+    # Message item should still be emitted, with output_index=1 (after the reasoning at 0).
+    msg_added = next(p for t, p in events
+                     if t == "response.output_item.added" and p["item"]["type"] == "message")
+    assert msg_added["output_index"] == 1
+    msg_done = next(p for t, p in events
+                    if t == "response.output_item.done" and p["item"]["type"] == "message")
+    assert msg_done is not None
+    assert types[-1] == "response.completed"
