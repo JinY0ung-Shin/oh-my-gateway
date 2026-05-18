@@ -401,3 +401,34 @@ def test_build_completed_response_no_thinking_texts_preserves_existing_shape():
     )
     assert [item.type for item in resp.output] == ["message"]
     assert resp.output[0].content[0].text == "hello"
+
+
+def test_build_completed_response_strips_think_tags_from_message_text():
+    """Even if assistant_text contains <think>...</think> wrappers (from the
+    parse_message fallback), the message output_item must not include them.
+    Thinking content belongs only in the reasoning items."""
+    from src.routes.responses import _build_completed_response
+
+    raw_text = "<think>SECRET_REASONING</think>The answer is 42."
+    resp = _build_completed_response(
+        "resp_1",
+        "m",
+        raw_text,
+        {},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=["SECRET_REASONING"],
+    )
+
+    # The reasoning item carries the thinking.
+    reasoning_items = [it for it in resp.output if it.type == "reasoning"]
+    assert reasoning_items and reasoning_items[0].summary[0].text == "SECRET_REASONING"
+
+    # The message item must NOT carry <think>...</think> or its inner content.
+    message_items = [it for it in resp.output if it.type == "message"]
+    assert message_items
+    msg_text = message_items[0].content[0].text
+    assert "<think>" not in msg_text
+    assert "</think>" not in msg_text
+    assert "SECRET_REASONING" not in msg_text
+    assert "The answer is 42." in msg_text
