@@ -68,3 +68,6 @@ working_dir/
 # Persisted runtime data
 data/
 .worktrees/
+
+# Local build/install scripts
+copr/
