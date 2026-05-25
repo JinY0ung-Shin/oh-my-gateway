@@ -167,6 +167,26 @@ def test_dockerfile_allows_apt_mirror_override():
     assert "docker/apt_mirror_sources.sh" in dockerfile
 
 
+def test_dockerfiles_run_generic_build_install_hook():
+    """Corporate builds should be able to run a local script without naming it."""
+    dockerfile = (ROOT / "Dockerfile").read_text()
+    codex_dockerfile = (ROOT / "Dockerfile.codex").read_text()
+
+    expected = (
+        "RUN --mount=type=secret,id=gateway_build_install_script,"
+        "target=/tmp/gateway-build-install.sh"
+    )
+
+    assert "gateway_build_install_script" in dockerfile
+    assert expected in dockerfile
+    assert "GATEWAY_BUILD_INSTALL_SCRIPT" in dockerfile
+    assert "ARG GATEWAY_BUILD_INSTALL_CACHE_BUST=" in dockerfile
+    assert "gateway_build_install_script" in codex_dockerfile
+    assert expected in codex_dockerfile
+    assert "GATEWAY_BUILD_INSTALL_SCRIPT" in codex_dockerfile
+    assert "ARG GATEWAY_BUILD_INSTALL_CACHE_BUST=" in codex_dockerfile
+
+
 def test_apt_mirror_rewrite_uses_security_mirror_without_main_mirror(tmp_path):
     """APT_SECURITY_MIRROR_URL should work even when APT_MIRROR_URL is unset."""
     updated = _rewrite_apt_sources(
@@ -214,6 +234,25 @@ def test_compose_forwards_corporate_build_mirror_args():
     assert "- OPENCODE_VERSION" in compose
     assert "- PIP_INDEX_URL" in compose
     assert "- PIP_EXTRA_INDEX_URL" in compose
+    assert "- GATEWAY_BUILD_INSTALL_CACHE_BUST" in compose
+
+
+def test_compose_provides_generic_build_install_hook():
+    """Compose should expose a product-neutral build install script hook."""
+    compose = (ROOT / "docker-compose.yml").read_text()
+    codex_compose = (ROOT / "docker-compose.codex.yml").read_text()
+    env_example = (ROOT / ".env.example").read_text()
+
+    expected_secret = (
+        "file: ${GATEWAY_BUILD_INSTALL_SCRIPT:-./docker/noop_build_install.sh}"
+    )
+
+    assert "- gateway_build_install_script" in compose
+    assert expected_secret in compose
+    assert "- gateway_build_install_script" in codex_compose
+    assert expected_secret in codex_compose
+    assert "GATEWAY_BUILD_INSTALL_SCRIPT=" in env_example
+    assert "GATEWAY_BUILD_INSTALL_CACHE_BUST=" in env_example
 
 
 def test_compose_mounts_host_ca_bundle_with_debian_default_path():

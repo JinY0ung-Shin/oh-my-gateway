@@ -17,6 +17,9 @@ services:
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
         - PIP_TRUSTED_HOST
+        - GATEWAY_BUILD_INSTALL_CACHE_BUST
+      secrets:
+        - gateway_build_install_script
     depends_on:
       gateway-log:
         condition: service_healthy
@@ -73,3 +76,7 @@ services:
 
 volumes:
   codex_home:
+
+secrets:
+  gateway_build_install_script:
+    file: ${GATEWAY_BUILD_INSTALL_SCRIPT:-./docker/noop_build_install.sh}

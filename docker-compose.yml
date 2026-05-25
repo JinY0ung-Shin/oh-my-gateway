@@ -23,6 +23,9 @@ services:
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
         - PIP_TRUSTED_HOST
+        - GATEWAY_BUILD_INSTALL_CACHE_BUST
+      secrets:
+        - gateway_build_install_script
     # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
     # before starting the gateway, so the usage-log engine can connect on first
     # try.  ``required: false`` (Compose v2.20+) keeps the gateway runnable
@@ -104,3 +107,7 @@ volumes:
   # Inspect with: docker volume inspect claude-code-openai-wrapper_claude_home
   # Wipe with:    docker compose down -v   (or: docker volume rm <name>)
   claude_home:
+
+secrets:
+  gateway_build_install_script:
+    file: ${GATEWAY_BUILD_INSTALL_SCRIPT:-./docker/noop_build_install.sh}

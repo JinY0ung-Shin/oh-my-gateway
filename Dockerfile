@@ -1,3 +1,5 @@
+# syntax=docker/dockerfile:1.7
+
 FROM python:3.12-slim-trixie AS opencode-builder
 
 ARG APT_MIRROR_URL=
@@ -78,6 +80,14 @@ COPY docs/*system-prompt*.md ./docs/
 # Optional GitHub plugin auto-install on container start (see CLAUDE_PLUGIN_* env vars).
 COPY docker/install_plugins.sh /usr/local/bin/install_plugins.sh
 RUN chmod +x /usr/local/bin/install_plugins.sh
+
+# Optional build-time install hook for private/corporate additions. Compose
+# supplies a no-op script by default; set GATEWAY_BUILD_INSTALL_SCRIPT to run
+# a local script without committing it to this repository.
+ARG GATEWAY_BUILD_INSTALL_CACHE_BUST=
+RUN --mount=type=secret,id=gateway_build_install_script,target=/tmp/gateway-build-install.sh \
+    echo "$GATEWAY_BUILD_INSTALL_CACHE_BUST" >/dev/null \
+    && bash /tmp/gateway-build-install.sh
 
 # Startup shim repairs writable bind mounts while still root, then drops to the
 # unprivileged app uid before running the server.

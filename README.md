@@ -166,6 +166,18 @@ PIP_INDEX_URL=https://pypi.example.com/simple/ \
 docker compose build
 ```
 
+To run a local corporate install script during the image build without checking
+it into this repository, point Compose at the script path:
+
+```bash
+GATEWAY_BUILD_INSTALL_SCRIPT=/opt/company/install_gateway_addons.sh \
+docker compose build
+```
+
+BuildKit does not include secret contents in the cache key. If the script
+changes, rebuild with `docker compose build --no-cache` or set
+`GATEWAY_BUILD_INSTALL_CACHE_BUST` to a new non-secret value.
+
 The Docker image is pinned to Debian trixie. OpenCode is installed from npm as
 `opencode-ai@${OPENCODE_VERSION:-1.14.29}`; mirror that package plus the
 matching platform package such as `opencode-linux-x64` or
