@@ -69,6 +69,7 @@ working_dir/
 
 # Persisted runtime data
 data/
+workspaces/
 .worktrees/
 
 # Local build/install scripts
