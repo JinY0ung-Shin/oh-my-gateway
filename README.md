@@ -185,8 +185,8 @@ should own that backend's runtime.
 
 For an OpenCode-only deployment, use the separate Compose file. It builds
 `Dockerfile.opencode`, installs `opencode-ai@${OPENCODE_VERSION:-1.14.29}`,
-forces `BACKENDS=opencode`, and persists OpenCode config and state in named
-Docker volumes:
+forces `BACKENDS=opencode`, defaults `OPENCODE_MODELS` to `openai/gpt-5.5`,
+and persists OpenCode config and state in named Docker volumes:
 
 ```bash
 docker compose -f docker-compose.opencode.yml up -d --build

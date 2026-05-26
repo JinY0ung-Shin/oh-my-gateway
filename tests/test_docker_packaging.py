@@ -108,6 +108,8 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     mysql_dir = data_dir / "mysql_data"
     claude_home = tmp_path / ".claude"
     codex_home = tmp_path / ".codex"
+    opencode_home = tmp_path / ".local" / "share" / "opencode"
+    opencode_config = tmp_path / ".config" / "opencode"
 
     prompts_dir.mkdir(parents=True)
     mysql_dir.mkdir()
@@ -133,6 +135,8 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
         data_dir=data_dir,
         claude_home=claude_home,
         codex_home=codex_home,
+        opencode_home=opencode_home,
+        opencode_config=opencode_config,
     )
 
     assert data_dir in chowned
@@ -142,6 +146,8 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     assert claude_home.parent in chowned
     assert claude_home in chowned
     assert codex_home in chowned
+    assert opencode_home in chowned
+    assert opencode_config in chowned
     assert mysql_dir not in chowned
     assert mysql_file not in chowned
 
@@ -330,6 +336,7 @@ def test_opencode_compose_enables_opencode_backend_and_state_volume():
         "- DEFAULT_MODEL=${OPENCODE_DEFAULT_GATEWAY_MODEL:-opencode/openai/gpt-5.5}"
         in compose
     )
+    assert "- OPENCODE_MODELS=${OPENCODE_MODELS:-openai/gpt-5.5}" in compose
     assert "- OPENCODE_HOME=/home/app/.local/share/opencode" in compose
     assert "- opencode_home:/home/app/.local/share/opencode" in compose
     assert "- opencode_config:/home/app/.config/opencode" in compose

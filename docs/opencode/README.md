@@ -91,9 +91,10 @@ docker compose -f docker-compose.opencode.yml up -d --build
 ```
 
 `docker-compose.opencode.yml` builds `Dockerfile.opencode`, installs
-`opencode-ai@${OPENCODE_VERSION:-1.14.29}`, forces `BACKENDS=opencode`, and
-stores OpenCode config + state in the `opencode_home` and `opencode_config`
-named volumes (XDG paths under `/home/app`).
+`opencode-ai@${OPENCODE_VERSION:-1.14.29}`, forces `BACKENDS=opencode`,
+defaults `OPENCODE_MODELS` to `openai/gpt-5.5`, and stores OpenCode config +
+state in the `opencode_home` and `opencode_config` named volumes (XDG paths
+under `/home/app`).
 
 Use `OPENCODE_DEFAULT_GATEWAY_MODEL` to set the gateway's default model in
 this container without reusing a Claude-oriented `DEFAULT_MODEL` from `.env`.
