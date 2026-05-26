@@ -110,6 +110,7 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     codex_home = tmp_path / ".codex"
     opencode_home = tmp_path / ".local" / "share" / "opencode"
     opencode_config = tmp_path / ".config" / "opencode"
+    uv_cache_dir = tmp_path / ".cache" / "uv"
 
     prompts_dir.mkdir(parents=True)
     mysql_dir.mkdir()
@@ -137,6 +138,7 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
         codex_home=codex_home,
         opencode_home=opencode_home,
         opencode_config=opencode_config,
+        uv_cache_dir=uv_cache_dir,
     )
 
     assert data_dir in chowned
@@ -146,8 +148,13 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     assert claude_home.parent in chowned
     assert claude_home in chowned
     assert codex_home in chowned
+    assert opencode_home.parent.parent in chowned
+    assert opencode_home.parent in chowned
     assert opencode_home in chowned
+    assert opencode_config.parent in chowned
     assert opencode_config in chowned
+    assert uv_cache_dir.parent in chowned
+    assert uv_cache_dir in chowned
     assert mysql_dir not in chowned
     assert mysql_file not in chowned
 
