@@ -60,8 +60,13 @@ services:
       # falls back to ./working_dir. Container path stays fixed so the
       # CLAUDE_CWD override below is always valid.
       - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
-      # Optional: Mount a specific workspace directory
-      # - ./workspace:/workspace
+      # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
+      # to the host so individual users' state survives container recreates.
+      # Activate by setting USER_WORKSPACES_DIR=/data/workspaces in .env; the
+      # bind mount itself is always present so the path exists either way.
+      # Override the host path with USER_WORKSPACES_HOST_DIR if you want it
+      # somewhere other than ./workspaces.
+      - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     # All runtime configuration comes from .env (see .env.example for the full list).
     env_file:
       - .env
