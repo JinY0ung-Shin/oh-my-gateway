@@ -19,7 +19,6 @@ services:
         - APT_MIRROR_URL
         - APT_SECURITY_MIRROR_URL
         - NPM_CONFIG_REGISTRY
-        - OPENCODE_VERSION
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
         - PIP_TRUSTED_HOST

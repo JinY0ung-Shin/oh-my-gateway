@@ -27,7 +27,9 @@ APT_SOURCES = textwrap.dedent(
 
 
 def _final_docker_stage(dockerfile: str) -> str:
-    return "FROM " + dockerfile.rsplit("\nFROM ", 1)[1]
+    if "\nFROM " in dockerfile:
+        return "FROM " + dockerfile.rsplit("\nFROM ", 1)[1]
+    return dockerfile
 
 
 def _load_docker_entrypoint():
@@ -59,9 +61,9 @@ def _rewrite_apt_sources(tmp_path: Path, **env_overrides: str) -> str:
     return sources.read_text()
 
 
-def test_dockerfile_installs_opencode_binary_for_managed_mode():
-    """The gateway image should install managed OpenCode through npm."""
-    dockerfile = (ROOT / "Dockerfile").read_text()
+def test_opencode_dockerfile_installs_opencode_binary_for_managed_mode():
+    """The OpenCode-specific image should install managed OpenCode through npm."""
+    dockerfile = (ROOT / "Dockerfile.opencode").read_text()
 
     assert "FROM python:3.12-slim-trixie AS opencode-builder" in dockerfile
     assert "ARG OPENCODE_VERSION=" in dockerfile
@@ -75,6 +77,15 @@ def test_dockerfile_installs_opencode_binary_for_managed_mode():
     )
     assert "https://opencode.ai/install" not in dockerfile
     assert "opencode --version" in dockerfile
+
+
+def test_default_dockerfile_does_not_install_opencode():
+    """Default image is Claude-only; OpenCode lives in Dockerfile.opencode."""
+    dockerfile = (ROOT / "Dockerfile").read_text()
+
+    assert "opencode-builder" not in dockerfile
+    assert "opencode-ai" not in dockerfile
+    assert "nodejs npm" not in dockerfile
 
 
 def test_dockerfile_uses_entrypoint_for_bind_mount_permissions():
@@ -97,6 +108,9 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     mysql_dir = data_dir / "mysql_data"
     claude_home = tmp_path / ".claude"
     codex_home = tmp_path / ".codex"
+    opencode_home = tmp_path / ".local" / "share" / "opencode"
+    opencode_config = tmp_path / ".config" / "opencode"
+    uv_cache_dir = tmp_path / ".cache" / "uv"
 
     prompts_dir.mkdir(parents=True)
     mysql_dir.mkdir()
@@ -122,6 +136,9 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
         data_dir=data_dir,
         claude_home=claude_home,
         codex_home=codex_home,
+        opencode_home=opencode_home,
+        opencode_config=opencode_config,
+        uv_cache_dir=uv_cache_dir,
     )
 
     assert data_dir in chowned
@@ -131,6 +148,13 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     assert claude_home.parent in chowned
     assert claude_home in chowned
     assert codex_home in chowned
+    assert opencode_home.parent.parent in chowned
+    assert opencode_home.parent in chowned
+    assert opencode_home in chowned
+    assert opencode_config.parent in chowned
+    assert opencode_config in chowned
+    assert uv_cache_dir.parent in chowned
+    assert uv_cache_dir in chowned
     assert mysql_dir not in chowned
     assert mysql_file not in chowned
 
@@ -145,9 +169,9 @@ def test_docker_entrypoint_rejects_root_runtime_uid(monkeypatch):
         entrypoint._parse_id("APP_UID", 1000)
 
 
-def test_final_docker_stage_does_not_keep_node_or_npm():
-    """The runtime image should keep the OpenCode binary, not npm tooling."""
-    dockerfile = (ROOT / "Dockerfile").read_text()
+def test_opencode_final_docker_stage_does_not_keep_node_or_npm():
+    """The OpenCode runtime stage should keep the OpenCode binary, not npm tooling."""
+    dockerfile = (ROOT / "Dockerfile.opencode").read_text()
     final_stage = _final_docker_stage(dockerfile)
 
     assert "nodejs npm" not in final_stage
@@ -171,20 +195,18 @@ def test_dockerfiles_run_generic_build_install_hook():
     """Corporate builds should be able to run a local script without naming it."""
     dockerfile = (ROOT / "Dockerfile").read_text()
     codex_dockerfile = (ROOT / "Dockerfile.codex").read_text()
+    opencode_dockerfile = (ROOT / "Dockerfile.opencode").read_text()
 
     expected = (
         "RUN --mount=type=secret,id=gateway_build_install_script,"
         "target=/tmp/gateway-build-install.sh"
     )
 
-    assert "gateway_build_install_script" in dockerfile
-    assert expected in dockerfile
-    assert "GATEWAY_BUILD_INSTALL_SCRIPT" in dockerfile
-    assert "ARG GATEWAY_BUILD_INSTALL_CACHE_BUST=" in dockerfile
-    assert "gateway_build_install_script" in codex_dockerfile
-    assert expected in codex_dockerfile
-    assert "GATEWAY_BUILD_INSTALL_SCRIPT" in codex_dockerfile
-    assert "ARG GATEWAY_BUILD_INSTALL_CACHE_BUST=" in codex_dockerfile
+    for variant in (dockerfile, codex_dockerfile, opencode_dockerfile):
+        assert "gateway_build_install_script" in variant
+        assert expected in variant
+        assert "GATEWAY_BUILD_INSTALL_SCRIPT" in variant
+        assert "ARG GATEWAY_BUILD_INSTALL_CACHE_BUST=" in variant
 
 
 def test_apt_mirror_rewrite_uses_security_mirror_without_main_mirror(tmp_path):
@@ -231,7 +253,9 @@ def test_compose_forwards_corporate_build_mirror_args():
     assert "- APT_MIRROR_URL" in compose
     assert "- APT_SECURITY_MIRROR_URL" in compose
     assert "- NPM_CONFIG_REGISTRY" in compose
-    assert "- OPENCODE_VERSION" in compose
+    # OPENCODE_VERSION is consumed by Dockerfile.opencode, not the Claude-only
+    # default image, so the main compose intentionally omits it.
+    assert "- OPENCODE_VERSION" not in compose
     assert "- PIP_INDEX_URL" in compose
     assert "- PIP_EXTRA_INDEX_URL" in compose
     assert "- GATEWAY_BUILD_INSTALL_CACHE_BUST" in compose
@@ -241,16 +265,16 @@ def test_compose_provides_generic_build_install_hook():
     """Compose should expose a product-neutral build install script hook."""
     compose = (ROOT / "docker-compose.yml").read_text()
     codex_compose = (ROOT / "docker-compose.codex.yml").read_text()
+    opencode_compose = (ROOT / "docker-compose.opencode.yml").read_text()
     env_example = (ROOT / ".env.example").read_text()
 
     expected_secret = (
         "file: ${GATEWAY_BUILD_INSTALL_SCRIPT:-./docker/noop_build_install.sh}"
     )
 
-    assert "- gateway_build_install_script" in compose
-    assert expected_secret in compose
-    assert "- gateway_build_install_script" in codex_compose
-    assert expected_secret in codex_compose
+    for variant in (compose, codex_compose, opencode_compose):
+        assert "- gateway_build_install_script" in variant
+        assert expected_secret in variant
     assert "GATEWAY_BUILD_INSTALL_SCRIPT=" in env_example
     assert "GATEWAY_BUILD_INSTALL_CACHE_BUST=" in env_example
 
@@ -306,3 +330,22 @@ def test_codex_compose_enables_codex_backend_and_state_volume():
     assert "- CODEX_HOME=/home/app/.codex" in compose
     assert "- codex_home:/home/app/.codex" in compose
     assert "codex_home:" in compose
+
+
+def test_opencode_compose_enables_opencode_backend_and_state_volume():
+    """OpenCode Compose should run an OpenCode-only gateway with persistent state."""
+    compose = (ROOT / "docker-compose.opencode.yml").read_text()
+
+    assert "dockerfile: Dockerfile.opencode" in compose
+    assert "- OPENCODE_VERSION" in compose
+    assert "- BACKENDS=opencode" in compose
+    assert (
+        "- DEFAULT_MODEL=${OPENCODE_DEFAULT_GATEWAY_MODEL:-opencode/openai/gpt-5.5}"
+        in compose
+    )
+    assert "- OPENCODE_MODELS=${OPENCODE_MODELS:-openai/gpt-5.5}" in compose
+    assert "- OPENCODE_HOME=/home/app/.local/share/opencode" in compose
+    assert "- opencode_home:/home/app/.local/share/opencode" in compose
+    assert "- opencode_config:/home/app/.config/opencode" in compose
+    assert "opencode_home:" in compose
+    assert "opencode_config:" in compose
