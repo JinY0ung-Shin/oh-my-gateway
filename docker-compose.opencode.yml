@@ -1,0 +1,80 @@
+services:
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile.opencode
+      args:
+        - HTTP_PROXY
+        - HTTPS_PROXY
+        - NO_PROXY
+        - http_proxy
+        - https_proxy
+        - no_proxy
+        - APT_MIRROR_URL
+        - APT_SECURITY_MIRROR_URL
+        - NPM_CONFIG_REGISTRY
+        - OPENCODE_VERSION
+        - PIP_INDEX_URL
+        - PIP_EXTRA_INDEX_URL
+        - PIP_TRUSTED_HOST
+        - GATEWAY_BUILD_INSTALL_CACHE_BUST
+      secrets:
+        - gateway_build_install_script
+    depends_on:
+      gateway-log:
+        condition: service_healthy
+        required: false
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      # Persist OpenCode config + state (XDG paths under HOME).
+      - opencode_home:/home/app/.local/share/opencode
+      - opencode_config:/home/app/.config/opencode
+      # Share the host CA bundle with the container for corporate roots.
+      - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
+      # Persist admin overrides across restarts.
+      - ./data:/app/data
+      # Gateway workspaces. The workspace manager is shared across backends and
+      # still keys off CLAUDE_CWD internally.
+      - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
+    env_file:
+      - .env
+    environment:
+      - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
+      - BACKENDS=opencode
+      - DEFAULT_MODEL=${OPENCODE_DEFAULT_GATEWAY_MODEL:-opencode/openai/gpt-5.5}
+      - OPENCODE_BIN=opencode
+      - OPENCODE_HOME=/home/app/.local/share/opencode
+      - CLAUDE_CWD=/app/working_dir
+
+  gateway-log:
+    profiles: ["logging"]
+    image: mysql:8.0
+    container_name: gateway-log
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    ports:
+      - "${GATEWAY_LOG_PORT:-3306}:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: ${GATEWAY_LOG_MYSQL_ROOT_PASSWORD:-gateway_root}
+      MYSQL_DATABASE: ${GATEWAY_LOG_MYSQL_DATABASE:-gateway_log}
+      MYSQL_USER: ${GATEWAY_LOG_MYSQL_USER:-gateway}
+      MYSQL_PASSWORD: ${GATEWAY_LOG_MYSQL_PASSWORD:-gateway}
+    volumes:
+      - ./data/mysql_data:/var/lib/mysql
+      - ./docker/mysql_init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-p${GATEWAY_LOG_MYSQL_ROOT_PASSWORD:-gateway_root}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  opencode_home:
+  opencode_config:
+
+secrets:
+  gateway_build_install_script:
+    file: ${GATEWAY_BUILD_INSTALL_SCRIPT:-./docker/noop_build_install.sh}

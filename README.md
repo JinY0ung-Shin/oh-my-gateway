@@ -178,8 +178,21 @@ BuildKit does not include secret contents in the cache key. If the script
 changes, rebuild with `docker compose build --no-cache` or set
 `GATEWAY_BUILD_INSTALL_CACHE_BUST` to a new non-secret value.
 
-The Docker image is pinned to Debian trixie. OpenCode is installed from npm as
-`opencode-ai@${OPENCODE_VERSION:-1.14.29}`; mirror that package plus the
+The Docker image is pinned to Debian trixie. The default `Dockerfile` /
+`docker-compose.yml` builds a Claude-only image and does not install OpenCode
+or Codex; pick a backend-specific Compose file when the gateway container
+should own that backend's runtime.
+
+For an OpenCode-only deployment, use the separate Compose file. It builds
+`Dockerfile.opencode`, installs `opencode-ai@${OPENCODE_VERSION:-1.14.29}`,
+forces `BACKENDS=opencode`, and persists OpenCode config and state in named
+Docker volumes:
+
+```bash
+docker compose -f docker-compose.opencode.yml up -d --build
+```
+
+When mirroring on corporate networks, host the `opencode-ai` package plus the
 matching platform package such as `opencode-linux-x64` or
 `opencode-linux-arm64`.
 

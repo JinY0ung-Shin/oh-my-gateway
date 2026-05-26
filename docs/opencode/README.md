@@ -78,6 +78,26 @@ curl http://localhost:8000/v1/responses \
 
 Full walkthrough: [external.md](external.md).
 
+## Docker Compose (OpenCode-only image)
+
+The default `docker-compose.yml` builds a Claude-only image. For an
+OpenCode-only deployment that owns the `opencode` CLI inside the gateway
+container, use the separate Compose file:
+
+```bash
+cp .env.example .env
+# set ADMIN_API_KEY and your OpenCode provider credentials
+docker compose -f docker-compose.opencode.yml up -d --build
+```
+
+`docker-compose.opencode.yml` builds `Dockerfile.opencode`, installs
+`opencode-ai@${OPENCODE_VERSION:-1.14.29}`, forces `BACKENDS=opencode`, and
+stores OpenCode config + state in the `opencode_home` and `opencode_config`
+named volumes (XDG paths under `/home/app`).
+
+Use `OPENCODE_DEFAULT_GATEWAY_MODEL` to set the gateway's default model in
+this container without reusing a Claude-oriented `DEFAULT_MODEL` from `.env`.
+
 ## Model id format
 
 The gateway recognises any `model` field starting with `opencode/`:
