@@ -97,11 +97,12 @@ COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py
 # The entrypoint starts as root only long enough to repair Docker bind-mount
 # permissions for gateway-owned data, then drops to APP_UID/APP_GID.
 RUN useradd -m -u 1000 -s /bin/bash app \
-    && mkdir -p /app/data /app/working_dir /home/app/.claude \
+    && mkdir -p /app/data /app/working_dir /home/app/.claude /home/app/.cache/uv \
     && chown -R app:app /app /home/app
 ENV HOME=/home/app \
     APP_UID=1000 \
-    APP_GID=1000
+    APP_GID=1000 \
+    UV_CACHE_DIR=/home/app/.cache/uv
 
 # Expose the port (default 8000; overridable via PORT env var at runtime).
 EXPOSE 8000
