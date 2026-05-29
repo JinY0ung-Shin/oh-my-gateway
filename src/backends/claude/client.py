@@ -43,8 +43,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
-from src.backends.common import error_chunk
-from src.backends.common import estimate_token_usage as estimate_backend_token_usage
+from src.backends.common import TokenEstimateMixin, error_chunk
 from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
@@ -98,7 +97,7 @@ class UnsupportedContinuationPolicy(ValueError):
     """
 
 
-class ClaudeCodeCLI:
+class ClaudeCodeCLI(TokenEstimateMixin):
     """Gateway for Claude Agent SDK queries.
 
     Implements the ``BackendClient`` protocol defined in
@@ -876,12 +875,6 @@ class ClaudeCodeCLI:
 
     # Backward-compatible alias — existing code calls parse_claude_message().
     parse_claude_message = parse_message
-
-    def estimate_token_usage(
-        self, prompt: str, completion: str, _model: Optional[str] = None
-    ) -> Dict[str, int]:
-        """Estimate token usage (~4 characters per token)."""
-        return estimate_backend_token_usage(prompt, completion)
 
     def _cleanup_temp_dir(self):
         """Clean up temporary directory on exit."""

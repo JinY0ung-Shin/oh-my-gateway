@@ -62,3 +62,18 @@ def estimate_token_usage(prompt: str, completion: str) -> Dict[str, int]:
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
     }
+
+
+class TokenEstimateMixin:
+    """Provides the shared ``estimate_token_usage`` implementation.
+
+    Every backend client delegates token estimation to the module-level
+    :func:`estimate_token_usage` heuristic; inheriting this mixin keeps that
+    single implementation in one place instead of three identical wrappers.
+    """
+
+    def estimate_token_usage(
+        self, prompt: str, completion: str, model: Optional[str] = None
+    ) -> Dict[str, int]:
+        _ = model  # signature parity with the BackendClient protocol; unused
+        return estimate_token_usage(prompt, completion)

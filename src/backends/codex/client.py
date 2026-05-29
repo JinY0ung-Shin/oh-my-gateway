@@ -30,11 +30,12 @@ from src.backends.codex.constants import (
     disallowed_tools_from_env,
     sandbox_mode,
 )
+from src.backends.base import SessionHandle
 from src.backends.common import (
+    TokenEstimateMixin,
     combine_system_prompt,
     completion_chunks,
     error_chunk,
-    estimate_token_usage as estimate_backend_token_usage,
 )
 from src.constants import DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
@@ -397,7 +398,7 @@ class CodexJsonRpcClient:
 
 
 @dataclass
-class CodexSessionClient:
+class CodexSessionClient(SessionHandle):
     """Handle for one gateway session mapped to one Codex thread."""
 
     rpc: CodexJsonRpcClient
@@ -425,7 +426,7 @@ class CodexSessionClient:
             await asyncio.to_thread(self.rpc.close)
 
 
-class CodexClient:
+class CodexClient(TokenEstimateMixin):
     """BackendClient implementation for local Codex app-server."""
 
     _combine_system_prompt = staticmethod(combine_system_prompt)
@@ -1584,12 +1585,3 @@ class CodexClient:
                 if text:
                     parts.append(text)
         return "\n".join(parts) if parts else None
-
-    def estimate_token_usage(
-        self,
-        prompt: str,
-        completion: str,
-        model: Optional[str] = None,
-    ) -> Dict[str, int]:
-        _ = model
-        return estimate_backend_token_usage(prompt, completion)

@@ -61,6 +61,22 @@ class BackendDescriptor:
 
 
 # ---------------------------------------------------------------------------
+# Session handle protocol
+# ---------------------------------------------------------------------------
+
+
+class SessionHandle(Protocol):
+    """Per-session handle returned by ``BackendClient.create_client``.
+
+    Each backend keeps its own concrete handle (e.g. ``OpenCodeSessionClient``,
+    ``CodexSessionClient``); the only shared contract is that the gateway can
+    release it on cleanup via ``disconnect()``.
+    """
+
+    async def disconnect(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
 # BackendClient protocol
 # ---------------------------------------------------------------------------
 
