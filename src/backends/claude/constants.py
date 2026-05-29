@@ -115,8 +115,8 @@ DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.str
 # Only affects Bash commands; Read/Edit/Write access is controlled by SDK permission rules.
 #
 # Tri-state: unset = respect project-level settings, true = force enable, false = force disable.
-_SANDBOX_VALID_TRUE = {"true", "1", "yes"}
-_SANDBOX_VALID_FALSE = {"false", "0", "no"}
+_SANDBOX_VALID_TRUE = {"true", "1", "yes", "on"}
+_SANDBOX_VALID_FALSE = {"false", "0", "no", "off"}
 _SANDBOX_VALID_ALL = _SANDBOX_VALID_TRUE | _SANDBOX_VALID_FALSE
 
 _sandbox_raw = os.getenv("CLAUDE_SANDBOX_ENABLED")

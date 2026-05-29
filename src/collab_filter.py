@@ -72,6 +72,9 @@ class CollabJsonStreamFilter:
         self._depth = 0
         self._in_string = False
         self._escape_next = False
+        # True while buffering but the first non-whitespace char after the
+        # opening '{' has not yet been seen.
+        self._awaiting_first_char = False
 
     @property
     def buffering(self) -> bool:
@@ -84,6 +87,19 @@ class CollabJsonStreamFilter:
         for ch in text:
             if self._buf:
                 self._buf += ch
+                # Collab blocks always start with a quoted key
+                # (see _COLLAB_MARKERS).  As soon as the first non-whitespace
+                # character after the opening '{' is known, if it is not a
+                # quote this block cannot be collab JSON: flush the buffer as
+                # plain output immediately so legitimate prose braces stream
+                # without stalling until the size cap.  No collab block can be
+                # mis-stripped because real collab JSON always begins with '"'.
+                if self._awaiting_first_char and not ch.isspace():
+                    self._awaiting_first_char = False
+                    if ch != '"':
+                        output.append(self._buf)
+                        self._reset()
+                        continue
                 if self._escape_next:
                     self._escape_next = False
                 elif ch == "\\" and self._in_string:
@@ -121,6 +137,7 @@ class CollabJsonStreamFilter:
                     self._depth = 1
                     self._in_string = False
                     self._escape_next = False
+                    self._awaiting_first_char = True
                 else:
                     output.append(ch)
 
@@ -137,3 +154,4 @@ class CollabJsonStreamFilter:
         self._depth = 0
         self._in_string = False
         self._escape_next = False
+        self._awaiting_first_char = False

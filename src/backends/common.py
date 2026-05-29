@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Any, Dict, Iterator, Optional
 
 
 def parse_csv(value: str) -> list[str]:
@@ -23,6 +23,34 @@ def combine_system_prompt(
     if custom_base and system_prompt:
         return f"{custom_base}\n\n{system_prompt}"
     return custom_base or system_prompt
+
+
+def error_chunk(message: str) -> Dict[str, Any]:
+    """Build the shared error chunk emitted by streaming backends."""
+    return {"type": "error", "is_error": True, "error_message": message}
+
+
+def completion_chunks(
+    text: str,
+    usage: Optional[Dict[str, int]] = None,
+) -> Iterator[Dict[str, Any]]:
+    """Yield the terminal assistant + result chunks for a completed turn."""
+    assistant: Dict[str, Any] = {
+        "type": "assistant",
+        "content": [{"type": "text", "text": text}],
+    }
+    result: Dict[str, Any] = {"type": "result", "subtype": "success", "result": text}
+    if usage:
+        assistant["usage"] = {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+        }
+        result["usage"] = {
+            "input_tokens": usage["input_tokens"],
+            "output_tokens": usage["output_tokens"],
+        }
+    yield assistant
+    yield result
 
 
 def estimate_token_usage(prompt: str, completion: str) -> Dict[str, int]:

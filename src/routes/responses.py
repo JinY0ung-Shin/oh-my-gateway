@@ -1241,8 +1241,11 @@ async def create_response(
                         sequence_number=0,
                     )
                     # Commit turn even for requires_action so the next
-                    # function_call_output can reference this response_id
+                    # function_call_output can reference this response_id.
+                    # Record the user prompt too — a paused turn still
+                    # consumed the user's input, so history must reflect it.
                     session.turn_counter = next_turn
+                    session.add_messages([Message(role="user", content=prompt)])
                     stream_result["success"] = True
                 elif stream_result.get("empty"):
                     # Stream ended with no text and no pending tool call —
@@ -1365,7 +1368,10 @@ async def create_response(
             if session.pending_tool_call is not None:
                 tc = session.pending_tool_call
                 resp_id = _make_response_id(session_id, pf.next_turn)
+                # Record the user prompt too — a paused turn still consumed
+                # the user's input, so history must reflect it.
                 session.turn_counter = pf.next_turn
+                session.add_messages([Message(role="user", content=prompt)])
                 return _build_requires_action_response(
                     resp_id, body.model, tc, body.metadata
                 ).model_dump()

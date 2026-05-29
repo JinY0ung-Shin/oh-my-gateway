@@ -106,7 +106,7 @@ async def root():
                 any_valid = True
                 auth_method_parts.append(backend_name)
         except Exception:
-            pass
+            logger.debug("root auth status check failed for %s", backend_name, exc_info=True)
 
     auth_info = {
         "method": ", ".join(auth_method_parts) if auth_method_parts else "none",

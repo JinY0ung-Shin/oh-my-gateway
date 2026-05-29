@@ -32,11 +32,6 @@ DELTA_PRIMARY_BLOCK: Dict[str, str] = {
     "input_json_delta": "tool_use",
 }
 
-# Backward-compatible alias: external callers (tests, etc.) may still reference
-# the old single-value mapping. The new compatibility set above is the source
-# of truth for the sanitizer's split decision.
-DELTA_TO_BLOCK_TYPE: Dict[str, str] = dict(DELTA_PRIMARY_BLOCK)
-
 
 def _is_empty_delta(delta: Dict[str, Any]) -> bool:
     """Return True when a ``content_block_delta`` carries no payload.
@@ -127,7 +122,8 @@ async def sanitize_events(
                 # Drop zero-payload deltas before any split logic runs. See
                 # ``_is_empty_delta`` for why this is unconditionally safe.
                 continue
-            delta_type = delta.get("type")
+            delta_type_raw = delta.get("type")
+            delta_type = delta_type_raw if isinstance(delta_type_raw, str) else ""
             compatible = DELTA_COMPATIBLE_BLOCKS.get(delta_type)
             if compatible is not None and current_block_type not in compatible:
                 # Current block can't validly hold this delta — close it and
@@ -139,7 +135,7 @@ async def sanitize_events(
                 if current_block_type is not None:
                     yield _close_current()
                 current_index += 1
-                primary = DELTA_PRIMARY_BLOCK[delta_type]
+                primary = DELTA_PRIMARY_BLOCK.get(delta_type, "text")
                 current_block_type = primary
                 yield {
                     "type": "content_block_start",

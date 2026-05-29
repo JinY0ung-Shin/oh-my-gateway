@@ -196,7 +196,7 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
     from src.session_manager import session_manager
 
     started_at = getattr(request.app.state, "started_at", None)
-    uptime_seconds = round(time.time() - started_at, 1) if started_at else None
+    uptime_seconds = round(time.time() - started_at, 1) if started_at is not None else None
 
     return {
         "version": __version__,
@@ -851,14 +851,15 @@ async def usage_summary_endpoint(
     """Overview counters for the usage tab."""
     from src.usage_queries import get_summary
 
+    window = max(1, min(window_days, 365))
     data = await get_summary(
-        window_days=max(1, min(window_days, 365)),
+        window_days=window,
         start_date=start_date,
         end_date=end_date,
     )
     if data is None:
         return {"enabled": False}
-    return {"enabled": True, "window_days": window_days, "summary": data}
+    return {"enabled": True, "window_days": window, "summary": data}
 
 
 @router.get("/api/usage/users")

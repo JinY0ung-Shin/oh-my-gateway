@@ -10,7 +10,7 @@ import tempfile
 import atexit
 import shutil
 import contextlib
-from typing import AsyncGenerator, Dict, Any, Optional, List, cast
+from typing import AsyncGenerator, Dict, Any, Literal, Optional, List, cast
 from pathlib import Path
 import logging
 
@@ -43,11 +43,13 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
+from src.backends.common import error_chunk
 from src.backends.common import estimate_token_usage as estimate_backend_token_usage
 from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns
+from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
 
 logger = logging.getLogger(__name__)
@@ -56,16 +58,17 @@ _DEFAULT_SETTING_SOURCES = ["project", "local"]
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
 
 
-def _get_setting_sources() -> List[str]:
+def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
     """Return Claude config sources for SDK calls.
 
     By default the gateway keeps user-level Claude config out of non-Docker
     runs. Docker Compose sets CLAUDE_SETTING_SOURCES=user,project,local so
     user-scope plugins installed at container startup are visible to Claude.
     """
+    SettingSource = Literal["user", "project", "local"]
     raw = os.getenv("CLAUDE_SETTING_SOURCES")
     if raw is None or not raw.strip():
-        return list(_DEFAULT_SETTING_SOURCES)
+        return cast(List[SettingSource], list(_DEFAULT_SETTING_SOURCES))
 
     sources = [part.strip() for part in raw.split(",") if part.strip()]
     invalid = [source for source in sources if source not in _VALID_SETTING_SOURCES]
@@ -75,13 +78,13 @@ def _get_setting_sources() -> List[str]:
             raw,
             ",".join(_DEFAULT_SETTING_SOURCES),
         )
-        return list(_DEFAULT_SETTING_SOURCES)
+        return cast(List[SettingSource], list(_DEFAULT_SETTING_SOURCES))
 
-    deduped = []
+    deduped: List[SettingSource] = []
     seen = set()
     for source in sources:
         if source not in seen:
-            deduped.append(source)
+            deduped.append(cast(SettingSource, source))
             seen.add(source)
     return deduped
 
@@ -203,10 +206,7 @@ class ClaudeCodeCLI:
         if disallowed_tools:
             base_disallowed.extend(disallowed_tools)
         if base_disallowed:
-            seen: set[str] = set()
-            options.disallowed_tools = [
-                t for t in base_disallowed if not (t in seen or seen.add(t))
-            ]
+            options.disallowed_tools = list(dict.fromkeys(base_disallowed))
 
     def _set_allowed_tools(self, options: ClaudeAgentOptions, tools: List[str]) -> None:
         """Set allowed_tools while translating deprecated Skill access."""
@@ -419,6 +419,8 @@ class ClaudeCodeCLI:
         custom_base = self._resolve_custom_base_prompt(_custom_base, effective_cwd)
         self._configure_system_prompt(options, custom_base, system_prompt)
         if permission_mode:
+            # The SDK narrows to a 6-value Literal; the value is validated
+            # upstream (request schema / runtime), so cast at this boundary.
             options.permission_mode = cast(Any, permission_mode)
         if output_format:
             options.output_format = output_format
@@ -642,7 +644,7 @@ class ClaudeCodeCLI:
         *,
         allowed_tools: Optional[List[str]] = None,
         disallowed_tools: Optional[List[str]] = None,
-        permission_mode: Optional[str] = None,
+        permission_mode: Optional[PermissionMode] = None,
         model_params: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Refresh per-request policy on an existing Claude SDK client.
@@ -801,7 +803,7 @@ class ClaudeCodeCLI:
         except Exception as exc:
             logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
             session.client = None
-            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+            yield error_chunk(str(exc))
         finally:
             session.stream_break_event = None
 
@@ -822,7 +824,7 @@ class ClaudeCodeCLI:
         except Exception as exc:
             logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
             session.client = None
-            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+            yield error_chunk(str(exc))
 
     # ------------------------------------------------------------------
     # Response parsing helpers

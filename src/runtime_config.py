@@ -111,15 +111,19 @@ class RuntimeConfig:
 
     def get_all(self) -> Dict[str, Any]:
         """Return all editable keys with their current effective values."""
+        # Snapshot overrides once under a single lock, then compute everything
+        # from the snapshot without re-acquiring the lock per key.
+        with self._lock:
+            overrides = dict(self._overrides)
         result = {}
         for key, meta in EDITABLE_KEYS.items():
-            value = self.get(key)
-            with self._lock:
-                is_overridden = key in self._overrides
+            original = self._get_original(key)
+            is_overridden = key in overrides
+            value = overrides[key] if is_overridden else original
             result[key] = {
                 **meta,
                 "value": value,
-                "original": self._get_original(key),
+                "original": original,
                 "overridden": is_overridden,
             }
         return result

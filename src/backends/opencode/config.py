@@ -34,7 +34,9 @@ def _copy_optional_fields(
             target[field] = copy.deepcopy(source[field])
 
 
-def _command_list(server: Dict[str, Any]) -> list[str]:
+def _command_list(server: Dict[str, Any], name: str = "<unnamed>") -> list[str]:
+    if "command" not in server:
+        raise ValueError(f"MCP server '{name}' missing required 'command'")
     command = server["command"]
     args = server.get("args") or []
     if isinstance(command, list):
@@ -42,12 +44,12 @@ def _command_list(server: Dict[str, Any]) -> list[str]:
     return [str(command), *[str(item) for item in args]]
 
 
-def _convert_mcp_server(server: Dict[str, Any]) -> Dict[str, Any]:
+def _convert_mcp_server(server: Dict[str, Any], name: str = "<unnamed>") -> Dict[str, Any]:
     server_type = server.get("type", "stdio")
     if server_type == "stdio":
         converted: Dict[str, Any] = {
             "type": "local",
-            "command": _command_list(server),
+            "command": _command_list(server, name),
         }
         environment = server.get("environment", server.get("env"))
         if environment is not None:
@@ -56,6 +58,8 @@ def _convert_mcp_server(server: Dict[str, Any]) -> Dict[str, Any]:
         return converted
 
     if server_type in _REMOTE_MCP_TYPES:
+        if "url" not in server:
+            raise ValueError(f"MCP server '{name}' missing required 'url'")
         converted = {
             "type": "remote",
             "url": server["url"],
@@ -87,7 +91,7 @@ def build_opencode_config(
         mcp_config = config.setdefault("mcp", {})
         if isinstance(mcp_config, dict):
             for name, server in mcp_servers.items():
-                mcp_config.setdefault(name, _convert_mcp_server(server))
+                mcp_config.setdefault(name, _convert_mcp_server(server, name))
 
     return config
 

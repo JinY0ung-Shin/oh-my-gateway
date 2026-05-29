@@ -38,15 +38,19 @@ def discover_backends(registry_cls=None) -> None:
 
     for name in _enabled_backend_names():
         if name == "claude":
-            from src.backends import claude as backend_pkg
+            from src.backends import claude
+
+            claude.register(registry_cls=registry_cls)
         elif name == "opencode":
-            from src.backends import opencode as backend_pkg
+            from src.backends import opencode
+
+            opencode.register(registry_cls=registry_cls)
         elif name == "codex":
-            from src.backends import codex as backend_pkg
+            from src.backends import codex
+
+            codex.register(registry_cls=registry_cls)
         else:
             logger.warning("Unknown backend in BACKENDS=%r; skipping", name)
-            continue
-        backend_pkg.register(registry_cls=registry_cls)
 
 
 def resolve_model(model: str) -> Optional[ResolvedModel]:

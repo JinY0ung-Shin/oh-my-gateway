@@ -103,6 +103,23 @@ def _validate_install_path(install_path: Path) -> Optional[Path]:
         return None
     if install_path.is_symlink():
         return None
+    # Reject a symlinked PARENT component: ``resolve()`` follows all symlinks,
+    # so a symlinked intermediate directory could still pass the containment
+    # check above.  Walk each component from the leaf up to (but not including)
+    # ``cache_dir`` and reject if any is a symlink.
+    try:
+        cache_anchor = cache_dir.resolve()
+    except OSError:
+        return None
+    for parent in install_path.parents:
+        try:
+            if parent.resolve() == cache_anchor:
+                break
+        except OSError:
+            return None
+        if parent.is_symlink():
+            logger.warning("Plugin install_path has symlinked parent: %s", parent)
+            return None
     return resolved if resolved.is_dir() else None
 
 

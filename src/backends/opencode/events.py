@@ -60,7 +60,7 @@ class OpenCodeEventConverter:
         event_session = self._event_session_id(event)
         if event_session not in (None, self.session_id):
             return None
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
         error = props.get("error") or props.get("message") or props
         return str(error)
 
@@ -92,7 +92,7 @@ class OpenCodeEventConverter:
     def _record_message_role(self, event: Dict[str, Any]) -> None:
         if event.get("type") != "message.updated":
             return
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
         info = props.get("info")
         if not isinstance(info, dict):
             return
@@ -108,6 +108,16 @@ class OpenCodeEventConverter:
         role = self.message_roles.get(message_id)
         return role in (None, "assistant")
 
+    @staticmethod
+    def _as_dict(value: Any) -> Dict[str, Any]:
+        """Return *value* if it is a dict, else an empty dict.
+
+        Binding the fetched value through this helper lets the type checker
+        narrow it to ``Dict[str, Any]`` (an inline ``x if isinstance(x, dict)``
+        on a fresh ``.get(...)`` call does not narrow the bound result).
+        """
+        return value if isinstance(value, dict) else {}
+
     def _text_delta_chunk(self, delta: str) -> Dict[str, Any]:
         return {
             "type": "stream_event",
@@ -120,12 +130,12 @@ class OpenCodeEventConverter:
     def _convert_question_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if event.get("type") != "question.asked":
             return None
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
         request_id = props.get("id")
         questions = props.get("questions")
         if not isinstance(request_id, str) or not request_id or not isinstance(questions, list):
             return None
-        tool = props.get("tool") if isinstance(props.get("tool"), dict) else {}
+        tool = self._as_dict(props.get("tool"))
         metadata = {"opencode_question_request_id": request_id}
         tool_call_id = tool.get("callID")
         if isinstance(tool_call_id, str) and tool_call_id:
@@ -147,7 +157,7 @@ class OpenCodeEventConverter:
     def _convert_permission_event(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if event.get("type") != "permission.asked":
             return None
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
         request_id = props.get("id")
         permission = props.get("permission")
         if not isinstance(request_id, str) or not request_id:
@@ -165,7 +175,7 @@ class OpenCodeEventConverter:
             "metadata": metadata_value if isinstance(metadata_value, dict) else {},
         }
         metadata = {"opencode_permission_request_id": request_id}
-        tool = props.get("tool") if isinstance(props.get("tool"), dict) else {}
+        tool = self._as_dict(props.get("tool"))
         tool_call_id = tool.get("callID")
         if isinstance(tool_call_id, str) and tool_call_id:
             metadata["opencode_tool_call_id"] = tool_call_id
@@ -188,7 +198,7 @@ class OpenCodeEventConverter:
         if not self._is_assistant_output_event(event):
             return None
         event_type = event.get("type")
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
 
         if event_type == "message.part.delta":
             if props.get("field") not in (None, "text"):
@@ -242,14 +252,14 @@ class OpenCodeEventConverter:
             return
         if event.get("type") != "message.part.updated":
             return
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
         part = props.get("part")
         if not isinstance(part, dict) or part.get("type") != "step-finish":
             return
         tokens = part.get("tokens")
         if not isinstance(tokens, dict):
             return
-        cache = tokens.get("cache") if isinstance(tokens.get("cache"), dict) else {}
+        cache = self._as_dict(tokens.get("cache"))
         input_tokens = int(tokens.get("input") or 0)
         input_tokens += int(cache.get("read") or 0)
         input_tokens += int(cache.get("write") or 0)
@@ -272,7 +282,7 @@ class OpenCodeEventConverter:
             return []
         if event.get("type") != "message.part.updated":
             return []
-        props = event.get("properties") if isinstance(event.get("properties"), dict) else {}
+        props = self._as_dict(event.get("properties"))
         part = props.get("part")
         if not isinstance(part, dict) or part.get("type") != "tool":
             return []

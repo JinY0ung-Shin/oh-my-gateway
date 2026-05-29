@@ -74,7 +74,10 @@ def _resolve_workspace_root() -> Optional[Path]:
             if hasattr(client, "cwd"):
                 return Path(client.cwd).resolve()
     except Exception:
-        pass
+        logger.debug(
+            "Failed to resolve workspace root from live Claude backend",
+            exc_info=True,
+        )
 
     return None
 
@@ -468,7 +471,7 @@ def get_redacted_config() -> Dict[str, Any]:
         if servers:
             mcp_servers_info = list(servers.keys())
     except Exception:
-        pass
+        logger.debug("Failed to read MCP server names for config", exc_info=True)
 
     return {
         "runtime": {
@@ -597,6 +600,7 @@ def get_tools_registry() -> Dict[str, Any]:
         else:
             result["mcp_tools"] = []
     except Exception:
+        logger.warning("Failed to read MCP tools", exc_info=True)
         result["mcp_tools"] = []
 
     return result
@@ -625,6 +629,7 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
             )
         return result
     except Exception:
+        logger.warning("Failed to read MCP servers detail", exc_info=True)
         return []
 
 
@@ -663,7 +668,7 @@ def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
         display = str(content) if content else ""
         thinking = [str(text) for text in getattr(msg, "thinking", []) if text]
 
-        item = {"role": msg.role, "content": display, "name": msg.name}
+        item: Dict[str, Any] = {"role": msg.role, "content": display, "name": msg.name}
         if thinking:
             item["thinking"] = thinking
         messages.append(item)

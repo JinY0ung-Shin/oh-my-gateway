@@ -32,6 +32,8 @@ from src.backends.codex.constants import (
 )
 from src.backends.common import (
     combine_system_prompt,
+    completion_chunks,
+    error_chunk,
     estimate_token_usage as estimate_backend_token_usage,
 )
 from src.constants import DEFAULT_TIMEOUT_MS
@@ -831,11 +833,7 @@ class CodexClient:
                 client.rpc = rpc
                 turn_obj = turn.get("turn")
                 if not isinstance(turn_obj, dict) or not turn_obj.get("id"):
-                    yield {
-                        "type": "error",
-                        "is_error": True,
-                        "error_message": "turn/start response missing turn.id",
-                    }
+                    yield error_chunk("turn/start response missing turn.id")
                     return
                 turn_id = str(turn_obj["id"])
                 notification_iter = self._notification_iterator(
@@ -859,11 +857,7 @@ class CodexClient:
             except Exception as exc:
                 await self._close_rpc_locked()
                 logger.error("Codex app-server turn failed: %s", exc, exc_info=True)
-                yield {
-                    "type": "error",
-                    "is_error": True,
-                    "error_message": self._public_error_message(exc),
-                }
+                yield error_chunk(self._public_error_message(exc))
 
     async def resume_approval_with_client(
         self,
@@ -884,11 +878,7 @@ class CodexClient:
                         "Codex approval continuation is missing pending request id for call_id %r",
                         call_id,
                     )
-                    yield {
-                        "type": "error",
-                        "is_error": True,
-                        "error_message": "Codex approval continuation is missing request id",
-                    }
+                    yield error_chunk("Codex approval continuation is missing request id")
                     return
                 if str(request_id) != str(call_id):
                     message = (
@@ -896,7 +886,7 @@ class CodexClient:
                         f"{request_id!r}, received {call_id!r}"
                     )
                     logger.error(message)
-                    yield {"type": "error", "is_error": True, "error_message": message}
+                    yield error_chunk(message)
                     return
                 pending_rpc = client.pending_approval_rpc
                 if pending_rpc is not None and pending_rpc is not rpc:
@@ -915,15 +905,11 @@ class CodexClient:
                     client.pending_approval_turn_id = None
                     client.pending_approval_params = None
                     client.pending_approval_rpc = None
-                    yield {"type": "error", "is_error": True, "error_message": message}
+                    yield error_chunk(message)
                     return
                 turn_id = client.pending_approval_turn_id or str(params.get("turnId") or "")
                 if not turn_id:
-                    yield {
-                        "type": "error",
-                        "is_error": True,
-                        "error_message": "Codex approval continuation is missing turn id",
-                    }
+                    yield error_chunk("Codex approval continuation is missing turn id")
                     return
 
                 result = self._approval_result_from_output(method, output, params)
@@ -955,11 +941,7 @@ class CodexClient:
             except Exception as exc:
                 await self._close_rpc_locked()
                 logger.error("Codex approval continuation failed: %s", exc, exc_info=True)
-                yield {
-                    "type": "error",
-                    "is_error": True,
-                    "error_message": self._public_error_message(exc),
-                }
+                yield error_chunk(self._public_error_message(exc))
 
     def _public_error_message(self, exc: Exception) -> str:
         message = str(exc)
@@ -1206,11 +1188,7 @@ class CodexClient:
             return
 
         if isinstance(turn, dict) and turn.get("status") == "failed":
-            yield {
-                "type": "error",
-                "is_error": True,
-                "error_message": self._turn_error_message(turn),
-            }
+            yield error_chunk(self._turn_error_message(turn))
             return
 
         yield from self._completion_chunks(items, usage_box)
@@ -1555,22 +1533,8 @@ class CodexClient:
         usage_box: dict[str, Optional[dict[str, int]]],
     ) -> Iterator[Dict[str, Any]]:
         final_text = self._final_response_from_items(items) or ""
-
-        assistant: Dict[str, Any] = {
-            "type": "assistant",
-            "content": [{"type": "text", "text": final_text}],
-        }
-        result: Dict[str, Any] = {
-            "type": "result",
-            "subtype": "success",
-            "result": final_text,
-        }
         usage = usage_box.get("usage")
-        if usage:
-            assistant["usage"] = usage
-            result["usage"] = usage
-        yield assistant
-        yield result
+        yield from completion_chunks(final_text, usage)
 
     def _extract_usage(self, token_usage: Any) -> Optional[dict[str, int]]:
         if not isinstance(token_usage, dict):
