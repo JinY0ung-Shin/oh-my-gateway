@@ -470,6 +470,10 @@ async def openai_stream_to_anthropic_events(
         # as canonical and ignore the duplicate to avoid double-emitting.
         reasoning = delta.get("reasoning_content")
         if isinstance(reasoning, str) and reasoning:
+            # Flush any buffered tool_calls before opening a new reasoning
+            # block. This is intentional: tool_use blocks always precede the
+            # text/reasoning that follows them in the converted stream, even
+            # when that text arrives after a tool-call delta in the same turn.
             for event in _flush_tool_calls(state):
                 yield event
             if state.open_kind != "thinking":
@@ -487,6 +491,10 @@ async def openai_stream_to_anthropic_events(
         # Plain assistant text.
         content = delta.get("content")
         if isinstance(content, str) and content:
+            # Flush any buffered tool_calls before opening a new text block.
+            # This is intentional: tool_use blocks always precede the
+            # text/reasoning that follows them in the converted stream, even
+            # when that text arrives after a tool-call delta in the same turn.
             for event in _flush_tool_calls(state):
                 yield event
             if state.open_kind != "text":

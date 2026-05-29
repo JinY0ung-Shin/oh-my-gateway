@@ -16,7 +16,6 @@ from typing import (
     Optional,
     Protocol,
     Union,
-    runtime_checkable,
 )
 
 
@@ -66,7 +65,6 @@ class BackendDescriptor:
 # ---------------------------------------------------------------------------
 
 
-@runtime_checkable
 class BackendClient(Protocol):
     """Interface that every backend must satisfy.
 
@@ -202,9 +200,9 @@ class BackendRegistry:
         return dict(cls._descriptors)
 
     @classmethod
-    def all_model_ids(cls) -> set:
+    def all_model_ids(cls) -> set[str]:
         """Return a set of all model IDs across all descriptors."""
-        ids: set = set()
+        ids: set[str] = set()
         for desc in cls._descriptors.values():
             ids.update(desc.models)
         return ids

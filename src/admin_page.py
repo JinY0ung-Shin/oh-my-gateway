@@ -6,6 +6,8 @@ maintainability while the final output is identical to the
 original monolithic version.
 """
 
+from functools import lru_cache
+
 from src.admin_html_config import get_config_html
 from src.admin_html_dashboard import get_dashboard_html
 from src.admin_html_files import get_files_html
@@ -18,6 +20,7 @@ from src.admin_js import get_admin_js
 from src.admin_styles import get_admin_css
 
 
+@lru_cache(maxsize=1)
 def build_admin_page() -> str:
     """Build the admin dashboard HTML.
 

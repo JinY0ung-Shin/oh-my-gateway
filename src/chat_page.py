@@ -5,7 +5,10 @@ Supports multi-turn conversation via previous_response_id chaining,
 and AskUserQuestion (function_call / function_call_output) flow.
 """
 
+from functools import lru_cache
 
+
+@lru_cache(maxsize=1)
 def build_chat_page() -> str:
     """Build the chat UI HTML."""
     return r"""<!DOCTYPE html>

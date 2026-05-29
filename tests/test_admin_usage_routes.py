@@ -79,12 +79,12 @@ def test_usage_summary_clamps_window_days(monkeypatch):
         resp = _client().get("/admin/api/usage/summary", params={"window_days": 9999})
         # Query received the clamped value (max 365)...
         assert captured["window_days"] == 365
-        # ...but the response body echoes the raw query param.
-        assert resp.json()["window_days"] == 9999
+        # ...and the response body echoes the same clamped value.
+        assert resp.json()["window_days"] == 365
 
         resp = _client().get("/admin/api/usage/summary", params={"window_days": 0})
         assert captured["window_days"] == 1
-        assert resp.json()["window_days"] == 0
+        assert resp.json()["window_days"] == 1
     finally:
         _restore()
 

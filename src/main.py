@@ -184,15 +184,16 @@ async def _verify_backends() -> None:
 async def _shutdown_backends() -> None:
     """Close backend-owned resources such as managed child processes."""
     for name, backend in BackendRegistry.all_backends().items():
-        close = getattr(backend, "close", None) or getattr(backend, "shutdown", None)
-        if close is None:
-            continue
-        try:
-            result = close()
-            if inspect.isawaitable(result):
-                await result
-        except Exception:
-            logger.warning("Backend %s shutdown failed", name, exc_info=True)
+        for method_name in ("close", "shutdown"):
+            method = getattr(backend, method_name, None)
+            if method is None:
+                continue
+            try:
+                result = method()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("Backend %s shutdown failed", name, exc_info=True)
 
 
 @asynccontextmanager
@@ -475,8 +476,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             status_code = response.status_code
             return response
-        except Exception:
-            raise
         finally:
             elapsed_ms = (asyncio.get_event_loop().time() - start) * 1000
             client_ip = request.client.host if request.client else "unknown"

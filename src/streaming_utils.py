@@ -400,8 +400,6 @@ async def bridge_sse_stream(
 # SSE comment line — compliant clients silently ignore these.
 _SSE_KEEPALIVE = ": keepalive\n\n"
 
-_SENTINEL = object()
-
 
 async def _keepalive_wrapper(
     source: AsyncGenerator,
@@ -794,6 +792,7 @@ async def stream_response_chunks(
         nonlocal reasoning_open, reasoning_item_id, reasoning_text_buf, output_index
         if not reasoning_open:
             return []
+        assert reasoning_item_id is not None
         full_text = "".join(reasoning_text_buf)
         item = ReasoningOutputItem(
             id=reasoning_item_id,
@@ -962,22 +961,23 @@ async def stream_response_chunks(
                     thinking_capture_buf.append(text_delta)
                 if reasoning_open and in_thinking:
                     reasoning_text_buf.append(text_delta)
-                    yield make_response_sse(
-                        "response.reasoning_summary_text.delta",
-                        item_id=reasoning_item_id,
-                        output_index=output_index,
-                        summary_index=0,
-                        delta=text_delta,
-                        sequence_number=_next_seq(),
-                    )
-                    yield make_response_sse(
-                        "response.reasoning_text.delta",
-                        item_id=reasoning_item_id,
-                        output_index=output_index,
-                        content_index=0,
-                        delta=text_delta,
-                        sequence_number=_next_seq(),
-                    )
+                    if text_delta:
+                        yield make_response_sse(
+                            "response.reasoning_summary_text.delta",
+                            item_id=reasoning_item_id,
+                            output_index=output_index,
+                            summary_index=0,
+                            delta=text_delta,
+                            sequence_number=_next_seq(),
+                        )
+                        yield make_response_sse(
+                            "response.reasoning_text.delta",
+                            item_id=reasoning_item_id,
+                            output_index=output_index,
+                            content_index=0,
+                            delta=text_delta,
+                            sequence_number=_next_seq(),
+                        )
                     continue
                 # We're inside a thinking block but couldn't open a reasoning item
                 # (message item already opened — OpenAI Responses contract doesn't support

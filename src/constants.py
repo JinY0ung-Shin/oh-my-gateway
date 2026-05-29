@@ -40,20 +40,20 @@ SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "")
 PROMPT_LANGUAGE = os.getenv("PROMPT_LANGUAGE", "English")
 
 # API Configuration
-DEFAULT_MAX_TURNS = int(os.getenv("DEFAULT_MAX_TURNS", "10"))
+DEFAULT_MAX_TURNS = parse_int_env("DEFAULT_MAX_TURNS", 10)
 DEFAULT_TIMEOUT_MS = parse_int_env("MAX_TIMEOUT", 600_000)  # 10 minutes
-DEFAULT_PORT = int(os.getenv("PORT", "8000"))
+DEFAULT_PORT = parse_int_env("PORT", 8000)
 DEFAULT_HOST = (
     os.getenv("GATEWAY_HOST") or os.getenv("CLAUDE_WRAPPER_HOST") or "0.0.0.0"
 )  # nosec B104
-MAX_REQUEST_SIZE = int(os.getenv("MAX_REQUEST_SIZE", str(10 * 1024 * 1024)))  # 10MB
+MAX_REQUEST_SIZE = parse_int_env("MAX_REQUEST_SIZE", 10 * 1024 * 1024)  # 10MB
 
 # Permission Modes
 PERMISSION_MODE_BYPASS = "bypassPermissions"
 
 # Session Management
-SESSION_CLEANUP_INTERVAL_MINUTES = int(os.getenv("SESSION_CLEANUP_INTERVAL_MINUTES", "5"))
-SESSION_MAX_AGE_MINUTES = int(os.getenv("SESSION_MAX_AGE_MINUTES", "60"))
+SESSION_CLEANUP_INTERVAL_MINUTES = parse_int_env("SESSION_CLEANUP_INTERVAL_MINUTES", 5)
+SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 
 # Per-user workspace isolation
 # Base directory for user workspaces. Falls back to CLAUDE_CWD if empty.
@@ -69,7 +69,7 @@ MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 # an SSE comment (`: keepalive\n\n`) on this interval prevents HTTP
 # proxies, load balancers, and client-side timeouts from closing the
 # connection.  Set to 0 to disable.
-SSE_KEEPALIVE_INTERVAL = int(os.getenv("SSE_KEEPALIVE_INTERVAL", "15"))
+SSE_KEEPALIVE_INTERVAL = parse_int_env("SSE_KEEPALIVE_INTERVAL", 15)
 
 # ---------------------------------------------------------------------------
 # Subagent Streaming Visibility
@@ -90,12 +90,12 @@ SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {
-    "debug": int(os.getenv("RATE_LIMIT_DEBUG_PER_MINUTE", "2")),
-    "auth": int(os.getenv("RATE_LIMIT_AUTH_PER_MINUTE", "10")),
-    "session": int(os.getenv("RATE_LIMIT_SESSION_PER_MINUTE", "15")),
-    "health": int(os.getenv("RATE_LIMIT_HEALTH_PER_MINUTE", "30")),
-    "responses": int(os.getenv("RATE_LIMIT_RESPONSES_PER_MINUTE", "10")),
-    "general": int(os.getenv("RATE_LIMIT_PER_MINUTE", "30")),
+    "debug": parse_int_env("RATE_LIMIT_DEBUG_PER_MINUTE", 2),
+    "auth": parse_int_env("RATE_LIMIT_AUTH_PER_MINUTE", 10),
+    "session": parse_int_env("RATE_LIMIT_SESSION_PER_MINUTE", 15),
+    "health": parse_int_env("RATE_LIMIT_HEALTH_PER_MINUTE", 30),
+    "responses": parse_int_env("RATE_LIMIT_RESPONSES_PER_MINUTE", 10),
+    "general": parse_int_env("RATE_LIMIT_PER_MINUTE", 30),
 }
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ METADATA_ENV_ALLOWLIST: frozenset[str] = frozenset(
 # AskUserQuestion hook timeout (seconds).
 # If the client does not respond within this window the hook denies the tool
 # call and the SDK resumes.  Set via ASK_USER_TIMEOUT_SECONDS env var.
-ASK_USER_TIMEOUT_SECONDS = int(os.environ.get("ASK_USER_TIMEOUT_SECONDS", "300"))
+ASK_USER_TIMEOUT_SECONDS = parse_int_env("ASK_USER_TIMEOUT_SECONDS", 300)
 
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")

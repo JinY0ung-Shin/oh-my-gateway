@@ -239,10 +239,18 @@ class SessionManager:
         """
         with self.lock:
             expired = [
-                (sid, self.sessions[sid]) for sid, s in self.sessions.items() if s.is_expired()
+                (sid, s) for sid, s in self.sessions.items() if s.is_expired()
             ]
-        count = 0
-        for sid, session in expired:
+        doomed = []
+        with self.lock:
+            for sid, session in expired:
+                # Re-check: session might have been refreshed since snapshot
+                current = self.sessions.get(sid)
+                if current is session and current.is_expired():
+                    del self.sessions[sid]
+                    logger.info(f"Cleaned up expired session: {sid}")
+                    doomed.append((sid, session))
+        for sid, session in doomed:
             if session.client is not None:
                 try:
                     await session.client.disconnect()
@@ -251,14 +259,7 @@ class SessionManager:
                 session.client = None
             if session.workspace:
                 self._cleanup_workspace(session.workspace)
-            with self.lock:
-                # Re-check: session might have been refreshed since snapshot
-                current = self.sessions.get(sid)
-                if current is session and current.is_expired():
-                    del self.sessions[sid]
-                    logger.info(f"Cleaned up expired session: {sid}")
-                    count += 1
-        return count
+        return len(doomed)
 
     def _purge_all_expired_sync(self) -> int:
         """Synchronous variant: remove expired sessions without client disconnect.
@@ -339,7 +340,7 @@ class SessionManager:
                 if hasattr(backend, "cleanup_images"):
                     backend.cleanup_images()
         except Exception:
-            pass  # Registry may not be ready during tests/shutdown
+            logger.debug("backend image cleanup skipped/failed", exc_info=True)
 
         return removed
 
@@ -548,8 +549,9 @@ class SessionManager:
     def stats(self) -> dict:
         """Return a summary dict including rehydrate hit/miss counters."""
         with self.lock:
+            active = sum(1 for s in self.sessions.values() if not s.is_expired())
             return {
-                "active_sessions": len(self.sessions),
+                "active_sessions": active,
                 "rehydrate_hits": self._rehydrate_hits,
                 "rehydrate_misses": self._rehydrate_misses,
             }

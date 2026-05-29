@@ -1004,9 +1004,11 @@ class TestCollabJsonStreamFilter:
 
     def test_flush_returns_buffered_text(self):
         f = CollabJsonStreamFilter()
-        f.feed("{incomplete")
+        # A '{' followed by a quote stays buffered as a potential collab block
+        # until the stream ends, so flush() returns the partial text.
+        assert f.feed('{"incomplete') == ""
         remaining = f.flush()
-        assert remaining == "{incomplete"
+        assert remaining == '{"incomplete'
 
 
 # ---------------------------------------------------------------------------

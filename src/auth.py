@@ -114,7 +114,9 @@ class ClaudeCodeAuthManager:
                 if hasattr(client, "get_auth_provider"):
                     return client.get_auth_provider()
         except Exception:
-            pass
+            logger.debug(
+                "live auth provider lookup failed for %s", backend, exc_info=True
+            )
 
         # Pre-startup / fallback: direct instantiation for known backends
         if backend == "claude":
@@ -270,6 +272,9 @@ def get_all_backends_auth_info() -> Dict[str, Any]:
                 "environment_variables": list(provider.build_env().keys()),
             }
         except Exception as e:
+            logger.warning(
+                "auth validate failed for %s", backend_name, exc_info=True
+            )
             result[backend_name] = {"status": {"valid": False, "errors": [str(e)]}}
     return result
 

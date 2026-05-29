@@ -70,7 +70,7 @@ async def get_summary(
           COALESCE(SUM(output_tokens), 0) AS output_tokens_window,
           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens_window,
           COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens_window,
-          SUM(status <> 'completed') AS errors_window
+          COALESCE(SUM(status <> 'completed'), 0) AS errors_window
         FROM usage_turn
         WHERE {where}
         """,
@@ -111,7 +111,7 @@ async def get_top_users(
           COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(SUM(t.call_count), 0) AS tool_calls,
           COALESCE(SUM(t.error_count), 0) AS tool_errors,
-          SUM(u.status <> 'completed') AS turn_errors
+          COALESCE(SUM(u.status <> 'completed'), 0) AS turn_errors
         FROM usage_turn u
         LEFT JOIN usage_tool t ON t.turn_id = u.id
         WHERE {where}

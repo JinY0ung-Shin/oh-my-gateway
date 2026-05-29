@@ -1,12 +1,14 @@
+import html
 from typing import Any, Dict
 
 
 def build_root_page(version: str, auth_info: Dict[str, Any], default_port: int) -> str:
     """Build the landing page HTML."""
-    auth_method = auth_info.get("method", "unknown")
+    auth_method = html.escape(str(auth_info.get("method", "unknown")))
     auth_valid = auth_info.get("status", {}).get("valid", False)
-    status_text = "ONLINE" if auth_valid else "OFFLINE"
+    status_text = html.escape("ONLINE" if auth_valid else "OFFLINE")
     status_class = "online" if auth_valid else "offline"
+    version = html.escape(str(version))
 
     return f"""<!DOCTYPE html>
 <html lang="ko">

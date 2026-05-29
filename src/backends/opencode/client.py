@@ -41,6 +41,8 @@ import httpx
 import src.mcp_config as mcp_config
 from src.backends.common import (
     combine_system_prompt,
+    completion_chunks,
+    error_chunk,
     estimate_token_usage as estimate_backend_token_usage,
 )
 from src.backends.opencode.auth import OpenCodeAuthProvider, normalize_opencode_base_url
@@ -558,11 +560,7 @@ class OpenCodeClient:
                     async for event in self._iter_sse_events(event_response):
                         error_message = converter.error_message(event)
                         if error_message:
-                            yield {
-                                "type": "error",
-                                "is_error": True,
-                                "error_message": error_message,
-                            }
+                            yield error_chunk(error_message)
                             return
                         if converter.finished(event):
                             break
@@ -570,27 +568,13 @@ class OpenCodeClient:
                             yield chunk
         except Exception as exc:
             logger.error("OpenCode streaming prompt failed: %s", exc, exc_info=True)
-            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+            yield error_chunk(str(exc))
             return
 
         text = converter.final_text()
         usage = converter.usage
-        assistant: Dict[str, Any] = {
-            "type": "assistant",
-            "content": [{"type": "text", "text": text}],
-        }
-        result: Dict[str, Any] = {"type": "result", "subtype": "success", "result": text}
-        if usage:
-            assistant["usage"] = {
-                "input_tokens": usage["input_tokens"],
-                "output_tokens": usage["output_tokens"],
-            }
-            result["usage"] = {
-                "input_tokens": usage["input_tokens"],
-                "output_tokens": usage["output_tokens"],
-            }
-        yield assistant
-        yield result
+        for chunk in completion_chunks(text, usage):
+            yield chunk
 
     async def run_completion_with_client(
         self,
@@ -619,41 +603,22 @@ class OpenCodeClient:
                 except json.JSONDecodeError:
                     error_message = self._describe_non_json_response(response)
                     logger.error("OpenCode session prompt returned invalid JSON: %s", error_message)
-                    yield {"type": "error", "is_error": True, "error_message": error_message}
+                    yield error_chunk(error_message)
                     return
         except Exception as exc:
             logger.error("OpenCode session prompt failed: %s", exc, exc_info=True)
-            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+            yield error_chunk(str(exc))
             return
 
         info = payload.get("info")
         if isinstance(info, dict) and info.get("error"):
-            yield {
-                "type": "error",
-                "is_error": True,
-                "error_message": str(info["error"]),
-            }
+            yield error_chunk(str(info["error"]))
             return
 
         text = self._extract_text(payload)
         usage = self._extract_usage(payload)
-        assistant: Dict[str, Any] = {
-            "type": "assistant",
-            "content": [{"type": "text", "text": text}],
-        }
-        result: Dict[str, Any] = {"type": "result", "subtype": "success", "result": text}
-        if usage:
-            assistant["usage"] = {
-                "input_tokens": usage["input_tokens"],
-                "output_tokens": usage["output_tokens"],
-            }
-            result["usage"] = {
-                "input_tokens": usage["input_tokens"],
-                "output_tokens": usage["output_tokens"],
-            }
-
-        yield assistant
-        yield result
+        for chunk in completion_chunks(text, usage):
+            yield chunk
 
     async def _resume_with_client(
         self,
@@ -687,11 +652,7 @@ class OpenCodeClient:
                     async for event in self._iter_sse_events(event_response):
                         error_message = converter.error_message(event)
                         if error_message:
-                            yield {
-                                "type": "error",
-                                "is_error": True,
-                                "error_message": error_message,
-                            }
+                            yield error_chunk(error_message)
                             return
                         if converter.finished(event):
                             break
@@ -699,12 +660,12 @@ class OpenCodeClient:
                             yield chunk
         except Exception as exc:
             logger.error("OpenCode %s continuation failed: %s", label, exc, exc_info=True)
-            yield {"type": "error", "is_error": True, "error_message": str(exc)}
+            yield error_chunk(str(exc))
             return
 
         text = converter.final_text()
-        yield {"type": "assistant", "content": [{"type": "text", "text": text}]}
-        yield {"type": "result", "subtype": "success", "result": text}
+        for chunk in completion_chunks(text):
+            yield chunk
 
     async def resume_question_with_client(
         self,
