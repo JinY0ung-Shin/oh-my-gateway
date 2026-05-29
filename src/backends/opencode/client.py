@@ -39,11 +39,12 @@ from typing import Any, AsyncGenerator, Dict, List, Optional
 import httpx
 
 import src.mcp_config as mcp_config
+from src.backends.base import SessionHandle
 from src.backends.common import (
+    TokenEstimateMixin,
     combine_system_prompt,
     completion_chunks,
     error_chunk,
-    estimate_token_usage as estimate_backend_token_usage,
 )
 from src.backends.opencode.auth import OpenCodeAuthProvider, normalize_opencode_base_url
 from src.backends.opencode.config import build_opencode_config, parse_opencode_config_content
@@ -66,7 +67,7 @@ _PERMISSION_REPLIES = {"once", "always", "reject"}
 
 
 @dataclass
-class OpenCodeSessionClient:
+class OpenCodeSessionClient(SessionHandle):
     """Lightweight handle for one OpenCode session."""
 
     session_id: str
@@ -101,7 +102,7 @@ class OpenCodeSessionClient:
             logger.warning("OpenCode session delete failed for %s", self.session_id, exc_info=True)
 
 
-class OpenCodeClient:
+class OpenCodeClient(TokenEstimateMixin):
     """BackendClient implementation for OpenCode."""
 
     _combine_system_prompt = staticmethod(combine_system_prompt)
@@ -533,14 +534,24 @@ class OpenCodeClient:
         if event:
             yield event
 
-    async def _run_completion_streaming(
+    async def _stream_events(
         self,
         client: OpenCodeSessionClient,
-        prompt: str,
+        *,
+        post_path: str,
+        post_body: Dict[str, Any],
+        error_label: str,
+        emit_usage: bool,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        body = await self._prompt_body_async(client, prompt)
-        converter = OpenCodeEventConverter(session_id=client.session_id)
+        """Drive one OpenCode turn over SSE and yield gateway chunks.
 
+        Opens the ``/event`` stream, POSTs the request on a second client, then
+        converts streamed events. Shared by the initial prompt and the
+        question/permission continuation paths, which differ only in the POST
+        target/body, the log label, and whether token usage is attached to the
+        terminal chunks.
+        """
+        converter = OpenCodeEventConverter(session_id=client.session_id)
         try:
             async with httpx.AsyncClient(**self._event_client_kwargs()) as event_client:
                 async with event_client.stream(
@@ -549,13 +560,16 @@ class OpenCodeClient:
                     params=self._directory_params(client.cwd),
                 ) as event_response:
                     event_response.raise_for_status()
-                    async with httpx.AsyncClient(**self._client_kwargs()) as prompt_client:
-                        response = await prompt_client.post(
-                            f"/session/{client.session_id}/prompt_async",
-                            json=body,
+                    async with httpx.AsyncClient(**self._client_kwargs()) as post_client:
+                        response = await post_client.post(
+                            post_path,
+                            json=post_body,
                             params=self._directory_params(client.cwd),
                         )
-                        response.raise_for_status()
+                        try:
+                            response.raise_for_status()
+                        except httpx.HTTPStatusError:
+                            raise RuntimeError(self._describe_http_error(response)) from None
 
                     async for event in self._iter_sse_events(event_response):
                         error_message = converter.error_message(event)
@@ -567,13 +581,28 @@ class OpenCodeClient:
                         for chunk in converter.convert(event):
                             yield chunk
         except Exception as exc:
-            logger.error("OpenCode streaming prompt failed: %s", exc, exc_info=True)
+            logger.error("OpenCode %s failed: %s", error_label, exc, exc_info=True)
             yield error_chunk(str(exc))
             return
 
         text = converter.final_text()
-        usage = converter.usage
+        usage = converter.usage if emit_usage else None
         for chunk in completion_chunks(text, usage):
+            yield chunk
+
+    async def _run_completion_streaming(
+        self,
+        client: OpenCodeSessionClient,
+        prompt: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        body = await self._prompt_body_async(client, prompt)
+        async for chunk in self._stream_events(
+            client,
+            post_path=f"/session/{client.session_id}/prompt_async",
+            post_body=body,
+            error_label="streaming prompt",
+            emit_usage=True,
+        ):
             yield chunk
 
     async def run_completion_with_client(
@@ -629,42 +658,13 @@ class OpenCodeClient:
         label: str,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         _ = session
-        converter = OpenCodeEventConverter(session_id=client.session_id)
-        try:
-            async with httpx.AsyncClient(**self._event_client_kwargs()) as event_client:
-                async with event_client.stream(
-                    "GET",
-                    "/event",
-                    params=self._directory_params(client.cwd),
-                ) as event_response:
-                    event_response.raise_for_status()
-                    async with httpx.AsyncClient(**self._client_kwargs()) as reply_client:
-                        response = await reply_client.post(
-                            reply_path,
-                            json=reply_body,
-                            params=self._directory_params(client.cwd),
-                        )
-                        try:
-                            response.raise_for_status()
-                        except httpx.HTTPStatusError:
-                            raise RuntimeError(self._describe_http_error(response)) from None
-
-                    async for event in self._iter_sse_events(event_response):
-                        error_message = converter.error_message(event)
-                        if error_message:
-                            yield error_chunk(error_message)
-                            return
-                        if converter.finished(event):
-                            break
-                        for chunk in converter.convert(event):
-                            yield chunk
-        except Exception as exc:
-            logger.error("OpenCode %s continuation failed: %s", label, exc, exc_info=True)
-            yield error_chunk(str(exc))
-            return
-
-        text = converter.final_text()
-        for chunk in completion_chunks(text):
+        async for chunk in self._stream_events(
+            client,
+            post_path=reply_path,
+            post_body=reply_body,
+            error_label=f"{label} continuation",
+            emit_usage=False,
+        ):
             yield chunk
 
     async def resume_question_with_client(
@@ -714,12 +714,3 @@ class OpenCodeClient:
                 if isinstance(part, dict) and part.get("type") == "text" and part.get("text"):
                     parts.append(part["text"])
         return "".join(parts) if parts else None
-
-    def estimate_token_usage(
-        self,
-        prompt: str,
-        completion: str,
-        model: Optional[str] = None,
-    ) -> Dict[str, int]:
-        _ = model
-        return estimate_backend_token_usage(prompt, completion)
