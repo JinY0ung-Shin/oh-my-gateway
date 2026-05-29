@@ -10,10 +10,7 @@ def get_admin_js() -> str:
     loginError: '',
     tab: 'dashboard',
     summary: {},
-    files: [],
     config: {},
-    editor: { path: null, content: '', etag: null, dirty: false },
-    cm: null,
     toasts: [],
     pollTimer: null,
     logs: {},
@@ -30,16 +27,6 @@ def get_admin_js() -> str:
     sessionMessages: null,
     sessionDetail: null,
     runtimeConfig: {},
-    skills: [],
-    selectedSkill: null,
-    skillContent: '',
-    skillEtag: null,
-    skillDirty: false,
-    skillMeta: {},
-    skillCm: null,
-    skillCreating: false,
-    newSkillName: '',
-    newSkillNameError: '',
     plugins: [],
     pluginSkillView: null,
     toolsRegistry: {},
@@ -76,8 +63,6 @@ def get_admin_js() -> str:
       document.addEventListener('keydown', (e) => {
         if ((e.ctrlKey || e.metaKey) && e.key === 's') {
           e.preventDefault();
-          if (this.tab === 'files' && this.editor.dirty) this.saveFile();
-          if (this.tab === 'skills' && this.skillDirty) this.saveSkill();
           if (this.tab === 'config' && this.promptView === 'named' && this.promptDirty) this.saveNamedPrompt();
         }
       });
@@ -86,20 +71,6 @@ def get_admin_js() -> str:
         const r = await this.api('/admin/api/summary');
         if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpServers(); this.loadMetrics(); this.startPolling(); }
       } catch(e) { console.error('Failed to load summary', e); this.loginError = 'Failed to load summary'; this.showToast('Failed to load summary', 'err'); } finally { this.loading.dashboard = false; }
-    },
-
-    getFileIcon(path) {
-      if (path.endsWith('.json')) return '{..}';
-      if (path.endsWith('.md')) return '##';
-      if (path.endsWith('.yaml') || path.endsWith('.yml')) return '~~';
-      if (path.endsWith('.toml')) return '**';
-      return '>_';
-    },
-    getFileIconClass(path) {
-      if (path.endsWith('.json')) return 'file-icon-json';
-      if (path.endsWith('.md')) return 'file-icon-md';
-      if (path.endsWith('.yaml') || path.endsWith('.yml')) return 'file-icon-yaml';
-      return 'file-icon-default';
     },
 
     async doLogin() {
@@ -164,73 +135,11 @@ def get_admin_js() -> str:
       } catch(e) { console.error('Failed to load MCP servers', e); this.showToast('Failed to load MCP servers', 'err'); }
     },
 
-    async loadFiles() {
-      try {
-        const r = await this.api('/admin/api/files');
-        if (r.ok) { const d = await r.json(); this.files = d.files || []; }
-      } catch(e) { console.error('Failed to load files', e); this.showToast('Failed to load files', 'err'); }
-    },
-
     async loadConfig() {
       try {
         const r = await this.api('/admin/api/config');
         if (r.ok) this.config = await r.json();
       } catch(e) { console.error('Failed to load config', e); this.showToast('Failed to load config', 'err'); }
-    },
-
-    async openFile(path) {
-      if (this.editor.dirty && !confirm('Unsaved changes will be lost. Continue?')) return;
-      try {
-        const r = await this.api('/admin/api/files/' + encodeURI(path));
-        if (r.ok) {
-          const d = await r.json();
-          this.editor = { path: d.path, content: d.content, etag: d.etag, dirty: false };
-          this.$nextTick(() => this.setupEditor());
-        } else {
-          const d = await r.json();
-          this.showToast(d.error || 'Failed to load file', 'err');
-        }
-      } catch(e) { this.showToast('Connection error', 'err'); }
-    },
-
-    setupEditor() {
-      const ta = this.$refs.editorArea;
-      if (!ta) return;
-      if (this.cm) { this.cm.toTextArea(); this.cm = null; }
-      ta.value = this.editor.content;
-      const ext = this.editor.path.split('.').pop();
-      const mode = ext === 'json' ? { name: 'javascript', json: true }
-        : ext === 'yaml' || ext === 'yml' ? 'yaml' : 'markdown';
-      this.cm = CodeMirror.fromTextArea(ta, {
-        mode, theme: 'material-darker', lineNumbers: true, lineWrapping: true, tabSize: 2
-      });
-      this.cm.on('change', () => {
-        this.editor.dirty = this.cm.getValue() !== this.editor.content;
-      });
-    },
-
-    async saveFile() {
-      if (!this.editor.path || !this.cm) return;
-      const newContent = this.cm.getValue();
-      try {
-        const r = await this.api('/admin/api/files/' + encodeURI(this.editor.path), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: newContent, etag: this.editor.etag })
-        });
-        const d = await r.json();
-        if (r.ok) {
-          this.editor.content = newContent;
-          this.editor.etag = d.etag;
-          this.editor.dirty = false;
-          this.showToast('FILE SAVED', 'ok');
-        } else {
-          this.showToast(d.error || 'Save failed', 'err');
-          if (r.status === 409) {
-            if (confirm('File modified externally. Reload?')) this.openFile(this.editor.path);
-          }
-        }
-      } catch(e) { this.showToast('Connection error', 'err'); }
     },
 
     async deleteSession(id) {
@@ -243,7 +152,7 @@ def get_admin_js() -> str:
     },
 
     async refreshAll() {
-      await Promise.all([this.loadSummary(), this.loadFiles(), this.loadConfig(), this.loadBackends(), this.loadMcpServers(), this.loadMetrics()]);
+      await Promise.all([this.loadSummary(), this.loadConfig(), this.loadBackends(), this.loadMcpServers(), this.loadMetrics()]);
       this.showToast('ALL SYSTEMS REFRESHED', 'ok');
     },
 
@@ -622,42 +531,16 @@ def get_admin_js() -> str:
     },
 
     async loadSkills() {
-      const [r1, r2] = await Promise.all([
-        this.api('/admin/api/skills').catch(() => null),
-        this.api('/admin/api/plugins').catch(() => null),
-      ]);
-      if (r1?.ok) { const d = await r1.json(); this.skills = d.skills || []; }
-      if (r2?.ok) {
-        const d = await r2.json();
-        const wasExpanded = new Set(this.plugins.filter(p => p._expanded).map(p => p.id));
-        this.plugins = (d.plugins || []).map(p => ({ ...p, _expanded: wasExpanded.has(p.id) }));
-      }
-    },
-    async openSkill(name) {
-      if (this.skillDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
-      this.skillCreating = false;
-      this.pluginSkillView = null;
       try {
-        const r = await this.api('/admin/api/skills/' + encodeURIComponent(name));
+        const r = await this.api('/admin/api/plugins');
         if (r.ok) {
           const d = await r.json();
-          this.selectedSkill = name;
-          this.skillContent = d.content;
-          this.skillEtag = d.etag;
-          this.skillMeta = d.metadata || {};
-          this.skillDirty = false;
-          this.$nextTick(() => this.setupSkillEditor());
-        } else {
-          const d = await r.json();
-          this.showToast(d.error || 'Failed to load skill', 'err');
+          const wasExpanded = new Set(this.plugins.filter(p => p._expanded).map(p => p.id));
+          this.plugins = (d.plugins || []).map(p => ({ ...p, _expanded: wasExpanded.has(p.id) }));
         }
-      } catch(e) { this.showToast('Connection error', 'err'); }
+      } catch(e) { console.error('Failed to load plugins', e); this.showToast('Failed to load plugins', 'err'); }
     },
     async openPluginSkill(plugin, skillName) {
-      if (this.skillDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
-      this.selectedSkill = null;
-      this.skillCreating = false;
-      if (this.skillCm) { this.skillCm.toTextArea(); this.skillCm = null; }
       this.pluginSkillView = { pluginId: plugin.id, skillName, pluginName: plugin.name, version: plugin.version, content: '' };
       try {
         const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plugin.id) + '/skills/' + encodeURIComponent(skillName));
@@ -669,114 +552,6 @@ def get_admin_js() -> str:
           this.pluginSkillView = null;
         }
       } catch(e) { this.showToast('Connection error', 'err'); this.pluginSkillView = null; }
-    },
-    setupSkillEditor() {
-      const ta = this.$refs.skillEditorArea;
-      if (!ta) return;
-      if (this.skillCm) { this.skillCm.toTextArea(); this.skillCm = null; }
-      ta.value = this.skillContent;
-      this.skillCm = CodeMirror.fromTextArea(ta, {
-        mode: 'markdown', theme: 'material-darker', lineNumbers: true, lineWrapping: true, tabSize: 2
-      });
-      this.skillCm.on('change', () => {
-        this.skillDirty = this.skillCm.getValue() !== this.skillContent;
-      });
-    },
-    async saveSkill() {
-      if (!this.selectedSkill || !this.skillCm) return;
-      const newContent = this.skillCm.getValue();
-      try {
-        const r = await this.api('/admin/api/skills/' + encodeURIComponent(this.selectedSkill), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: newContent, etag: this.skillEtag })
-        });
-        const d = await r.json();
-        if (r.ok || r.status === 201) {
-          this.skillContent = newContent;
-          this.skillEtag = d.etag;
-          this.skillDirty = false;
-          this.showToast('SKILL SAVED', 'ok');
-          await this.loadSkills();
-        } else {
-          this.showToast(d.error || 'Save failed', 'err');
-          if (r.status === 409) {
-            if (confirm('Skill modified externally. Reload?')) this.openSkill(this.selectedSkill);
-          }
-        }
-      } catch(e) { this.showToast('Connection error', 'err'); }
-    },
-    showNewSkillForm() {
-      if (this.skillDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
-      this.skillCreating = true;
-      this.selectedSkill = null;
-      this.pluginSkillView = null;
-      this.skillDirty = false;
-      this.newSkillName = '';
-      this.newSkillNameError = '';
-      if (this.skillCm) { this.skillCm.toTextArea(); this.skillCm = null; }
-    },
-    validateNewSkillName() {
-      const n = this.newSkillName;
-      if (!n) { this.newSkillNameError = ''; return; }
-      if (!/^[a-z0-9][a-z0-9-]*$/.test(n)) {
-        this.newSkillNameError = 'lowercase, digits, hyphens only (start with letter/digit)';
-        return;
-      }
-      if (this.skills.some(s => s.name === n)) {
-        this.newSkillNameError = 'skill already exists';
-        return;
-      }
-      this.newSkillNameError = '';
-    },
-    async createSkill() {
-      if (!this.newSkillName || this.newSkillNameError) return;
-      const name = this.newSkillName;
-      const template = `---
-name: ${name}
-description: ""
-metadata:
-  author: ""
-  version: "1.0.0"
----
-
-# ${name}
-
-Skill description here.
-`;
-      try {
-        const r = await this.api('/admin/api/skills/' + encodeURIComponent(name), {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ content: template })
-        });
-        if (r.ok || r.status === 201) {
-          this.skillCreating = false;
-          this.showToast('SKILL CREATED: ' + name, 'ok');
-          await this.loadSkills();
-          await this.openSkill(name);
-        } else {
-          const d = await r.json();
-          this.showToast(d.error || 'Create failed', 'err');
-        }
-      } catch(e) { this.showToast('Connection error', 'err'); }
-    },
-    async confirmDeleteSkill() {
-      if (!this.selectedSkill) return;
-      if (!confirm('Delete skill "' + this.selectedSkill + '"? This cannot be undone.')) return;
-      try {
-        const r = await this.api('/admin/api/skills/' + encodeURIComponent(this.selectedSkill), { method: 'DELETE' });
-        if (r.ok) {
-          this.showToast('SKILL DELETED', 'ok');
-          if (this.skillCm) { this.skillCm.toTextArea(); this.skillCm = null; }
-          this.selectedSkill = null;
-          this.skillDirty = false;
-          await this.loadSkills();
-        } else {
-          const d = await r.json();
-          this.showToast(d.error || 'Delete failed', 'err');
-        }
-      } catch(e) { this.showToast('Connection error', 'err'); }
     },
 
     async toggleSessionHistory(sessionId) {

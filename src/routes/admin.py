@@ -7,9 +7,6 @@ HTML page:      GET  /admin
 Login:          POST /admin/api/login
 Logout:         POST /admin/api/logout
 Dashboard:      GET  /admin/api/summary
-File tree:      GET  /admin/api/files
-File read:      GET  /admin/api/files/{path:path}
-File write:     PUT  /admin/api/files/{path:path}
 Config:         GET  /admin/api/config
 Session delete: DELETE /admin/api/sessions/{session_id}
 Session stats:  GET  /admin/api/sessions/stats
@@ -19,7 +16,6 @@ Server info:    GET  /admin/api/server-info
 Logs:           GET  /admin/api/logs
 Rate limits:    GET  /admin/api/rate-limits
 Session msgs:   GET  /admin/api/sessions/{session_id}/messages
-Skills:         GET/PUT/DELETE /admin/api/skills/{name}
 System prompt:  GET/PUT/DELETE /admin/api/system-prompt
 Named prompts:  GET/PUT/DELETE /admin/api/prompts/{name}
                 POST /admin/api/prompts/{name}/activate
@@ -33,7 +29,7 @@ Blocklist:      GET  /admin/api/plugins/blocklist
 import logging
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, Header, Query, Request, Response
+from fastapi import APIRouter, Depends, Request, Response
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -44,8 +40,6 @@ from src.admin_auth import (
     require_admin,
 )
 from src.admin_service import (
-    create_or_update_skill,
-    delete_skill,
     export_session_json,
     get_backends_health,
     get_mcp_servers_detail,
@@ -53,12 +47,7 @@ from src.admin_service import (
     get_sandbox_config,
     get_session_detail,
     get_session_messages,
-    get_skill,
     get_tools_registry,
-    list_skills,
-    list_workspace_files,
-    read_file,
-    write_file,
 )
 
 logger = logging.getLogger(__name__)
@@ -75,19 +64,9 @@ class LoginRequest(BaseModel):
     api_key: str
 
 
-class FileWriteRequest(BaseModel):
-    content: str
-    etag: Optional[str] = None
-
-
 class RuntimeConfigUpdate(BaseModel):
     key: str
     value: Any
-
-
-class SkillWriteRequest(BaseModel):
-    content: str
-    etag: Optional[str] = None
 
 
 class SystemPromptUpdate(BaseModel):
@@ -331,53 +310,6 @@ async def export_session_endpoint(session_id: str, _=Depends(require_admin)):
 
 
 # ---------------------------------------------------------------------------
-# Workspace file management
-# ---------------------------------------------------------------------------
-
-
-@router.get("/api/files")
-async def list_files(_=Depends(require_admin)):
-    """List allowlisted workspace files."""
-    try:
-        return {"files": list_workspace_files()}
-    except RuntimeError as e:
-        return JSONResponse(status_code=503, content={"error": str(e)})
-
-
-@router.get("/api/files/{file_path:path}")
-async def get_file(file_path: str, _=Depends(require_admin)):
-    """Read a workspace file. Returns content and ETag."""
-    try:
-        content, etag = read_file(file_path)
-        return {"path": file_path, "content": content, "etag": etag}
-    except FileNotFoundError as e:
-        return JSONResponse(status_code=404, content={"error": str(e)})
-    except ValueError as e:
-        return JSONResponse(status_code=403, content={"error": str(e)})
-
-
-@router.put("/api/files/{file_path:path}")
-async def put_file(
-    file_path: str,
-    body: FileWriteRequest,
-    _=Depends(require_admin),
-    if_match: Optional[str] = Header(None),
-):
-    """Write a workspace file. Supports If-Match for optimistic concurrency."""
-    expected_etag = body.etag or if_match
-    try:
-        new_etag = write_file(file_path, body.content, expected_etag)
-        return {"path": file_path, "etag": new_etag, "status": "saved"}
-    except FileNotFoundError as e:
-        return JSONResponse(status_code=404, content={"error": str(e)})
-    except ValueError as e:
-        error_msg = str(e)
-        if "ETag mismatch" in error_msg:
-            return JSONResponse(status_code=409, content={"error": error_msg})
-        return JSONResponse(status_code=400, content={"error": error_msg})
-
-
-# ---------------------------------------------------------------------------
 # Session management (proxied through admin auth boundary)
 # ---------------------------------------------------------------------------
 
@@ -546,85 +478,6 @@ async def reset_runtime_config(
         return {"status": "reset", "key": key, "value": runtime_config.get(key)}
     runtime_config.reset_all()
     return {"status": "all_reset"}
-
-
-# ---------------------------------------------------------------------------
-# Skills management
-# ---------------------------------------------------------------------------
-
-
-@router.get("/api/skills")
-async def list_skills_endpoint(
-    backend: str = Query("claude"),
-    _=Depends(require_admin),
-):
-    """List all skills with parsed metadata."""
-    try:
-        return {"skills": list_skills(backend=backend)}
-    except ValueError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-    except RuntimeError as e:
-        return JSONResponse(status_code=503, content={"error": str(e)})
-
-
-@router.get("/api/skills/{name}")
-async def get_skill_endpoint(
-    name: str,
-    backend: str = Query("claude"),
-    _=Depends(require_admin),
-):
-    """Read a skill's SKILL.md content and parsed metadata."""
-    try:
-        meta, content, etag = get_skill(name, backend=backend)
-        return {"name": name, "metadata": meta, "content": content, "etag": etag}
-    except FileNotFoundError as e:
-        return JSONResponse(status_code=404, content={"error": str(e)})
-    except ValueError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
-
-
-@router.put("/api/skills/{name}")
-async def put_skill_endpoint(
-    name: str,
-    body: SkillWriteRequest,
-    backend: str = Query("claude"),
-    _=Depends(require_admin),
-    if_match: Optional[str] = Header(None),
-):
-    """Create or update a skill. Supports If-Match for optimistic concurrency."""
-    expected_etag = body.etag or if_match
-    try:
-        new_etag, created = create_or_update_skill(
-            name,
-            body.content,
-            expected_etag,
-            backend=backend,
-        )
-        return JSONResponse(
-            status_code=201 if created else 200,
-            content={"name": name, "etag": new_etag, "status": "created" if created else "updated"},
-        )
-    except ValueError as e:
-        error_msg = str(e)
-        if "ETag mismatch" in error_msg:
-            return JSONResponse(status_code=409, content={"error": error_msg})
-        return JSONResponse(status_code=400, content={"error": error_msg})
-
-
-@router.delete("/api/skills/{name}")
-async def delete_skill_endpoint(
-    name: str,
-    backend: str = Query("claude"),
-    _=Depends(require_admin),
-):
-    """Delete a skill and its directory."""
-    try:
-        delete_skill(name, backend=backend)
-        return {"name": name, "status": "deleted"}
-    except FileNotFoundError as e:
-        return JSONResponse(status_code=404, content={"error": str(e)})
-    except ValueError as e:
-        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 # ---------------------------------------------------------------------------

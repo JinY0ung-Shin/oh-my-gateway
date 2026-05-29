@@ -71,7 +71,7 @@ class TestUserParam:
             )
 
         assert resp.status_code == 200
-        mock_wm.resolve.assert_called_once_with("alice", sync_template=True, backend="claude")
+        mock_wm.resolve.assert_called_once_with("alice", backend="claude")
 
     def test_user_none_creates_temp_workspace(self, isolated_session_manager):
         mock_wm = MagicMock()
@@ -89,7 +89,7 @@ class TestUserParam:
             )
 
         assert resp.status_code == 200
-        mock_wm.resolve.assert_called_once_with(None, sync_template=True, backend="claude")
+        mock_wm.resolve.assert_called_once_with(None, backend="claude")
 
     def test_cwd_passed_to_run_completion(self, isolated_session_manager):
         """cwd is forwarded to create_client (which spawns the persistent SDK session)."""
@@ -145,7 +145,7 @@ class TestUserParam:
             )
 
         assert resp.status_code == 200
-        mock_wm.resolve.assert_called_once_with("alice", sync_template=True, backend="codex")
+        mock_wm.resolve.assert_called_once_with("alice", backend="codex")
         assert create_calls[0]["cwd"] == "/tmp/ws/alice/codex"
 
     def test_invalid_user_returns_400(self, isolated_session_manager):
@@ -264,9 +264,8 @@ class TestUserSessionBinding:
         mock_wm = MagicMock()
         create_calls = []
 
-        def fake_resolve(user, *, sync_template, backend=None):
+        def fake_resolve(user, *, backend=None):
             assert user == "alice"
-            assert sync_template is False
             if backend == "claude":
                 return Path("/tmp/ws/alice/claude")
             assert backend is None
@@ -303,8 +302,8 @@ class TestUserSessionBinding:
 
         assert resp.status_code == 200
         assert mock_wm.resolve.call_args_list == [
-            call("alice", sync_template=False, backend="claude"),
-            call("alice", sync_template=False),
+            call("alice", backend="claude"),
+            call("alice"),
         ]
         assert mock_get_session.call_args_list == [
             call(existing_session_id),
@@ -359,7 +358,7 @@ class TestUserSessionBinding:
             )
 
         assert resp.status_code == 200
-        mock_wm.resolve.assert_called_once_with("alice", sync_template=False, backend="codex")
+        mock_wm.resolve.assert_called_once_with("alice", backend="codex")
         assert mock_get_session.call_args_list == [
             call(existing_session_id),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice/codex"),

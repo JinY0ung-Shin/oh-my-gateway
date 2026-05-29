@@ -33,7 +33,7 @@ def empty_registry():
 class TestDiscoverBackends:
     """Test discover_backends() in src/backends/__init__.py."""
 
-    def test_discover_backends_registers_claude(self, tmp_path):
+    def test_discover_backends_registers_claude(self):
         """Happy path: Claude backend registers successfully."""
         with (
             patch(
@@ -41,7 +41,6 @@ class TestDiscoverBackends:
                 return_value=(True, {"method": "claude_cli"}),
             ),
             patch("src.auth.auth_manager") as mock_auth,
-            patch.dict("os.environ", {"CLAUDE_CWD": str(tmp_path)}),
         ):
             mock_auth.get_claude_code_env_vars.return_value = {}
 
@@ -72,7 +71,6 @@ class TestDiscoverBackends:
                 return_value=(True, {"method": "claude_cli"}),
             ),
             patch("src.auth.auth_manager") as mock_auth,
-            patch.dict("os.environ", {"CLAUDE_CWD": "/tmp"}),
         ):
             mock_auth.get_claude_code_env_vars.return_value = {}
 
@@ -277,15 +275,14 @@ class TestClaudeRegister:
 
             assert BackendRegistry.is_registered("claude")
 
-    def test_register_uses_env_cwd_when_none(self, tmp_path):
-        """When cwd is None, register() falls back to CLAUDE_CWD env var."""
+    def test_register_without_cwd_uses_temp_dir(self):
+        """When cwd is None, register() still succeeds (client uses a temp dir)."""
         with (
             patch(
                 "src.auth.validate_claude_code_auth",
                 return_value=(True, {"method": "claude_cli"}),
             ),
             patch("src.auth.auth_manager") as mock_auth,
-            patch.dict("os.environ", {"CLAUDE_CWD": str(tmp_path)}),
         ):
             mock_auth.get_claude_code_env_vars.return_value = {}
 

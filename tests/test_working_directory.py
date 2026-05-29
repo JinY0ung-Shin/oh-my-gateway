@@ -14,11 +14,8 @@ from src.claude_cli import ClaudeCodeCLI
 
 
 def test_default_temp_directory():
-    """Test that default working directory is a temp directory."""
+    """Test that the default working directory is an isolated temp directory."""
     print("Testing default temp directory creation...")
-
-    # Ensure CLAUDE_CWD is not set
-    original_cwd = os.environ.pop("CLAUDE_CWD", None)
 
     try:
         # Create CLI instance without cwd parameter
@@ -46,47 +43,6 @@ def test_default_temp_directory():
     except Exception as e:
         print(f"  ✗ Unexpected error: {e}")
         raise
-    finally:
-        # Restore original CLAUDE_CWD if it existed
-        if original_cwd:
-            os.environ["CLAUDE_CWD"] = original_cwd
-
-
-def test_env_var_directory():
-    """Test that CLAUDE_CWD environment variable is respected."""
-    print("\nTesting CLAUDE_CWD environment variable...")
-
-    # Create a test directory
-    test_dir = tempfile.mkdtemp(prefix="test_claude_cwd_")
-    original_cwd = os.environ.get("CLAUDE_CWD")
-
-    try:
-        # Set CLAUDE_CWD environment variable
-        os.environ["CLAUDE_CWD"] = test_dir
-
-        # Create CLI instance - it reads from env var directly
-        cli = ClaudeCodeCLI(cwd=os.environ.get("CLAUDE_CWD"))
-
-        # Check that the specified directory is used
-        assert cli.temp_dir is None, "No temp directory should be created when CLAUDE_CWD exists"
-        assert str(cli.cwd) == test_dir, f"Working directory should be {test_dir}, got {cli.cwd}"
-
-        print(f"  ✓ Using CLAUDE_CWD: {test_dir}")
-
-    except AssertionError as e:
-        print(f"  ✗ {e}")
-        raise
-    except Exception as e:
-        print(f"  ✗ Unexpected error: {e}")
-        raise
-    finally:
-        # Clean up
-        if original_cwd:
-            os.environ["CLAUDE_CWD"] = original_cwd
-        else:
-            os.environ.pop("CLAUDE_CWD", None)
-        if os.path.exists(test_dir):
-            shutil.rmtree(test_dir)
 
 
 def test_explicit_cwd_parameter():
@@ -176,7 +132,6 @@ def main():
 
     tests = [
         test_default_temp_directory,
-        test_env_var_directory,
         test_explicit_cwd_parameter,
         test_nonexistent_directory_error,
         test_cross_platform_compatibility,

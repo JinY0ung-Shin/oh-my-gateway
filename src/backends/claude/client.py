@@ -116,18 +116,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self.timeout = timeout / 1000  # Convert ms to seconds
         self.temp_dir = None
 
-        # If cwd is provided (from CLAUDE_CWD env var), use it
-        # Otherwise create an isolated temp directory
+        # If an explicit cwd is provided, use it. Otherwise create an isolated
+        # temp directory. Live requests override cwd per request with the
+        # resolved per-user workspace, so this default is only a fallback.
         if cwd:
             self.cwd = Path(cwd)
             if not self.cwd.exists():
                 logger.error(f"ERROR: Specified working directory does not exist: {self.cwd}")
-                logger.error(
-                    "Please create the directory first or unset CLAUDE_CWD to use a temporary directory"
-                )
+                logger.error("Please create the directory first to use it as a working directory")
                 raise ValueError(f"Working directory does not exist: {self.cwd}")
             else:
-                logger.info(f"Using CLAUDE_CWD: {self.cwd}")
+                logger.info(f"Using configured working directory: {self.cwd}")
         else:
             self.temp_dir = tempfile.mkdtemp(prefix="claude_code_workspace_")
             self.cwd = Path(self.temp_dir)

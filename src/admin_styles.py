@@ -326,28 +326,6 @@ nav.tabs button:hover {
   color: var(--green);
 }
 .file-item .icon { margin-right: 6px; font-size: var(--fs-sm); }
-.file-icon-json { color: var(--amber); }
-.file-icon-md { color: var(--cyan); }
-.file-icon-yaml { color: var(--magenta); }
-.file-icon-default { color: var(--text-dim); }
-
-.CodeMirror {
-  height: auto;
-  min-height: 300px;
-  max-height: 70vh;
-  border: 1px solid var(--border);
-  border-radius: 0;
-  font-size: 13px;
-  font-family: var(--font) !important;
-  overflow: hidden;
-  background: var(--bg) !important;
-}
-.CodeMirror-scroll { max-height: 70vh; overflow-y: auto !important; }
-.CodeMirror-gutters { background: var(--bg-raised) !important; border-right: 1px solid var(--border) !important; }
-.CodeMirror-linenumber { color: var(--text-muted) !important; }
-.CodeMirror-cursor { border-left-color: var(--green) !important; }
-.CodeMirror-selected { background: var(--green-subtle) !important; }
-.CodeMirror-focused .CodeMirror-selected { background: var(--green-subtle) !important; }
 
 .editor-toolbar {
   display: flex;
@@ -748,7 +726,6 @@ input[type="checkbox"] {
   .sidebar { flex-direction: column; }
   .sidebar .file-tree { width: 100%; max-height: 200px; overflow-y: auto; }
   nav.tabs button { padding: var(--gap-sm) var(--gap-md); }
-  .CodeMirror { min-height: 200px; max-height: 50vh; }
   .ascii-header { font-size: 0.45rem; }
 }
 

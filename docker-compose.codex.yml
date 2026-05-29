@@ -33,9 +33,10 @@ services:
       - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
       # Persist admin overrides across restarts.
       - ./data:/app/data
-      # Gateway workspaces. This still uses CLAUDE_CWD internally because the
-      # workspace manager is shared across Claude/OpenCode/Codex backends.
-      - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
+      # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
+      # to the host so individual users' state survives container recreates.
+      # Override the host path with USER_WORKSPACES_HOST_DIR.
+      - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     env_file:
       - .env
     environment:
@@ -48,7 +49,7 @@ services:
       - CODEX_APPROVAL_POLICY=${CODEX_APPROVAL_POLICY:-never}
       - CODEX_SANDBOX=${CODEX_SANDBOX:-danger-full-access}
       - CODEX_CONFIG_OVERRIDES=${CODEX_CONFIG_OVERRIDES:-}
-      - CLAUDE_CWD=/app/working_dir
+      - USER_WORKSPACES_DIR=${USER_WORKSPACES_DIR:-/data/workspaces}
 
   gateway-log:
     profiles: ["logging"]

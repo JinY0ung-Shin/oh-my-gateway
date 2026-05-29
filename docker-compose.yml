@@ -54,17 +54,11 @@ services:
       - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
       # Persist admin overrides (system prompt, runtime config) across restarts
       - ./data:/app/data
-      # Claude working directory (shared with host for inspection/editing).
-      # Host path comes from CLAUDE_CWD in .env (parse-time interpolation);
-      # falls back to ./working_dir. Container path stays fixed so the
-      # CLAUDE_CWD override below is always valid.
-      - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
       # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
       # to the host so individual users' state survives container recreates.
-      # Activate by setting USER_WORKSPACES_DIR=/data/workspaces in .env; the
-      # bind mount itself is always present so the path exists either way.
-      # Override the host path with USER_WORKSPACES_HOST_DIR if you want it
-      # somewhere other than ./workspaces.
+      # The container defaults USER_WORKSPACES_DIR to /data/workspaces (see the
+      # environment block below). Override the host path with
+      # USER_WORKSPACES_HOST_DIR if you want it somewhere other than ./workspaces.
       - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     # All runtime configuration comes from .env (see .env.example for the full list).
     env_file:
@@ -72,8 +66,8 @@ services:
     environment:
       # Fail fast if ADMIN_API_KEY is missing — the server refuses to start without it.
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
-      # Override .env CLAUDE_CWD (host path) with the in-container mount target.
-      - CLAUDE_CWD=/app/working_dir
+      # Persist per-user workspaces to the host bind mount by default.
+      - USER_WORKSPACES_DIR=${USER_WORKSPACES_DIR:-/data/workspaces}
       # Docker installs optional plugins into the container user's ~/.claude,
       # so include user-scope config when the Claude SDK starts.
       - CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}

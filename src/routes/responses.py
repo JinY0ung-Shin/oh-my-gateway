@@ -401,15 +401,13 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
     _early_cwd: Optional[str] = None
     if body.user:
         try:
-            _early_cwd = str(
-                workspace_manager.resolve(body.user, sync_template=False, backend=backend)
-            )
+            _early_cwd = str(workspace_manager.resolve(body.user, backend=backend))
         except (ValueError, OSError):
             pass
     session = session_manager.get_session(session_id, user=body.user, cwd=_early_cwd)
     if session is None and backend == "claude" and body.user:
         try:
-            legacy_cwd = str(workspace_manager.resolve(body.user, sync_template=False))
+            legacy_cwd = str(workspace_manager.resolve(body.user))
         except (ValueError, OSError):
             legacy_cwd = None
         if legacy_cwd and legacy_cwd != _early_cwd:
@@ -452,11 +450,7 @@ async def _resolve_response_workspace(
 
     if is_new_session:
         try:
-            workspace = workspace_manager.resolve(
-                body.user,
-                sync_template=True,
-                backend=backend,
-            )
+            workspace = workspace_manager.resolve(body.user, backend=backend)
         except ValueError as e:
             await session_manager.delete_session_async(session_id)
             raise HTTPException(status_code=400, detail=str(e)) from e
@@ -468,11 +462,7 @@ async def _resolve_response_workspace(
         return Path(session.workspace)
 
     try:
-        workspace = workspace_manager.resolve(
-            body.user,
-            sync_template=False,
-            backend=backend,
-        )
+        workspace = workspace_manager.resolve(body.user, backend=backend)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
     session.workspace = str(workspace)
@@ -1108,7 +1098,6 @@ async def create_response(
     validate_backend_auth_or_raise(resolved.backend)
     validate_image_request(body, backend)
 
-    # Moved earlier — needed for workspace sync_template decision
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
     session_id, session = _resolve_response_session(body, resolved.backend)

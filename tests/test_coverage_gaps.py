@@ -5,112 +5,10 @@ Only contains tests for branches NOT already covered by existing test files.
 
 import json
 import os
-import shutil
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-
-
-# ---------------------------------------------------------------------------
-# admin_service — _resolve_workspace_root fallback branches
-# ---------------------------------------------------------------------------
-
-
-class TestResolveWorkspaceRoot:
-    def test_fallback_to_claude_backend_cwd(self, tmp_path):
-        """When CLAUDE_CWD is not set, _resolve_workspace_root falls back to Claude backend."""
-        from src.admin_service import _resolve_workspace_root
-        from src.backends.base import BackendRegistry
-
-        fake_backend = SimpleNamespace(cwd=str(tmp_path))
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLAUDE_CWD", None)
-            with patch.object(BackendRegistry, "is_registered", return_value=True):
-                with patch.object(BackendRegistry, "get", return_value=fake_backend):
-                    result = _resolve_workspace_root()
-                    assert result == tmp_path.resolve()
-
-    def test_fallback_exception_returns_none(self):
-        """When backend lookup raises, returns None."""
-        from src.admin_service import _resolve_workspace_root
-        from src.backends.base import BackendRegistry
-
-        with patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("CLAUDE_CWD", None)
-            with patch.object(BackendRegistry, "is_registered", side_effect=RuntimeError("boom")):
-                result = _resolve_workspace_root()
-                assert result is None
-
-    def test_get_workspace_root_raises_when_none(self):
-        """get_workspace_root raises RuntimeError when no root found."""
-        from src.admin_service import get_workspace_root
-
-        with patch("src.admin_service._resolve_workspace_root", return_value=None):
-            with pytest.raises(RuntimeError, match="Workspace root"):
-                get_workspace_root()
-
-    def test_env_cwd_not_a_dir(self, tmp_path):
-        """CLAUDE_CWD pointing to a non-directory falls through to backend."""
-        from src.admin_service import _resolve_workspace_root
-        from src.backends.base import BackendRegistry
-
-        fake_file = tmp_path / "not-a-dir.txt"
-        fake_file.write_text("file")
-        with patch.dict(os.environ, {"CLAUDE_CWD": str(fake_file)}):
-            with patch.object(BackendRegistry, "is_registered", return_value=False):
-                result = _resolve_workspace_root()
-                assert result is None
-
-
-# ---------------------------------------------------------------------------
-# admin_service — _has_symlink_ancestor
-# ---------------------------------------------------------------------------
-
-
-class TestHasSymlinkAncestor:
-    def test_outside_root_returns_true(self, tmp_path):
-        from src.admin_service import _has_symlink_ancestor
-
-        outside = Path("/completely/outside")
-        assert _has_symlink_ancestor(outside, tmp_path) is True
-
-    def test_no_symlinks_returns_false(self, tmp_path):
-        from src.admin_service import _has_symlink_ancestor
-
-        child = tmp_path / "a" / "b"
-        child.mkdir(parents=True)
-        assert _has_symlink_ancestor(child, tmp_path) is False
-
-
-# ---------------------------------------------------------------------------
-# admin_service — list_workspace_files: symlink parent in rglob
-# ---------------------------------------------------------------------------
-
-
-class TestListWorkspaceFilesEdgeCases:
-    def test_child_with_symlink_parent_excluded(self, tmp_path):
-        """Files under a symlink parent component in rglob are excluded."""
-        from src.admin_service import list_workspace_files
-
-        agents_dir = tmp_path / ".claude" / "agents"
-        agents_dir.mkdir(parents=True)
-        (agents_dir / "normal.md").write_text("ok")
-
-        external = tmp_path / "_ext"
-        external.mkdir()
-        (external / "evil.md").write_text("leak")
-        (agents_dir / "subdir").symlink_to(external)
-
-        with patch("src.admin_service.get_workspace_root", return_value=tmp_path):
-            files = list_workspace_files()
-            paths = [f["path"] for f in files]
-            assert ".claude/agents/normal.md" in paths
-            assert not any("evil" in p for p in paths)
-
-        # cleanup symlink target
-        shutil.rmtree(external, ignore_errors=True)
 
 
 # ---------------------------------------------------------------------------
@@ -165,24 +63,6 @@ class TestGetToolsRegistryMcp:
         with patch("src.mcp_config.get_mcp_servers", return_value=None):
             result = get_tools_registry()
             assert result["mcp_tools"] == []
-
-
-# ---------------------------------------------------------------------------
-# admin_service — list_skills: oversized file excluded
-# ---------------------------------------------------------------------------
-
-
-class TestListSkillsOversized:
-    def test_oversized_skill_file_excluded(self, tmp_path):
-        from src.admin_service import MAX_FILE_SIZE, list_skills
-
-        skills_dir = tmp_path / ".claude" / "skills" / "big-skill"
-        skills_dir.mkdir(parents=True)
-        (skills_dir / "SKILL.md").write_bytes(b"x" * (MAX_FILE_SIZE + 1))
-
-        with patch("src.admin_service.get_workspace_root", return_value=tmp_path):
-            result = list_skills()
-            assert len(result) == 0
 
 
 # ---------------------------------------------------------------------------

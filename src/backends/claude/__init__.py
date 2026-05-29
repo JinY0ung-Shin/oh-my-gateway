@@ -56,7 +56,6 @@ def register(registry_cls=None, cwd: Optional[str] = None, timeout: Optional[int
     Always registers the descriptor (static metadata).
     Attempts to create a ClaudeCodeCLI instance and register it as a live client.
     """
-    import os
     from src.constants import DEFAULT_TIMEOUT_MS
     from src.backends.claude.client import ClaudeCodeCLI
 
@@ -66,11 +65,13 @@ def register(registry_cls=None, cwd: Optional[str] = None, timeout: Optional[int
     # Always register descriptor
     registry_cls.register_descriptor(CLAUDE_DESCRIPTOR)
 
-    # Create and register client
+    # Create and register client. With no explicit cwd the client falls back to
+    # a private temp dir; live requests always override cwd per request from the
+    # resolved per-user workspace.
     try:
         cli = ClaudeCodeCLI(
             timeout=timeout if timeout is not None else DEFAULT_TIMEOUT_MS,
-            cwd=cwd or os.getenv("CLAUDE_CWD"),
+            cwd=cwd,
         )
         registry_cls.register("claude", cli)
         logger.info("Registered backend: claude")

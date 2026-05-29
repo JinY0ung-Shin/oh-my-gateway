@@ -22,7 +22,7 @@ export ADMIN_API_KEY=change-this-admin-key
 uv run uvicorn src.main:app --reload --port 8000
 ```
 
-`ADMIN_API_KEY` is required at startup because the admin surface can inspect files and change runtime settings. Use `API_KEY` separately when public gateway endpoints need bearer-token protection.
+`ADMIN_API_KEY` is required at startup because the admin surface can change runtime settings and read live diagnostics. Use `API_KEY` separately when public gateway endpoints need bearer-token protection.
 
 ```bash
 curl http://localhost:8000/v1/responses \
@@ -116,8 +116,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
 | `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
 | `GATEWAY_HOST` | Host bind address; falls back to legacy `CLAUDE_WRAPPER_HOST` |
-| `CLAUDE_CWD` | Global Claude working directory |
-| `USER_WORKSPACES_DIR` | Per-user workspace root |
+| `USER_WORKSPACES_DIR` | Per-user workspace root (per-session temp dir if unset) |
 | `MCP_CONFIG` | Shared MCP server config |
 | `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |

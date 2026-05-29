@@ -96,6 +96,30 @@ async def test_lifespan_handles_auth_failure_timeout_and_debug_logging():
     async_shutdown.assert_awaited_once()
 
 
+async def test_lifespan_runs_startup_orphan_workspace_sweep():
+    """The lifespan must invoke the orphan-sweep with the session max age in seconds."""
+    from src.constants import SESSION_MAX_AGE_MINUTES
+    from src.workspace_manager import workspace_manager
+
+    with (
+        patch.object(
+            main,
+            "validate_claude_code_auth",
+            return_value=(True, {"method": "claude_cli"}),
+        ),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(main, "discover_backends"),
+        patch.object(main, "_verify_backends", AsyncMock()),
+        patch.object(main.session_manager, "start_cleanup_task"),
+        patch.object(main.session_manager, "async_shutdown", AsyncMock()),
+        patch.object(workspace_manager, "sweep_orphan_temp_workspaces") as sweep,
+    ):
+        async with main.lifespan(main.app):
+            pass
+
+    sweep.assert_called_once_with(SESSION_MAX_AGE_MINUTES * 60)
+
+
 def test_find_available_port_returns_first_free_port():
     socket_instances = []
     connect_results = iter([0, 1])

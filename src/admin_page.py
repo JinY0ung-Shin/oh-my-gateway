@@ -10,7 +10,6 @@ from functools import lru_cache
 
 from src.admin_html_config import get_config_html
 from src.admin_html_dashboard import get_dashboard_html
-from src.admin_html_files import get_files_html
 from src.admin_html_logs import get_logs_html
 from src.admin_html_ratelimits import get_ratelimits_html
 from src.admin_html_sessions import get_sessions_html
@@ -35,12 +34,6 @@ def build_admin_page() -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>GATEWAY CTRL // Admin Terminal</title>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.css" integrity="sha384-EAMaqTIrSR3wOlf2EQj7Kkx5ZCHPjHmlYJsFof5IB8dzXMASyR8eIwXgp+IGz/rs" crossorigin="anonymous">
-<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/theme/material-darker.min.css" integrity="sha384-/7IRGUZjrVsGRxRmWYycW70x8/46N5NLfEElIMgl+k0aOfmvzAMSg6Or2NG3a6tp" crossorigin="anonymous">
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.js" integrity="sha384-t/C99Ss9npjVCqOGZhNjaRnafXAhKyPyhSP+cSSP0CWoFTfMXG4+impqZ6WfgO0a" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/markdown/markdown.min.js" integrity="sha384-n04h9Gi6L8HyI+Xs9bOsNBdP9/Oo6HtQ6x+a7KFxgoZ267JCOoEZzP2YEAanxMTX" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/javascript/javascript.min.js" integrity="sha384-9WXBgfPaWP2zA74XYJo/qmYSaQuy6wy1FyptaVjcRrEdBZagvms/3mIBuPWPqsgg" crossorigin="anonymous"></script>
-<script src="https://cdn.jsdelivr.net/npm/codemirror@5.65.18/mode/yaml/yaml.min.js" integrity="sha384-131Ong53rCgUDHHluJOESiyk8FRC3j7cL7INdfB2n4SVkOoI87gNHb0B23LKlrMp" crossorigin="anonymous"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -122,7 +115,6 @@ def build_admin_page() -> str:
         <button role="tab" :aria-selected="tab === 'logs'" @click="tab='logs'; loadLogs()">LOGS</button>
         <button role="tab" :aria-selected="tab === 'usage'" @click="tab='usage'; loadUsage()">USAGE</button>
         <button role="tab" :aria-selected="tab === 'ratelimits'" @click="tab='ratelimits'; loadRateLimits()">LIMITS</button>
-        <button role="tab" :aria-selected="tab === 'files'" @click="tab='files'; loadFiles()">FILES</button>
         <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">SKILLS</button>
         <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">CONFIG</button>
         <a href="/admin/chat" role="tab" style="color:var(--cyan);text-decoration:none;padding:var(--gap-sm) var(--gap-lg);font-size:var(--fs-sm);letter-spacing:0.08em;border-bottom:2px solid transparent;display:flex;align-items:center;gap:4px;white-space:nowrap;">CHAT ↗</a>
@@ -136,8 +128,6 @@ def build_admin_page() -> str:
         + get_usage_html()
         + "\n\n"
         + get_ratelimits_html()
-        + "\n\n"
-        + get_files_html()
         + "\n\n"
         + get_skills_html()
         + "\n\n"

@@ -34,9 +34,10 @@ services:
       - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
       # Persist admin overrides across restarts.
       - ./data:/app/data
-      # Gateway workspaces. The workspace manager is shared across backends and
-      # still keys off CLAUDE_CWD internally.
-      - ${CLAUDE_CWD:-./working_dir}:/app/working_dir
+      # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
+      # to the host so individual users' state survives container recreates.
+      # Override the host path with USER_WORKSPACES_HOST_DIR.
+      - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
     env_file:
       - .env
     environment:
@@ -46,7 +47,7 @@ services:
       - OPENCODE_MODELS=${OPENCODE_MODELS:-openai/gpt-5.5}
       - OPENCODE_BIN=opencode
       - OPENCODE_HOME=/home/app/.local/share/opencode
-      - CLAUDE_CWD=/app/working_dir
+      - USER_WORKSPACES_DIR=${USER_WORKSPACES_DIR:-/data/workspaces}
 
   gateway-log:
     profiles: ["logging"]

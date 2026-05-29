@@ -12,23 +12,22 @@ docker run --rm \
   oh-my-gateway:test \
   python -c "from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(); print(f'Working directory: {cli.cwd}'); print(f'Is temp dir: {cli.temp_dir is not None}')"
 
-# Test 2: With CLAUDE_CWD environment variable
-echo -e "\n2. Testing with CLAUDE_CWD environment variable:"
+# Test 2: With an explicit working directory
+echo -e "\n2. Testing with an explicit cwd:"
 docker run --rm \
   -v ~/.claude:/root/.claude \
-  -e CLAUDE_CWD=/app \
   oh-my-gateway:test \
-  python -c "import os; from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(cwd=os.getenv('CLAUDE_CWD')); print(f'Working directory: {cli.cwd}'); print(f'Is temp dir: {cli.temp_dir is not None}')"
+  python -c "from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(cwd='/app'); print(f'Working directory: {cli.cwd}'); print(f'Is temp dir: {cli.temp_dir is not None}')"
 
-# Test 3: With mounted workspace
-echo -e "\n3. Testing with mounted workspace:"
+# Test 3: Per-user workspaces under USER_WORKSPACES_DIR
+echo -e "\n3. Testing per-user workspace under USER_WORKSPACES_DIR:"
 mkdir -p /tmp/test_workspace
 docker run --rm \
   -v ~/.claude:/root/.claude \
-  -v /tmp/test_workspace:/workspace \
-  -e CLAUDE_CWD=/workspace \
+  -v /tmp/test_workspace:/workspaces \
+  -e USER_WORKSPACES_DIR=/workspaces \
   oh-my-gateway:test \
-  python -c "import os; from src.claude_cli import ClaudeCodeCLI; cli = ClaudeCodeCLI(cwd=os.getenv('CLAUDE_CWD')); print(f'Working directory: {cli.cwd}'); print(f'Directory exists: {os.path.exists(cli.cwd)}')"
+  python -c "import os; from src.workspace_manager import workspace_manager; ws = workspace_manager.resolve('alice', backend='claude'); print(f'Workspace: {ws}'); print(f'Directory exists: {os.path.exists(ws)}')"
 
 echo -e "\n========================================="
 echo "Docker workspace tests complete!"

@@ -56,7 +56,7 @@ SESSION_CLEANUP_INTERVAL_MINUTES = parse_int_env("SESSION_CLEANUP_INTERVAL_MINUT
 SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 
 # Per-user workspace isolation
-# Base directory for user workspaces. Falls back to CLAUDE_CWD if empty.
+# Base directory for user workspaces. Empty means a per-process system temp dir.
 USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
 
 # MCP Server Configuration

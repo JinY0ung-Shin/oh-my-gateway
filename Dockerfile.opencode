@@ -81,7 +81,7 @@ COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py
 # OpenCode follows XDG conventions; persist config + state under HOME so the
 # named volume below survives container recreates.
 RUN useradd -m -u 1000 -s /bin/bash app \
-    && mkdir -p /app/data /app/working_dir \
+    && mkdir -p /app/data \
                 /home/app/.config/opencode \
                 /home/app/.local/share/opencode \
     && chown -R app:app /app /home/app

@@ -32,10 +32,15 @@ class TestAdminPage:
         r = admin_client.get("/admin")
 
         assert r.status_code == 200
-        assert r.text.count('integrity="sha384-') >= 7
-        assert r.text.count('crossorigin="anonymous"') >= 7
-        assert "https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" in r.text
-        assert "https://cdn.jsdelivr.net/npm/codemirror@5.65.18/lib/codemirror.min.js" in r.text
+        # SRI-pinned CDN assets carry both attributes. CodeMirror was dropped
+        # when the admin file/skill editors were removed; Alpine.js remains.
+        assert r.text.count('integrity="sha384-') >= 1
+        assert r.text.count('crossorigin="anonymous"') >= 1
+        # The Alpine.js CDN <script> is loaded with SRI + crossorigin pinning.
+        alpine_tag = re.search(r"<script[^>]*alpinejs@3\.14\.8[^>]*>", r.text)
+        assert alpine_tag is not None
+        assert 'integrity="sha384-' in alpine_tag.group(0)
+        assert 'crossorigin="anonymous"' in alpine_tag.group(0)
 
     def test_admin_page_script_has_no_empty_catch_blocks(self, admin_client):
         r = admin_client.get("/admin")
@@ -133,22 +138,6 @@ class TestAdminSummary:
         assert "models" in data
         assert "sessions" in data
         assert "auth" in data
-
-
-class TestAdminFiles:
-    def test_list_files(self, admin_client):
-        r = admin_client.get("/admin/api/files")
-        assert r.status_code == 200
-        data = r.json()
-        assert "files" in data
-
-    def test_read_file_not_found(self, admin_client):
-        r = admin_client.get("/admin/api/files/.claude/agents/missing.md")
-        assert r.status_code in (403, 404)
-
-    def test_read_file_outside_allowlist(self, admin_client):
-        r = admin_client.get("/admin/api/files/secret.env")
-        assert r.status_code == 403
 
 
 class TestAdminLogs:

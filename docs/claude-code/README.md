@@ -60,19 +60,7 @@ curl http://localhost:8000/v1/auth/status
 
 ## Working Directory
 
-Claude operates inside a working directory. Configure it once globally, or per-user.
-
-### Single global workspace
-
-```bash
-CLAUDE_CWD=./working_dir
-```
-
-If unset, the gateway creates a fresh temp directory per session and cleans it up on expiry.
-
-### Per-user workspace isolation
-
-Each `/v1/responses` request can include a `user` field. The gateway routes that user's requests to a permanent directory under `USER_WORKSPACES_DIR`:
+Each `/v1/responses` request can include a `user` field. With `USER_WORKSPACES_DIR` set, the gateway routes that user's requests to a persistent directory under it:
 
 ```bash
 USER_WORKSPACES_DIR=/data/workspaces
@@ -85,10 +73,10 @@ curl http://localhost:8000/v1/responses \
 
 - `user` specified → workspace at `/data/workspaces/alice/`, survives restarts
 - `user` omitted → temp workspace per session, cleaned on TTL expiry
-- New sessions copy `.claude/` config from `CLAUDE_CWD` into the user workspace
+- Workspaces start empty; Claude configuration is loaded from `~/.claude` (and `~/.claude/plugins`) independently of the workspace
 - User identifiers must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`
 
-`USER_WORKSPACES_DIR` falls back to `CLAUDE_CWD` when unset; if both are unset, temp dirs are used.
+If `USER_WORKSPACES_DIR` is unset, the gateway falls back to a per-session system temp directory.
 
 ## Thinking Mode
 
@@ -249,8 +237,7 @@ End-to-end examples live in `examples/`:
 | `ANTHROPIC_BASE_URL` | `https://api.anthropic.com` | Override Anthropic endpoint |
 | `CLAUDE_AUTH_METHOD` | auto | `cli` or `api_key` |
 | `DEFAULT_MODEL` | `sonnet` | Used when request omits `model` |
-| `CLAUDE_CWD` | temp dir | Global working directory |
-| `USER_WORKSPACES_DIR` | `CLAUDE_CWD` | Per-user workspace base |
+| `USER_WORKSPACES_DIR` | temp dir | Per-user workspace base (per-session temp dir if unset) |
 | `THINKING_MODE` | `adaptive` | `adaptive` / `enabled` / `disabled` |
 | `THINKING_BUDGET_TOKENS` | `10000` | Budget for `enabled` mode |
 | `TASK_BUDGET` | unset | Global tool-use token budget |

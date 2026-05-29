@@ -248,7 +248,6 @@ async def lifespan(app: FastAPI):
         cors_origins_val = os.getenv("CORS_ORIGINS", '["*"]')
         logger.debug(f"   CORS_ORIGINS: {cors_origins_val}")
         logger.debug(f"   MAX_TIMEOUT: {DEFAULT_TIMEOUT_MS}")
-        logger.debug(f"   CLAUDE_CWD: {os.getenv('CLAUDE_CWD', 'Not set')}")
         logger.debug("🔧 Available endpoints:")
         logger.debug("   POST /v1/responses - Responses API endpoint")
         logger.debug("   GET  /v1/models - List available models")
@@ -276,6 +275,17 @@ async def lifespan(app: FastAPI):
 
     # Start session cleanup task
     session_manager.start_cleanup_task()
+
+    # Sweep orphaned anonymous workspaces left behind by prior runs. Sessions are
+    # in-memory only, so a restart orphans every active anonymous session's
+    # _tmp_ directory; without this they accumulate forever under the base path.
+    try:
+        from src.workspace_manager import workspace_manager
+        from src.constants import SESSION_MAX_AGE_MINUTES
+
+        workspace_manager.sweep_orphan_temp_workspaces(SESSION_MAX_AGE_MINUTES * 60)
+    except Exception:
+        logger.debug("Orphan workspace sweep skipped", exc_info=True)
 
     # Bring up the optional usage-log SQLAlchemy engine (no-op when the env var is
     # unset).  Kept late in startup so a flaky logging DB cannot block the

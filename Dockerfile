@@ -69,7 +69,7 @@ COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py
 # The entrypoint starts as root only long enough to repair Docker bind-mount
 # permissions for gateway-owned data, then drops to APP_UID/APP_GID.
 RUN useradd -m -u 1000 -s /bin/bash app \
-    && mkdir -p /app/data /app/working_dir /home/app/.claude /home/app/.cache/uv \
+    && mkdir -p /app/data /home/app/.claude /home/app/.cache/uv \
     && chown -R app:app /app /home/app
 ENV HOME=/home/app \
     APP_UID=1000 \
