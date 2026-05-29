@@ -46,9 +46,10 @@ COPY src ./src
 # The admin system-prompt UI loads these templates at runtime.
 COPY docs/*system-prompt*.md ./docs/
 
-# Optional GitHub plugin auto-install on container start (see CLAUDE_PLUGIN_* env vars).
-COPY docker/install_plugins.sh /usr/local/bin/install_plugins.sh
-RUN chmod +x /usr/local/bin/install_plugins.sh
+# Optional marketplace plugin auto-install on container start. Supports multiple
+# repos and multiple plugins per repo, and fresh-clones each repo on every start
+# so the latest plugin version is installed (see CLAUDE_PLUGIN_* env vars).
+COPY docker/install_plugins.py /usr/local/bin/install_plugins.py
 
 # Optional build-time install hook for private/corporate additions. Compose
 # supplies a no-op script by default; set GATEWAY_BUILD_INSTALL_SCRIPT to run
@@ -81,4 +82,4 @@ EXPOSE 8000
 # Run the app with Uvicorn and honor PORT env var.
 # exec ensures SIGTERM from docker stop reaches uvicorn.
 ENTRYPOINT ["python", "/usr/local/bin/docker-entrypoint.py"]
-CMD ["sh", "-c", "/usr/local/bin/install_plugins.sh && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "python /usr/local/bin/install_plugins.py && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
