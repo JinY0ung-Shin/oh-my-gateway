@@ -41,9 +41,13 @@ def _encode_cwd(cwd) -> str:
 
     The Claude SDK stores per-project transcripts under
     ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. The encoding
-    rule observed across recorded sessions: every ``/``, ``_`` and ``.``
-    is replaced with ``-``. (To be re-verified against SDK source if the
-    rule changes — see plan Task C-followup.)
+    rule (verified against on-disk transcript directories): every ``/``,
+    ``_`` and ``.`` is replaced with ``-``.
+
+    The rule is **lossy** — distinct workspaces such as ``a_b``, ``a.b`` and
+    ``a-b`` collapse to the same directory — so ``_try_rehydrate_from_jsonl``
+    additionally verifies the transcript's recorded ``cwd`` against the
+    requester's workspace before trusting it.
     """
     return _CWD_ENCODE_RE.sub("-", str(cwd))
 
@@ -76,6 +80,7 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
         jsonl_path = _session_jsonl_path(session_id, cwd)
         if not jsonl_path.is_file():
             return None
+        expected_cwd = Path(cwd)
         user_msg_count = 0
         with jsonl_path.open("r") as fh:
             for raw in fh:
@@ -83,6 +88,27 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
                     line = json.loads(raw)
                 except (ValueError, json.JSONDecodeError):
                     return None  # corrupt — refuse to guess
+                # Ownership guard. ``_encode_cwd`` is lossy ('/', '_', '.' all
+                # collapse to '-'), so distinct workspaces — e.g. users "a_b",
+                # "a.b" and "a-b" — share one on-disk transcript directory. The
+                # SDK records the REAL cwd on each turn line, so refuse to
+                # rehydrate a transcript whose recorded cwd does not match the
+                # requester's resolved workspace; otherwise a colliding user
+                # could rebuild another user's session and history.
+                recorded_cwd = line.get("cwd")
+                if (
+                    isinstance(recorded_cwd, str)
+                    and recorded_cwd
+                    and Path(recorded_cwd) != expected_cwd
+                ):
+                    logger.warning(
+                        "Refusing to rehydrate session %s: transcript cwd %r "
+                        "does not match requester workspace %r",
+                        session_id,
+                        recorded_cwd,
+                        str(cwd),
+                    )
+                    return None
                 if line.get("type") != "user":
                     continue
                 # Claude jsonl reuses type="user" for two distinct things:

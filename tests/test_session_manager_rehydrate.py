@@ -227,6 +227,77 @@ def test_try_rehydrate_skips_isMeta_user_entries(tmp_path, monkeypatch):
     assert sess.turn_counter == 1
 
 
+def test_try_rehydrate_allows_matching_recorded_cwd(tmp_path, monkeypatch):
+    """A transcript whose recorded cwd matches the requester rehydrates."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/base/alice"
+    encoded = session_manager._encode_cwd(cwd)
+    sid = "owned-1"
+    jsonl = tmp_path / encoded / f"{sid}.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {"type": "user", "cwd": cwd, "message": {"role": "user", "content": "hi"}},
+            {"type": "assistant", "cwd": cwd, "message": {"role": "assistant", "content": "ok"}},
+        ],
+    )
+
+    sess = session_manager._try_rehydrate_from_jsonl(sid, user="alice", cwd=cwd)
+    assert sess is not None
+    assert sess.turn_counter == 1
+
+
+def test_try_rehydrate_refuses_on_recorded_cwd_mismatch(tmp_path, monkeypatch):
+    """Refuse to rehydrate when the transcript's recorded cwd differs from
+    the requester's workspace (cross-workspace transcript)."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    requester_cwd = "/base/bob"
+    encoded = session_manager._encode_cwd(requester_cwd)
+    sid = "foreign-1"
+    jsonl = tmp_path / encoded / f"{sid}.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            # Transcript was created in a DIFFERENT workspace.
+            {"type": "user", "cwd": "/base/someone-else", "message": {"role": "user", "content": "hi"}},
+        ],
+    )
+
+    sess = session_manager._try_rehydrate_from_jsonl(sid, user="bob", cwd=requester_cwd)
+    assert sess is None
+
+
+def test_try_rehydrate_isolates_colliding_workspaces(tmp_path, monkeypatch):
+    """Distinct usernames that differ only by '_'/'.'/'-' collapse to the same
+    encoded transcript dir; the recorded-cwd guard must keep them isolated."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    owner_cwd = "/base/a_b"  # user "a_b"
+    attacker_cwd = "/base/a.b"  # user "a.b" — encodes to the SAME dir
+    assert session_manager._encode_cwd(owner_cwd) == session_manager._encode_cwd(attacker_cwd)
+
+    sid = "shared-sid"
+    jsonl = tmp_path / session_manager._encode_cwd(owner_cwd) / f"{sid}.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {"type": "user", "cwd": owner_cwd, "message": {"role": "user", "content": "secret"}},
+        ],
+    )
+
+    # The colliding user is refused...
+    assert session_manager._try_rehydrate_from_jsonl(sid, user="a.b", cwd=attacker_cwd) is None
+    # ...but the real owner still rehydrates.
+    owned = session_manager._try_rehydrate_from_jsonl(sid, user="a_b", cwd=owner_cwd)
+    assert owned is not None
+    assert owned.turn_counter == 1
+
+
 def test_session_jsonl_exists_reflects_filesystem(tmp_path, monkeypatch):
     from src import session_manager
     from src.session_manager import Session
