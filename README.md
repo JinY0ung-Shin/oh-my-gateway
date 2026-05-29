@@ -37,7 +37,7 @@ curl http://localhost:8000/v1/responses \
 - **Session continuity**: `previous_response_id` and server-side session tracking.
 - **Workspace isolation**: temporary sessions by default, or per-user directories with `USER_WORKSPACES_DIR`.
 - **MCP support**: shared gateway `MCP_CONFIG`, with optional OpenCode managed-mode config generation.
-- **Admin tools**: `/admin` dashboard, `/admin/chat`, runtime config, sessions, logs, prompts, skills, plugins, and diagnostics.
+- **Admin tools**: `/admin` dashboard, `/admin/chat`, runtime config, sessions, logs, prompts, read-only plugin skills, and diagnostics.
 - **Docker support**: Dockerfile and Compose setup with optional usage-log MySQL sidecar.
 
 ## Documentation
