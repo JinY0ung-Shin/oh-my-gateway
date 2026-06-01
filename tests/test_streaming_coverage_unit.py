@@ -297,6 +297,20 @@ class TestBuildTaskEventUnmatched:
         result = _build_task_event({})
         assert result is None
 
+    def test_propagates_parent_tool_use_id(self):
+        """Subagent task events carry parent_tool_use_id so the UI can attribute
+        them to the agent that spawned the subagent."""
+        for subtype in ("task_started", "task_progress", "task_notification"):
+            result = _build_task_event(
+                {"subtype": subtype, "task_id": "t1", "parent_tool_use_id": "agent-1"}
+            )
+            assert result["parent_tool_use_id"] == "agent-1"
+
+    def test_parent_tool_use_id_none_for_top_level_task(self):
+        """Top-level (main-agent) task events have no parent → None."""
+        result = _build_task_event({"subtype": "task_started", "task_id": "t1"})
+        assert result["parent_tool_use_id"] is None
+
 
 # ---------------------------------------------------------------------------
 # Lines 395, 399-427: Tool block normalization fallbacks

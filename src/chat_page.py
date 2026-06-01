@@ -517,6 +517,15 @@ body::after {
   word-break: break-all;
   color: var(--text-dim);
 }
+.tool-event .tool-children { padding: 0 8px; }
+.tool-event .tool-children:empty { display: none; }
+.tool-event .tool-children > .tool-event:first-child { margin-top: 0.4rem; }
+.tool-event.tool-child {
+  max-width: 100%;
+  margin-bottom: 0.4rem;
+  border-left: 2px solid var(--green-dim);
+}
+.tool-event.tool-child > details { border-left: none; }
 
 /* === Input area === */
 .input-area {
@@ -814,6 +823,8 @@ let sessionId = null;
 let isStreaming = false;
 let currentAbortController = null;
 let pendingAsk = null;
+// tool_use_id -> tool-event card, so a subagent's calls nest under the agent that spawned them
+let toolEventsById = {};
 
 const chatEl = document.getElementById('chat');
 const inputEl = document.getElementById('input');
@@ -852,6 +863,7 @@ function newSession() {
     if (!confirm('현재 대화가 삭제됩니다. 새 세션을 시작하시겠습니까?')) return;
   }
   previousResponseId = null; sessionId = null; pendingAsk = null;
+  toolEventsById = {};
   updateSessionTag();
   chatEl.innerHTML = '';
   chatEl.appendChild(welcomeEl);
@@ -945,18 +957,37 @@ function extractReasoningTexts(response) {
   return out;
 }
 
-function addToolEvent(badgeClass, badgeText, title, bodyContent) {
+function addToolEvent(badgeClass, badgeText, title, bodyContent, opts) {
+  opts = opts || {};
   welcomeEl.style.display = 'none';
+
+  // Attribute to the agent that called this tool, if any.
+  let container = chatEl;
+  const parentId = opts.parentToolUseId;
+  if (parentId && toolEventsById[parentId]) {
+    const parentDetails = toolEventsById[parentId].querySelector(':scope > details');
+    const parentChildren = parentDetails && parentDetails.querySelector(':scope > .tool-children');
+    if (parentChildren) {
+      container = parentChildren;
+      parentDetails.open = true; // reveal the subagent's activity as it streams in
+    }
+  }
+
   const div = document.createElement('div');
-  div.className = 'tool-event';
+  div.className = 'tool-event' + (container !== chatEl ? ' tool-child' : '');
   div.innerHTML =
     '<details><summary>' +
     '<span class="tool-badge ' + badgeClass + '">' + escapeHtml(badgeText) + '</span> ' +
     '<span>' + escapeHtml(title) + '</span>' +
     '</summary>' +
     '<div class="tool-body"><pre>' + escapeHtml(bodyContent) + '</pre></div>' +
+    '<div class="tool-children"></div>' +
     '</details>';
-  chatEl.appendChild(div);
+
+  // Register tool_use cards so their callees can nest underneath.
+  if (opts.toolUseId) toolEventsById[opts.toolUseId] = div;
+
+  container.appendChild(div);
   scrollToBottom();
   return div;
 }
@@ -1268,7 +1299,8 @@ async function streamRequest(body) {
             : String(input).substring(0, 120);
           setStatus('streaming', 'Tool: ' + name);
           addToolEvent('tool-use', 'TOOL', name + (summary ? ' — ' + summary.substring(0, 60) : ''),
-            JSON.stringify(input, null, 2));
+            JSON.stringify(input, null, 2),
+            { toolUseId: evt.tool_use_id, parentToolUseId: evt.parent_tool_use_id });
         }
 
         // --- Tool result ---
@@ -1281,22 +1313,24 @@ async function streamRequest(body) {
             isError ? 'tool-error' : 'tool-result',
             isError ? 'ERROR' : 'RESULT',
             preview || '(empty)',
-            content || '(no content)'
+            content || '(no content)',
+            { parentToolUseId: evt.parent_tool_use_id }
           );
           setStatus('streaming', '스트리밍중...');
         }
 
-        // --- Task events ---
-        if (type === 'response.task') {
-          const task = evt.task || evt;
-          const taskType = task.type || '';
+        // --- Task events (subagent lifecycle: started / progress / notification) ---
+        if (typeof type === 'string' && type.startsWith('response.task')) {
+          const task = evt;
+          const taskType = type.slice('response.'.length);
           let title = '';
           if (taskType === 'task_started') title = 'Started: ' + (task.description || '');
           else if (taskType === 'task_progress') title = 'Progress: ' + (task.description || task.last_tool_name || '');
           else if (taskType === 'task_notification') title = (task.status || '') + ': ' + (task.summary || '');
           else title = taskType;
           if (title) {
-            addToolEvent('task', 'TASK', title, JSON.stringify(task, null, 2));
+            addToolEvent('task', 'TASK', title, JSON.stringify(task, null, 2),
+              { parentToolUseId: task.parent_tool_use_id });
             setStatus('streaming', title.substring(0, 40));
           }
         }

@@ -38,12 +38,14 @@ def make_response_sse(
 def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Build a structured task event dict from a system chunk, or None."""
     subtype = chunk.get("subtype")
+    parent_tool_use_id = chunk.get("parent_tool_use_id")
     if subtype == "task_started":
         return {
             "type": "task_started",
             "task_id": chunk.get("task_id", ""),
             "description": chunk.get("description", ""),
             "session_id": chunk.get("session_id", ""),
+            "parent_tool_use_id": parent_tool_use_id,
         }
     if subtype == "task_progress":
         return {
@@ -52,6 +54,7 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "description": chunk.get("description", ""),
             "last_tool_name": chunk.get("last_tool_name"),
             "usage": chunk.get("usage"),
+            "parent_tool_use_id": parent_tool_use_id,
         }
     if subtype == "task_notification":
         return {
@@ -60,6 +63,7 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "status": chunk.get("status", ""),
             "summary": chunk.get("summary", ""),
             "usage": chunk.get("usage"),
+            "parent_tool_use_id": parent_tool_use_id,
         }
     return None
 
