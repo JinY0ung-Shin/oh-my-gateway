@@ -99,23 +99,60 @@ def _deny(reason: str) -> Dict[str, Any]:
     }
 
 
-_ABS_PATH_RE = re.compile(r"(?:^|[\s=:'\"`(])(/[\w./\-+@]+)")
+# Matches path-like substrings beginning with ``/`` (absolute), ``./`` or
+# ``../`` (relative traversal) or ``~`` (home). Used as a fallback for shell
+# constructs ``shlex`` cannot tokenize cleanly (here-docs, ``$(...)``).
+_PATH_RE = re.compile(r"(?:^|[\s=:'\"`(])((?:/|\.\.?/|~/?)[\w./\-+@]*)")
 
 
-def _check_bash(command: str, root: Path) -> Optional[str]:
-    """Return a deny reason if *command* references paths outside *root*."""
-    if not command:
-        return None
-    # shlex catches quoted arguments; fall back to regex for shell constructs
-    # (here-docs, $(...)) that shlex can't tokenize cleanly.
+def _is_path_like(token: str) -> bool:
+    """Whether *token* looks like a filesystem path worth boundary-checking.
+
+    Covers absolute paths, any token containing a separator, bare parent refs
+    (``..``) and home refs (``~``/``~user``). Inside-workspace relative paths
+    also match but resolve within *root*, so checking them is harmless.
+    """
+    return bool(token) and ("/" in token or token == ".." or token.startswith("~"))
+
+
+def _expand_user(path: str) -> str:
+    """Expand a leading ``~`` so home-relative escapes are resolved statically."""
+    return os.path.expanduser(path) if path.startswith("~") else path
+
+
+def _bash_path_candidates(command: str) -> list[str]:
+    """Extract path-like substrings from a Bash *command*.
+
+    ``shlex`` handles quoting and ``--flag=value`` / ``VAR=value`` forms (the
+    value after ``=`` is inspected separately so an escape hidden in a flag is
+    not masked by the flag name). A regex pass over the raw command is layered
+    on top for shell constructs ``shlex`` cannot split cleanly.
+    """
+    candidates: list[str] = []
     try:
         tokens = shlex.split(command, posix=True)
     except ValueError:
         tokens = []
-    candidates = [t for t in tokens if t.startswith("/")]
-    candidates.extend(m.group(1) for m in _ABS_PATH_RE.finditer(command))
-    for path in candidates:
-        if _resolve_within(root, path) is None:
+    for tok in tokens:
+        parts = (tok, tok.split("=", 1)[1]) if "=" in tok else (tok,)
+        candidates.extend(p for p in parts if _is_path_like(p))
+    candidates.extend(m.group(1) for m in _PATH_RE.finditer(command))
+    return candidates
+
+
+def _check_bash(command: str, root: Path) -> Optional[str]:
+    """Return a deny reason if *command* references paths outside *root*.
+
+    Catches absolute paths, ``..`` traversal and ``~`` references — including
+    relative symlink targets such as ``ln -s ../../secret link``. Only
+    statically visible paths are inspected: runtime shell expansions (``$VAR``,
+    command substitution output) cannot be resolved here and are deferred to the
+    OS-level sandbox (``CLAUDE_SANDBOX_ENABLED``).
+    """
+    if not command:
+        return None
+    for path in _bash_path_candidates(command):
+        if _resolve_within(root, _expand_user(path)) is None:
             return (
                 f"Workspace sandbox: Bash referenced path outside workspace "
                 f"({path}). Allowed root: {root}."

@@ -1071,8 +1071,43 @@ class TestConfigureHelpers:
 
         opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
         with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", None):
-            cli_instance._configure_sandbox(opts)
+            with patch("src.backends.claude.client.sandbox_enabled", return_value=False):
+                cli_instance._configure_sandbox(opts)
         assert getattr(opts, "sandbox", None) is None
+
+    def test_configure_sandbox_unset_enabled_by_workspace(self, cli_instance):
+        """Workspace sandbox force-enables the OS sandbox when env is unset."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", None):
+            with patch("src.backends.claude.client.sandbox_enabled", return_value=True):
+                with patch("src.backends.claude.client.CLAUDE_SANDBOX_AUTO_ALLOW_BASH", True):
+                    with patch("src.backends.claude.client.CLAUDE_SANDBOX_EXCLUDED_COMMANDS", []):
+                        with patch(
+                            "src.backends.claude.client.CLAUDE_SANDBOX_ALLOW_UNSANDBOXED", False
+                        ):
+                            with patch(
+                                "src.backends.claude.client.CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL",
+                                False,
+                            ):
+                                with patch(
+                                    "src.backends.claude.client.CLAUDE_SANDBOX_WEAKER_NESTED", False
+                                ):
+                                    cli_instance._configure_sandbox(opts)
+        assert opts.sandbox is not None
+        assert opts.sandbox["enabled"] is True
+
+    def test_configure_sandbox_explicit_false_overrides_workspace(self, cli_instance):
+        """Explicit CLAUDE_SANDBOX_ENABLED=False wins over workspace sandbox."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.CLAUDE_SANDBOX_ENABLED", False):
+            with patch("src.backends.claude.client.sandbox_enabled", return_value=True):
+                cli_instance._configure_sandbox(opts)
+        assert opts.sandbox is not None
+        assert opts.sandbox["enabled"] is False
 
     def test_build_sdk_options_includes_sandbox(self, cli_instance):
         """_build_sdk_options calls _configure_sandbox."""

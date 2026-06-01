@@ -145,6 +145,38 @@ class TestBash:
         )
         assert result == {}
 
+    async def test_relative_traversal_denied(self, workspace):
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(hook, "Bash", {"command": "cat ../../etc/passwd"})
+        assert _is_deny(result)
+
+    async def test_relative_inside_subdir_allowed(self, workspace):
+        (workspace / "logs").mkdir()
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(hook, "Bash", {"command": "cat logs/app.log"})
+        assert result == {}
+
+    async def test_relative_symlink_target_denied(self, workspace):
+        # ``ln -s`` with a relative target escapes via the parent traversal in
+        # the link target argument, even though no token starts with ``/``.
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(
+            hook, "Bash", {"command": "ln -s ../../etc/passwd shortcut"}
+        )
+        assert _is_deny(result)
+
+    async def test_home_reference_denied(self, workspace):
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(hook, "Bash", {"command": "cat ~/.ssh/id_rsa"})
+        assert _is_deny(result)
+
+    async def test_flag_value_traversal_denied(self, workspace):
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(
+            hook, "Bash", {"command": "tar --file=../../escape.tar ."}
+        )
+        assert _is_deny(result)
+
 
 class TestAllowOutside:
     async def test_read_category_releases_read_glob_grep(
