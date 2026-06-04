@@ -36,15 +36,25 @@ def make_response_sse(
 
 
 def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Build a structured task event dict from a system chunk, or None."""
+    """Build a structured task event dict from a system chunk, or None.
+
+    Nesting reference: the Claude SDK's ``TaskStarted/Progress/Notification``
+    messages carry ``tool_use_id`` — the id of the orchestrator's ``Task``
+    tool_use that spawned this subagent. That is exactly the node the chat UI
+    nests progress under, so we surface it as ``parent_tool_use_id`` (the field
+    every other event uses for attribution). An explicit ``parent_tool_use_id``
+    on the chunk still wins, for forward-compatibility and synthetic callers.
+    """
     subtype = chunk.get("subtype")
-    parent_tool_use_id = chunk.get("parent_tool_use_id")
+    tool_use_id = chunk.get("tool_use_id")
+    parent_tool_use_id = chunk.get("parent_tool_use_id") or tool_use_id
     if subtype == "task_started":
         return {
             "type": "task_started",
             "task_id": chunk.get("task_id", ""),
             "description": chunk.get("description", ""),
             "session_id": chunk.get("session_id", ""),
+            "tool_use_id": tool_use_id,
             "parent_tool_use_id": parent_tool_use_id,
         }
     if subtype == "task_progress":
@@ -54,6 +64,7 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "description": chunk.get("description", ""),
             "last_tool_name": chunk.get("last_tool_name"),
             "usage": chunk.get("usage"),
+            "tool_use_id": tool_use_id,
             "parent_tool_use_id": parent_tool_use_id,
         }
     if subtype == "task_notification":
@@ -63,6 +74,7 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "status": chunk.get("status", ""),
             "summary": chunk.get("summary", ""),
             "usage": chunk.get("usage"),
+            "tool_use_id": tool_use_id,
             "parent_tool_use_id": parent_tool_use_id,
         }
     return None

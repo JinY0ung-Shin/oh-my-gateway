@@ -58,6 +58,15 @@ class TestAdminPage:
 
 
 class TestAdminChatPage:
+    def test_build_chat_page_returns_html(self):
+        """Direct smoke test of the static builder, independent of routing."""
+        from src.chat_page import build_chat_page
+
+        html = build_chat_page()
+        assert isinstance(html, str)
+        assert "GATEWAY CHAT" in html
+        assert html.lstrip().startswith("<!DOCTYPE html>")
+
     def test_get_admin_chat_page(self, admin_client):
         r = admin_client.get("/admin/chat")
 
@@ -92,15 +101,48 @@ class TestAdminChatPage:
         assert "let activeBubble = null" in r.text
         assert "activeBubbleText += evt.delta" in r.text
 
+        # A tool_use still finalizes the current text bubble before its card is
+        # rendered, so text segments split by a tool call stay visually separate.
         tool_use_idx = r.text.index("if (type === 'response.tool_use')")
         tool_use_finalize_idx = r.text.index("finalizeActiveBubble();", tool_use_idx)
-        tool_use_append_idx = r.text.index("addToolEvent('tool-use'", tool_use_idx)
-        assert tool_use_finalize_idx < tool_use_append_idx
+        tool_use_render_idx = r.text.index("renderToolUse(evt)", tool_use_idx)
+        assert tool_use_finalize_idx < tool_use_render_idx
 
-        tool_result_idx = r.text.index("if (type === 'response.tool_result')")
-        tool_result_finalize_idx = r.text.index("finalizeActiveBubble();", tool_result_idx)
-        tool_result_append_idx = r.text.index("addToolEvent(", tool_result_idx)
-        assert tool_result_finalize_idx < tool_result_append_idx
+    def test_admin_chat_page_pairs_tool_result_with_its_tool_use(self, admin_client):
+        """A tool_result merges back into the card of the call it answers
+        (looked up by tool_use_id) instead of rendering a disconnected card."""
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "toolEventsById[evt.tool_use_id]" in r.text
+        assert "function attachToolResult(" in r.text
+        # tool_result no longer unconditionally finalizes + appends a sibling card;
+        # the merge path runs before any standalone fallback.
+        tr_idx = r.text.index("if (type === 'response.tool_result')")
+        assert r.text.index("attachToolResult(card", tr_idx) < r.text.index(
+            "createToolCard({", tr_idx
+        )
+
+    def test_admin_chat_page_renders_per_tool_badges(self, admin_client):
+        """Each tool type — and the Agent/Task tool in particular — gets a
+        distinct category badge rather than a generic 'TOOL' label."""
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "function toolMeta(" in r.text
+        assert "cat-agent" in r.text
+        assert "tool-agent" in r.text
+        assert "cat-bash" in r.text
+
+    def test_admin_chat_page_nests_task_lifecycle_under_agent(self, admin_client):
+        """Subagent lifecycle events collapse into one in-place status line that
+        nests under the spawning agent card."""
+        r = admin_client.get("/admin/chat")
+
+        assert r.status_code == 200
+        assert "function upsertTaskStatus(" in r.text
+        assert "task-status-line" in r.text
+        assert "parent_tool_use_id || evt.tool_use_id" in r.text
 
     def test_admin_chat_page_serves_login_gate_to_unauthenticated_clients(self):
         """Anonymous GET /admin/chat should return 200 with the inline auth gate."""

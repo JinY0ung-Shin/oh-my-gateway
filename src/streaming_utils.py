@@ -892,7 +892,13 @@ async def stream_response_chunks(
 
             # Handle task system messages (structured JSON, not content)
             if chunk.get("type") == "system":
-                is_subagent_task = chunk.get("parent_tool_use_id") is not None
+                # SDK task messages identify their spawning Task tool via
+                # ``tool_use_id``; treat either field as the subagent signal so
+                # SUBAGENT_STREAM_PROGRESS actually gates real SDK output.
+                is_subagent_task = (
+                    chunk.get("parent_tool_use_id") is not None
+                    or chunk.get("tool_use_id") is not None
+                )
                 if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
                     task_event = _build_task_event(chunk)
                     if task_event:

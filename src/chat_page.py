@@ -178,7 +178,8 @@ body::after {
   outline: none;
 }
 .api-key-input:focus {
-  border-color: var(--amber-dim);
+  border-color: var(--green-dim);
+  box-shadow: 0 0 6px var(--green-muted);
 }
 .api-key-input::placeholder {
   color: var(--text-muted);
@@ -272,6 +273,7 @@ body::after {
   border: 1px solid var(--amber-dim);
   background: var(--amber-subtle);
 }
+.thinking-panel[hidden] { display: none; }
 .thinking-panel summary {
   display: flex;
   align-items: center;
@@ -339,6 +341,18 @@ body::after {
 .bubble pre code {
   background: none;
   padding: 0;
+}
+.bubble ul, .bubble ol { margin: 0.3rem 0 0.3rem 1.25rem; padding: 0; }
+.bubble li { margin: 0.12rem 0; }
+.bubble a { color: var(--cyan); text-decoration: underline; word-break: break-all; }
+.bubble a:hover { text-shadow: 0 0 6px var(--cyan-dim); }
+.bubble em { color: var(--text-bright); font-style: italic; }
+
+/* Error bubble — visually distinct from normal assistant output */
+.message.assistant .bubble.bubble-error {
+  border-color: var(--red-dim);
+  background: var(--red-subtle);
+  color: var(--red);
 }
 
 /* AskUserQuestion prompt */
@@ -452,16 +466,29 @@ body::after {
   text-shadow: 0 0 4px rgba(255, 0, 255, 0.4);
 }
 
-/* Tool events */
+/* === Tool events ===
+   One card per tool call. The result is merged back into the originating
+   card (status pill + RESULT section) rather than a disconnected sibling.
+   The left accent border encodes status; the badge color encodes tool type. */
 .tool-event {
   margin-bottom: 0.5rem;
   max-width: 85%;
   animation: fadeIn 0.15s ease;
+  border-left: 3px solid var(--border-bright);
 }
+/* Only top-level cards are inset from the conversation column; nested cards
+   take their indent from the parent's .tool-children padding (no stacking). */
+#chat > .tool-event { margin-left: 0.75rem; }
+.tool-event[data-status="running"] { border-left-color: var(--amber-dim); }
+.tool-event[data-status="done"]    { border-left-color: var(--green-dim); }
+.tool-event[data-status="error"]   { border-left-color: var(--red-dim); }
+.tool-event.tool-agent { border-left-color: var(--magenta); }
 .tool-event details {
   border: 1px solid var(--border);
+  border-left: none;
   background: var(--bg-surface);
 }
+.tool-event.tool-agent > details { background: rgba(255, 0, 255, 0.04); }
 .tool-event summary {
   display: flex;
   align-items: center;
@@ -475,7 +502,7 @@ body::after {
 .tool-event summary::-webkit-details-marker { display: none; }
 .tool-event summary::after {
   content: '>';
-  margin-left: auto;
+  margin-left: 0.25rem;
   color: var(--text-muted);
   font-size: var(--fs-xs);
   transition: transform 0.15s;
@@ -483,49 +510,99 @@ body::after {
 .tool-event details[open] summary::after { transform: rotate(90deg); color: var(--green-dim); }
 .tool-event details[open] summary { border-bottom: 1px solid var(--border); }
 .tool-event .tool-badge {
+  flex: 0 0 auto;
   font-size: var(--fs-xs);
   padding: 1px 6px;
   border: 1px solid;
-  font-weight: 500;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
 }
-.tool-badge.tool-use {
-  color: var(--amber);
-  border-color: var(--amber-dim);
+.tool-event .tool-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
 }
-.tool-badge.tool-result {
-  color: var(--cyan);
-  border-color: var(--cyan-dim);
+.tool-event .tool-status {
+  flex: 0 0 auto;
+  font-weight: 700;
+  font-size: var(--fs-xs);
 }
-.tool-badge.tool-error {
-  color: var(--red);
-  border-color: var(--red-dim);
-}
-.tool-badge.task {
-  color: var(--green-dim);
-  border-color: var(--green-dim);
-}
+.tool-status.running { color: var(--amber); animation: pulse 1s ease-in-out infinite; }
+.tool-status.done    { color: var(--green); }
+.tool-status.error   { color: var(--red); }
+/* Per-tool-type badge colors */
+.tool-badge.cat-agent   { color: var(--magenta); border-color: var(--magenta); }
+.tool-badge.cat-bash    { color: var(--green); border-color: var(--green-dim); }
+.tool-badge.cat-read    { color: var(--cyan); border-color: var(--cyan-dim); }
+.tool-badge.cat-write,
+.tool-badge.cat-edit    { color: var(--amber); border-color: var(--amber-dim); }
+.tool-badge.cat-search  { color: var(--cyan-dim); border-color: var(--cyan-dim); }
+.tool-badge.cat-web     { color: var(--cyan); border-color: var(--cyan-dim); }
+.tool-badge.cat-todo    { color: var(--green-dim); border-color: var(--green-dim); }
+.tool-badge.cat-mcp     { color: var(--magenta); border-color: var(--magenta); }
+.tool-badge.cat-ask     { color: var(--magenta); border-color: var(--magenta); }
+.tool-badge.cat-result  { color: var(--cyan); border-color: var(--cyan-dim); }
+.tool-badge.cat-error   { color: var(--red); border-color: var(--red-dim); }
+.tool-badge.cat-default { color: var(--amber); border-color: var(--amber-dim); }
 .tool-event .tool-body {
   padding: 6px 8px;
   font-size: var(--fs-xs);
   overflow-x: auto;
-  max-height: 300px;
+  max-height: 320px;
   overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-bright) var(--bg-surface);
 }
+.tool-event .tool-section { margin-bottom: 6px; }
+.tool-event .tool-section:last-child { margin-bottom: 0; }
+.tool-event .tool-section-label {
+  font-size: 0.62rem;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+.tool-event .tool-section-result .tool-section-label { color: var(--cyan-dim); }
+.tool-event .tool-section-error .tool-section-label { color: var(--red); }
 .tool-event .tool-body pre {
   margin: 0;
   white-space: pre-wrap;
-  word-break: break-all;
+  word-break: break-word;
   color: var(--text-dim);
 }
-.tool-event .tool-children { padding: 0 8px; }
+.tool-event .tool-children { padding-left: 0.85rem; }
 .tool-event .tool-children:empty { display: none; }
-.tool-event .tool-children > .tool-event:first-child { margin-top: 0.4rem; }
+.tool-event .tool-children > .tool-event:first-child,
+.tool-event .tool-children > .task-status-line:first-child { margin-top: 0.4rem; }
 .tool-event.tool-child {
   max-width: 100%;
   margin-bottom: 0.4rem;
-  border-left: 2px solid var(--green-dim);
 }
 .tool-event.tool-child > details { border-left: none; }
+
+/* Subagent lifecycle: one in-place status line per agent (not stacked cards) */
+.task-status-line {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 3px 8px;
+  margin: 0.3rem 0;
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  border-left: 2px solid var(--border-bright);
+  background: var(--bg-raised);
+  animation: fadeIn 0.15s ease;
+}
+#chat > .task-status-line { margin-left: 0.75rem; }
+.task-status-line[data-state="running"] { border-left-color: var(--amber-dim); color: var(--amber); }
+.task-status-line[data-state="done"]    { border-left-color: var(--green-dim); color: var(--green-dim); }
+.task-status-line[data-state="error"]   { border-left-color: var(--red-dim); color: var(--red); }
+.task-status-line .task-status-glyph { flex: 0 0 auto; font-weight: 700; }
+.task-status-line .task-status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* === Input area === */
 .input-area {
@@ -717,8 +794,6 @@ body::after {
 /* Send button active */
 .send-btn:active:not(:disabled) { transform: scale(0.96); background: var(--green-muted); }
 
-/* Tool event indent */
-.tool-event { margin-left: 1.5rem; border-left: 2px solid var(--border); padding-left: var(--gap-sm); }
 .tool-event .tool-body::-webkit-scrollbar { width: 4px; }
 .tool-event .tool-body::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
 
@@ -733,7 +808,9 @@ body::after {
   .input-area { padding: var(--gap-sm); }
   .ask-prompt .ask-input-row { flex-direction: column; }
   .ask-prompt .ask-option-btn { padding: 10px 12px; }
-  .tool-event { max-width: 100%; margin-left: var(--gap-sm); }
+  .tool-event { max-width: 100%; }
+  #chat > .tool-event, #chat > .task-status-line { margin-left: 0; }
+  .tool-event .tool-children { padding-left: 0.6rem; }
 }
 </style>
 </head>
@@ -823,8 +900,17 @@ let sessionId = null;
 let isStreaming = false;
 let currentAbortController = null;
 let pendingAsk = null;
-// tool_use_id -> tool-event card, so a subagent's calls nest under the agent that spawned them
+// tool_use_id -> tool-event card. Lets a tool_result merge back into the card
+// that invoked it, and a subagent's calls nest under the agent that spawned them.
 let toolEventsById = {};
+// task_id -> the single live status line for that subagent (updated in place)
+let taskStatusById = {};
+// Resilience to out-of-order SSE: nodes whose parent agent card isn't registered
+// yet are parked at top level and re-homed once the agent card appears.
+let pendingChildrenByParent = {};   // parentToolUseId -> [orphaned child nodes]
+let pendingResultsByToolUseId = {}; // toolUseId -> {content, isError, card} awaiting its tool_use
+let orphanSeq = 0;                  // unique fallback key for task lines lacking ids
+let lastIdlessTaskKey = null;       // groups id-less task lifecycle events together
 
 const chatEl = document.getElementById('chat');
 const inputEl = document.getElementById('input');
@@ -864,6 +950,11 @@ function newSession() {
   }
   previousResponseId = null; sessionId = null; pendingAsk = null;
   toolEventsById = {};
+  taskStatusById = {};
+  pendingChildrenByParent = {};
+  pendingResultsByToolUseId = {};
+  orphanSeq = 0;
+  lastIdlessTaskKey = null;
   updateSessionTag();
   chatEl.innerHTML = '';
   chatEl.appendChild(welcomeEl);
@@ -887,12 +978,59 @@ function escapeHtml(text) {
 function escapeAttr(text) {
   return String(text).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/'/g, '&#39;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
+// U+E000 (private-use) delimits stashed code blocks. escapeHtml leaves it
+// untouched and it cannot appear in normal text, so it can't collide with
+// user/model content the way an ASCII sentinel could.
+const CB_SENTINEL = '\uE000';
 function renderMarkdown(text) {
   let html = escapeHtml(text);
-  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>');
+  // Fenced code blocks first (tolerate a missing newline after the fence),
+  // stashed as placeholders so inline rules don't touch their contents.
+  const codeBlocks = [];
+  html = html.replace(/```(\w*)\r?\n?([\s\S]*?)```/g, (m, lang, code) => {
+    const cls = lang ? ' class="language-' + lang + '"' : '';
+    codeBlocks.push('<pre><code' + cls + '>' + code.replace(/\n$/, '') + '</code></pre>');
+    return CB_SENTINEL + (codeBlocks.length - 1) + CB_SENTINEL;
+  });
   html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // Links: only http(s), and the URL goes into an href attribute, so quotes
+  // (which escapeHtml does NOT escape) must be neutralized to prevent
+  // attribute-injection. The link text is element content and stays escaped.
+  html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)<>"']+)\)/g, (m, txt, url) =>
+    '<a href="' + url.replace(/"/g, '%22').replace(/'/g, '%27') +
+    '" target="_blank" rel="noopener noreferrer">' + txt + '</a>');
   html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
+  // Italic: require the asterisks to hug non-space content and sit at word
+  // boundaries, so globs (*.py), math (2 * 3) and a*b are left alone.
+  html = html.replace(/(^|[\s(])\*(\S(?:[^*\n]*?\S)?)\*(?=[\s).,!?;:]|$)/g, '$1<em>$2</em>');
+  html = renderMarkdownLists(html);
+  // Restore code blocks; leave a stray sentinel-shaped literal untouched.
+  const restore = new RegExp(CB_SENTINEL + '(\\d+)' + CB_SENTINEL, 'g');
+  html = html.replace(restore, (m, i) => codeBlocks[+i] !== undefined ? codeBlocks[+i] : m);
   return html;
+}
+// Group consecutive -/*/+ or 1. lines into <ul>/<ol>; leave other lines intact.
+function renderMarkdownLists(html) {
+  const lines = html.split('\n');
+  const out = [];
+  let listType = null;
+  const closeList = () => { if (listType) { out.push('</' + listType + '>'); listType = null; } };
+  for (const line of lines) {
+    const ul = /^\s*[-*+]\s+(.*)$/.exec(line);
+    const ol = /^\s*\d+\.\s+(.*)$/.exec(line);
+    if (ul) {
+      if (listType !== 'ul') { closeList(); out.push('<ul>'); listType = 'ul'; }
+      out.push('<li>' + ul[1] + '</li>');
+    } else if (ol) {
+      if (listType !== 'ol') { closeList(); out.push('<ol>'); listType = 'ol'; }
+      out.push('<li>' + ol[1] + '</li>');
+    } else {
+      closeList();
+      out.push(line);
+    }
+  }
+  closeList();
+  return out.join('\n');
 }
 
 // --- UI builders ---
@@ -913,7 +1051,7 @@ function addStreamingMessage() {
   div.className = 'message assistant';
   div.innerHTML =
     '<div class="role">assistant</div>' +
-    '<details class="thinking-panel" open style="display:none">' +
+    '<details class="thinking-panel" open hidden>' +
     '<summary><span>THINKING</span><span class="thinking-meta"></span></summary>' +
     '<div class="thinking-content"></div>' +
     '</details>' +
@@ -929,9 +1067,13 @@ function updateThinkingPanel(messageEl, text) {
   const content = messageEl.querySelector('.thinking-content');
   const meta = messageEl.querySelector('.thinking-meta');
   if (!panel || !content) return;
-  panel.style.display = 'block';
+  panel.hidden = false;
   content.textContent = text || '(empty)';
-  if (meta) meta.textContent = String(text || '').length + ' chars';
+  if (meta) {
+    const n = String(text || '').length;
+    meta.textContent = n ? '~' + Math.max(1, Math.round(n / 5)) + ' words' : '';
+    meta.title = n + ' characters';
+  }
   scrollToBottom();
 }
 
@@ -957,39 +1099,211 @@ function extractReasoningTexts(response) {
   return out;
 }
 
-function addToolEvent(badgeClass, badgeText, title, bodyContent, opts) {
-  opts = opts || {};
-  welcomeEl.style.display = 'none';
+function statusGlyph(status) {
+  if (status === 'done') return '✓';   // ✓
+  if (status === 'error') return '✗';  // ✗
+  if (status === 'running') return '⋯'; // ⋯
+  return '';
+}
 
-  // Attribute to the agent that called this tool, if any.
-  let container = chatEl;
-  const parentId = opts.parentToolUseId;
-  if (parentId && toolEventsById[parentId]) {
-    const parentDetails = toolEventsById[parentId].querySelector(':scope > details');
-    const parentChildren = parentDetails && parentDetails.querySelector(':scope > .tool-children');
-    if (parentChildren) {
-      container = parentChildren;
-      parentDetails.open = true; // reveal the subagent's activity as it streams in
+// Map a tool name to a display category {cls, glyph, label} so each kind of
+// tool — and especially the Task/Agent tool — is visually distinguishable.
+function toolMeta(name) {
+  const raw = name || 'tool';
+  const n = raw.toLowerCase();
+  if (n === 'task' || n === 'agent') return { cls: 'cat-agent', glyph: '✦', label: raw };
+  if (n.indexOf('mcp__') === 0) return { cls: 'cat-mcp', glyph: '⚙', label: raw };
+  if (n === 'bash' || n === 'bashoutput' || n === 'killshell' || n === 'killbash') return { cls: 'cat-bash', glyph: '$', label: raw };
+  if (n === 'read' || n === 'notebookread') return { cls: 'cat-read', glyph: '▤', label: raw };
+  if (n === 'write') return { cls: 'cat-write', glyph: '✎', label: raw };
+  if (n === 'edit' || n === 'multiedit' || n === 'notebookedit') return { cls: 'cat-edit', glyph: '✎', label: raw };
+  if (n === 'grep' || n === 'glob' || n === 'ls') return { cls: 'cat-search', glyph: '⌕', label: raw };
+  if (n === 'webfetch' || n === 'websearch') return { cls: 'cat-web', glyph: '◎', label: raw };
+  if (n === 'todowrite' || n === 'todoread') return { cls: 'cat-todo', glyph: '☑', label: raw };
+  if (n === 'askuserquestion') return { cls: 'cat-ask', glyph: '?', label: raw };
+  return { cls: 'cat-default', glyph: '▸', label: raw };
+}
+
+// One-line summary of a tool's input, favoring its most telling argument.
+function summarizeInput(input) {
+  if (input === null || typeof input !== 'object') {
+    return String(input == null ? '' : input).slice(0, 140);
+  }
+  const primary = input.command || input.file_path || input.path || input.pattern ||
+    input.query || input.url || input.description || input.prompt || input.notebook_path;
+  let s;
+  if (primary) {
+    s = String(primary);
+  } else {
+    const entries = Object.entries(input);
+    if (!entries.length) return '';
+    s = entries.map(([k, v]) => k + ': ' + (typeof v === 'string' ? v : JSON.stringify(v))).join(', ');
+  }
+  return s.replace(/\s+/g, ' ').trim().slice(0, 140);
+}
+
+// Find the .tool-children container of a registered tool card (and open it).
+function childContainerFor(parentToolUseId) {
+  if (!parentToolUseId || !toolEventsById[parentToolUseId]) return null;
+  const details = toolEventsById[parentToolUseId].querySelector(':scope > details');
+  const children = details && details.querySelector(':scope > .tool-children');
+  if (children) { details.open = true; return children; }
+  return null;
+}
+
+// When an agent card finally registers, pull in any child nodes (nested tool
+// cards, task status lines) that arrived earlier and were parked at top level.
+function adoptPendingChildren(parentToolUseId, card) {
+  const orphans = pendingChildrenByParent[parentToolUseId];
+  if (!orphans || !orphans.length) return;
+  const details = card.querySelector(':scope > details');
+  const children = details && details.querySelector(':scope > .tool-children');
+  if (children) {
+    details.open = true;
+    for (const node of orphans) children.appendChild(node); // moves out of #chat
+  }
+  delete pendingChildrenByParent[parentToolUseId];
+}
+
+// Build a tool-event card. Used for tool_use, and as a fallback for an
+// orphaned tool_result/failure that has no card to merge into.
+function createToolCard(o) {
+  welcomeEl.style.display = 'none';
+  const container = childContainerFor(o.parentToolUseId) || chatEl;
+  const div = document.createElement('div');
+  div.className = 'tool-event ' + (o.badgeCls || 'cat-default') +
+    (container !== chatEl ? ' tool-child' : '') + (o.isAgent ? ' tool-agent' : '');
+  div.dataset.status = o.status || '';
+  const bodyLabel = o.bodyLabel || 'INPUT';
+  const sectionCls = bodyLabel === 'ERROR' ? 'tool-section-error'
+    : (bodyLabel === 'RESULT' ? 'tool-section-result' : '');
+  const body = o.body
+    ? '<div class="tool-section ' + sectionCls + '"><div class="tool-section-label">' + bodyLabel +
+      '</div><pre>' + escapeHtml(o.body) + '</pre></div>'
+    : '';
+  div.innerHTML =
+    '<details' + (o.isAgent ? ' open' : '') + '>' +
+      '<summary aria-label="' + escapeAttr((o.badgeLabel || '') + ' ' + (o.title || '')) + '">' +
+        '<span class="tool-badge ' + (o.badgeCls || 'cat-default') + '">' +
+          escapeHtml((o.glyph ? o.glyph + ' ' : '') + (o.badgeLabel || '')) + '</span>' +
+        '<span class="tool-title">' + escapeHtml(o.title || '') + '</span>' +
+        '<span class="tool-status ' + (o.status || '') + '">' + statusGlyph(o.status) + '</span>' +
+      '</summary>' +
+      '<div class="tool-body">' + body + '</div>' +
+      '<div class="tool-children"></div>' +
+    '</details>';
+  container.appendChild(div);
+  // If this card couldn't nest yet (parent not registered), park it so the
+  // agent card can adopt it later. Result-fallback cards opt out (o.noReparent).
+  if (container === chatEl && o.parentToolUseId && !o.noReparent) {
+    (pendingChildrenByParent[o.parentToolUseId] = pendingChildrenByParent[o.parentToolUseId] || []).push(div);
+  }
+  if (o.toolUseId) {
+    toolEventsById[o.toolUseId] = div;
+    adoptPendingChildren(o.toolUseId, div);
+    const pr = pendingResultsByToolUseId[o.toolUseId];
+    if (pr) {
+      if (pr.card && pr.card.parentNode) pr.card.parentNode.removeChild(pr.card);
+      attachToolResult(div, pr.content, pr.isError);
+      delete pendingResultsByToolUseId[o.toolUseId];
     }
   }
-
-  const div = document.createElement('div');
-  div.className = 'tool-event' + (container !== chatEl ? ' tool-child' : '');
-  div.innerHTML =
-    '<details><summary>' +
-    '<span class="tool-badge ' + badgeClass + '">' + escapeHtml(badgeText) + '</span> ' +
-    '<span>' + escapeHtml(title) + '</span>' +
-    '</summary>' +
-    '<div class="tool-body"><pre>' + escapeHtml(bodyContent) + '</pre></div>' +
-    '<div class="tool-children"></div>' +
-    '</details>';
-
-  // Register tool_use cards so their callees can nest underneath.
-  if (opts.toolUseId) toolEventsById[opts.toolUseId] = div;
-
-  container.appendChild(div);
   scrollToBottom();
   return div;
+}
+
+// Render a tool_use SSE event as a card (status starts as "running").
+function renderToolUse(evt) {
+  const meta = toolMeta(evt.name);
+  const input = evt.input || {};
+  const isAgent = meta.cls === 'cat-agent';
+  let title;
+  if (isAgent) {
+    const who = input.subagent_type ? '@' + input.subagent_type : '';
+    title = [who, input.description || summarizeInput(input)].filter(Boolean).join('  ');
+  } else {
+    title = summarizeInput(input);
+  }
+  return createToolCard({
+    badgeCls: meta.cls,
+    glyph: meta.glyph,
+    badgeLabel: meta.label,
+    title: title,
+    body: JSON.stringify(input, null, 2),
+    bodyLabel: 'INPUT',
+    status: 'running',
+    toolUseId: evt.tool_use_id,
+    parentToolUseId: evt.parent_tool_use_id,
+    isAgent: isAgent,
+  });
+}
+
+// Merge a tool_result into the card of the tool_use it answers, flipping the
+// card's status pill and appending a RESULT/ERROR section to its body.
+function attachToolResult(card, content, isError) {
+  const details = card.querySelector(':scope > details');
+  const body = details && details.querySelector(':scope > .tool-body');
+  if (body) {
+    const sec = document.createElement('div');
+    sec.className = 'tool-section ' + (isError ? 'tool-section-error' : 'tool-section-result');
+    sec.innerHTML = '<div class="tool-section-label">' + (isError ? 'ERROR' : 'RESULT') +
+      '</div><pre>' + escapeHtml(content || '(no content)') + '</pre>';
+    body.appendChild(sec);
+  }
+  const status = isError ? 'error' : 'done';
+  card.dataset.status = status;
+  const pill = details && details.querySelector(':scope > summary > .tool-status');
+  if (pill) { pill.className = 'tool-status ' + status; pill.textContent = statusGlyph(status); }
+  scrollToBottom();
+}
+
+// Maintain ONE live status line per subagent, nested under the spawning agent,
+// updated in place across task_started / task_progress / task_notification.
+function upsertTaskStatus(evt) {
+  const taskType = String(evt.type || '').slice('response.'.length);
+  const parentId = evt.parent_tool_use_id || evt.tool_use_id;
+  let text, state;
+  if (taskType === 'task_started') {
+    text = 'started' + (evt.description ? ' · ' + evt.description : '');
+    state = 'running';
+  } else if (taskType === 'task_progress') {
+    const bits = [evt.last_tool_name, evt.description].filter(Boolean);
+    text = 'running' + (bits.length ? ' · ' + bits.join(' · ') : '');
+    state = 'running';
+  } else if (taskType === 'task_notification') {
+    state = evt.status === 'failed' ? 'error' : 'done';
+    text = (evt.status || 'done') + (evt.summary ? ' · ' + evt.summary : '');
+  } else {
+    return;
+  }
+  // Group a subagent's lifecycle by a STABLE id. task_id and parentId are both
+  // empty only for truly id-less tasks (which the SDK does not emit in
+  // practice); those fall back to a fresh key per started event so distinct
+  // subagents never collide, while later progress/notification reuse the last.
+  let key = evt.task_id || parentId;
+  if (!key) {
+    if (taskType === 'task_started' || !lastIdlessTaskKey) lastIdlessTaskKey = 'task#' + (orphanSeq++);
+    key = lastIdlessTaskKey;
+  }
+  let line = taskStatusById[key];
+  if (!line) {
+    line = document.createElement('div');
+    line.className = 'task-status-line';
+    const children = childContainerFor(parentId);
+    if (children) {
+      children.insertBefore(line, children.firstChild); // pin above nested tool cards
+    } else {
+      welcomeEl.style.display = 'none';
+      chatEl.appendChild(line);
+      // Park under the agent so it can be re-homed once the agent card arrives.
+      if (parentId) (pendingChildrenByParent[parentId] = pendingChildrenByParent[parentId] || []).push(line);
+    }
+    taskStatusById[key] = line;
+  }
+  line.dataset.state = state;
+  line.innerHTML = '<span class="task-status-glyph">' + statusGlyph(state) + '</span>' +
+    '<span class="task-status-text">' + escapeHtml(text) + '</span>';
+  scrollToBottom();
 }
 
 // --- AskUserQuestion ---
@@ -1177,7 +1491,7 @@ async function streamRequest(body) {
 
   function messageHasThinking(messageEl) {
     const panel = messageEl && messageEl.querySelector('.thinking-panel');
-    return !!(panel && panel.style.display !== 'none');
+    return !!(panel && !panel.hidden);
   }
 
   function ensureActiveBubble() {
@@ -1227,7 +1541,9 @@ async function streamRequest(body) {
     if (!resp.ok) {
       const err = await resp.text();
       const bubble = ensureActiveBubble();
-      bubble.innerHTML = renderMarkdown('Error: ' + resp.status + ' — ' + err);
+      bubble.classList.add('bubble-error');
+      bubble.innerHTML = renderMarkdown('Error ' + resp.status + ' — ' + err);
+      activeBubble = null; activeBubbleText = '';
       setStatus('error', '오류 발생');
       setStreaming(false);
       return;
@@ -1289,50 +1605,50 @@ async function streamRequest(body) {
           updateThinkingPanel(ensureThinkingMessageEl(), reasoningText);
         }
 
-        // --- Tool use ---
+        // --- Tool use: one card per call, status starts "running" ---
         if (type === 'response.tool_use') {
           finalizeActiveBubble();
-          const name = evt.name || 'unknown';
-          const input = evt.input || {};
-          const summary = typeof input === 'object'
-            ? Object.entries(input).map(([k,v]) => k + ': ' + (typeof v === 'string' ? v.substring(0, 80) : JSON.stringify(v).substring(0, 80))).join(', ')
-            : String(input).substring(0, 120);
-          setStatus('streaming', 'Tool: ' + name);
-          addToolEvent('tool-use', 'TOOL', name + (summary ? ' — ' + summary.substring(0, 60) : ''),
-            JSON.stringify(input, null, 2),
-            { toolUseId: evt.tool_use_id, parentToolUseId: evt.parent_tool_use_id });
+          const meta = toolMeta(evt.name);
+          setStatus('streaming', meta.glyph + ' ' + (evt.name || 'tool'));
+          renderToolUse(evt);
         }
 
-        // --- Tool result ---
+        // --- Tool result: merge back into the card of the call it answers ---
         if (type === 'response.tool_result') {
-          finalizeActiveBubble();
-          const isError = evt.is_error;
+          const isError = !!evt.is_error;
           const content = typeof evt.content === 'string' ? evt.content : JSON.stringify(evt.content, null, 2);
-          const preview = (content || '').substring(0, 80).replace(/\n/g, ' ');
-          addToolEvent(
-            isError ? 'tool-error' : 'tool-result',
-            isError ? 'ERROR' : 'RESULT',
-            preview || '(empty)',
-            content || '(no content)',
-            { parentToolUseId: evt.parent_tool_use_id }
-          );
+          const card = evt.tool_use_id ? toolEventsById[evt.tool_use_id] : null;
+          if (card) {
+            attachToolResult(card, content, isError);
+          } else {
+            // Orphan result (call suppressed or arrived out of order) → standalone
+            // card now (never lose a result), but remember it so that if its
+            // tool_use card shows up later the standalone is replaced by a merge.
+            finalizeActiveBubble();
+            const preview = (content || '').substring(0, 100).replace(/\s+/g, ' ');
+            const orphan = createToolCard({
+              badgeCls: isError ? 'cat-error' : 'cat-result',
+              glyph: statusGlyph(isError ? 'error' : 'done'),
+              badgeLabel: isError ? 'ERROR' : 'RESULT',
+              title: preview || '(empty)',
+              body: content || '(no content)',
+              bodyLabel: isError ? 'ERROR' : 'RESULT',
+              status: isError ? 'error' : 'done',
+              parentToolUseId: evt.parent_tool_use_id,
+              noReparent: true,
+            });
+            if (evt.tool_use_id) {
+              pendingResultsByToolUseId[evt.tool_use_id] = { content: content, isError: isError, card: orphan };
+            }
+          }
           setStatus('streaming', '스트리밍중...');
         }
 
-        // --- Task events (subagent lifecycle: started / progress / notification) ---
+        // --- Task events: one in-place status line per subagent ---
         if (typeof type === 'string' && type.startsWith('response.task')) {
-          const task = evt;
-          const taskType = type.slice('response.'.length);
-          let title = '';
-          if (taskType === 'task_started') title = 'Started: ' + (task.description || '');
-          else if (taskType === 'task_progress') title = 'Progress: ' + (task.description || task.last_tool_name || '');
-          else if (taskType === 'task_notification') title = (task.status || '') + ': ' + (task.summary || '');
-          else title = taskType;
-          if (title) {
-            addToolEvent('task', 'TASK', title, JSON.stringify(task, null, 2),
-              { parentToolUseId: task.parent_tool_use_id });
-            setStatus('streaming', title.substring(0, 40));
-          }
+          upsertTaskStatus(evt);
+          const label = type.slice('response.'.length).replace('task_', '');
+          setStatus('streaming', 'agent: ' + label);
         }
 
         // --- function_call (AskUserQuestion) ---
@@ -1364,14 +1680,25 @@ async function streamRequest(body) {
           }
           if (evt.response.usage) {
             const u = evt.response.usage;
-            tokenInfo.textContent = 'IN: ' + (u.input_tokens || 0) + '  OUT: ' + (u.output_tokens || 0);
+            const tin = u.input_tokens || 0, tout = u.output_tokens || 0;
+            tokenInfo.textContent = 'tokens · in ' + tin + ' · out ' + tout;
+            tokenInfo.title = tin + ' input tokens, ' + tout + ' output tokens';
           }
         }
 
         // --- response.failed ---
         if (type === 'response.failed' && evt.response && evt.response.error) {
           const e = evt.response.error;
-          addToolEvent('tool-error', 'FAILED', e.code + ': ' + e.message, JSON.stringify(e, null, 2));
+          finalizeActiveBubble();
+          createToolCard({
+            badgeCls: 'cat-error',
+            glyph: statusGlyph('error'),
+            badgeLabel: 'FAILED',
+            title: (e.code || 'error') + ': ' + (e.message || ''),
+            body: JSON.stringify(e, null, 2),
+            bodyLabel: 'ERROR',
+            status: 'error',
+          });
         }
       }
     }
@@ -1379,8 +1706,9 @@ async function streamRequest(body) {
   } catch (err) {
     if (err.name !== 'AbortError') {
       const bubble = ensureActiveBubble();
-      activeBubbleText = 'Error: ' + err.message;
-      bubble.innerHTML = renderMarkdown(activeBubbleText);
+      bubble.classList.add('bubble-error');
+      bubble.innerHTML = renderMarkdown('Error — ' + err.message);
+      activeBubble = null; activeBubbleText = '';
       setStatus('error', '연결 오류');
     }
   }
