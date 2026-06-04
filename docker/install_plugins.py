@@ -11,13 +11,14 @@ Indexed form (repeat the ``_1``, ``_2``, ... suffix for each repo)::
     CLAUDE_PLUGIN_NAME_1         comma-separated plugin names (default: repo basename)
     CLAUDE_PLUGIN_MARKETPLACE_1  marketplace name from marketplace.json (optional)
     CLAUDE_PLUGIN_SCOPE_1        install scope: user | project | local (default: user)
+    CLAUDE_PLUGIN_BRANCH_1       git branch/tag to clone for a remote repo (default: main)
     CLAUDE_PLUGIN_GIT_TOKEN_1    HTTPS git token for a private repo (optional)
 
 The legacy single-repo form (no suffix) is still honored as one additional
 entry, so existing deployments keep working unchanged::
 
     CLAUDE_PLUGIN_REPO, CLAUDE_PLUGIN_NAME, CLAUDE_PLUGIN_MARKETPLACE,
-    CLAUDE_PLUGIN_SCOPE, CLAUDE_PLUGIN_GIT_TOKEN
+    CLAUDE_PLUGIN_SCOPE, CLAUDE_PLUGIN_BRANCH, CLAUDE_PLUGIN_GIT_TOKEN
 
 Global (not per-entry)::
 
@@ -27,8 +28,9 @@ Global (not per-entry)::
 
 Behavior:
     * ``CLAUDE_PLUGIN_REPO`` values that point at a clone URL are removed and
-      freshly ``git clone --depth 1``'d on every run; values that point at an
-      existing local path are used in place (no clone).
+      freshly ``git clone --depth 1 --branch <branch>``'d on every run (branch
+      defaults to ``main``; override per entry with ``CLAUDE_PLUGIN_BRANCH*``);
+      values that point at an existing local path are used in place (no clone).
     * Each plugin is ``install``'d (first run) and then ``update``'d (later
       runs) so the installed version always tracks the marketplace's latest.
     * A failure for one plugin or one repo is logged and skipped; it never
@@ -61,6 +63,10 @@ MAX_INDEX = 64
 # CLAUDE_PLUGIN_TIMEOUT_SECONDS.
 DEFAULT_TIMEOUT_SECONDS = 300
 
+# Branch/tag fresh-cloned from a remote marketplace repo when CLAUDE_PLUGIN_BRANCH*
+# is unset. Local-path repos ignore this (they are used in place).
+DEFAULT_BRANCH = "main"
+
 # Helper that answers git's credential prompts using a token supplied via the
 # CLAUDE_PLUGIN_ASKPASS_TOKEN environment variable. The token itself never
 # appears on a command line or in the marketplace URL handed to ``claude``.
@@ -87,6 +93,7 @@ class PluginEntry:
     names: List[str] = field(default_factory=list)
     marketplace: str = ""
     scope: str = "user"
+    branch: str = DEFAULT_BRANCH
     git_token: str = ""
     source_label: str = ""
 
@@ -137,6 +144,8 @@ def _entry_from_suffix(suffix: str) -> Optional[PluginEntry]:
         names=names,
         marketplace=os.environ.get(f"CLAUDE_PLUGIN_MARKETPLACE{suffix}", "").strip(),
         scope=os.environ.get(f"CLAUDE_PLUGIN_SCOPE{suffix}", "").strip() or "user",
+        branch=os.environ.get(f"CLAUDE_PLUGIN_BRANCH{suffix}", "").strip()
+        or DEFAULT_BRANCH,
         git_token=os.environ.get(f"CLAUDE_PLUGIN_GIT_TOKEN{suffix}", ""),
         source_label=label,
     )
@@ -295,8 +304,9 @@ def _clone_dir(root: Path, repo: str) -> Path:
 def prepare_repo(entry: PluginEntry, root: Path) -> Path:
     """Return the local marketplace path for *entry*, fresh-cloning if remote.
 
-    Local-path repos are used in place. Remote repos are removed and freshly
-    cloned every run so the latest marketplace content is always on disk.
+    Local-path repos are used in place (``entry.branch`` is ignored). Remote
+    repos are removed and freshly cloned from ``entry.branch`` every run so the
+    latest marketplace content is always on disk.
     """
     if Path(entry.repo).exists():
         return Path(entry.repo)
@@ -309,9 +319,18 @@ def prepare_repo(entry: PluginEntry, root: Path) -> Path:
     staging = dest.with_name(dest.name + ".new")
     if staging.exists():
         shutil.rmtree(staging)
-    log(f"{entry.source_label}: fresh-cloning {entry.repo} -> {dest}")
+    log(f"{entry.source_label}: fresh-cloning {entry.repo} (branch {entry.branch}) -> {dest}")
     run(
-        ["git", "clone", "--depth", "1", entry.repo, str(staging)],
+        [
+            "git",
+            "clone",
+            "--depth",
+            "1",
+            "--branch",
+            entry.branch,
+            entry.repo,
+            str(staging),
+        ],
         token=entry.git_token,
     )
     if dest.exists():

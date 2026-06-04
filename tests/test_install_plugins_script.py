@@ -71,8 +71,14 @@ def _write_fake_git(bin_dir: Path) -> Path:
 set -eu
 printf '%s\\n' "$*" >> "$FAKE_GIT_LOG"
 if [ "${1:-}" = "clone" ]; then
-    repo="$4"
-    dest="$5"
+    # repo and dest are always the final two positional args, regardless of
+    # which options (--depth, --branch, ...) precede them.
+    repo=""
+    dest=""
+    for a in "$@"; do
+        repo="$dest"
+        dest="$a"
+    done
     if [ -n "${GIT_ASKPASS:-}" ]; then
         "$GIT_ASKPASS" "Username for 'https://example'" >> "$FAKE_ASKPASS_LOG"
         "$GIT_ASKPASS" "Password for 'https://example'" >> "$FAKE_ASKPASS_LOG"
@@ -183,6 +189,21 @@ def test_collect_entries_parses_legacy_and_indexed(monkeypatch):
     assert entries[2].names == ["mkt"]
 
 
+def test_collect_entries_branch_defaults_to_main_and_honors_override(monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    # _1 omits the branch -> defaults to main; _2 pins an explicit branch.
+    monkeypatch.setenv("CLAUDE_PLUGIN_REPO_1", "https://host/acme/mkt.git")
+    monkeypatch.setenv("CLAUDE_PLUGIN_REPO_2", "https://host/beta/mkt.git")
+    monkeypatch.setenv("CLAUDE_PLUGIN_BRANCH_2", "develop")
+
+    entries = installer.collect_entries()
+
+    assert entries[0].branch == installer.DEFAULT_BRANCH == "main"
+    assert entries[1].branch == "develop"
+
+
 def test_collect_entries_empty_when_unset(monkeypatch):
     for key in list(os.environ):
         if key.startswith("CLAUDE_PLUGIN"):
@@ -256,8 +277,8 @@ def test_installs_multiple_plugins_from_multiple_repos(tmp_path):
         Path(env["HOME"]) / ".claude" / "plugin-marketplaces",
         env["CLAUDE_PLUGIN_REPO_2"],
     )
-    assert f"clone --depth 1 {env['CLAUDE_PLUGIN_REPO_1']}" in git_log
-    assert f"clone --depth 1 {env['CLAUDE_PLUGIN_REPO_2']}" in git_log
+    assert f"clone --depth 1 --branch main {env['CLAUDE_PLUGIN_REPO_1']}" in git_log
+    assert f"clone --depth 1 --branch main {env['CLAUDE_PLUGIN_REPO_2']}" in git_log
     assert repo1_dir.is_dir() and repo2_dir.is_dir()
 
     # One marketplace add per repo, install + update per plugin.
@@ -279,6 +300,28 @@ def test_installs_multiple_plugins_from_multiple_repos(tmp_path):
 
     assert _idx("plugin install foo@acme") < _idx("plugin update foo@acme")
     assert _idx("plugin install baz@beta") < _idx("plugin update baz@beta")
+
+
+def test_branch_override_passed_to_git_clone(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/acme/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "foo",
+        "CLAUDE_PLUGIN_BRANCH_1": "release-1.2",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    git_log = _read(tmp_path / "git.log")
+    assert (
+        f"clone --depth 1 --branch release-1.2 {env['CLAUDE_PLUGIN_REPO_1']}" in git_log
+    )
 
 
 def test_fresh_clone_removes_existing_clone(tmp_path):
@@ -309,7 +352,7 @@ def test_fresh_clone_removes_existing_clone(tmp_path):
     assert (
         clone_dir / ".claude-plugin"
     ).is_dir(), "fresh clone must replace the stale dir"
-    assert f"clone --depth 1 {env['CLAUDE_PLUGIN_REPO_1']}" in _read(
+    assert f"clone --depth 1 --branch main {env['CLAUDE_PLUGIN_REPO_1']}" in _read(
         tmp_path / "git.log"
     )
 
