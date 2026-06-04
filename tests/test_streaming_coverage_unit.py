@@ -306,6 +306,29 @@ class TestBuildTaskEventUnmatched:
             )
             assert result["parent_tool_use_id"] == "agent-1"
 
+    def test_derives_nesting_id_from_sdk_tool_use_id(self):
+        """The real SDK task messages expose ``tool_use_id`` (the spawning Task
+        tool's id) and no ``parent_tool_use_id``. Surface it as
+        parent_tool_use_id so the chat UI nests progress under the agent."""
+        for subtype in ("task_started", "task_progress", "task_notification"):
+            result = _build_task_event(
+                {"subtype": subtype, "task_id": "t1", "tool_use_id": "agent-1"}
+            )
+            assert result["tool_use_id"] == "agent-1"
+            assert result["parent_tool_use_id"] == "agent-1"
+
+    def test_explicit_parent_wins_over_tool_use_id(self):
+        """An explicit parent_tool_use_id takes precedence over tool_use_id."""
+        result = _build_task_event(
+            {
+                "subtype": "task_started",
+                "task_id": "t1",
+                "tool_use_id": "agent-1",
+                "parent_tool_use_id": "agent-outer",
+            }
+        )
+        assert result["parent_tool_use_id"] == "agent-outer"
+
     def test_parent_tool_use_id_none_for_top_level_task(self):
         """Top-level (main-agent) task events have no parent → None."""
         result = _build_task_event({"subtype": "task_started", "task_id": "t1"})
