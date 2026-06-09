@@ -3,6 +3,7 @@
 import json
 from typing import Any, Dict, Optional
 
+from src.constants import STREAM_COMPACTION_EVENTS, STREAM_HOOK_EVENTS
 from src.content_blocks import normalize_tool_result_for_sse
 
 
@@ -84,6 +85,90 @@ def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int =
     """Build an SSE line for Responses API with a custom task event type."""
     event_type = f"response.{task_event['type']}"
     data = {**task_event, "type": event_type, "sequence_number": sequence_number}
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+
+
+def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Build a liveness ("still working") event dict from a system chunk, or None.
+
+    Complements :func:`_build_task_event` (which only handles subagent task
+    messages). Surfaces two more classes of progress that the SDK reports as
+    ``system`` messages but the gateway previously dropped:
+
+    * Hook lifecycle (``hook_started`` / ``hook_response``) — emitted when
+      ``include_hook_events`` is on. Becomes ``response.hook_event`` carrying
+      the hook name (e.g. ``PreToolUse``), the tool it fired for, and the run
+      phase, so a UI can show "running <tool>…" / "<tool> finished".
+    * Context compaction (``compact_boundary`` / ``compaction``) — becomes
+      ``response.compaction`` so a UI can show "compacting context…" during the
+      otherwise-silent pause.
+
+    Returns ``None`` for any other subtype (caller leaves it dropped) and when
+    the corresponding feature flag is disabled.
+    """
+    subtype = chunk.get("subtype")
+    if subtype in ("hook_started", "hook_response"):
+        if not STREAM_HOOK_EVENTS:
+            return None
+        data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
+        hook_event_name = (
+            chunk.get("hook_event_name")
+            or data.get("hook_event")
+            or data.get("hook_event_name")
+            or data.get("hook_name")
+            or ""
+        )
+        tool_use_id = data.get("tool_use_id") or chunk.get("tool_use_id")
+        return {
+            "type": "hook_event",
+            "phase": subtype,  # "hook_started" | "hook_response"
+            "hook_event_name": hook_event_name,
+            "tool_name": data.get("tool_name") or data.get("tool"),
+            "tool_use_id": tool_use_id,
+            "outcome": data.get("outcome"),  # present on hook_response
+            "session_id": chunk.get("session_id"),
+            "parent_tool_use_id": chunk.get("parent_tool_use_id") or tool_use_id,
+        }
+    if subtype in ("compact_boundary", "compaction"):
+        if not STREAM_COMPACTION_EVENTS:
+            return None
+        data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
+        trigger = data.get("trigger")
+        if trigger is None and isinstance(data.get("compact_metadata"), dict):
+            trigger = data["compact_metadata"].get("trigger")
+        return {
+            "type": "compaction",
+            "subtype": subtype,
+            "trigger": trigger,
+            "session_id": chunk.get("session_id"),
+        }
+    return None
+
+
+def make_tool_use_started_response_sse(
+    tool_use_id: str,
+    name: str,
+    *,
+    sequence_number: int = 0,
+    parent_tool_use_id: Optional[str] = None,
+) -> str:
+    """Build an SSE line announcing a tool call is starting.
+
+    Emitted at ``content_block_start`` for a tool_use block — before its JSON
+    arguments finish streaming — so a UI can show "preparing <tool>…" instead
+    of a silent gap while a large tool input is generated. The matching
+    ``response.tool_use`` (same ``tool_use_id``) arrives once the input is
+    complete.
+    """
+    event_type = "response.tool_use_started"
+    data = {
+        "type": event_type,
+        "tool_use_id": tool_use_id or "",
+        "name": name or "",
+        "sequence_number": sequence_number,
+    }
+    if parent_tool_use_id:
+        data["parent_tool_use_id"] = parent_tool_use_id
     return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 

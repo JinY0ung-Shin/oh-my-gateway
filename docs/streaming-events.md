@@ -35,11 +35,14 @@ response.in_progress
 response.output_item.added
 response.content_part.added
 response.output_text.delta      # zero or more
+response.tool_use_started       # zero or more (liveness; precedes response.tool_use)
 response.tool_use               # zero or more
 response.tool_result            # zero or more
 response.task_started           # zero or more
 response.task_progress          # zero or more
 response.task_notification      # zero or more
+response.hook_event             # zero or more (liveness)
+response.compaction             # zero or more (liveness)
 response.output_text.done
 response.content_part.done
 response.output_item.done
@@ -48,6 +51,12 @@ response.completed
 
 Failures emit `response.failed`. Empty SDK output is also surfaced as
 `response.failed` so clients receive a definite terminal event.
+
+Reasoning (thinking) blocks are emitted as `reasoning` output items with
+`response.reasoning_summary_text.delta` / `response.reasoning_text.delta`
+events. A turn that interleaves thinking and text (think → text → think → text)
+produces multiple `reasoning` and `message` output items in emission order;
+clients that concatenate all `message` items' text reconstruct the full answer.
 
 ## Lifecycle Events
 
@@ -208,6 +217,71 @@ Subagent visibility is controlled by:
 | `SUBAGENT_STREAM_TEXT` | `false` | Forward subagent text deltas |
 | `SUBAGENT_STREAM_TOOL_BLOCKS` | `true` | Forward subagent tool events |
 | `SUBAGENT_STREAM_PROGRESS` | `true` | Forward subagent task progress |
+
+## Liveness / Progress Events
+
+These optional events keep the client informed that the agent is still working
+during the gaps between visible text — long tool-call generation, hook
+execution, and context compaction — instead of a silent stream punctuated only
+by SSE keepalive comments. They are advisory: clients may ignore any event type
+they don't recognize.
+
+`response.tool_use_started` is emitted at the *start* of a tool call, before its
+JSON arguments finish streaming. The matching `response.tool_use` (same
+`tool_use_id`) arrives once the arguments are complete. Use it to show
+"preparing <tool>…" during long argument generation.
+
+```json
+{
+  "type": "response.tool_use_started",
+  "tool_use_id": "toolu_01ABC123",
+  "name": "Bash",
+  "sequence_number": 6
+}
+```
+
+`response.hook_event` mirrors the SDK's hook lifecycle (PreToolUse, PostToolUse,
+Stop, …) so a UI can show "running <tool>…" / "<tool> finished". `phase` is
+`hook_started` or `hook_response`; `outcome` is present on `hook_response`.
+
+```json
+{
+  "type": "response.hook_event",
+  "phase": "hook_started",
+  "hook_event_name": "PreToolUse",
+  "tool_name": "Bash",
+  "tool_use_id": "toolu_01ABC123",
+  "outcome": null,
+  "session_id": "sdk-session-id",
+  "sequence_number": 7
+}
+```
+
+`response.compaction` is emitted when the SDK compacts the context window (an
+otherwise-silent pause). `trigger` is `auto` or `manual` when the SDK reports it.
+
+```json
+{
+  "type": "response.compaction",
+  "subtype": "compact_boundary",
+  "trigger": "auto",
+  "session_id": "sdk-session-id",
+  "sequence_number": 8
+}
+```
+
+Liveness events are controlled by:
+
+| Env var | Default | Effect |
+|---------|---------|--------|
+| `STREAM_TOOL_PROGRESS` | `true` | Emit `response.tool_use_started` |
+| `STREAM_HOOK_EVENTS` | `true` | Enable SDK `include_hook_events`; forward `response.hook_event` |
+| `STREAM_COMPACTION_EVENTS` | `true` | Forward `response.compaction` |
+
+Subagent-originated liveness events (with `parent_tool_use_id`) follow the same
+subagent gates as their block type: `response.tool_use_started` respects
+`SUBAGENT_STREAM_TOOL_BLOCKS`; `response.hook_event` respects
+`SUBAGENT_STREAM_PROGRESS`.
 
 ## AskUserQuestion Pauses
 
