@@ -60,6 +60,12 @@ services:
       # environment block below). Override the host path with
       # USER_WORKSPACES_HOST_DIR if you want it somewhere other than ./workspaces.
       - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
+      # Optional: bind a host system-prompt file into the container. Set
+      # SYSTEM_PROMPT_HOST_FILE in .env to a host path (e.g. /home/me/prompt.md)
+      # and it is mounted read-only here; the SYSTEM_PROMPT_FILE env below then
+      # auto-points at it. When unset, /dev/null is mapped harmlessly and
+      # SYSTEM_PROMPT_FILE stays empty (claude_code preset mode).
+      - ${SYSTEM_PROMPT_HOST_FILE:-/dev/null}:/app/system_prompt.md:ro
     # All runtime configuration comes from .env (see .env.example for the full list).
     env_file:
       - .env
@@ -71,6 +77,11 @@ services:
       # Docker installs optional plugins into the container user's ~/.claude,
       # so include user-scope config when the Claude SDK starts.
       - CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}
+      # Auto-wire the custom system prompt to the host file mounted above.
+      # Resolves to /app/system_prompt.md only when SYSTEM_PROMPT_HOST_FILE is
+      # set; otherwise empty so the claude_code preset is used. This overrides
+      # any SYSTEM_PROMPT_FILE in .env — under Docker, set SYSTEM_PROMPT_HOST_FILE.
+      - SYSTEM_PROMPT_FILE=${SYSTEM_PROMPT_HOST_FILE:+/app/system_prompt.md}
 
   # Optional MySQL sidecar that persists per-turn usage logs (token counts,
   # tool-call stats).  Activated only when the `logging` compose profile is

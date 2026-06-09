@@ -38,6 +38,10 @@ services:
       # to the host so individual users' state survives container recreates.
       # Override the host path with USER_WORKSPACES_HOST_DIR.
       - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
+      # Optional host system-prompt file. Set SYSTEM_PROMPT_HOST_FILE in .env to
+      # a host path; it is mounted read-only here and SYSTEM_PROMPT_FILE below
+      # auto-points at it. Unset maps /dev/null (preset mode).
+      - ${SYSTEM_PROMPT_HOST_FILE:-/dev/null}:/app/system_prompt.md:ro
     env_file:
       - .env
     environment:
@@ -48,6 +52,9 @@ services:
       - OPENCODE_BIN=opencode
       - OPENCODE_HOME=/home/app/.local/share/opencode
       - USER_WORKSPACES_DIR=${USER_WORKSPACES_DIR:-/data/workspaces}
+      # Auto-wire the custom system prompt to the host file mounted above; empty
+      # (preset mode) when SYSTEM_PROMPT_HOST_FILE is unset. Overrides .env.
+      - SYSTEM_PROMPT_FILE=${SYSTEM_PROMPT_HOST_FILE:+/app/system_prompt.md}
 
   gateway-log:
     profiles: ["logging"]
