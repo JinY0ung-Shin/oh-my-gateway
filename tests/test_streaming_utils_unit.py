@@ -2117,10 +2117,12 @@ async def test_stream_forwards_hook_lifecycle_events():
     assert hook_events[0]["hook_event_name"] == "PreToolUse"
     assert hook_events[0]["tool_name"] == "Bash"
     assert hook_events[0]["tool_use_id"] == "tu_9"
+    assert "parent_tool_use_id" not in hook_events[0]
 
     assert hook_events[1]["phase"] == "hook_response"
     assert hook_events[1]["hook_event_name"] == "PostToolUse"
     assert hook_events[1]["outcome"] == "success"
+    assert "parent_tool_use_id" not in hook_events[1]
 
     # Normal content still flows after the hook events.
     deltas = [p.get("delta") for t, p in events if t == "response.output_text.delta"]
@@ -2142,6 +2144,46 @@ async def test_stream_hook_events_disabled_by_flag(monkeypatch):
 
     events, _ = await _collect_response_events(chunk_source())
     assert not any(t == "response.hook_event" for t, _ in events)
+
+
+async def test_stream_hook_event_preserves_explicit_parent_tool_use_id():
+    """Only an explicit parent_tool_use_id marks hook_event nesting."""
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "hook_started", "hook_event_name": "PreToolUse",
+            "parent_tool_use_id": "parent_1",
+            "data": {"hook_event": "PreToolUse", "tool_name": "Bash", "tool_use_id": "tu_child"},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    hook_event = next(p for t, p in events if t == "response.hook_event")
+    assert hook_event["tool_use_id"] == "tu_child"
+    assert hook_event["parent_tool_use_id"] == "parent_1"
+
+
+async def test_stream_top_level_hook_event_not_gated_as_subagent(monkeypatch):
+    """A hook's tool_use_id is its target tool, not a subagent parent marker."""
+    monkeypatch.setattr("src.streaming_utils.SUBAGENT_STREAM_PROGRESS", False)
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "hook_started", "hook_event_name": "PreToolUse",
+            "data": {"hook_event": "PreToolUse", "tool_name": "Bash", "tool_use_id": "tu_top"},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    hook_event = next(p for t, p in events if t == "response.hook_event")
+    assert hook_event["tool_use_id"] == "tu_top"
+    assert "parent_tool_use_id" not in hook_event
 
 
 async def test_stream_forwards_compaction_event():

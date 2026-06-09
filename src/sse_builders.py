@@ -119,7 +119,7 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             or ""
         )
         tool_use_id = data.get("tool_use_id") or chunk.get("tool_use_id")
-        return {
+        event = {
             "type": "hook_event",
             "phase": subtype,  # "hook_started" | "hook_response"
             "hook_event_name": hook_event_name,
@@ -127,8 +127,10 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "tool_use_id": tool_use_id,
             "outcome": data.get("outcome"),  # present on hook_response
             "session_id": chunk.get("session_id"),
-            "parent_tool_use_id": chunk.get("parent_tool_use_id") or tool_use_id,
         }
+        if chunk.get("parent_tool_use_id") is not None:
+            event["parent_tool_use_id"] = chunk.get("parent_tool_use_id")
+        return event
     if subtype in ("compact_boundary", "compaction"):
         if not STREAM_COMPACTION_EVENTS:
             return None

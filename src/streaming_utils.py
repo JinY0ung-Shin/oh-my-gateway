@@ -1013,20 +1013,23 @@ async def stream_response_chunks(
 
             # Handle task system messages (structured JSON, not content)
             if chunk.get("type") == "system":
-                # SDK task messages identify their spawning Task tool via
-                # ``tool_use_id``; treat either field as the subagent signal so
-                # SUBAGENT_STREAM_PROGRESS actually gates real SDK output.
-                is_subagent_task = (
-                    chunk.get("parent_tool_use_id") is not None
-                    or chunk.get("tool_use_id") is not None
-                )
-                if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
-                    # Subagent task progress (task_started/progress/notification).
-                    task_event = _build_task_event(chunk)
-                    if task_event:
+                # Subagent task messages identify their spawning Task tool via
+                # ``tool_use_id``. Hook events also carry ``tool_use_id``, but
+                # that is the hook's target tool, not a parent/nesting marker.
+                task_event = _build_task_event(chunk)
+                if task_event:
+                    is_subagent_task = (
+                        chunk.get("parent_tool_use_id") is not None
+                        or chunk.get("tool_use_id") is not None
+                    )
+                    if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
                         yield make_task_response_sse(task_event, sequence_number=_next_seq())
-                    else:
-                        # Other liveness signals: hook lifecycle + compaction.
+                else:
+                    # Other liveness signals: hook lifecycle + compaction.
+                    # For these, only an explicit parent_tool_use_id marks
+                    # subagent origin. A plain tool_use_id is the target tool.
+                    is_subagent_progress = chunk.get("parent_tool_use_id") is not None
+                    if not is_subagent_progress or SUBAGENT_STREAM_PROGRESS:
                         progress_event = _build_progress_event(chunk)
                         if progress_event:
                             yield make_task_response_sse(
