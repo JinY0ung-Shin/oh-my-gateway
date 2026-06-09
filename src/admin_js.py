@@ -380,6 +380,13 @@ def get_admin_js() -> str:
       this.promptEditorContent = this.systemPrompt.preset_text || '';
       this.promptDirty = false;
     },
+    selectFilePrompt() {
+      if (this.promptDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
+      this.promptView = 'file';
+      this.promptViewName = null;
+      this.promptEditorContent = this.systemPrompt.prompt || '';
+      this.promptDirty = false;
+    },
     selectTemplatePrompt(t) {
       if (this.promptDirty && !confirm('Unsaved changes will be lost. Continue?')) return;
       this.promptView = 'template';
@@ -518,6 +525,14 @@ def get_admin_js() -> str:
       this.newPromptNameError = '';
       this.newPromptNameWarning = '';
       this.newPromptContent = this.systemPrompt.preset_text || '';
+      this.promptDirty = false;
+    },
+    forkFromFile() {
+      this.promptView = 'new';
+      this.newPromptName = '';
+      this.newPromptNameError = '';
+      this.newPromptNameWarning = '';
+      this.newPromptContent = this.systemPrompt.prompt || '';
       this.promptDirty = false;
     },
     forkFromTemplate() {

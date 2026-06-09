@@ -72,7 +72,8 @@ def get_config_html() -> str:
           <div class="flex-gap-sm">
             <span class="text-xs text-muted">ACTIVE_PROMPT:</span>
             <span x-show="systemPrompt.active_name" style="color:var(--green); font-weight:600; font-size:var(--fs-sm); text-shadow: 0 0 6px var(--green-muted)" x-text="systemPrompt.active_name"></span>
-            <span x-show="!systemPrompt.active_name && systemPrompt.mode !== 'custom'" style="color:var(--text-dim); font-size:var(--fs-sm)">claude_code (preset)</span>
+            <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'preset'" style="color:var(--text-dim); font-size:var(--fs-sm)">claude_code (preset)</span>
+            <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'file'" style="color:var(--cyan); font-size:var(--fs-sm)">file default (SYSTEM_PROMPT_FILE)</span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'custom'" style="color:var(--amber); font-size:var(--fs-sm)">custom (unnamed)</span>
           </div>
           <div class="flex-gap-sm">
@@ -95,10 +96,22 @@ def get_config_html() -> str:
               style="border-bottom:1px solid var(--border); margin-bottom:4px; padding-bottom:8px">
               <span class="icon" style="color:var(--text-dim)">&gt;_</span>
               <div style="flex:1; min-width:0">
-                <div style="font-size:var(--fs-sm); font-weight:600" :style="systemPrompt.active_name == null && systemPrompt.mode !== 'custom' ? 'color:var(--green)' : 'color:var(--text)'">
-                  claude_code <span x-show="systemPrompt.active_name == null && systemPrompt.mode !== 'custom'" class="text-xs" style="color:var(--green)">ACTIVE</span>
+                <div style="font-size:var(--fs-sm); font-weight:600" :style="systemPrompt.active_name == null && systemPrompt.mode === 'preset' ? 'color:var(--green)' : 'color:var(--text)'">
+                  claude_code <span x-show="systemPrompt.active_name == null && systemPrompt.mode === 'preset'" class="text-xs" style="color:var(--green)">ACTIVE</span>
                 </div>
                 <div class="text-xs text-muted">built-in preset</div>
+              </div>
+            </div>
+
+            <!-- File default entry (SYSTEM_PROMPT_FILE) — only when a file default is loaded -->
+            <div x-show="systemPrompt.mode === 'file'" class="file-item" :class="{ active: promptView === 'file' }" @click="selectFilePrompt()"
+              style="border-bottom:1px solid var(--border); margin-bottom:4px; padding-bottom:8px">
+              <span class="icon" style="color:var(--cyan)">&#9636;</span>
+              <div style="flex:1; min-width:0">
+                <div style="font-size:var(--fs-sm); font-weight:600" :style="systemPrompt.active_name == null ? 'color:var(--green)' : 'color:var(--text)'">
+                  file default <span x-show="systemPrompt.active_name == null" class="text-xs" style="color:var(--green)">ACTIVE</span>
+                </div>
+                <div class="text-xs text-muted">SYSTEM_PROMPT_FILE</div>
               </div>
             </div>
 
@@ -177,7 +190,7 @@ def get_config_html() -> str:
                   <div class="flex-gap-sm">
                     <span style="color:var(--text-bright); font-weight:600">claude_code</span>
                     <span class="badge text-xs" style="border-color:var(--border-bright); color:var(--text-dim)">PRESET</span>
-                    <span x-show="systemPrompt.active_name == null && systemPrompt.mode !== 'custom'" class="badge badge-ok text-xs">ACTIVE</span>
+                    <span x-show="systemPrompt.active_name == null && systemPrompt.mode === 'preset'" class="badge badge-ok text-xs">ACTIVE</span>
                   </div>
                   <span class="text-xs text-muted" x-text="(systemPrompt.preset_text?.length ?? 0) + ' chars'"></span>
                 </div>
@@ -187,6 +200,25 @@ def get_config_html() -> str:
                   <button class="btn btn-sm btn-primary" @click="activatePreset()"
                     :disabled="systemPrompt.active_name == null && systemPrompt.mode !== 'custom'">[ACTIVATE]</button>
                   <button class="btn btn-sm btn-ghost" @click="forkFromPreset()">[FORK AS NEW]</button>
+                </div>
+              </div>
+            </template>
+
+            <!-- File default view (read-only) — content loaded from SYSTEM_PROMPT_FILE -->
+            <template x-if="promptView === 'file'">
+              <div>
+                <div class="flex-between mb-md">
+                  <div class="flex-gap-sm">
+                    <span style="color:var(--text-bright); font-weight:600">file default</span>
+                    <span class="badge text-xs" style="border-color:var(--cyan); color:var(--cyan)">SYSTEM_PROMPT_FILE</span>
+                    <span x-show="systemPrompt.active_name == null" class="badge badge-ok text-xs">ACTIVE</span>
+                  </div>
+                  <span class="text-xs text-muted" x-text="(systemPrompt.prompt?.length ?? 0) + ' chars'"></span>
+                </div>
+                <p class="text-xs text-muted mb-md">// loaded from SYSTEM_PROMPT_FILE at startup. read-only — edit the file and restart, or fork to a named prompt. {{PLACEHOLDER}} tokens shown unresolved.</p>
+                <textarea readonly :value="systemPrompt.prompt || ''" class="readonly-editor"></textarea>
+                <div class="flex-gap-sm" style="margin-top:0.75rem">
+                  <button class="btn btn-sm btn-ghost" @click="forkFromFile()">[FORK AS NEW]</button>
                 </div>
               </div>
             </template>
