@@ -5,6 +5,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
 from src.constants import (
     SSE_KEEPALIVE_INTERVAL,
+    STREAM_TOOL_PROGRESS,
     SUBAGENT_STREAM_PROGRESS,
     SUBAGENT_STREAM_TOOL_BLOCKS,
 )
@@ -26,6 +27,7 @@ from src.usage_logger import usage_logger
 # External callers continue to use `from src.streaming_utils import X`.
 from src.collab_filter import CollabJsonStreamFilter, strip_collab_json  # noqa: F401
 from src.sse_builders import (  # noqa: F401
+    _build_progress_event,
     _build_task_event,
     _normalize_tool_result,
     make_function_call_response_sse,
@@ -33,6 +35,7 @@ from src.sse_builders import (  # noqa: F401
     make_task_response_sse,
     make_tool_result_response_sse,
     make_tool_use_response_sse,
+    make_tool_use_started_response_sse,
 )
 from src.chunk_processing import (  # noqa: F401
     _extract_tool_blocks,
@@ -495,6 +498,11 @@ def _generate_rs_id() -> str:
     return f"rs_{uuid.uuid4().hex[:24]}"
 
 
+def _generate_msg_id() -> str:
+    import uuid
+    return f"msg_{uuid.uuid4().hex[:24]}"
+
+
 def _is_synthetic_ask_user_response_result(
     result_block: Dict[str, Any],
     tool_names_by_id: Dict[str, str],
@@ -514,6 +522,41 @@ def _is_synthetic_ask_user_response_result(
     if not isinstance(request_context, dict):
         return False
     return request_context.get("function_call_output_call_id") == tool_use_id
+
+
+def _tool_use_started_events(
+    chunk: Dict[str, Any],
+    next_seq: Callable[[], int],
+) -> list[str]:
+    """Emit a ``response.tool_use_started`` signal at the tool_use block start.
+
+    Fires once per tool call at ``content_block_start`` — before its JSON
+    arguments finish streaming — so a UI can show "preparing <tool>…" during
+    long argument generation instead of a silent gap. The matching
+    ``response.tool_use`` (same ``tool_use_id``) arrives once the input is
+    complete. Honours STREAM_TOOL_PROGRESS and the subagent tool-block gate.
+    """
+    if not STREAM_TOOL_PROGRESS:
+        return []
+    if chunk.get("type") != "stream_event":
+        return []
+    event = chunk.get("event")
+    if not isinstance(event, dict) or event.get("type") != "content_block_start":
+        return []
+    block = event.get("content_block")
+    if not isinstance(block, dict) or block.get("type") != "tool_use":
+        return []
+    parent_id = chunk.get("parent_tool_use_id")
+    if parent_id is not None and not SUBAGENT_STREAM_TOOL_BLOCKS:
+        return []
+    return [
+        make_tool_use_started_response_sse(
+            block.get("id", ""),
+            block.get("name", ""),
+            sequence_number=next_seq(),
+            parent_tool_use_id=parent_id,
+        )
+    ]
 
 
 def _tool_use_events(
@@ -657,8 +700,16 @@ async def stream_response_chunks(
     tool_acc = ToolUseAccumulator()
     collab_filter = CollabJsonStreamFilter()
     full_text = []
+    # Accumulates *all* visible text across every message segment.  ``full_text``
+    # is reset at each segment boundary (think→text→think), so this is the
+    # source of truth for the complete assistant text handed back to the route.
+    all_visible_text: list[str] = []
     seq = 0
     message_item_opened = False
+    # True once *any* message output item has been opened (never reset), so
+    # finalization can tell "thinking-only response" (needs a trailing empty
+    # message item) apart from "stream ended after a real message segment".
+    any_message_item = False
     output_index = 0
     reasoning_open = False
     reasoning_item_id: Optional[str] = None
@@ -666,7 +717,9 @@ async def stream_response_chunks(
     thinking_seen = False
     thinking_texts: list[str] = []
     thinking_capture_buf: list[str] = []
-    completed_reasoning_items: list[ReasoningOutputItem] = []
+    # Every completed output item (reasoning and message) in emission order.
+    # Interleaving is allowed, so this is no longer reasoning-only.
+    completed_output_items: list = []
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
@@ -739,10 +792,11 @@ async def stream_response_chunks(
 
     def _open_message_item() -> list[str]:
         """Emit message output_item.added + content_part.added. Idempotent."""
-        nonlocal message_item_opened
+        nonlocal message_item_opened, any_message_item
         if message_item_opened:
             return []
         message_item_opened = True
+        any_message_item = True
         out_item = OutputItem(id=output_item_id, status="in_progress")
         content_part = ResponseContentPart(type="output_text", text="")
         return [
@@ -800,7 +854,7 @@ async def stream_response_chunks(
             summary=[ReasoningSummary(text=full_text)],
             content=[ReasoningContent(text=full_text)],
         )
-        completed_reasoning_items.append(item)
+        completed_output_items.append(item)
         lines = [
             make_response_sse(
                 "response.reasoning_summary_text.done",
@@ -837,6 +891,73 @@ async def stream_response_chunks(
         reasoning_item_id = None
         reasoning_text_buf = []
         output_index += 1
+        return lines
+
+    def _close_message_item() -> list[str]:
+        """Close the currently-open message item and record it.
+
+        Flushes the collab filter into the segment, emits
+        output_text.done / content_part.done / output_item.done, appends the
+        completed item to ``completed_output_items`` (preserving emission
+        order), then resets the per-segment state, advances ``output_index``,
+        and mints a fresh ``output_item_id`` so a following reasoning or
+        message item gets its own slot.  No-op when no message item is open.
+
+        This is what makes interleaved think→text→think→text turns work: each
+        text run becomes its own message item rather than the second thinking
+        block being dropped because reasoning can't reopen after text started.
+        """
+        nonlocal message_item_opened, full_text, output_index, output_item_id
+        nonlocal content_sent
+        if not message_item_opened:
+            return []
+        lines: list[str] = []
+        remaining = collab_filter.flush()
+        if remaining:
+            lines.append(_emit_delta(remaining))
+            full_text.append(remaining)
+            all_visible_text.append(remaining)
+            content_sent = True
+        seg_text = "".join(full_text)
+        item = OutputItem(
+            id=output_item_id,
+            status="completed",
+            content=[ResponseContentPart(text=seg_text)],
+        )
+        lines.append(
+            make_response_sse(
+                "response.output_text.done",
+                item_id=output_item_id,
+                output_index=output_index,
+                content_index=0,
+                text=seg_text,
+                logprobs=[],
+                sequence_number=_next_seq(),
+            )
+        )
+        lines.append(
+            make_response_sse(
+                "response.content_part.done",
+                item_id=output_item_id,
+                output_index=output_index,
+                content_index=0,
+                part=ResponseContentPart(text=seg_text),
+                sequence_number=_next_seq(),
+            )
+        )
+        lines.append(
+            make_response_sse(
+                "response.output_item.done",
+                output_index=output_index,
+                item=item,
+                sequence_number=_next_seq(),
+            )
+        )
+        completed_output_items.append(item)
+        message_item_opened = False
+        full_text = []
+        output_index += 1
+        output_item_id = _generate_msg_id()
         return lines
 
     # --- Main streaming loop ---
@@ -892,17 +1013,28 @@ async def stream_response_chunks(
 
             # Handle task system messages (structured JSON, not content)
             if chunk.get("type") == "system":
-                # SDK task messages identify their spawning Task tool via
-                # ``tool_use_id``; treat either field as the subagent signal so
-                # SUBAGENT_STREAM_PROGRESS actually gates real SDK output.
-                is_subagent_task = (
-                    chunk.get("parent_tool_use_id") is not None
-                    or chunk.get("tool_use_id") is not None
-                )
-                if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
-                    task_event = _build_task_event(chunk)
-                    if task_event:
+                # Subagent task messages identify their spawning Task tool via
+                # ``tool_use_id``. Hook events also carry ``tool_use_id``, but
+                # that is the hook's target tool, not a parent/nesting marker.
+                task_event = _build_task_event(chunk)
+                if task_event:
+                    is_subagent_task = (
+                        chunk.get("parent_tool_use_id") is not None
+                        or chunk.get("tool_use_id") is not None
+                    )
+                    if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
                         yield make_task_response_sse(task_event, sequence_number=_next_seq())
+                else:
+                    # Other liveness signals: hook lifecycle + compaction.
+                    # For these, only an explicit parent_tool_use_id marks
+                    # subagent origin. A plain tool_use_id is the target tool.
+                    is_subagent_progress = chunk.get("parent_tool_use_id") is not None
+                    if not is_subagent_progress or SUBAGENT_STREAM_PROGRESS:
+                        progress_event = _build_progress_event(chunk)
+                        if progress_event:
+                            yield make_task_response_sse(
+                                progress_event, sequence_number=_next_seq()
+                            )
                 continue
 
             # Token-level streaming (text/thinking deltas)
@@ -919,13 +1051,18 @@ async def stream_response_chunks(
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
             if text_delta is not None:
                 token_streaming = True
-                # Open reasoning output_item on first thinking delta of a block,
-                # but only if the message item is not already open. The OpenAI
-                # Responses API contract does not support interleaving reasoning
-                # back in after a message item has started emitting text; if a
-                # second thinking block arrives after text in the rare
-                # think→text→think case, those thinking deltas are dropped.
-                if in_thinking and not was_thinking and not message_item_opened:
+                # Open a reasoning output_item on the first thinking delta of a
+                # block. If a message item is already streaming text (the
+                # think→text→think case), close it first so this thinking block
+                # gets its OWN reasoning item at a fresh output_index. The
+                # OpenAI Responses output array is an ordered sequence, so
+                # interleaving reasoning and message items is valid — we open a
+                # new reasoning item, we never reopen the closed one — and the
+                # later thinking blocks are preserved instead of dropped.
+                if in_thinking and not was_thinking:
+                    if message_item_opened:
+                        for line in _close_message_item():
+                            yield line
                     reasoning_item_id = _generate_rs_id()
                     reasoning_open = True
                     reasoning_text_buf = []
@@ -985,9 +1122,11 @@ async def stream_response_chunks(
                             sequence_number=_next_seq(),
                         )
                     continue
-                # We're inside a thinking block but couldn't open a reasoning item
-                # (message item already opened — OpenAI Responses contract doesn't support
-                # reopening reasoning). Drop these deltas so they don't leak as message text.
+                # Safety net: inside a thinking block but no reasoning item is
+                # open. This should no longer happen — a new thinking block now
+                # closes any open message item and opens its own reasoning item
+                # above — but keep the guard so thinking text can never leak
+                # into the visible message stream.
                 if in_thinking:
                     continue
                 # If reasoning was open and we just exited it, close it now.
@@ -1002,8 +1141,15 @@ async def stream_response_chunks(
                                 yield line
                         yield _emit_delta(cleaned)
                         full_text.append(cleaned)
+                        all_visible_text.append(cleaned)
                         content_sent = True
                 continue
+
+            # Announce a tool call as it starts (content_block_start), before
+            # its arguments finish streaming, so the client isn't left silent
+            # during long tool-input generation.
+            for event in _tool_use_started_events(chunk, _next_seq):
+                yield event
 
             # Accumulate tool_use blocks from stream events
             handled, tool_block = tool_acc.process_stream_event(chunk)
@@ -1052,6 +1198,7 @@ async def stream_response_chunks(
                         yield line
                 yield _emit_delta(text)
                 full_text.append(text)
+                all_visible_text.append(text)
                 content_sent = True
 
     except Exception as e:
@@ -1067,7 +1214,7 @@ async def stream_response_chunks(
         await _log_usage("failed", "server_error")
         return
 
-    # Flush remaining buffered chars from collab filter
+    # Flush remaining buffered chars from collab filter into the open segment.
     remaining_collab = collab_filter.flush()
     if remaining_collab:
         if not message_item_opened:
@@ -1075,6 +1222,7 @@ async def stream_response_chunks(
                 yield line
         yield _emit_delta(remaining_collab)
         full_text.append(remaining_collab)
+        all_visible_text.append(remaining_collab)
         content_sent = True
 
     if tool_acc.has_incomplete:
@@ -1093,69 +1241,38 @@ async def stream_response_chunks(
         stream_result["empty"] = True
         return
 
-    # Close reasoning if it's still open (stream ended without exiting thinking).
+    # Close a trailing reasoning item if the stream ended without exiting thinking.
     _close_thinking_capture()
     if reasoning_open:
         for line in _close_reasoning():
             yield line
 
-    # Emit closing events for successful stream
-    final_text = "".join(full_text)
-
-    # Ensure the message item has been announced (consumer always sees one).
-    if not message_item_opened:
+    # Close the final (or only) message segment.  If no message item was ever
+    # opened — a thinking-only response, or a stream that ended right after a
+    # think→text→think segment boundary — ensure the consumer still sees one
+    # trailing (possibly empty) message item.
+    if message_item_opened:
+        for line in _close_message_item():
+            yield line
+    elif not any_message_item:
         for line in _open_message_item():
             yield line
+        for line in _close_message_item():
+            yield line
 
-    # response.output_text.done
-    yield make_response_sse(
-        "response.output_text.done",
-        item_id=output_item_id,
-        output_index=output_index,
-        content_index=0,
-        text=final_text,
-        logprobs=[],
-        sequence_number=_next_seq(),
-    )
-
-    # response.content_part.done
-    yield make_response_sse(
-        "response.content_part.done",
-        item_id=output_item_id,
-        output_index=output_index,
-        content_index=0,
-        part=ResponseContentPart(text=final_text),
-        sequence_number=_next_seq(),
-    )
-
-    # response.output_item.done
-    yield make_response_sse(
-        "response.output_item.done",
-        output_index=output_index,
-        item=OutputItem(
-            id=output_item_id,
-            status="completed",
-            content=[ResponseContentPart(text=final_text)],
-        ),
-        sequence_number=_next_seq(),
-    )
-
-    # response.completed (with usage — prefer real SDK values)
+    # response.completed (with usage — prefer real SDK values).  ``output``
+    # carries every reasoning and message item in emission order, so an
+    # interleaved think→text→think→text turn round-trips intact rather than
+    # dropping the later thinking blocks.
+    complete_text = "".join(all_visible_text)
     prompt_tokens, completion_tokens = resolve_token_usage(
-        chunks_buffer, prompt_text or "", final_text
+        chunks_buffer, prompt_text or "", complete_text
     )
     final_resp = ResponseObject(
         id=response_id,
         model=model,
         status="completed",
-        output=[
-            *completed_reasoning_items,
-            OutputItem(
-                id=output_item_id,
-                status="completed",
-                content=[ResponseContentPart(text=final_text)],
-            ),
-        ],
+        output=list(completed_output_items),
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
@@ -1163,13 +1280,13 @@ async def stream_response_chunks(
         metadata=_metadata,
     )
     stream_result["success"] = True
-    stream_result["assistant_text"] = final_text
+    stream_result["assistant_text"] = complete_text
     stream_result["thinking_texts"] = thinking_texts
     logger.info(
         "Responses stream completed: response_id=%s assistant_chars=%d "
         "thinking_blocks=%d thinking_chars=%s",
         response_id,
-        len(final_text),
+        len(complete_text),
         len(thinking_texts),
         [len(text) for text in thinking_texts],
     )

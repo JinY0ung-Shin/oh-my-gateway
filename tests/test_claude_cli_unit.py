@@ -541,6 +541,18 @@ class TestBuildSdkOptions:
             opts = cli_instance._build_sdk_options()
             assert not getattr(opts, "include_partial_messages", False)
 
+    def test_include_hook_events_on_by_default(self, cli_instance):
+        """STREAM_HOOK_EVENTS (default True) enables include_hook_events so the
+        gateway can forward hook lifecycle events as liveness signals."""
+        opts = cli_instance._build_sdk_options()
+        assert opts.include_hook_events is True
+
+    def test_include_hook_events_disabled_by_flag(self, cli_instance, monkeypatch):
+        """STREAM_HOOK_EVENTS=False leaves include_hook_events off."""
+        monkeypatch.setattr("src.constants.STREAM_HOOK_EVENTS", False)
+        opts = cli_instance._build_sdk_options()
+        assert not getattr(opts, "include_hook_events", False)
+
     def test_mcp_servers_passthrough(self, cli_instance):
         """mcp_servers option is set on options."""
         servers = {"my_server": {"type": "stdio", "command": "node"}}

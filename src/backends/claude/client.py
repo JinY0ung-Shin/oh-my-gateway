@@ -428,6 +428,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if get_token_streaming():
             options.include_partial_messages = True
 
+        # Surface hook lifecycle events (PreToolUse/PostToolUse/Stop/…) into the
+        # message stream so the gateway can forward them as `response.hook_event`
+        # liveness signals. Additive: does not change hook *callback* behaviour
+        # (e.g. the AskUserQuestion PreToolUse hook still parks as before).
+        from src.constants import STREAM_HOOK_EVENTS
+
+        if STREAM_HOOK_EVENTS:
+            options.include_hook_events = True
+
         self._configure_session_identity(options, session_id, resume)
         self._configure_task_budget(options, task_budget)
         self._configure_metadata_env(options, extra_env)

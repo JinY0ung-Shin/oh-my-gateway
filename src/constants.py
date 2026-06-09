@@ -87,6 +87,28 @@ SUBAGENT_STREAM_TEXT = parse_bool_env("SUBAGENT_STREAM_TEXT", "false")
 SUBAGENT_STREAM_TOOL_BLOCKS = parse_bool_env("SUBAGENT_STREAM_TOOL_BLOCKS", "true")
 SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")
 
+# ---------------------------------------------------------------------------
+# Liveness / "still working" progress signals forwarded to the Responses API
+# client during streaming. These let a UI show what the agent is doing in the
+# gaps between text — large tool-call generation, tool execution, hook runs,
+# and context compaction — instead of a silent stream punctuated only by SSE
+# keepalive comments.
+#
+# STREAM_TOOL_PROGRESS: Emit `response.tool_use_started` at content_block_start
+#   for a tool_use block (before its arguments finish streaming), so the client
+#   can show "preparing tool call…" during long argument generation.
+#   Default true.
+# STREAM_HOOK_EVENTS: Enable the SDK's include_hook_events and forward hook
+#   lifecycle messages (PreToolUse/PostToolUse/Stop/…) as `response.hook_event`.
+#   This is the SDK's purpose-built "about to run X / finished X" feed.
+#   Default true.
+# STREAM_COMPACTION_EVENTS: Forward context-compaction system messages
+#   (compact_boundary/compaction) as `response.compaction`, so the client can
+#   show "compacting context…" during the pause. Default true.
+STREAM_TOOL_PROGRESS = parse_bool_env("STREAM_TOOL_PROGRESS", "true")
+STREAM_HOOK_EVENTS = parse_bool_env("STREAM_HOOK_EVENTS", "true")
+STREAM_COMPACTION_EVENTS = parse_bool_env("STREAM_COMPACTION_EVENTS", "true")
+
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth
 RATE_LIMITS = {

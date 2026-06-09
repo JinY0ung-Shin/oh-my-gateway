@@ -1415,14 +1415,105 @@ async def test_stream_closes_reasoning_with_accumulated_text():
     assert msg_added["output_index"] == 1
 
 
-# NOTE: A test for fully-interleaved think → text → think → text was removed.
-# The OpenAI Responses API contract does not cleanly support reopening a
-# reasoning output_item after a message output_item has started emitting text.
-# Buffering text deltas until end-of-stream to preserve ordering would break
-# live token streaming for the common case (single thinking block followed by
-# text), so we accept that in the rare interleaved case the second thinking
-# block's content is dropped. See test_stream_text_after_thinking_emits_deltas_live
-# below for the live-streaming regression check.
+async def test_stream_interleaved_think_text_think_text_preserves_second_block():
+    """Fully-interleaved think → text → think → text must NOT drop the 2nd block.
+
+    The OpenAI Responses ``output`` array is an ordered sequence, so a new
+    thinking block after text closes the current message item and opens its
+    own reasoning item, then a fresh message item for the trailing text. All
+    four blocks (r1, m1, r2, m2) survive and stream live.
+    """
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    def _think_start(idx):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+
+    def _think_delta(idx, text):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": idx,
+            "delta": {"type": "thinking_delta", "thinking": text},
+        }}
+
+    def _text_start(idx):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "text", "text": ""},
+        }}
+
+    def _text_delta(idx, text):
+        return {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": idx,
+            "delta": {"type": "text_delta", "text": text},
+        }}
+
+    def _stop(idx):
+        return {"type": "stream_event", "event": {"type": "content_block_stop", "index": idx}}
+
+    async def chunk_source():
+        yield _think_start(0)
+        yield _think_delta(0, "ponder-A")
+        yield _stop(0)
+        yield _text_start(1)
+        yield _text_delta(1, "answer-A")
+        yield _stop(1)
+        yield _think_start(2)
+        yield _think_delta(2, "ponder-B")
+        yield _stop(2)
+        yield _text_start(3)
+        yield _text_delta(3, "answer-B")
+        yield _stop(3)
+
+    events = []
+    stream_result: dict = {}
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+        stream_result=stream_result,
+    ):
+        events.append(_parse_response_sse(line))
+
+    # Both thinking blocks must be streamed as reasoning text (the 2nd is the regression).
+    reasoning_deltas = [p["delta"] for t, p in events if t == "response.reasoning_text.delta"]
+    assert "ponder-A" in reasoning_deltas
+    assert "ponder-B" in reasoning_deltas, "2nd thinking block was dropped"
+
+    # Both text runs must be streamed live as message deltas.
+    text_deltas = [p["delta"] for t, p in events if t == "response.output_text.delta"]
+    assert text_deltas == ["answer-A", "answer-B"]
+
+    # Two reasoning items and two message items closed, interleaved in order.
+    done_types = [
+        p["item"]["type"]
+        for t, p in events
+        if t == "response.output_item.done"
+    ]
+    assert done_types == ["reasoning", "message", "reasoning", "message"]
+
+    # output_index increases monotonically across the four items: 0,1,2,3.
+    done_indices = [p["output_index"] for t, p in events if t == "response.output_item.done"]
+    assert done_indices == [0, 1, 2, 3]
+
+    # The final response.completed carries all four items in order.
+    completed = next(p for t, p in events if t == "response.completed")
+    out_types = [item["type"] for item in completed["response"]["output"]]
+    assert out_types == ["reasoning", "message", "reasoning", "message"]
+
+    # The full visible text handed back to the route is the concatenation of
+    # both message segments (not just the last one).
+    assert stream_result["assistant_text"] == "answer-Aanswer-B"
+    assert stream_result["thinking_texts"] == ["ponder-A", "ponder-B"]
+
+
+# Regression: the common case (single thinking block then text) must still
+# stream text deltas live, not buffer them until end-of-stream.
 
 
 async def test_stream_text_after_thinking_emits_deltas_live_not_buffered():
@@ -1907,3 +1998,209 @@ class TestExtractVisibleAssistantText:
             {"type": "assistant", "content": [{"type": "text", "text": "second"}]},
         ]
         assert extract_visible_assistant_text(chunks) == "first\nsecond"
+
+
+# ---------------------------------------------------------------------------
+# Liveness / "still working" progress signals (tool_use_started, hook events,
+# compaction). These let a UI show activity in the gaps between text.
+# ---------------------------------------------------------------------------
+
+
+async def _collect_response_events(source):
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    events = []
+    stream_result: dict = {}
+    async for line in stream_response_chunks(
+        source,
+        model="m",
+        response_id="resp_1",
+        output_item_id="msg_1",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+        stream_result=stream_result,
+    ):
+        events.append(_parse_response_sse(line))
+    return events, stream_result
+
+
+async def test_stream_emits_tool_use_started_before_full_tool_use():
+    """`response.tool_use_started` fires at content_block_start, before the
+    accumulated `response.tool_use` with the full arguments."""
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu_1", "name": "Bash"},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '{"command":'},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": '"ls"}'},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    types = [t for t, _ in events]
+
+    assert "response.tool_use_started" in types, "no tool_use_started signal emitted"
+    started_idx = types.index("response.tool_use_started")
+    full_idx = types.index("response.tool_use")
+    assert started_idx < full_idx, "started must precede the completed tool_use"
+
+    started = events[started_idx][1]
+    assert started["tool_use_id"] == "tu_1"
+    assert started["name"] == "Bash"
+    # No arguments yet on the started signal.
+    assert "input" not in started
+
+    # The completed tool_use carries the assembled arguments.
+    full = events[full_idx][1]
+    assert full["tool_use_id"] == "tu_1"
+    assert full["input"] == {"command": "ls"}
+
+
+async def test_stream_tool_use_started_disabled_by_flag(monkeypatch):
+    monkeypatch.setattr("src.streaming_utils.STREAM_TOOL_PROGRESS", False)
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "tool_use", "id": "tu_1", "name": "Bash"},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "input_json_delta", "partial_json": "{}"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    types = [t for t, _ in events]
+    assert "response.tool_use_started" not in types
+    # The completed tool_use still flows.
+    assert "response.tool_use" in types
+
+
+async def test_stream_forwards_hook_lifecycle_events():
+    """hook_started/hook_response system messages become response.hook_event."""
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "hook_started", "hook_event_name": "PreToolUse",
+            "data": {"hook_event": "PreToolUse", "tool_name": "Bash", "tool_use_id": "tu_9"},
+            "session_id": "s1",
+        }
+        yield {
+            "type": "system", "subtype": "hook_response", "hook_event_name": "PostToolUse",
+            "data": {
+                "hook_event": "PostToolUse", "tool_name": "Bash",
+                "tool_use_id": "tu_9", "outcome": "success",
+            },
+            "session_id": "s1",
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    hook_events = [p for t, p in events if t == "response.hook_event"]
+    assert len(hook_events) == 2
+
+    assert hook_events[0]["phase"] == "hook_started"
+    assert hook_events[0]["hook_event_name"] == "PreToolUse"
+    assert hook_events[0]["tool_name"] == "Bash"
+    assert hook_events[0]["tool_use_id"] == "tu_9"
+    assert "parent_tool_use_id" not in hook_events[0]
+
+    assert hook_events[1]["phase"] == "hook_response"
+    assert hook_events[1]["hook_event_name"] == "PostToolUse"
+    assert hook_events[1]["outcome"] == "success"
+    assert "parent_tool_use_id" not in hook_events[1]
+
+    # Normal content still flows after the hook events.
+    deltas = [p.get("delta") for t, p in events if t == "response.output_text.delta"]
+    assert "ok" in deltas
+
+
+async def test_stream_hook_events_disabled_by_flag(monkeypatch):
+    monkeypatch.setattr("src.sse_builders.STREAM_HOOK_EVENTS", False)
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "hook_started", "hook_event_name": "PreToolUse",
+            "data": {"hook_event": "PreToolUse", "tool_name": "Bash"},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    assert not any(t == "response.hook_event" for t, _ in events)
+
+
+async def test_stream_hook_event_preserves_explicit_parent_tool_use_id():
+    """Only an explicit parent_tool_use_id marks hook_event nesting."""
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "hook_started", "hook_event_name": "PreToolUse",
+            "parent_tool_use_id": "parent_1",
+            "data": {"hook_event": "PreToolUse", "tool_name": "Bash", "tool_use_id": "tu_child"},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    hook_event = next(p for t, p in events if t == "response.hook_event")
+    assert hook_event["tool_use_id"] == "tu_child"
+    assert hook_event["parent_tool_use_id"] == "parent_1"
+
+
+async def test_stream_top_level_hook_event_not_gated_as_subagent(monkeypatch):
+    """A hook's tool_use_id is its target tool, not a subagent parent marker."""
+    monkeypatch.setattr("src.streaming_utils.SUBAGENT_STREAM_PROGRESS", False)
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "hook_started", "hook_event_name": "PreToolUse",
+            "data": {"hook_event": "PreToolUse", "tool_name": "Bash", "tool_use_id": "tu_top"},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    hook_event = next(p for t, p in events if t == "response.hook_event")
+    assert hook_event["tool_use_id"] == "tu_top"
+    assert "parent_tool_use_id" not in hook_event
+
+
+async def test_stream_forwards_compaction_event():
+    """compact_boundary system messages become response.compaction."""
+
+    async def chunk_source():
+        yield {
+            "type": "system", "subtype": "compact_boundary",
+            "data": {"trigger": "auto"}, "session_id": "s1",
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "ok"},
+        }}
+
+    events, _ = await _collect_response_events(chunk_source())
+    compaction = [p for t, p in events if t == "response.compaction"]
+    assert len(compaction) == 1
+    assert compaction[0]["subtype"] == "compact_boundary"
+    assert compaction[0]["trigger"] == "auto"

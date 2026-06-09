@@ -1651,6 +1651,25 @@ async function streamRequest(body) {
           setStatus('streaming', 'agent: ' + label);
         }
 
+        // --- Liveness: tool call starting (before its arguments finish) ---
+        if (type === 'response.tool_use_started') {
+          const meta = toolMeta(evt.name);
+          setStatus('streaming', meta.glyph + ' 준비 중: ' + (evt.name || 'tool'));
+        }
+
+        // --- Liveness: hook lifecycle (PreToolUse/PostToolUse/…) ---
+        if (type === 'response.hook_event') {
+          const hookName = evt.hook_event_name || 'hook';
+          const toolPart = evt.tool_name ? (' · ' + evt.tool_name) : '';
+          const phase = evt.phase === 'hook_response' ? '완료' : '실행';
+          setStatus('streaming', '🪝 ' + hookName + toolPart + ' ' + phase);
+        }
+
+        // --- Liveness: context compaction in progress ---
+        if (type === 'response.compaction') {
+          setStatus('streaming', '🗜️ 컨텍스트 압축 중…');
+        }
+
         // --- function_call (AskUserQuestion) ---
         if (type === 'response.output_item.added' && evt.item && evt.item.type === 'function_call') {
           // Will be handled in response.completed
