@@ -55,15 +55,19 @@ ARG PIP_INDEX_URL=
 ARG PIP_EXTRA_INDEX_URL=
 ARG PIP_TRUSTED_HOST=
 
-COPY requirements.txt ./
-RUN PIP_INDEX_URL="$PIP_INDEX_URL" \
+# Install runtime dependencies pinned by uv.lock (exported at build time so
+# the pins can never drift from the lock; pip installs via PIP_INDEX_URL mirrors).
+COPY pyproject.toml uv.lock ./
+RUN uv export --format requirements.txt --no-dev --no-hashes --no-emit-project --locked -o /tmp/requirements.txt \
+    && PIP_INDEX_URL="$PIP_INDEX_URL" \
     PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" \
     PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
     python -m pip install --upgrade pip \
     && PIP_INDEX_URL="$PIP_INDEX_URL" \
     PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" \
     PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
-    python -m pip install -r requirements.txt
+    python -m pip install -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 COPY src ./src
 COPY docs/*system-prompt*.md ./docs/

@@ -217,11 +217,9 @@ uv run pytest
 uv run ruff check .
 ```
 
-Refresh Docker dependency pins after dependency changes:
-
-```bash
-uv export --format requirements.txt --no-dev --no-hashes --no-emit-project --locked -o requirements.txt
-```
+Docker builds export dependency pins from `uv.lock` at build time, so `uv lock`
+(or `uv sync` after editing `pyproject.toml`) is all that's needed after
+dependency changes — there is no committed `requirements.txt` to refresh.
 
 Run a live OpenCode smoke test only when a real provider is configured:
 

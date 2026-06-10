@@ -30,16 +30,20 @@ ARG PIP_INDEX_URL=
 ARG PIP_EXTRA_INDEX_URL=
 ARG PIP_TRUSTED_HOST=
 
-# Install pinned runtime dependencies exported from uv.lock.
-COPY requirements.txt ./
-RUN PIP_INDEX_URL="$PIP_INDEX_URL" \
+# Install runtime dependencies pinned by uv.lock. The export happens at build
+# time (offline, reads only the lock) so the pins can never drift from the lock;
+# pip does the actual install so PIP_INDEX_URL mirrors keep working.
+COPY pyproject.toml uv.lock ./
+RUN uv export --format requirements.txt --no-dev --no-hashes --no-emit-project --locked -o /tmp/requirements.txt \
+    && PIP_INDEX_URL="$PIP_INDEX_URL" \
     PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" \
     PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
     python -m pip install --upgrade pip \
     && PIP_INDEX_URL="$PIP_INDEX_URL" \
     PIP_EXTRA_INDEX_URL="$PIP_EXTRA_INDEX_URL" \
     PIP_TRUSTED_HOST="$PIP_TRUSTED_HOST" \
-    python -m pip install -r requirements.txt
+    python -m pip install -r /tmp/requirements.txt \
+    && rm /tmp/requirements.txt
 
 # Copy runtime files used by the app.
 COPY src ./src
