@@ -38,6 +38,7 @@ from src.constants import (
     MAX_REQUEST_SIZE,
 )
 from src import __version__
+from src import metrics
 from src.mcp_config import get_mcp_servers
 from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
@@ -205,6 +206,12 @@ async def lifespan(app: FastAPI):
     from src.admin_auth import validate_admin_config
 
     validate_admin_config()
+
+    # Validate env configuration — log warnings for confusing combinations and
+    # refuse to start on contradictory ones (bypass with SKIP_CONFIG_CHECK=true).
+    from src.config_check import run_startup_config_check
+
+    run_startup_config_check()
 
     # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
@@ -453,6 +460,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         model: Optional[str] = None
         session_id: Optional[str] = None
         backend: Optional[str] = None
+        streaming: Optional[bool] = None
 
         # Extract model/session_id from request body for /v1/ POST endpoints.
         # Follow the same safety pattern as the existing debug middleware:
@@ -466,6 +474,8 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                         parsed = json.loads(body.decode())
                         model = parsed.get("model")
                         session_id = parsed.get("session_id")
+                        if path == "/v1/responses":
+                            streaming = bool(parsed.get("stream", False))
                         # Resolve backend from model name
                         if model:
                             try:
@@ -501,6 +511,18 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 session_id=session_id,
             )
             request_logger.log(entry)
+            try:
+                metrics.record_request(
+                    path=path,
+                    method=request.method,
+                    status_code=status_code,
+                    duration_seconds=elapsed_ms / 1000,
+                    streaming=streaming,
+                )
+            except Exception:
+                logger.debug(
+                    "Prometheus request metrics recording failed", exc_info=True
+                )
 
 
 # Add security middleware (order matters - first added = last executed)

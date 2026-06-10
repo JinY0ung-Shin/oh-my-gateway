@@ -35,6 +35,7 @@ response.in_progress
 response.output_item.added
 response.content_part.added
 response.output_text.delta      # zero or more
+response.output_text.annotation.added  # zero or more (citations)
 response.tool_use_started       # zero or more (liveness; precedes response.tool_use)
 response.tool_use               # zero or more
 response.tool_result            # zero or more
@@ -101,6 +102,35 @@ message and its first text part.
 Final text is repeated in `response.output_text.done`,
 `response.content_part.done`, and `response.output_item.done` so clients can
 reconcile their buffered content.
+
+### Citations
+
+When the Claude API emits `citations_delta` stream events (citations are
+opt-in, attached to document-grounded text), each one is forwarded as a
+`response.output_text.annotation.added` event. The `annotation` field is the
+raw Claude citation object (e.g. `char_location`), passed through unchanged:
+
+```json
+{
+  "type": "response.output_text.annotation.added",
+  "item_id": "msg_abc123",
+  "output_index": 0,
+  "content_index": 0,
+  "annotation_index": 0,
+  "annotation": {
+    "type": "char_location",
+    "cited_text": "the answer is 42",
+    "document_index": 0,
+    "document_title": "guide.pdf",
+    "start_char_index": 100,
+    "end_char_index": 116
+  },
+  "sequence_number": 6
+}
+```
+
+`annotation_index` counts citations within the current message item and resets
+when a new message item opens.
 
 ## Tool Events
 

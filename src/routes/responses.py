@@ -31,6 +31,7 @@ from src.response_models import (
     ResponseInputItem,
     FunctionCallOutputInput,
     FunctionCallOutputItem,
+    ResponseDeletedObject,
     ResponseObject,
     OutputItem,
     ReasoningContent,
@@ -39,6 +40,7 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.rate_limiter import rate_limit_endpoint
+from src.chunk_processing import classify_error_chunk
 from src.constants import DEFAULT_TIMEOUT_MS, PERMISSION_MODE_BYPASS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
@@ -89,6 +91,45 @@ def _parse_response_id(resp_id: str):
     except ValueError:
         return None
     return parts[1], turn
+
+
+def _response_not_found(response_id: str) -> HTTPException:
+    """OpenAI-style 404 for a missing, expired, or unstored response id."""
+    return HTTPException(
+        status_code=404,
+        detail={
+            "error": {
+                "message": f"Response with id '{response_id}' not found.",
+                "type": "invalid_request_error",
+                "param": "response_id",
+                "code": "response_not_found",
+            }
+        },
+    )
+
+
+def _lookup_stored_response(response_id: str, user: Optional[str]):
+    """Resolve a response_id to ``(session, session_id, turn)`` or raise 404.
+
+    User scoping: sessions record their owner in ``session.user`` (set by
+    POST /v1/responses). GET/DELETE carry no body, so the owner is matched
+    against the optional ``user`` query parameter when provided; a mismatch
+    is reported as 404 (unlike POST's 400) so callers cannot probe which
+    user owns a response id. When ``user`` is omitted, API-key auth alone
+    grants access — the same model as GET/DELETE /v1/sessions.
+    """
+    parsed = _parse_response_id(response_id)
+    if parsed is None:
+        raise _response_not_found(response_id)
+    session_id, turn = parsed
+    session = session_manager.get_session(session_id)
+    if session is None:
+        raise _response_not_found(response_id)
+    if user is not None and session.user != user:
+        raise _response_not_found(response_id)
+    if turn > session.turn_counter:
+        raise _response_not_found(response_id)
+    return session, session_id, turn
 
 
 def _detect_function_call_output(input_data) -> Optional[Dict[str, str]]:
@@ -202,6 +243,7 @@ def _build_completed_response(
     input_tokens: int,
     output_tokens: int,
     thinking_texts: Optional[List[str]] = None,
+    structured_output: Any = None,
 ) -> ResponseObject:
     output_items: List[Any] = []
     for t in thinking_texts or []:
@@ -228,7 +270,64 @@ def _build_completed_response(
             output_tokens=output_tokens,
         ),
         metadata=metadata or {},
+        structured_output=structured_output,
     )
+
+
+def _record_turn_response(
+    session, turn: int, response_obj: ResponseObject, *, store: Optional[bool]
+) -> None:
+    """Persist a committed turn's ResponseObject for GET /v1/responses/{id}.
+
+    Honors OpenAI ``store`` semantics: ``store=false`` turns still chain
+    normally via ``previous_response_id`` (session history is unaffected)
+    but cannot be retrieved later. The payload is stored as a plain dict so
+    retrieval returns exactly what POST returned (item ids, created_at,
+    usage, structured_output).
+    """
+    if store is False:
+        return
+    session.record_turn_response(turn, response_obj.model_dump())
+
+
+def _record_stream_turn_response(
+    session,
+    *,
+    turn: int,
+    response_id: str,
+    model: str,
+    stream_result: dict,
+    chunks_buffer: list,
+    prompt: Any,
+    metadata: Optional[dict],
+    store: Optional[bool],
+    backend: "BackendClient",
+) -> None:
+    """Record a completed streaming turn for GET /v1/responses/{id}.
+
+    Mirrors the non-stream commit: rebuilds the completed ResponseObject
+    from the stream result and buffered chunks (usage, thinking texts,
+    structured_output) and stores it on the session.
+    """
+    if store is False:
+        return
+    assistant_text = stream_result.get("assistant_text") or ""
+    thinking_texts = stream_result.get("thinking_texts") or []
+    usage_text = assistant_text or "\n".join(thinking_texts)
+    input_tokens, output_tokens = streaming_utils.resolve_token_usage(
+        chunks_buffer, prompt, usage_text, model, backend=backend
+    )
+    response_obj = _build_completed_response(
+        response_id,
+        model,
+        assistant_text,
+        metadata,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        thinking_texts=thinking_texts,
+        structured_output=streaming_utils.extract_structured_output(chunks_buffer),
+    )
+    session.record_turn_response(turn, response_obj.model_dump())
 
 
 def _split_assistant_text_and_thinking(
@@ -485,6 +584,61 @@ def _response_model_params(body: ResponseCreateRequest) -> Optional[Dict[str, An
     return params or None
 
 
+def _response_output_format(body: ResponseCreateRequest) -> Optional[Dict[str, Any]]:
+    """Map the OpenAI ``text.format`` json_schema config to the SDK shape.
+
+    Returns ``{"type": "json_schema", "schema": {...}}`` (the
+    ``ClaudeAgentOptions.output_format`` payload) when the request asks for
+    Structured Outputs, or ``None`` for the default ``text`` format. The
+    schema is passed through as-is — the gateway does not rewrite it.
+    """
+    fmt = body.text.format if body.text is not None else None
+    if fmt is None or fmt.type != "json_schema":
+        return None
+    return {"type": "json_schema", "schema": fmt.json_schema}
+
+
+def _validate_output_format_backend(
+    output_format: Optional[Dict[str, Any]], backend_name: str
+) -> None:
+    """Reject Structured Outputs requests for backends that can't honor them."""
+    if output_format is not None and backend_name != "claude":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"text.format type 'json_schema' is not supported by the "
+                f"'{backend_name}' backend; only the claude backend supports "
+                f"structured outputs"
+            ),
+        )
+
+
+def _validate_continuation_output_format(
+    client: Any, output_format: Optional[Dict[str, Any]]
+) -> None:
+    """Fail closed when a continuation asks for a different structured-output schema.
+
+    The Claude SDK bakes ``output_format`` into the session at create time
+    and has no runtime API to change it. Re-sending the same format is a
+    no-op (OpenAI clients typically resend the full request config on every
+    turn); asking for a different one is rejected instead of silently
+    ignored.
+    """
+    if output_format is None:
+        return
+    existing = getattr(getattr(client, "options", None), "output_format", None)
+    if existing == output_format:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "text.format 'json_schema' cannot be changed on a continuation "
+            "turn; structured output is fixed when the session is created. "
+            "Start a new session to apply a different schema."
+        ),
+    )
+
+
 def _response_prompt_and_system(
     body: ResponseCreateRequest,
     workspace: Path,
@@ -645,7 +799,9 @@ async def _ensure_response_session_client(
     workspace_str: str,
 ) -> None:
     """Create the persistent backend client after session preflight has passed."""
+    output_format = _response_output_format(body)
     if session.client is not None:
+        _validate_continuation_output_format(session.client, output_format)
         await _refresh_existing_client_policy(body, backend, session.client)
         return
 
@@ -655,6 +811,12 @@ async def _ensure_response_session_client(
         resolved_base = session.base_system_prompt
     else:
         resolved_base = resolve_request_placeholders(get_system_prompt(), workspace_str)
+    # ``output_format`` is only passed when set: the route already rejects
+    # json_schema for non-claude backends, so this keyword never reaches a
+    # backend whose create_client() doesn't accept it.
+    create_kwargs: Dict[str, Any] = {}
+    if output_format is not None:
+        create_kwargs["output_format"] = output_format
     try:
         session.client = await backend.create_client(
             session=session,
@@ -668,6 +830,7 @@ async def _ensure_response_session_client(
             extra_env=body.metadata,
             model_params=_response_model_params(body),
             _custom_base=resolved_base,
+            **create_kwargs,
         )
     except Exception:
         logger.error("create_client failed", exc_info=True)
@@ -1073,6 +1236,55 @@ async def _collect_non_stream_continuation_chunks(chunk_source):
     return chunks
 
 
+async def _raise_for_error_chunks(
+    chunks: List[Any],
+    *,
+    response_id: str,
+    model: str,
+    request_context: Dict[str, Any],
+    started_monotonic: float,
+) -> None:
+    """Fail a non-streaming collection on terminal backend error chunks.
+
+    Mirrors the streaming loop's error handling (``classify_error_chunk`` in
+    ``streaming_utils.stream_response_chunks``): the same chunks that make a
+    stream emit ``response.failed`` — SDK in-band errors, AssistantMessage
+    errors, rejected rate limits — raise an HTTPException here, and the turn
+    is recorded as failed in the usage log instead of degrading into an
+    empty-response 502.
+    """
+    for chunk in chunks:
+        error_info = classify_error_chunk(chunk)
+        if error_info is None:
+            continue
+        logger.error(
+            "Responses API non-stream: backend error chunk: %s (code=%s)",
+            error_info["message"],
+            error_info["code"],
+        )
+        try:
+            await usage_logger.log_turn_from_context(
+                request_context=request_context,
+                response_id=response_id,
+                model=model,
+                chunks=chunks,
+                tool_stats=None,
+                started_monotonic=started_monotonic,
+                status="failed",
+                error_code=error_info["code"],
+            )
+        except Exception:
+            logger.warning("usage-log emit failed (non-stream)", exc_info=True)
+        # Error messages here are SDK-curated (rate-limit, auth, etc.) — not
+        # raw Python exception strings — so they are safe to surface to
+        # clients. Raw ``except Exception`` leaks are redacted elsewhere.
+        status_code = 429 if error_info["code"] == "rate_limit" else 502
+        raise HTTPException(
+            status_code=status_code,
+            detail=f"Backend error: {error_info['message']}",
+        )
+
+
 @router.post("/v1/responses")
 @rate_limit_endpoint("responses")
 async def create_response(
@@ -1097,6 +1309,7 @@ async def create_response(
     )
     validate_backend_auth_or_raise(resolved.backend)
     validate_image_request(body, backend)
+    _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
@@ -1235,6 +1448,9 @@ async def create_response(
                     # consumed the user's input, so history must reflect it.
                     session.turn_counter = next_turn
                     session.add_messages([Message(role="user", content=prompt)])
+                    _record_turn_response(
+                        session, next_turn, requires_action_resp, store=body.store
+                    )
                     stream_result["success"] = True
                 elif stream_result.get("empty"):
                     # Stream ended with no text and no pending tool call —
@@ -1267,6 +1483,18 @@ async def create_response(
                         session.turn_counter = next_turn
                         session.add_messages([Message(role="user", content=prompt)])
                         session_manager.add_assistant_response(session_id, assistant_message)
+                        _record_stream_turn_response(
+                            session,
+                            turn=next_turn,
+                            response_id=resp_id,
+                            model=body.model,
+                            stream_result=stream_result,
+                            chunks_buffer=chunks_buffer,
+                            prompt=prompt,
+                            metadata=body.metadata,
+                            store=body.store,
+                            backend=backend,
+                        )
                         _log_session_assistant_write(
                             path="responses.stream",
                             session_id=session_id,
@@ -1343,15 +1571,23 @@ async def create_response(
             async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
                 chunks.append(chunk)
 
-            # Check for backend errors (run_completion wraps exceptions as error chunks)
-            for chunk in chunks:
-                if isinstance(chunk, dict) and chunk.get("is_error"):
-                    # ``error_message`` here is SDK-curated (rate-limit, auth,
-                    # etc.) — not a raw Python exception string — so it is
-                    # safe to surface to clients. Raw ``except Exception``
-                    # leaks are redacted at the catch-all below.
-                    error_msg = chunk.get("error_message", "Unknown backend error")
-                    raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
+            # Check for backend errors — SDK in-band error chunks plus
+            # AssistantMessage errors and rejected rate limits, mirroring
+            # the streaming loop's failure semantics.
+            await _raise_for_error_chunks(
+                chunks,
+                response_id=_make_response_id(session_id, pf.next_turn),
+                model=body.model,
+                request_context={
+                    "session_id": session_id,
+                    "user": body.user,
+                    "backend": resolved.backend,
+                    "provider_model": resolved.provider_model,
+                    "previous_response_id": body.previous_response_id,
+                    "turn": pf.next_turn,
+                },
+                started_monotonic=_usage_start,
+            )
 
             # Check if the SDK paused on AskUserQuestion
             if session.pending_tool_call is not None:
@@ -1361,9 +1597,13 @@ async def create_response(
                 # the user's input, so history must reflect it.
                 session.turn_counter = pf.next_turn
                 session.add_messages([Message(role="user", content=prompt)])
-                return _build_requires_action_response(
+                requires_action_resp = _build_requires_action_response(
                     resp_id, body.model, tc, body.metadata
-                ).model_dump()
+                )
+                _record_turn_response(
+                    session, pf.next_turn, requires_action_resp, store=body.store
+                )
+                return requires_action_resp.model_dump()
 
             # Extract assistant text
             assistant_text = backend.parse_message(chunks) or ""
@@ -1420,7 +1660,9 @@ async def create_response(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
         thinking_texts=thinking_texts,
+        structured_output=streaming_utils.extract_structured_output(chunks),
     )
+    _record_turn_response(session, session.turn_counter, response_obj, store=body.store)
 
     try:
         await usage_logger.log_turn_from_context(
@@ -1491,6 +1733,7 @@ async def _handle_function_call_output(
     # of the session.
     if session.client is not None:
         try:
+            _validate_continuation_output_format(session.client, _response_output_format(body))
             await _refresh_existing_client_policy(body, backend, session.client)
         except Exception:
             if session.lock.locked():
@@ -1574,6 +1817,9 @@ async def _handle_function_call_output(
                         sequence_number=0,
                     )
                     session.turn_counter = next_turn
+                    _record_turn_response(
+                        session, next_turn, requires_action_resp, store=body.store
+                    )
                     stream_result["success"] = True
                 elif stream_result.get("success"):
                     assistant_text = stream_result.get("assistant_text") or ""
@@ -1584,6 +1830,18 @@ async def _handle_function_call_output(
                     if assistant_message is not None:
                         session.turn_counter = next_turn
                         session_manager.add_assistant_response(session_id, assistant_message)
+                        _record_stream_turn_response(
+                            session,
+                            turn=next_turn,
+                            response_id=resp_id,
+                            model=body.model,
+                            stream_result=stream_result,
+                            chunks_buffer=chunks_buffer,
+                            prompt="",
+                            metadata=body.metadata,
+                            store=body.store,
+                            backend=backend,
+                        )
                         _log_session_assistant_write(
                             path="responses.continuation_stream",
                             session_id=session_id,
@@ -1634,17 +1892,33 @@ async def _handle_function_call_output(
             tc = session.pending_tool_call
             session.turn_counter = next_turn
             continuation_success = True
-            return _build_requires_action_response(
+            requires_action_resp = _build_requires_action_response(
                 resp_id, body.model, tc, body.metadata
-            ).model_dump()
+            )
+            _record_turn_response(
+                session, next_turn, requires_action_resp, store=body.store
+            )
+            return requires_action_resp.model_dump()
 
-        for chunk in chunks:
-            if isinstance(chunk, dict) and chunk.get("is_error"):
-                # ``error_message`` here is SDK-curated (rate-limit, auth,
-                # etc.) — not a raw Python exception string — so it is safe
-                # to surface to clients.
-                error_msg = chunk.get("error_message", "Unknown backend error")
-                raise HTTPException(status_code=502, detail=f"Backend error: {error_msg}")
+        # Check for backend errors — SDK in-band error chunks plus
+        # AssistantMessage errors and rejected rate limits, mirroring the
+        # streaming continuation's failure semantics.
+        await _raise_for_error_chunks(
+            chunks,
+            response_id=resp_id,
+            model=body.model,
+            request_context={
+                "session_id": session_id,
+                "user": body.user,
+                "backend": resolved.backend,
+                "provider_model": resolved.provider_model,
+                "previous_response_id": body.previous_response_id,
+                "turn": next_turn,
+                "continuation": True,
+                "function_call_output_call_id": fc_output["call_id"],
+            },
+            started_monotonic=_usage_start,
+        )
 
         assistant_text = backend.parse_message(chunks) or ""
         visible_text, thinking_texts = _split_assistant_text_and_thinking(chunks, assistant_text)
@@ -1682,7 +1956,9 @@ async def _handle_function_call_output(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
         thinking_texts=thinking_texts,
+        structured_output=streaming_utils.extract_structured_output(chunks),
     )
+    _record_turn_response(session, next_turn, response_obj, store=body.store)
 
     try:
         await usage_logger.log_turn_from_context(
@@ -1705,3 +1981,80 @@ async def _handle_function_call_output(
         logger.warning("usage-log emit failed (non-stream continuation)", exc_info=True)
 
     return response_obj.model_dump()
+
+
+@router.get("/v1/responses/{response_id}")
+@rate_limit_endpoint("responses")
+async def get_response(
+    request: Request,
+    response_id: str,
+    user: Optional[str] = None,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """OpenAI-compatible retrieve: return the stored response for a past turn.
+
+    Responses are recorded per turn on the in-memory session at commit time,
+    so retrieval is subject to the session TTL. Turns created with
+    ``store=false`` and sessions rehydrated from the on-disk jsonl transcript
+    (which only preserves the turn counter) are not retrievable and return
+    404 with an OpenAI-style error body.
+
+    The optional ``user`` query parameter scopes the lookup to the session
+    owner: when provided it must match ``session.user`` (mismatches are
+    indistinguishable from a missing response); when omitted, API-key auth
+    alone grants access, matching GET /v1/sessions semantics.
+    """
+    await verify_api_key(request, credentials)
+    session, _session_id, turn = _lookup_stored_response(response_id, user)
+    payload = session.get_turn_response(turn)
+    if payload is None:
+        raise _response_not_found(response_id)
+    return payload
+
+
+@router.delete("/v1/responses/{response_id}")
+@rate_limit_endpoint("responses")
+async def delete_response(
+    request: Request,
+    response_id: str,
+    user: Optional[str] = None,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """OpenAI-compatible delete, mapped onto the gateway session model.
+
+    Gateway responses are turns of a chained session, so deleting a single
+    mid-chain turn would be destructive and ambiguous (the session history
+    and SDK transcript cannot drop one turn). Chosen semantics:
+
+    * Latest turn (``resp_<session>_<turn_counter>``, the same id the 409
+      stale-turn recovery message advertises): deletes the entire session —
+      SDK client and temp workspace included — consistent with
+      ``DELETE /v1/sessions/{session_id}``.
+    * Earlier turn: 409 with an error explaining that turn-level deletion is
+      not supported and which id is deletable.
+    * Unknown/expired session or turn, or ``user`` mismatch: 404.
+
+    Returns the OpenAI deletion acknowledgment
+    ``{"id": ..., "object": "response", "deleted": true}``.
+    """
+    await verify_api_key(request, credentials)
+    session, session_id, turn = _lookup_stored_response(response_id, user)
+    if turn != session.turn_counter:
+        latest_id = _make_response_id(session_id, session.turn_counter)
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": {
+                    "message": (
+                        f"Response '{response_id}' is not the latest turn of its "
+                        f"session; turn-level deletion is not supported. Delete "
+                        f"'{latest_id}' to remove the session and its history."
+                    ),
+                    "type": "invalid_request_error",
+                    "param": "response_id",
+                    "code": "response_delete_not_latest",
+                }
+            },
+        )
+    await session_manager.delete_session_async(session_id)
+    return ResponseDeletedObject(id=response_id).model_dump()

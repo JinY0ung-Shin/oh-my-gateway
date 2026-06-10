@@ -3,7 +3,7 @@
 import time
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, Discriminator, Field, Tag
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
 
 from src.runtime_config import get_default_model
 
@@ -70,6 +70,42 @@ class FunctionCallOutputInput(BaseModel):
     output: str
 
 
+class TextFormatText(BaseModel):
+    """The default ``text`` response format (no-op)."""
+
+    type: Literal["text"] = "text"
+
+
+class TextFormatJSONSchema(BaseModel):
+    """Structured Outputs response format (``text.format.type == "json_schema"``).
+
+    Mirrors the OpenAI Responses API shape. The ``schema`` payload is handed
+    to the backend SDK as-is (gateway pass-through philosophy — no rewriting).
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: Literal["json_schema"] = "json_schema"
+    name: Optional[str] = None
+    description: Optional[str] = None
+    json_schema: Dict[str, Any] = Field(
+        alias="schema",
+        description="JSON Schema the model output must conform to",
+    )
+    strict: Optional[bool] = None
+
+
+class ResponseTextConfig(BaseModel):
+    """The ``text`` request option (response format configuration)."""
+
+    format: Optional[
+        Annotated[
+            Union[TextFormatText, TextFormatJSONSchema],
+            Field(discriminator="type"),
+        ]
+    ] = None
+
+
 class ResponseCreateRequest(BaseModel):
     """POST /v1/responses request body."""
 
@@ -111,6 +147,13 @@ class ResponseCreateRequest(BaseModel):
     user: Optional[str] = Field(
         default=None,
         description="Unique user identifier for workspace isolation",
+    )
+    text: Optional[ResponseTextConfig] = Field(
+        default=None,
+        description=(
+            "Text response configuration. format.type 'json_schema' enables "
+            "Structured Outputs (Claude backend only); 'text' is the default."
+        ),
     )
 
 
@@ -181,6 +224,14 @@ class FunctionCallOutputItem(BaseModel):
     status: str = "completed"
 
 
+class ResponseDeletedObject(BaseModel):
+    """DELETE /v1/responses/{response_id} acknowledgment (OpenAI shape)."""
+
+    id: str
+    object: Literal["response"] = "response"
+    deleted: bool = True
+
+
 class ResponseObject(BaseModel):
     """The response object returned by POST /v1/responses."""
 
@@ -193,3 +244,10 @@ class ResponseObject(BaseModel):
     usage: ResponseUsage = Field(default_factory=ResponseUsage)
     metadata: Dict[str, str] = Field(default_factory=dict)
     error: Optional[ResponseErrorDetail] = None
+    structured_output: Any = Field(
+        default=None,
+        description=(
+            "Parsed Structured Outputs payload from the backend (ResultMessage"
+            ".structured_output) when the request set text.format json_schema."
+        ),
+    )

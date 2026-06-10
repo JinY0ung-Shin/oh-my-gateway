@@ -6,7 +6,7 @@ so endpoint code dispatches by interface rather than concrete backend type.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Any,
     AsyncIterator,
@@ -52,12 +52,16 @@ class BackendDescriptor:
 
     Separates "known backends" from "live clients" so that model resolution
     and auth status work even if a backend failed to start.
+
+    ``capabilities`` carries feature flags surfaced in ``/v1/models``
+    (e.g. ``{"image_input": True}``).
     """
 
     name: str
     owned_by: str
     models: List[str]
     resolve_fn: Callable[[str], Optional[ResolvedModel]]
+    capabilities: Dict[str, bool] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -224,13 +228,26 @@ class BackendRegistry:
         return ids
 
     @classmethod
-    def available_models(cls) -> List[Dict[str, str]]:
-        """Build the ``/v1/models`` data list from registered backends."""
-        data: List[Dict[str, str]] = []
+    def available_models(cls) -> List[Dict[str, Any]]:
+        """Build the ``/v1/models`` data list from registered backends.
+
+        Keeps the original ``id``/``object``/``owned_by`` fields for
+        compatibility and adds ``backend`` plus a ``capabilities`` map
+        (``image_input`` is always present).
+        """
+        data: List[Dict[str, Any]] = []
 
         for desc in cls._descriptors.values():
             if cls.is_registered(desc.name):
                 for model_id in desc.models:
-                    data.append({"id": model_id, "object": "model", "owned_by": desc.owned_by})
+                    data.append(
+                        {
+                            "id": model_id,
+                            "object": "model",
+                            "owned_by": desc.owned_by,
+                            "backend": desc.name,
+                            "capabilities": {"image_input": False, **desc.capabilities},
+                        }
+                    )
 
         return data

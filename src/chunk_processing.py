@@ -92,6 +92,54 @@ def extract_stream_event_delta(chunk: Dict[str, Any], in_thinking: bool = False)
     return None, in_thinking
 
 
+def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
+    """Extract the status string from a rate_limit chunk.
+
+    ``rate_limit_info`` may be a plain dict (in tests) or an SDK
+    ``RateLimitInfo`` dataclass (at runtime).  Handle both.
+    """
+    info = chunk.get("rate_limit_info")
+    if info is None:
+        return "unknown"
+    if isinstance(info, dict):
+        return info.get("status", "unknown")
+    return getattr(info, "status", "unknown")
+
+
+def classify_error_chunk(chunk: Any) -> Optional[Dict[str, str]]:
+    """Classify a chunk as a terminal backend error, or return ``None``.
+
+    Single source of truth for the error semantics shared by the streaming
+    loop (``streaming_utils.stream_response_chunks``) and the non-streaming
+    collection paths in ``src.routes.responses``.  Recognizes:
+
+    * SDK in-band error chunks (``is_error``) → code ``sdk_error``
+    * ``AssistantMessage.error`` (auth failures, rate limits, billing, …) —
+      the SDK error type becomes the code
+    * ``rate_limit`` events with status ``rejected`` → code ``rate_limit``
+
+    Returns ``{"code": ..., "message": ...}`` matching the ``error`` field of
+    the streaming path's ``response.failed`` event.  Informational chunks
+    (e.g. non-rejected rate_limit events) and non-dicts return ``None``.
+    """
+    if not isinstance(chunk, dict):
+        return None
+    if chunk.get("is_error"):
+        return {
+            "code": "sdk_error",
+            "message": chunk.get("error_message", "Unknown SDK error"),
+        }
+    if chunk.get("type") == "assistant" and chunk.get("error"):
+        error_type = chunk["error"]
+        return {"code": error_type, "message": f"Claude error: {error_type}"}
+    if (
+        chunk.get("type") == "rate_limit"
+        and _extract_rate_limit_status(chunk) == "rejected"
+    ):
+        return {"code": "rate_limit", "message": "Rate limit rejected"}
+    return None
+
+
 def is_assistant_content_chunk(chunk: Dict[str, Any]) -> bool:
     """Return True for assistant chunks, including the SDK's untyped content-list shape."""
     chunk_type = chunk.get("type")

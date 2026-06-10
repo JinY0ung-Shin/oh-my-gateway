@@ -31,6 +31,9 @@ OPENCODE_DESCRIPTOR = BackendDescriptor(
     owned_by="opencode",
     models=configured_public_models(),
     resolve_fn=_opencode_resolve,
+    # OpenCode accepts multimodal input via its own message parts (see
+    # validate_image_request in src/routes/deps.py).
+    capabilities={"image_input": True},
 )
 
 

@@ -7,6 +7,7 @@ from src.constants import (
     SSE_KEEPALIVE_INTERVAL,
     STREAM_TOOL_PROGRESS,
     SUBAGENT_STREAM_PROGRESS,
+    SUBAGENT_STREAM_TEXT,
     SUBAGENT_STREAM_TOOL_BLOCKS,
 )
 from src.message_adapter import MessageAdapter
@@ -38,9 +39,11 @@ from src.sse_builders import (  # noqa: F401
     make_tool_use_started_response_sse,
 )
 from src.chunk_processing import (  # noqa: F401
+    _extract_rate_limit_status,
     _extract_tool_blocks,
     _filter_tool_blocks,
     ToolUseAccumulator,
+    classify_error_chunk,
     extract_embedded_tool_blocks,
     extract_stream_event_delta,
     extract_user_tool_results,
@@ -227,6 +230,22 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     return None
 
 
+def extract_structured_output(chunks: list) -> Any:
+    """Return ``ResultMessage.structured_output`` from SDK chunks, if present.
+
+    Mirrors ``extract_sdk_usage``: when the session was created with
+    ``output_format={"type": "json_schema", ...}``, the Claude SDK attaches
+    the parsed structured-output payload to the final ResultMessage.
+    Returns ``None`` when no result chunk carries it.
+    """
+    for msg in reversed(chunks):
+        if isinstance(msg, dict) and msg.get("type") == "result":
+            value = msg.get("structured_output")
+            if value is not None:
+                return value
+    return None
+
+
 def extract_thinking_texts(chunks: list) -> list[str]:
     """Return thinking-block texts in the order they appear in the chunk list.
 
@@ -328,20 +347,6 @@ def resolve_token_usage(
         est = backend.estimate_token_usage(prompt, completion_text, model)
         return est["prompt_tokens"], est["completion_tokens"]
     return MessageAdapter.estimate_tokens(prompt), MessageAdapter.estimate_tokens(completion_text)
-
-
-def _extract_rate_limit_status(chunk: Dict[str, Any]) -> str:
-    """Extract the status string from a rate_limit chunk.
-
-    ``rate_limit_info`` may be a plain dict (in tests) or an SDK
-    ``RateLimitInfo`` dataclass (at runtime).  Handle both.
-    """
-    info = chunk.get("rate_limit_info")
-    if info is None:
-        return "unknown"
-    if isinstance(info, dict):
-        return info.get("status", "unknown")
-    return getattr(info, "status", "unknown")
 
 
 # ---------------------------------------------------------------------------
@@ -705,6 +710,9 @@ async def stream_response_chunks(
     # source of truth for the complete assistant text handed back to the route.
     all_visible_text: list[str] = []
     seq = 0
+    # Index of the next text annotation (citation) within the open message
+    # item's content part.  Reset whenever a message item closes.
+    annotation_index = 0
     message_item_opened = False
     # True once *any* message output item has been opened (never reset), so
     # finalization can tell "thinking-only response" (needs a trailing empty
@@ -908,7 +916,7 @@ async def stream_response_chunks(
         block being dropped because reasoning can't reopen after text started.
         """
         nonlocal message_item_opened, full_text, output_index, output_item_id
-        nonlocal content_sent
+        nonlocal content_sent, annotation_index
         if not message_item_opened:
             return []
         lines: list[str] = []
@@ -956,6 +964,7 @@ async def stream_response_chunks(
         completed_output_items.append(item)
         message_item_opened = False
         full_text = []
+        annotation_index = 0
         output_index += 1
         output_item_id = _generate_msg_id()
         return lines
@@ -969,46 +978,34 @@ async def stream_response_chunks(
                 yield _SSE_KEEPALIVE
                 continue
 
-            # Detect SDK in-band error chunks
-            if isinstance(chunk, dict) and chunk.get("is_error"):
-                error_msg = chunk.get("error_message", "Unknown SDK error")
+            # Detect terminal error chunks: SDK in-band errors (is_error),
+            # AssistantMessage.error (auth failures, rate limits, etc.) and
+            # rejected SDK rate-limit events.  Classification is shared with
+            # the non-streaming collection paths (classify_error_chunk) so
+            # both report identical failure semantics.
+            error_info = classify_error_chunk(chunk)
+            if error_info is not None:
+                if chunk.get("type") == "assistant":
+                    chunks_buffer.append(chunk)
                 logger.error(
-                    "Responses stream: SDK error chunk: %s | chunk=%r | prior_chunks=%r | %s",
-                    error_msg,
+                    "Responses stream: %s (code=%s) | chunk=%r | prior_chunks=%r | %s",
+                    error_info["message"],
+                    error_info["code"],
                     _chunk_summary(chunk),
                     _buffer_summary(chunks_buffer),
                     _error_context(),
                 )
                 stream_result["success"] = False
-                yield _make_failed_event("sdk_error", error_msg)
-                await _log_usage("failed", "sdk_error")
+                yield _make_failed_event(error_info["code"], error_info["message"])
+                await _log_usage("failed", error_info["code"])
                 return
 
-            # Handle AssistantMessage.error (auth failures, rate limits, etc.)
-            if chunk.get("type") == "assistant" and chunk.get("error"):
-                error_type = chunk["error"]
-                logger.error(
-                    "Responses stream: assistant error: %s | chunk=%r | prior_chunks=%r | %s",
-                    error_type,
-                    _chunk_summary(chunk),
-                    _buffer_summary(chunks_buffer),
-                    _error_context(),
-                )
-                chunks_buffer.append(chunk)
-                stream_result["success"] = False
-                yield _make_failed_event(error_type, f"Claude error: {error_type}")
-                await _log_usage("failed", error_type)
-                return
-
-            # Handle SDK rate-limit events (new in SDK 0.1.49)
+            # Non-rejected SDK rate-limit events (new in SDK 0.1.49) are
+            # informational only — rejected ones fail above.
             if chunk.get("type") == "rate_limit":
-                status = _extract_rate_limit_status(chunk)
-                logger.warning("SDK rate limit event: status=%s", status)
-                if status == "rejected":
-                    stream_result["success"] = False
-                    yield _make_failed_event("rate_limit", "Rate limit rejected")
-                    await _log_usage("failed", "rate_limit")
-                    return
+                logger.warning(
+                    "SDK rate limit event: status=%s", _extract_rate_limit_status(chunk)
+                )
                 continue
 
             # Handle task system messages (structured JSON, not content)
@@ -1041,6 +1038,27 @@ async def stream_response_chunks(
             was_thinking = in_thinking
             event = chunk.get("event", {}) if chunk.get("type") == "stream_event" else {}
             delta = event.get("delta", {}) if isinstance(event, dict) else {}
+
+            # Citations attached to streamed text (SDK ``citations_delta``)
+            # map to OpenAI Responses annotation events.  Pass-through: the
+            # raw citation dict becomes the annotation, untransformed.
+            if delta.get("type") == "citations_delta":
+                if chunk.get("parent_tool_use_id") is None or SUBAGENT_STREAM_TEXT:
+                    if not message_item_opened:
+                        for line in _open_message_item():
+                            yield line
+                    yield make_response_sse(
+                        "response.output_text.annotation.added",
+                        item_id=output_item_id,
+                        output_index=output_index,
+                        content_index=0,
+                        annotation_index=annotation_index,
+                        annotation=delta.get("citation") or {},
+                        sequence_number=_next_seq(),
+                    )
+                    annotation_index += 1
+                continue
+
             if delta.get("type") == "thinking_delta" and not in_thinking:
                 logger.warning(
                     "Responses stream received thinking_delta outside a thinking block: "
@@ -1278,6 +1296,7 @@ async def stream_response_chunks(
             output_tokens=completion_tokens,
         ),
         metadata=_metadata,
+        structured_output=extract_structured_output(chunks_buffer),
     )
     stream_result["success"] = True
     stream_result["assistant_text"] = complete_text

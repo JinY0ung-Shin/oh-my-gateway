@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml>=6.0",
     "sqlalchemy[asyncio]>=2.0.0",
     "aiomysql>=0.2.0",
+    "prometheus-client>=0.25.0",
 ]
 
 [dependency-groups]

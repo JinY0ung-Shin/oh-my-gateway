@@ -34,6 +34,9 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     owned_by="anthropic",
     models=list(CLAUDE_MODELS),
     resolve_fn=_claude_resolve,
+    # Image input is supported via the client's image_handler (see
+    # validate_image_request in src/routes/deps.py).
+    capabilities={"image_input": True},
 )
 
 

@@ -31,6 +31,9 @@ CODEX_DESCRIPTOR = BackendDescriptor(
     owned_by="openai",
     models=configured_public_models(),
     resolve_fn=_codex_resolve,
+    # Codex accepts multimodal input natively via turn input items (see
+    # validate_image_request in src/routes/deps.py).
+    capabilities={"image_input": True},
 )
 
 

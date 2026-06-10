@@ -301,10 +301,26 @@ class UsageLogger:
         Returns silently when the logger is disabled, when the request has
         no ``user`` identifier, or when the turn metadata is incomplete -
         the caller doesn't need to pre-check.
+
+        Prometheus token counters are recorded unconditionally (before the
+        early returns) so metrics work even when DB logging is disabled.
         """
+        ctx = request_context or {}
+        usage = extract_sdk_usage_detail(chunks)
+
+        try:
+            from src.metrics import record_token_usage
+
+            record_token_usage(
+                backend=ctx.get("backend"),
+                model=model or ctx.get("provider_model"),
+                usage=usage,
+            )
+        except Exception:  # pragma: no cover - metrics must never break the turn
+            logger.debug("Prometheus token metrics recording failed", exc_info=True)
+
         if self._engine is None:
             return
-        ctx = request_context or {}
         user = ctx.get("user") or ""
         if not user:
             return
@@ -313,7 +329,6 @@ class UsageLogger:
         if not session_id or turn is None or not response_id:
             return
 
-        usage = extract_sdk_usage_detail(chunks)
         ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         duration_ms = int((time.monotonic() - started_monotonic) * 1000)
 

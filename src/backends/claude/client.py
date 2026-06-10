@@ -703,12 +703,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         model_params: Optional[Dict[str, Any]] = None,
+        output_format: Optional[Dict[str, Any]] = None,
         _custom_base: object = _UNSET,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
         The client is connected with ``prompt=None`` (interactive mode)
         so subsequent turns can be sent via ``client.query()``.
+
+        ``output_format`` is the SDK structured-output config
+        (``{"type": "json_schema", "schema": {...}}``); it is baked into the
+        session at create time and cannot be changed on later turns.
 
         ``_custom_base`` follows the same contract as ``run_completion``:
         when provided, the caller is responsible for having already resolved
@@ -731,6 +736,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             session_id=None if has_history else session.session_id,
             resume=session.session_id if has_history else None,
             permission_mode=permission_mode,
+            output_format=output_format,
             mcp_servers=mcp_servers,
             task_budget=task_budget,
             cwd=Path(cwd) if cwd else None,

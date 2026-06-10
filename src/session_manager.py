@@ -180,6 +180,15 @@ class Session:
     pending_tool_call: Optional[Dict[str, Any]] = None
     stream_break_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
 
+    # Per-turn stored ResponseObject payloads, keyed by 1-based turn number.
+    # Populated by the responses route at turn-commit time and served by
+    # ``GET /v1/responses/{response_id}``. Turns created with ``store=false``
+    # are never recorded, and sessions rehydrated from the on-disk jsonl
+    # transcript start empty (only the turn counter survives rehydration).
+    turn_records: Dict[int, Dict[str, Any]] = field(
+        default_factory=dict, repr=False, compare=False
+    )
+
     def __post_init__(self) -> None:
         self.created_at = _ensure_utc(self.created_at)
         self.last_accessed = _ensure_utc(self.last_accessed)
@@ -202,6 +211,14 @@ class Session:
     def get_all_messages(self) -> List[Message]:
         """Return a shallow copy of the session's message list."""
         return list(self.messages)
+
+    def record_turn_response(self, turn: int, payload: Dict[str, Any]) -> None:
+        """Store the response payload for *turn* (``GET /v1/responses/{id}``)."""
+        self.turn_records[turn] = payload
+
+    def get_turn_response(self, turn: int) -> Optional[Dict[str, Any]]:
+        """Return the stored response payload for *turn*, or ``None``."""
+        return self.turn_records.get(turn)
 
     def is_expired(self) -> bool:
         """Check if the session has expired."""
