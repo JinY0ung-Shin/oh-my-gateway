@@ -891,10 +891,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     parse_claude_message = parse_message
 
     def _cleanup_temp_dir(self):
-        """Clean up temporary directory on exit."""
+        """Best-effort removal of the temporary workspace at process exit.
+
+        Registered as an ``atexit`` handler (see ``__init__``). It runs when
+        logging streams may already be torn down — under pytest the capture
+        handlers are closed before atexit fires, and ``sys.is_finalizing()`` is
+        still ``False`` there, so the timing can't be guarded reliably. It
+        therefore performs **no logging**: a stray log call would surface as a
+        noisy ``ValueError: I/O operation on closed file`` traceback. The
+        workspace is already logged at construction time. The handler
+        unregisters itself afterwards so repeated client churn never
+        accumulates stale callbacks and a redundant second call is a no-op.
+        """
         if self.temp_dir and os.path.exists(self.temp_dir):
-            try:
+            with contextlib.suppress(Exception):
                 shutil.rmtree(self.temp_dir)
-                logger.info(f"Cleaned up temporary workspace: {self.temp_dir}")
-            except Exception as e:
-                logger.warning(f"Failed to clean up temp directory {self.temp_dir}: {e}")
+        with contextlib.suppress(Exception):
+            atexit.unregister(self._cleanup_temp_dir)

@@ -163,6 +163,49 @@ class TestSweepOrphanTempWorkspaces:
         mgr = WorkspaceManager(base_path=tmp_base / "does-not-exist")
         assert mgr.sweep_orphan_temp_workspaces(max_age_seconds=0) == 0
 
+    def test_returns_zero_when_listing_base_path_raises(self, manager):
+        """An unreadable base directory (iterdir raising OSError) is tolerated:
+        the sweep reports zero removals instead of crashing startup."""
+        manager.base_path.mkdir(parents=True, exist_ok=True)
+        with patch.object(Path, "iterdir", side_effect=OSError("permission denied")):
+            assert manager.sweep_orphan_temp_workspaces(max_age_seconds=0) == 0
+
+    def test_skips_child_whose_stat_raises(self, manager):
+        """A _tmp_ child that vanishes or is unreadable between listing and
+        stat() is skipped, not removed and not fatal."""
+        child = manager.resolve(None)
+        assert child.name.startswith("_tmp_")
+
+        real_stat = Path.stat
+
+        def _selective_stat(self, *args, **kwargs):
+            if self.name.startswith("_tmp_"):
+                raise OSError("stat failed")
+            return real_stat(self, *args, **kwargs)
+
+        with patch.object(Path, "stat", _selective_stat):
+            removed = manager.sweep_orphan_temp_workspaces(max_age_seconds=0)
+
+        assert removed == 0
+        assert child.exists()
+
+
+class TestResolveBasePath:
+    def test_uses_user_workspaces_dir_when_set(self):
+        from src import workspace_manager as wm
+
+        with patch.object(wm, "USER_WORKSPACES_DIR", "/srv/workspaces"):
+            assert wm._resolve_base_path() == Path("/srv/workspaces")
+
+    def test_falls_back_to_stable_temp_dir_when_unset(self):
+        import tempfile
+
+        from src import workspace_manager as wm
+
+        with patch.object(wm, "USER_WORKSPACES_DIR", ""):
+            expected = Path(tempfile.gettempdir()) / "oh-my-gateway-workspaces"
+            assert wm._resolve_base_path() == expected
+
 
 class TestSessionUserField:
     def test_session_has_user_field(self):

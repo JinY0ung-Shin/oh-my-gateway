@@ -5,6 +5,9 @@ Unit tests for src/mcp_config.py
 
 import json
 from unittest.mock import patch
+
+import pytest
+
 from src.mcp_config import load_mcp_config, get_mcp_servers, get_mcp_tool_patterns
 
 
@@ -273,3 +276,74 @@ class TestOpenCodeConfigGeneration:
             assert "OPENCODE_CONFIG_CONTENT is not valid JSON" in str(exc)
         else:
             raise AssertionError("expected ValueError")
+
+    def test_parse_opencode_config_content_rejects_non_object_json(self):
+        """Valid JSON that is not an object (e.g. a list) is rejected."""
+        from src.backends.opencode.config import parse_opencode_config_content
+
+        with pytest.raises(ValueError, match="must be a JSON object"):
+            parse_opencode_config_content("[1, 2, 3]")
+
+    def test_build_opencode_config_rejects_stdio_server_missing_command(self):
+        """A local (stdio) MCP server without a 'command' is a config error."""
+        from src.backends.opencode.config import build_opencode_config
+
+        with pytest.raises(ValueError, match="missing required 'command'"):
+            build_opencode_config(
+                base_config={},
+                mcp_servers={"broken": {"type": "stdio", "args": ["x"]}},
+                default_model="openai/gpt-5.5",
+                question_permission="ask",
+            )
+
+    def test_build_opencode_config_rejects_remote_server_missing_url(self):
+        """A remote (streamable-http) MCP server without a 'url' is a config error."""
+        from src.backends.opencode.config import build_opencode_config
+
+        with pytest.raises(ValueError, match="missing required 'url'"):
+            build_opencode_config(
+                base_config={},
+                mcp_servers={"broken": {"type": "streamable-http"}},
+                default_model="openai/gpt-5.5",
+                question_permission="ask",
+            )
+
+    def test_build_opencode_config_rejects_unsupported_server_type(self):
+        """An MCP server type that is neither stdio nor a known remote type errors."""
+        from src.backends.opencode.config import build_opencode_config
+
+        with pytest.raises(ValueError, match="Unsupported MCP server type"):
+            build_opencode_config(
+                base_config={},
+                mcp_servers={"weird": {"type": "carrier-pigeon", "command": "fly"}},
+                default_model="openai/gpt-5.5",
+                question_permission="ask",
+            )
+
+    def test_build_opencode_config_accepts_list_command(self):
+        """A stdio server may specify 'command' as a list; it is flattened with args."""
+        from src.backends.opencode.config import build_opencode_config
+
+        config = build_opencode_config(
+            base_config={},
+            mcp_servers={
+                "fs": {"type": "stdio", "command": ["npx", "server"], "args": ["/ws"]}
+            },
+            default_model="openai/gpt-5.5",
+            question_permission="ask",
+        )
+
+        assert config["mcp"]["fs"]["command"] == ["npx", "server", "/ws"]
+
+    def test_parse_opencode_config_content_empty_returns_empty_dict(self):
+        from src.backends.opencode.config import parse_opencode_config_content
+
+        assert parse_opencode_config_content(None) == {}
+        assert parse_opencode_config_content("") == {}
+
+    def test_parse_opencode_config_content_returns_parsed_object(self):
+        from src.backends.opencode.config import parse_opencode_config_content
+
+        assert parse_opencode_config_content('{"share": "disabled"}') == {
+            "share": "disabled"
+        }
