@@ -34,4 +34,4 @@ uv run pytest --cov=src                            # with coverage
 - `pytest-asyncio` uses `asyncio_mode = "auto"`; do not add `@pytest.mark.asyncio` unless a test specifically needs it.
 - Mock SDK calls in tests and prefer the shared fixtures in `tests/conftest.py`.
 - Markers: `integration` (real subprocess with mock binary), `slow`, `e2e` (needs live server + credentials; excluded by default).
-- `claude-agent-sdk` is pinned exactly (`==0.2.90`); upgrades are deliberate, gap-analyzed events — do not bump casually.
+- `claude-agent-sdk`  is pinned exactly (`==0.2.90`); upgrades are deliberate, gap-analyzed events — do not bump casually.
