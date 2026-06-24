@@ -50,6 +50,10 @@ from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns
 from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
+from src.backends.claude.workspace_sandbox import (
+    make_workspace_sandbox_hook,
+    sandbox_enabled,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -221,14 +225,22 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         * ``None`` (env unset) — do **not** set ``options.sandbox`` at all,
           allowing project-level settings (``setting_sources=["project"]``)
-          to take effect.
+          to take effect. As a defense-in-depth backstop, if the per-workspace
+          sandbox is enabled (``WORKSPACE_SANDBOX_ENABLED``) the OS-level bash
+          sandbox is force-enabled here so runtime shell expansions the
+          PreToolUse hook cannot resolve statically are still confined.
         * ``True`` — force-enable sandbox with env-configured parameters.
-        * ``False`` — force-disable sandbox explicitly.
+        * ``False`` — force-disable sandbox explicitly (honored even when the
+          workspace sandbox is on).
         """
-        if CLAUDE_SANDBOX_ENABLED is None:
+        effective_enabled = CLAUDE_SANDBOX_ENABLED
+        if effective_enabled is None and sandbox_enabled():
+            effective_enabled = True
+
+        if effective_enabled is None:
             return  # Respect project-level settings
 
-        if not CLAUDE_SANDBOX_ENABLED:
+        if not effective_enabled:
             options.sandbox = SandboxSettings(enabled=False)
             return
 
@@ -743,14 +755,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             extra_env=extra_env,
             _custom_base=_custom_base,
         )
-        options.hooks = {
-            "PreToolUse": [
+        pre_tool_use = [
+            HookMatcher(
+                matcher="AskUserQuestion",
+                hooks=[self._make_ask_user_hook(session)],
+            )
+        ]
+        if cwd and sandbox_enabled():
+            pre_tool_use.append(
                 HookMatcher(
-                    matcher="AskUserQuestion",
-                    hooks=[self._make_ask_user_hook(session)],
+                    matcher="",
+                    hooks=[make_workspace_sandbox_hook(Path(cwd))],
                 )
-            ]
-        }
+            )
+        options.hooks = {"PreToolUse": pre_tool_use}
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
