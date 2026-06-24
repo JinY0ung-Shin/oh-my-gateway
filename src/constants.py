@@ -6,6 +6,7 @@ Backend-specific constants live in ``src/backends/<name>/constants.py``.
 All configurable values can be overridden via environment variables.
 """
 
+import fnmatch
 import os
 from dotenv import dotenv_values, load_dotenv
 
@@ -151,3 +152,28 @@ ASK_USER_TIMEOUT_SECONDS = parse_int_env("ASK_USER_TIMEOUT_SECONDS", 300)
 # Debug / Verbose mode — single source of truth
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")
+
+# ---------------------------------------------------------------------------
+# Vision capability gating (text-only model denylist)
+# ---------------------------------------------------------------------------
+# With LiteLLM (or any multi-model proxy) behind one Anthropic endpoint, a
+# single backend can route to models that lack vision. Image input sent to a
+# text-only model otherwise fails late at the upstream (or is silently dropped
+# under drop_params). List text-only models here to reject image input for
+# them up front with a 400. Comma-separated, fnmatch globs, case-insensitive;
+# matched against the resolved provider_model first, then the public model.
+# Default empty = no model is gated (current behavior preserved).
+# Example: TEXT_ONLY_MODELS=o1-mini,deepseek-*,gpt-4o-mini-tts
+def is_text_only_model(model: str | None) -> bool:
+    """True when *model* matches a configured ``TEXT_ONLY_MODELS`` pattern.
+
+    Read from the environment on each call so runtime/test overrides take
+    effect without a module reload.
+    """
+    if not model:
+        return False
+    patterns = [m.strip() for m in os.getenv("TEXT_ONLY_MODELS", "").split(",") if m.strip()]
+    if not patterns:
+        return False
+    name = model.lower()
+    return any(fnmatch.fnmatch(name, p.lower()) for p in patterns)

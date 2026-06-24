@@ -11,9 +11,12 @@ from fastapi.testclient import TestClient
 import src.main as main
 import src.routes.responses as responses_module
 from src.backend_registry import BackendRegistry
+from src.backends import ResolvedModel
+from src.constants import is_text_only_model
 from src.routes.deps import (
     request_has_images as _request_has_images,
     validate_image_request as _validate_image_request,
+    validate_model_vision_support as _validate_model_vision_support,
     truncate_image_data as _truncate_image_data,
 )
 
@@ -271,6 +274,104 @@ class TestResponsesImageErrors:
 
         assert response.status_code == 400
         assert "Malformed image base64 payload" in response.json()["error"]["message"]
+
+
+# ===========================================================================
+# Vision capability gating (text-only model denylist)
+# ===========================================================================
+
+
+class TestIsTextOnlyModel:
+    """Tests for is_text_only_model() helper (TEXT_ONLY_MODELS denylist)."""
+
+    def test_empty_denylist_gates_nothing(self, monkeypatch):
+        monkeypatch.delenv("TEXT_ONLY_MODELS", raising=False)
+        assert is_text_only_model("o1-mini") is False
+
+    def test_exact_match(self, monkeypatch):
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "o1-mini,deepseek-chat")
+        assert is_text_only_model("o1-mini") is True
+        assert is_text_only_model("gpt-4o") is False
+
+    def test_glob_and_case_insensitive(self, monkeypatch):
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "deepseek-*")
+        assert is_text_only_model("DeepSeek-Chat") is True
+        assert is_text_only_model("deepseek-reasoner") is True
+        assert is_text_only_model("claude-sonnet") is False
+
+    def test_none_model(self, monkeypatch):
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "*")
+        assert is_text_only_model(None) is False
+
+
+class TestValidateModelVisionSupport:
+    """Tests for validate_model_vision_support() per-model gate."""
+
+    def _image_request(self):
+        return _FakeRequest(
+            input=[
+                {"role": "user", "content": [{"type": "input_image", "image_url": DATA_URL}]}
+            ]
+        )
+
+    def test_text_only_model_with_image_rejected(self, monkeypatch):
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "o1-mini")
+        resolved = ResolvedModel(public_model="o1-mini", backend="claude", provider_model="o1-mini")
+
+        with pytest.raises(HTTPException) as exc_info:
+            _validate_model_vision_support(self._image_request(), resolved)
+
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["error"]["code"] == "unsupported_image_input"
+        assert "does not support image inputs" in exc_info.value.detail["error"]["message"]
+
+    def test_provider_model_takes_precedence(self, monkeypatch):
+        """The model the upstream sees (provider_model) is matched first."""
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "litellm-text-only")
+        resolved = ResolvedModel(
+            public_model="my-alias", backend="claude", provider_model="litellm-text-only"
+        )
+        with pytest.raises(HTTPException):
+            _validate_model_vision_support(self._image_request(), resolved)
+
+    def test_vision_model_with_image_passes(self, monkeypatch):
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "o1-mini")
+        resolved = ResolvedModel(public_model="sonnet", backend="claude", provider_model="sonnet")
+        # Should not raise
+        _validate_model_vision_support(self._image_request(), resolved)
+
+    def test_text_only_model_without_image_passes(self, monkeypatch):
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "o1-mini")
+        resolved = ResolvedModel(public_model="o1-mini", backend="claude", provider_model="o1-mini")
+        text_req = _FakeRequest(
+            input=[{"role": "user", "content": [{"type": "input_text", "text": "hi"}]}]
+        )
+        # No image -> gate is a no-op even for a text-only model
+        _validate_model_vision_support(text_req, resolved)
+
+
+class TestResponsesVisionGateEndpoint:
+    def test_create_response_rejects_image_for_text_only_model(self, monkeypatch):
+        # "sonnet" resolves to provider_model "sonnet"; list it to exercise the gate.
+        monkeypatch.setenv("TEXT_ONLY_MODELS", "sonnet")
+        with client_context() as (client, _mock_cli):
+            response = client.post(
+                "/v1/responses",
+                json={
+                    "model": "sonnet",
+                    "input": [
+                        {
+                            "role": "user",
+                            "content": [{"type": "input_image", "image_url": DATA_URL}],
+                        }
+                    ],
+                },
+            )
+
+        assert response.status_code == 400
+        body = response.json()
+        assert body["error"]["code"] == "unsupported_image_input"
+        assert "does not support image inputs" in body["error"]["message"]
 
 
 # ===========================================================================

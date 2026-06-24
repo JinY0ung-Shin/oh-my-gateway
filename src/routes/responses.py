@@ -52,6 +52,7 @@ from src.routes.deps import (
     resolve_and_get_backend,
     validate_backend_auth_or_raise,
     validate_image_request,
+    validate_model_vision_support,
 )
 
 logger = logging.getLogger(__name__)
@@ -1310,6 +1311,7 @@ async def create_response(
     )
     validate_backend_auth_or_raise(resolved.backend)
     validate_image_request(body, backend)
+    validate_model_vision_support(body, resolved)
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
     is_new_session = body.previous_response_id is None

@@ -97,6 +97,36 @@ def validate_image_request(request: Any, backend: BackendClient) -> None:
         )
 
 
+def validate_model_vision_support(request: Any, resolved: ResolvedModel) -> None:
+    """Reject image input when the resolved model is text-only.
+
+    Backend-level image capability (``validate_image_request``) can't express
+    per-model vision support when LiteLLM (or any proxy) multiplexes many
+    models behind one Anthropic endpoint. If the request carries images and
+    the resolved model matches a configured ``TEXT_ONLY_MODELS`` pattern, fail
+    fast with an OpenAI-style 400 instead of letting the image reach a model
+    that can't see it (late upstream error / silent drop under drop_params).
+    """
+    if not request_has_images(request):
+        return
+
+    # Prefer the model the upstream actually sees; fall back to the public id.
+    from src.constants import is_text_only_model
+
+    model = resolved.provider_model or resolved.public_model
+    if is_text_only_model(model):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "unsupported_image_input",
+                    "message": f"Model '{model}' does not support image inputs.",
+                }
+            },
+        )
+
+
 def truncate_image_data(obj: Any) -> Any:
     """Deep-copy and truncate base64 image data for safe logging."""
     if isinstance(obj, dict):
