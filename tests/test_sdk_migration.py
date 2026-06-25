@@ -369,7 +369,10 @@ class TestSkillsOptionMigration:
         )
 
         assert "Skill" not in (options.allowed_tools or [])
-        assert "mcp__fs__*" in (options.allowed_tools or [])
+        # The default-allowlist path allows all MCP tools via ``mcp__*`` (which
+        # subsumes ``mcp__fs__*``) so plugin-bundled MCP servers loaded via
+        # setting_sources are not locked out when MCP_CONFIG is set.
+        assert "mcp__*" in (options.allowed_tools or [])
         assert getattr(options, "skills", None) == "all"
 
 

@@ -322,11 +322,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             return
 
         options.mcp_servers = mcp_servers
-        mcp_patterns = get_mcp_tool_patterns(mcp_servers)
         if not options.allowed_tools:
             self._set_allowed_tools(options, list(DEFAULT_ALLOWED_TOOLS))
-        options.allowed_tools.extend(mcp_patterns)
-        logger.debug(f"MCP tools enabled: {mcp_patterns}")
+        # The caller passed no allowed_tools, so the gateway is choosing the
+        # default surface here. Allow *all* MCP tools rather than only the
+        # MCP_CONFIG servers' patterns: the SDK also loads plugin-bundled MCP
+        # servers via setting_sources, and pinning a narrow allowlist would
+        # silently lock those out the moment MCP_CONFIG is set. The CLI treats
+        # ``mcp__*`` as "every MCP tool" (covering MCP_CONFIG and plugin
+        # servers alike), so configuring MCP_CONFIG no longer narrows the MCP
+        # surface. Callers who pass an explicit allowed_tools take the branch
+        # above and keep full control.
+        if "mcp__*" not in options.allowed_tools:
+            options.allowed_tools.append("mcp__*")
+        logger.debug("MCP tools enabled (mcp__*); servers=%s", list(mcp_servers))
 
     def _configure_session_identity(
         self,

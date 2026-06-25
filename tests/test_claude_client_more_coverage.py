@@ -201,6 +201,40 @@ class TestClaudeCodeCLIConfigureMcpServers:
         assert options.mcp_servers is not None
         assert "my-server" in options.mcp_servers
 
+    def test_no_allowed_tools_allows_all_mcp_tools_for_plugins(self):
+        """Without caller allowed_tools, MCP_CONFIG pins a default allowlist that
+        must not lock out plugin-bundled MCP servers the SDK loads via
+        setting_sources. The CLI treats ``mcp__*`` as "every MCP tool", so the
+        gateway adds it rather than only the MCP_CONFIG servers' narrow patterns.
+        """
+        cli = _make_cli()
+        options = self._fresh_options()
+        mcp_servers = {
+            "srv1": {"type": "stdio", "command": "s1"},
+        }
+
+        cli._configure_mcp_servers(options, mcp_servers, None)
+
+        # MCP_CONFIG servers are forwarded, and the allowlist is broadened to
+        # all MCP tools so a plugin server like ``mcp__some_plugin__*`` is not
+        # silently blocked just because MCP_CONFIG was set.
+        assert options.mcp_servers == mcp_servers
+        assert "mcp__*" in options.allowed_tools
+
+    def test_explicit_allowed_tools_not_broadened_to_all_mcp(self):
+        """A caller that passes explicit allowed_tools keeps full control: the
+        gateway must NOT inject ``mcp__*`` and re-enable every MCP tool behind
+        their back."""
+        cli = _make_cli()
+        options = self._fresh_options()
+        options.allowed_tools = ["mcp__my_server__*"]
+
+        mcp_servers = {"my-server": {"type": "stdio", "command": "myserver"}}
+
+        cli._configure_mcp_servers(options, mcp_servers, ["mcp__my_server__*"])
+
+        assert "mcp__*" not in options.allowed_tools
+
 
 # ---------------------------------------------------------------------------
 # ClaudeCodeCLI._configure_metadata_env() — lines 346-350
