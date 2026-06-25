@@ -242,6 +242,68 @@ class TestAllowOutside:
         ) == {}
 
 
+class TestHomeClaudeRoot:
+    """The Claude Code SDK's own ``$HOME/.claude`` state dir is always allowed
+    (issue #115), while the rest of ``$HOME`` stays denied."""
+
+    @pytest.fixture
+    def home(self, tmp_path: Path, monkeypatch) -> Path:
+        home = tmp_path / "home" / "app"
+        (home / ".claude" / "projects").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        return home
+
+    async def test_bash_home_claude_tilde_allowed(self, workspace, home):
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(
+            hook, "Bash", {"command": "cat ~/.claude/projects/x/tool-results/y.json"}
+        )
+        assert result == {}
+
+    async def test_bash_home_claude_absolute_allowed(self, workspace, home):
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(
+            hook, "Bash", {"command": f"cat {home}/.claude/projects/x/y.json"}
+        )
+        assert result == {}
+
+    async def test_read_home_claude_allowed(self, workspace, home):
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(
+            hook, "Read", {"file_path": str(home / ".claude" / "state.json")}
+        )
+        assert result == {}
+
+    async def test_other_home_paths_still_denied(self, workspace, home):
+        # Only $HOME/.claude is added, not all of $HOME — ~/.ssh stays denied.
+        hook = make_workspace_sandbox_hook(workspace)
+        assert _is_deny(await _call(hook, "Bash", {"command": "cat ~/.ssh/id_rsa"}))
+        bad = await _call(hook, "Read", {"file_path": str(home / ".ssh" / "id_rsa")})
+        assert _is_deny(bad)
+
+    async def test_other_workspace_still_denied(
+        self, workspace, other_workspace, home
+    ):
+        hook = make_workspace_sandbox_hook(workspace)
+        bad_read = await _call(
+            hook, "Read", {"file_path": str(other_workspace / "CLAUDE.md")}
+        )
+        assert _is_deny(bad_read)
+        bad_bash = await _call(
+            hook, "Bash", {"command": f"cat {other_workspace}/CLAUDE.md"}
+        )
+        assert _is_deny(bad_bash)
+
+    async def test_no_home_keeps_claude_denied(self, workspace, monkeypatch):
+        # With $HOME unset there is no extra root, so ~/.claude is not special.
+        monkeypatch.delenv("HOME", raising=False)
+        hook = make_workspace_sandbox_hook(workspace)
+        result = await _call(
+            hook, "Bash", {"command": "cat ~/.claude/projects/x/y.json"}
+        )
+        assert _is_deny(result)
+
+
 class TestUnknownTool:
     async def test_unknown_tool_passes_through(self, workspace):
         hook = make_workspace_sandbox_hook(workspace)
