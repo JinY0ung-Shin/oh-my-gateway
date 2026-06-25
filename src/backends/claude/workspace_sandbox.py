@@ -69,24 +69,46 @@ def _allow_outside() -> Set[str]:
     return entries & _VALID_CATEGORIES
 
 
-def _resolve_within(root: Path, candidate: str) -> Optional[Path]:
-    """Return the resolved path if it lies inside *root*, else ``None``.
+def _resolve_within_any(roots: list[Path], candidate: str) -> Optional[Path]:
+    """Return the resolved path if it lies inside any of *roots*, else ``None``.
 
-    Relative paths are resolved against *root* (Claude's cwd). ``resolve()``
-    collapses ``..`` and symlinks so escape attempts via either are caught.
+    Relative paths are resolved against ``roots[0]`` (Claude's cwd / workspace
+    root). ``resolve()`` collapses ``..`` and symlinks so escape attempts via
+    either are caught. A candidate passes as soon as it falls inside one root.
     """
     try:
         p = Path(candidate)
         if not p.is_absolute():
-            p = root / p
+            p = roots[0] / p
         resolved = p.resolve()
     except (OSError, RuntimeError, ValueError):
         return None
+    for root in roots:
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            continue
+        return resolved
+    return None
+
+
+def _extra_allowed_roots() -> list[Path]:
+    """Always-on allowed roots outside the per-user workspace.
+
+    The Claude Code SDK keeps its own internal state under ``$HOME/.claude``
+    (e.g. ``projects/.../tool-results``) and reaches it via ``~/.claude/...``,
+    which expands outside the workspace root. That access must be permitted
+    explicitly or the sandbox breaks normal SDK operation. Only ``$HOME/.claude``
+    is added — not all of ``$HOME`` — so ``~/.ssh`` and other home paths stay
+    denied. Returns an empty list when ``$HOME`` is unset.
+    """
+    home = os.getenv("HOME")
+    if not home:
+        return []
     try:
-        resolved.relative_to(root)
-    except ValueError:
-        return None
-    return resolved
+        return [(Path(home) / ".claude").resolve()]
+    except (OSError, RuntimeError, ValueError):
+        return []
 
 
 def _deny(reason: str) -> Dict[str, Any]:
@@ -140,8 +162,8 @@ def _bash_path_candidates(command: str) -> list[str]:
     return candidates
 
 
-def _check_bash(command: str, root: Path) -> Optional[str]:
-    """Return a deny reason if *command* references paths outside *root*.
+def _check_bash(command: str, roots: list[Path]) -> Optional[str]:
+    """Return a deny reason if *command* references paths outside *roots*.
 
     Catches absolute paths, ``..`` traversal and ``~`` references — including
     relative symlink targets such as ``ln -s ../../secret link``. Only
@@ -152,10 +174,10 @@ def _check_bash(command: str, root: Path) -> Optional[str]:
     if not command:
         return None
     for path in _bash_path_candidates(command):
-        if _resolve_within(root, _expand_user(path)) is None:
+        if _resolve_within_any(roots, _expand_user(path)) is None:
             return (
                 f"Workspace sandbox: Bash referenced path outside workspace "
-                f"({path}). Allowed root: {root}."
+                f"({path}). Allowed root: {roots[0]}."
             )
     return None
 
@@ -167,7 +189,7 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     :class:`claude_agent_sdk.types.HookMatcher`. It returns an empty dict to
     let the call proceed, or a ``deny`` decision to block it.
     """
-    root = Path(workspace_root).resolve()
+    roots = [Path(workspace_root).resolve()] + _extra_allowed_roots()
     allowed = _allow_outside()
 
     async def hook(input_data, _tool_use_id, _context):
@@ -182,10 +204,10 @@ def make_workspace_sandbox_hook(workspace_root: Path):
                 return {}
             path = tool_input.get(key)
             if isinstance(path, str) and path:
-                if _resolve_within(root, path) is None:
+                if _resolve_within_any(roots, path) is None:
                     return _deny(
                         f"Workspace sandbox: {tool_name} target {path!r} is "
-                        f"outside the session workspace ({root})."
+                        f"outside the session workspace ({roots[0]})."
                     )
             return {}
 
@@ -193,7 +215,7 @@ def make_workspace_sandbox_hook(workspace_root: Path):
             if "bash" in allowed:
                 return {}
             command = tool_input.get("command", "")
-            reason = _check_bash(command, root) if isinstance(command, str) else None
+            reason = _check_bash(command, roots) if isinstance(command, str) else None
             if reason:
                 return _deny(reason)
             return {}
