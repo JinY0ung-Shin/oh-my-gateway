@@ -7,6 +7,7 @@ from src.usage_logger import (
     _bind_positional_params,
     _normalize_db_url,
     _safe_url,
+    extract_model_id,
     extract_sdk_usage_detail,
 )
 
@@ -453,3 +454,73 @@ async def test_log_turn_from_context_builds_turn_record(monkeypatch):
     assert turn["duration_ms"] == 5000
     assert turn["status"] == "errored"
     assert turn["error_code"] == "rate_limit"
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [
+        "claude-opus-4-5-20250929",
+        "claude-sonnet-4-5-20250929",
+        "claude-haiku-4-5-20251001",
+    ],
+)
+def test_extract_model_id_returns_reported_model(resolved):
+    chunks = [
+        {"type": "assistant", "model": resolved, "usage": {"input_tokens": 1}},
+        {"type": "result", "usage": {"input_tokens": 1, "output_tokens": 2}},
+    ]
+    assert extract_model_id(chunks) == resolved
+
+
+def test_extract_model_id_skips_subagent_model():
+    # A subagent (parent_tool_use_id set) may run a cheaper model; the turn's
+    # model must reflect the primary agent, not the subagent.
+    chunks = [
+        {"type": "assistant", "model": "claude-haiku-4-5", "parent_tool_use_id": "tu_1"},
+        {"type": "assistant", "model": "claude-opus-4-5-20250929"},
+    ]
+    assert extract_model_id(chunks) == "claude-opus-4-5-20250929"
+
+
+def test_extract_model_id_returns_none_without_assistant_model():
+    assert extract_model_id([{"type": "result", "usage": {"input_tokens": 1}}]) is None
+    assert extract_model_id([{"type": "assistant"}]) is None
+
+
+async def test_log_turn_from_context_prefers_resolved_model_over_alias(monkeypatch):
+    logger = UsageLogger()
+    logger._engine = object()
+    calls = []
+    metrics = []
+
+    async def fake_log_turn(**kwargs):
+        calls.append(kwargs)
+
+    logger.log_turn = fake_log_turn
+    monkeypatch.setattr(
+        "src.metrics.record_token_usage",
+        lambda **kw: metrics.append(kw),
+    )
+
+    await logger.log_turn_from_context(
+        request_context={
+            "user": "alice",
+            "session_id": "sess-1",
+            "turn": 1,
+            "provider_model": "sonnet",
+            "backend": "claude",
+        },
+        response_id="resp-1",
+        model="sonnet",
+        chunks=[
+            {"type": "assistant", "model": "claude-sonnet-4-5-20250929"},
+            {"type": "result", "usage": {"input_tokens": 3, "output_tokens": 4}},
+        ],
+        tool_stats=None,
+        started_monotonic=0.0,
+        status="completed",
+    )
+
+    # Both the DB row and the Prometheus label carry the concrete id, not "sonnet".
+    assert calls[0]["turn"]["model"] == "claude-sonnet-4-5-20250929"
+    assert metrics[0]["model"] == "claude-sonnet-4-5-20250929"

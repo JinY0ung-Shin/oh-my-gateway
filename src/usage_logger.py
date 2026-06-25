@@ -123,6 +123,31 @@ def extract_sdk_usage_detail(chunks: list) -> Dict[str, int]:
     return total
 
 
+def extract_model_id(chunks: list) -> Optional[str]:
+    """Return the concrete model id the backend actually used, if reported.
+
+    The public request model is an alias (``opus`` / ``sonnet`` / ``haiku``);
+    the Claude CLI resolves it — honoring ``ANTHROPIC_DEFAULT_*_MODEL`` — and
+    echoes the concrete id (e.g. ``claude-opus-4-5-20250929``) back on each
+    ``AssistantMessage.model``. Logging that id is ground-truth and needs no
+    alias-to-id mapping in the gateway.
+
+    Only the primary turn's model is considered: assistant chunks carrying a
+    ``parent_tool_use_id`` come from subagents (which may run a different
+    model) and are skipped. Returns ``None`` when no chunk reports a model
+    (non-Claude backends, error-only turns), so callers fall back to the alias.
+    """
+    for msg in chunks:
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        if msg.get("parent_tool_use_id"):
+            continue
+        model = msg.get("model")
+        if isinstance(model, str) and model.strip():
+            return model.strip()
+    return None
+
+
 class UsageLogger:
     """Async usage-log writer backed by a SQLAlchemy ``AsyncEngine``."""
 
@@ -307,13 +332,17 @@ class UsageLogger:
         """
         ctx = request_context or {}
         usage = extract_sdk_usage_detail(chunks)
+        # Prefer the concrete model id the backend reported (resolves opus/
+        # sonnet/haiku aliases via ANTHROPIC_DEFAULT_*_MODEL); fall back to the
+        # public alias when no chunk carries one.
+        logged_model = extract_model_id(chunks) or model or ctx.get("provider_model")
 
         try:
             from src.metrics import record_token_usage
 
             record_token_usage(
                 backend=ctx.get("backend"),
-                model=model or ctx.get("provider_model"),
+                model=logged_model,
                 usage=usage,
             )
         except Exception:  # pragma: no cover - metrics must never break the turn
@@ -340,7 +369,7 @@ class UsageLogger:
                 "response_id": response_id,
                 "previous_response_id": ctx.get("previous_response_id"),
                 "turn": int(turn),
-                "model": model or ctx.get("provider_model"),
+                "model": logged_model,
                 "backend": ctx.get("backend"),
                 "input_tokens": usage["input_tokens"],
                 "output_tokens": usage["output_tokens"],
