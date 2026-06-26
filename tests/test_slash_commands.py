@@ -27,6 +27,10 @@ def _reset_cache():
         ("/compact foo bar", "compact"),
         ("/dev-server status", "dev-server"),
         ("/superpowers:brainstorming", "superpowers:brainstorming"),
+        # Command-shaped per the CLI's char class — kept on the validated path
+        # (the CLI would otherwise silently return "Unknown skill").
+        ("/:foo", ":foo"),
+        ("/foo::bar baz", "foo::bar"),
         # Slash-prefixed plain input is not a command (issue #117).
         ("/api/v1/users", None),
         ("/home/ozymandias 경로 있음?", None),

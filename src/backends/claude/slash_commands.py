@@ -45,7 +45,13 @@ CACHE_TTL_SECONDS: float = 60.0
 # else after a leading ``/`` — file paths (``/home/x``), URLs (``/api/v1/users``)
 # — is not a command name; the SDK passes such input to the model as a plain
 # message, so the gateway must not reject it. See issue #117.
-_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*$")
+#
+# The character class matches the CLI's own command-shape test
+# (``!/[^a-zA-Z0-9:\-_]/``): any token of these chars is command-shaped and, if
+# unregistered, the CLI returns ``"Unknown skill"`` with 0 tokens — so we keep
+# such tokens on the validated path (→ a clear 400) rather than letting them
+# through to that silent response.
+_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9:_-]+$")
 
 
 class SlashCommandError(Exception):
