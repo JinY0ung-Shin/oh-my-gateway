@@ -25,11 +25,15 @@ def _reset_cache():
         ("/help", "help"),
         ("  /help  ", "help"),
         ("/compact foo bar", "compact"),
-        ("/api/v1/users", "api/v1/users"),
         ("/dev-server status", "dev-server"),
         ("/superpowers:brainstorming", "superpowers:brainstorming"),
-        ("/", ""),
-        ("/ tell me a joke", ""),
+        # Slash-prefixed plain input is not a command (issue #117).
+        ("/api/v1/users", None),
+        ("/home/ozymandias 경로 있음?", None),
+        ("/etc/passwd", None),
+        ("/data/workspaces/x", None),
+        ("/", None),
+        ("/ tell me a joke", None),
     ],
 )
 def test_extract_command_name(prompt, expected):
@@ -90,15 +94,25 @@ async def test_unknown_command_raises(monkeypatch):
     assert calls["n"] == 2
 
 
-async def test_empty_slash_is_unknown(monkeypatch):
+async def test_slash_prefixed_plain_input_is_noop(monkeypatch):
+    """Paths / URLs / bare slash pass through without a command fetch (#117)."""
+    called = {"n": 0}
+
     async def _fake_fetch(cwd):
+        called["n"] += 1
         return {"review"}
 
     monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
 
-    with pytest.raises(sc.SlashCommandError) as ei:
-        await sc.validate_prompt("/ hello")
-    assert ei.value.code == "unknown_command"
+    for prompt in (
+        "/home/ozymandias 경로 있음?",
+        "/etc/passwd",
+        "/api/v1/users",
+        "/",
+        "/ hello",
+    ):
+        await sc.validate_prompt(prompt)
+    assert called["n"] == 0  # never treated as a command
 
 
 async def test_ttl_cache_reuses_within_window(monkeypatch):

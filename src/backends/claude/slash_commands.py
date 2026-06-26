@@ -13,17 +13,24 @@ From an OpenAI-compatible API perspective, both outcomes are problematic:
 
 This module validates the prompt before it reaches the SDK:
 
+* Input that only *starts* with ``/`` but is not a command — file paths
+  (``/home/x``), URLs (``/api/v1/users``), a bare ``/`` — is **not** a slash
+  command. The SDK passes it to the model as a plain message, so the gateway
+  lets it through unchanged (issue #117). Only a command-name-shaped token
+  (alphanumeric/kebab, optional ``:namespace``) is treated as a command.
 * A small **blocklist** of destructive built-ins is always rejected with
   ``blocked_command``.
-* For other slash-prefixed prompts, the command name is checked against a
+* For other (command-shaped) slash prompts, the name is checked against a
   **TTL-cached allowlist** pulled from ``ClaudeSDKClient.get_server_info()``.
-  Unknown names are rejected with ``unknown_command``; recognised names are
-  allowed through so that intentional skills (e.g. ``/dev-server``) still work.
+  Unknown names are rejected with ``unknown_command`` (the SDK would otherwise
+  silently return ``"Unknown skill: <name>"`` with 0 tokens); recognised names
+  are allowed through so that intentional skills (e.g. ``/dev-server``) work.
 """
 
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -32,6 +39,13 @@ from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
 BLOCKED_COMMANDS: frozenset[str] = frozenset({"compact", "init", "heapdump"})
 CACHE_TTL_SECONDS: float = 60.0
+
+# A slash-command name is alphanumeric/kebab-case, optionally namespaced with
+# ``:`` (e.g. ``help``, ``dev-server``, ``superpowers:brainstorming``). Anything
+# else after a leading ``/`` — file paths (``/home/x``), URLs (``/api/v1/users``)
+# — is not a command name; the SDK passes such input to the model as a plain
+# message, so the gateway must not reject it. See issue #117.
+_COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+(?::[A-Za-z0-9_-]+)*$")
 
 
 class SlashCommandError(Exception):
@@ -95,7 +109,12 @@ async def get_available_commands(
 
 
 def extract_command_name(prompt: str) -> Optional[str]:
-    """Return the command name (without the leading ``/``) or ``None``.
+    """Return the slash-command name (without the leading ``/``) or ``None``.
+
+    Returns ``None`` for anything that is not a slash command — including
+    slash-prefixed plain messages such as file paths (``/home/x``) and URLs
+    (``/api/v1/users``), a bare ``/``, or ``/ text``. Such input passes through
+    to the model unchanged, matching Claude Code (issue #117).
 
     The SDK itself strips leading whitespace before dispatching, so we do the
     same — ``"  /help"`` is equivalent to ``"/help"``.
@@ -105,13 +124,14 @@ def extract_command_name(prompt: str) -> Optional[str]:
         return None
     rest = stripped[1:]
     if not rest or rest[0].isspace():
-        # A lone "/" or "/ text" — the SDK returns a syntax error; treat as
-        # unknown so the caller sees a proper error response.
-        return ""
+        # A lone "/" or "/ text" is not a command name — plain message.
+        return None
     name = rest.split(None, 1)[0]
-    # Trim any trailing punctuation the user might have attached; the SDK
-    # only dispatches on the bare name.  Keep ``:`` because it's used in
-    # namespaced skills like ``superpowers:brainstorming``.
+    # Only a command-name-shaped token is a slash command. A token carrying a
+    # path separator or other punctuation (``home/ozymandias``, ``etc/passwd``)
+    # is a slash-prefixed plain message, not a command, so let it through.
+    if not _COMMAND_NAME_RE.match(name):
+        return None
     return name
 
 
@@ -123,12 +143,6 @@ async def validate_prompt(prompt: str, cwd: Optional[Path] = None) -> None:
     name = extract_command_name(prompt)
     if name is None:
         return
-
-    if name == "":
-        raise SlashCommandError(
-            code="unknown_command",
-            message="Slash-prefixed input without a command name is not supported.",
-        )
 
     if name in BLOCKED_COMMANDS:
         raise SlashCommandError(
