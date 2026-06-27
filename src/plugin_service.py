@@ -18,6 +18,7 @@ Key data sources:
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -123,37 +124,68 @@ def _validate_install_path(install_path: Path) -> Optional[Path]:
     return resolved if resolved.is_dir() else None
 
 
-def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
-    """Validate *install_location* resolves within ``plugins/marketplaces``.
+def _marketplace_anchors() -> List[Path]:
+    """Directories a marketplace ``installLocation`` may legitimately live under.
 
-    Analogous to :func:`_validate_install_path` but anchored at
-    ``~/.claude/plugins/marketplaces``.  Returns the resolved path, or
-    ``None`` if the path is a symlink (leaf or parent), escapes the
-    marketplaces tree, or does not exist as a directory.
+    ``claude plugin marketplace add`` stores the exact path it was handed:
+    ``~/.claude/plugins/marketplaces/<name>`` when added by a remote shorthand,
+    or the clone-root path when added from a local clone — which is how BOTH this
+    gateway's admin ``add_marketplace`` and the startup installer register remote
+    repos (clone to the clone root, then add that local path). So both roots are
+    valid anchors. The clone root mirrors
+    ``plugin_admin_service.clone_root()`` / ``docker/install_plugins.py``.
     """
+    anchors: List[Path] = []
     root = _plugins_root()
-    if root is None:
-        return None
-    mkt_dir = root / "marketplaces"
+    if root is not None:
+        anchors.append(root / "marketplaces")
+    configured = os.environ.get("CLAUDE_PLUGIN_CLONE_ROOT", "").strip()
+    if configured:
+        anchors.append(Path(configured))
+    else:
+        home = os.environ.get("HOME", "").strip() or str(Path.home())
+        anchors.append(Path(home) / ".claude" / "plugin-marketplaces")
+    return anchors
+
+
+def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
+    """Validate *install_location* resolves within an allowed marketplace root.
+
+    Allowed roots are ``~/.claude/plugins/marketplaces`` and the clone root
+    (see :func:`_marketplace_anchors`). Returns the resolved path, or ``None`` if
+    the path is a symlink (leaf or parent), escapes every allowed root, or does
+    not exist as a directory.
+    """
     try:
         resolved = install_location.resolve()
-        resolved.relative_to(mkt_dir.resolve())
-    except (ValueError, OSError):
+    except OSError:
+        return None
+
+    anchor: Optional[Path] = None
+    for candidate in _marketplace_anchors():
+        try:
+            resolved.relative_to(candidate.resolve())
+            anchor = candidate
+            break
+        except (ValueError, OSError):
+            continue
+    if anchor is None:
         logger.warning(
-            "Marketplace installLocation outside marketplaces: %s",
+            "Marketplace installLocation outside allowed roots: %s",
             install_location,
         )
         return None
+
     if install_location.is_symlink():
         return None
     # Reject a symlinked PARENT component (see _validate_install_path).
     try:
-        mkt_anchor = mkt_dir.resolve()
+        anchor_resolved = anchor.resolve()
     except OSError:
         return None
     for parent in install_location.parents:
         try:
-            if parent.resolve() == mkt_anchor:
+            if parent.resolve() == anchor_resolved:
                 break
         except OSError:
             return None

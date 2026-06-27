@@ -599,6 +599,21 @@ class TestValidateMarketplacePath:
         link.symlink_to(real)
         assert _validate_marketplace_path(link) is None
 
+    def test_clone_root_location_accepted(self, plugins_dir, monkeypatch):
+        # claude stores installLocation as the clone-root path when a marketplace
+        # is added from a local clone (the admin/env flow), so that root is valid.
+        clone_root = plugins_dir.parent / "clones"
+        loc = clone_root / "m-123"
+        loc.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(clone_root))
+        assert _validate_marketplace_path(loc) == loc.resolve()
+
+    def test_outside_all_roots_rejected(self, plugins_dir, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(plugins_dir / "clones"))
+        outside = plugins_dir.parent / "elsewhere"
+        outside.mkdir()
+        assert _validate_marketplace_path(outside) is None
+
 
 # ---------------------------------------------------------------------------
 # list_marketplace_plugins
@@ -616,6 +631,42 @@ class TestListMarketplacePlugins:
         assert by_name["other-plugin"]["installed"] is False
         assert by_name["other-plugin"]["version"] == ""
         assert by_name["other-plugin"]["skill_count"] == 0
+
+    def test_catalog_from_clone_root_install_location(self, plugins_dir, monkeypatch):
+        # The real admin/env flow: claude records installLocation as the
+        # clone-root clone path (NOT under plugins/marketplaces). The catalog
+        # reader must still read it, else "add marketplace -> Browse" is empty.
+        clone_root = plugins_dir.parent / "clones"
+        mkt_loc = clone_root / "acme-mkt-deadbeef"
+        meta = mkt_loc / ".claude-plugin"
+        meta.mkdir(parents=True)
+        (meta / "marketplace.json").write_text(
+            json.dumps(
+                {
+                    "name": "acme-mkt",
+                    "plugins": [
+                        {"name": "octo", "description": "d", "version": "2.0.0"}
+                    ],
+                }
+            )
+        )
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "acme-mkt": {
+                        "source": {"source": "directory", "path": str(mkt_loc)},
+                        "installLocation": str(mkt_loc),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(clone_root))
+
+        plugins = list_marketplace_plugins("acme-mkt")
+        assert [p["name"] for p in plugins] == ["octo"]
+        assert plugins[0]["version"] == "2.0.0"
+        assert plugins[0]["installed"] is False
 
     def test_installed_scope_reflects_registry(self, plugins_dir):
         # An installed catalog entry exposes its real registry scope (so the UI
