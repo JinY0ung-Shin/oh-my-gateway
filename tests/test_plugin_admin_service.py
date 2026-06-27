@@ -264,6 +264,63 @@ def test_install_plugin_with_repo_adds_marketplace_first(
     assert add_idx < install_idx
 
 
+def test_install_from_catalog_resolves_marketplace_repo(
+    monkeypatch, tmp_path, fake_claude, recorded_runs, fake_manifest
+):
+    # A catalog install passes only a marketplace name (repo=""). The service
+    # must resolve the marketplace's repo from known_marketplaces.json so the
+    # manifest entry carries a replayable repo (the startup installer skips
+    # entries with no repo).
+    import json as _json
+
+    plugins_dir = tmp_path / ".claude" / "plugins"
+    plugins_dir.mkdir(parents=True)
+    (plugins_dir / "known_marketplaces.json").write_text(
+        _json.dumps(
+            {
+                "nyldn-plugins": {
+                    "source": {"source": "github", "repo": "acme/nyldn"},
+                    "installLocation": str(plugins_dir / "marketplaces" / "nyldn"),
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    svc.install_plugin("octo", marketplace="nyldn-plugins", scope="user")
+
+    assert fake_manifest.add_plugin_calls == [
+        {
+            "repo": "https://github.com/acme/nyldn.git",
+            "name": "octo",
+            "marketplace": "nyldn-plugins",
+            "scope": "user",
+            "branch": "main",
+        }
+    ]
+
+
+def test_resolve_marketplace_repo_prefers_full_url(monkeypatch, tmp_path):
+    import json as _json
+
+    plugins_dir = tmp_path / ".claude" / "plugins"
+    plugins_dir.mkdir(parents=True)
+    (plugins_dir / "known_marketplaces.json").write_text(
+        _json.dumps(
+            {"m": {"source": {"source": "git", "url": "https://git.example/m.git"}}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert svc._resolve_marketplace_repo("m") == "https://git.example/m.git"
+
+
+def test_resolve_marketplace_repo_unknown_returns_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert svc._resolve_marketplace_repo("nope") == ""
+
+
 def test_install_plugin_cli_failure_raises(monkeypatch, fake_claude, fake_manifest):
     def boom(cmd, *, token=""):
         raise subprocess.CalledProcessError(2, cmd)

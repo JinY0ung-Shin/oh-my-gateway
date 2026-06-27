@@ -31,6 +31,8 @@ All functions here are synchronous; routes wrap them in
 from __future__ import annotations
 
 import hashlib
+import json
+import logging
 import os
 import platform
 import re
@@ -41,6 +43,8 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import plugin_manifest
+
+logger = logging.getLogger(__name__)
 
 # Branch fresh-cloned from a remote marketplace repo when none is given.
 DEFAULT_BRANCH = "main"
@@ -333,6 +337,46 @@ def prepare_repo(repo: str, *, branch: str, token: str, root: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_marketplace_repo(marketplace: str) -> str:
+    """Best-effort: resolve a registered marketplace name to a clonable repo.
+
+    Used so a plugin installed from a *catalog* (where the caller supplies only a
+    marketplace name, not a repo) still records a replayable ``repo`` in the
+    manifest. Reads ``~/.claude/plugins/known_marketplaces.json`` and converts a
+    GitHub ``owner/repo`` shorthand into a full clone URL. Returns ``""`` when the
+    marketplace is unknown or its source cannot be turned into something the
+    startup installer can clone/add. Never raises.
+    """
+    if not marketplace:
+        return ""
+    home = os.environ.get("HOME", "").strip() or str(Path.home())
+    known = Path(home) / ".claude" / "plugins" / "known_marketplaces.json"
+    try:
+        data = json.loads(known.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ""
+    entry = data.get(marketplace) if isinstance(data, dict) else None
+    if not isinstance(entry, dict):
+        return ""
+    source = entry.get("source") if isinstance(entry.get("source"), dict) else {}
+    url = str(source.get("url", "")).strip()
+    if url:
+        return url
+    repo = str(source.get("repo", "")).strip()
+    if repo:
+        if "://" in repo or repo.startswith("git@"):
+            return repo
+        # GitHub owner/repo shorthand -> clonable HTTPS URL.
+        if source.get("source") == "github" or re.match(r"^[\w.-]+/[\w.-]+$", repo):
+            return f"https://github.com/{repo}.git"
+        return repo
+    # Local marketplace: replayable only if the path still exists at startup.
+    loc = str(entry.get("installLocation", "")).strip()
+    if loc and Path(loc).is_dir():
+        return loc
+    return ""
+
+
 def add_marketplace(
     repo: str,
     *,
@@ -444,8 +488,20 @@ def install_plugin(
     except subprocess.CalledProcessError:
         pass
 
+    # For a catalog install the caller passes only a marketplace name; resolve
+    # its repo so the manifest entry is replayable by the startup installer
+    # (which skips entries that carry no repo).
+    manifest_repo = repo or _resolve_marketplace_repo(marketplace)
+    if not manifest_repo:
+        logger.warning(
+            "could not resolve a repo for marketplace %r; manifest entry for %r "
+            "may not be reinstalled on startup after a plugin-cache wipe",
+            marketplace,
+            spec,
+        )
+
     plugin_manifest.add_plugin(
-        repo=repo,
+        repo=manifest_repo,
         name=name,
         marketplace=marketplace,
         scope=scope,

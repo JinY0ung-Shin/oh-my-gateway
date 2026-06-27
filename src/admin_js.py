@@ -656,7 +656,7 @@ def get_admin_js() -> str:
       this.catalogBusy[plug.id] = true;
       try {
         const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plug.id) +
-          '?scope=user', { method: 'DELETE' });
+          '?scope=' + encodeURIComponent(plug.scope || 'user'), { method: 'DELETE' });
         if (r.ok) {
           this.showToast('PLUGIN UNINSTALLED', 'ok');
           await this.refreshPluginViews();
@@ -737,12 +737,12 @@ def get_admin_js() -> str:
       finally { this.pluginBusy = false; }
     },
 
-    async uninstallPlugin(pluginId) {
+    async uninstallPlugin(pluginId, scope) {
       if (!confirm('Uninstall plugin "' + pluginId + '"?')) return;
       this.pluginBusy = true;
       try {
         const r = await this.api('/admin/api/plugins/' + encodeURIComponent(pluginId) +
-          '?scope=' + encodeURIComponent(this.pluginForm.scope), { method: 'DELETE' });
+          '?scope=' + encodeURIComponent(scope || 'user'), { method: 'DELETE' });
         if (r.ok) {
           this.showToast('PLUGIN UNINSTALLED', 'ok');
           await this.refreshPluginViews();

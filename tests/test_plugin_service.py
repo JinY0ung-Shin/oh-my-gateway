@@ -601,6 +601,27 @@ class TestListMarketplacePlugins:
         assert by_name["other-plugin"]["version"] == ""
         assert by_name["other-plugin"]["skill_count"] == 0
 
+    def test_installed_scope_reflects_registry(self, plugins_dir):
+        # An installed catalog entry exposes its real registry scope (so the UI
+        # can uninstall with the correct scope); not-installed entries default
+        # to "user".
+        known = plugins_dir / "installed_plugins.json"
+        known.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {"scope": "local", "installPath": "/x", "version": "1.0.0"}
+                        ]
+                    },
+                }
+            )
+        )
+        by_name = {p["name"]: p for p in list_marketplace_plugins("test-mkt")}
+        assert by_name["demo-plugin"]["scope"] == "local"
+        assert by_name["other-plugin"]["scope"] == "user"
+
     def test_unknown_marketplace(self, plugins_dir):
         assert list_marketplace_plugins("does-not-exist") == []
 

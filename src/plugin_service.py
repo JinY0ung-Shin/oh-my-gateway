@@ -511,6 +511,13 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
     if isinstance(plugins_data, dict):
         installed_keys = set(plugins_data.keys())
 
+    def _installed_scope(key: str) -> str:
+        """Scope of an installed plugin from the registry, defaulting to user."""
+        entries = plugins_data.get(key) if isinstance(plugins_data, dict) else None
+        if isinstance(entries, list) and entries and isinstance(entries[0], dict):
+            return entries[0].get("scope", "user")
+        return "user"
+
     results: List[Dict[str, Any]] = []
     for entry in plugins:
         if not isinstance(entry, dict):
@@ -521,6 +528,7 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
         version = entry.get("version")
         skills = entry.get("skills")
         plugin_id = f"{name}@{marketplace_name}"
+        installed = plugin_id in installed_keys
         results.append(
             {
                 "name": name,
@@ -528,7 +536,8 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
                 "version": version if isinstance(version, str) else "",
                 "skill_count": len(skills) if isinstance(skills, list) else 0,
                 "id": plugin_id,
-                "installed": plugin_id in installed_keys,
+                "installed": installed,
+                "scope": _installed_scope(plugin_id) if installed else "user",
             }
         )
     return results

@@ -136,7 +136,7 @@ def get_plugins_html() -> str:
                       <td class="text-xs text-muted" x-text="(p.skills?.length || 0)"></td>
                       <td>
                         <button class="btn btn-sm btn-ghost" style="color:var(--red)"
-                          @click="uninstallPlugin(p.id)" aria-label="Uninstall plugin">[DEL]</button>
+                          @click="uninstallPlugin(p.id, p.scope)" aria-label="Uninstall plugin">[DEL]</button>
                       </td>
                     </tr>
                   </template>
