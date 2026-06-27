@@ -457,17 +457,31 @@ def list_marketplaces() -> List[Dict[str, Any]]:
     if not isinstance(data, dict):
         return []
 
+    # Marketplace scope is not stored in known_marketplaces.json; the admin-
+    # managed manifest is the only source of truth for it (so the UI can remove
+    # a marketplace at its real scope rather than guessing).
+    records: Dict[str, Any] = {}
+    try:
+        from src import plugin_manifest
+
+        records = plugin_manifest.list_marketplace_records()
+    except Exception:
+        logger.debug("Failed to read manifest marketplace records", exc_info=True)
+
     results: List[Dict[str, Any]] = []
     for name, info in data.items():
         if not isinstance(info, dict):
             continue
         source = info.get("source", {})
+        record = records.get(name) if isinstance(records, dict) else None
+        scope = record.get("scope", "user") if isinstance(record, dict) else "user"
         results.append(
             {
                 "name": name,
                 "source_type": source.get("source", "unknown"),
                 "repo": source.get("repo", source.get("url", "")),
                 "last_updated": info.get("lastUpdated"),
+                "scope": scope,
             }
         )
     return results

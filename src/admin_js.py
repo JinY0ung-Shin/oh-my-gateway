@@ -694,12 +694,12 @@ def get_admin_js() -> str:
       finally { this.pluginBusy = false; }
     },
 
-    async removeMarketplace(name) {
+    async removeMarketplace(name, scope) {
       if (!confirm('Remove marketplace "' + name + '"?')) return;
       this.pluginBusy = true;
       try {
         const r = await this.api('/admin/api/marketplaces/' + encodeURIComponent(name) +
-          '?scope=' + encodeURIComponent(this.mpForm.scope), { method: 'DELETE' });
+          '?scope=' + encodeURIComponent(scope || 'user'), { method: 'DELETE' });
         if (r.ok) {
           this.showToast('MARKETPLACE REMOVED', 'ok');
           await this.loadMarketplaces();

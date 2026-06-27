@@ -8,6 +8,11 @@ container start). The admin panel mutates it at runtime; startup replays it.
   them (survives a wipe of the plugin cache volume).
 - ``removed`` = specs the admin uninstalled that ALSO came from the env
   bootstrap, so startup uninstalls them and skips reinstall.
+- ``marketplaces`` = the original remote/branch/scope the admin used to add each
+  marketplace, keyed by marketplace name. ``claude plugin marketplace add`` is
+  given a local clone path and records ``source: directory`` (losing the
+  remote), so this map is the authoritative record for replay and for telling
+  the UI a marketplace's scope.
 
 The file is JSON at ``CLAUDE_PLUGIN_MANIFEST`` (or ``<project>/data/
 gateway-plugins.json``). ``load()`` never raises; ``save()`` is atomic
@@ -39,7 +44,7 @@ def manifest_path() -> Path:
 
 
 def _defaults() -> dict:
-    return {"version": 1, "added": [], "removed": []}
+    return {"version": 1, "added": [], "removed": [], "marketplaces": {}}
 
 
 def load() -> dict:
@@ -65,10 +70,22 @@ def load() -> dict:
         removed = []
     else:
         removed = [s for s in removed if isinstance(s, str)]
+    marketplaces = data.get("marketplaces")
+    if not isinstance(marketplaces, dict):
+        marketplaces = {}
+    else:
+        marketplaces = {
+            k: v for k, v in marketplaces.items() if isinstance(v, dict)
+        }
     version = data.get("version")
     if not isinstance(version, int):
         version = 1
-    return {"version": version, "added": added, "removed": removed}
+    return {
+        "version": version,
+        "added": added,
+        "removed": removed,
+        "marketplaces": marketplaces,
+    }
 
 
 def save(data: dict) -> None:
@@ -147,10 +164,34 @@ def unmark_removed(spec: str) -> None:
 
 
 def remove_marketplace_entries(marketplace: str) -> None:
-    """Drop all ``added`` entries belonging to ``marketplace``."""
+    """Drop a marketplace's ``added`` entries and its marketplace record."""
     data = load()
     data["added"] = [e for e in data["added"] if e.get("marketplace") != marketplace]
+    data["marketplaces"].pop(marketplace, None)
     save(data)
+
+
+def set_marketplace(name: str, *, repo: str, branch: str, scope: str) -> None:
+    """Record the original remote/branch/scope an admin used to add a marketplace.
+
+    This preserves the remote even though ``claude plugin marketplace add`` is
+    given a local clone path (and records ``source: directory``), so startup can
+    re-clone it after a volume wipe and the UI knows the marketplace's scope.
+    """
+    data = load()
+    data["marketplaces"][name] = {"repo": repo, "branch": branch, "scope": scope}
+    save(data)
+
+
+def get_marketplace(name: str) -> dict:
+    """Return the marketplace record for ``name`` (empty dict if absent)."""
+    rec = load()["marketplaces"].get(name)
+    return rec if isinstance(rec, dict) else {}
+
+
+def list_marketplace_records() -> dict:
+    """Return the full marketplace-name -> record map."""
+    return load()["marketplaces"]
 
 
 def list_added() -> list:

@@ -19,7 +19,12 @@ def test_manifest_path_env_override(manifest_file):
 
 
 def test_load_missing_returns_defaults(manifest_file):
-    assert plugin_manifest.load() == {"version": 1, "added": [], "removed": []}
+    assert plugin_manifest.load() == {
+        "version": 1,
+        "added": [],
+        "removed": [],
+        "marketplaces": {},
+    }
 
 
 def test_save_load_roundtrip(manifest_file):
@@ -35,6 +40,7 @@ def test_save_load_roundtrip(manifest_file):
             }
         ],
         "removed": ["foo@bar"],
+        "marketplaces": {},
     }
     plugin_manifest.save(data)
     assert json.loads(manifest_file.read_text(encoding="utf-8")) == data
@@ -43,12 +49,22 @@ def test_save_load_roundtrip(manifest_file):
 
 def test_load_corrupt_file_fallback(manifest_file):
     manifest_file.write_text("{not valid json", encoding="utf-8")
-    assert plugin_manifest.load() == {"version": 1, "added": [], "removed": []}
+    assert plugin_manifest.load() == {
+        "version": 1,
+        "added": [],
+        "removed": [],
+        "marketplaces": {},
+    }
 
 
 def test_load_wrong_types_fallback(manifest_file):
     manifest_file.write_text(json.dumps([1, 2, 3]), encoding="utf-8")
-    assert plugin_manifest.load() == {"version": 1, "added": [], "removed": []}
+    assert plugin_manifest.load() == {
+        "version": 1,
+        "added": [],
+        "removed": [],
+        "marketplaces": {},
+    }
 
 
 def test_load_coerces_bad_member_types(manifest_file):
@@ -131,6 +147,29 @@ def test_remove_marketplace_entries(manifest_file):
     plugin_manifest.remove_marketplace_entries("mkt1")
     names = [e["name"] for e in plugin_manifest.list_added()]
     assert names == ["c"]
+
+
+def test_marketplace_record_set_get_list(manifest_file):
+    plugin_manifest.set_marketplace(
+        "mkt1", repo="https://github.com/acme/mkt1.git", branch="dev", scope="project"
+    )
+    assert plugin_manifest.get_marketplace("mkt1") == {
+        "repo": "https://github.com/acme/mkt1.git",
+        "branch": "dev",
+        "scope": "project",
+    }
+    assert plugin_manifest.get_marketplace("missing") == {}
+    assert "mkt1" in plugin_manifest.list_marketplace_records()
+
+
+def test_remove_marketplace_entries_drops_record(manifest_file):
+    plugin_manifest.set_marketplace("mkt1", repo="r", branch="main", scope="user")
+    plugin_manifest.add_plugin(
+        repo="r", name="a", marketplace="mkt1", scope="user", branch="main"
+    )
+    plugin_manifest.remove_marketplace_entries("mkt1")
+    assert plugin_manifest.get_marketplace("mkt1") == {}
+    assert plugin_manifest.list_added() == []
 
 
 def test_save_creates_parent_dirs(tmp_path, monkeypatch):

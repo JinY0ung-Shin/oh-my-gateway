@@ -337,18 +337,43 @@ def prepare_repo(repo: str, *, branch: str, token: str, root: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 
+def _marketplace_name_from_clone(local_path: Path, repo: str) -> str:
+    """Read the marketplace name from a clone's ``marketplace.json``.
+
+    This is the name ``claude`` keys the marketplace under, so it matches what a
+    catalog install passes. Falls back to the repo basename. Never raises.
+    """
+    try:
+        catalog = json.loads(
+            (local_path / ".claude-plugin" / "marketplace.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        name = str(catalog.get("name", "")).strip()
+        if name:
+            return name
+    except (OSError, ValueError, AttributeError):
+        pass
+    return _default_name(repo)
+
+
 def _resolve_marketplace_repo(marketplace: str) -> str:
     """Best-effort: resolve a registered marketplace name to a clonable repo.
 
     Used so a plugin installed from a *catalog* (where the caller supplies only a
     marketplace name, not a repo) still records a replayable ``repo`` in the
-    manifest. Reads ``~/.claude/plugins/known_marketplaces.json`` and converts a
-    GitHub ``owner/repo`` shorthand into a full clone URL. Returns ``""`` when the
-    marketplace is unknown or its source cannot be turned into something the
-    startup installer can clone/add. Never raises.
+    manifest. The admin-managed manifest record is authoritative — it preserves
+    the original remote even though ``claude plugin marketplace add`` is handed a
+    local clone path and records ``source: directory``. Falls back to
+    ``~/.claude/plugins/known_marketplaces.json`` (converting a GitHub
+    ``owner/repo`` shorthand to a clone URL) for env/externally-added
+    marketplaces. Returns ``""`` when nothing replayable is found. Never raises.
     """
     if not marketplace:
         return ""
+    record = plugin_manifest.get_marketplace(marketplace)
+    if record.get("repo", "").strip():
+        return record["repo"].strip()
     home = os.environ.get("HOME", "").strip() or str(Path.home())
     known = Path(home) / ".claude" / "plugins" / "known_marketplaces.json"
     try:
@@ -409,9 +434,16 @@ def add_marketplace(
             f"(scope {scope}): rc={exc.returncode}"
         ) from exc
 
+    # Record the ORIGINAL repo/branch/scope keyed by the marketplace's own name.
+    # claude only persists the local clone path (source: directory), so this is
+    # the only place the remote survives a `docker compose down -v`.
+    name = _marketplace_name_from_clone(Path(local_path), repo)
+    plugin_manifest.set_marketplace(name, repo=repo, branch=branch, scope=scope)
+
     return {
         "status": "added",
         "repo": repo,
+        "marketplace": name,
         "path": str(local_path),
         "branch": branch,
         "scope": scope,
@@ -489,9 +521,15 @@ def install_plugin(
         pass
 
     # For a catalog install the caller passes only a marketplace name; resolve
-    # its repo so the manifest entry is replayable by the startup installer
-    # (which skips entries that carry no repo).
-    manifest_repo = repo or _resolve_marketplace_repo(marketplace)
+    # its repo (and branch) from the manifest record so the entry is replayable
+    # by the startup installer (which skips entries that carry no repo).
+    manifest_repo = repo
+    manifest_branch = branch
+    if not manifest_repo and marketplace:
+        manifest_repo = _resolve_marketplace_repo(marketplace)
+        record = plugin_manifest.get_marketplace(marketplace)
+        if record.get("branch", "").strip():
+            manifest_branch = record["branch"].strip()
     if not manifest_repo:
         logger.warning(
             "could not resolve a repo for marketplace %r; manifest entry for %r "
@@ -505,7 +543,7 @@ def install_plugin(
         name=name,
         marketplace=marketplace,
         scope=scope,
-        branch=branch,
+        branch=manifest_branch,
     )
 
     return {

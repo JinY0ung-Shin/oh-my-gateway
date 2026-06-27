@@ -43,7 +43,7 @@ def get_plugins_html() -> str:
                     </div>
                     <span class="text-xs text-muted" style="margin-right:8px" x-text="m.plugin_count + ' plugins'"></span>
                     <button class="btn btn-sm btn-ghost" style="color:var(--red)"
-                      @click.stop="removeMarketplace(m.name)" aria-label="Remove marketplace">[DEL]</button>
+                      @click.stop="removeMarketplace(m.name, m.scope)" aria-label="Remove marketplace">[DEL]</button>
                   </div>
 
                   <!-- Catalog plugins (expandable; force-open while filtering) -->

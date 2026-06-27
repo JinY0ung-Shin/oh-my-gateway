@@ -49,12 +49,25 @@ def fake_manifest(monkeypatch):
             self.mark_removed_calls = []
             self.unmark_removed_calls = []
             self.remove_marketplace_calls = []
+            self.marketplaces = {}
+            self.set_marketplace_calls = []
 
         def spec_for(self, name, marketplace):
             return f"{name}@{marketplace}" if marketplace else name
 
         def list_added(self):
             return self.added_entries
+
+        def set_marketplace(self, name, *, repo, branch, scope):
+            rec = {"repo": repo, "branch": branch, "scope": scope}
+            self.set_marketplace_calls.append({"name": name, **rec})
+            self.marketplaces[name] = rec
+
+        def get_marketplace(self, name):
+            return self.marketplaces.get(name, {})
+
+        def list_marketplace_records(self):
+            return self.marketplaces
 
         def add_plugin(self, *, repo, name, marketplace, scope, branch):
             self.add_plugin_calls.append(
@@ -301,6 +314,37 @@ def test_install_from_catalog_resolves_marketplace_repo(
     ]
 
 
+def test_catalog_install_after_add_marketplace_replays_remote(
+    monkeypatch, fake_claude, recorded_runs, fake_manifest
+):
+    # The REAL admin flow: add a remote marketplace (clone-then-add-local, which
+    # makes claude record source: directory, losing the remote), then install a
+    # plugin from its catalog. The manifest added-entry must carry the ORIGINAL
+    # REMOTE + branch (from the marketplace record), not the local clone path, so
+    # the startup installer can re-clone it after a `docker compose down -v`.
+    monkeypatch.setattr(
+        svc, "prepare_repo", lambda repo, **kw: svc.Path("/clones/octo-mkt-x")
+    )
+    svc.add_marketplace(
+        "https://github.com/acme/octo-mkt", branch="dev", scope="project"
+    )
+    # name falls back to the repo basename (the fake clone has no marketplace.json)
+    assert fake_manifest.marketplaces["octo-mkt"] == {
+        "repo": "https://github.com/acme/octo-mkt",
+        "branch": "dev",
+        "scope": "project",
+    }
+
+    svc.install_plugin("octo", marketplace="octo-mkt", scope="project")
+    assert fake_manifest.add_plugin_calls[-1] == {
+        "repo": "https://github.com/acme/octo-mkt",
+        "name": "octo",
+        "marketplace": "octo-mkt",
+        "scope": "project",
+        "branch": "dev",
+    }
+
+
 def test_resolve_marketplace_repo_prefers_full_url(monkeypatch, tmp_path):
     import json as _json
 
@@ -313,11 +357,13 @@ def test_resolve_marketplace_repo_prefers_full_url(monkeypatch, tmp_path):
         encoding="utf-8",
     )
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
     assert svc._resolve_marketplace_repo("m") == "https://git.example/m.git"
 
 
 def test_resolve_marketplace_repo_unknown_returns_empty(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
     assert svc._resolve_marketplace_repo("nope") == ""
 
 
