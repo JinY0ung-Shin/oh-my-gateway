@@ -792,23 +792,30 @@ async def uninstall_plugin_endpoint(
 async def get_plugin_skill_endpoint(
     plugin_id: str,
     skill_name: str,
+    scope: Optional[str] = None,
     _=Depends(require_admin),
 ):
-    """Read a specific skill's content from an installed plugin."""
+    """Read a specific skill's content from an installed plugin.
+
+    *scope* picks the right per-scope registry entry when a plugin is installed
+    at more than one scope.
+    """
     from src.plugin_service import get_plugin_skill_content
 
-    result = get_plugin_skill_content(plugin_id, skill_name)
+    result = get_plugin_skill_content(plugin_id, skill_name, scope)
     if result is None:
         return JSONResponse(status_code=404, content={"error": "Plugin or skill not found"})
     return result
 
 
 @router.get("/api/plugins/{plugin_id:path}")
-async def get_plugin_detail_endpoint(plugin_id: str, _=Depends(require_admin)):
-    """Return full detail for a single installed plugin."""
+async def get_plugin_detail_endpoint(
+    plugin_id: str, scope: Optional[str] = None, _=Depends(require_admin)
+):
+    """Return full detail for a single installed plugin (optionally per scope)."""
     from src.plugin_service import get_plugin_detail
 
-    detail = get_plugin_detail(plugin_id)
+    detail = get_plugin_detail(plugin_id, scope)
     if detail is None:
         return JSONResponse(status_code=404, content={"error": "Plugin not found"})
     return detail

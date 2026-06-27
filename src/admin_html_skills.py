@@ -13,7 +13,7 @@ def get_skills_html() -> str:
             <p class="text-xs text-muted" style="padding-left:12px; margin:0 0 8px 0">// read-only. managed by CLI plugin system.</p>
 
             <!-- Plugin skills section -->
-            <template x-for="p in plugins" :key="p.id">
+            <template x-for="p in plugins" :key="p.id + '@' + p.scope">
               <div>
                 <!-- Plugin group header -->
                 <div class="file-item" style="cursor:pointer; opacity:0.8" @click="p._expanded = !p._expanded">
@@ -21,6 +21,7 @@ def get_skills_html() -> str:
                   <div style="flex:1; min-width:0">
                     <div class="flex-gap-sm">
                       <span style="font-size:var(--fs-sm); font-weight:600; color:var(--amber)" x-text="p.name"></span>
+                      <span class="text-xs text-muted" x-text="p.scope || 'user'"></span>
                       <span class="text-xs text-muted" x-text="p.version ? 'v' + p.version : ''"></span>
                     </div>
                     <div class="text-xs text-muted" x-text="(p.skills?.length || 0) + ' skills'"></div>
@@ -29,9 +30,9 @@ def get_skills_html() -> str:
                 <!-- Plugin skills (expandable) -->
                 <template x-if="p._expanded">
                   <div>
-                    <template x-for="sk in (p.skills || [])" :key="p.id + ':' + sk.name">
+                    <template x-for="sk in (p.skills || [])" :key="p.id + '@' + p.scope + ':' + sk.name">
                       <div class="file-item" style="padding-left:28px"
-                        :class="{ active: pluginSkillView && pluginSkillView.pluginId === p.id && pluginSkillView.skillName === sk.name }"
+                        :class="{ active: pluginSkillView && pluginSkillView.pluginId === p.id && pluginSkillView.scope === p.scope && pluginSkillView.skillName === sk.name }"
                         @click="openPluginSkill(p, sk.name)">
                         <span class="icon" style="color:var(--cyan)">&#9670;</span>
                         <div style="flex:1; min-width:0">

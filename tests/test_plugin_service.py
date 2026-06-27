@@ -349,6 +349,36 @@ class TestListPlugins:
         assert p["skill_count"] == 2
         assert p["command_count"] == 1
 
+    def test_multi_scope_emits_one_row_per_scope(self, plugins_dir):
+        # claude stores one entry per scope under a plugin id; each must surface
+        # as its own row so it is visible and removable at its real scope.
+        cache = plugins_dir / "cache" / "test-mkt" / "demo-plugin" / "1.0.0"
+        reg = plugins_dir / "installed_plugins.json"
+        reg.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {
+                                "scope": "user",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            },
+                            {
+                                "scope": "project",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            },
+                        ]
+                    },
+                }
+            )
+        )
+        rows = list_plugins()
+        assert sorted(p["scope"] for p in rows) == ["project", "user"]
+        assert all(p["id"] == "demo-plugin@test-mkt" for p in rows)
+
     def test_no_plugins_dir(self, no_plugins_dir):
         assert list_plugins() == []
 
@@ -393,6 +423,38 @@ class TestListPlugins:
 
 
 class TestGetPluginDetail:
+    def test_selects_entry_by_scope(self, plugins_dir):
+        # With per-scope entries, the scope arg picks the right one (default first).
+        cache = plugins_dir / "cache" / "test-mkt" / "demo-plugin" / "1.0.0"
+        reg = plugins_dir / "installed_plugins.json"
+        reg.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {
+                                "scope": "user",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            },
+                            {
+                                "scope": "project",
+                                "installPath": str(cache),
+                                "version": "9.9.9",
+                            },
+                        ]
+                    },
+                }
+            )
+        )
+        proj = get_plugin_detail("demo-plugin@test-mkt", "project")
+        user = get_plugin_detail("demo-plugin@test-mkt", "user")
+        assert proj["version"] == "9.9.9"
+        assert user["version"] == "1.0.0"
+        # default (no scope) -> first entry
+        assert get_plugin_detail("demo-plugin@test-mkt")["version"] == "1.0.0"
+
     def test_existing_plugin(self, plugins_dir):
         detail = get_plugin_detail("demo-plugin@test-mkt")
         assert detail is not None
@@ -668,26 +730,33 @@ class TestListMarketplacePlugins:
         assert plugins[0]["version"] == "2.0.0"
         assert plugins[0]["installed"] is False
 
-    def test_installed_scope_reflects_registry(self, plugins_dir):
-        # An installed catalog entry exposes its real registry scope (so the UI
-        # can uninstall with the correct scope); not-installed entries default
-        # to "user".
-        known = plugins_dir / "installed_plugins.json"
-        known.write_text(
-            json.dumps(
-                {
-                    "version": 2,
-                    "plugins": {
-                        "demo-plugin@test-mkt": [
-                            {"scope": "local", "installPath": "/x", "version": "1.0.0"}
-                        ]
-                    },
-                }
-            )
+    def test_catalog_scope_is_marketplace_scope(self, plugins_dir, monkeypatch):
+        # The catalog reports the marketplace's own scope (the scope a one-click
+        # install would target), and availability is judged at THAT scope.
+        from src import plugin_manifest
+
+        monkeypatch.setattr(
+            plugin_manifest,
+            "list_marketplace_records",
+            lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "project"}},
         )
         by_name = {p["name"]: p for p in list_marketplace_plugins("test-mkt")}
-        assert by_name["demo-plugin"]["scope"] == "local"
-        assert by_name["other-plugin"]["scope"] == "user"
+        # marketplace is project-scope; demo-plugin is installed only at user
+        # scope (fixture), so at the marketplace's project scope it is NOT yet
+        # installed -> still available, and the row scope is the marketplace's.
+        assert by_name["demo-plugin"]["scope"] == "project"
+        assert by_name["demo-plugin"]["installed"] is False
+        assert by_name["other-plugin"]["scope"] == "project"
+
+    def test_catalog_installed_when_scope_matches(self, plugins_dir, monkeypatch):
+        # demo-plugin is installed at user scope in the fixture; a user-scope
+        # marketplace (default, no record) therefore shows it as installed.
+        from src import plugin_manifest
+
+        monkeypatch.setattr(plugin_manifest, "list_marketplace_records", lambda: {})
+        by_name = {p["name"]: p for p in list_marketplace_plugins("test-mkt")}
+        assert by_name["demo-plugin"]["scope"] == "user"
+        assert by_name["demo-plugin"]["installed"] is True
 
     def test_unknown_marketplace(self, plugins_dir):
         assert list_marketplace_plugins("does-not-exist") == []

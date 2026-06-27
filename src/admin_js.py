@@ -558,15 +558,15 @@ def get_admin_js() -> str:
         const r = await this.api('/admin/api/plugins');
         if (r.ok) {
           const d = await r.json();
-          const wasExpanded = new Set(this.plugins.filter(p => p._expanded).map(p => p.id));
-          this.plugins = (d.plugins || []).map(p => ({ ...p, _expanded: wasExpanded.has(p.id) }));
+          const wasExpanded = new Set(this.plugins.filter(p => p._expanded).map(p => p.id + '@' + p.scope));
+          this.plugins = (d.plugins || []).map(p => ({ ...p, _expanded: wasExpanded.has(p.id + '@' + p.scope) }));
         }
       } catch(e) { console.error('Failed to load plugins', e); this.showToast('Failed to load plugins', 'err'); }
     },
     async openPluginSkill(plugin, skillName) {
-      this.pluginSkillView = { pluginId: plugin.id, skillName, pluginName: plugin.name, version: plugin.version, content: '' };
+      this.pluginSkillView = { pluginId: plugin.id, scope: plugin.scope, skillName, pluginName: plugin.name, version: plugin.version, content: '' };
       try {
-        const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plugin.id) + '/skills/' + encodeURIComponent(skillName));
+        const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plugin.id) + '/skills/' + encodeURIComponent(skillName) + '?scope=' + encodeURIComponent(plugin.scope || 'user'));
         if (r.ok) {
           const d = await r.json();
           this.pluginSkillView.content = d.content || '';

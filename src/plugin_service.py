@@ -308,6 +308,19 @@ def _parse_plugin_id(plugin_key: str) -> Tuple[str, str]:
     return plugin_key, "unknown"
 
 
+def _entry_index_for_scope(entries: list, scope: Optional[str]) -> int:
+    """Index of the registry entry matching *scope*, or 0 when unspecified/absent.
+
+    The registry stores one entry per scope under a plugin id, so a scope-aware
+    caller picks the right one rather than always reading ``entries[0]``.
+    """
+    if scope and isinstance(entries, list):
+        for i, e in enumerate(entries):
+            if isinstance(e, dict) and e.get("scope") == scope:
+                return i
+    return 0
+
+
 def _resolve_plugin_entry(
     key: str, entries: list, entry_index: int = 0
 ) -> Optional[Dict[str, Any]]:
@@ -397,16 +410,21 @@ def list_plugins() -> List[Dict[str, Any]]:
     return results
 
 
-def get_plugin_detail(plugin_id: str) -> Optional[Dict[str, Any]]:
+def get_plugin_detail(
+    plugin_id: str, scope: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Return full detail for a single installed plugin.
 
-    *plugin_id* is the registry key (e.g. ``octo@nyldn-plugins``).
+    *plugin_id* is the registry key (e.g. ``octo@nyldn-plugins``); *scope*
+    selects which per-scope registry entry to read (defaults to the first).
     Returns ``None`` if the plugin is not found.
     """
     registry = _load_installed_registry()
     plugins_data = registry.get("plugins", {})
     entries = plugins_data.get(plugin_id)
-    resolved = _resolve_plugin_entry(plugin_id, entries)
+    resolved = _resolve_plugin_entry(
+        plugin_id, entries, _entry_index_for_scope(entries, scope)
+    )
     if resolved is None:
         return None
 
@@ -463,19 +481,24 @@ def get_plugin_detail(plugin_id: str) -> Optional[Dict[str, Any]]:
     }
 
 
-def get_plugin_skill_content(plugin_id: str, skill_name: str) -> Optional[Dict[str, Any]]:
+def get_plugin_skill_content(
+    plugin_id: str, skill_name: str, scope: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
     """Read the content of a specific skill from a plugin.
 
-    Returns ``None`` if plugin or skill not found.
+    *scope* selects which per-scope registry entry to read from (the install
+    path can differ by scope). Returns ``None`` if plugin or skill not found.
     """
-    detail = get_plugin_detail(plugin_id)
+    detail = get_plugin_detail(plugin_id, scope)
     if detail is None:
         return None
 
     # Re-resolve install_path through validation
     registry = _load_installed_registry()
     entries = registry.get("plugins", {}).get(plugin_id)
-    resolved = _resolve_plugin_entry(plugin_id, entries)
+    resolved = _resolve_plugin_entry(
+        plugin_id, entries, _entry_index_for_scope(entries, scope)
+    )
     if resolved is None or resolved["install_path"] is None:
         return None
     install_path = resolved["install_path"]
@@ -499,6 +522,30 @@ def get_plugin_skill_content(plugin_id: str, skill_name: str) -> Optional[Dict[s
     }
 
 
+def _marketplace_records() -> Dict[str, Any]:
+    """Return the manifest's marketplace-name -> record map (``{}`` on failure).
+
+    The admin-managed manifest is the only source of truth for a marketplace's
+    scope — ``known_marketplaces.json`` does not store it.
+    """
+    try:
+        from src import plugin_manifest
+
+        records = plugin_manifest.list_marketplace_records()
+        return records if isinstance(records, dict) else {}
+    except Exception:
+        logger.debug("Failed to read manifest marketplace records", exc_info=True)
+        return {}
+
+
+def _marketplace_scope(marketplace_name: str, records: Optional[Dict] = None) -> str:
+    """Scope a marketplace was added at (from the manifest), defaulting to user."""
+    if records is None:
+        records = _marketplace_records()
+    record = records.get(marketplace_name)
+    return record.get("scope", "user") if isinstance(record, dict) else "user"
+
+
 def list_marketplaces() -> List[Dict[str, Any]]:
     """Return registered marketplace sources."""
     root = _plugins_root()
@@ -508,24 +555,13 @@ def list_marketplaces() -> List[Dict[str, Any]]:
     if not isinstance(data, dict):
         return []
 
-    # Marketplace scope is not stored in known_marketplaces.json; the admin-
-    # managed manifest is the only source of truth for it (so the UI can remove
-    # a marketplace at its real scope rather than guessing).
-    records: Dict[str, Any] = {}
-    try:
-        from src import plugin_manifest
-
-        records = plugin_manifest.list_marketplace_records()
-    except Exception:
-        logger.debug("Failed to read manifest marketplace records", exc_info=True)
-
+    records = _marketplace_records()
     results: List[Dict[str, Any]] = []
     for name, info in data.items():
         if not isinstance(info, dict):
             continue
         source = info.get("source", {})
-        record = records.get(name) if isinstance(records, dict) else None
-        scope = record.get("scope", "user") if isinstance(record, dict) else "user"
+        scope = _marketplace_scope(name, records)
         results.append(
             {
                 "name": name,
@@ -543,9 +579,11 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
 
     Resolves ``installLocation`` from ``known_marketplaces.json``, validates
     it, and parses ``<installLocation>/.claude-plugin/marketplace.json``.
-    Each returned dict marks whether the catalog entry is already installed
-    (against ``installed_plugins.json``).  Tolerates a missing marketplace,
-    missing/corrupt catalog, or bad paths by returning ``[]`` — never raises.
+    ``installed`` is judged at the marketplace's OWN scope (the scope a catalog
+    install would target), so a plugin present only at another scope still shows
+    as available; ``scope`` echoes that marketplace scope. Tolerates a missing
+    marketplace, missing/corrupt catalog, or bad paths by returning ``[]`` —
+    never raises.
     """
     root = _plugins_root()
     if root is None:
@@ -570,18 +608,18 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
     if not isinstance(plugins, list):
         return []
 
-    installed_keys = set()
+    # Availability is judged at the marketplace's own scope (the scope a catalog
+    # install targets), since scope is part of a plugin's identity.
+    mkt_scope = _marketplace_scope(marketplace_name)
+    installed_scoped = set()
     registry = _load_installed_registry()
     plugins_data = registry.get("plugins", {})
     if isinstance(plugins_data, dict):
-        installed_keys = set(plugins_data.keys())
-
-    def _installed_scope(key: str) -> str:
-        """Scope of an installed plugin from the registry, defaulting to user."""
-        entries = plugins_data.get(key) if isinstance(plugins_data, dict) else None
-        if isinstance(entries, list) and entries and isinstance(entries[0], dict):
-            return entries[0].get("scope", "user")
-        return "user"
+        for key, entries in plugins_data.items():
+            if isinstance(entries, list):
+                for e in entries:
+                    if isinstance(e, dict):
+                        installed_scoped.add((key, e.get("scope", "user")))
 
     results: List[Dict[str, Any]] = []
     for entry in plugins:
@@ -593,7 +631,6 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
         version = entry.get("version")
         skills = entry.get("skills")
         plugin_id = f"{name}@{marketplace_name}"
-        installed = plugin_id in installed_keys
         results.append(
             {
                 "name": name,
@@ -601,8 +638,8 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
                 "version": version if isinstance(version, str) else "",
                 "skill_count": len(skills) if isinstance(skills, list) else 0,
                 "id": plugin_id,
-                "installed": installed,
-                "scope": _installed_scope(plugin_id) if installed else "user",
+                "installed": (plugin_id, mkt_scope) in installed_scoped,
+                "scope": mkt_scope,
             }
         )
     return results
