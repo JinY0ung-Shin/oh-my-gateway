@@ -13,9 +13,12 @@ from src.plugin_service import (
     _parse_plugin_id,
     _read_json,
     _validate_install_path,
+    _validate_marketplace_path,
+    get_marketplaces_with_plugins,
     get_plugin_blocklist,
     get_plugin_detail,
     get_plugin_skill_content,
+    list_marketplace_plugins,
     list_marketplaces,
     list_plugins,
 )
@@ -92,6 +95,35 @@ def _make_plugin_tree(plugins_root: Path) -> Path:
                     "installLocation": str(plugins_root / "marketplaces" / "test-mkt"),
                     "lastUpdated": "2026-03-01T00:00:00Z",
                 }
+            }
+        )
+    )
+
+    # marketplace catalog (.claude-plugin/marketplace.json)
+    mkt_meta = plugins_root / "marketplaces" / "test-mkt" / ".claude-plugin"
+    mkt_meta.mkdir(parents=True)
+    (mkt_meta / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "test-mkt",
+                "owner": {"name": "tester"},
+                "metadata": {},
+                "plugins": [
+                    {
+                        "name": "demo-plugin",
+                        "description": "A demo plugin for testing",
+                        "source": "./demo-plugin",
+                        "strict": True,
+                        "version": "1.0.0",
+                        "skills": ["greet", "farewell"],
+                    },
+                    {
+                        "name": "other-plugin",
+                        "description": "Not installed",
+                        "source": "./other-plugin",
+                        "strict": False,
+                    },
+                ],
             }
         )
     )
@@ -519,3 +551,162 @@ class TestPluginRoutes:
         resp = client.get("/admin/api/plugins/blocklist")
         assert resp.status_code == 200
         assert len(resp.json()["blocklist"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _validate_marketplace_path
+# ---------------------------------------------------------------------------
+
+
+class TestValidateMarketplacePath:
+    def test_valid_path(self, plugins_dir):
+        loc = plugins_dir / "marketplaces" / "test-mkt"
+        result = _validate_marketplace_path(loc)
+        assert result is not None
+        assert result.is_dir()
+
+    def test_outside_marketplaces_rejected(self, plugins_dir):
+        assert _validate_marketplace_path(Path("/tmp")) is None
+
+    def test_no_plugins_root(self, no_plugins_dir):
+        assert _validate_marketplace_path(Path("/anything")) is None
+
+    def test_nonexistent_rejected(self, plugins_dir):
+        assert (
+            _validate_marketplace_path(plugins_dir / "marketplaces" / "nope")
+            is None
+        )
+
+    def test_symlink_rejected(self, plugins_dir):
+        real = plugins_dir / "marketplaces" / "test-mkt"
+        link = plugins_dir / "marketplaces" / "evil-link"
+        link.symlink_to(real)
+        assert _validate_marketplace_path(link) is None
+
+
+# ---------------------------------------------------------------------------
+# list_marketplace_plugins
+# ---------------------------------------------------------------------------
+
+
+class TestListMarketplacePlugins:
+    def test_installed_flag(self, plugins_dir):
+        plugins = list_marketplace_plugins("test-mkt")
+        by_name = {p["name"]: p for p in plugins}
+        assert by_name["demo-plugin"]["installed"] is True
+        assert by_name["demo-plugin"]["id"] == "demo-plugin@test-mkt"
+        assert by_name["demo-plugin"]["version"] == "1.0.0"
+        assert by_name["demo-plugin"]["skill_count"] == 2
+        assert by_name["other-plugin"]["installed"] is False
+        assert by_name["other-plugin"]["version"] == ""
+        assert by_name["other-plugin"]["skill_count"] == 0
+
+    def test_unknown_marketplace(self, plugins_dir):
+        assert list_marketplace_plugins("does-not-exist") == []
+
+    def test_missing_catalog(self, plugins_dir):
+        # installLocation present + valid but no marketplace.json inside.
+        empty_loc = plugins_dir / "marketplaces" / "empty-mkt"
+        empty_loc.mkdir(parents=True)
+        known = plugins_dir / "known_marketplaces.json"
+        known.write_text(
+            json.dumps(
+                {
+                    "empty-mkt": {
+                        "source": {"source": "github", "repo": "x/y"},
+                        "installLocation": str(empty_loc),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        assert list_marketplace_plugins("empty-mkt") == []
+
+    def test_corrupt_catalog(self, plugins_dir):
+        catalog = (
+            plugins_dir
+            / "marketplaces"
+            / "test-mkt"
+            / ".claude-plugin"
+            / "marketplace.json"
+        )
+        catalog.write_text("not json {{{")
+        assert list_marketplace_plugins("test-mkt") == []
+
+    def test_symlinked_install_location_rejected(self, plugins_dir):
+        real = plugins_dir / "marketplaces" / "test-mkt"
+        link = plugins_dir / "marketplaces" / "linked-mkt"
+        link.symlink_to(real)
+        known = plugins_dir / "known_marketplaces.json"
+        known.write_text(
+            json.dumps(
+                {
+                    "linked-mkt": {
+                        "source": {"source": "github", "repo": "x/y"},
+                        "installLocation": str(link),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        assert list_marketplace_plugins("linked-mkt") == []
+
+    def test_no_plugins_dir(self, no_plugins_dir):
+        assert list_marketplace_plugins("test-mkt") == []
+
+
+# ---------------------------------------------------------------------------
+# get_marketplaces_with_plugins
+# ---------------------------------------------------------------------------
+
+
+class TestGetMarketplacesWithPlugins:
+    def test_aggregation(self, plugins_dir):
+        result = get_marketplaces_with_plugins()
+        assert len(result) == 1
+        mkt = result[0]
+        assert mkt["name"] == "test-mkt"
+        assert mkt["plugin_count"] == 2
+        assert len(mkt["plugins"]) == 2
+        names = {p["name"] for p in mkt["plugins"]}
+        assert names == {"demo-plugin", "other-plugin"}
+
+    def test_no_plugins_dir(self, no_plugins_dir):
+        assert get_marketplaces_with_plugins() == []
+
+
+# ---------------------------------------------------------------------------
+# origin field (managed vs env)
+# ---------------------------------------------------------------------------
+
+
+class TestPluginOrigin:
+    def test_env_origin_when_not_managed(self, plugins_dir):
+        with patch("src.plugin_manifest.list_added", return_value=[]):
+            plugins = list_plugins()
+            assert plugins[0]["origin"] == "env"
+            detail = get_plugin_detail("demo-plugin@test-mkt")
+            assert detail["origin"] == "env"
+
+    def test_managed_origin(self, plugins_dir):
+        fake = [
+            {
+                "repo": "test/marketplace",
+                "name": "demo-plugin",
+                "marketplace": "test-mkt",
+                "scope": "user",
+                "branch": "main",
+            }
+        ]
+        with patch("src.plugin_manifest.list_added", return_value=fake):
+            plugins = list_plugins()
+            assert plugins[0]["origin"] == "managed"
+            detail = get_plugin_detail("demo-plugin@test-mkt")
+            assert detail["origin"] == "managed"
+
+    def test_origin_defaults_env_on_manifest_failure(self, plugins_dir):
+        with patch(
+            "src.plugin_manifest.list_added", side_effect=RuntimeError("boom")
+        ):
+            plugins = list_plugins()
+            assert plugins[0]["origin"] == "env"

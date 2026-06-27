@@ -123,6 +123,48 @@ def _validate_install_path(install_path: Path) -> Optional[Path]:
     return resolved if resolved.is_dir() else None
 
 
+def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
+    """Validate *install_location* resolves within ``plugins/marketplaces``.
+
+    Analogous to :func:`_validate_install_path` but anchored at
+    ``~/.claude/plugins/marketplaces``.  Returns the resolved path, or
+    ``None`` if the path is a symlink (leaf or parent), escapes the
+    marketplaces tree, or does not exist as a directory.
+    """
+    root = _plugins_root()
+    if root is None:
+        return None
+    mkt_dir = root / "marketplaces"
+    try:
+        resolved = install_location.resolve()
+        resolved.relative_to(mkt_dir.resolve())
+    except (ValueError, OSError):
+        logger.warning(
+            "Marketplace installLocation outside marketplaces: %s",
+            install_location,
+        )
+        return None
+    if install_location.is_symlink():
+        return None
+    # Reject a symlinked PARENT component (see _validate_install_path).
+    try:
+        mkt_anchor = mkt_dir.resolve()
+    except OSError:
+        return None
+    for parent in install_location.parents:
+        try:
+            if parent.resolve() == mkt_anchor:
+                break
+        except OSError:
+            return None
+        if parent.is_symlink():
+            logger.warning(
+                "Marketplace installLocation has symlinked parent: %s", parent
+            )
+            return None
+    return resolved if resolved.is_dir() else None
+
+
 # ---------------------------------------------------------------------------
 # Installed plugins registry
 # ---------------------------------------------------------------------------
@@ -137,6 +179,29 @@ def _load_installed_registry() -> Dict[str, Any]:
     if not isinstance(data, dict):
         return {}
     return data
+
+
+def _managed_plugin_ids() -> set:
+    """Return the set of admin-managed plugin ids (``name@marketplace``).
+
+    Sourced from :mod:`src.plugin_manifest`'s ``list_added``.  Imported
+    lazily so a manifest import/load failure never breaks plugin listing;
+    returns an empty set on any error (callers then default origin to
+    ``"env"``).
+    """
+    try:
+        from src import plugin_manifest
+
+        return {
+            plugin_manifest.spec_for(
+                r.get("name", ""), r.get("marketplace", "")
+            )
+            for r in plugin_manifest.list_added()
+            if isinstance(r, dict)
+        }
+    except Exception:  # pragma: no cover - defensive
+        logger.debug("Failed to load managed plugin manifest", exc_info=True)
+        return set()
 
 
 def _load_manifest(install_path: Path) -> Dict[str, Any]:
@@ -256,6 +321,7 @@ def list_plugins() -> List[Dict[str, Any]]:
     if not isinstance(plugins_data, dict):
         return []
 
+    managed = _managed_plugin_ids()
     results: List[Dict[str, Any]] = []
     for key, entries in plugins_data.items():
         resolved = _resolve_plugin_entry(key, entries)
@@ -272,6 +338,7 @@ def list_plugins() -> List[Dict[str, Any]]:
                 "scope": resolved["scope"],
                 "installed_at": resolved["installed_at"],
                 "last_updated": resolved["last_updated"],
+                "origin": "managed" if resolved["id"] in managed else "env",
                 "skills": resolved["skills"],
                 "skill_count": len(resolved["skills"]),
                 "command_count": len(resolved["commands"]),
@@ -334,6 +401,9 @@ def get_plugin_detail(plugin_id: str) -> Optional[Dict[str, Any]]:
         "installed_at": resolved["installed_at"],
         "last_updated": resolved["last_updated"],
         "git_commit_sha": resolved["git_commit_sha"],
+        "origin": (
+            "managed" if resolved["id"] in _managed_plugin_ids() else "env"
+        ),
         "skills": resolved["skills"],
         "commands": resolved["commands"],
         "has_hooks": has_hooks,
@@ -400,6 +470,81 @@ def list_marketplaces() -> List[Dict[str, Any]]:
                 "last_updated": info.get("lastUpdated"),
             }
         )
+    return results
+
+
+def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
+    """Return the plugins a marketplace offers in its catalog.
+
+    Resolves ``installLocation`` from ``known_marketplaces.json``, validates
+    it, and parses ``<installLocation>/.claude-plugin/marketplace.json``.
+    Each returned dict marks whether the catalog entry is already installed
+    (against ``installed_plugins.json``).  Tolerates a missing marketplace,
+    missing/corrupt catalog, or bad paths by returning ``[]`` — never raises.
+    """
+    root = _plugins_root()
+    if root is None:
+        return []
+    known = _read_json(root / "known_marketplaces.json")
+    if not isinstance(known, dict):
+        return []
+    info = known.get(marketplace_name)
+    if not isinstance(info, dict):
+        return []
+    raw_location = info.get("installLocation")
+    if not isinstance(raw_location, str) or not raw_location:
+        return []
+    location = _validate_marketplace_path(Path(raw_location))
+    if location is None:
+        return []
+
+    catalog = _read_json(location / ".claude-plugin" / "marketplace.json")
+    if not isinstance(catalog, dict):
+        return []
+    plugins = catalog.get("plugins")
+    if not isinstance(plugins, list):
+        return []
+
+    installed_keys = set()
+    registry = _load_installed_registry()
+    plugins_data = registry.get("plugins", {})
+    if isinstance(plugins_data, dict):
+        installed_keys = set(plugins_data.keys())
+
+    results: List[Dict[str, Any]] = []
+    for entry in plugins:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        version = entry.get("version")
+        skills = entry.get("skills")
+        plugin_id = f"{name}@{marketplace_name}"
+        results.append(
+            {
+                "name": name,
+                "description": entry.get("description", ""),
+                "version": version if isinstance(version, str) else "",
+                "skill_count": len(skills) if isinstance(skills, list) else 0,
+                "id": plugin_id,
+                "installed": plugin_id in installed_keys,
+            }
+        )
+    return results
+
+
+def get_marketplaces_with_plugins() -> List[Dict[str, Any]]:
+    """Return each marketplace augmented with its catalog plugins.
+
+    Convenience aggregate the admin UI can render in one call: every
+    :func:`list_marketplaces` entry gets a ``plugins`` list (from
+    :func:`list_marketplace_plugins`) and a ``plugin_count``.
+    """
+    results: List[Dict[str, Any]] = []
+    for mkt in list_marketplaces():
+        plugins = list_marketplace_plugins(mkt["name"])
+        results.append({**mkt, "plugins": plugins, "plugin_count": len(plugins)})
     return results
 
 

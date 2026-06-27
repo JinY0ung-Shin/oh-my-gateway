@@ -595,6 +595,177 @@ def test_missing_claude_cli_skips_without_blocking_startup(tmp_path):
     assert _read(tmp_path / "claude.log") == ""
 
 
+# ---------------------------------------------------------------------------
+# Integration tests — admin-managed manifest reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_added_entries_are_installed(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "added": [
+                    {
+                        "repo": "https://example/admin/mkt.git",
+                        "name": "adminplug",
+                        "marketplace": "adminmkt",
+                        "scope": "user",
+                        "branch": "main",
+                    }
+                ],
+                "removed": [],
+            }
+        )
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        # An env-bootstrap entry alongside the manifest entry.
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    # Env bootstrap entry still installed.
+    assert "plugin install envplug@envmkt --scope user" in claude_log
+    # Manifest-added entry installed (and updated) too.
+    assert "plugin install adminplug@adminmkt --scope user" in claude_log
+    assert "plugin update adminplug@adminmkt --scope user" in claude_log
+
+    git_log = _read(tmp_path / "git.log")
+    assert "clone --depth 1 --branch main https://example/admin/mkt.git" in git_log
+
+
+def test_manifest_removed_spec_is_skipped_and_uninstalled(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "added": [],
+                "removed": ["envplug@envmkt"],
+            }
+        )
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        # The env bootstrap still names a plugin the admin has removed, plus a
+        # second one that must remain installed.
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug,keepplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    # The removed spec is never (re)installed...
+    assert "plugin install envplug@envmkt" not in claude_log
+    assert "plugin update envplug@envmkt" not in claude_log
+    # ...but it IS actively uninstalled.
+    assert "plugin uninstall envplug@envmkt --scope user" in claude_log
+    # The sibling plugin from the same repo is unaffected.
+    assert "plugin install keepplug@envmkt --scope user" in claude_log
+
+
+def test_manifest_removed_uninstall_failure_does_not_block_startup(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    # FAILPLUGIN makes the fake claude exit 1 on the uninstall call.
+    manifest.write_text(
+        json.dumps({"version": 1, "added": [], "removed": ["FAILPLUGIN@x"]})
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "keepplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    # A failing uninstall must never block the run / server startup.
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    assert "plugin uninstall FAILPLUGIN@x --scope user" in claude_log
+    assert "plugin install keepplug@envmkt --scope user" in claude_log
+
+
+def test_no_manifest_file_behaves_as_before(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        # Point at a path that does not exist; the installer must tolerate it.
+        "CLAUDE_PLUGIN_MANIFEST": str(tmp_path / "missing.json"),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    # Behaves exactly as before: env entry installed, no uninstall calls.
+    assert "plugin install envplug@envmkt --scope user" in claude_log
+    assert "plugin uninstall" not in claude_log
+
+
+def test_corrupt_manifest_is_tolerated(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text("{not valid json")
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    assert "plugin install envplug@envmkt --scope user" in claude_log
+    assert "plugin uninstall" not in claude_log
+
+
 def test_marketplace_install_registers_cli_usable_plugin_from_local_directory(tmp_path):
     """End-to-end against the real Claude CLI when it is available."""
     if shutil.which("claude") is None:

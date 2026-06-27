@@ -22,7 +22,14 @@ Named prompts:  GET/PUT/DELETE /admin/api/prompts/{name}
 Plugins:        GET  /admin/api/plugins
 Plugin detail:  GET  /admin/api/plugins/{id}
 Plugin skills:  GET  /admin/api/plugins/{id}/skills/{name}
+Plugin install: POST /admin/api/plugins
+Plugin remove:  DELETE /admin/api/plugins/{id}
+Plugin manifest: GET /admin/api/plugins/manifest
 Marketplaces:   GET  /admin/api/marketplaces
+                POST /admin/api/marketplaces
+                GET  /admin/api/marketplaces/catalog
+                GET  /admin/api/marketplaces/{name}/plugins
+                DELETE /admin/api/marketplaces/{name}
 Blocklist:      GET  /admin/api/plugins/blocklist
 """
 
@@ -75,6 +82,21 @@ class SystemPromptUpdate(BaseModel):
 
 class NamedPromptWrite(BaseModel):
     content: str
+
+
+class MarketplaceAddRequest(BaseModel):
+    repo: str
+    branch: str = "main"
+    scope: str = "user"
+    git_token: str = ""
+
+
+class PluginInstallRequest(BaseModel):
+    name: str
+    marketplace: str = ""
+    scope: str = "user"
+    repo: str = ""
+    branch: str = "main"
 
 
 # ---------------------------------------------------------------------------
@@ -655,6 +677,117 @@ async def get_blocklist_endpoint(_=Depends(require_admin)):
     return {"blocklist": get_plugin_blocklist()}
 
 
+# --- Plugin / marketplace mutations (admin-managed) -----------------------
+#
+# These static / method-specific routes MUST be declared before the catch-all
+# GET /api/plugins/{plugin_id:path} below. FastAPI matches in declaration
+# order: a later GET /api/plugins/{plugin_id:path} would otherwise capture
+# "manifest" as a plugin_id. (POST and DELETE are method-distinct and would not
+# be shadowed by the GET catch-all, but they are kept here for clarity.)
+
+
+@router.get("/api/plugins/manifest")
+async def get_plugin_manifest_endpoint(_=Depends(require_admin)):
+    """Return the admin-managed plugin manifest (added / removed specs)."""
+    from src import plugin_manifest
+
+    return {
+        "added": plugin_manifest.list_added(),
+        "removed": plugin_manifest.list_removed(),
+    }
+
+
+@router.post("/api/marketplaces")
+async def add_marketplace_endpoint(
+    body: MarketplaceAddRequest,
+    _=Depends(require_admin),
+):
+    """Register a plugin marketplace from a repo URL or local path."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import plugin_admin_service
+
+    try:
+        result = await run_in_threadpool(
+            plugin_admin_service.add_marketplace,
+            body.repo,
+            branch=body.branch,
+            scope=body.scope,
+            git_token=body.git_token,
+        )
+    except plugin_admin_service.PluginAdminError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return result
+
+
+@router.delete("/api/marketplaces/{name}")
+async def remove_marketplace_endpoint(
+    name: str,
+    scope: str = "user",
+    _=Depends(require_admin),
+):
+    """Remove a configured marketplace and drop its managed entries."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import plugin_admin_service
+
+    try:
+        result = await run_in_threadpool(
+            plugin_admin_service.remove_marketplace,
+            name,
+            scope=scope,
+        )
+    except plugin_admin_service.PluginAdminError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return result
+
+
+@router.post("/api/plugins")
+async def install_plugin_endpoint(
+    body: PluginInstallRequest,
+    _=Depends(require_admin),
+):
+    """Install a plugin (optionally registering its marketplace first)."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import plugin_admin_service
+
+    try:
+        result = await run_in_threadpool(
+            plugin_admin_service.install_plugin,
+            body.name,
+            marketplace=body.marketplace,
+            scope=body.scope,
+            repo=body.repo,
+            branch=body.branch,
+        )
+    except plugin_admin_service.PluginAdminError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return result
+
+
+@router.delete("/api/plugins/{plugin_id:path}")
+async def uninstall_plugin_endpoint(
+    plugin_id: str,
+    scope: str = "user",
+    _=Depends(require_admin),
+):
+    """Uninstall a plugin by its registry key (e.g. ``octo@nyldn-plugins``)."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import plugin_admin_service
+
+    try:
+        result = await run_in_threadpool(
+            plugin_admin_service.uninstall_plugin,
+            plugin_id,
+            scope=scope,
+        )
+    except plugin_admin_service.PluginAdminError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return result
+
+
 @router.get("/api/plugins/{plugin_id:path}/skills/{skill_name}")
 async def get_plugin_skill_endpoint(
     plugin_id: str,
@@ -687,6 +820,30 @@ async def list_marketplaces_endpoint(_=Depends(require_admin)):
     from src.plugin_service import list_marketplaces
 
     return {"marketplaces": list_marketplaces()}
+
+
+# --- Marketplace catalog (read-only, one-click install UI) ----------------
+#
+# Route ordering: the literal /api/marketplaces/catalog MUST be declared
+# before the parametrised /api/marketplaces/{name}/plugins (and before the
+# existing DELETE /api/marketplaces/{name}). FastAPI resolves in declaration
+# order, so a single-segment {name} would otherwise capture "catalog".
+
+
+@router.get("/api/marketplaces/catalog")
+async def marketplaces_catalog_endpoint(_=Depends(require_admin)):
+    """All marketplaces with their offered plugins (one-shot for the UI)."""
+    from src.plugin_service import get_marketplaces_with_plugins
+
+    return {"marketplaces": get_marketplaces_with_plugins()}
+
+
+@router.get("/api/marketplaces/{name}/plugins")
+async def marketplace_plugins_endpoint(name: str, _=Depends(require_admin)):
+    """Catalog plugins offered by a single marketplace."""
+    from src.plugin_service import list_marketplace_plugins
+
+    return {"plugins": list_marketplace_plugins(name)}
 
 
 # ---------------------------------------------------------------------------
