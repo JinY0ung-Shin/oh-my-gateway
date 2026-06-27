@@ -232,7 +232,14 @@ def _manifest_entries() -> List[PluginEntry]:
     Each added record carries its own repo/name/marketplace/scope/branch, so it
     becomes a single-plugin entry. Records missing both a repo and a name are
     dropped (nothing actionable to install).
+
+    The admin panel never persists a git token, so a PRIVATE admin-added
+    marketplace would otherwise clone unauthenticated and fail. As a fallback,
+    manifest entries inherit the un-indexed ``CLAUDE_PLUGIN_GIT_TOKEN`` (the same
+    credential the legacy env-bootstrap entry uses) so a private marketplace
+    replays when that token is provided at startup.
     """
+    manifest_token = os.environ.get("CLAUDE_PLUGIN_GIT_TOKEN", "")
     entries: List[PluginEntry] = []
     for record in load_manifest()["added"]:
         repo = str(record.get("repo", "")).strip()
@@ -249,6 +256,7 @@ def _manifest_entries() -> List[PluginEntry]:
                 marketplace=str(record.get("marketplace", "")).strip(),
                 scope=str(record.get("scope", "")).strip() or "user",
                 branch=str(record.get("branch", "")).strip() or DEFAULT_BRANCH,
+                git_token=manifest_token,
                 source_label="manifest",
             )
         )

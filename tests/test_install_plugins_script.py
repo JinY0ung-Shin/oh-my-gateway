@@ -189,6 +189,58 @@ def test_collect_entries_parses_legacy_and_indexed(monkeypatch):
     assert entries[2].names == ["mkt"]
 
 
+def test_manifest_private_entry_inherits_git_token(tmp_path, monkeypatch):
+    # A private marketplace added via the admin panel must replay on startup when
+    # the un-indexed CLAUDE_PLUGIN_GIT_TOKEN is provided: the manifest entry has
+    # no token of its own, so it inherits that env credential for the clone.
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "added": [
+                    {
+                        "repo": "https://host/acme/private.git",
+                        "name": "octo",
+                        "marketplace": "acme",
+                        "scope": "user",
+                        "branch": "main",
+                    }
+                ],
+                "removed": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(manifest))
+    monkeypatch.setenv("CLAUDE_PLUGIN_GIT_TOKEN", "secret-token")
+
+    entries = installer.collect_entries()
+
+    assert len(entries) == 1
+    assert entries[0].source_label == "manifest"
+    assert entries[0].repo == "https://host/acme/private.git"
+    assert entries[0].git_token == "secret-token"
+
+
+def test_manifest_entry_no_token_when_env_unset(tmp_path, monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {"added": [{"repo": "https://host/x/pub.git", "name": "p"}], "removed": []}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(manifest))
+    entries = installer.collect_entries()
+    assert entries[0].git_token == ""
+
+
 def test_collect_entries_branch_defaults_to_main_and_honors_override(monkeypatch):
     for key in list(os.environ):
         if key.startswith("CLAUDE_PLUGIN"):
