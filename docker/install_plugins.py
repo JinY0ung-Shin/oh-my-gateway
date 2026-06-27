@@ -200,8 +200,9 @@ def manifest_path() -> Path:
 def load_manifest() -> Dict[str, list]:
     """Read the manifest, tolerating a missing/corrupt file.
 
-    Always returns ``{"added": [...], "removed": [...]}`` with ``added``
-    filtered to dicts and ``removed`` filtered to strings; never raises.
+    Always returns ``{"added": [...], "removed": [...]}`` with ``added`` filtered
+    to dicts and ``removed`` normalized to ``{"spec","scope"}`` dicts (scope is
+    part of a plugin's identity); never raises.
     """
     empty: Dict[str, list] = {"added": [], "removed": []}
     try:
@@ -216,13 +217,24 @@ def load_manifest() -> Dict[str, list]:
         return empty
     added = data.get("added")
     removed = data.get("removed")
+    removed_norm = []
+    if isinstance(removed, list):
+        for r in removed:
+            if isinstance(r, dict) and isinstance(r.get("spec"), str) and r["spec"]:
+                scope = r.get("scope")
+                removed_norm.append(
+                    {
+                        "spec": r["spec"],
+                        "scope": scope if isinstance(scope, str) and scope else "user",
+                    }
+                )
+            elif isinstance(r, str) and r:  # legacy spec-only
+                removed_norm.append({"spec": r, "scope": "user"})
     return {
         "added": [e for e in added if isinstance(e, dict)]
         if isinstance(added, list)
         else [],
-        "removed": [s for s in removed if isinstance(s, str)]
-        if isinstance(removed, list)
-        else [],
+        "removed": removed_norm,
     }
 
 
@@ -468,12 +480,21 @@ def process_entry(
 ) -> Tuple[int, int]:
     """Prepare one repo and install/update its plugins. Returns ``(ok, failed)``.
 
-    Any plugin spec present in *removed_set* (the admin-uninstalled set from the
-    manifest) is skipped before any subprocess for that plugin runs.
+    Any (spec, scope) present in *removed_set* (the admin-uninstalled set from the
+    manifest) is skipped before any subprocess for that plugin runs. scope is part
+    of the identity, so an entry is only skipped when its own scope was removed.
     """
     removed_set = removed_set or set()
-    names = [n for n in entry.names if _spec(n, entry.marketplace) not in removed_set]
-    skipped = [n for n in entry.names if _spec(n, entry.marketplace) in removed_set]
+    names = [
+        n
+        for n in entry.names
+        if (_spec(n, entry.marketplace), entry.scope) not in removed_set
+    ]
+    skipped = [
+        n
+        for n in entry.names
+        if (_spec(n, entry.marketplace), entry.scope) in removed_set
+    ]
     for name in skipped:
         log(
             f"{entry.source_label}: skipping {_spec(name, entry.marketplace)!r} "
@@ -540,7 +561,7 @@ def main() -> int:
         )
         return 0  # never block server startup
 
-    removed_set = set(load_manifest()["removed"])
+    removed_set = {(r["spec"], r["scope"]) for r in load_manifest()["removed"]}
 
     root = clone_root()
     total_ok = 0
@@ -562,17 +583,20 @@ def apply_removed(claude_bin: str, removed_set: set) -> None:
     """Best-effort uninstall every spec the admin marked removed.
 
     These specs came from the env bootstrap (so install was skipped above); this
-    actively uninstalls them so a `down -v` plugin-cache wipe stays consistent
-    with the admin's intent. Failures are logged and ignored — uninstalling an
-    already-absent plugin is expected and must never block startup.
+    actively uninstalls them at the scope they were removed from so a `down -v`
+    plugin-cache wipe stays consistent with the admin's intent. Failures are
+    logged and ignored — uninstalling an already-absent plugin is expected and
+    must never block startup.
+
+    *removed_set* is a set of ``(spec, scope)`` tuples.
     """
-    for spec in sorted(removed_set):
+    for spec, scope in sorted(removed_set):
         try:
-            run([claude_bin, "plugin", "uninstall", spec, "--scope", "user"])
-            log(f"uninstalled {spec!r} (marked removed in manifest)")
+            run([claude_bin, "plugin", "uninstall", spec, "--scope", scope])
+            log(f"uninstalled {spec!r} (scope {scope}; marked removed in manifest)")
         except subprocess.CalledProcessError as exc:
             log(
-                f"uninstall for {spec!r} returned rc={exc.returncode}; "
+                f"uninstall for {spec!r} (scope {scope}) returned rc={exc.returncode}; "
                 f"likely already absent, continuing"
             )
 

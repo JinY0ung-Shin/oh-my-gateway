@@ -574,13 +574,19 @@ def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
             f"rc={exc.returncode}"
         ) from exc
 
-    added_specs = {
-        plugin_manifest.spec_for(e.get("name", ""), e.get("marketplace", ""))
+    # scope is part of the identity: only drop the managed entry for THIS scope,
+    # and mark removed at THIS scope (so startup uninstalls it at the right scope
+    # and leaves any other-scope install of the same plugin untouched).
+    added_keys = {
+        (
+            plugin_manifest.spec_for(e.get("name", ""), e.get("marketplace", "")),
+            e.get("scope"),
+        )
         for e in plugin_manifest.list_added()
     }
-    if spec in added_specs:
-        plugin_manifest.remove_added(spec)
+    if (spec, scope) in added_keys:
+        plugin_manifest.remove_added(spec, scope)
     else:
-        plugin_manifest.mark_removed(spec)
+        plugin_manifest.mark_removed(spec, scope)
 
     return {"status": "uninstalled", "plugin": spec, "scope": scope}

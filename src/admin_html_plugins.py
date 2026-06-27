@@ -121,11 +121,12 @@ def get_plugins_html() -> str:
 
             <div class="table-wrapper mb-md">
               <table>
-                <thead><tr><th>PLUGIN</th><th>ORIGIN</th><th>VERSION</th><th>SKILLS</th><th></th></tr></thead>
+                <thead><tr><th>PLUGIN</th><th>SCOPE</th><th>ORIGIN</th><th>VERSION</th><th>SKILLS</th><th></th></tr></thead>
                 <tbody>
-                  <template x-for="p in plugins" :key="p.id">
+                  <template x-for="p in plugins" :key="p.id + '@' + p.scope">
                     <tr>
                       <td style="color:var(--amber); font-weight:600" x-text="p.name"></td>
+                      <td class="text-xs text-muted" x-text="p.scope || 'user'"></td>
                       <td>
                         <span class="badge text-xs" x-show="p.origin === 'managed'"
                           style="border-color:var(--cyan); color:var(--cyan)">MANAGED</span>
@@ -141,7 +142,7 @@ def get_plugins_html() -> str:
                     </tr>
                   </template>
                   <tr x-show="plugins.length === 0">
-                    <td colspan="5" class="text-sm text-muted">[ NO PLUGINS ]</td>
+                    <td colspan="6" class="text-sm text-muted">[ NO PLUGINS ]</td>
                   </tr>
                 </tbody>
               </table>

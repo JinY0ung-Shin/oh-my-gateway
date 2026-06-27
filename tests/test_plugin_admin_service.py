@@ -80,14 +80,14 @@ def fake_manifest(monkeypatch):
                 }
             )
 
-        def remove_added(self, spec):
-            self.remove_added_calls.append(spec)
+        def remove_added(self, spec, scope):
+            self.remove_added_calls.append((spec, scope))
 
-        def mark_removed(self, spec):
-            self.mark_removed_calls.append(spec)
+        def mark_removed(self, spec, scope):
+            self.mark_removed_calls.append((spec, scope))
 
-        def unmark_removed(self, spec):
-            self.unmark_removed_calls.append(spec)
+        def unmark_removed(self, spec, scope):
+            self.unmark_removed_calls.append((spec, scope))
 
         def remove_marketplace_entries(self, marketplace):
             self.remove_marketplace_calls.append(marketplace)
@@ -399,7 +399,7 @@ def test_uninstall_managed_plugin_removes_added(
         "--scope",
         "user",
     ]
-    assert fake_manifest.remove_added_calls == ["octo@nyldn-plugins"]
+    assert fake_manifest.remove_added_calls == [("octo@nyldn-plugins", "user")]
     assert fake_manifest.mark_removed_calls == []
 
 
@@ -409,8 +409,25 @@ def test_uninstall_env_plugin_marks_removed(fake_claude, recorded_runs, fake_man
     result = svc.uninstall_plugin("telegram@other-mkt")
 
     assert result["status"] == "uninstalled"
-    assert fake_manifest.mark_removed_calls == ["telegram@other-mkt"]
+    assert fake_manifest.mark_removed_calls == [("telegram@other-mkt", "user")]
     assert fake_manifest.remove_added_calls == []
+
+
+def test_uninstall_is_scope_specific(fake_claude, recorded_runs, fake_manifest):
+    # Same plugin managed only at project scope; uninstalling the user-scope
+    # install must NOT drop the project managed entry — it marks (spec, user)
+    # removed instead, and uninstalls at the requested scope.
+    fake_manifest.added_entries = [
+        {"name": "octo", "marketplace": "m", "scope": "project"}
+    ]
+    svc.uninstall_plugin("octo@m", scope="user")
+    assert recorded_runs[-1]["cmd"][-2:] == ["--scope", "user"]
+    assert fake_manifest.remove_added_calls == []
+    assert fake_manifest.mark_removed_calls == [("octo@m", "user")]
+
+    # Uninstalling the managed project install drops exactly that entry.
+    svc.uninstall_plugin("octo@m", scope="project")
+    assert fake_manifest.remove_added_calls == [("octo@m", "project")]
 
 
 def test_uninstall_cli_failure_raises(monkeypatch, fake_claude, fake_manifest):

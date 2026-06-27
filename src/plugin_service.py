@@ -214,19 +214,21 @@ def _load_installed_registry() -> Dict[str, Any]:
 
 
 def _managed_plugin_ids() -> set:
-    """Return the set of admin-managed plugin ids (``name@marketplace``).
+    """Return the set of admin-managed ``(spec, scope)`` keys.
 
-    Sourced from :mod:`src.plugin_manifest`'s ``list_added``.  Imported
-    lazily so a manifest import/load failure never breaks plugin listing;
-    returns an empty set on any error (callers then default origin to
-    ``"env"``).
+    ``spec`` is ``name@marketplace``; scope is included because the same plugin
+    can be managed at one scope and env-installed at another. Sourced from
+    :mod:`src.plugin_manifest`'s ``list_added``. Imported lazily so a manifest
+    import/load failure never breaks plugin listing; returns an empty set on any
+    error (callers then default origin to ``"env"``).
     """
     try:
         from src import plugin_manifest
 
         return {
-            plugin_manifest.spec_for(
-                r.get("name", ""), r.get("marketplace", "")
+            (
+                plugin_manifest.spec_for(r.get("name", ""), r.get("marketplace", "")),
+                r.get("scope", "user"),
             )
             for r in plugin_manifest.list_added()
             if isinstance(r, dict)
@@ -306,15 +308,21 @@ def _parse_plugin_id(plugin_key: str) -> Tuple[str, str]:
     return plugin_key, "unknown"
 
 
-def _resolve_plugin_entry(key: str, entries: list) -> Optional[Dict[str, Any]]:
+def _resolve_plugin_entry(
+    key: str, entries: list, entry_index: int = 0
+) -> Optional[Dict[str, Any]]:
     """Resolve and validate a single plugin registry entry.
 
-    Returns a dict with common fields or ``None`` if invalid.
-    Shared by :func:`list_plugins` and :func:`get_plugin_detail`.
+    The registry stores one entry per scope under a plugin id; *entry_index*
+    selects which (default the first). Returns a dict with common fields or
+    ``None`` if invalid. Shared by :func:`list_plugins` and
+    :func:`get_plugin_detail`.
     """
     if not isinstance(entries, list) or not entries:
         return None
-    entry = entries[0]
+    if entry_index < 0 or entry_index >= len(entries):
+        return None
+    entry = entries[entry_index]
     name, marketplace = _parse_plugin_id(key)
     raw_path = Path(entry.get("installPath", ""))
     install_path = _validate_install_path(raw_path)
@@ -356,26 +364,35 @@ def list_plugins() -> List[Dict[str, Any]]:
     managed = _managed_plugin_ids()
     results: List[Dict[str, Any]] = []
     for key, entries in plugins_data.items():
-        resolved = _resolve_plugin_entry(key, entries)
-        if resolved is None:
+        # claude stores one entry per scope under a plugin id; emit one row each
+        # so multi-scope installs are visible and removable at their real scope.
+        if not isinstance(entries, list):
             continue
-        results.append(
-            {
-                "id": resolved["id"],
-                "name": resolved["name"],
-                "marketplace": resolved["marketplace"],
-                "version": resolved["version"],
-                "description": resolved["description"],
-                "author": resolved["author"],
-                "scope": resolved["scope"],
-                "installed_at": resolved["installed_at"],
-                "last_updated": resolved["last_updated"],
-                "origin": "managed" if resolved["id"] in managed else "env",
-                "skills": resolved["skills"],
-                "skill_count": len(resolved["skills"]),
-                "command_count": len(resolved["commands"]),
-            }
-        )
+        for idx in range(len(entries)):
+            resolved = _resolve_plugin_entry(key, entries, idx)
+            if resolved is None:
+                continue
+            results.append(
+                {
+                    "id": resolved["id"],
+                    "name": resolved["name"],
+                    "marketplace": resolved["marketplace"],
+                    "version": resolved["version"],
+                    "description": resolved["description"],
+                    "author": resolved["author"],
+                    "scope": resolved["scope"],
+                    "installed_at": resolved["installed_at"],
+                    "last_updated": resolved["last_updated"],
+                    "origin": (
+                        "managed"
+                        if (resolved["id"], resolved["scope"]) in managed
+                        else "env"
+                    ),
+                    "skills": resolved["skills"],
+                    "skill_count": len(resolved["skills"]),
+                    "command_count": len(resolved["commands"]),
+                }
+            )
 
     return results
 
@@ -434,7 +451,9 @@ def get_plugin_detail(plugin_id: str) -> Optional[Dict[str, Any]]:
         "last_updated": resolved["last_updated"],
         "git_commit_sha": resolved["git_commit_sha"],
         "origin": (
-            "managed" if resolved["id"] in _managed_plugin_ids() else "env"
+            "managed"
+            if (resolved["id"], resolved["scope"]) in _managed_plugin_ids()
+            else "env"
         ),
         "skills": resolved["skills"],
         "commands": resolved["commands"],

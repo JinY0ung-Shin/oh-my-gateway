@@ -40,7 +40,7 @@ def test_save_load_roundtrip(manifest_file):
                 "branch": "main",
             }
         ],
-        "removed": ["foo@bar"],
+        "removed": [{"spec": "foo@bar", "scope": "user"}],
         "marketplaces": {},
     }
     plugin_manifest.save(data)
@@ -74,7 +74,7 @@ def test_load_coerces_bad_member_types(manifest_file):
             {
                 "version": "x",
                 "added": [{"name": "a", "marketplace": "m"}, "junk"],
-                "removed": ["ok", 5],
+                "removed": ["ok", 5, {"spec": "p@m", "scope": "project"}],
             }
         ),
         encoding="utf-8",
@@ -82,7 +82,11 @@ def test_load_coerces_bad_member_types(manifest_file):
     data = plugin_manifest.load()
     assert data["version"] == 1
     assert data["added"] == [{"name": "a", "marketplace": "m"}]
-    assert data["removed"] == ["ok"]
+    # legacy string -> user scope; bad member dropped; dict form preserved
+    assert data["removed"] == [
+        {"spec": "ok", "scope": "user"},
+        {"spec": "p@m", "scope": "project"},
+    ]
 
 
 def test_spec_for():
@@ -90,9 +94,9 @@ def test_spec_for():
     assert plugin_manifest.spec_for("octo", "") == "octo"
 
 
-def test_add_plugin_upsert_and_unmark_removed(manifest_file):
+def test_add_plugin_upsert_same_scope_and_unmark_removed(manifest_file):
     spec = "octo@nyldn-plugins"
-    plugin_manifest.mark_removed(spec)
+    plugin_manifest.mark_removed(spec, "user")
     plugin_manifest.add_plugin(
         repo="https://example.com/x.git",
         name="octo",
@@ -100,39 +104,54 @@ def test_add_plugin_upsert_and_unmark_removed(manifest_file):
         scope="user",
         branch="main",
     )
-    # add a second time with a different branch -> upsert (no duplicate)
+    # re-add at the SAME scope with a different branch -> upsert (no duplicate)
     plugin_manifest.add_plugin(
         repo="https://example.com/x.git",
         name="octo",
         marketplace="nyldn-plugins",
-        scope="project",
+        scope="user",
         branch="dev",
     )
     added = plugin_manifest.list_added()
     assert len(added) == 1
-    assert added[0]["scope"] == "project"
     assert added[0]["branch"] == "dev"
-    # add_plugin cleared the removed mark
-    assert spec not in plugin_manifest.list_removed()
+    # add_plugin cleared the (spec, user) removed mark
+    assert plugin_manifest.list_removed() == []
 
 
-def test_remove_added(manifest_file):
-    plugin_manifest.add_plugin(
-        repo="r", name="octo", marketplace="nyldn-plugins", scope="user", branch="main"
-    )
-    plugin_manifest.remove_added("octo@nyldn-plugins")
-    assert plugin_manifest.list_added() == []
+def test_add_plugin_distinct_scopes_coexist(manifest_file):
+    # The same plugin installed at two scopes is two managed entries (scope is
+    # part of the identity), so both replay on startup.
+    for sc in ("user", "project"):
+        plugin_manifest.add_plugin(
+            repo="r", name="octo", marketplace="m", scope=sc, branch="main"
+        )
+    scopes = sorted(e["scope"] for e in plugin_manifest.list_added())
+    assert scopes == ["project", "user"]
+
+
+def test_remove_added_is_scope_specific(manifest_file):
+    for sc in ("user", "project"):
+        plugin_manifest.add_plugin(
+            repo="r", name="octo", marketplace="m", scope=sc, branch="main"
+        )
+    plugin_manifest.remove_added("octo@m", "user")
+    remaining = plugin_manifest.list_added()
+    assert [e["scope"] for e in remaining] == ["project"]
     # no-op when absent
-    plugin_manifest.remove_added("missing@x")
+    plugin_manifest.remove_added("missing@x", "user")
 
 
 def test_mark_unmark_removed_idempotent(manifest_file):
-    plugin_manifest.mark_removed("foo@bar")
-    plugin_manifest.mark_removed("foo@bar")
-    assert plugin_manifest.list_removed() == ["foo@bar"]
-    plugin_manifest.unmark_removed("foo@bar")
-    plugin_manifest.unmark_removed("foo@bar")
-    assert plugin_manifest.list_removed() == []
+    plugin_manifest.mark_removed("foo@bar", "project")
+    plugin_manifest.mark_removed("foo@bar", "project")
+    assert plugin_manifest.list_removed() == [{"spec": "foo@bar", "scope": "project"}]
+    # a different scope is a distinct removal
+    plugin_manifest.mark_removed("foo@bar", "user")
+    assert len(plugin_manifest.list_removed()) == 2
+    plugin_manifest.unmark_removed("foo@bar", "project")
+    plugin_manifest.unmark_removed("foo@bar", "project")
+    assert plugin_manifest.list_removed() == [{"spec": "foo@bar", "scope": "user"}]
 
 
 def test_remove_marketplace_entries(manifest_file):

@@ -51,6 +51,26 @@ def _defaults() -> dict:
     return {"version": 1, "added": [], "removed": [], "marketplaces": {}}
 
 
+def _normalize_removed(removed) -> list:
+    """Coerce ``removed`` into a list of ``{"spec","scope"}`` dicts.
+
+    scope is part of a plugin's identity (claude stores one registry entry per
+    scope), so a removal must remember which scope it targeted. Legacy spec-only
+    strings are read as ``user`` scope for backward tolerance.
+    """
+    if not isinstance(removed, list):
+        return []
+    out = []
+    for r in removed:
+        if isinstance(r, dict) and isinstance(r.get("spec"), str) and r["spec"]:
+            scope = r.get("scope")
+            scope = scope if isinstance(scope, str) and scope else "user"
+            out.append({"spec": r["spec"], "scope": scope})
+        elif isinstance(r, str) and r:
+            out.append({"spec": r, "scope": "user"})
+    return out
+
+
 def load() -> dict:
     """Return a well-formed manifest; corrupt/missing -> defaults, never raises."""
     path = manifest_path()
@@ -70,10 +90,7 @@ def load() -> dict:
         added = []
     else:
         added = [e for e in added if isinstance(e, dict)]
-    if not isinstance(removed, list):
-        removed = []
-    else:
-        removed = [s for s in removed if isinstance(s, str)]
+    removed = _normalize_removed(removed)
     marketplaces = data.get("marketplaces")
     if not isinstance(marketplaces, dict):
         marketplaces = {}
@@ -134,40 +151,60 @@ def add_plugin(
         added = [
             e
             for e in data["added"]
-            if spec_for(e.get("name", ""), e.get("marketplace", "")) != spec
+            if not (
+                spec_for(e.get("name", ""), e.get("marketplace", "")) == spec
+                and e.get("scope") == scope
+            )
         ]
         added.append(entry)
         data["added"] = added
-        data["removed"] = [s for s in data["removed"] if s != spec]
+        data["removed"] = [
+            r
+            for r in data["removed"]
+            if not (r["spec"] == spec and r["scope"] == scope)
+        ]
         save(data)
 
 
-def remove_added(spec: str) -> None:
-    """Drop the ``added`` entry matching ``spec`` (no-op if absent)."""
+def remove_added(spec: str, scope: str) -> None:
+    """Drop the ``added`` entry matching (``spec``, ``scope``); no-op if absent.
+
+    scope is part of the identity: the same plugin can be installed at more than
+    one scope, each a distinct managed entry.
+    """
     with _lock:
         data = load()
         data["added"] = [
             e
             for e in data["added"]
-            if spec_for(e.get("name", ""), e.get("marketplace", "")) != spec
+            if not (
+                spec_for(e.get("name", ""), e.get("marketplace", "")) == spec
+                and e.get("scope") == scope
+            )
         ]
         save(data)
 
 
-def mark_removed(spec: str) -> None:
-    """Record ``spec`` as admin-removed (idempotent)."""
+def mark_removed(spec: str, scope: str) -> None:
+    """Record (``spec``, ``scope``) as admin-removed (idempotent)."""
     with _lock:
         data = load()
-        if spec not in data["removed"]:
-            data["removed"].append(spec)
+        if not any(
+            r["spec"] == spec and r["scope"] == scope for r in data["removed"]
+        ):
+            data["removed"].append({"spec": spec, "scope": scope})
         save(data)
 
 
-def unmark_removed(spec: str) -> None:
-    """Clear the admin-removed mark for ``spec`` (idempotent)."""
+def unmark_removed(spec: str, scope: str) -> None:
+    """Clear the admin-removed mark for (``spec``, ``scope``) (idempotent)."""
     with _lock:
         data = load()
-        data["removed"] = [s for s in data["removed"] if s != spec]
+        data["removed"] = [
+            r
+            for r in data["removed"]
+            if not (r["spec"] == spec and r["scope"] == scope)
+        ]
         save(data)
 
 

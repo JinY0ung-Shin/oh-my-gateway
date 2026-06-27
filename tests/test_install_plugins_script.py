@@ -740,6 +740,43 @@ def test_manifest_removed_spec_is_skipped_and_uninstalled(tmp_path):
     assert "plugin install keepplug@envmkt --scope user" in claude_log
 
 
+def test_manifest_removed_honors_scope(tmp_path):
+    # A project-scope env plugin removed via the admin panel must be uninstalled
+    # at --scope project on startup (a --scope user uninstall would fail and
+    # leave it installed), and skipped from reinstall only at that scope.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "added": [],
+                "removed": [{"spec": "envplug@envmkt", "scope": "project"}],
+            }
+        )
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+        "CLAUDE_PLUGIN_SCOPE_1": "project",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    assert "plugin uninstall envplug@envmkt --scope project" in claude_log
+    assert "plugin install envplug@envmkt" not in claude_log
+
+
 def test_manifest_removed_uninstall_failure_does_not_block_startup(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
