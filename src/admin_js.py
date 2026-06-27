@@ -638,7 +638,7 @@ def get_admin_js() -> str:
       try {
         const r = await this.api('/admin/api/plugins', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ name: plug.name, marketplace: m.name, scope: 'user' })
+          body: JSON.stringify({ name: plug.name, marketplace: m.name, scope: m.scope || 'user' })
         });
         if (r.ok) {
           this.showToast('PLUGIN INSTALLED: ' + plug.name, 'ok');

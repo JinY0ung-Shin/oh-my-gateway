@@ -1,6 +1,7 @@
 """Tests for the persistent managed plugin manifest."""
 
 import json
+import threading
 
 import pytest
 
@@ -170,6 +171,29 @@ def test_remove_marketplace_entries_drops_record(manifest_file):
     plugin_manifest.remove_marketplace_entries("mkt1")
     assert plugin_manifest.get_marketplace("mkt1") == {}
     assert plugin_manifest.list_added() == []
+
+
+def test_concurrent_add_plugin_no_lost_updates(manifest_file):
+    # Concurrent admin mutations (run_in_threadpool) must not clobber each
+    # other: each add_plugin is a read-modify-write that has to run under the
+    # lock, else two requests read the same manifest and the last save wins.
+    n = 12
+    barrier = threading.Barrier(n)
+
+    def worker(i):
+        barrier.wait()  # force all writers to contend at once
+        plugin_manifest.add_plugin(
+            repo="r", name=f"p{i}", marketplace="m", scope="user", branch="main"
+        )
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    names = sorted(e["name"] for e in plugin_manifest.list_added())
+    assert names == sorted(f"p{i}" for i in range(n))
 
 
 def test_save_creates_parent_dirs(tmp_path, monkeypatch):

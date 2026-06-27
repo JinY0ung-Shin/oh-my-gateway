@@ -25,11 +25,15 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from threading import Lock
+from threading import RLock
 
 logger = logging.getLogger(__name__)
 
-_lock = Lock()
+# Reentrant so a mutator can hold the lock across its whole read-modify-write
+# while still calling save() (which re-acquires it). This serializes concurrent
+# admin mutations — run_in_threadpool can issue several at once — so two requests
+# can't both read the same manifest and clobber each other's entry.
+_lock = RLock()
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DEFAULT_PATH = _DATA_DIR / "gateway-plugins.json"
@@ -125,50 +129,57 @@ def add_plugin(
         "scope": scope,
         "branch": branch,
     }
-    data = load()
-    added = [
-        e
-        for e in data["added"]
-        if spec_for(e.get("name", ""), e.get("marketplace", "")) != spec
-    ]
-    added.append(entry)
-    data["added"] = added
-    data["removed"] = [s for s in data["removed"] if s != spec]
-    save(data)
+    with _lock:
+        data = load()
+        added = [
+            e
+            for e in data["added"]
+            if spec_for(e.get("name", ""), e.get("marketplace", "")) != spec
+        ]
+        added.append(entry)
+        data["added"] = added
+        data["removed"] = [s for s in data["removed"] if s != spec]
+        save(data)
 
 
 def remove_added(spec: str) -> None:
     """Drop the ``added`` entry matching ``spec`` (no-op if absent)."""
-    data = load()
-    data["added"] = [
-        e
-        for e in data["added"]
-        if spec_for(e.get("name", ""), e.get("marketplace", "")) != spec
-    ]
-    save(data)
+    with _lock:
+        data = load()
+        data["added"] = [
+            e
+            for e in data["added"]
+            if spec_for(e.get("name", ""), e.get("marketplace", "")) != spec
+        ]
+        save(data)
 
 
 def mark_removed(spec: str) -> None:
     """Record ``spec`` as admin-removed (idempotent)."""
-    data = load()
-    if spec not in data["removed"]:
-        data["removed"].append(spec)
-    save(data)
+    with _lock:
+        data = load()
+        if spec not in data["removed"]:
+            data["removed"].append(spec)
+        save(data)
 
 
 def unmark_removed(spec: str) -> None:
     """Clear the admin-removed mark for ``spec`` (idempotent)."""
-    data = load()
-    data["removed"] = [s for s in data["removed"] if s != spec]
-    save(data)
+    with _lock:
+        data = load()
+        data["removed"] = [s for s in data["removed"] if s != spec]
+        save(data)
 
 
 def remove_marketplace_entries(marketplace: str) -> None:
     """Drop a marketplace's ``added`` entries and its marketplace record."""
-    data = load()
-    data["added"] = [e for e in data["added"] if e.get("marketplace") != marketplace]
-    data["marketplaces"].pop(marketplace, None)
-    save(data)
+    with _lock:
+        data = load()
+        data["added"] = [
+            e for e in data["added"] if e.get("marketplace") != marketplace
+        ]
+        data["marketplaces"].pop(marketplace, None)
+        save(data)
 
 
 def set_marketplace(name: str, *, repo: str, branch: str, scope: str) -> None:
@@ -178,9 +189,10 @@ def set_marketplace(name: str, *, repo: str, branch: str, scope: str) -> None:
     given a local clone path (and records ``source: directory``), so startup can
     re-clone it after a volume wipe and the UI knows the marketplace's scope.
     """
-    data = load()
-    data["marketplaces"][name] = {"repo": repo, "branch": branch, "scope": scope}
-    save(data)
+    with _lock:
+        data = load()
+        data["marketplaces"][name] = {"repo": repo, "branch": branch, "scope": scope}
+        save(data)
 
 
 def get_marketplace(name: str) -> dict:
