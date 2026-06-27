@@ -41,6 +41,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional
+from urllib.parse import urlsplit
 
 from . import plugin_manifest
 
@@ -249,6 +250,22 @@ def _validate_repo(repo: str) -> str:
     if _has_shell_metacharacters(repo):
         raise PluginAdminError(f"invalid repo {repo!r}: contains illegal characters")
 
+    # Reject credentials embedded in an http(s) URL (e.g.
+    # https://user:token@host/... or https://TOKEN@host/...). The repo string is
+    # stored in the manifest, returned in the API response, and printed in clone
+    # error logs, so a secret there would leak; use the git_token field instead.
+    scheme = repo.split("://", 1)[0].lower() if "://" in repo else ""
+    if scheme in ("http", "https"):
+        try:
+            parts = urlsplit(repo)
+        except ValueError:
+            parts = None
+        if parts is not None and (parts.username or parts.password):
+            raise PluginAdminError(
+                "invalid repo: credentials must not be embedded in the URL; "
+                "use the git_token field for a private repo"
+            )
+
     # Accept common remote forms: http(s)://, git://, ssh://, and scp-like
     # git@host:org/repo.git.
     if re.match(r"^(https?|git|ssh)://[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]+$", repo):
@@ -451,32 +468,37 @@ def add_marketplace(
 
 
 def remove_marketplace(name: str, *, scope: str = "user") -> dict:
-    """Remove a configured marketplace and drop its managed ``added`` entries."""
+    """Remove a configured marketplace and drop its managed ``added`` entries.
+
+    known_marketplaces.json does not record a marketplace's scope, so an
+    env-added project/local marketplace has no manifest record and the UI can
+    only guess ``user``. Try the requested scope first, then the others, so a
+    ``[DEL]`` on such a marketplace still removes it at its real scope.
+    """
     name = _validate_name(name, what="marketplace name")
     scope = _validate_scope(scope)
     claude_bin = _require_claude_bin()
 
-    try:
-        run(
-            [
-                claude_bin,
-                "plugin",
-                "marketplace",
-                "remove",
-                name,
-                "--scope",
-                scope,
-            ]
-        )
-    except subprocess.CalledProcessError as exc:
+    scopes = [scope] + [s for s in ("user", "project", "local") if s != scope]
+    last_rc = None
+    removed_scope = None
+    for sc in scopes:
+        try:
+            run([claude_bin, "plugin", "marketplace", "remove", name, "--scope", sc])
+            removed_scope = sc
+            break
+        except subprocess.CalledProcessError as exc:
+            last_rc = exc.returncode
+
+    if removed_scope is None:
         raise PluginAdminError(
             f"claude plugin marketplace remove failed for {name!r} "
-            f"(scope {scope}): rc={exc.returncode}"
-        ) from exc
+            f"(tried scopes {scopes}): rc={last_rc}"
+        )
 
     plugin_manifest.remove_marketplace_entries(name)
 
-    return {"status": "removed", "marketplace": name, "scope": scope}
+    return {"status": "removed", "marketplace": name, "scope": removed_scope}
 
 
 def install_plugin(
@@ -574,19 +596,11 @@ def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
             f"rc={exc.returncode}"
         ) from exc
 
-    # scope is part of the identity: only drop the managed entry for THIS scope,
-    # and mark removed at THIS scope (so startup uninstalls it at the right scope
-    # and leaves any other-scope install of the same plugin untouched).
-    added_keys = {
-        (
-            plugin_manifest.spec_for(e.get("name", ""), e.get("marketplace", "")),
-            e.get("scope"),
-        )
-        for e in plugin_manifest.list_added()
-    }
-    if (spec, scope) in added_keys:
-        plugin_manifest.remove_added(spec, scope)
-    else:
-        plugin_manifest.mark_removed(spec, scope)
+    # scope is part of the identity. Drop any managed entry for THIS (spec,
+    # scope) AND always record the removal: if the same plugin is also declared
+    # by the env bootstrap, only the recorded removal stops startup from
+    # resurrecting it. A later admin re-install clears the mark via add_plugin.
+    plugin_manifest.remove_added(spec, scope)
+    plugin_manifest.mark_removed(spec, scope)
 
     return {"status": "uninstalled", "plugin": spec, "scope": scope}

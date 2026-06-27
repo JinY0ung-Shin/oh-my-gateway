@@ -399,35 +399,37 @@ def test_uninstall_managed_plugin_removes_added(
         "--scope",
         "user",
     ]
+    # uninstall always drops any managed entry AND records the removal, so an
+    # env-bootstrap declaration of the same plugin can't resurrect it on restart.
     assert fake_manifest.remove_added_calls == [("octo@nyldn-plugins", "user")]
-    assert fake_manifest.mark_removed_calls == []
+    assert fake_manifest.mark_removed_calls == [("octo@nyldn-plugins", "user")]
 
 
 def test_uninstall_env_plugin_marks_removed(fake_claude, recorded_runs, fake_manifest):
-    # Not present in manifest.added -> it came from env bootstrap.
+    # Not present in manifest.added -> remove_added is a harmless no-op, but the
+    # removal is still recorded so startup skips/uninstalls it.
     fake_manifest.added_entries = []
     result = svc.uninstall_plugin("telegram@other-mkt")
 
     assert result["status"] == "uninstalled"
     assert fake_manifest.mark_removed_calls == [("telegram@other-mkt", "user")]
-    assert fake_manifest.remove_added_calls == []
+    assert fake_manifest.remove_added_calls == [("telegram@other-mkt", "user")]
 
 
-def test_uninstall_is_scope_specific(fake_claude, recorded_runs, fake_manifest):
-    # Same plugin managed only at project scope; uninstalling the user-scope
-    # install must NOT drop the project managed entry — it marks (spec, user)
-    # removed instead, and uninstalls at the requested scope.
+def test_uninstall_records_at_requested_scope(fake_claude, recorded_runs, fake_manifest):
+    # scope is part of the identity: uninstall targets and records the requested
+    # scope, leaving any other-scope install of the same plugin untouched.
     fake_manifest.added_entries = [
         {"name": "octo", "marketplace": "m", "scope": "project"}
     ]
     svc.uninstall_plugin("octo@m", scope="user")
     assert recorded_runs[-1]["cmd"][-2:] == ["--scope", "user"]
-    assert fake_manifest.remove_added_calls == []
+    assert fake_manifest.remove_added_calls == [("octo@m", "user")]
     assert fake_manifest.mark_removed_calls == [("octo@m", "user")]
 
-    # Uninstalling the managed project install drops exactly that entry.
     svc.uninstall_plugin("octo@m", scope="project")
-    assert fake_manifest.remove_added_calls == [("octo@m", "project")]
+    assert ("octo@m", "project") in fake_manifest.remove_added_calls
+    assert ("octo@m", "project") in fake_manifest.mark_removed_calls
 
 
 def test_uninstall_cli_failure_raises(monkeypatch, fake_claude, fake_manifest):
@@ -483,6 +485,41 @@ def test_add_marketplace_rejects_injection_repo(
     with pytest.raises(svc.PluginAdminError):
         svc.add_marketplace(bad)
     assert calls == []
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "https://user:token@host/o/r.git",
+        "https://ghp_secrettoken@github.com/o/r.git",
+        "http://x:y@host/o/r.git",
+    ],
+)
+def test_add_marketplace_rejects_credential_url(
+    monkeypatch, bad, fake_claude, fake_manifest
+):
+    # Credentials in the URL would leak into the manifest/response/logs; reject
+    # before any subprocess and steer the caller to the git_token field.
+    calls = []
+    monkeypatch.setattr(svc, "run", lambda cmd, **kw: calls.append(cmd))
+    with pytest.raises(svc.PluginAdminError):
+        svc.add_marketplace(bad)
+    assert calls == []
+    assert fake_manifest.set_marketplace_calls == []
+
+
+def test_remove_marketplace_best_effort_scope(monkeypatch, fake_claude, fake_manifest):
+    # An env-added project marketplace has no manifest scope record, so the UI
+    # sends user; removal falls back across scopes and succeeds at project.
+    def fake_run(cmd, *, token=""):
+        if cmd[-2:] == ["--scope", "user"]:
+            raise subprocess.CalledProcessError(1, cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(svc, "run", fake_run)
+    result = svc.remove_marketplace("envmkt", scope="user")
+    assert result["scope"] == "project"
+    assert fake_manifest.remove_marketplace_calls == ["envmkt"]
 
 
 @pytest.mark.parametrize("bad", INJECTION)
