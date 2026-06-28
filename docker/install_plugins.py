@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -299,6 +300,31 @@ def env_journal_path() -> Path:
     return manifest_path().with_name("gateway-plugins-env.json")
 
 
+def _strip_url_credentials(repo: str) -> str:
+    """Remove embedded credentials from an http(s) repo URL before journaling.
+
+    A deployment may put a token in ``CLAUDE_PLUGIN_REPO*`` (e.g.
+    ``https://user:token@host/org/repo.git``); git uses it to clone, but it must
+    not be persisted to the journal (which the app reads and replays into the
+    manifest/API). Strip the userinfo here — replay credentials come from
+    ``CLAUDE_PLUGIN_GIT_TOKEN*``. Non-http(s) values are returned unchanged.
+    """
+    repo = (repo or "").strip()
+    scheme = repo.split("://", 1)[0].lower() if "://" in repo else ""
+    if scheme not in ("http", "https"):
+        return repo
+    try:
+        parts = urlsplit(repo)
+    except ValueError:
+        return repo
+    if not (parts.username or parts.password):
+        return repo
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
 def _marketplace_name_for(local_path: Path, entry: PluginEntry) -> str:
     """Resolve the name claude keys this marketplace by (its marketplace.json name).
 
@@ -340,7 +366,8 @@ def write_env_journal(entries: List[PluginEntry], root: Path) -> None:
         records[name] = {
             "scope": entry.scope,
             "branch": entry.branch,
-            "repo": entry.repo,
+            # Never persist credentials embedded in the repo URL to the journal.
+            "repo": _strip_url_credentials(entry.repo),
         }
     payload = {"version": 1, "marketplaces": records}
     path = env_journal_path()

@@ -367,6 +367,51 @@ def test_resolve_marketplace_repo_unknown_returns_empty(monkeypatch, tmp_path):
     assert svc._resolve_marketplace_repo("nope") == ""
 
 
+def test_strip_url_credentials():
+    f = svc._strip_url_credentials
+    # http(s) userinfo (user:token and token-only) is removed
+    assert f("https://user:tok@host/org/r.git") == "https://host/org/r.git"
+    assert f("https://tok@host/org/r.git") == "https://host/org/r.git"
+    assert f("http://u:p@host:8443/r") == "http://host:8443/r"
+    # clean / non-http(s) values are untouched (ssh user is not a secret)
+    assert f("https://host/org/r.git") == "https://host/org/r.git"
+    assert f("ssh://git@host/org/r.git") == "ssh://git@host/org/r.git"
+    assert f("git@host:org/r.git") == "git@host:org/r.git"
+    assert f("/clones/local-mkt") == "/clones/local-mkt"
+    assert f("") == ""
+
+
+def test_resolve_marketplace_repo_strips_journal_credentials(monkeypatch, tmp_path):
+    from src import plugin_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
+    monkeypatch.setattr(
+        plugin_service,
+        "env_bootstrap_records",
+        lambda: {"m": {"repo": "https://user:tok@host/o/r.git"}},
+    )
+    assert svc._resolve_marketplace_repo("m") == "https://host/o/r.git"
+
+
+def test_resolve_marketplace_repo_strips_known_marketplaces_credentials(
+    monkeypatch, tmp_path
+):
+    import json as _json
+
+    plugins_dir = tmp_path / ".claude" / "plugins"
+    plugins_dir.mkdir(parents=True)
+    (plugins_dir / "known_marketplaces.json").write_text(
+        _json.dumps(
+            {"m": {"source": {"source": "git", "url": "https://t@git.example/m.git"}}}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
+    assert svc._resolve_marketplace_repo("m") == "https://git.example/m.git"
+
+
 def test_resolve_marketplace_repo_falls_back_to_env_journal(monkeypatch, tmp_path):
     # An env-bootstrapped marketplace (clone-then-add records source: directory)
     # has no remote in known_marketplaces.json; the startup installer's journal

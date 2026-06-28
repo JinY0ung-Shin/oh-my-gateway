@@ -41,7 +41,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Optional
-from urllib.parse import urlsplit
+from urllib.parse import urlsplit, urlunsplit
 
 from . import plugin_manifest
 
@@ -374,6 +374,34 @@ def _marketplace_name_from_clone(local_path: Path, repo: str) -> str:
     return _default_name(repo)
 
 
+def _strip_url_credentials(repo: str) -> str:
+    """Remove embedded credentials from an http(s) repo URL.
+
+    ``_validate_repo`` rejects credential URLs on the interactive admin-add path,
+    but env-bootstrap (``CLAUDE_PLUGIN_REPO*``) and ``known_marketplaces.json``
+    fallbacks are not validated, so a ``https://user:token@host/...`` value could
+    otherwise be persisted to the journal/manifest and returned by the admin API.
+    Strip the userinfo before storing/returning; replay credentials must come
+    from ``CLAUDE_PLUGIN_GIT_TOKEN*``, never the URL. Non-http(s) values (ssh,
+    scp-like ``git@host:org/repo``, local paths) are returned unchanged — their
+    userinfo is the ssh login, not a secret. Never raises.
+    """
+    repo = (repo or "").strip()
+    scheme = repo.split("://", 1)[0].lower() if "://" in repo else ""
+    if scheme not in ("http", "https"):
+        return repo
+    try:
+        parts = urlsplit(repo)
+    except ValueError:
+        return repo
+    if not (parts.username or parts.password):
+        return repo
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
 def _env_marketplace_record(marketplace: str) -> dict:
     """Env-bootstrap journal record (``{scope, branch, repo}``) for *marketplace*.
 
@@ -402,7 +430,14 @@ def _resolve_marketplace_repo(marketplace: str) -> str:
     ``~/.claude/plugins/known_marketplaces.json`` (converting a GitHub
     ``owner/repo`` shorthand to a clone URL) for env/externally-added
     marketplaces. Returns ``""`` when nothing replayable is found. Never raises.
+
+    Any embedded http(s) credential is stripped before returning, since the
+    result is persisted to the manifest and surfaced by the admin API.
     """
+    return _strip_url_credentials(_resolve_marketplace_repo_raw(marketplace))
+
+
+def _resolve_marketplace_repo_raw(marketplace: str) -> str:
     if not marketplace:
         return ""
     record = plugin_manifest.get_marketplace(marketplace)

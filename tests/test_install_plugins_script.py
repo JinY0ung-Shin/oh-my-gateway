@@ -309,6 +309,35 @@ def test_write_env_journal_records_real_name_scope_branch_repo(tmp_path, monkeyp
     }
 
 
+def test_strip_url_credentials_installer():
+    f = installer._strip_url_credentials
+    assert f("https://user:tok@host/o/r.git") == "https://host/o/r.git"
+    assert f("https://tok@host/o/r.git") == "https://host/o/r.git"
+    assert f("ssh://git@host/o/r.git") == "ssh://git@host/o/r.git"
+    assert f("/clones/local") == "/clones/local"
+
+
+def test_write_env_journal_strips_credentials_from_repo(tmp_path, monkeypatch):
+    # A token in CLAUDE_PLUGIN_REPO* is used to clone but must NEVER land in the
+    # journal (which the app replays into the manifest/API).
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+    entry = installer.PluginEntry(
+        repo="https://user:secret-token@host/org/private.git",
+        names=["p"],
+        marketplace="priv",
+        scope="user",
+        branch="main",
+        source_label="CLAUDE_PLUGIN_REPO_1",
+    )
+    installer.write_env_journal([entry], tmp_path)
+    raw = journal.read_text()
+    assert "secret-token" not in raw
+    assert json.loads(raw)["marketplaces"]["priv"]["repo"] == (
+        "https://host/org/private.git"
+    )
+
+
 def test_write_env_journal_skips_manifest_entries_and_clears(tmp_path, monkeypatch):
     journal = tmp_path / "env.json"
     monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
