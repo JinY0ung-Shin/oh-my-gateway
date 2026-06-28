@@ -76,7 +76,7 @@ def get_config_html() -> str:
         <div class="prompt-status-bar">
           <div class="prompt-status-main">
             <span class="text-xs text-muted prompt-status-label">Active prompt</span>
-            <span x-show="systemPrompt.active_name" style="color:var(--green); font-weight:600; font-size:var(--fs-sm); text-shadow: 0 0 6px var(--green-muted)" x-text="systemPrompt.active_name"></span>
+            <span x-show="systemPrompt.active_name" style="color:var(--green); font-weight:600; font-size:var(--fs-sm)" x-text="systemPrompt.active_name"></span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'preset'" style="color:var(--text-dim); font-size:var(--fs-sm)">claude_code (preset)</span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'file'" style="color:var(--cyan); font-size:var(--fs-sm)">file default (SYSTEM_PROMPT_FILE)</span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'custom'" style="color:var(--amber); font-size:var(--fs-sm)">custom (unnamed)</span>

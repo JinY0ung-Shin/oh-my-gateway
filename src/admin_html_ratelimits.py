@@ -33,7 +33,7 @@ def get_ratelimits_html() -> str:
               <div style="background:var(--bg-surface); height:4px; overflow:hidden; margin-bottom:0.75rem">
                 <div class="rate-bar-fill" :style="'width:' + Math.min(100, data.total_usage / data.limit * 100) + '%; height:100%; background:' +
                   ((data.total_usage / data.limit * 100) > 90 ? 'var(--red)' : (data.total_usage / data.limit * 100) > 70 ? 'var(--amber)' : 'var(--green)') +
-                  '; box-shadow: 0 0 6px currentColor'"></div>
+                  ''"></div>
               </div>
               <template x-if="data.clients && data.clients.length > 0">
                 <div class="table-wrapper">

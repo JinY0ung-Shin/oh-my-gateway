@@ -21,16 +21,16 @@ def get_dashboard_html() -> str:
               <div class="label">ACTIVE SESSIONS</div>
             </div>
             <div class="card stat">
-              <div class="value" style="color:var(--cyan); text-shadow: 0 0 10px var(--cyan-subtle)" x-text="summary.models?.length ?? '-'"></div>
+              <div class="value" style="color:var(--cyan)" x-text="summary.models?.length ?? '-'"></div>
               <div class="label">MODELS LOADED</div>
             </div>
             <div class="card stat">
-              <div class="value" style="color:var(--amber); text-shadow: 0 0 10px var(--amber-subtle)"
+              <div class="value" style="color:var(--amber)"
                 x-text="loading.backends ? '...' : (backendsDetail.length || '-')"></div>
               <div class="label">BACKENDS</div>
             </div>
             <div class="card stat">
-              <div class="value" :style="(metrics.stats?.error_rate ?? 0) > 0.05 ? 'color:var(--red); text-shadow: 0 0 10px var(--red-subtle)' : ''"
+              <div class="value" :style="(metrics.stats?.error_rate ?? 0) > 0.05 ? 'color:var(--red)' : ''"
                 x-text="((metrics.stats?.error_rate ?? 0) * 100).toFixed(1) + '%'"></div>
               <div class="label">ERROR RATE</div>
             </div>
