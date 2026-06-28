@@ -367,6 +367,51 @@ def test_resolve_marketplace_repo_unknown_returns_empty(monkeypatch, tmp_path):
     assert svc._resolve_marketplace_repo("nope") == ""
 
 
+def test_resolve_marketplace_repo_falls_back_to_env_journal(monkeypatch, tmp_path):
+    # An env-bootstrapped marketplace (clone-then-add records source: directory)
+    # has no remote in known_marketplaces.json; the startup installer's journal
+    # supplies it so the catalog-install manifest entry stays replayable.
+    from src import plugin_service
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
+    monkeypatch.setattr(
+        plugin_service,
+        "env_bootstrap_records",
+        lambda: {"envmkt": {"scope": "project", "branch": "dev", "repo": "o/r.git"}},
+    )
+    assert svc._resolve_marketplace_repo("envmkt") == "o/r.git"
+
+
+def test_catalog_install_from_env_marketplace_replays_branch_and_repo(
+    monkeypatch, fake_claude, recorded_runs, fake_manifest
+):
+    # Catalog install from an env-bootstrapped (non-main) marketplace must record
+    # the journaled branch + remote, not the main/local defaults, so a `down -v`
+    # self-heal clones the same content.
+    from src import plugin_service
+
+    monkeypatch.setattr(
+        plugin_service,
+        "env_bootstrap_records",
+        lambda: {
+            "envmkt": {
+                "scope": "project",
+                "branch": "develop",
+                "repo": "https://host/o/r.git",
+            }
+        },
+    )
+    svc.install_plugin("octo", marketplace="envmkt", scope="project")
+    assert fake_manifest.add_plugin_calls[-1] == {
+        "repo": "https://host/o/r.git",
+        "name": "octo",
+        "marketplace": "envmkt",
+        "scope": "project",
+        "branch": "develop",
+    }
+
+
 def test_install_plugin_cli_failure_raises(monkeypatch, fake_claude, fake_manifest):
     def boom(cmd, *, token=""):
         raise subprocess.CalledProcessError(2, cmd)

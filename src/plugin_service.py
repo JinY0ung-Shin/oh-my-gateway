@@ -309,16 +309,21 @@ def _parse_plugin_id(plugin_key: str) -> Tuple[str, str]:
 
 
 def _entry_index_for_scope(entries: list, scope: Optional[str]) -> int:
-    """Index of the registry entry matching *scope*, or 0 when unspecified/absent.
+    """Index of the registry entry matching *scope*.
 
-    The registry stores one entry per scope under a plugin id, so a scope-aware
-    caller picks the right one rather than always reading ``entries[0]``.
+    The registry stores one entry per scope under a plugin id. With no *scope*,
+    returns the first entry (``0``). With an explicit *scope*, returns the
+    matching entry's index, or ``-1`` when no entry has that scope — so a
+    scope-specific request 404s instead of silently reading another scope's
+    install path/content.
     """
-    if scope and isinstance(entries, list):
+    if not scope:
+        return 0
+    if isinstance(entries, list):
         for i, e in enumerate(entries):
             if isinstance(e, dict) and e.get("scope") == scope:
                 return i
-    return 0
+    return -1
 
 
 def _resolve_plugin_entry(
@@ -538,12 +543,78 @@ def _marketplace_records() -> Dict[str, Any]:
         return {}
 
 
-def _marketplace_scope(marketplace_name: str, records: Optional[Dict] = None) -> str:
-    """Scope a marketplace was added at (from the manifest), defaulting to user."""
+def _env_journal_path() -> Optional[Path]:
+    """Path of the startup installer's env-bootstrap marketplace journal.
+
+    Lives beside the managed manifest; overridable with
+    ``CLAUDE_PLUGIN_ENV_JOURNAL`` (kept in sync with ``docker/install_plugins.py``).
+    """
+    configured = os.environ.get("CLAUDE_PLUGIN_ENV_JOURNAL", "").strip()
+    if configured:
+        return Path(configured)
+    try:
+        from src import plugin_manifest
+
+        return plugin_manifest.manifest_path().with_name("gateway-plugins-env.json")
+    except Exception:
+        logger.debug("Failed to resolve env journal path", exc_info=True)
+        return None
+
+
+def env_bootstrap_records() -> Dict[str, Dict[str, str]]:
+    """Marketplace name -> ``{scope, branch, repo}`` from the startup installer.
+
+    Env-bootstrapped marketplaces (``CLAUDE_PLUGIN_*``) have no admin manifest
+    record, and ``known_marketplaces.json`` persists neither their scope/branch
+    nor their original remote (a clone-then-add marketplace records only the
+    local path). ``docker/install_plugins.py`` journals that metadata, keyed by
+    the marketplace's real ``marketplace.json`` name, so the app can recover it
+    for catalog availability, install scope, and replay branch/repo. Returns
+    ``{}`` when the journal is absent/corrupt; never raises.
+    """
+    path = _env_journal_path()
+    if path is None:
+        return {}
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return {}
+    records = data.get("marketplaces")
+    if not isinstance(records, dict):
+        return {}
+    out: Dict[str, Dict[str, str]] = {}
+    for name, rec in records.items():
+        if isinstance(name, str) and name and isinstance(rec, dict):
+            out[name] = {
+                "scope": str(rec.get("scope") or "user"),
+                "branch": str(rec.get("branch") or "main"),
+                "repo": str(rec.get("repo") or ""),
+            }
+    return out
+
+
+def _marketplace_scope(
+    marketplace_name: str,
+    records: Optional[Dict] = None,
+    env_records: Optional[Dict] = None,
+) -> str:
+    """Scope a marketplace was added at, defaulting to user.
+
+    The admin manifest is authoritative; for an env-bootstrapped marketplace
+    (no manifest record) the startup installer's journal supplies the scope it
+    was added with, so catalog install/availability/delete target the right
+    scope instead of always assuming ``user``.
+    """
     if records is None:
         records = _marketplace_records()
     record = records.get(marketplace_name)
-    return record.get("scope", "user") if isinstance(record, dict) else "user"
+    if isinstance(record, dict) and record.get("scope"):
+        return record["scope"]
+    if env_records is None:
+        env_records = env_bootstrap_records()
+    env = env_records.get(marketplace_name)
+    if isinstance(env, dict) and env.get("scope"):
+        return env["scope"]
+    return "user"
 
 
 def list_marketplaces() -> List[Dict[str, Any]]:
@@ -556,12 +627,13 @@ def list_marketplaces() -> List[Dict[str, Any]]:
         return []
 
     records = _marketplace_records()
+    env_records = env_bootstrap_records()
     results: List[Dict[str, Any]] = []
     for name, info in data.items():
         if not isinstance(info, dict):
             continue
         source = info.get("source", {})
-        scope = _marketplace_scope(name, records)
+        scope = _marketplace_scope(name, records, env_records)
         results.append(
             {
                 "name": name,

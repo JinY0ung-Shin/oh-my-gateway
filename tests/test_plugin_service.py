@@ -455,6 +455,31 @@ class TestGetPluginDetail:
         # default (no scope) -> first entry
         assert get_plugin_detail("demo-plugin@test-mkt")["version"] == "1.0.0"
 
+    def test_explicit_scope_with_no_matching_entry_is_none(self, plugins_dir):
+        # A scope-specific request must 404 (None) rather than silently fall
+        # back to another scope's install path/content.
+        cache = plugins_dir / "cache" / "test-mkt" / "demo-plugin" / "1.0.0"
+        reg = plugins_dir / "installed_plugins.json"
+        reg.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {
+                                "scope": "user",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        assert get_plugin_detail("demo-plugin@test-mkt", "project") is None
+        # omitted scope still resolves to the first entry
+        assert get_plugin_detail("demo-plugin@test-mkt") is not None
+
     def test_existing_plugin(self, plugins_dir):
         detail = get_plugin_detail("demo-plugin@test-mkt")
         assert detail is not None
@@ -547,8 +572,92 @@ class TestListMarketplaces:
         )
         assert list_marketplaces()[0]["scope"] == "project"
 
+    def test_scope_from_env_journal_without_manifest_record(
+        self, plugins_dir, monkeypatch, tmp_path
+    ):
+        # No manifest record -> fall back to the startup installer's env journal
+        # so an env-bootstrapped marketplace keeps its declared (non-user) scope.
+        from src import plugin_manifest
+
+        monkeypatch.setattr(plugin_manifest, "list_marketplace_records", lambda: {})
+        journal = tmp_path / "gateway-plugins-env.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "marketplaces": {
+                        "test-mkt": {
+                            "scope": "project",
+                            "branch": "main",
+                            "repo": "test/marketplace",
+                        }
+                    },
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        assert list_marketplaces()[0]["scope"] == "project"
+
+    def test_manifest_record_wins_over_env_journal(
+        self, plugins_dir, monkeypatch, tmp_path
+    ):
+        from src import plugin_manifest
+
+        monkeypatch.setattr(
+            plugin_manifest,
+            "list_marketplace_records",
+            lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "local"}},
+        )
+        journal = tmp_path / "gateway-plugins-env.json"
+        journal.write_text(
+            json.dumps(
+                {"version": 1, "marketplaces": {"test-mkt": {"scope": "project"}}}
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        assert list_marketplaces()[0]["scope"] == "local"
+
     def test_no_plugins_dir(self, no_plugins_dir):
         assert list_marketplaces() == []
+
+
+class TestEnvBootstrapRecords:
+    def test_missing_journal_returns_empty(self, monkeypatch, tmp_path):
+        from src.plugin_service import env_bootstrap_records
+
+        monkeypatch.setenv(
+            "CLAUDE_PLUGIN_ENV_JOURNAL", str(tmp_path / "nope.json")
+        )
+        assert env_bootstrap_records() == {}
+
+    def test_reads_and_normalizes(self, monkeypatch, tmp_path):
+        from src.plugin_service import env_bootstrap_records
+
+        journal = tmp_path / "env.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "marketplaces": {
+                        "mkt": {"scope": "project", "branch": "dev", "repo": "o/r"},
+                        "bare": {},
+                    },
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        recs = env_bootstrap_records()
+        assert recs["mkt"] == {"scope": "project", "branch": "dev", "repo": "o/r"}
+        # missing fields default to user/main/empty
+        assert recs["bare"] == {"scope": "user", "branch": "main", "repo": ""}
+
+    def test_corrupt_journal_returns_empty(self, monkeypatch, tmp_path):
+        from src.plugin_service import env_bootstrap_records
+
+        journal = tmp_path / "env.json"
+        journal.write_text("not json{")
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        assert env_bootstrap_records() == {}
 
 
 # ---------------------------------------------------------------------------

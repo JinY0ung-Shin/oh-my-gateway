@@ -374,6 +374,23 @@ def _marketplace_name_from_clone(local_path: Path, repo: str) -> str:
     return _default_name(repo)
 
 
+def _env_marketplace_record(marketplace: str) -> dict:
+    """Env-bootstrap journal record (``{scope, branch, repo}``) for *marketplace*.
+
+    Returns ``{}`` when there is no env-bootstrapped marketplace by that name or
+    the journal is unavailable; never raises.
+    """
+    if not marketplace:
+        return {}
+    try:
+        from . import plugin_service
+
+        rec = plugin_service.env_bootstrap_records().get(marketplace)
+        return rec if isinstance(rec, dict) else {}
+    except Exception:
+        return {}
+
+
 def _resolve_marketplace_repo(marketplace: str) -> str:
     """Best-effort: resolve a registered marketplace name to a clonable repo.
 
@@ -391,6 +408,11 @@ def _resolve_marketplace_repo(marketplace: str) -> str:
     record = plugin_manifest.get_marketplace(marketplace)
     if record.get("repo", "").strip():
         return record["repo"].strip()
+    # Env-bootstrapped marketplace: the startup installer journals its remote,
+    # which known_marketplaces.json (source: directory) does not preserve.
+    env = _env_marketplace_record(marketplace)
+    if env.get("repo", "").strip():
+        return env["repo"].strip()
     home = os.environ.get("HOME", "").strip() or str(Path.home())
     known = Path(home) / ".claude" / "plugins" / "known_marketplaces.json"
     try:
@@ -552,6 +574,12 @@ def install_plugin(
         record = plugin_manifest.get_marketplace(marketplace)
         if record.get("branch", "").strip():
             manifest_branch = record["branch"].strip()
+        else:
+            # Env-bootstrapped marketplace: replay the branch it was cloned at,
+            # not the default, so a `down -v` self-heal clones the same content.
+            env = _env_marketplace_record(marketplace)
+            if env.get("branch", "").strip():
+                manifest_branch = env["branch"].strip()
     if not manifest_repo:
         logger.warning(
             "could not resolve a repo for marketplace %r; manifest entry for %r "

@@ -263,6 +263,86 @@ def test_collect_entries_empty_when_unset(monkeypatch):
     assert installer.collect_entries() == []
 
 
+def test_env_journal_path_defaults_beside_manifest(monkeypatch):
+    monkeypatch.delenv("CLAUDE_PLUGIN_ENV_JOURNAL", raising=False)
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", "/data/gw.json")
+    assert installer.env_journal_path() == Path("/data/gateway-plugins-env.json")
+
+
+def test_env_journal_path_honors_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", "/x/custom.json")
+    assert installer.env_journal_path() == Path("/x/custom.json")
+
+
+def test_write_env_journal_records_real_name_scope_branch_repo(tmp_path, monkeypatch):
+    # The journal key is the marketplace.json `name`, NOT the env declaration's
+    # repo basename, so the app can match it against known_marketplaces.json.
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+
+    clone = tmp_path / "clone"
+    (clone / ".claude-plugin").mkdir(parents=True)
+    (clone / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps({"name": "real-mkt-name", "plugins": []})
+    )
+    entry = installer.PluginEntry(
+        repo=str(clone),
+        names=["p"],
+        marketplace="",
+        scope="project",
+        branch="develop",
+        source_label="CLAUDE_PLUGIN_REPO_1",
+    )
+
+    installer.write_env_journal([entry], tmp_path)
+
+    data = json.loads(journal.read_text())
+    assert data["marketplaces"] == {
+        "real-mkt-name": {
+            "scope": "project",
+            "branch": "develop",
+            "repo": str(clone),
+        }
+    }
+
+
+def test_write_env_journal_skips_manifest_entries_and_clears(tmp_path, monkeypatch):
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+    manifest_entry = installer.PluginEntry(
+        repo="https://host/x/y.git", names=["p"], source_label="manifest"
+    )
+    installer.write_env_journal([manifest_entry], tmp_path)
+    assert json.loads(journal.read_text())["marketplaces"] == {}
+
+
+def test_write_env_journal_name_fallback_to_explicit_then_basename(
+    tmp_path, monkeypatch
+):
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+    # No marketplace.json on disk -> explicit marketplace name wins.
+    e1 = installer.PluginEntry(
+        repo=str(tmp_path / "missing1"),
+        names=["p"],
+        marketplace="explicit-mkt",
+        source_label="CLAUDE_PLUGIN_REPO_1",
+    )
+    # No marketplace.json and no explicit name -> repo basename.
+    e2 = installer.PluginEntry(
+        repo="https://host/acme/cool-mkt.git",
+        names=["q"],
+        source_label="CLAUDE_PLUGIN_REPO_2",
+    )
+    installer.write_env_journal([e1, e2], tmp_path)
+    mkts = json.loads(journal.read_text())["marketplaces"]
+    assert "explicit-mkt" in mkts
+    assert "cool-mkt" in mkts
+
+
 def test_collect_entries_drops_entry_with_uninferable_name(monkeypatch):
     for key in list(os.environ):
         if key.startswith("CLAUDE_PLUGIN"):

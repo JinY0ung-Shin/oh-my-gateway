@@ -281,6 +281,79 @@ def _spec(name: str, marketplace: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Env-bootstrap marketplace journal (consumed by the running app)
+# ---------------------------------------------------------------------------
+
+
+def env_journal_path() -> Path:
+    """Path of the env-bootstrap marketplace journal (beside the manifest).
+
+    ``known_marketplaces.json`` persists neither an env marketplace's scope/branch
+    nor its original remote (clone-then-add records only the local path). This
+    journal hands that metadata to the running app, keyed by the marketplace's
+    real ``marketplace.json`` name. Overridable with ``CLAUDE_PLUGIN_ENV_JOURNAL``.
+    """
+    configured = os.environ.get("CLAUDE_PLUGIN_ENV_JOURNAL", "").strip()
+    if configured:
+        return Path(configured)
+    return manifest_path().with_name("gateway-plugins-env.json")
+
+
+def _marketplace_name_for(local_path: Path, entry: PluginEntry) -> str:
+    """Resolve the name claude keys this marketplace by (its marketplace.json name).
+
+    Falls back to the explicit ``CLAUDE_PLUGIN_MARKETPLACE*`` value, then the repo
+    basename, so the journal always has a usable key.
+    """
+    try:
+        raw = (local_path / ".claude-plugin" / "marketplace.json").read_text(
+            encoding="utf-8"
+        )
+        data = json.loads(raw)
+        name = data.get("name") if isinstance(data, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except (OSError, ValueError):
+        pass
+    return entry.marketplace or _default_name(entry.repo)
+
+
+def write_env_journal(entries: List[PluginEntry], root: Path) -> None:
+    """Write the env-bootstrap marketplace journal (overwrites fully each run).
+
+    Only ENV-declared entries are recorded; ``manifest.added`` entries are already
+    persisted in the manifest. Best-effort: a write failure is logged, not fatal —
+    the app simply falls back to user/main defaults.
+    """
+    records: Dict[str, Dict[str, str]] = {}
+    for entry in entries:
+        if entry.source_label == "manifest" or not entry.repo:
+            continue
+        local_path = (
+            Path(entry.repo)
+            if Path(entry.repo).exists()
+            else _clone_dir(root, entry.repo)
+        )
+        name = _marketplace_name_for(local_path, entry)
+        if not name:
+            continue
+        records[name] = {
+            "scope": entry.scope,
+            "branch": entry.branch,
+            "repo": entry.repo,
+        }
+    payload = {"version": 1, "marketplaces": records}
+    path = env_journal_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f"could not write env journal {path}: {exc}")
+
+
+# ---------------------------------------------------------------------------
 # claude CLI discovery
 # ---------------------------------------------------------------------------
 
@@ -547,6 +620,7 @@ def process_entry(
 def main() -> int:
     entries = collect_entries()
     if not entries:
+        write_env_journal([], clone_root())  # clear any stale journal
         return 0  # nothing configured — no-op, same as the legacy installer
 
     total_plugins = sum(len(entry.names) for entry in entries)
@@ -572,6 +646,7 @@ def main() -> int:
         total_failed += failed
 
     apply_removed(claude_bin, removed_set)
+    write_env_journal(entries, root)
 
     log(
         f"done: {total_ok} plugin(s) ensured, {total_failed} failed, across {len(entries)} repo(s)"
