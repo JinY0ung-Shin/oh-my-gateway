@@ -64,12 +64,12 @@ def get_plugins_html() -> str:
                               style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis" x-text="plug.description"></div>
                           </div>
                           <button x-show="!plug.installed" class="btn btn-sm btn-primary"
-                            @click="installFromCatalog(m, plug)" :disabled="catalogBusy[plug.id]"
+                            @click="installFromCatalog(m, plug)" :disabled="!!catalogBusy[plug.id]"
                             aria-label="Install plugin">
                             <span x-text="catalogBusy[plug.id] ? 'Working...' : 'Install'"></span>
                           </button>
                           <button x-show="plug.installed" class="btn btn-sm btn-ghost" style="color:var(--red)"
-                            @click="uninstallFromCatalog(plug)" :disabled="catalogBusy[plug.id]"
+                            @click="uninstallFromCatalog(plug)" :disabled="!!catalogBusy[plug.id]"
                             aria-label="Uninstall plugin">
                             <span x-text="catalogBusy[plug.id] ? 'Working...' : 'Uninstall'"></span>
                           </button>

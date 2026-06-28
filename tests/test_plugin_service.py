@@ -879,6 +879,45 @@ class TestListMarketplacePlugins:
         assert plugins[0]["version"] == "2.0.0"
         assert plugins[0]["installed"] is False
 
+    def test_catalog_skill_count_scans_local_source(self, plugins_dir, monkeypatch):
+        # marketplace.json entries usually omit an explicit "skills" list; the
+        # catalog must scan the plugin's local source dir so it doesn't show
+        # "0 skills" for a plugin that actually ships skills/*/SKILL.md.
+        clone_root = plugins_dir.parent / "clones"
+        mkt_loc = clone_root / "brainy-mkt-cafe"
+        meta = mkt_loc / ".claude-plugin"
+        meta.mkdir(parents=True)
+        (meta / "marketplace.json").write_text(
+            json.dumps(
+                {
+                    "name": "brainy-mkt",
+                    "plugins": [
+                        # No "skills" field -> must be discovered from source dir.
+                        {"name": "brain", "source": "./plugins/brain"},
+                    ],
+                }
+            )
+        )
+        for skill in ("brain-search", "brain-ingest", "brain-reflect"):
+            sdir = mkt_loc / "plugins" / "brain" / "skills" / skill
+            sdir.mkdir(parents=True)
+            (sdir / "SKILL.md").write_text(f"# {skill}")
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "brainy-mkt": {
+                        "source": {"source": "directory", "path": str(mkt_loc)},
+                        "installLocation": str(mkt_loc),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(clone_root))
+
+        plugins = list_marketplace_plugins("brainy-mkt")
+        assert plugins[0]["skill_count"] == 3
+
     def test_catalog_scope_is_marketplace_scope(self, plugins_dir, monkeypatch):
         # The catalog reports the marketplace's own scope (the scope a one-click
         # install would target), and availability is judged at THAT scope.

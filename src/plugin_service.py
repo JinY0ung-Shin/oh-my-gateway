@@ -676,6 +676,29 @@ def list_marketplaces() -> List[Dict[str, Any]]:
     return results
 
 
+def _count_catalog_skills(location: Path, source: Any) -> int:
+    """Best-effort skill count for a not-yet-installed catalog plugin.
+
+    ``marketplace.json`` entries rarely declare ``skills`` explicitly, so when a
+    plugin lives in a local directory under the marketplace checkout, resolve its
+    ``source`` path and scan it the same way installed plugins are scanned (see
+    :func:`_discover_skills`). Returns 0 for remote/object sources or any path
+    that escapes the marketplace directory.
+    """
+    if not isinstance(source, str) or not source or "://" in source:
+        return 0
+    try:
+        base = location.resolve()
+        plugin_dir = (location / source).resolve()
+        if plugin_dir != base and base not in plugin_dir.parents:
+            return 0
+        if not plugin_dir.is_dir():
+            return 0
+        return len(_discover_skills(plugin_dir))
+    except Exception:
+        return 0
+
+
 def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
     """Return the plugins a marketplace offers in its catalog.
 
@@ -732,13 +755,19 @@ def list_marketplace_plugins(marketplace_name: str) -> List[Dict[str, Any]]:
             continue
         version = entry.get("version")
         skills = entry.get("skills")
+        if isinstance(skills, list):
+            skill_count = len(skills)
+        else:
+            # marketplace.json omitted an explicit skills list — scan the
+            # plugin's local source dir so the catalog matches the installed view.
+            skill_count = _count_catalog_skills(location, entry.get("source"))
         plugin_id = f"{name}@{marketplace_name}"
         results.append(
             {
                 "name": name,
                 "description": entry.get("description", ""),
                 "version": version if isinstance(version, str) else "",
-                "skill_count": len(skills) if isinstance(skills, list) else 0,
+                "skill_count": skill_count,
                 "id": plugin_id,
                 "installed": (plugin_id, mkt_scope) in installed_scoped,
                 "scope": mkt_scope,
