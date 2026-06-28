@@ -617,6 +617,34 @@ def _marketplace_scope(
     return "user"
 
 
+def _strip_url_credentials(repo: str) -> str:
+    """Remove embedded credentials from an http(s) repo URL before returning it.
+
+    ``known_marketplaces.json`` may hold a ``https://user:token@host/...`` source
+    (e.g. an externally-run ``claude plugin marketplace add`` with a credential
+    URL). The marketplace listing/catalog API surfaces this ``repo`` field, so the
+    userinfo must be stripped — a secret must never appear in an API response.
+    Non-http(s) values (ssh, scp-like ``git@host:org/repo``, local paths) are
+    returned unchanged; their userinfo is the ssh login, not a secret.
+    """
+    repo = (repo or "").strip()
+    scheme = repo.split("://", 1)[0].lower() if "://" in repo else ""
+    if scheme not in ("http", "https"):
+        return repo
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(repo)
+    except ValueError:
+        return repo
+    if not (parts.username or parts.password):
+        return repo
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
 def list_marketplaces() -> List[Dict[str, Any]]:
     """Return registered marketplace sources."""
     root = _plugins_root()
@@ -638,7 +666,9 @@ def list_marketplaces() -> List[Dict[str, Any]]:
             {
                 "name": name,
                 "source_type": source.get("source", "unknown"),
-                "repo": source.get("repo", source.get("url", "")),
+                "repo": _strip_url_credentials(
+                    source.get("repo", source.get("url", ""))
+                ),
                 "last_updated": info.get("lastUpdated"),
                 "scope": scope,
             }

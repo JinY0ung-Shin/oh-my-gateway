@@ -617,8 +617,48 @@ class TestListMarketplaces:
         monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
         assert list_marketplaces()[0]["scope"] == "local"
 
+    def test_credential_url_is_stripped_from_repo_field(self, plugins_dir):
+        # A known_marketplaces.json source.url with embedded credentials must not
+        # be surfaced verbatim by the listing/catalog API.
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "priv-mkt": {
+                        "source": {
+                            "source": "git",
+                            "url": "https://user:secret-token@host/org/priv.git",
+                        },
+                        "installLocation": str(
+                            plugins_dir / "marketplaces" / "priv-mkt"
+                        ),
+                    }
+                }
+            )
+        )
+        mkts = list_marketplaces()
+        assert mkts[0]["repo"] == "https://host/org/priv.git"
+        assert "secret-token" not in json.dumps(mkts)
+
     def test_no_plugins_dir(self, no_plugins_dir):
         assert list_marketplaces() == []
+
+
+class TestStripUrlCredentials:
+    def test_strips_http_userinfo(self):
+        from src.plugin_service import _strip_url_credentials as f
+
+        assert f("https://user:tok@host/o/r.git") == "https://host/o/r.git"
+        assert f("https://tok@host/o/r.git") == "https://host/o/r.git"
+        assert f("http://u:p@host:8443/r") == "http://host:8443/r"
+
+    def test_leaves_clean_and_non_http_untouched(self):
+        from src.plugin_service import _strip_url_credentials as f
+
+        assert f("https://host/o/r.git") == "https://host/o/r.git"
+        assert f("ssh://git@host/o/r.git") == "ssh://git@host/o/r.git"
+        assert f("git@host:o/r.git") == "git@host:o/r.git"
+        assert f("/clones/local") == "/clones/local"
+        assert f("") == ""
 
 
 class TestEnvBootstrapRecords:
