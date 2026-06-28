@@ -10,14 +10,14 @@ def get_skills_html() -> str:
             <div class="flex-between mb-sm">
               <h3 style="margin:0">Plugin Skills</h3>
             </div>
-            <p class="text-xs text-muted" style="padding-left:12px; margin:0 0 8px 0">// read-only. managed by CLI plugin system.</p>
+            <p class="text-xs text-muted" style="padding-left:12px; margin:0 0 8px 0">Read-only. Managed by the CLI plugin system.</p>
 
             <!-- Plugin skills section -->
             <template x-for="p in plugins" :key="p.id + '@' + p.scope">
               <div>
                 <!-- Plugin group header -->
                 <div class="file-item" style="cursor:pointer; opacity:0.8" @click="p._expanded = !p._expanded">
-                  <span class="text-xs" style="color:var(--amber); margin-right:4px" x-text="p._expanded ? '[-]' : '[+]'"></span>
+                  <span class="text-xs" style="color:var(--amber); margin-right:4px" x-text="p._expanded ? '-' : '+'"></span>
                   <div style="flex:1; min-width:0">
                     <div class="flex-gap-sm">
                       <span style="font-size:var(--fs-sm); font-weight:600; color:var(--amber)" x-text="p.name"></span>
@@ -50,7 +50,7 @@ def get_skills_html() -> str:
               </div>
             </template>
             <div x-show="plugins.length === 0" class="text-sm text-muted" style="padding:4px 12px">
-              [ NO PLUGINS ]
+              No plugins
             </div>
           </div>
           <div class="editor-area card">
@@ -58,7 +58,7 @@ def get_skills_html() -> str:
             <template x-if="!pluginSkillView">
               <div class="text-muted" style="padding:3rem; text-align:center">
                 <div style="font-size:2rem; margin-bottom:0.5rem; opacity:0.2">&#9881;</div>
-                select a plugin skill to view_<span class="cursor-blink"></span>
+                No skill selected
               </div>
             </template>
             <!-- Plugin skill read-only view -->
@@ -72,7 +72,7 @@ def get_skills_html() -> str:
                   </div>
                   <span class="text-xs text-muted" x-text="(pluginSkillView.content?.length || 0) + ' chars'"></span>
                 </div>
-                <p class="text-xs text-muted mb-sm">// read-only. managed by CLI plugin system.</p>
+                <p class="text-xs text-muted mb-sm">Read-only. Managed by the CLI plugin system.</p>
                 <textarea readonly :value="pluginSkillView.content || ''" class="readonly-editor"></textarea>
               </div>
             </template>

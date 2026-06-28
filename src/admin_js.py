@@ -50,7 +50,14 @@ def get_admin_js() -> str:
     newPromptNameError: '',
     newPromptNameWarning: '',
     newPromptContent: '',
-    loading: { dashboard: false, logs: false, sessions: false, usage: false },
+    loading: {
+      dashboard: false,
+      logs: false,
+      sessions: false,
+      usage: false,
+      backends: false,
+      mcp: false,
+    },
     usage: {
       enabled: null, summary: null, users: [], tools: [], turns: [],
       series: { day: [], week: [], month: [] },
@@ -131,16 +138,20 @@ def get_admin_js() -> str:
       } catch(e) { console.error('Failed to load metrics', e); this.showToast('Failed to load metrics', 'err'); }
     },
     async loadBackends() {
+      this.loading.backends = true;
       try {
         const r = await this.api('/admin/api/backends');
         if (r.ok) { const d = await r.json(); this.backendsDetail = d.backends || []; }
       } catch(e) { console.error('Failed to load backends', e); this.showToast('Failed to load backends', 'err'); }
+      finally { this.loading.backends = false; }
     },
     async loadMcpServers() {
+      this.loading.mcp = true;
       try {
         const r = await this.api('/admin/api/mcp-servers');
         if (r.ok) { const d = await r.json(); this.mcpServers = d.servers || []; }
       } catch(e) { console.error('Failed to load MCP servers', e); this.showToast('Failed to load MCP servers', 'err'); }
+      finally { this.loading.mcp = false; }
     },
 
     async loadConfig() {

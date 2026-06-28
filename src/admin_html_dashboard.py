@@ -8,10 +8,10 @@ def get_dashboard_html() -> str:
         <!-- Zone 1: Stats -->
         <template x-if="loading.dashboard">
           <div class="grid-4 mb-lg">
-            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">LOADING...</div></div>
-            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">LOADING...</div></div>
-            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">LOADING...</div></div>
-            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">LOADING...</div></div>
+            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">Loading</div></div>
+            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">Loading</div></div>
+            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">Loading</div></div>
+            <div class="card stat"><div class="skeleton skeleton-stat"></div><div class="label">Loading</div></div>
           </div>
         </template>
         <template x-if="!loading.dashboard">
@@ -25,7 +25,8 @@ def get_dashboard_html() -> str:
               <div class="label">MODELS LOADED</div>
             </div>
             <div class="card stat">
-              <div class="value" style="color:var(--amber); text-shadow: 0 0 10px var(--amber-subtle)" x-text="backendsDetail.length || '-'"></div>
+              <div class="value" style="color:var(--amber); text-shadow: 0 0 10px var(--amber-subtle)"
+                x-text="loading.backends ? '...' : (backendsDetail.length || '-')"></div>
               <div class="label">BACKENDS</div>
             </div>
             <div class="card stat">
@@ -41,9 +42,9 @@ def get_dashboard_html() -> str:
           <div class="card">
             <div class="flex-between mb-md">
               <h3 style="margin:0">Performance</h3>
-              <button class="btn btn-sm btn-ghost" @click="loadMetrics()" aria-label="Refresh metrics">[RELOAD]</button>
+              <button class="btn btn-sm btn-ghost" @click="loadMetrics()" aria-label="Refresh metrics">Reload</button>
             </div>
-            <div class="grid-3 mb-md" style="gap:0.5rem">
+            <div class="grid-3 metric-strip mb-md" style="gap:0.5rem">
               <div class="stat" style="padding:0.25rem">
                 <div class="value" style="font-size:1.3rem" x-text="metrics.stats?.total_requests ?? '-'"></div>
                 <div class="label">REQUESTS</div>
@@ -76,7 +77,10 @@ def get_dashboard_html() -> str:
           <div class="card">
             <div class="flex-between mb-md">
               <h3 style="margin:0">Backend Health</h3>
-              <button class="btn btn-sm btn-ghost" @click="loadBackends()" aria-label="Refresh backends">[RELOAD]</button>
+              <button class="btn btn-sm btn-ghost" @click="loadBackends()" aria-label="Refresh backends">Reload</button>
+            </div>
+            <div x-show="loading.backends" class="text-muted" style="text-align:center; padding:1rem">
+              Loading backend health...
             </div>
             <template x-for="b in backendsDetail" :key="b.name">
               <div style="border:1px solid var(--border); padding:0.75rem; margin-bottom:0.5rem">
@@ -106,8 +110,8 @@ def get_dashboard_html() -> str:
                 </div>
               </div>
             </template>
-            <div x-show="backendsDetail.length === 0" class="text-muted" style="text-align:center; padding:1rem">
-              [ NO BACKENDS DETECTED ]
+            <div x-show="!loading.backends && backendsDetail.length === 0" class="text-muted" style="text-align:center; padding:1rem">
+              No backends detected
             </div>
           </div>
         </div>
@@ -117,7 +121,10 @@ def get_dashboard_html() -> str:
           <div class="card">
             <div class="flex-between mb-md">
               <h3 style="margin:0">MCP Servers</h3>
-              <button class="btn btn-sm btn-ghost" @click="loadMcpServers()" aria-label="Refresh MCP servers">[RELOAD]</button>
+              <button class="btn btn-sm btn-ghost" @click="loadMcpServers()" aria-label="Refresh MCP servers">Reload</button>
+            </div>
+            <div x-show="loading.mcp" class="text-muted" style="text-align:center; padding:0.5rem">
+              Loading MCP servers...
             </div>
             <template x-for="s in mcpServers" :key="s.name">
               <div style="border:1px solid var(--border); padding:0.75rem; margin-bottom:0.5rem">
@@ -132,8 +139,8 @@ def get_dashboard_html() -> str:
                 </div>
               </div>
             </template>
-            <div x-show="mcpServers.length === 0" class="text-muted" style="text-align:center; padding:0.5rem">
-              [ NO MCP SERVERS ]
+            <div x-show="!loading.mcp && mcpServers.length === 0" class="text-muted" style="text-align:center; padding:0.5rem">
+              No MCP servers
             </div>
           </div>
 

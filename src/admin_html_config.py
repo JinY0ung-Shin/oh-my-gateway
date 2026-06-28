@@ -10,12 +10,12 @@ def get_config_html() -> str:
           <div class="flex-between mb-md">
             <h3 style="margin:0">Runtime Settings <span class="text-xs" style="color:var(--green)">HOT-RELOAD</span></h3>
             <div class="flex-gap-sm">
-              <button class="btn btn-sm btn-ghost" @click="resetAllRuntimeConfig()">[RESET ALL]</button>
-              <button class="btn btn-sm btn-ghost" @click="loadRuntimeConfig()">[RELOAD]</button>
+              <button class="btn btn-sm btn-ghost" @click="resetAllRuntimeConfig()">Reset all</button>
+              <button class="btn btn-sm btn-ghost" @click="loadRuntimeConfig()">Reload</button>
             </div>
           </div>
           <p class="text-xs text-muted mb-md">
-            // changes take effect on next request. no restart needed.
+            Changes take effect on the next request. No restart needed.
           </p>
           <div class="table-wrapper">
             <table>
@@ -29,7 +29,9 @@ def get_config_html() -> str:
                     </td>
                     <td style="min-width:160px">
                       <template x-if="meta.type === 'bool'">
-                        <select :value="meta.value ? 'true' : 'false'" @change="updateRuntimeConfig(key, $event.target.value === 'true')"
+                        <select :value="meta.value ? 'true' : 'false'"
+                          :aria-label="'Set ' + meta.label"
+                          @change="updateRuntimeConfig(key, $event.target.value === 'true')"
                           style="padding:4px 8px; font-size:0.75rem">
                           <option value="true">true</option>
                           <option value="false">false</option>
@@ -37,11 +39,13 @@ def get_config_html() -> str:
                       </template>
                       <template x-if="meta.type === 'int'">
                         <input type="number" :value="meta.value" min="1"
+                          :aria-label="'Set ' + meta.label"
                           @change="updateRuntimeConfig(key, parseInt($event.target.value))"
                           style="padding:4px 8px; font-size:0.75rem; width:100px">
                       </template>
                       <template x-if="meta.type === 'string' && Array.isArray(meta.options)">
                         <select :value="meta.value"
+                          :aria-label="'Set ' + meta.label"
                           @change="updateRuntimeConfig(key, $event.target.value)"
                           style="padding:4px 8px; font-size:0.75rem">
                           <template x-for="opt in meta.options" :key="opt">
@@ -51,6 +55,7 @@ def get_config_html() -> str:
                       </template>
                       <template x-if="meta.type === 'string' && !Array.isArray(meta.options)">
                         <input type="text" :value="meta.value"
+                          :aria-label="'Set ' + meta.label"
                           @change="updateRuntimeConfig(key, $event.target.value)"
                           style="padding:4px 8px; font-size:0.75rem; width:160px">
                       </template>
@@ -58,7 +63,7 @@ def get_config_html() -> str:
                     <td class="text-sm text-muted" x-text="meta.original"></td>
                     <td>
                       <span x-show="meta.overridden" class="badge badge-warn" style="cursor:pointer; font-size:0.65rem"
-                        @click="resetRuntimeConfig(key)">[RESET]</span>
+                        @click="resetRuntimeConfig(key)">Reset</span>
                     </td>
                   </tr>
                 </template>
@@ -68,16 +73,16 @@ def get_config_html() -> str:
         </div>
 
         <!-- Active prompt status bar -->
-        <div style="border:1px solid var(--border); background:var(--bg-raised); padding:8px 16px; margin-bottom:2px; display:flex; justify-content:space-between; align-items:center">
-          <div class="flex-gap-sm">
-            <span class="text-xs text-muted">ACTIVE_PROMPT:</span>
+        <div class="prompt-status-bar">
+          <div class="prompt-status-main">
+            <span class="text-xs text-muted prompt-status-label">Active prompt</span>
             <span x-show="systemPrompt.active_name" style="color:var(--green); font-weight:600; font-size:var(--fs-sm); text-shadow: 0 0 6px var(--green-muted)" x-text="systemPrompt.active_name"></span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'preset'" style="color:var(--text-dim); font-size:var(--fs-sm)">claude_code (preset)</span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'file'" style="color:var(--cyan); font-size:var(--fs-sm)">file default (SYSTEM_PROMPT_FILE)</span>
             <span x-show="!systemPrompt.active_name && systemPrompt.mode === 'custom'" style="color:var(--amber); font-size:var(--fs-sm)">custom (unnamed)</span>
           </div>
-          <div class="flex-gap-sm">
-            <span class="text-xs text-muted" x-text="'MODE=' + systemPrompt.mode"></span>
+          <div class="prompt-status-meta">
+            <span class="text-xs text-muted" x-text="'Mode: ' + systemPrompt.mode"></span>
             <span class="text-xs text-muted" x-text="systemPrompt.char_count + ' chars'"></span>
           </div>
         </div>
@@ -88,7 +93,7 @@ def get_config_html() -> str:
           <div class="file-tree card">
             <div class="flex-between mb-sm">
               <h3 style="margin:0">Prompts</h3>
-              <button class="btn btn-sm btn-primary" @click="showNewPromptForm()">[+ NEW]</button>
+              <button class="btn btn-sm btn-primary" @click="showNewPromptForm()">New</button>
             </div>
 
             <!-- Preset entry -->
@@ -129,7 +134,7 @@ def get_config_html() -> str:
 
             <!-- Divider -->
             <div x-show="namedPrompts.length > 0" style="border-top:1px solid var(--border); margin:4px 0; padding-top:4px">
-              <span class="text-xs text-muted" style="padding-left:12px">// SAVED</span>
+              <span class="text-xs text-muted" style="padding-left:12px">Saved</span>
             </div>
 
             <!-- Named prompts -->
@@ -165,11 +170,11 @@ def get_config_html() -> str:
                   style="width:100%; min-height:300px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
                     background:var(--bg-surface); color:var(--text-bright); border:1px solid var(--border-bright);
                     padding:8px; resize:vertical; border-radius:0; margin-top:4px"
-                  placeholder="// enter system prompt content..."></textarea>
+                  placeholder="Enter system prompt content..."></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
                   <button class="btn btn-sm btn-primary" @click="createNamedPrompt()"
-                    :disabled="!newPromptName.trim() || !newPromptContent.trim() || !!newPromptNameError">[CREATE]</button>
-                  <button class="btn btn-sm btn-ghost" @click="promptView = null">[CANCEL]</button>
+                    :disabled="!newPromptName.trim() || !newPromptContent.trim() || !!newPromptNameError">Create</button>
+                  <button class="btn btn-sm btn-ghost" @click="promptView = null">Cancel</button>
                   <span class="text-xs text-muted" x-show="newPromptContent.trim()" x-text="newPromptContent.trim().length + ' chars'"></span>
                 </div>
               </div>
@@ -179,7 +184,7 @@ def get_config_html() -> str:
             <template x-if="!promptView">
               <div class="text-muted" style="padding:3rem; text-align:center">
                 <div style="font-size:2rem; margin-bottom:0.5rem; opacity:0.2">&gt;_</div>
-                select a prompt or create new_<span class="cursor-blink"></span>
+                No prompt selected
               </div>
             </template>
 
@@ -194,12 +199,12 @@ def get_config_html() -> str:
                   </div>
                   <span class="text-xs text-muted" x-text="(systemPrompt.preset_text?.length ?? 0) + ' chars'"></span>
                 </div>
-                <p class="text-xs text-muted mb-md">// built-in claude_code preset. read-only.</p>
+                <p class="text-xs text-muted mb-md">Built-in claude_code preset. Read-only.</p>
                 <textarea readonly :value="systemPrompt.preset_text || ''" class="readonly-editor"></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
                   <button class="btn btn-sm btn-primary" @click="activatePreset()"
-                    :disabled="systemPrompt.active_name == null && systemPrompt.mode !== 'custom'">[ACTIVATE]</button>
-                  <button class="btn btn-sm btn-ghost" @click="forkFromPreset()">[FORK AS NEW]</button>
+                    :disabled="systemPrompt.active_name == null && systemPrompt.mode !== 'custom'">Activate</button>
+                  <button class="btn btn-sm btn-ghost" @click="forkFromPreset()">Fork as new</button>
                 </div>
               </div>
             </template>
@@ -215,10 +220,10 @@ def get_config_html() -> str:
                   </div>
                   <span class="text-xs text-muted" x-text="(systemPrompt.prompt?.length ?? 0) + ' chars'"></span>
                 </div>
-                <p class="text-xs text-muted mb-md">// loaded from SYSTEM_PROMPT_FILE at startup. read-only — edit the file and restart, or fork to a named prompt. {{PLACEHOLDER}} tokens shown unresolved.</p>
+                <p class="text-xs text-muted mb-md">Loaded from SYSTEM_PROMPT_FILE at startup. Read-only. Edit the file and restart, or fork to a named prompt. {{PLACEHOLDER}} tokens are shown unresolved.</p>
                 <textarea readonly :value="systemPrompt.prompt || ''" class="readonly-editor"></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
-                  <button class="btn btn-sm btn-ghost" @click="forkFromFile()">[FORK AS NEW]</button>
+                  <button class="btn btn-sm btn-ghost" @click="forkFromFile()">Fork as new</button>
                 </div>
               </div>
             </template>
@@ -233,10 +238,10 @@ def get_config_html() -> str:
                   </div>
                   <span class="text-xs text-muted" x-text="(promptEditorContent?.length ?? 0) + ' chars'"></span>
                 </div>
-                <p class="text-xs text-muted mb-md">// template from docs/. save as named prompt to edit.</p>
+                <p class="text-xs text-muted mb-md">Template from docs. Save as a named prompt to edit.</p>
                 <textarea readonly :value="promptEditorContent || ''" class="readonly-editor"></textarea>
                 <div class="flex-gap-sm" style="margin-top:0.75rem">
-                  <button class="btn btn-sm btn-ghost" @click="forkFromTemplate()">[SAVE AS NEW]</button>
+                  <button class="btn btn-sm btn-ghost" @click="forkFromTemplate()">Save as new</button>
                 </div>
               </div>
             </template>
@@ -252,7 +257,7 @@ def get_config_html() -> str:
                   </div>
                   <span class="text-xs text-muted" x-text="(promptEditorContent?.length ?? 0) + ' chars'"></span>
                 </div>
-                <p class="text-xs text-muted mb-md">// affects new sessions only after activation.</p>
+                <p class="text-xs text-muted mb-md">Affects new sessions only after activation.</p>
                 <textarea x-model="promptEditorContent"
                   style="width:100%; min-height:350px; max-height:60vh; font-family:var(--font); font-size:0.78rem;
                     background:var(--bg-surface); color:var(--text-bright); border:1px solid var(--border-bright);
@@ -260,11 +265,11 @@ def get_config_html() -> str:
                   @input="promptDirty = true"></textarea>
                 <div class="flex-between" style="margin-top:0.75rem">
                   <div class="flex-gap-sm">
-                    <button class="btn btn-sm btn-primary" @click="saveNamedPrompt()" :disabled="!promptDirty || !promptEditorContent.trim()">[SAVE]</button>
+                    <button class="btn btn-sm btn-primary" @click="saveNamedPrompt()" :disabled="!promptDirty || !promptEditorContent.trim()">Save</button>
                     <button class="btn btn-sm btn-primary" @click="activateNamedPrompt()"
-                      :disabled="systemPrompt.active_name === promptViewName && !promptDirty">[ACTIVATE]</button>
+                      :disabled="systemPrompt.active_name === promptViewName && !promptDirty">Activate</button>
                   </div>
-                  <button class="btn btn-sm btn-danger-ghost" @click="deleteNamedPrompt()">[DELETE]</button>
+                  <button class="btn btn-sm btn-danger-ghost" @click="deleteNamedPrompt()">Delete</button>
                 </div>
               </div>
             </template>
@@ -334,7 +339,7 @@ def get_config_html() -> str:
             <div class="mb-lg">
               <div class="flex-between mb-sm">
                 <h3 style="margin:0">Sandbox & Permissions</h3>
-                <button class="btn btn-sm btn-ghost" @click="loadSandbox()">[RELOAD]</button>
+                <button class="btn btn-sm btn-ghost" @click="loadSandbox()">Reload</button>
               </div>
               <div class="flex-wrap-gap" style="gap:1rem; font-size:var(--fs-sm)">
                 <div>
@@ -361,7 +366,7 @@ def get_config_html() -> str:
             <div>
               <div class="flex-between mb-sm">
                 <h3 style="margin:0">Tools Registry</h3>
-                <button class="btn btn-sm btn-ghost" @click="loadTools()">[RELOAD]</button>
+                <button class="btn btn-sm btn-ghost" @click="loadTools()">Reload</button>
               </div>
               <template x-for="(info, backend) in (toolsRegistry.backends ?? {})" :key="backend">
                 <div class="mb-md">
@@ -373,7 +378,7 @@ def get_config_html() -> str:
                         style="font-size:0.65rem" x-text="t"></span>
                     </template>
                   </div>
-                  <div class="text-xs text-muted" style="margin-top:0.25rem">// green = default_allowed</div>
+                  <div class="text-xs text-muted" style="margin-top:0.25rem">Green marks default-allowed tools.</div>
                 </div>
               </template>
               <div x-show="(toolsRegistry.mcp_tools ?? []).length > 0" style="margin-top:0.5rem">

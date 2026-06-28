@@ -6,7 +6,7 @@ def get_usage_html() -> str:
     return """      <!-- Usage Tab -->
       <div x-show="tab==='usage'" role="tabpanel">
         <div x-show="usage.enabled === false" class="card" style="text-align:center; padding:2rem">
-          <div class="text-muted">[ USAGE LOGGING OFF ]</div>
+          <div class="text-muted">Usage logging is off</div>
           <div class="text-xs text-dim" style="margin-top:0.5rem">
             Set <span class="text-mono" style="color:var(--cyan)">USAGE_LOG_DB_URL</span>
             and restart the gateway to enable per-turn token / tool logging.
@@ -33,18 +33,18 @@ def get_usage_html() -> str:
                 <label class="text-xs text-dim" style="display:flex; gap:4px; align-items:center">
                   FROM
                   <input type="date" x-model="usageStart"
-                    style="padding:4px 8px; font-size:0.75rem; color-scheme:dark">
+                    style="padding:4px 8px; font-size:0.75rem; color-scheme:light">
                 </label>
                 <label class="text-xs text-dim" style="display:flex; gap:4px; align-items:center">
                   TO
                   <input type="date" x-model="usageEnd"
-                    style="padding:4px 8px; font-size:0.75rem; color-scheme:dark">
+                    style="padding:4px 8px; font-size:0.75rem; color-scheme:light">
                 </label>
                 <button class="btn btn-sm" :class="(usageStart && usageEnd) ? 'btn-primary' : 'btn-ghost'"
-                  @click="loadUsage()" :disabled="(usageStart || usageEnd) && !(usageStart && usageEnd)">[APPLY]</button>
+                  @click="loadUsage()" :disabled="(usageStart || usageEnd) && !(usageStart && usageEnd)">Apply</button>
                 <button class="btn btn-sm btn-ghost" x-show="usageStart || usageEnd"
-                  @click="usageStart=''; usageEnd=''; loadUsage()">[CLEAR]</button>
-                <button class="btn btn-sm btn-ghost" @click="loadUsage()">[RELOAD]</button>
+                  @click="usageStart=''; usageEnd=''; loadUsage()">Clear</button>
+                <button class="btn btn-sm btn-ghost" @click="loadUsage()">Reload</button>
               </div>
             </div>
             <div x-show="usageStart && usageEnd" class="text-xs text-dim" style="margin-top:-0.5rem; margin-bottom:0.75rem">
@@ -56,7 +56,7 @@ def get_usage_html() -> str:
                 <h3 style="margin:0">Trends</h3>
                 <span class="text-xs text-dim">last 5 · day / week / month</span>
               </div>
-              <div x-show="usageSeriesEmpty()" class="text-muted" style="padding:1rem; text-align:center">[ NO DATA ]</div>
+              <div x-show="usageSeriesEmpty()" class="text-muted" style="padding:1rem; text-align:center">No data</div>
               <div x-show="!usageSeriesEmpty()" class="table-wrapper">
                 <table style="table-layout:fixed; width:100%">
                   <colgroup>
@@ -78,7 +78,7 @@ def get_usage_html() -> str:
                       {key:'tokens', label:'TOKENS', color:'var(--red)'}
                     ]" :key="'row-' + chart.key">
                       <tr>
-                        <td class="text-xs text-dim" style="vertical-align:middle; letter-spacing:0.08em" x-text="chart.label"></td>
+                        <td class="text-xs text-dim" style="vertical-align:middle; letter-spacing:0" x-text="chart.label"></td>
                         <template x-for="g in ['day','week','month']" :key="'cell-' + chart.key + '-' + g">
                           <td style="vertical-align:middle; padding:8px">
                             <div style="display:flex; gap:4px; align-items:flex-end; height:90px; border-bottom:1px solid var(--border-dim)">
@@ -99,7 +99,7 @@ def get_usage_html() -> str:
                       </tr>
                     </template>
                     <tr>
-                      <td class="text-xs text-dim" style="vertical-align:middle; letter-spacing:0.08em">TOOL CALLS</td>
+                      <td class="text-xs text-dim" style="vertical-align:middle; letter-spacing:0">TOOL CALLS</td>
                       <template x-for="g in ['day','week','month']" :key="'tool-cell-' + g">
                         <td style="vertical-align:middle; padding:8px">
                           <template x-if="(usage.toolsSeries?.[g]?.buckets ?? []).length === 0">
@@ -138,7 +138,7 @@ def get_usage_html() -> str:
                       </template>
                     </tr>
                     <tr>
-                      <td class="text-xs text-dim" style="vertical-align:top; letter-spacing:0.08em; padding-top:12px">TOP TOOLS</td>
+                      <td class="text-xs text-dim" style="vertical-align:top; letter-spacing:0; padding-top:12px">TOP TOOLS</td>
                       <template x-for="g in ['day','week','month']" :key="'tools-' + g">
                         <td style="vertical-align:top; padding:8px">
                           <div x-show="(usage.toolsByGran?.[g] ?? []).length === 0" class="text-muted text-xs">-</div>
@@ -192,10 +192,10 @@ def get_usage_html() -> str:
               </div>
               <div class="table-wrapper">
                 <table>
-                  <thead><tr><th>USER</th><th>CHATS</th><th>TURNS</th><th>TOKENS</th><th>CACHE READ</th><th>TOOL CALLS</th><th>ERRORS</th></tr></thead>
+                  <thead><tr><th>USER</th><th>CHATS</th><th>TURNS</th><th>TOKENS</th><th>CACHE READ</th><th>TOOL CALLS</th><th>ERRORS</th><th></th></tr></thead>
                   <tbody>
                     <template x-for="u in (usage.users ?? [])" :key="u.user">
-                      <tr style="cursor:pointer" @click="usageTurnsFilter = u.user; loadUsageTurns()">
+                      <tr style="cursor:pointer" @click="usageTurnsFilter = u.user; usageTurnsOffset = 0; loadUsageTurns()">
                         <td class="text-mono" style="color:var(--text-bright)" x-text="u.user"></td>
                         <td class="text-sm" x-text="u.chats"></td>
                         <td class="text-sm" x-text="u.turns"></td>
@@ -204,13 +204,16 @@ def get_usage_html() -> str:
                         <td class="text-sm" x-text="u.tool_calls"></td>
                         <td class="text-sm" :style="(u.tool_errors + u.turn_errors) > 0 ? 'color:var(--red)' : 'color:var(--text-dim)'"
                           x-text="(u.tool_errors ?? 0) + '/' + (u.turn_errors ?? 0)"></td>
+                        <td>
+                          <button type="button" class="btn btn-sm btn-ghost"
+                            @click.stop="usageTurnsFilter = u.user; usageTurnsOffset = 0; loadUsageTurns()">Filter</button>
+                        </td>
                       </tr>
                     </template>
                   </tbody>
                 </table>
               </div>
-              <div x-show="(usage.users ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO USERS ]</div>
-              <div class="text-xs text-dim" style="margin-top:0.5rem">// click a user to filter the turns table below</div>
+              <div x-show="(usage.users ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">No users</div>
             </div>
 
             <div class="card mb-lg">
@@ -235,7 +238,7 @@ def get_usage_html() -> str:
                   </tbody>
                 </table>
               </div>
-              <div x-show="(usage.tools ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO TOOL CALLS ]</div>
+              <div x-show="(usage.tools ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">No tool calls</div>
             </div>
 
             <div class="card">
@@ -245,7 +248,7 @@ def get_usage_html() -> str:
                   <input type="text" x-model="usageTurnsFilter" placeholder="filter:user"
                     style="padding:4px 8px; font-size:0.75rem; width:150px"
                     @input.debounce.300ms="usageTurnsOffset = 0; loadUsageTurns()">
-                  <button class="btn btn-sm btn-ghost" @click="usageTurnsFilter=''; usageTurnsOffset=0; loadUsageTurns()">[CLEAR]</button>
+                  <button class="btn btn-sm btn-ghost" @click="usageTurnsFilter=''; usageTurnsOffset=0; loadUsageTurns()">Clear</button>
                 </div>
               </div>
               <div class="table-wrapper">
@@ -268,16 +271,16 @@ def get_usage_html() -> str:
                   </tbody>
                 </table>
               </div>
-              <div x-show="(usage.turns ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO TURNS ]</div>
+              <div x-show="(usage.turns ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">No turns</div>
               <div style="display:flex; justify-content:center; gap:0.5rem; margin-top:0.75rem">
                 <button class="btn btn-sm btn-ghost"
                   @click="usageTurnsOffset = Math.max(0, usageTurnsOffset - 50); loadUsageTurns()"
-                  :disabled="usageTurnsOffset === 0">[PREV]</button>
+                  :disabled="usageTurnsOffset === 0">Previous</button>
                 <span class="text-xs text-muted" style="padding:4px 8px"
                   x-text="'OFFSET ' + usageTurnsOffset"></span>
                 <button class="btn btn-sm btn-ghost"
                   @click="usageTurnsOffset += 50; loadUsageTurns()"
-                  :disabled="(usage.turns ?? []).length < 50">[NEXT]</button>
+                  :disabled="(usage.turns ?? []).length < 50">Next</button>
               </div>
             </div>
           </div>

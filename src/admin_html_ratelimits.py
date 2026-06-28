@@ -8,9 +8,9 @@ def get_ratelimits_html() -> str:
         <div class="card mb-md">
           <div class="flex-between">
             <p class="text-xs text-muted" style="margin:0">
-              // approximate monitoring based on request logs. actual enforcement by slowapi.
+              Approximate monitoring based on request logs. Slowapi handles enforcement.
             </p>
-            <button class="btn btn-sm btn-ghost" @click="loadRateLimits()" aria-label="Refresh rate limits">[RELOAD]</button>
+            <button class="btn btn-sm btn-ghost" @click="loadRateLimits()" aria-label="Refresh rate limits">Reload</button>
           </div>
           <div x-show="config.rate_limits" class="flex-wrap-gap" style="margin-top:0.5rem">
             <template x-for="(v, k) in (config.rate_limits ?? {})" :key="k">
@@ -52,7 +52,7 @@ def get_ratelimits_html() -> str:
                   </table>
                 </div>
               </template>
-              <div x-show="!data.clients || data.clients.length === 0" class="text-sm text-muted">[ NO TRAFFIC ]</div>
+              <div x-show="!data.clients || data.clients.length === 0" class="text-sm text-muted">No traffic</div>
             </div>
           </template>
         </div>

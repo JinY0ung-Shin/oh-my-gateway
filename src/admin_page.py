@@ -29,11 +29,11 @@ def build_admin_page() -> str:
     """
     return (
         """<!DOCTYPE html>
-<html lang="ko" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GATEWAY CTRL // Admin Terminal</title>
+<title>Oh My Gateway Admin</title>
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
@@ -44,9 +44,6 @@ def build_admin_page() -> str:
 </style>
 </head>
 <body>
-
-<!-- Vignette overlay -->
-<div class="vignette"></div>
 
 <div x-data="adminApp()" x-init="init()" class="container">
 
@@ -59,67 +56,53 @@ def build_admin_page() -> str:
 
   <!-- Login -->
   <template x-if="!authenticated">
-    <div class="login-box card">
-      <div class="ascii-header" style="font-size:0.55rem; text-align:left; margin-bottom:1.5rem">  ██████╗ ██╗      █████╗ ██╗   ██╗██████╗ ███████╗
- ██╔════╝ ██║     ██╔══██╗██║   ██║██╔══██╗██╔════╝
- ██║      ██║     ███████║██║   ██║██║  ██║█████╗
- ██║      ██║     ██╔══██║██║   ██║██║  ██║██╔══╝
- ╚██████╗ ███████╗██║  ██║╚██████╔╝██████╔╝███████╗
-  ╚═════╝ ╚══════╝╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚══════╝</div>
-      <h2>Access Terminal</h2>
-      <p class="prompt-prefix">ADMIN_API_KEY required for authentication</p>
-      <p class="text-xs text-muted" style="margin-bottom:1.5rem">Enter credentials to proceed_<span class="cursor-blink"></span></p>
+    <div class="login-wrap">
+      <div class="login-box card">
+      <div class="product-mark">OH MY GATEWAY</div>
+      <h1>Admin Access</h1>
+      <p class="prompt-prefix">Use the configured ADMIN_API_KEY to continue.</p>
       <form @submit.prevent="doLogin()">
-        <label class="text-xs text-dim" style="margin-bottom:4px; display:block">root@gateway:~# </label>
-        <input type="password" x-model="loginKey" placeholder="••••••••••••••••"
+        <label for="admin-login-key" class="text-xs text-dim" style="margin-bottom:4px; display:block">Admin API key</label>
+        <input id="admin-login-key" type="password" x-model="loginKey" placeholder="••••••••••••••••"
           style="width:100%; margin-bottom:1rem" required>
-        <button class="btn btn-primary" style="width:100%" type="submit">AUTHENTICATE</button>
+        <button class="btn btn-primary" style="width:100%; justify-content:center" type="submit">Sign in</button>
       </form>
       <p x-show="loginError" class="text-danger text-sm" style="margin-top:0.75rem">
-        <span style="color:var(--red)">ERR</span> <span x-text="loginError"></span>
+        <span x-text="loginError"></span>
       </p>
+      </div>
     </div>
   </template>
 
   <!-- Main UI -->
   <template x-if="authenticated">
     <div>
-      <!-- ASCII Header -->
-      <div class="ascii-header">╔═══════════════════════════════════════════════════════════════╗
-║   ░██████╗░█████╗░████████╗███████╗░██╗░░░░░░░██╗░█████╗░██╗░░░██╗  ║
-║   ██╔════╝██╔══██╗╚══██╔══╝██╔════╝░██║░░██╗░░██║██╔══██╗╚██╗░██╔╝  ║
-║   ██║░░██╗███████║░░░██║░░░█████╗░░░╚██╗████╗██╔╝███████║░╚████╔╝░  ║
-║   ██║░░╚██╗██╔══██║░░░██║░░░██╔══╝░░░░████╔═████║░██╔══██║░░╚██╔╝░░  ║
-║   ╚██████╔╝██║░░██║░░░██║░░░███████╗░░╚██╔╝░╚██╔╝░██║░░██║░░░██║░░░  ║
-║   ░╚═════╝░╚═╝░░╚═╝░░░╚═╝░░░╚══════╝░░░╚═╝░░░╚═╝░░╚═╝░░╚═╝░░░╚═╝░░░  ║
-╚═══════════════════════════════════════════════════════════════╝</div>
-
       <!-- Header Bar -->
-      <div class="header-bar">
+      <header class="header-bar">
         <div>
-          <span class="text-xs text-muted">OH MY GATEWAY</span>
-          <span class="text-xs" style="color:var(--green-dim); margin-left:0.5rem">// ADMIN TERMINAL v2.0</span>
+          <div class="product-mark">OH MY GATEWAY</div>
+          <h1>Admin</h1>
         </div>
         <div class="flex-gap-sm">
           <span class="status-line">
-            <span class="online">&#9679;</span> CONNECTED
+            <span class="online"></span> Connected
           </span>
-          <button class="btn btn-sm btn-ghost" @click="refreshAll()" aria-label="Refresh all data">[REFRESH]</button>
-          <button class="btn btn-sm btn-ghost" @click="doLogout()" aria-label="Log out">[LOGOUT]</button>
+          <button class="btn btn-sm btn-ghost" @click="refreshAll()" aria-label="Refresh all data">Refresh</button>
+          <button class="btn btn-sm btn-ghost" @click="doLogout()" aria-label="Log out">Log out</button>
         </div>
-      </div>
+      </header>
 
       <!-- Tabs -->
       <nav class="tabs" role="tablist" aria-label="Admin sections">
-        <button role="tab" :aria-selected="tab === 'dashboard'" @click="tab='dashboard'">DASH</button>
-        <button role="tab" :aria-selected="tab === 'sessions'" @click="tab='sessions'; loadSummary()">SESSIONS</button>
-        <button role="tab" :aria-selected="tab === 'logs'" @click="tab='logs'; loadLogs()">LOGS</button>
-        <button role="tab" :aria-selected="tab === 'usage'" @click="tab='usage'; loadUsage()">USAGE</button>
-        <button role="tab" :aria-selected="tab === 'ratelimits'" @click="tab='ratelimits'; loadRateLimits()">LIMITS</button>
-        <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">SKILLS</button>
-        <button role="tab" :aria-selected="tab === 'plugins'" @click="tab='plugins'; loadPlugins(); loadCatalog()">PLUGINS</button>
-        <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">CONFIG</button>
-        <a href="/admin/chat" role="tab" style="color:var(--cyan);text-decoration:none;padding:var(--gap-sm) var(--gap-lg);font-size:var(--fs-sm);letter-spacing:0.08em;border-bottom:2px solid transparent;display:flex;align-items:center;gap:4px;white-space:nowrap;">CHAT ↗</a>
+        <button role="tab" :aria-selected="tab === 'dashboard'" @click="tab='dashboard'">Dashboard</button>
+        <button role="tab" :aria-selected="tab === 'sessions'" @click="tab='sessions'; loadSummary()">Sessions</button>
+        <button role="tab" :aria-selected="tab === 'logs'" @click="tab='logs'; loadLogs()">Logs</button>
+        <button role="tab" :aria-selected="tab === 'usage'" @click="tab='usage'; loadUsage()">Usage</button>
+        <button role="tab" :aria-selected="tab === 'ratelimits'" @click="tab='ratelimits'; loadRateLimits()">Limits</button>
+        <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">Skills</button>
+        <button role="tab" :aria-selected="tab === 'plugins'" @click="tab='plugins'; loadPlugins(); loadCatalog()">Plugins</button>
+        <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">Config</button>
+        <a href="/admin/chat" role="tab" class="tab-link">Chat ↗</a>
       </nav>
 
 """

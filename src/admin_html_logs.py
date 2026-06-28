@@ -23,9 +23,9 @@ def get_logs_html() -> str:
           <div class="flex-between mb-md">
             <h3 style="margin:0">Request Log</h3>
             <div class="flex-gap-sm" style="flex-wrap:wrap">
-              <input type="text" x-model="logsFilter.endpoint" placeholder="filter:endpoint"
+              <input type="text" x-model="logsFilter.endpoint" placeholder="filter:endpoint" aria-label="Filter logs by endpoint"
                 style="padding:4px 8px; font-size:0.75rem; width:150px" @input.debounce.300ms="loadLogs()">
-              <select x-model="logsFilter.status" @change="loadLogs()"
+              <select x-model="logsFilter.status" @change="loadLogs()" aria-label="Filter logs by status"
                 style="padding:4px 8px; font-size:0.75rem; width:90px">
                 <option value="">ALL</option>
                 <option value="200">200</option>
@@ -33,9 +33,9 @@ def get_logs_html() -> str:
                 <option value="5xx">5xx</option>
               </select>
               <label class="text-xs flex-gap-sm" style="gap:4px; color:var(--text-dim)">
-                <input type="checkbox" x-model="logsAutoRefresh" @change="toggleLogsPolling()"> AUTO
+                <input type="checkbox" x-model="logsAutoRefresh" @change="toggleLogsPolling()" aria-label="Auto-refresh logs"> AUTO
               </label>
-              <button class="btn btn-sm btn-ghost" @click="loadLogs()" aria-label="Refresh logs">[RELOAD]</button>
+              <button class="btn btn-sm btn-ghost" @click="loadLogs()" aria-label="Refresh logs">Reload</button>
             </div>
           </div>
           <template x-if="loading.logs">
@@ -75,13 +75,13 @@ def get_logs_html() -> str:
                   </tbody>
                 </table>
               </div>
-              <div x-show="(logs.items ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO LOGS ]</div>
+              <div x-show="(logs.items ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">No logs</div>
               <div x-show="logs.total > 50" style="display:flex; justify-content:center; gap:0.5rem; margin-top:0.75rem">
-                <button class="btn btn-sm btn-ghost" @click="logsPage = Math.max(0, logsPage-1); loadLogs()" :disabled="logsPage === 0">[PREV]</button>
+                <button class="btn btn-sm btn-ghost" @click="logsPage = Math.max(0, logsPage-1); loadLogs()" :disabled="logsPage === 0">Previous</button>
                 <span class="text-xs text-muted" style="padding:4px 8px" x-text="'PAGE ' + (logsPage+1)"></span>
-                <button class="btn btn-sm btn-ghost" @click="logsPage++; loadLogs()" :disabled="(logsPage+1)*50 >= logs.total">[NEXT]</button>
+                <button class="btn btn-sm btn-ghost" @click="logsPage++; loadLogs()" :disabled="(logsPage+1)*50 >= logs.total">Next</button>
               </div>
-              <div class="text-xs text-muted" style="margin-top:0.5rem; text-align:right">// latency = handler creation time only (streaming excluded)</div>
+              <div class="text-xs text-muted" style="margin-top:0.5rem; text-align:right">Latency is handler creation time only; streaming is excluded.</div>
             </div>
           </template>
         </div>

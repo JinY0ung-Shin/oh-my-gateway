@@ -156,7 +156,7 @@ class TestAdminChatPage:
         assert "text/html" in r.headers["content-type"]
         assert 'id="auth-overlay"' in r.text
         assert "/admin/api/login" in r.text
-        assert "ACCESS TERMINAL" in r.text
+        assert "Admin Chat Access" in r.text
 
 
 class TestAdminAuth:

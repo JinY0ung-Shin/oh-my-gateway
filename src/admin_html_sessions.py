@@ -30,15 +30,15 @@ def get_sessions_html() -> str:
                         <td style="color:var(--amber)" x-text="s.turn_counter ?? '-'"></td>
                         <td class="text-xs" style="color:var(--text-dim)" x-text="formatTime(s.last_accessed)"></td>
                         <td style="white-space:nowrap">
-                          <button class="btn btn-sm btn-ghost" @click.stop="exportSession(s.session_id)" title="Export JSON">[EXPORT]</button>
-                          <button class="btn btn-sm btn-danger-ghost" @click.stop="deleteSession(s.session_id)">[DEL]</button>
+                          <button class="btn btn-sm btn-ghost" @click.stop="exportSession(s.session_id)" title="Export JSON">Export</button>
+                          <button class="btn btn-sm btn-danger-ghost" @click.stop="deleteSession(s.session_id)">Delete</button>
                         </td>
                       </tr>
                     </template>
                   </tbody>
                 </table>
               </div>
-              <div x-show="(summary.sessions?.sessions ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">[ NO ACTIVE SESSIONS ]</div>
+              <div x-show="(summary.sessions?.sessions ?? []).length === 0" class="text-muted" style="padding:1rem; text-align:center">No active sessions</div>
             </div>
           </template>
         </div>
@@ -50,7 +50,7 @@ def get_sessions_html() -> str:
                 <h3 style="margin:0">Session Detail</h3>
                 <span class="text-mono text-xs" style="color:var(--cyan)" x-text="expandedSession?.substring(0,16) + '...'"></span>
               </div>
-              <button class="btn btn-sm btn-ghost" @click="expandedSession = null; sessionMessages = null; sessionDetail = null">[CLOSE]</button>
+              <button class="btn btn-sm btn-ghost" @click="expandedSession = null; sessionMessages = null; sessionDetail = null">Close</button>
             </div>
             <div x-show="sessionDetail" class="flex-wrap-gap text-xs mb-md" style="gap:0.75rem; color:var(--text-dim)">
               <span>backend=<span style="color:var(--text-bright)" x-text="sessionDetail?.backend || '-'"></span></span>
@@ -60,7 +60,7 @@ def get_sessions_html() -> str:
             </div>
             <div class="flex-between mb-md">
               <span class="text-sm text-muted">
-                // message_history (<span style="color:var(--text-bright)" x-text="sessionMessages.total"></span> entries)
+                Message history (<span style="color:var(--text-bright)" x-text="sessionMessages.total"></span> entries)
               </span>
               <span class="badge badge-warn text-xs">SENSITIVE DATA</span>
             </div>
@@ -78,12 +78,14 @@ def get_sessions_html() -> str:
                   </div>
                 </template>
                 <div x-text="m.content || '(empty)'"></div>
-                <span x-show="m.truncated || m.thinking_truncated" class="text-xs" style="cursor:pointer; color:var(--cyan)"
-                  @click.stop="loadFullMessage(expandedSession, m.index)">[...truncated — click to expand]</span>
+                <button x-show="m.truncated || m.thinking_truncated" type="button" class="btn btn-sm btn-ghost"
+                  style="margin-top:0.5rem" @click.stop="loadFullMessage(expandedSession, m.index)">
+                  Show full message
+                </button>
               </div>
             </template>
             <div x-show="!sessionMessages.messages || sessionMessages.messages.length === 0"
-              class="text-sm text-muted" style="text-align:center">[ NO MESSAGES ]</div>
+              class="text-sm text-muted" style="text-align:center">No messages</div>
           </div>
         </template>
       </div>"""

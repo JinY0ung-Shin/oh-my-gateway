@@ -1,4 +1,4 @@
-"""Chat UI page — a simple terminal-style chat interface.
+"""Chat UI page.
 
 Communicates with /v1/responses via SSE streaming.
 Supports multi-turn conversation via previous_response_id chaining,
@@ -12,48 +12,47 @@ from functools import lru_cache
 def build_chat_page() -> str:
     """Build the chat UI HTML."""
     return r"""<!DOCTYPE html>
-<html lang="ko" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>GATEWAY CHAT // Terminal</title>
+<title>Oh My Gateway Chat</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
 /* ================================================================
-   TERMINAL CHAT UI — Oh My Gateway
-   Matches the admin panel phosphor/CRT aesthetic
+   Oh My Gateway Chat
    ================================================================ */
 
 :root {
-  --green: #00ff41;
-  --green-dim: #00cc33;
-  --green-muted: #00802080;
-  --green-subtle: #00ff4112;
-  --green-glow: 0 0 10px #00ff4140, 0 0 40px #00ff4110;
-  --amber: #ffb000;
-  --amber-dim: #cc8800;
-  --amber-subtle: #ffb00015;
-  --cyan: #00e5ff;
-  --cyan-dim: #00b8cc;
-  --cyan-subtle: #00e5ff12;
-  --red: #ff0033;
-  --red-dim: #cc0029;
-  --red-subtle: #ff003315;
-  --magenta: #ff00ff;
+  --green: #15803d;
+  --green-dim: #166534;
+  --green-muted: #bbf7d0;
+  --green-subtle: #ecfdf3;
+  --green-glow: none;
+  --amber: #b45309;
+  --amber-dim: #92400e;
+  --amber-subtle: #fffbeb;
+  --cyan: #2563eb;
+  --cyan-dim: #1d4ed8;
+  --cyan-subtle: #eff6ff;
+  --red: #b91c1c;
+  --red-dim: #991b1b;
+  --red-subtle: #fef2f2;
+  --magenta: #7c3aed;
 
-  --bg-deep: #050505;
-  --bg: #0a0a0a;
-  --bg-raised: #111111;
-  --bg-surface: #161616;
-  --bg-hover: #1a1a1a;
-  --border: #1e1e1e;
-  --border-bright: #2a2a2a;
+  --bg-deep: #f4f6f8;
+  --bg: #ffffff;
+  --bg-raised: #ffffff;
+  --bg-surface: #f8fafc;
+  --bg-hover: #f1f5f9;
+  --border: #e2e8f0;
+  --border-bright: #cbd5e1;
 
-  --text: #b0ffb0;
-  --text-bright: #00ff41;
-  --text-dim: #4a7a4a;
-  --text-muted: #3a5a3a;
+  --text: #243244;
+  --text-bright: #0f172a;
+  --text-dim: #64748b;
+  --text-muted: #94a3b8;
 
   --font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace;
   --fs-xs: 0.7rem;
@@ -69,6 +68,8 @@ def build_chat_page() -> str:
 
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+html { color-scheme: light; }
+
 body {
   background: var(--bg-deep);
   color: var(--text);
@@ -82,40 +83,13 @@ body {
   overflow: hidden;
 }
 
-/* CRT Scanline */
-body::before {
-  content: '';
-  position: fixed;
-  inset: 0;
-  background: repeating-linear-gradient(
-    0deg, transparent, transparent 2px,
-    rgba(0,0,0,0.08) 2px, rgba(0,0,0,0.08) 4px
-  );
-  pointer-events: none;
-  z-index: 9999;
-}
-
-/* Grid BG */
-body::after {
-  content: '';
-  position: fixed;
-  inset: 0;
-  background-image:
-    linear-gradient(var(--green-muted) 1px, transparent 1px),
-    linear-gradient(90deg, var(--green-muted) 1px, transparent 1px);
-  background-size: 60px 60px;
-  opacity: 0.04;
-  pointer-events: none;
-  z-index: -1;
-}
-
 /* === Header === */
 .header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0.5rem 1rem;
-  border-bottom: 1px solid var(--border-bright);
+  border-bottom: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
   z-index: 10;
@@ -126,16 +100,17 @@ body::after {
   gap: 0.75rem;
 }
 .header .title {
-  color: var(--green);
+  color: var(--text-bright);
   font-size: var(--fs-lg);
-  font-weight: 600;
-  text-shadow: 0 0 8px var(--green-muted);
+  font-weight: 700;
 }
 .header .session-tag {
   font-size: var(--fs-xs);
   color: var(--text-dim);
-  border: 1px solid var(--border-bright);
-  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 3px 9px;
+  background: var(--bg-surface);
 }
 .header .right {
   display: flex;
@@ -147,19 +122,22 @@ body::after {
 .btn {
   font-family: var(--font);
   font-size: var(--fs-xs);
+  min-height: 30px;
   padding: 4px 10px;
   background: var(--bg-raised);
   border: 1px solid var(--border-bright);
-  color: var(--text-dim);
+  border-radius: 6px;
+  color: var(--text-bright);
   cursor: pointer;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  transition: all 0.15s;
+  text-transform: none;
+  letter-spacing: 0;
+  transition: background-color 0.15s, border-color 0.15s, color 0.15s;
+  text-decoration: none;
 }
 .btn:hover {
-  color: var(--green);
-  border-color: var(--green-dim);
-  text-shadow: 0 0 4px var(--green-muted);
+  background: var(--bg-hover);
+  color: var(--text-bright);
+  border-color: var(--text-dim);
 }
 .btn-danger:hover {
   color: var(--red);
@@ -171,15 +149,16 @@ body::after {
   font-family: var(--font);
   font-size: var(--fs-xs);
   background: var(--bg-raised);
-  color: var(--text);
+  color: var(--text-bright);
   border: 1px solid var(--border-bright);
+  border-radius: 6px;
   padding: 3px 6px;
   width: 140px;
   outline: none;
 }
 .api-key-input:focus {
-  border-color: var(--green-dim);
-  box-shadow: 0 0 6px var(--green-muted);
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
 }
 .api-key-input::placeholder {
   color: var(--text-muted);
@@ -190,14 +169,15 @@ body::after {
   font-family: var(--font);
   font-size: var(--fs-xs);
   background: var(--bg-raised);
-  color: var(--text);
+  color: var(--text-bright);
   border: 1px solid var(--border-bright);
+  border-radius: 6px;
   padding: 3px 6px;
   outline: none;
   cursor: pointer;
 }
 .model-select:focus {
-  border-color: var(--green-dim);
+  border-color: var(--cyan);
 }
 .model-select option {
   background: var(--bg);
@@ -236,7 +216,7 @@ body::after {
 .message .role {
   font-size: var(--fs-xs);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0;
   margin-bottom: 2px;
 }
 .message.user .role { color: var(--cyan); }
@@ -248,6 +228,7 @@ body::after {
   text-align: left;
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--border);
+  border-radius: 8px;
   background: var(--bg-raised);
   font-size: var(--fs-sm);
   line-height: 1.65;
@@ -264,14 +245,16 @@ body::after {
 }
 .message.system .bubble {
   border-color: var(--amber-dim);
-  background: rgba(255, 176, 0, 0.05);
+  background: var(--amber-subtle);
   color: var(--amber);
   font-size: var(--fs-xs);
 }
 .thinking-panel {
   margin-bottom: 0.4rem;
   border: 1px solid var(--amber-dim);
+  border-radius: 8px;
   background: var(--amber-subtle);
+  overflow: hidden;
 }
 .thinking-panel[hidden] { display: none; }
 .thinking-panel summary {
@@ -284,7 +267,7 @@ body::after {
   font-size: var(--fs-xs);
   list-style: none;
   text-transform: uppercase;
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 .thinking-panel summary::-webkit-details-marker { display: none; }
 .thinking-panel summary::after {
@@ -327,12 +310,13 @@ body::after {
 .bubble code {
   background: var(--bg-surface);
   padding: 1px 4px;
-  border-radius: 2px;
+  border-radius: 4px;
   font-size: 0.9em;
 }
 .bubble pre {
-  background: var(--bg-deep);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
+  border-radius: 6px;
   padding: 0.5rem;
   margin: 0.4rem 0;
   overflow-x: auto;
@@ -364,14 +348,15 @@ body::after {
 .ask-prompt .role {
   font-size: var(--fs-xs);
   text-transform: uppercase;
-  letter-spacing: 0.1em;
+  letter-spacing: 0;
   margin-bottom: 2px;
   color: var(--magenta);
 }
 .ask-prompt .ask-bubble {
   padding: 0.5rem 0.75rem;
   border: 1px solid var(--magenta);
-  background: rgba(255, 0, 255, 0.05);
+  border-radius: 8px;
+  background: #f5f3ff;
   font-size: var(--fs-sm);
   white-space: pre-wrap;
   word-break: break-word;
@@ -400,6 +385,7 @@ body::after {
   padding: 8px 12px;
   background: var(--bg-surface);
   border: 1px solid var(--border-bright);
+  border-radius: 6px;
   color: var(--text);
   cursor: pointer;
   transition: all 0.15s;
@@ -411,11 +397,11 @@ body::after {
 }
 .ask-prompt .ask-option-btn:hover {
   border-color: var(--magenta);
-  background: rgba(255, 0, 255, 0.08);
+  background: #ede9fe;
 }
 .ask-prompt .ask-option-btn.selected {
   border-color: var(--magenta);
-  background: rgba(255, 0, 255, 0.15);
+  background: #ede9fe;
   color: var(--magenta);
 }
 .ask-prompt .ask-option-marker {
@@ -443,11 +429,12 @@ body::after {
   background: var(--bg);
   color: var(--text);
   border: 1px solid var(--magenta);
+  border-radius: 6px;
   padding: 6px 10px;
   outline: none;
 }
 .ask-prompt .ask-input:focus {
-  box-shadow: 0 0 6px rgba(255, 0, 255, 0.3);
+  box-shadow: 0 0 0 3px rgba(124, 58, 237, 0.14);
 }
 .ask-prompt .ask-submit {
   font-family: var(--font);
@@ -455,15 +442,15 @@ body::after {
   padding: 6px 14px;
   background: rgba(255, 0, 255, 0.1);
   border: 1px solid var(--magenta);
+  border-radius: 6px;
   color: var(--magenta);
   cursor: pointer;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+  text-transform: none;
+  letter-spacing: 0;
   transition: all 0.15s;
 }
 .ask-prompt .ask-submit:hover {
-  background: rgba(255, 0, 255, 0.2);
-  text-shadow: 0 0 4px rgba(255, 0, 255, 0.4);
+  background: #ede9fe;
 }
 
 /* === Tool events ===
@@ -475,6 +462,7 @@ body::after {
   max-width: 85%;
   animation: fadeIn 0.15s ease;
   border-left: 3px solid var(--border-bright);
+  border-radius: 8px;
 }
 /* Only top-level cards are inset from the conversation column; nested cards
    take their indent from the parent's .tool-children padding (no stacking). */
@@ -486,9 +474,11 @@ body::after {
 .tool-event details {
   border: 1px solid var(--border);
   border-left: none;
+  border-radius: 0 8px 8px 0;
   background: var(--bg-surface);
+  overflow: hidden;
 }
-.tool-event.tool-agent > details { background: rgba(255, 0, 255, 0.04); }
+.tool-event.tool-agent > details { background: #f5f3ff; }
 .tool-event summary {
   display: flex;
   align-items: center;
@@ -514,8 +504,9 @@ body::after {
   font-size: var(--fs-xs);
   padding: 1px 6px;
   border: 1px solid;
+  border-radius: 999px;
   font-weight: 600;
-  letter-spacing: 0.03em;
+  letter-spacing: 0;
   white-space: nowrap;
 }
 .tool-event .tool-title {
@@ -561,7 +552,7 @@ body::after {
 .tool-event .tool-section:last-child { margin-bottom: 0; }
 .tool-event .tool-section-label {
   font-size: 0.62rem;
-  letter-spacing: 0.1em;
+  letter-spacing: 0;
   text-transform: uppercase;
   color: var(--text-muted);
   margin-bottom: 2px;
@@ -594,6 +585,7 @@ body::after {
   font-size: var(--fs-xs);
   color: var(--text-dim);
   border-left: 2px solid var(--border-bright);
+  border-radius: 6px;
   background: var(--bg-raised);
   animation: fadeIn 0.15s ease;
 }
@@ -607,7 +599,7 @@ body::after {
 /* === Input area === */
 .input-area {
   padding: 0.75rem 1rem;
-  border-top: 1px solid var(--border-bright);
+  border-top: 1px solid var(--border);
   background: var(--bg);
   flex-shrink: 0;
   z-index: 10;
@@ -622,8 +614,9 @@ body::after {
   font-family: var(--font);
   font-size: var(--fs-sm);
   background: var(--bg-deep);
-  color: var(--text);
+  color: var(--text-bright);
   border: 1px solid var(--border-bright);
+  border-radius: 8px;
   padding: 8px 12px;
   resize: none;
   outline: none;
@@ -633,8 +626,8 @@ body::after {
   overflow-y: auto;
 }
 .input-row textarea:focus {
-  border-color: var(--green-dim);
-  box-shadow: 0 0 6px var(--green-muted);
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
 }
 .input-row textarea::placeholder {
   color: var(--text-muted);
@@ -644,19 +637,20 @@ body::after {
   font-family: var(--font);
   font-size: var(--fs-sm);
   padding: 8px 18px;
-  background: var(--bg-raised);
-  color: var(--green);
-  border: 1px solid var(--green-dim);
+  background: var(--cyan);
+  color: #ffffff;
+  border: 1px solid var(--cyan);
+  border-radius: 8px;
   cursor: pointer;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  transition: all 0.15s;
+  text-transform: none;
+  letter-spacing: 0;
+  transition: background-color 0.15s, border-color 0.15s;
   white-space: nowrap;
   height: 38px;
 }
 .send-btn:hover:not(:disabled) {
-  background: var(--green-subtle);
-  text-shadow: 0 0 6px var(--green-muted);
+  background: var(--cyan-dim);
+  border-color: var(--cyan-dim);
 }
 .send-btn:disabled {
   opacity: 0.3;
@@ -695,13 +689,18 @@ body::after {
   padding: 3rem 1rem;
   color: var(--text-dim);
 }
-.welcome .ascii-art {
-  font-size: var(--fs-xs);
-  color: var(--green-dim);
-  text-shadow: 0 0 8px var(--green-muted);
-  white-space: pre;
-  line-height: 1.15;
+.welcome .welcome-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  min-height: 42px;
   margin-bottom: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--cyan-dim);
+  font-weight: 700;
 }
 .welcome p {
   font-size: var(--fs-sm);
@@ -713,13 +712,13 @@ body::after {
 }
 
 /* Focus visible */
-:focus-visible { outline: 1px solid var(--green); outline-offset: 2px; }
+:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
 
 /* === Auth Overlay === */
 .auth-overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.85);
+  background: rgba(15, 23, 42, 0.35);
   backdrop-filter: blur(4px);
   display: flex;
   align-items: center;
@@ -731,16 +730,16 @@ body::after {
 .auth-box {
   width: min(420px, 100%);
   background: var(--bg);
-  border: 1px solid var(--green-dim);
+  border: 1px solid var(--border);
+  border-radius: 8px;
   padding: 1.5rem;
-  box-shadow: var(--green-glow);
+  box-shadow: 0 24px 60px rgba(15, 23, 42, 0.22);
 }
 .auth-box h2 {
-  color: var(--green);
+  color: var(--text-bright);
   font-size: var(--fs-lg);
   margin-bottom: 0.5rem;
-  text-shadow: 0 0 6px var(--green-muted);
-  letter-spacing: 0.08em;
+  letter-spacing: 0;
 }
 .auth-box .auth-prompt {
   color: var(--text-dim);
@@ -758,31 +757,33 @@ body::after {
   font-family: var(--font);
   font-size: var(--fs-sm);
   background: var(--bg-deep);
-  color: var(--text);
+  color: var(--text-bright);
   border: 1px solid var(--border-bright);
+  border-radius: 6px;
   padding: 8px 10px;
   outline: none;
   margin-bottom: 0.75rem;
 }
 .auth-box .auth-input:focus {
-  border-color: var(--green-dim);
-  box-shadow: 0 0 6px var(--green-muted);
+  border-color: var(--cyan);
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.14);
 }
 .auth-box .auth-submit {
   width: 100%;
   font-family: var(--font);
   font-size: var(--fs-sm);
   padding: 8px 14px;
-  background: var(--bg-raised);
-  color: var(--green);
-  border: 1px solid var(--green-dim);
+  background: var(--cyan);
+  color: #ffffff;
+  border: 1px solid var(--cyan);
+  border-radius: 6px;
   cursor: pointer;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
+  text-transform: none;
+  letter-spacing: 0;
 }
 .auth-box .auth-submit:hover {
-  background: var(--green-subtle);
-  text-shadow: 0 0 4px var(--green-muted);
+  background: var(--cyan-dim);
+  border-color: var(--cyan-dim);
 }
 .auth-box .auth-error {
   color: var(--red);
@@ -792,7 +793,7 @@ body::after {
 }
 
 /* Send button active */
-.send-btn:active:not(:disabled) { transform: scale(0.96); background: var(--green-muted); }
+.send-btn:active:not(:disabled) { transform: scale(0.98); background: var(--cyan-dim); }
 
 .tool-event .tool-body::-webkit-scrollbar { width: 4px; }
 .tool-event .tool-body::-webkit-scrollbar-thumb { background: var(--border-bright); border-radius: 2px; }
@@ -801,7 +802,6 @@ body::after {
 @media (max-width: 640px) {
   .message { max-width: 95%; }
   .header .title { font-size: var(--fs-base); }
-  .welcome .ascii-art { font-size: 0.5rem; }
   .header { flex-wrap: wrap; gap: var(--gap-sm); padding: 0.4rem var(--gap-md); }
   .header .right { width: 100%; justify-content: flex-end; overflow-x: auto; flex-wrap: nowrap; }
   .api-key-input { width: 100px; }
@@ -819,12 +819,12 @@ body::after {
 <!-- Auth Overlay (admin login gate — hidden once authenticated) -->
 <div class="auth-overlay" id="auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-title">
   <div class="auth-box">
-    <h2 id="auth-title">ACCESS TERMINAL</h2>
-    <p class="auth-prompt">ADMIN_API_KEY required for chat access</p>
+    <h2 id="auth-title">Admin Chat Access</h2>
+    <p class="auth-prompt">Use the configured ADMIN_API_KEY to continue.</p>
     <form id="auth-form">
-      <label class="auth-label" for="auth-key">root@gateway:~#</label>
+      <label class="auth-label" for="auth-key">Admin API key</label>
       <input type="password" id="auth-key" class="auth-input" placeholder="••••••••••••••••" autocomplete="current-password" required>
-      <button type="submit" class="auth-submit">AUTHENTICATE</button>
+      <button type="submit" class="auth-submit">Sign in</button>
       <p class="auth-error" id="auth-error" aria-live="polite"></p>
     </form>
   </div>
@@ -833,50 +833,42 @@ body::after {
 <!-- Header -->
 <div class="header">
   <div class="left">
-    <span class="title">CHAT //</span>
-    <span class="session-tag" id="session-tag">NO SESSION</span>
+    <span class="title">GATEWAY CHAT</span>
+    <span class="session-tag" id="session-tag">No session</span>
   </div>
   <div class="right">
-    <input type="password" class="api-key-input" id="api-key" placeholder="API Key (optional)" title="Bearer token for /v1/responses">
-    <select class="model-select" id="model-select">
+    <input type="password" class="api-key-input" id="api-key" placeholder="API key" title="Bearer token for /v1/responses" aria-label="Responses API key">
+    <select class="model-select" id="model-select" aria-label="Model">
       <option value="sonnet">sonnet</option>
       <option value="opus">opus</option>
       <option value="haiku">haiku</option>
     </select>
-    <button class="btn" onclick="newSession()" title="New session">NEW</button>
-    <a class="btn" href="/admin">ADMIN</a>
-    <a class="btn" href="/">HOME</a>
+    <button class="btn" onclick="newSession()" title="New session">New</button>
+    <a class="btn" href="/admin">Admin</a>
+    <a class="btn" href="/">Home</a>
   </div>
 </div>
 
 <!-- Chat -->
-<div class="chat-container" id="chat" role="log" aria-label="채팅 메시지" aria-live="polite">
-  <div class="welcome" id="welcome">
-    <div class="ascii-art">
- ██████╗██╗  ██╗ █████╗ ████████╗
-██╔════╝██║  ██║██╔══██╗╚══██╔══╝
-██║     ███████║███████║   ██║
-██║     ██╔══██║██╔══██║   ██║
-╚██████╗██║  ██║██║  ██║   ██║
- ╚═════╝╚═╝  ╚═╝╚═╝  ╚═╝   ╚═╝
-    </div>
-    <p>Oh My Gateway Chat Terminal</p>
-    <p class="hint">메시지를 입력하고 Enter로 전송 (Shift+Enter: 줄바꿈)</p>
-    <p class="hint">v1/responses API를 통해 실시간 SSE 스트리밍</p>
-  </div>
+<div class="chat-container" id="chat" role="log" aria-label="Chat messages" aria-live="polite">
+<div class="welcome" id="welcome">
+<div class="welcome-mark">AI</div>
+<p>Oh My Gateway Chat</p>
+<p class="hint">New conversation</p>
+</div>
 </div>
 
 <!-- Input -->
 <div class="input-area">
   <div class="input-row">
-    <textarea id="input" rows="1" placeholder="메시지 입력..." autofocus aria-label="메시지 입력"></textarea>
-    <button class="send-btn" id="send-btn" onclick="sendMessage()" aria-label="메시지 전송">SEND</button>
+    <textarea id="input" rows="1" placeholder="Message..." autofocus aria-label="Message"></textarea>
+    <button class="send-btn" id="send-btn" onclick="sendMessage()" aria-label="Send message">Send</button>
   </div>
 </div>
 
 <!-- Status Bar -->
 <div class="status-bar">
-  <span><span class="status-dot idle" id="status-dot"></span><span id="status-text">대기중</span></span>
+  <span><span class="status-dot idle" id="status-dot"></span><span id="status-text">Idle</span></span>
   <span id="token-info"></span>
 </div>
 
@@ -938,15 +930,15 @@ function setStreaming(v) {
   isStreaming = v;
   sendBtn.disabled = v;
   inputEl.disabled = v;
-  setStatus(v ? 'streaming' : 'idle', v ? '스트리밍중...' : '대기중');
+  setStatus(v ? 'streaming' : 'idle', v ? 'Streaming...' : 'Idle');
 }
 function updateSessionTag() {
-  sessionTag.textContent = sessionId ? sessionId.substring(0, 12) + '...' : 'NO SESSION';
+  sessionTag.textContent = sessionId ? sessionId.substring(0, 12) + '...' : 'No session';
   sessionTag.title = sessionId || '';
 }
 function newSession() {
   if (chatEl.querySelectorAll('.message').length > 0) {
-    if (!confirm('현재 대화가 삭제됩니다. 새 세션을 시작하시겠습니까?')) return;
+    if (!confirm('This will clear the current conversation. Start a new session?')) return;
   }
   previousResponseId = null; sessionId = null; pendingAsk = null;
   toolEventsById = {};
@@ -960,7 +952,7 @@ function newSession() {
   chatEl.appendChild(welcomeEl);
   welcomeEl.style.display = '';
   tokenInfo.textContent = '';
-  setStatus('idle', '대기중');
+  setStatus('idle', 'Idle');
   inputEl.focus();
 }
 function isNearBottom() {
@@ -1349,7 +1341,7 @@ function showAskPrompt(argsObj, callId, responseId) {
       html += '</div>';
     }
     html += '<div class="ask-input-row">' +
-      '<input type="text" class="ask-input" placeholder="직접 입력...">' +
+      '<input type="text" class="ask-input" placeholder="직접 입력..." aria-label="Answer">' +
       '<button class="ask-submit">REPLY</button></div>';
     div.innerHTML = html;
   } else {
@@ -1359,7 +1351,7 @@ function showAskPrompt(argsObj, callId, responseId) {
       '<div class="role">AskUserQuestion</div>' +
       '<div class="ask-bubble">' + escapeHtml(question) + '</div>' +
       '<div class="ask-input-row">' +
-      '<input type="text" class="ask-input" placeholder="응답 입력...">' +
+      '<input type="text" class="ask-input" placeholder="응답 입력..." aria-label="Answer">' +
       '<button class="ask-submit">REPLY</button></div>';
   }
 
