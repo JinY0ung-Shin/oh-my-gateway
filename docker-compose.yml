@@ -77,6 +77,12 @@ services:
       # Docker installs optional plugins into the container user's ~/.claude,
       # so include user-scope config when the Claude SDK starts.
       - CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}
+      # Admin-managed plugin manifest layered on top of the CLAUDE_PLUGIN_* env
+      # bootstrap. Persisted to the ./data bind mount so it survives image
+      # redeploy AND `docker compose down -v` (which wipes claude_home's plugin
+      # cache); install_plugins.py reinstalls manifest.added and reapplies
+      # manifest.removed on next boot (self-healing).
+      - CLAUDE_PLUGIN_MANIFEST=${CLAUDE_PLUGIN_MANIFEST:-/app/data/gateway-plugins.json}
       # Auto-wire the custom system prompt to the host file mounted above.
       # Resolves to /app/system_prompt.md only when SYSTEM_PROMPT_HOST_FILE is
       # set; otherwise empty so the claude_code preset is used. This overrides

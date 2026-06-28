@@ -189,6 +189,58 @@ def test_collect_entries_parses_legacy_and_indexed(monkeypatch):
     assert entries[2].names == ["mkt"]
 
 
+def test_manifest_private_entry_inherits_git_token(tmp_path, monkeypatch):
+    # A private marketplace added via the admin panel must replay on startup when
+    # the un-indexed CLAUDE_PLUGIN_GIT_TOKEN is provided: the manifest entry has
+    # no token of its own, so it inherits that env credential for the clone.
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "added": [
+                    {
+                        "repo": "https://host/acme/private.git",
+                        "name": "octo",
+                        "marketplace": "acme",
+                        "scope": "user",
+                        "branch": "main",
+                    }
+                ],
+                "removed": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(manifest))
+    monkeypatch.setenv("CLAUDE_PLUGIN_GIT_TOKEN", "secret-token")
+
+    entries = installer.collect_entries()
+
+    assert len(entries) == 1
+    assert entries[0].source_label == "manifest"
+    assert entries[0].repo == "https://host/acme/private.git"
+    assert entries[0].git_token == "secret-token"
+
+
+def test_manifest_entry_no_token_when_env_unset(tmp_path, monkeypatch):
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {"added": [{"repo": "https://host/x/pub.git", "name": "p"}], "removed": []}
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(manifest))
+    entries = installer.collect_entries()
+    assert entries[0].git_token == ""
+
+
 def test_collect_entries_branch_defaults_to_main_and_honors_override(monkeypatch):
     for key in list(os.environ):
         if key.startswith("CLAUDE_PLUGIN"):
@@ -209,6 +261,115 @@ def test_collect_entries_empty_when_unset(monkeypatch):
         if key.startswith("CLAUDE_PLUGIN"):
             monkeypatch.delenv(key, raising=False)
     assert installer.collect_entries() == []
+
+
+def test_env_journal_path_defaults_beside_manifest(monkeypatch):
+    monkeypatch.delenv("CLAUDE_PLUGIN_ENV_JOURNAL", raising=False)
+    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", "/data/gw.json")
+    assert installer.env_journal_path() == Path("/data/gateway-plugins-env.json")
+
+
+def test_env_journal_path_honors_override(monkeypatch):
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", "/x/custom.json")
+    assert installer.env_journal_path() == Path("/x/custom.json")
+
+
+def test_write_env_journal_records_real_name_scope_branch_repo(tmp_path, monkeypatch):
+    # The journal key is the marketplace.json `name`, NOT the env declaration's
+    # repo basename, so the app can match it against known_marketplaces.json.
+    for key in list(os.environ):
+        if key.startswith("CLAUDE_PLUGIN"):
+            monkeypatch.delenv(key, raising=False)
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+
+    clone = tmp_path / "clone"
+    (clone / ".claude-plugin").mkdir(parents=True)
+    (clone / ".claude-plugin" / "marketplace.json").write_text(
+        json.dumps({"name": "real-mkt-name", "plugins": []})
+    )
+    entry = installer.PluginEntry(
+        repo=str(clone),
+        names=["p"],
+        marketplace="",
+        scope="project",
+        branch="develop",
+        source_label="CLAUDE_PLUGIN_REPO_1",
+    )
+
+    installer.write_env_journal([entry], tmp_path)
+
+    data = json.loads(journal.read_text())
+    assert data["marketplaces"] == {
+        "real-mkt-name": {
+            "scope": "project",
+            "branch": "develop",
+            "repo": str(clone),
+        }
+    }
+
+
+def test_strip_url_credentials_installer():
+    f = installer._strip_url_credentials
+    assert f("https://user:tok@host/o/r.git") == "https://host/o/r.git"
+    assert f("https://tok@host/o/r.git") == "https://host/o/r.git"
+    assert f("ssh://git@host/o/r.git") == "ssh://git@host/o/r.git"
+    assert f("/clones/local") == "/clones/local"
+
+
+def test_write_env_journal_strips_credentials_from_repo(tmp_path, monkeypatch):
+    # A token in CLAUDE_PLUGIN_REPO* is used to clone but must NEVER land in the
+    # journal (which the app replays into the manifest/API).
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+    entry = installer.PluginEntry(
+        repo="https://user:secret-token@host/org/private.git",
+        names=["p"],
+        marketplace="priv",
+        scope="user",
+        branch="main",
+        source_label="CLAUDE_PLUGIN_REPO_1",
+    )
+    installer.write_env_journal([entry], tmp_path)
+    raw = journal.read_text()
+    assert "secret-token" not in raw
+    assert json.loads(raw)["marketplaces"]["priv"]["repo"] == (
+        "https://host/org/private.git"
+    )
+
+
+def test_write_env_journal_skips_manifest_entries_and_clears(tmp_path, monkeypatch):
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+    manifest_entry = installer.PluginEntry(
+        repo="https://host/x/y.git", names=["p"], source_label="manifest"
+    )
+    installer.write_env_journal([manifest_entry], tmp_path)
+    assert json.loads(journal.read_text())["marketplaces"] == {}
+
+
+def test_write_env_journal_name_fallback_to_explicit_then_basename(
+    tmp_path, monkeypatch
+):
+    journal = tmp_path / "env.json"
+    monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+    # No marketplace.json on disk -> explicit marketplace name wins.
+    e1 = installer.PluginEntry(
+        repo=str(tmp_path / "missing1"),
+        names=["p"],
+        marketplace="explicit-mkt",
+        source_label="CLAUDE_PLUGIN_REPO_1",
+    )
+    # No marketplace.json and no explicit name -> repo basename.
+    e2 = installer.PluginEntry(
+        repo="https://host/acme/cool-mkt.git",
+        names=["q"],
+        source_label="CLAUDE_PLUGIN_REPO_2",
+    )
+    installer.write_env_journal([e1, e2], tmp_path)
+    mkts = json.loads(journal.read_text())["marketplaces"]
+    assert "explicit-mkt" in mkts
+    assert "cool-mkt" in mkts
 
 
 def test_collect_entries_drops_entry_with_uninferable_name(monkeypatch):
@@ -593,6 +754,214 @@ def test_missing_claude_cli_skips_without_blocking_startup(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "claude CLI not found" in result.stderr
     assert _read(tmp_path / "claude.log") == ""
+
+
+# ---------------------------------------------------------------------------
+# Integration tests — admin-managed manifest reconciliation
+# ---------------------------------------------------------------------------
+
+
+def test_manifest_added_entries_are_installed(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "added": [
+                    {
+                        "repo": "https://example/admin/mkt.git",
+                        "name": "adminplug",
+                        "marketplace": "adminmkt",
+                        "scope": "user",
+                        "branch": "main",
+                    }
+                ],
+                "removed": [],
+            }
+        )
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        # An env-bootstrap entry alongside the manifest entry.
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    # Env bootstrap entry still installed.
+    assert "plugin install envplug@envmkt --scope user" in claude_log
+    # Manifest-added entry installed (and updated) too.
+    assert "plugin install adminplug@adminmkt --scope user" in claude_log
+    assert "plugin update adminplug@adminmkt --scope user" in claude_log
+
+    git_log = _read(tmp_path / "git.log")
+    assert "clone --depth 1 --branch main https://example/admin/mkt.git" in git_log
+
+
+def test_manifest_removed_spec_is_skipped_and_uninstalled(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "added": [],
+                "removed": ["envplug@envmkt"],
+            }
+        )
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        # The env bootstrap still names a plugin the admin has removed, plus a
+        # second one that must remain installed.
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug,keepplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    # The removed spec is never (re)installed...
+    assert "plugin install envplug@envmkt" not in claude_log
+    assert "plugin update envplug@envmkt" not in claude_log
+    # ...but it IS actively uninstalled.
+    assert "plugin uninstall envplug@envmkt --scope user" in claude_log
+    # The sibling plugin from the same repo is unaffected.
+    assert "plugin install keepplug@envmkt --scope user" in claude_log
+
+
+def test_manifest_removed_honors_scope(tmp_path):
+    # A project-scope env plugin removed via the admin panel must be uninstalled
+    # at --scope project on startup (a --scope user uninstall would fail and
+    # leave it installed), and skipped from reinstall only at that scope.
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "added": [],
+                "removed": [{"spec": "envplug@envmkt", "scope": "project"}],
+            }
+        )
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+        "CLAUDE_PLUGIN_SCOPE_1": "project",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    assert "plugin uninstall envplug@envmkt --scope project" in claude_log
+    assert "plugin install envplug@envmkt" not in claude_log
+
+
+def test_manifest_removed_uninstall_failure_does_not_block_startup(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    # FAILPLUGIN makes the fake claude exit 1 on the uninstall call.
+    manifest.write_text(
+        json.dumps({"version": 1, "added": [], "removed": ["FAILPLUGIN@x"]})
+    )
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "keepplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    # A failing uninstall must never block the run / server startup.
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    assert "plugin uninstall FAILPLUGIN@x --scope user" in claude_log
+    assert "plugin install keepplug@envmkt --scope user" in claude_log
+
+
+def test_no_manifest_file_behaves_as_before(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        # Point at a path that does not exist; the installer must tolerate it.
+        "CLAUDE_PLUGIN_MANIFEST": str(tmp_path / "missing.json"),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    # Behaves exactly as before: env entry installed, no uninstall calls.
+    assert "plugin install envplug@envmkt --scope user" in claude_log
+    assert "plugin uninstall" not in claude_log
+
+
+def test_corrupt_manifest_is_tolerated(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _write_fake_claude(bin_dir)
+    _write_fake_git(bin_dir)
+
+    manifest = tmp_path / "gateway-plugins.json"
+    manifest.write_text("{not valid json")
+
+    env = {
+        **_base_env(tmp_path, bin_dir),
+        "CLAUDE_PLUGIN_MANIFEST": str(manifest),
+        "CLAUDE_PLUGIN_REPO_1": "https://example/env/mkt.git",
+        "CLAUDE_PLUGIN_NAME_1": "envplug",
+        "CLAUDE_PLUGIN_MARKETPLACE_1": "envmkt",
+    }
+
+    result = _run_installer(env)
+    assert result.returncode == 0, result.stderr
+
+    claude_log = _read(tmp_path / "claude.log")
+    assert "plugin install envplug@envmkt --scope user" in claude_log
+    assert "plugin uninstall" not in claude_log
 
 
 def test_marketplace_install_registers_cli_usable_plugin_from_local_directory(tmp_path):

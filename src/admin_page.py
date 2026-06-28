@@ -11,6 +11,7 @@ from functools import lru_cache
 from src.admin_html_config import get_config_html
 from src.admin_html_dashboard import get_dashboard_html
 from src.admin_html_logs import get_logs_html
+from src.admin_html_plugins import get_plugins_html
 from src.admin_html_ratelimits import get_ratelimits_html
 from src.admin_html_sessions import get_sessions_html
 from src.admin_html_skills import get_skills_html
@@ -116,6 +117,7 @@ def build_admin_page() -> str:
         <button role="tab" :aria-selected="tab === 'usage'" @click="tab='usage'; loadUsage()">USAGE</button>
         <button role="tab" :aria-selected="tab === 'ratelimits'" @click="tab='ratelimits'; loadRateLimits()">LIMITS</button>
         <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">SKILLS</button>
+        <button role="tab" :aria-selected="tab === 'plugins'" @click="tab='plugins'; loadPlugins(); loadCatalog()">PLUGINS</button>
         <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">CONFIG</button>
         <a href="/admin/chat" role="tab" style="color:var(--cyan);text-decoration:none;padding:var(--gap-sm) var(--gap-lg);font-size:var(--fs-sm);letter-spacing:0.08em;border-bottom:2px solid transparent;display:flex;align-items:center;gap:4px;white-space:nowrap;">CHAT ↗</a>
       </nav>
@@ -130,6 +132,8 @@ def build_admin_page() -> str:
         + get_ratelimits_html()
         + "\n\n"
         + get_skills_html()
+        + "\n\n"
+        + get_plugins_html()
         + "\n\n"
         + get_sessions_html()
         + "\n\n"

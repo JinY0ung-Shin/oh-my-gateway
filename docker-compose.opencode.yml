@@ -52,6 +52,9 @@ services:
       - OPENCODE_BIN=opencode
       - OPENCODE_HOME=/home/app/.local/share/opencode
       - USER_WORKSPACES_DIR=${USER_WORKSPACES_DIR:-/data/workspaces}
+      # Admin-managed plugin manifest persisted to the ./data bind mount so it
+      # survives image redeploy and `docker compose down -v`.
+      - CLAUDE_PLUGIN_MANIFEST=${CLAUDE_PLUGIN_MANIFEST:-/app/data/gateway-plugins.json}
       # Auto-wire the custom system prompt to the host file mounted above; empty
       # (preset mode) when SYSTEM_PROMPT_HOST_FILE is unset. Overrides .env.
       - SYSTEM_PROMPT_FILE=${SYSTEM_PROMPT_HOST_FILE:+/app/system_prompt.md}

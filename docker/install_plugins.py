@@ -43,6 +43,7 @@ URL.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import platform
 import shutil
@@ -50,10 +51,16 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 LOG_PREFIX = "[install_plugins]"
+
+# Container default for the admin-managed manifest. The app side derives this
+# from the project root; this standalone script can't, so docker-compose pins
+# CLAUDE_PLUGIN_MANIFEST so both sides agree exactly.
+DEFAULT_MANIFEST_PATH = "/app/data/gateway-plugins.json"
 
 # Safety cap on how many indexed entries (CLAUDE_PLUGIN_REPO_1..N) we scan for.
 MAX_INDEX = 64
@@ -152,7 +159,12 @@ def _entry_from_suffix(suffix: str) -> Optional[PluginEntry]:
 
 
 def collect_entries() -> List[PluginEntry]:
-    """Collect the legacy un-indexed entry plus all indexed ``_N`` entries."""
+    """Collect the legacy un-indexed entry plus all indexed ``_N`` entries.
+
+    Entries from the admin-managed manifest (``manifest.added``) are appended
+    after the env bootstrap so admin-installed plugins are reinstalled on every
+    boot (self-healing after a plugin-cache volume wipe).
+    """
     entries: List[PluginEntry] = []
 
     legacy = _entry_from_suffix("")
@@ -170,7 +182,202 @@ def collect_entries() -> List[PluginEntry]:
             f"only indices 1..{MAX_INDEX} are scanned"
         )
 
+    entries.extend(_manifest_entries())
+
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Admin-managed manifest (read inline; stdlib only — never import src)
+# ---------------------------------------------------------------------------
+
+
+def manifest_path() -> Path:
+    """Resolve the manifest path, matching the app side's env override."""
+    configured = os.environ.get("CLAUDE_PLUGIN_MANIFEST", "").strip()
+    return Path(configured) if configured else Path(DEFAULT_MANIFEST_PATH)
+
+
+def load_manifest() -> Dict[str, list]:
+    """Read the manifest, tolerating a missing/corrupt file.
+
+    Always returns ``{"added": [...], "removed": [...]}`` with ``added`` filtered
+    to dicts and ``removed`` normalized to ``{"spec","scope"}`` dicts (scope is
+    part of a plugin's identity); never raises.
+    """
+    empty: Dict[str, list] = {"added": [], "removed": []}
+    try:
+        raw = manifest_path().read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError):
+        return empty
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, ValueError):
+        return empty
+    if not isinstance(data, dict):
+        return empty
+    added = data.get("added")
+    removed = data.get("removed")
+    removed_norm = []
+    if isinstance(removed, list):
+        for r in removed:
+            if isinstance(r, dict) and isinstance(r.get("spec"), str) and r["spec"]:
+                scope = r.get("scope")
+                removed_norm.append(
+                    {
+                        "spec": r["spec"],
+                        "scope": scope if isinstance(scope, str) and scope else "user",
+                    }
+                )
+            elif isinstance(r, str) and r:  # legacy spec-only
+                removed_norm.append({"spec": r, "scope": "user"})
+    return {
+        "added": [e for e in added if isinstance(e, dict)]
+        if isinstance(added, list)
+        else [],
+        "removed": removed_norm,
+    }
+
+
+def _manifest_entries() -> List[PluginEntry]:
+    """Build :class:`PluginEntry` objects from ``manifest.added``.
+
+    Each added record carries its own repo/name/marketplace/scope/branch, so it
+    becomes a single-plugin entry. Records missing both a repo and a name are
+    dropped (nothing actionable to install).
+
+    The admin panel never persists a git token, so a PRIVATE admin-added
+    marketplace would otherwise clone unauthenticated and fail. As a fallback,
+    manifest entries inherit the un-indexed ``CLAUDE_PLUGIN_GIT_TOKEN`` (the same
+    credential the legacy env-bootstrap entry uses) so a private marketplace
+    replays when that token is provided at startup.
+    """
+    manifest_token = os.environ.get("CLAUDE_PLUGIN_GIT_TOKEN", "")
+    entries: List[PluginEntry] = []
+    for record in load_manifest()["added"]:
+        repo = str(record.get("repo", "")).strip()
+        name = str(record.get("name", "")).strip()
+        if not name:
+            name = _default_name(repo)
+        if not repo or not name:
+            log(f"manifest: skipping entry with no actionable repo/name: {record!r}")
+            continue
+        entries.append(
+            PluginEntry(
+                repo=repo,
+                names=[name],
+                marketplace=str(record.get("marketplace", "")).strip(),
+                scope=str(record.get("scope", "")).strip() or "user",
+                branch=str(record.get("branch", "")).strip() or DEFAULT_BRANCH,
+                git_token=manifest_token,
+                source_label="manifest",
+            )
+        )
+    return entries
+
+
+def _spec(name: str, marketplace: str) -> str:
+    """``name@marketplace`` when *marketplace* is truthy, else ``name``."""
+    return f"{name}@{marketplace}" if marketplace else name
+
+
+# ---------------------------------------------------------------------------
+# Env-bootstrap marketplace journal (consumed by the running app)
+# ---------------------------------------------------------------------------
+
+
+def env_journal_path() -> Path:
+    """Path of the env-bootstrap marketplace journal (beside the manifest).
+
+    ``known_marketplaces.json`` persists neither an env marketplace's scope/branch
+    nor its original remote (clone-then-add records only the local path). This
+    journal hands that metadata to the running app, keyed by the marketplace's
+    real ``marketplace.json`` name. Overridable with ``CLAUDE_PLUGIN_ENV_JOURNAL``.
+    """
+    configured = os.environ.get("CLAUDE_PLUGIN_ENV_JOURNAL", "").strip()
+    if configured:
+        return Path(configured)
+    return manifest_path().with_name("gateway-plugins-env.json")
+
+
+def _strip_url_credentials(repo: str) -> str:
+    """Remove embedded credentials from an http(s) repo URL before journaling.
+
+    A deployment may put a token in ``CLAUDE_PLUGIN_REPO*`` (e.g.
+    ``https://user:token@host/org/repo.git``); git uses it to clone, but it must
+    not be persisted to the journal (which the app reads and replays into the
+    manifest/API). Strip the userinfo here — replay credentials come from
+    ``CLAUDE_PLUGIN_GIT_TOKEN*``. Non-http(s) values are returned unchanged.
+    """
+    repo = (repo or "").strip()
+    scheme = repo.split("://", 1)[0].lower() if "://" in repo else ""
+    if scheme not in ("http", "https"):
+        return repo
+    try:
+        parts = urlsplit(repo)
+    except ValueError:
+        return repo
+    if not (parts.username or parts.password):
+        return repo
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
+
+
+def _marketplace_name_for(local_path: Path, entry: PluginEntry) -> str:
+    """Resolve the name claude keys this marketplace by (its marketplace.json name).
+
+    Falls back to the explicit ``CLAUDE_PLUGIN_MARKETPLACE*`` value, then the repo
+    basename, so the journal always has a usable key.
+    """
+    try:
+        raw = (local_path / ".claude-plugin" / "marketplace.json").read_text(
+            encoding="utf-8"
+        )
+        data = json.loads(raw)
+        name = data.get("name") if isinstance(data, dict) else None
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    except (OSError, ValueError):
+        pass
+    return entry.marketplace or _default_name(entry.repo)
+
+
+def write_env_journal(entries: List[PluginEntry], root: Path) -> None:
+    """Write the env-bootstrap marketplace journal (overwrites fully each run).
+
+    Only ENV-declared entries are recorded; ``manifest.added`` entries are already
+    persisted in the manifest. Best-effort: a write failure is logged, not fatal —
+    the app simply falls back to user/main defaults.
+    """
+    records: Dict[str, Dict[str, str]] = {}
+    for entry in entries:
+        if entry.source_label == "manifest" or not entry.repo:
+            continue
+        local_path = (
+            Path(entry.repo)
+            if Path(entry.repo).exists()
+            else _clone_dir(root, entry.repo)
+        )
+        name = _marketplace_name_for(local_path, entry)
+        if not name:
+            continue
+        records[name] = {
+            "scope": entry.scope,
+            "branch": entry.branch,
+            # Never persist credentials embedded in the repo URL to the journal.
+            "repo": _strip_url_credentials(entry.repo),
+        }
+    payload = {"version": 1, "marketplaces": records}
+    path = env_journal_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        log(f"could not write env journal {path}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -365,8 +572,37 @@ def install_and_update(claude_bin: str, spec: str, scope: str) -> bool:
     return True
 
 
-def process_entry(entry: PluginEntry, claude_bin: str, root: Path) -> Tuple[int, int]:
-    """Prepare one repo and install/update its plugins. Returns ``(ok, failed)``."""
+def process_entry(
+    entry: PluginEntry,
+    claude_bin: str,
+    root: Path,
+    removed_set: Optional[set] = None,
+) -> Tuple[int, int]:
+    """Prepare one repo and install/update its plugins. Returns ``(ok, failed)``.
+
+    Any (spec, scope) present in *removed_set* (the admin-uninstalled set from the
+    manifest) is skipped before any subprocess for that plugin runs. scope is part
+    of the identity, so an entry is only skipped when its own scope was removed.
+    """
+    removed_set = removed_set or set()
+    names = [
+        n
+        for n in entry.names
+        if (_spec(n, entry.marketplace), entry.scope) not in removed_set
+    ]
+    skipped = [
+        n
+        for n in entry.names
+        if (_spec(n, entry.marketplace), entry.scope) in removed_set
+    ]
+    for name in skipped:
+        log(
+            f"{entry.source_label}: skipping {_spec(name, entry.marketplace)!r} "
+            f"(marked removed in manifest)"
+        )
+    if not names:
+        return (0, 0)
+
     try:
         local_path = prepare_repo(entry, root)
     except subprocess.CalledProcessError as exc:
@@ -399,8 +635,8 @@ def process_entry(entry: PluginEntry, claude_bin: str, root: Path) -> Tuple[int,
 
     ok = 0
     failed = 0
-    for name in entry.names:
-        spec = f"{name}@{entry.marketplace}" if entry.marketplace else name
+    for name in names:
+        spec = _spec(name, entry.marketplace)
         if install_and_update(claude_bin, spec, entry.scope):
             ok += 1
         else:
@@ -411,6 +647,7 @@ def process_entry(entry: PluginEntry, claude_bin: str, root: Path) -> Tuple[int,
 def main() -> int:
     entries = collect_entries()
     if not entries:
+        write_env_journal([], clone_root())  # clear any stale journal
         return 0  # nothing configured — no-op, same as the legacy installer
 
     total_plugins = sum(len(entry.names) for entry in entries)
@@ -425,18 +662,45 @@ def main() -> int:
         )
         return 0  # never block server startup
 
+    removed_set = {(r["spec"], r["scope"]) for r in load_manifest()["removed"]}
+
     root = clone_root()
     total_ok = 0
     total_failed = 0
     for entry in entries:
-        ok, failed = process_entry(entry, claude_bin, root)
+        ok, failed = process_entry(entry, claude_bin, root, removed_set)
         total_ok += ok
         total_failed += failed
+
+    apply_removed(claude_bin, removed_set)
+    write_env_journal(entries, root)
 
     log(
         f"done: {total_ok} plugin(s) ensured, {total_failed} failed, across {len(entries)} repo(s)"
     )
     return 0
+
+
+def apply_removed(claude_bin: str, removed_set: set) -> None:
+    """Best-effort uninstall every spec the admin marked removed.
+
+    These specs came from the env bootstrap (so install was skipped above); this
+    actively uninstalls them at the scope they were removed from so a `down -v`
+    plugin-cache wipe stays consistent with the admin's intent. Failures are
+    logged and ignored — uninstalling an already-absent plugin is expected and
+    must never block startup.
+
+    *removed_set* is a set of ``(spec, scope)`` tuples.
+    """
+    for spec, scope in sorted(removed_set):
+        try:
+            run([claude_bin, "plugin", "uninstall", spec, "--scope", scope])
+            log(f"uninstalled {spec!r} (scope {scope}; marked removed in manifest)")
+        except subprocess.CalledProcessError as exc:
+            log(
+                f"uninstall for {spec!r} (scope {scope}) returned rc={exc.returncode}; "
+                f"likely already absent, continuing"
+            )
 
 
 if __name__ == "__main__":

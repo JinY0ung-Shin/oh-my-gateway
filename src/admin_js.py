@@ -29,6 +29,14 @@ def get_admin_js() -> str:
     runtimeConfig: {},
     plugins: [],
     pluginSkillView: null,
+    marketplaces: [],
+    pluginBusy: false,
+    catalogFilter: '',
+    catalogBusy: {},
+    catalogLoading: false,
+    showAdvancedInstall: false,
+    mpForm: { repo: '', branch: 'main', scope: 'user', git_token: '' },
+    pluginForm: { name: '', marketplace: '', scope: 'user' },
     toolsRegistry: {},
     sandboxConfig: {},
     systemPrompt: { mode: 'preset', prompt: null, resolved_prompt: null, preset_text: null, char_count: 0, active_name: null },
@@ -550,15 +558,15 @@ def get_admin_js() -> str:
         const r = await this.api('/admin/api/plugins');
         if (r.ok) {
           const d = await r.json();
-          const wasExpanded = new Set(this.plugins.filter(p => p._expanded).map(p => p.id));
-          this.plugins = (d.plugins || []).map(p => ({ ...p, _expanded: wasExpanded.has(p.id) }));
+          const wasExpanded = new Set(this.plugins.filter(p => p._expanded).map(p => p.id + '@' + p.scope));
+          this.plugins = (d.plugins || []).map(p => ({ ...p, _expanded: wasExpanded.has(p.id + '@' + p.scope) }));
         }
       } catch(e) { console.error('Failed to load plugins', e); this.showToast('Failed to load plugins', 'err'); }
     },
     async openPluginSkill(plugin, skillName) {
-      this.pluginSkillView = { pluginId: plugin.id, skillName, pluginName: plugin.name, version: plugin.version, content: '' };
+      this.pluginSkillView = { pluginId: plugin.id, scope: plugin.scope, skillName, pluginName: plugin.name, version: plugin.version, content: '' };
       try {
-        const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plugin.id) + '/skills/' + encodeURIComponent(skillName));
+        const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plugin.id) + '/skills/' + encodeURIComponent(skillName) + '?scope=' + encodeURIComponent(plugin.scope || 'user'));
         if (r.ok) {
           const d = await r.json();
           this.pluginSkillView.content = d.content || '';
@@ -567,6 +575,183 @@ def get_admin_js() -> str:
           this.pluginSkillView = null;
         }
       } catch(e) { this.showToast('Connection error', 'err'); this.pluginSkillView = null; }
+    },
+
+    // --- Plugin management (PLUGINS tab) ---
+    async loadPlugins() { await this.loadSkills(); },
+
+    // Browse catalog: load every marketplace + its plugins in one call.
+    async loadCatalog() {
+      this.catalogLoading = true;
+      try {
+        const r = await this.api('/admin/api/marketplaces/catalog');
+        if (r.ok) {
+          const d = await r.json();
+          const wasExpanded = new Set(this.marketplaces.filter(m => m._expanded).map(m => m.name));
+          this.marketplaces = (d.marketplaces || []).map(m => ({
+            ...m, _expanded: wasExpanded.has(m.name),
+          }));
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Failed to load catalog', 'err');
+        }
+      } catch(e) {
+        console.error('Failed to load catalog', e);
+        this.showToast('Failed to load catalog', 'err');
+      } finally { this.catalogLoading = false; }
+    },
+
+    // Refresh both the catalog and the installed list so installed flags
+    // and origin badges update immediately after a mutation.
+    async refreshPluginViews() {
+      await Promise.all([this.loadCatalog(), this.loadPlugins()]);
+    },
+
+    // Legacy plain marketplace list (kept for the advanced install form's
+    // dropdown); catalog also populates this.marketplaces with names.
+    async loadMarketplaces() { await this.loadCatalog(); },
+
+    toggleMarketplace(m) { m._expanded = !m._expanded; },
+
+    // Client-side filter across all marketplaces by name/description.
+    filteredCatalogPlugins(m) {
+      const q = this.catalogFilter.trim().toLowerCase();
+      const list = m.plugins || [];
+      if (!q) return list;
+      return list.filter(p =>
+        (p.name || '').toLowerCase().includes(q) ||
+        (p.description || '').toLowerCase().includes(q));
+    },
+
+    // A marketplace is hidden while filtering if it has no matching plugins.
+    marketplaceVisible(m) {
+      if (!this.catalogFilter.trim()) return true;
+      return this.filteredCatalogPlugins(m).length > 0;
+    },
+
+    catalogVisibleCount() {
+      return this.marketplaces.filter(m => this.marketplaceVisible(m)).length;
+    },
+
+    async installFromCatalog(m, plug) {
+      this.catalogBusy[plug.id] = true;
+      try {
+        const r = await this.api('/admin/api/plugins', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ name: plug.name, marketplace: m.name, scope: m.scope || 'user' })
+        });
+        if (r.ok) {
+          this.showToast('PLUGIN INSTALLED: ' + plug.name, 'ok');
+          await this.refreshPluginViews();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Install failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { delete this.catalogBusy[plug.id]; }
+    },
+
+    async uninstallFromCatalog(plug) {
+      if (!confirm('Uninstall plugin "' + plug.name + '"?')) return;
+      this.catalogBusy[plug.id] = true;
+      try {
+        const r = await this.api('/admin/api/plugins/' + encodeURIComponent(plug.id) +
+          '?scope=' + encodeURIComponent(plug.scope || 'user'), { method: 'DELETE' });
+        if (r.ok) {
+          this.showToast('PLUGIN UNINSTALLED', 'ok');
+          await this.refreshPluginViews();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Uninstall failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { delete this.catalogBusy[plug.id]; }
+    },
+
+    async addMarketplace() {
+      const repo = this.mpForm.repo.trim();
+      if (!repo) return;
+      this.pluginBusy = true;
+      try {
+        const r = await this.api('/admin/api/marketplaces', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            repo,
+            branch: this.mpForm.branch.trim() || 'main',
+            scope: this.mpForm.scope,
+            git_token: this.mpForm.git_token,
+          })
+        });
+        if (r.ok) {
+          this.showToast('MARKETPLACE ADDED', 'ok');
+          this.mpForm = { repo: '', branch: 'main', scope: 'user', git_token: '' };
+          await this.loadMarketplaces();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Add failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.pluginBusy = false; }
+    },
+
+    async removeMarketplace(name, scope) {
+      if (!confirm('Remove marketplace "' + name + '"?')) return;
+      this.pluginBusy = true;
+      try {
+        const r = await this.api('/admin/api/marketplaces/' + encodeURIComponent(name) +
+          '?scope=' + encodeURIComponent(scope || 'user'), { method: 'DELETE' });
+        if (r.ok) {
+          this.showToast('MARKETPLACE REMOVED', 'ok');
+          await this.loadMarketplaces();
+          await this.loadPlugins();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Remove failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.pluginBusy = false; }
+    },
+
+    async installPlugin() {
+      const name = this.pluginForm.name.trim();
+      if (!name) return;
+      this.pluginBusy = true;
+      try {
+        const r = await this.api('/admin/api/plugins', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            name,
+            marketplace: this.pluginForm.marketplace,
+            scope: this.pluginForm.scope,
+          })
+        });
+        if (r.ok) {
+          this.showToast('PLUGIN INSTALLED: ' + name, 'ok');
+          this.pluginForm = { name: '', marketplace: '', scope: 'user' };
+          await this.refreshPluginViews();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Install failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.pluginBusy = false; }
+    },
+
+    async uninstallPlugin(pluginId, scope) {
+      if (!confirm('Uninstall plugin "' + pluginId + '"?')) return;
+      this.pluginBusy = true;
+      try {
+        const r = await this.api('/admin/api/plugins/' + encodeURIComponent(pluginId) +
+          '?scope=' + encodeURIComponent(scope || 'user'), { method: 'DELETE' });
+        if (r.ok) {
+          this.showToast('PLUGIN UNINSTALLED', 'ok');
+          await this.refreshPluginViews();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Uninstall failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.pluginBusy = false; }
     },
 
     async toggleSessionHistory(sessionId) {

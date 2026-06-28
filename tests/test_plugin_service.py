@@ -13,9 +13,12 @@ from src.plugin_service import (
     _parse_plugin_id,
     _read_json,
     _validate_install_path,
+    _validate_marketplace_path,
+    get_marketplaces_with_plugins,
     get_plugin_blocklist,
     get_plugin_detail,
     get_plugin_skill_content,
+    list_marketplace_plugins,
     list_marketplaces,
     list_plugins,
 )
@@ -92,6 +95,35 @@ def _make_plugin_tree(plugins_root: Path) -> Path:
                     "installLocation": str(plugins_root / "marketplaces" / "test-mkt"),
                     "lastUpdated": "2026-03-01T00:00:00Z",
                 }
+            }
+        )
+    )
+
+    # marketplace catalog (.claude-plugin/marketplace.json)
+    mkt_meta = plugins_root / "marketplaces" / "test-mkt" / ".claude-plugin"
+    mkt_meta.mkdir(parents=True)
+    (mkt_meta / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": "test-mkt",
+                "owner": {"name": "tester"},
+                "metadata": {},
+                "plugins": [
+                    {
+                        "name": "demo-plugin",
+                        "description": "A demo plugin for testing",
+                        "source": "./demo-plugin",
+                        "strict": True,
+                        "version": "1.0.0",
+                        "skills": ["greet", "farewell"],
+                    },
+                    {
+                        "name": "other-plugin",
+                        "description": "Not installed",
+                        "source": "./other-plugin",
+                        "strict": False,
+                    },
+                ],
             }
         )
     )
@@ -317,6 +349,36 @@ class TestListPlugins:
         assert p["skill_count"] == 2
         assert p["command_count"] == 1
 
+    def test_multi_scope_emits_one_row_per_scope(self, plugins_dir):
+        # claude stores one entry per scope under a plugin id; each must surface
+        # as its own row so it is visible and removable at its real scope.
+        cache = plugins_dir / "cache" / "test-mkt" / "demo-plugin" / "1.0.0"
+        reg = plugins_dir / "installed_plugins.json"
+        reg.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {
+                                "scope": "user",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            },
+                            {
+                                "scope": "project",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            },
+                        ]
+                    },
+                }
+            )
+        )
+        rows = list_plugins()
+        assert sorted(p["scope"] for p in rows) == ["project", "user"]
+        assert all(p["id"] == "demo-plugin@test-mkt" for p in rows)
+
     def test_no_plugins_dir(self, no_plugins_dir):
         assert list_plugins() == []
 
@@ -361,6 +423,63 @@ class TestListPlugins:
 
 
 class TestGetPluginDetail:
+    def test_selects_entry_by_scope(self, plugins_dir):
+        # With per-scope entries, the scope arg picks the right one (default first).
+        cache = plugins_dir / "cache" / "test-mkt" / "demo-plugin" / "1.0.0"
+        reg = plugins_dir / "installed_plugins.json"
+        reg.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {
+                                "scope": "user",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            },
+                            {
+                                "scope": "project",
+                                "installPath": str(cache),
+                                "version": "9.9.9",
+                            },
+                        ]
+                    },
+                }
+            )
+        )
+        proj = get_plugin_detail("demo-plugin@test-mkt", "project")
+        user = get_plugin_detail("demo-plugin@test-mkt", "user")
+        assert proj["version"] == "9.9.9"
+        assert user["version"] == "1.0.0"
+        # default (no scope) -> first entry
+        assert get_plugin_detail("demo-plugin@test-mkt")["version"] == "1.0.0"
+
+    def test_explicit_scope_with_no_matching_entry_is_none(self, plugins_dir):
+        # A scope-specific request must 404 (None) rather than silently fall
+        # back to another scope's install path/content.
+        cache = plugins_dir / "cache" / "test-mkt" / "demo-plugin" / "1.0.0"
+        reg = plugins_dir / "installed_plugins.json"
+        reg.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "demo-plugin@test-mkt": [
+                            {
+                                "scope": "user",
+                                "installPath": str(cache),
+                                "version": "1.0.0",
+                            }
+                        ]
+                    },
+                }
+            )
+        )
+        assert get_plugin_detail("demo-plugin@test-mkt", "project") is None
+        # omitted scope still resolves to the first entry
+        assert get_plugin_detail("demo-plugin@test-mkt") is not None
+
     def test_existing_plugin(self, plugins_dir):
         detail = get_plugin_detail("demo-plugin@test-mkt")
         assert detail is not None
@@ -437,8 +556,148 @@ class TestListMarketplaces:
         assert mkts[0]["source_type"] == "github"
         assert mkts[0]["repo"] == "test/marketplace"
 
+    def test_scope_defaults_user_without_manifest_record(self, plugins_dir, monkeypatch):
+        from src import plugin_manifest
+
+        monkeypatch.setattr(plugin_manifest, "list_marketplace_records", lambda: {})
+        assert list_marketplaces()[0]["scope"] == "user"
+
+    def test_scope_from_manifest_record(self, plugins_dir, monkeypatch):
+        from src import plugin_manifest
+
+        monkeypatch.setattr(
+            plugin_manifest,
+            "list_marketplace_records",
+            lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "project"}},
+        )
+        assert list_marketplaces()[0]["scope"] == "project"
+
+    def test_scope_from_env_journal_without_manifest_record(
+        self, plugins_dir, monkeypatch, tmp_path
+    ):
+        # No manifest record -> fall back to the startup installer's env journal
+        # so an env-bootstrapped marketplace keeps its declared (non-user) scope.
+        from src import plugin_manifest
+
+        monkeypatch.setattr(plugin_manifest, "list_marketplace_records", lambda: {})
+        journal = tmp_path / "gateway-plugins-env.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "marketplaces": {
+                        "test-mkt": {
+                            "scope": "project",
+                            "branch": "main",
+                            "repo": "test/marketplace",
+                        }
+                    },
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        assert list_marketplaces()[0]["scope"] == "project"
+
+    def test_manifest_record_wins_over_env_journal(
+        self, plugins_dir, monkeypatch, tmp_path
+    ):
+        from src import plugin_manifest
+
+        monkeypatch.setattr(
+            plugin_manifest,
+            "list_marketplace_records",
+            lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "local"}},
+        )
+        journal = tmp_path / "gateway-plugins-env.json"
+        journal.write_text(
+            json.dumps(
+                {"version": 1, "marketplaces": {"test-mkt": {"scope": "project"}}}
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        assert list_marketplaces()[0]["scope"] == "local"
+
+    def test_credential_url_is_stripped_from_repo_field(self, plugins_dir):
+        # A known_marketplaces.json source.url with embedded credentials must not
+        # be surfaced verbatim by the listing/catalog API.
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "priv-mkt": {
+                        "source": {
+                            "source": "git",
+                            "url": "https://user:secret-token@host/org/priv.git",
+                        },
+                        "installLocation": str(
+                            plugins_dir / "marketplaces" / "priv-mkt"
+                        ),
+                    }
+                }
+            )
+        )
+        mkts = list_marketplaces()
+        assert mkts[0]["repo"] == "https://host/org/priv.git"
+        assert "secret-token" not in json.dumps(mkts)
+
     def test_no_plugins_dir(self, no_plugins_dir):
         assert list_marketplaces() == []
+
+
+class TestStripUrlCredentials:
+    def test_strips_http_userinfo(self):
+        from src.plugin_service import _strip_url_credentials as f
+
+        assert f("https://user:tok@host/o/r.git") == "https://host/o/r.git"
+        assert f("https://tok@host/o/r.git") == "https://host/o/r.git"
+        assert f("http://u:p@host:8443/r") == "http://host:8443/r"
+
+    def test_leaves_clean_and_non_http_untouched(self):
+        from src.plugin_service import _strip_url_credentials as f
+
+        assert f("https://host/o/r.git") == "https://host/o/r.git"
+        assert f("ssh://git@host/o/r.git") == "ssh://git@host/o/r.git"
+        assert f("git@host:o/r.git") == "git@host:o/r.git"
+        assert f("/clones/local") == "/clones/local"
+        assert f("") == ""
+
+
+class TestEnvBootstrapRecords:
+    def test_missing_journal_returns_empty(self, monkeypatch, tmp_path):
+        from src.plugin_service import env_bootstrap_records
+
+        monkeypatch.setenv(
+            "CLAUDE_PLUGIN_ENV_JOURNAL", str(tmp_path / "nope.json")
+        )
+        assert env_bootstrap_records() == {}
+
+    def test_reads_and_normalizes(self, monkeypatch, tmp_path):
+        from src.plugin_service import env_bootstrap_records
+
+        journal = tmp_path / "env.json"
+        journal.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "marketplaces": {
+                        "mkt": {"scope": "project", "branch": "dev", "repo": "o/r"},
+                        "bare": {},
+                    },
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        recs = env_bootstrap_records()
+        assert recs["mkt"] == {"scope": "project", "branch": "dev", "repo": "o/r"}
+        # missing fields default to user/main/empty
+        assert recs["bare"] == {"scope": "user", "branch": "main", "repo": ""}
+
+    def test_corrupt_journal_returns_empty(self, monkeypatch, tmp_path):
+        from src.plugin_service import env_bootstrap_records
+
+        journal = tmp_path / "env.json"
+        journal.write_text("not json{")
+        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
+        assert env_bootstrap_records() == {}
 
 
 # ---------------------------------------------------------------------------
@@ -519,3 +778,241 @@ class TestPluginRoutes:
         resp = client.get("/admin/api/plugins/blocklist")
         assert resp.status_code == 200
         assert len(resp.json()["blocklist"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _validate_marketplace_path
+# ---------------------------------------------------------------------------
+
+
+class TestValidateMarketplacePath:
+    def test_valid_path(self, plugins_dir):
+        loc = plugins_dir / "marketplaces" / "test-mkt"
+        result = _validate_marketplace_path(loc)
+        assert result is not None
+        assert result.is_dir()
+
+    def test_outside_marketplaces_rejected(self, plugins_dir):
+        assert _validate_marketplace_path(Path("/tmp")) is None
+
+    def test_no_plugins_root(self, no_plugins_dir):
+        assert _validate_marketplace_path(Path("/anything")) is None
+
+    def test_nonexistent_rejected(self, plugins_dir):
+        assert (
+            _validate_marketplace_path(plugins_dir / "marketplaces" / "nope")
+            is None
+        )
+
+    def test_symlink_rejected(self, plugins_dir):
+        real = plugins_dir / "marketplaces" / "test-mkt"
+        link = plugins_dir / "marketplaces" / "evil-link"
+        link.symlink_to(real)
+        assert _validate_marketplace_path(link) is None
+
+    def test_clone_root_location_accepted(self, plugins_dir, monkeypatch):
+        # claude stores installLocation as the clone-root path when a marketplace
+        # is added from a local clone (the admin/env flow), so that root is valid.
+        clone_root = plugins_dir.parent / "clones"
+        loc = clone_root / "m-123"
+        loc.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(clone_root))
+        assert _validate_marketplace_path(loc) == loc.resolve()
+
+    def test_outside_all_roots_rejected(self, plugins_dir, monkeypatch):
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(plugins_dir / "clones"))
+        outside = plugins_dir.parent / "elsewhere"
+        outside.mkdir()
+        assert _validate_marketplace_path(outside) is None
+
+
+# ---------------------------------------------------------------------------
+# list_marketplace_plugins
+# ---------------------------------------------------------------------------
+
+
+class TestListMarketplacePlugins:
+    def test_installed_flag(self, plugins_dir):
+        plugins = list_marketplace_plugins("test-mkt")
+        by_name = {p["name"]: p for p in plugins}
+        assert by_name["demo-plugin"]["installed"] is True
+        assert by_name["demo-plugin"]["id"] == "demo-plugin@test-mkt"
+        assert by_name["demo-plugin"]["version"] == "1.0.0"
+        assert by_name["demo-plugin"]["skill_count"] == 2
+        assert by_name["other-plugin"]["installed"] is False
+        assert by_name["other-plugin"]["version"] == ""
+        assert by_name["other-plugin"]["skill_count"] == 0
+
+    def test_catalog_from_clone_root_install_location(self, plugins_dir, monkeypatch):
+        # The real admin/env flow: claude records installLocation as the
+        # clone-root clone path (NOT under plugins/marketplaces). The catalog
+        # reader must still read it, else "add marketplace -> Browse" is empty.
+        clone_root = plugins_dir.parent / "clones"
+        mkt_loc = clone_root / "acme-mkt-deadbeef"
+        meta = mkt_loc / ".claude-plugin"
+        meta.mkdir(parents=True)
+        (meta / "marketplace.json").write_text(
+            json.dumps(
+                {
+                    "name": "acme-mkt",
+                    "plugins": [
+                        {"name": "octo", "description": "d", "version": "2.0.0"}
+                    ],
+                }
+            )
+        )
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "acme-mkt": {
+                        "source": {"source": "directory", "path": str(mkt_loc)},
+                        "installLocation": str(mkt_loc),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(clone_root))
+
+        plugins = list_marketplace_plugins("acme-mkt")
+        assert [p["name"] for p in plugins] == ["octo"]
+        assert plugins[0]["version"] == "2.0.0"
+        assert plugins[0]["installed"] is False
+
+    def test_catalog_scope_is_marketplace_scope(self, plugins_dir, monkeypatch):
+        # The catalog reports the marketplace's own scope (the scope a one-click
+        # install would target), and availability is judged at THAT scope.
+        from src import plugin_manifest
+
+        monkeypatch.setattr(
+            plugin_manifest,
+            "list_marketplace_records",
+            lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "project"}},
+        )
+        by_name = {p["name"]: p for p in list_marketplace_plugins("test-mkt")}
+        # marketplace is project-scope; demo-plugin is installed only at user
+        # scope (fixture), so at the marketplace's project scope it is NOT yet
+        # installed -> still available, and the row scope is the marketplace's.
+        assert by_name["demo-plugin"]["scope"] == "project"
+        assert by_name["demo-plugin"]["installed"] is False
+        assert by_name["other-plugin"]["scope"] == "project"
+
+    def test_catalog_installed_when_scope_matches(self, plugins_dir, monkeypatch):
+        # demo-plugin is installed at user scope in the fixture; a user-scope
+        # marketplace (default, no record) therefore shows it as installed.
+        from src import plugin_manifest
+
+        monkeypatch.setattr(plugin_manifest, "list_marketplace_records", lambda: {})
+        by_name = {p["name"]: p for p in list_marketplace_plugins("test-mkt")}
+        assert by_name["demo-plugin"]["scope"] == "user"
+        assert by_name["demo-plugin"]["installed"] is True
+
+    def test_unknown_marketplace(self, plugins_dir):
+        assert list_marketplace_plugins("does-not-exist") == []
+
+    def test_missing_catalog(self, plugins_dir):
+        # installLocation present + valid but no marketplace.json inside.
+        empty_loc = plugins_dir / "marketplaces" / "empty-mkt"
+        empty_loc.mkdir(parents=True)
+        known = plugins_dir / "known_marketplaces.json"
+        known.write_text(
+            json.dumps(
+                {
+                    "empty-mkt": {
+                        "source": {"source": "github", "repo": "x/y"},
+                        "installLocation": str(empty_loc),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        assert list_marketplace_plugins("empty-mkt") == []
+
+    def test_corrupt_catalog(self, plugins_dir):
+        catalog = (
+            plugins_dir
+            / "marketplaces"
+            / "test-mkt"
+            / ".claude-plugin"
+            / "marketplace.json"
+        )
+        catalog.write_text("not json {{{")
+        assert list_marketplace_plugins("test-mkt") == []
+
+    def test_symlinked_install_location_rejected(self, plugins_dir):
+        real = plugins_dir / "marketplaces" / "test-mkt"
+        link = plugins_dir / "marketplaces" / "linked-mkt"
+        link.symlink_to(real)
+        known = plugins_dir / "known_marketplaces.json"
+        known.write_text(
+            json.dumps(
+                {
+                    "linked-mkt": {
+                        "source": {"source": "github", "repo": "x/y"},
+                        "installLocation": str(link),
+                        "lastUpdated": "2026-03-01T00:00:00Z",
+                    }
+                }
+            )
+        )
+        assert list_marketplace_plugins("linked-mkt") == []
+
+    def test_no_plugins_dir(self, no_plugins_dir):
+        assert list_marketplace_plugins("test-mkt") == []
+
+
+# ---------------------------------------------------------------------------
+# get_marketplaces_with_plugins
+# ---------------------------------------------------------------------------
+
+
+class TestGetMarketplacesWithPlugins:
+    def test_aggregation(self, plugins_dir):
+        result = get_marketplaces_with_plugins()
+        assert len(result) == 1
+        mkt = result[0]
+        assert mkt["name"] == "test-mkt"
+        assert mkt["plugin_count"] == 2
+        assert len(mkt["plugins"]) == 2
+        names = {p["name"] for p in mkt["plugins"]}
+        assert names == {"demo-plugin", "other-plugin"}
+
+    def test_no_plugins_dir(self, no_plugins_dir):
+        assert get_marketplaces_with_plugins() == []
+
+
+# ---------------------------------------------------------------------------
+# origin field (managed vs env)
+# ---------------------------------------------------------------------------
+
+
+class TestPluginOrigin:
+    def test_env_origin_when_not_managed(self, plugins_dir):
+        with patch("src.plugin_manifest.list_added", return_value=[]):
+            plugins = list_plugins()
+            assert plugins[0]["origin"] == "env"
+            detail = get_plugin_detail("demo-plugin@test-mkt")
+            assert detail["origin"] == "env"
+
+    def test_managed_origin(self, plugins_dir):
+        fake = [
+            {
+                "repo": "test/marketplace",
+                "name": "demo-plugin",
+                "marketplace": "test-mkt",
+                "scope": "user",
+                "branch": "main",
+            }
+        ]
+        with patch("src.plugin_manifest.list_added", return_value=fake):
+            plugins = list_plugins()
+            assert plugins[0]["origin"] == "managed"
+            detail = get_plugin_detail("demo-plugin@test-mkt")
+            assert detail["origin"] == "managed"
+
+    def test_origin_defaults_env_on_manifest_failure(self, plugins_dir):
+        with patch(
+            "src.plugin_manifest.list_added", side_effect=RuntimeError("boom")
+        ):
+            plugins = list_plugins()
+            assert plugins[0]["origin"] == "env"
