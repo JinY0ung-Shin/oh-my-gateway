@@ -1609,8 +1609,11 @@ class TestResolveResponseSessionFallbackPaths:
         assert resp.status_code == 404
         assert "not found or expired" in resp.json()["error"]["message"]
 
-    def test_user_mismatch_after_rehydration_returns_400(self, isolated_session_manager):
-        """Lines 423-428 — user mismatch when session found via workspace lookup."""
+    def test_user_mismatch_after_rehydration_returns_404_without_leaking_owner(
+        self, isolated_session_manager
+    ):
+        """User mismatch when session found via workspace lookup → non-revealing
+        404 (not 400), consistent with GET/DELETE; never echo the owner."""
         sid = str(uuid.uuid4())
         session = isolated_session_manager.get_or_create_session(sid)
         session.user = "alice"
@@ -1618,18 +1621,14 @@ class TestResolveResponseSessionFallbackPaths:
         session.turn_counter = 1
 
         with client_context() as (client, mock_cli, mock_wm):
-            # patch get_session to return None first, then the session
-            original_get = isolated_session_manager.get_session
-
-            call_count = {"n": 0}
-
-            def patched_get(session_id, user=None, cwd=None):
-                call_count["n"] += 1
-                if call_count["n"] <= 1:
-                    return None  # first call returns None to trigger fallback
-                return session
-
-            with patch.object(isolated_session_manager, "get_session", side_effect=patched_get):
+            # peek_session miss forces the workspace-rehydration fallback,
+            # where get_session then surfaces the foreign session.
+            with (
+                patch.object(isolated_session_manager, "peek_session", return_value=None),
+                patch.object(
+                    isolated_session_manager, "get_session", return_value=session
+                ),
+            ):
                 resp = client.post(
                     "/v1/responses",
                     json={
@@ -1640,8 +1639,10 @@ class TestResolveResponseSessionFallbackPaths:
                     },
                 )
 
-        assert resp.status_code == 400
-        assert "mismatch" in resp.json()["error"]["message"].lower()
+        assert resp.status_code == 404
+        message = resp.json()["error"]["message"]
+        assert "alice" not in message
+        assert "mismatch" not in message.lower()
 
     def test_future_turn_in_fallback_session_returns_404(self, isolated_session_manager):
         """Lines 429-433 — future turn when session found via workspace fallback."""

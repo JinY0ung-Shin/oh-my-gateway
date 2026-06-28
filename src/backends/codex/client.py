@@ -16,6 +16,7 @@ import os
 import queue
 import subprocess
 import threading
+import time
 import uuid
 from collections import deque
 from dataclasses import dataclass
@@ -28,6 +29,7 @@ from src.backends.codex.constants import (
     codex_bin,
     configured_config_overrides,
     disallowed_tools_from_env,
+    read_idle_timeout_ms,
     sandbox_mode,
 )
 from src.backends.base import SessionHandle
@@ -431,8 +433,20 @@ class CodexClient(TokenEstimateMixin):
 
     _combine_system_prompt = staticmethod(combine_system_prompt)
 
-    def __init__(self, timeout: Optional[int] = None) -> None:
+    def __init__(
+        self,
+        timeout: Optional[int] = None,
+        read_idle_timeout: Optional[int] = None,
+    ) -> None:
+        # ``timeout`` is the overall turn budget (wall-clock cap for a whole
+        # turn's notification drain). ``read_idle_timeout`` is the much shorter
+        # per-message idle-gap cap used by the shared RPC transport so a wedged
+        # app-server can't hold the lock for the full turn budget and
+        # head-of-line-block other concurrent Codex requests.
         self.timeout = (timeout if timeout is not None else DEFAULT_TIMEOUT_MS) / 1000
+        self.read_idle_timeout = (
+            read_idle_timeout if read_idle_timeout is not None else read_idle_timeout_ms()
+        ) / 1000
         self._rpc: Optional[CodexJsonRpcClient] = None
         self._rpc_env: Dict[str, str] = {}
         self._rpc_lock = asyncio.Lock()
@@ -499,7 +513,7 @@ class CodexClient(TokenEstimateMixin):
     async def verify(self) -> bool:
         rpc = CodexJsonRpcClient(
             config_overrides=configured_config_overrides(),
-            read_timeout=self.timeout,
+            read_timeout=self.read_idle_timeout,
         )
         try:
             await asyncio.to_thread(rpc.start)
@@ -586,7 +600,7 @@ class CodexClient(TokenEstimateMixin):
                 cwd=None,
                 env=env,
                 config_overrides=configured_config_overrides(),
-                read_timeout=self.timeout,
+                read_timeout=self.read_idle_timeout,
             )
             try:
                 await asyncio.to_thread(rpc.start)
@@ -840,6 +854,7 @@ class CodexClient(TokenEstimateMixin):
                 notification_iter = self._notification_iterator(
                     rpc, client.thread_id, turn_id, client=client
                 )
+                deadline = self._turn_deadline()
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -855,6 +870,7 @@ class CodexClient(TokenEstimateMixin):
                             yield tool_chunk
                             return
                         yield chunk
+                    self._check_turn_deadline(deadline)
             except Exception as exc:
                 await self._close_rpc_locked()
                 logger.error("Codex app-server turn failed: %s", exc, exc_info=True)
@@ -924,6 +940,7 @@ class CodexClient(TokenEstimateMixin):
                 notification_iter = self._notification_iterator(
                     rpc, client.thread_id, turn_id, client=client
                 )
+                deadline = self._turn_deadline()
                 while True:
                     has_value, chunk = await asyncio.to_thread(
                         self._next_chunk,
@@ -939,6 +956,7 @@ class CodexClient(TokenEstimateMixin):
                             yield tool_chunk
                             return
                         yield chunk
+                    self._check_turn_deadline(deadline)
             except Exception as exc:
                 await self._close_rpc_locked()
                 logger.error("Codex approval continuation failed: %s", exc, exc_info=True)
@@ -956,6 +974,22 @@ class CodexClient(TokenEstimateMixin):
             return True, next(iterator)
         except StopIteration:
             return False, None
+
+    def _turn_deadline(self) -> float:
+        """Monotonic wall-clock deadline for one turn's notification drain.
+
+        The per-message idle timeout (``read_idle_timeout``) caps inter-message
+        silence, but a steady drip of notifications could otherwise keep the
+        shared RPC lock indefinitely. This overall budget (``self.timeout``)
+        bounds the whole turn so the lock is always released eventually.
+        """
+        return time.monotonic() + self.timeout
+
+    def _check_turn_deadline(self, deadline: float) -> None:
+        if time.monotonic() > deadline:
+            raise CodexAppServerError(
+                f"Codex turn exceeded the overall turn budget of {self.timeout:.3g}s"
+            )
 
     def _notification_iterator(
         self,

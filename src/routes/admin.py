@@ -46,6 +46,7 @@ from src.admin_auth import (
     logout,
     require_admin,
 )
+from src.rate_limiter import rate_limit_endpoint
 from src.admin_service import (
     export_session_json,
     get_backends_health,
@@ -126,8 +127,14 @@ async def admin_chat_page():
 
 
 @router.post("/api/login")
-async def admin_login(body: LoginRequest, response: Response):
-    """Authenticate with admin API key and receive a session cookie."""
+@rate_limit_endpoint("admin_login")
+async def admin_login(request: Request, body: LoginRequest, response: Response):
+    """Authenticate with admin API key and receive a session cookie.
+
+    Strictly rate-limited (``admin_login``) to blunt brute-force attempts
+    against ``ADMIN_API_KEY``. slowapi requires the ``request`` parameter.
+    """
+    _ = request  # slowapi requires a request parameter in decorated handlers.
     return login(body.api_key, response)
 
 

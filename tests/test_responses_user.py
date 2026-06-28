@@ -1,5 +1,6 @@
 """Integration tests for user parameter in /v1/responses."""
 
+import json
 from contextlib import contextmanager
 from unittest.mock import AsyncMock, MagicMock, call, patch
 from pathlib import Path
@@ -192,12 +193,18 @@ class TestUserSessionBinding:
 
         assert resp.status_code == 200
 
-    def test_followup_with_different_user_returns_400(self, isolated_session_manager):
+    def test_followup_with_different_user_returns_404_without_leaking_owner(
+        self, isolated_session_manager
+    ):
+        """Cross-user previous_response_id must 404 (not 400) and never echo
+        the owning user — same non-revealing policy as GET/DELETE — and must
+        not refresh the owner's session TTL by probing it."""
         existing_session_id = "c2f6d3fd-1f1a-4c13-9c60-46b4df1d4d5f"
         session = isolated_session_manager.get_or_create_session(existing_session_id)
         session.user = "alice"
         session.workspace = "/tmp/ws/alice"
         session.turn_counter = 1
+        ttl_before = session.last_accessed
 
         mock_wm = MagicMock()
 
@@ -212,8 +219,14 @@ class TestUserSessionBinding:
                 },
             )
 
-        assert resp.status_code == 400
-        assert "user mismatch" in resp.json()["error"]["message"].lower()
+        assert resp.status_code == 404
+        message = resp.json()["error"]["message"]
+        # Non-revealing: no owner name, no "mismatch" wording.
+        assert "alice" not in message
+        assert "mismatch" not in message.lower()
+        # Ownership check happens before the TTL touch, so probing must not
+        # have extended the owner's session lifetime.
+        assert session.last_accessed == ttl_before
         mock_wm.resolve.assert_not_called()
 
     def test_followup_reuses_stored_workspace(self, isolated_session_manager):
@@ -279,10 +292,17 @@ class TestUserSessionBinding:
             yield {"subtype": "success", "result": "Legacy follow-up answer"}
 
         with (
+            # peek_session is the cache-check before the legacy rehydrate
+            # fallback; force a miss so the fallback path is exercised.
+            patch.object(
+                isolated_session_manager,
+                "peek_session",
+                return_value=None,
+            ) as mock_peek_session,
             patch.object(
                 isolated_session_manager,
                 "get_session",
-                side_effect=[None, None, session, session],
+                side_effect=[None, session, session],
             ) as mock_get_session,
             client_context_with_workspace(mock_wm) as (client, mock_cli),
         ):
@@ -301,12 +321,12 @@ class TestUserSessionBinding:
             )
 
         assert resp.status_code == 200
+        assert mock_peek_session.call_args_list == [call(existing_session_id)]
         assert mock_wm.resolve.call_args_list == [
             call("alice", backend="claude"),
             call("alice"),
         ]
         assert mock_get_session.call_args_list == [
-            call(existing_session_id),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice/claude"),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice"),
             call(existing_session_id),
@@ -337,8 +357,13 @@ class TestUserSessionBinding:
         with (
             patch.object(
                 isolated_session_manager,
+                "peek_session",
+                return_value=None,
+            ) as mock_peek_session,
+            patch.object(
+                isolated_session_manager,
                 "get_session",
-                side_effect=[None, session, session],
+                side_effect=[session, session],
             ) as mock_get_session,
             client_context_with_workspace(mock_wm) as (client, mock_cli),
         ):
@@ -359,8 +384,8 @@ class TestUserSessionBinding:
 
         assert resp.status_code == 200
         mock_wm.resolve.assert_called_once_with("alice", backend="codex")
+        assert mock_peek_session.call_args_list == [call(existing_session_id)]
         assert mock_get_session.call_args_list == [
-            call(existing_session_id),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice/codex"),
             call(existing_session_id),
         ]
@@ -442,3 +467,87 @@ def test_build_completed_response_uses_caller_supplied_visible_text():
     msg = [it for it in resp.output if it.type == "message"][0]
     assert reasoning.summary[0].text == "my reasoning"
     assert msg.content[0].text == "the answer"
+
+
+def _parse_sse_completed_id(sse_text: str) -> str:
+    """Pull the response id out of the response.completed SSE event."""
+    event = None
+    for line in sse_text.splitlines():
+        if line.startswith("event:"):
+            event = line.split(":", 1)[1].strip()
+        elif line.startswith("data:") and event == "response.completed":
+            payload = json.loads(line.split(":", 1)[1].strip())
+            return payload["response"]["id"]
+    raise AssertionError("no response.completed event in stream:\n" + sse_text)
+
+
+class TestStreamingEmptyThinkingTurnCommitted:
+    """A streaming turn that opens a thinking block but emits no thinking
+    deltas and no visible text still reports success (response.completed).
+    The turn MUST be committed so the resp_id the client already received
+    stays continuable — otherwise GET 404s and a follow-up sees a future
+    turn. Regression for the silently-dropped-turn bug."""
+
+    @staticmethod
+    async def _thinking_only_stream(client, prompt, session):
+        # content_block_start of type thinking sets thinking_seen=True, but
+        # no thinking_delta / text_delta ever arrives.
+        yield {
+            "type": "stream_event",
+            "event": {
+                "type": "content_block_start",
+                "content_block": {"type": "thinking"},
+            },
+        }
+        yield {
+            "type": "stream_event",
+            "event": {"type": "content_block_stop"},
+        }
+        yield {"subtype": "success", "result": ""}
+
+    def test_empty_thinking_stream_leaves_resp_id_continuable(
+        self, isolated_session_manager
+    ):
+        mock_wm = MagicMock()
+        mock_wm.resolve.return_value = Path("/tmp/ws/alice")
+
+        with client_context_with_workspace(mock_wm) as (client, mock_cli):
+            mock_cli.run_completion_with_client = self._thinking_only_stream
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hello",
+                    "user": "alice",
+                    "stream": True,
+                },
+            )
+            assert resp.status_code == 200
+            resp_id = _parse_sse_completed_id(resp.text)
+
+            # Turn must have been committed: session advanced + GET works.
+            session_id = resp_id.rsplit("_", 2)[1]
+            session = isolated_session_manager.peek_session(session_id)
+            assert session is not None
+            assert session.turn_counter == 1
+
+            got = client.get(f"/v1/responses/{resp_id}", params={"user": "alice"})
+            assert got.status_code == 200
+
+            # And a follow-up using it must not be rejected as a future turn
+            # (the committed turn makes the resp_id a valid parent).
+            async def _normal_stream(client, prompt, session):
+                yield {"subtype": "success", "result": "follow-up answer"}
+
+            mock_cli.run_completion_with_client = _normal_stream
+            mock_cli.parse_message = MagicMock(return_value="follow-up answer")
+            followup = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "again",
+                    "user": "alice",
+                    "previous_response_id": resp_id,
+                },
+            )
+            assert followup.status_code == 200

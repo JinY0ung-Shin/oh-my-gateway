@@ -103,7 +103,9 @@ def login(provided_key: str, response: Response) -> dict:
         samesite="strict",
         path="/admin",
         max_age=ADMIN_SESSION_TTL,
-        secure=parse_bool_env("ADMIN_COOKIE_SECURE", "false"),
+        # Secure by default — the session cookie should only travel over HTTPS.
+        # For local HTTP development set ``ADMIN_COOKIE_SECURE=false`` to opt out.
+        secure=parse_bool_env("ADMIN_COOKIE_SECURE", "true"),
     )
     logger.info("Admin login successful")
     return {"status": "ok", "ttl": ADMIN_SESSION_TTL}

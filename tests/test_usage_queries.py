@@ -19,8 +19,8 @@ class _FakeUsageLogger:
 
 
 def test_granularity_sql_uses_sql_percent_literals():
-    assert usage_queries._GRANULARITY_SQL["week"] == "DATE_FORMAT(ts, '%x-W%v')"
-    assert usage_queries._GRANULARITY_SQL["month"] == "DATE_FORMAT(ts, '%Y-%m')"
+    assert usage_queries._GRANULARITY_SQL_MYSQL["week"] == "DATE_FORMAT(ts, '%x-W%v')"
+    assert usage_queries._GRANULARITY_SQL_MYSQL["month"] == "DATE_FORMAT(ts, '%Y-%m')"
 
 
 def test_parse_date_accepts_empty_invalid_and_valid_values():

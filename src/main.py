@@ -323,10 +323,14 @@ app = FastAPI(
 
 # Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
+# A wildcard origin combined with credentials is unsafe (and Starlette would
+# echo the request origin back with Access-Control-Allow-Credentials: true).
+# Only allow credentials when an explicit origin allowlist is configured.
+cors_allow_credentials = "*" not in cors_origins
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
-    allow_credentials=True,
+    allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
 )

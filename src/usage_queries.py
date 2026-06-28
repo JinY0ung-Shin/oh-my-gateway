@@ -24,6 +24,16 @@ def _parse_date(value: Optional[str]) -> Optional[_dt.date]:
         return None
 
 
+def _is_sqlite() -> bool:
+    """True when the usage-log engine speaks SQLite.
+
+    The read queries default to MySQL/MariaDB SQL; SQLite needs different
+    date/time builtins (``date()``/``datetime()``/``strftime()`` vs
+    ``DATE_ADD``/``NOW``/``DATE_FORMAT``).  Date-agnostic SQL is shared.
+    """
+    return getattr(usage_logger, "dialect", None) == "sqlite"
+
+
 def _window_clause(
     start_date: Optional[str],
     end_date: Optional[str],
@@ -37,16 +47,21 @@ def _window_clause(
     strings, filters the inclusive calendar range.  Otherwise falls back
     to the rolling ``window_days`` window ending now.
     """
+    sqlite = _is_sqlite()
     s, e = _parse_date(start_date), _parse_date(end_date)
     if s and e:
         if e < s:
             s, e = e, s
+        end_expr = "date(%s, '+1 day')" if sqlite else "DATE_ADD(%s, INTERVAL 1 DAY)"
         return (
-            f"{column} >= %s AND {column} < DATE_ADD(%s, INTERVAL 1 DAY)",
+            f"{column} >= %s AND {column} < {end_expr}",
             (s.isoformat(), e.isoformat()),
         )
+    window_expr = (
+        "datetime('now', '-' || %s || ' days')" if sqlite else "NOW() - INTERVAL %s DAY"
+    )
     return (
-        f"{column} >= NOW() - INTERVAL %s DAY",
+        f"{column} >= {window_expr}",
         (max(1, int(window_days)),),
     )
 
@@ -70,19 +85,21 @@ async def get_summary(
           COALESCE(SUM(output_tokens), 0) AS output_tokens_window,
           COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens_window,
           COALESCE(SUM(cache_creation_tokens), 0) AS cache_creation_tokens_window,
-          COALESCE(SUM(status <> 'completed'), 0) AS errors_window
+          COALESCE(SUM(CASE WHEN status <> 'completed' THEN 1 ELSE 0 END), 0)
+            AS errors_window
         FROM usage_turn
         WHERE {where}
         """,
         params,
     )
+    today_expr = "date('now')" if _is_sqlite() else "CURDATE()"
     today_rows = await usage_logger.fetch_rows(
-        """
+        f"""
         SELECT
           COUNT(*) AS turns_today,
           COALESCE(SUM(input_tokens + output_tokens), 0) AS tokens_today
         FROM usage_turn
-        WHERE ts >= CURDATE()
+        WHERE ts >= {today_expr}
         """,
     )
     if rows is None or today_rows is None:
@@ -111,7 +128,8 @@ async def get_top_users(
           COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
           COALESCE(SUM(t.call_count), 0) AS tool_calls,
           COALESCE(SUM(t.error_count), 0) AS tool_errors,
-          COALESCE(SUM(u.status <> 'completed'), 0) AS turn_errors
+          COALESCE(SUM(CASE WHEN u.status <> 'completed' THEN 1 ELSE 0 END), 0)
+            AS turn_errors
         FROM usage_turn u
         LEFT JOIN usage_tool t ON t.turn_id = u.id
         WHERE {where}
@@ -153,15 +171,30 @@ async def get_top_tools(
     return rows
 
 
-_GRANULARITY_SQL: Dict[str, str] = {
-    # MySQL expressions that bucket ``ts`` for the requested granularity.
-    # ``%v`` (ISO week) paired with ``%x`` (ISO week year) so boundaries
-    # line up with the Monday-first ISO week definition.
-    #
+# MySQL expressions that bucket ``ts`` for the requested granularity.
+# ``%v`` (ISO week) paired with ``%x`` (ISO week year) so boundaries line up
+# with the Monday-first ISO week definition.
+_GRANULARITY_SQL_MYSQL: Dict[str, str] = {
     "day": "DATE(ts)",
     "week": "DATE_FORMAT(ts, '%x-W%v')",
     "month": "DATE_FORMAT(ts, '%Y-%m')",
 }
+
+# SQLite equivalents.  ``%G`` (ISO week year) / ``%V`` (ISO week) match MySQL's
+# ``%x``/``%v`` Monday-first ISO weeks.  None of these literals contain the
+# substring ``ts`` outside the column reference, so the ``.replace("ts", "u.ts")``
+# used to alias the column for the join below stays safe.
+_GRANULARITY_SQL_SQLITE: Dict[str, str] = {
+    "day": "date(ts)",
+    "week": "strftime('%G-W%V', ts)",
+    "month": "strftime('%Y-%m', ts)",
+}
+
+
+def _granularity_sql(granularity: str) -> Optional[str]:
+    """Return the dialect-correct bucketing expression, or ``None``."""
+    table = _GRANULARITY_SQL_SQLITE if _is_sqlite() else _GRANULARITY_SQL_MYSQL
+    return table.get(granularity)
 
 
 async def get_time_series(
@@ -178,7 +211,7 @@ async def get_time_series(
     Returns ``None`` when usage logging is disabled or the granularity is
     unknown (caller surfaces that as "logging off").
     """
-    bucket_expr = _GRANULARITY_SQL.get(granularity)
+    bucket_expr = _granularity_sql(granularity)
     if bucket_expr is None or not usage_logger.enabled:
         return None
     n = max(1, min(int(buckets), 60))
@@ -234,11 +267,16 @@ async def get_tool_breakdown_series(
     Approximates the time window per granularity as 5d / 35d / 150d for
     day / week / month so the same backend can serve all three columns.
     """
-    bucket_expr = _GRANULARITY_SQL.get(granularity)
+    bucket_expr = _granularity_sql(granularity)
     if bucket_expr is None or not usage_logger.enabled:
         return None
     bucket_expr_uts = bucket_expr.replace("ts", "u.ts")
     days_window = {"day": 5, "week": 35, "month": 150}.get(granularity, 30)
+    window_expr = (
+        "datetime('now', '-' || %s || ' days')"
+        if _is_sqlite()
+        else "NOW() - INTERVAL %s DAY"
+    )
 
     rows = await usage_logger.fetch_rows(
         f"""
@@ -248,7 +286,7 @@ async def get_tool_breakdown_series(
           SUM(t.call_count) AS calls
         FROM usage_tool t
         JOIN usage_turn u ON u.id = t.turn_id
-        WHERE u.ts >= NOW() - INTERVAL %s DAY
+        WHERE u.ts >= {window_expr}
         GROUP BY {bucket_expr_uts}, t.tool_name
         ORDER BY {bucket_expr_uts} DESC, calls DESC
         """,

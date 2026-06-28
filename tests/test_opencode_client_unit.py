@@ -182,6 +182,64 @@ def test_extract_usage_sums_tokens(client):
     }
 
 
+def test_extract_usage_folds_cache_read_and_write_into_input(client):
+    # Regression: non-stream usage must include cache read/write in
+    # input_tokens, matching the streaming converter. Cache values are
+    # non-zero here precisely because earlier tests left them at 0.
+    payload = {
+        "info": {
+            "tokens": {
+                "input": 10,
+                "output": 20,
+                "reasoning": 5,
+                "cache": {"read": 100, "write": 7},
+            }
+        }
+    }
+    assert client._extract_usage(payload) == {
+        "input_tokens": 117,
+        "output_tokens": 20,
+        "total_tokens": 142,
+    }
+
+
+def test_extract_usage_handles_missing_or_bad_cache(client):
+    # No cache key, and a non-dict cache, both behave like zero cache.
+    no_cache = {"info": {"tokens": {"input": 3, "output": 4}}}
+    assert client._extract_usage(no_cache)["input_tokens"] == 3
+    bad_cache = {"info": {"tokens": {"input": 3, "cache": "nope"}}}
+    assert client._extract_usage(bad_cache)["input_tokens"] == 3
+
+
+def test_extract_usage_matches_streaming_converter_with_cache(client):
+    # Stream vs non-stream must agree on input/total tokens for the same turn.
+    from src.backends.opencode.events import OpenCodeEventConverter
+
+    tokens = {
+        "input": 12,
+        "output": 8,
+        "reasoning": 4,
+        "cache": {"read": 50, "write": 6},
+    }
+    non_stream = client._extract_usage({"info": {"tokens": tokens}})
+
+    converter = OpenCodeEventConverter(session_id="sess-1")
+    converter._convert_usage_event(
+        {
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "type": "step-finish",
+                    "messageID": "msg-1",
+                    "tokens": tokens,
+                }
+            },
+        }
+    )
+    assert non_stream["input_tokens"] == converter.usage["input_tokens"]
+    assert non_stream["total_tokens"] == converter.usage["total_tokens"]
+
+
 def test_describe_non_json_response_includes_status_and_body_snippet(client):
     class FakeResp:
         status_code = 502

@@ -31,6 +31,7 @@ import os
 import re
 import select
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,7 @@ class OpenCodeClient(TokenEstimateMixin):
     ) -> None:
         self.timeout = (timeout if timeout is not None else DEFAULT_TIMEOUT_MS) / 1000
         self._process: Optional[subprocess.Popen[str]] = None
+        self._drain_thread: Optional[threading.Thread] = None
         self._server_username = os.getenv("OPENCODE_SERVER_USERNAME", "opencode")
         self._server_password = os.getenv("OPENCODE_SERVER_PASSWORD")
         self._agent = os.getenv("OPENCODE_AGENT", "general").strip() or "general"
@@ -217,6 +219,7 @@ class OpenCodeClient(TokenEstimateMixin):
             output.append(line)
             match = re.search(r"opencode server listening on\s+(https?://\S+)", line)
             if match:
+                self._start_stdout_drainer(proc)
                 return match.group(1).rstrip("/")
 
         self.close()
@@ -224,13 +227,43 @@ class OpenCodeClient(TokenEstimateMixin):
             f"Timeout waiting for OpenCode server after {timeout_ms}ms: {''.join(output).strip()}"
         )
 
+    def _start_stdout_drainer(self, proc: subprocess.Popen[str]) -> None:
+        """Drain the managed server's stdout on a daemon thread.
+
+        The startup loop stops reading once it sees the "listening" line, but
+        ``opencode serve`` keeps logging to the merged stdout/stderr pipe. If
+        nobody drains it, the OS pipe buffer (~64KB) eventually fills and the
+        server's next ``write()`` blocks, hanging the whole process. This
+        forwards each remaining line to the logger so the buffer never fills.
+        """
+
+        def _drain() -> None:
+            stdout = proc.stdout
+            if stdout is None:
+                return
+            try:
+                for line in stdout:
+                    logger.debug("opencode server: %s", line.rstrip())
+            except (ValueError, OSError):
+                # Pipe closed during shutdown; nothing left to drain.
+                pass
+
+        thread = threading.Thread(
+            target=_drain, name="opencode-stdout-drainer", daemon=True
+        )
+        self._drain_thread = thread
+        thread.start()
+
     def close(self) -> None:
         """Stop a managed OpenCode server if this backend owns one."""
         proc = self._process
         if proc is None:
             return
         self._process = None
+        drain_thread = getattr(self, "_drain_thread", None)
+        self._drain_thread = None
         if proc.poll() is not None:
+            self._join_drainer(drain_thread)
             return
         proc.terminate()
         try:
@@ -238,6 +271,13 @@ class OpenCodeClient(TokenEstimateMixin):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait(timeout=3)
+        # The process is gone, so its stdout is at EOF; the daemon drainer
+        # loop exits on its own. Join briefly so it tears down with us.
+        self._join_drainer(drain_thread)
+
+    def _join_drainer(self, drain_thread: Optional[threading.Thread]) -> None:
+        if drain_thread is not None and drain_thread.is_alive():
+            drain_thread.join(timeout=1)
 
     shutdown = close
 
@@ -346,7 +386,12 @@ class OpenCodeClient(TokenEstimateMixin):
         tokens = info.get("tokens")
         if not isinstance(tokens, dict):
             return None
+        cache = tokens.get("cache")
+        if not isinstance(cache, dict):
+            cache = {}
         input_tokens = int(tokens.get("input") or 0)
+        input_tokens += int(cache.get("read") or 0)
+        input_tokens += int(cache.get("write") or 0)
         output_tokens = int(tokens.get("output") or 0)
         reasoning_tokens = int(tokens.get("reasoning") or 0)
         return {

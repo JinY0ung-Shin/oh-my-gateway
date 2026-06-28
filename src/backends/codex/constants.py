@@ -5,6 +5,25 @@ from __future__ import annotations
 import os
 
 from src.backends.common import parse_csv
+from src.env_utils import parse_int_env
+
+# Per-message (idle-gap) read timeout for the shared Codex app-server JSON-RPC
+# transport, in milliseconds. This bounds how long a single ``_read_message``
+# waits for the *next* line of output before failing, and is SEPARATE from the
+# overall turn budget (``DEFAULT_TIMEOUT_MS`` / ``CodexClient.timeout``).
+#
+# Why a short value: the app-server is a single shared process serialized by
+# one asyncio lock per ``CodexClient``. A wedged turn (process alive but
+# emitting nothing) otherwise holds that lock for the full turn budget and
+# head-of-line-blocks every other concurrent Codex request. A normal turn
+# resets this window on every incremental notification, so the cap only bites
+# on genuine inter-message silence. Override via CODEX_READ_IDLE_TIMEOUT_MS.
+DEFAULT_READ_IDLE_TIMEOUT_MS = parse_int_env("CODEX_READ_IDLE_TIMEOUT_MS", 60_000)
+
+
+def read_idle_timeout_ms() -> int:
+    """Per-message idle read timeout in ms, read from the env on each call."""
+    return parse_int_env("CODEX_READ_IDLE_TIMEOUT_MS", 60_000)
 
 
 def configured_provider_models() -> list[str]:

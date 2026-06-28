@@ -44,7 +44,9 @@ OPENCODE_MANAGED_ONLY_VARS = (
 
 # usage_logger relies on ``result.lastrowid`` for the usage_tool insert,
 # which MySQL/MariaDB/SQLite support but PostgreSQL does not (see the
-# module docstring in src/usage_logger.py).  Dialects after the shorthand
+# module docstring in src/usage_logger.py).  The read-side analytics in
+# src/usage_queries.py also branch their date/time SQL on the dialect so the
+# admin dashboard works on all three.  Dialects after the shorthand
 # normalisation performed by usage_logger._normalize_db_url:
 USAGE_LOG_SUPPORTED_DIALECTS = ("mysql", "mariadb", "sqlite")
 

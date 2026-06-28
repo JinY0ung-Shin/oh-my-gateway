@@ -110,6 +110,22 @@ def _response_not_found(response_id: str) -> HTTPException:
     )
 
 
+def _previous_response_not_found(previous_response_id: Optional[str]) -> HTTPException:
+    """Non-revealing 404 for an unknown/foreign previous_response_id.
+
+    Used for cross-user access so callers cannot probe ownership: the
+    response is identical to the genuinely-missing case (same message as
+    the "not found or expired" path), never echoing the owning user.
+    """
+    return HTTPException(
+        status_code=404,
+        detail=(
+            f"Session for previous_response_id "
+            f"'{previous_response_id}' not found or expired"
+        ),
+    )
+
+
 def _lookup_stored_response(response_id: str, user: Optional[str]):
     """Resolve a response_id to ``(session, session_id, turn)`` or raise 404.
 
@@ -484,19 +500,21 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             detail=f"previous_response_id '{body.previous_response_id}' is invalid",
         )
     session_id, turn = parsed
-    session = session_manager.get_session(session_id)
+    # Peek first so an ownership check happens *before* the TTL is touched —
+    # otherwise probing another user's response_id would keep their session
+    # alive. Only refresh the TTL once ownership is confirmed.
+    session = session_manager.peek_session(session_id)
     if session is not None:
         if session.user != body.user:
-            raise HTTPException(
-                status_code=400,
-                detail=f"User mismatch: session belongs to {session.user!r}, "
-                f"but request specifies {body.user!r}",
-            )
+            # Mirror the GET/DELETE 404 policy: never echo the owner or
+            # confirm the session exists for a non-owner.
+            raise _previous_response_not_found(body.previous_response_id)
         if turn > session.turn_counter:
             raise HTTPException(
                 status_code=404,
                 detail=f"previous_response_id '{body.previous_response_id}' references a future turn",
             )
+        session.touch()
         return session_id, session
 
     _early_cwd: Optional[str] = None
@@ -522,11 +540,8 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             ),
         )
     if session.user != body.user:
-        raise HTTPException(
-            status_code=400,
-            detail=f"User mismatch: session belongs to {session.user!r}, "
-            f"but request specifies {body.user!r}",
-        )
+        # Same non-revealing 404 as the cache-hit path above.
+        raise _previous_response_not_found(body.previous_response_id)
     if turn > session.turn_counter:
         raise HTTPException(
             status_code=404,
@@ -543,11 +558,9 @@ async def _resolve_response_workspace(
     backend: str,
 ) -> Path:
     if not is_new_session and session.user != body.user:
-        raise HTTPException(
-            status_code=400,
-            detail=f"User mismatch: session belongs to {session.user!r}, "
-            f"but request specifies {body.user!r}",
-        )
+        # Non-revealing 404 consistent with GET/DELETE and
+        # _resolve_response_session; never echo the owning user.
+        raise _previous_response_not_found(body.previous_response_id)
 
     if is_new_session:
         try:
@@ -1477,34 +1490,39 @@ async def create_response(
                     )
                 elif stream_result.get("success"):
                     # SUCCESS-ONLY: commit turn counter and session messages.
+                    # The client already received response.completed carrying
+                    # this resp_id, so the turn MUST be committed even when the
+                    # assistant produced no visible text or thinking (e.g. a
+                    # thinking block opened with no deltas). Otherwise the
+                    # resp_id is uncontinuable: GET 404s and a follow-up using
+                    # previous_response_id sees a "future turn".
                     assistant_text = stream_result.get("assistant_text") or ""
                     assistant_message = _build_session_assistant_message(
                         assistant_text,
                         stream_result.get("thinking_texts"),
+                    ) or Message(role="assistant", content="")
+                    session.turn_counter = next_turn
+                    session.add_messages([Message(role="user", content=prompt)])
+                    session_manager.add_assistant_response(session_id, assistant_message)
+                    _record_stream_turn_response(
+                        session,
+                        turn=next_turn,
+                        response_id=resp_id,
+                        model=body.model,
+                        stream_result=stream_result,
+                        chunks_buffer=chunks_buffer,
+                        prompt=prompt,
+                        metadata=body.metadata,
+                        store=body.store,
+                        backend=backend,
                     )
-                    if assistant_message is not None:
-                        session.turn_counter = next_turn
-                        session.add_messages([Message(role="user", content=prompt)])
-                        session_manager.add_assistant_response(session_id, assistant_message)
-                        _record_stream_turn_response(
-                            session,
-                            turn=next_turn,
-                            response_id=resp_id,
-                            model=body.model,
-                            stream_result=stream_result,
-                            chunks_buffer=chunks_buffer,
-                            prompt=prompt,
-                            metadata=body.metadata,
-                            store=body.store,
-                            backend=backend,
-                        )
-                        _log_session_assistant_write(
-                            path="responses.stream",
-                            session_id=session_id,
-                            turn=next_turn,
-                            visible_text=assistant_text,
-                            thinking_texts=stream_result.get("thinking_texts"),
-                        )
+                    _log_session_assistant_write(
+                        path="responses.stream",
+                        session_id=session_id,
+                        turn=next_turn,
+                        visible_text=assistant_text,
+                        thinking_texts=stream_result.get("thinking_texts"),
+                    )
 
             except Exception as e:
                 logger.error("Responses API Stream: setup error: %s", e, exc_info=True)
@@ -1825,33 +1843,37 @@ async def _handle_function_call_output(
                     )
                     stream_result["success"] = True
                 elif stream_result.get("success"):
+                    # Commit the turn on success even when the assistant
+                    # produced no visible text or thinking — the client has
+                    # already seen response.completed for this resp_id, so it
+                    # must remain continuable. (See the matching note in the
+                    # primary streaming branch above.)
                     assistant_text = stream_result.get("assistant_text") or ""
                     assistant_message = _build_session_assistant_message(
                         assistant_text,
                         stream_result.get("thinking_texts"),
+                    ) or Message(role="assistant", content="")
+                    session.turn_counter = next_turn
+                    session_manager.add_assistant_response(session_id, assistant_message)
+                    _record_stream_turn_response(
+                        session,
+                        turn=next_turn,
+                        response_id=resp_id,
+                        model=body.model,
+                        stream_result=stream_result,
+                        chunks_buffer=chunks_buffer,
+                        prompt="",
+                        metadata=body.metadata,
+                        store=body.store,
+                        backend=backend,
                     )
-                    if assistant_message is not None:
-                        session.turn_counter = next_turn
-                        session_manager.add_assistant_response(session_id, assistant_message)
-                        _record_stream_turn_response(
-                            session,
-                            turn=next_turn,
-                            response_id=resp_id,
-                            model=body.model,
-                            stream_result=stream_result,
-                            chunks_buffer=chunks_buffer,
-                            prompt="",
-                            metadata=body.metadata,
-                            store=body.store,
-                            backend=backend,
-                        )
-                        _log_session_assistant_write(
-                            path="responses.continuation_stream",
-                            session_id=session_id,
-                            turn=next_turn,
-                            visible_text=assistant_text,
-                            thinking_texts=stream_result.get("thinking_texts"),
-                        )
+                    _log_session_assistant_write(
+                        path="responses.continuation_stream",
+                        session_id=session_id,
+                        turn=next_turn,
+                        visible_text=assistant_text,
+                        thinking_texts=stream_result.get("thinking_texts"),
+                    )
 
             except Exception as e:
                 logger.error("Responses API Stream: continuation error: %s", e, exc_info=True)

@@ -115,6 +115,7 @@ STREAM_COMPACTION_EVENTS = parse_bool_env("STREAM_COMPACTION_EVENTS", "true")
 RATE_LIMITS = {
     "debug": parse_int_env("RATE_LIMIT_DEBUG_PER_MINUTE", 2),
     "auth": parse_int_env("RATE_LIMIT_AUTH_PER_MINUTE", 10),
+    "admin_login": parse_int_env("RATE_LIMIT_ADMIN_LOGIN_PER_MINUTE", 5),
     "session": parse_int_env("RATE_LIMIT_SESSION_PER_MINUTE", 15),
     "health": parse_int_env("RATE_LIMIT_HEALTH_PER_MINUTE", 30),
     "responses": parse_int_env("RATE_LIMIT_RESPONSES_PER_MINUTE", 10),

@@ -223,6 +223,18 @@ class UsageLogger:
     def enabled(self) -> bool:
         return self._engine is not None
 
+    @property
+    def dialect(self) -> Optional[str]:
+        """SQLAlchemy dialect name (e.g. ``"mysql"``, ``"sqlite"``) or ``None``.
+
+        ``None`` when logging is disabled. Read-side queries branch on this to
+        emit dialect-correct date/time SQL (see :mod:`src.usage_queries`).
+        """
+        engine = self._engine
+        if engine is None:
+            return None
+        return engine.dialect.name
+
     async def fetch_rows(self, sql: str, params: tuple = ()) -> Optional[list]:
         """Execute a read-only SELECT and return ``list[dict]``.
 

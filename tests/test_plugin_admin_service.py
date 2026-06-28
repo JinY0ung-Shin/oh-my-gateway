@@ -118,9 +118,10 @@ def test_add_marketplace_remote_clones_then_adds(
         "plugin",
         "marketplace",
         "add",
-        "/clones/octo-12345678",
         "--scope",
         "user",
+        "--",
+        "/clones/octo-12345678",
     ]
 
 
@@ -139,9 +140,10 @@ def test_add_marketplace_local_path_added_in_place(
         "plugin",
         "marketplace",
         "add",
-        str(local),
         "--scope",
         "project",
+        "--",
+        str(local),
     ]
 
 
@@ -175,9 +177,10 @@ def test_remove_marketplace_argv_and_manifest(
         "plugin",
         "marketplace",
         "remove",
-        "nyldn-plugins",
         "--scope",
         "user",
+        "--",
+        "nyldn-plugins",
     ]
     assert fake_manifest.remove_marketplace_calls == ["nyldn-plugins"]
 
@@ -198,17 +201,19 @@ def test_install_plugin_argv_and_manifest(fake_claude, recorded_runs, fake_manif
         CLAUDE_BIN,
         "plugin",
         "install",
-        "octo@nyldn-plugins",
         "--scope",
         "user",
+        "--",
+        "octo@nyldn-plugins",
     ] in install_cmds
     assert [
         CLAUDE_BIN,
         "plugin",
         "update",
-        "octo@nyldn-plugins",
         "--scope",
         "user",
+        "--",
+        "octo@nyldn-plugins",
     ] in install_cmds
 
     assert fake_manifest.add_plugin_calls == [
@@ -231,9 +236,10 @@ def test_install_plugin_no_marketplace_spec_is_bare_name(
         CLAUDE_BIN,
         "plugin",
         "install",
-        "octo",
         "--scope",
         "user",
+        "--",
+        "octo",
     ] in [c["cmd"] for c in recorded_runs]
 
 
@@ -266,13 +272,14 @@ def test_install_plugin_with_repo_adds_marketplace_first(
             "plugin",
             "marketplace",
             "add",
-            "/clones/octo-deadbeef",
             "--scope",
             "user",
+            "--",
+            "/clones/octo-deadbeef",
         ]
     )
     install_idx = cmds.index(
-        [CLAUDE_BIN, "plugin", "install", "octo@octo", "--scope", "user"]
+        [CLAUDE_BIN, "plugin", "install", "--scope", "user", "--", "octo@octo"]
     )
     assert add_idx < install_idx
 
@@ -485,9 +492,10 @@ def test_uninstall_managed_plugin_removes_added(
         CLAUDE_BIN,
         "plugin",
         "uninstall",
-        "octo@nyldn-plugins",
         "--scope",
         "user",
+        "--",
+        "octo@nyldn-plugins",
     ]
     # uninstall always drops any managed entry AND records the removal, so an
     # env-bootstrap declaration of the same plugin can't resurrect it on restart.
@@ -506,14 +514,16 @@ def test_uninstall_env_plugin_marks_removed(fake_claude, recorded_runs, fake_man
     assert fake_manifest.remove_added_calls == [("telegram@other-mkt", "user")]
 
 
-def test_uninstall_records_at_requested_scope(fake_claude, recorded_runs, fake_manifest):
+def test_uninstall_records_at_requested_scope(
+    fake_claude, recorded_runs, fake_manifest
+):
     # scope is part of the identity: uninstall targets and records the requested
     # scope, leaving any other-scope install of the same plugin untouched.
     fake_manifest.added_entries = [
         {"name": "octo", "marketplace": "m", "scope": "project"}
     ]
     svc.uninstall_plugin("octo@m", scope="user")
-    assert recorded_runs[-1]["cmd"][-2:] == ["--scope", "user"]
+    assert recorded_runs[-1]["cmd"][-4:] == ["--scope", "user", "--", "octo@m"]
     assert fake_manifest.remove_added_calls == [("octo@m", "user")]
     assert fake_manifest.mark_removed_calls == [("octo@m", "user")]
 
@@ -602,7 +612,7 @@ def test_remove_marketplace_best_effort_scope(monkeypatch, fake_claude, fake_man
     # An env-added project marketplace has no manifest scope record, so the UI
     # sends user; removal falls back across scopes and succeeds at project.
     def fake_run(cmd, *, token=""):
-        if cmd[-2:] == ["--scope", "user"]:
+        if "--scope" in cmd and cmd[cmd.index("--scope") + 1] == "user":
             raise subprocess.CalledProcessError(1, cmd)
         return subprocess.CompletedProcess(cmd, 0)
 
@@ -648,3 +658,107 @@ def test_missing_claude_bin_raises(monkeypatch, recorded_runs, fake_manifest):
         svc.install_plugin("octo", marketplace="m")
     # validation passed, but bin resolution failed before any subprocess
     assert recorded_runs == []
+
+
+# ---------------------------------------------------------------------------
+# Option-injection hardening: leading-dash names/branches and the `--`
+# end-of-options separator at every user-controlled positional arg site.
+# ---------------------------------------------------------------------------
+
+
+LEADING_DASH = ["-h", "--help", "-rf", "--scope", "-x"]
+
+
+@pytest.mark.parametrize("bad", LEADING_DASH)
+def test_validate_name_rejects_leading_dash(bad):
+    # A leading-dash name would otherwise be parsed as a CLI option, not a
+    # positional, by the claude/git subcommand it is forwarded to.
+    with pytest.raises(svc.PluginAdminError):
+        svc._validate_name(bad, what="plugin name")
+
+
+@pytest.mark.parametrize("bad", LEADING_DASH)
+def test_validate_branch_rejects_leading_dash(bad):
+    with pytest.raises(svc.PluginAdminError):
+        svc._validate_branch(bad)
+
+
+def test_validate_name_accepts_legitimate_values():
+    for ok in ["octo", "octo@nyldn-plugins", "a.b_c", "org/repo", "x-y-z"]:
+        assert svc._validate_name(ok, what="plugin name") == ok
+
+
+def test_validate_branch_accepts_legitimate_values():
+    for ok in ["main", "release/1.0", "feat-x", "v2.3.4"]:
+        assert svc._validate_branch(ok) == ok
+
+
+@pytest.mark.parametrize("bad", LEADING_DASH)
+def test_install_plugin_rejects_leading_dash_name(
+    monkeypatch, bad, fake_claude, fake_manifest
+):
+    calls = []
+    monkeypatch.setattr(svc, "run", lambda cmd, **kw: calls.append(cmd))
+    with pytest.raises(svc.PluginAdminError):
+        svc.install_plugin(bad, marketplace="m")
+    assert calls == []
+    assert fake_manifest.add_plugin_calls == []
+
+
+@pytest.mark.parametrize("bad", LEADING_DASH)
+def test_uninstall_plugin_rejects_leading_dash_id(
+    monkeypatch, bad, fake_claude, fake_manifest
+):
+    calls = []
+    monkeypatch.setattr(svc, "run", lambda cmd, **kw: calls.append(cmd))
+    with pytest.raises(svc.PluginAdminError):
+        svc.uninstall_plugin(bad)
+    assert calls == []
+    assert fake_manifest.mark_removed_calls == []
+
+
+@pytest.mark.parametrize("bad", LEADING_DASH)
+def test_remove_marketplace_rejects_leading_dash_name(
+    monkeypatch, bad, fake_claude, fake_manifest
+):
+    calls = []
+    monkeypatch.setattr(svc, "run", lambda cmd, **kw: calls.append(cmd))
+    with pytest.raises(svc.PluginAdminError):
+        svc.remove_marketplace(bad)
+    assert calls == []
+    assert fake_manifest.remove_marketplace_calls == []
+
+
+def _positional_after_separator(cmd):
+    """Return the positional args that follow the `--` end-of-options marker."""
+    assert "--" in cmd, f"missing `--` end-of-options separator in {cmd!r}"
+    return cmd[cmd.index("--") + 1 :]
+
+
+def test_install_argv_passes_spec_after_options_separator(
+    fake_claude, recorded_runs, fake_manifest
+):
+    # Layered defense: even if validation were bypassed, the user-controlled spec
+    # sits after `--`, so it can never be parsed as an option.
+    svc.install_plugin("octo", marketplace="nyldn-plugins")
+    install = next(
+        c["cmd"]
+        for c in recorded_runs
+        if c["cmd"][:3] == [CLAUDE_BIN, "plugin", "install"]
+    )
+    assert _positional_after_separator(install) == ["octo@nyldn-plugins"]
+
+
+def test_uninstall_argv_passes_spec_after_options_separator(
+    fake_claude, recorded_runs, fake_manifest
+):
+    fake_manifest.added_entries = []
+    svc.uninstall_plugin("octo@m")
+    assert _positional_after_separator(recorded_runs[-1]["cmd"]) == ["octo@m"]
+
+
+def test_remove_marketplace_argv_passes_name_after_options_separator(
+    fake_claude, recorded_runs, fake_manifest
+):
+    svc.remove_marketplace("nyldn-plugins")
+    assert _positional_after_separator(recorded_runs[-1]["cmd"]) == ["nyldn-plugins"]

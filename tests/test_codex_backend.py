@@ -2,9 +2,12 @@
 
 import asyncio
 import importlib
+import queue
 import subprocess
 import sys
-from unittest.mock import AsyncMock
+import time
+from collections import deque
+from unittest.mock import AsyncMock, MagicMock
 from types import SimpleNamespace
 
 import pytest
@@ -3902,3 +3905,166 @@ async def test_codex_resume_approval_errors_when_turn_id_missing(monkeypatch):
     assert len(chunks) == 1
     assert chunks[0]["type"] == "error"
     assert "turn id" in chunks[0]["error_message"]
+
+
+# ---------------------------------------------------------------------------
+# Idle-gap read timeout (head-of-line-blocking guard)
+# ---------------------------------------------------------------------------
+
+
+class _SilentRpc:
+    """RPC whose turn starts fine but goes silent forever during the drain.
+
+    ``next_notification`` delegates to the real ``CodexJsonRpcClient._read_message``
+    against an empty stdout queue with a tiny ``read_timeout`` so the per-message
+    idle-gap timeout fires fast — modeling an app-server that accepts the turn
+    then wedges (process alive, emitting nothing).
+    """
+
+    def __init__(self, read_timeout):
+        from src.backends.codex.client import CodexJsonRpcClient
+
+        self.closed = False
+        self.respond_calls = []
+        self._pending_notifications = deque()
+        # Borrow the real read path so the queue.Empty -> CodexAppServerError
+        # idle-timeout behavior is exercised exactly as in production.
+        self._real = CodexJsonRpcClient(read_timeout=read_timeout)
+        self._real._proc = MagicMock()
+        self._real._proc.stdout = MagicMock()
+        self._real._stdout_queue = queue.Queue()  # stays empty == silent
+
+    def start(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    def is_running(self):
+        return not self.closed
+
+    def thread_start(self, params):
+        return {"thread": {"id": "thr_codex"}}
+
+    def thread_resume(self, thread_id, params):
+        return {"thread": {"id": thread_id}}
+
+    def turn_start(self, thread_id, input_items, params):
+        return {"turn": {"id": "turn_1", "status": "inProgress"}}
+
+    def next_notification(self):
+        # No pending notifications and a silent queue: blocks up to read_timeout.
+        return self._real._read_message()
+
+    def respond(self, request_id, result):
+        self.respond_calls.append((request_id, result))
+
+
+@pytest.mark.asyncio
+async def test_codex_silent_app_server_fails_after_idle_timeout_not_turn_budget(monkeypatch):
+    """A wedged app-server fails after the SHORT idle timeout, not the 600s turn budget.
+
+    Regression for head-of-line blocking: with the idle-gap read timeout wired
+    separately from the overall turn budget, a silent app-server must surface an
+    error in ~idle_timeout seconds rather than holding the shared lock for the
+    full turn budget.
+    """
+    from src.backends.codex.client import CodexClient
+
+    silent_rpc = _SilentRpc(read_timeout=0.2)
+    monkeypatch.setattr(
+        "src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: silent_rpc
+    )
+
+    # Tiny idle timeout, large overall turn budget: prove the idle gap is what bites.
+    backend = CodexClient(timeout=600_000, read_idle_timeout=200)
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+    client = await backend.create_client(session=session, model="gpt-5.5")
+
+    start = time.monotonic()
+    chunks = [chunk async for chunk in backend.run_completion_with_client(client, "hi", session)]
+    elapsed = time.monotonic() - start
+
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+    # Failed fast on the idle gap, nowhere near the 600s overall budget.
+    assert elapsed < 5.0
+    # The dead shared RPC was torn down by the error path.
+    assert silent_rpc.closed is True
+
+
+@pytest.mark.asyncio
+async def test_codex_idle_timeout_releases_lock_for_concurrent_call(monkeypatch):
+    """A wedged turn must release the shared lock so a second request can proceed.
+
+    Proves the head-of-line block is gone: after one silent turn times out on the
+    idle gap, a concurrent normal turn completes instead of waiting the full
+    budget behind the first.
+    """
+    import time as _time  # local alias to avoid shadowing
+
+    from src.backends.codex.client import CodexClient
+
+    silent_rpc = _SilentRpc(read_timeout=0.2)
+    healthy_rpc = FakeRpc()
+    healthy_rpc.notifications = [
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turnId": "turn_1",
+                "item": {
+                    "type": "agentMessage",
+                    "id": "item_ok",
+                    "phase": "final_answer",
+                    "text": "second call ok",
+                },
+            },
+        },
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thr_codex",
+                "turn": {"id": "turn_1", "status": "completed", "items": []},
+            },
+        },
+    ]
+
+    rpcs = iter([silent_rpc, healthy_rpc])
+    monkeypatch.setattr(
+        "src.backends.codex.client.CodexJsonRpcClient", lambda **kwargs: next(rpcs)
+    )
+
+    backend = CodexClient(timeout=600_000, read_idle_timeout=200)
+    session = SimpleNamespace(session_id="gw-session", pending_tool_call=None)
+
+    # First (wedged) client/turn: idle-timeouts and releases the lock.
+    silent_client = await backend.create_client(session=session, model="gpt-5.5")
+
+    async def _drain_silent():
+        return [
+            chunk
+            async for chunk in backend.run_completion_with_client(silent_client, "hi", session)
+        ]
+
+    async def _second_call():
+        # Give the silent turn a head start so it owns the lock first.
+        await asyncio.sleep(0.05)
+        start = _time.monotonic()
+        healthy_client = await backend.create_client(session=session, model="gpt-5.5")
+        chunks = [
+            chunk
+            async for chunk in backend.run_completion_with_client(healthy_client, "hi2", session)
+        ]
+        return chunks, _time.monotonic() - start
+
+    silent_chunks, (second_chunks, second_elapsed) = await asyncio.gather(
+        _drain_silent(), _second_call()
+    )
+
+    assert silent_chunks[-1]["type"] == "error"
+    # The second call ran after the lock was released and completed normally.
+    assert second_chunks[-1]["type"] == "result"
+    assert second_chunks[-1]["result"] == "second call ok"
+    # It did not wait anywhere near the 600s overall budget.
+    assert second_elapsed < 5.0

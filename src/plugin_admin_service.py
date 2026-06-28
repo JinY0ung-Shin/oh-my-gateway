@@ -204,7 +204,7 @@ def _validate_name(value: str, *, what: str) -> str:
     value = (value or "").strip()
     if not value:
         raise PluginAdminError(f"{what} is required")
-    if not _NAME_RE.match(value):
+    if not _NAME_RE.match(value) or value.startswith("-"):
         raise PluginAdminError(
             f"invalid {what} {value!r}: only letters, digits and ._@/- are allowed"
         )
@@ -222,7 +222,7 @@ def _validate_scope(scope: str) -> str:
 
 def _validate_branch(branch: str) -> str:
     branch = (branch or "").strip() or DEFAULT_BRANCH
-    if not _NAME_RE.match(branch):
+    if not _NAME_RE.match(branch) or branch.startswith("-"):
         raise PluginAdminError(
             f"invalid branch {branch!r}: only letters, digits and ._@/- are allowed"
         )
@@ -334,6 +334,7 @@ def prepare_repo(repo: str, *, branch: str, token: str, root: Path) -> Path:
                 "1",
                 "--branch",
                 branch,
+                "--",
                 repo,
                 str(staging),
             ],
@@ -497,9 +498,10 @@ def add_marketplace(
                 "plugin",
                 "marketplace",
                 "add",
-                str(local_path),
                 "--scope",
                 scope,
+                "--",
+                str(local_path),
             ]
         )
     except subprocess.CalledProcessError as exc:
@@ -541,7 +543,18 @@ def remove_marketplace(name: str, *, scope: str = "user") -> dict:
     removed_scope = None
     for sc in scopes:
         try:
-            run([claude_bin, "plugin", "marketplace", "remove", name, "--scope", sc])
+            run(
+                [
+                    claude_bin,
+                    "plugin",
+                    "marketplace",
+                    "remove",
+                    "--scope",
+                    sc,
+                    "--",
+                    name,
+                ]
+            )
             removed_scope = sc
             break
         except subprocess.CalledProcessError as exc:
@@ -585,7 +598,7 @@ def install_plugin(
     spec = plugin_manifest.spec_for(name, marketplace)
 
     try:
-        run([claude_bin, "plugin", "install", spec, "--scope", scope])
+        run([claude_bin, "plugin", "install", "--scope", scope, "--", spec])
     except subprocess.CalledProcessError as exc:
         raise PluginAdminError(
             f"claude plugin install failed for {spec!r} (scope {scope}): "
@@ -595,7 +608,7 @@ def install_plugin(
     # Update is best-effort: the plugin is installed even if no newer version
     # exists, so a non-zero update rc is not fatal.
     try:
-        run([claude_bin, "plugin", "update", spec, "--scope", scope])
+        run([claude_bin, "plugin", "update", "--scope", scope, "--", spec])
     except subprocess.CalledProcessError:
         pass
 
@@ -652,7 +665,7 @@ def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
     claude_bin = _require_claude_bin()
 
     try:
-        run([claude_bin, "plugin", "uninstall", spec, "--scope", scope])
+        run([claude_bin, "plugin", "uninstall", "--scope", scope, "--", spec])
     except subprocess.CalledProcessError as exc:
         raise PluginAdminError(
             f"claude plugin uninstall failed for {spec!r} (scope {scope}): "
