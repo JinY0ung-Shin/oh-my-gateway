@@ -11,7 +11,7 @@ def get_logs_html() -> str:
             <div class="label">TOTAL REQUESTS</div>
           </div>
           <div class="card stat">
-            <div class="value" :style="(logs.stats?.error_count ?? 0) > 0 ? 'color:var(--red); text-shadow: 0 0 10px var(--red-subtle)' : ''" x-text="logs.stats?.error_count ?? '-'"></div>
+            <div class="value" :style="(logs.stats?.error_count ?? 0) > 0 ? 'color:var(--red)' : ''" x-text="logs.stats?.error_count ?? '-'"></div>
             <div class="label">ERRORS</div>
           </div>
           <div class="card stat">

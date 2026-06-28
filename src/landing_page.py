@@ -1,334 +1,248 @@
 import html
 from typing import Any, Dict
 
+from src.theme import (
+    theme_head_init,
+    theme_tokens_css,
+    base_css,
+    theme_toggle_html,
+    theme_toggle_js,
+)
+
 
 def build_root_page(version: str, auth_info: Dict[str, Any], default_port: int) -> str:
     """Build the landing page HTML."""
     auth_method = html.escape(str(auth_info.get("method", "unknown")))
     auth_valid = auth_info.get("status", {}).get("valid", False)
-    status_text = html.escape("ONLINE" if auth_valid else "OFFLINE")
+    status_text = html.escape("Online" if auth_valid else "Offline")
     status_class = "online" if auth_valid else "offline"
     version = html.escape(str(version))
 
+    # Theme module returns single-brace CSS/JS/HTML. Because the page body below
+    # is an f-string (where only `{name}` interpolates and `{{`/`}}` are literal
+    # braces), interpolated values are inserted verbatim — their `{`/`}` are NOT
+    # re-processed. So these can be embedded directly with no brace escaping.
+    head_init = theme_head_init()
+    tokens_css = theme_tokens_css()
+    shared_css = base_css()
+    toggle_html = theme_toggle_html()
+    toggle_js = theme_toggle_js()
+
     return f"""<!DOCTYPE html>
-<html lang="ko">
+<html lang="en" data-theme="system">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Oh My Gateway</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+{head_init}
 <style>
+{tokens_css}
+{shared_css}
+
 /* ================================================================
-   TERMINAL DESIGN SYSTEM — Landing Page
-   Mirrors the admin panel phosphor/CRT aesthetic
+   Landing page — modern developer console (page-specific styles)
    ================================================================ */
 
-:root {{
-  --green: #00ff41;
-  --green-dim: #00cc33;
-  --green-muted: #00802080;
-  --green-subtle: #00ff4112;
-  --green-glow: 0 0 10px #00ff4140, 0 0 40px #00ff4110;
-  --amber: #ffb000;
-  --amber-dim: #cc8800;
-  --amber-subtle: #ffb00015;
-  --cyan: #00e5ff;
-  --cyan-dim: #00b8cc;
-  --cyan-subtle: #00e5ff12;
-  --red: #ff0033;
-  --red-dim: #cc0029;
-  --red-subtle: #ff003315;
+.container {{ max-width: 960px; margin: 0 auto; padding: 2rem 1.5rem 3rem; }}
 
-  --bg-deep: #050505;
-  --bg: #0a0a0a;
-  --bg-raised: #111111;
-  --bg-surface: #161616;
-  --bg-hover: #1a1a1a;
-  --border: #1e1e1e;
-  --border-bright: #2a2a2a;
-
-  --text: #b0ffb0;
-  --text-bright: #00ff41;
-  --text-dim: #4a7a4a;
-  --text-muted: #3a5a3a;
-
-  --font: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'SF Mono', monospace;
-  --fs-xs: 0.7rem;
-  --fs-sm: 0.78rem;
-  --fs-base: 0.85rem;
-  --fs-lg: 1rem;
-  --fs-xl: 1.2rem;
-}}
-
-*, *::before, *::after {{ box-sizing: border-box; margin: 0; padding: 0; }}
-
-body {{
-  background: var(--bg-deep);
-  color: var(--text);
+/* === Wordmark / header === */
+.wordmark {{
   font-family: var(--font);
-  font-size: var(--fs-base);
-  line-height: 1.6;
-  -webkit-font-smoothing: antialiased;
-  overflow-x: hidden;
+  font-weight: 700;
+  font-size: var(--fs-2xl);
+  letter-spacing: -0.02em;
+  color: var(--text-bright);
+  margin: 0;
+  line-height: 1.1;
 }}
-
-/* CRT Scanline Overlay */
-body::before {{
-  content: '';
-  position: fixed;
-  inset: 0;
-  background: repeating-linear-gradient(
-    0deg,
-    transparent,
-    transparent 2px,
-    rgba(0, 0, 0, 0.08) 2px,
-    rgba(0, 0, 0, 0.08) 4px
-  );
-  pointer-events: none;
-  z-index: 9999;
-}}
-
-/* Grid Background */
-body::after {{
-  content: '';
-  position: fixed;
-  inset: 0;
-  background-image:
-    linear-gradient(var(--green-muted) 1px, transparent 1px),
-    linear-gradient(90deg, var(--green-muted) 1px, transparent 1px);
-  background-size: 60px 60px;
-  opacity: 0.04;
-  pointer-events: none;
-  z-index: -1;
-}}
-
-.container {{ max-width: 960px; margin: 0 auto; padding: 1.5rem; }}
-
-a {{ color: var(--green-dim); text-decoration: none; transition: color 0.15s, text-shadow 0.15s; }}
-a:hover {{ color: var(--green); text-shadow: 0 0 6px var(--green-muted); }}
-
-/* === ASCII Header === */
-.ascii-header {{
-  font-size: var(--fs-xs);
-  color: var(--green-dim);
-  text-align: center;
-  line-height: 1.15;
-  letter-spacing: 0.05em;
-  margin-bottom: var(--fs-sm);
-  text-shadow: 0 0 8px var(--green-muted);
-  white-space: pre;
-  overflow: hidden;
+.wordmark .accent {{ color: var(--accent); }}
+.tagline {{
+  color: var(--text-dim);
+  font-size: var(--fs-sm);
+  margin-top: 0.35rem;
 }}
 
 .header-bar {{
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
-  padding: 0.5rem 0;
-  border-bottom: 1px solid var(--border-bright);
-  margin-bottom: 1.5rem;
+  padding-bottom: 1.25rem;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 1.75rem;
   flex-wrap: wrap;
-  gap: 0.5rem;
+  gap: 1rem;
 }}
 .header-bar .left {{
   display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}}
+.header-bar .meta {{
+  display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 0.6rem;
+  flex-wrap: wrap;
 }}
 .header-bar .right {{
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: 0.6rem;
 }}
+
 .version-tag {{
-  font-size: var(--fs-xs);
-  color: var(--text-dim);
-  border: 1px solid var(--border-bright);
-  padding: 2px 8px;
-}}
-.github-link {{
+  font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--text-dim);
   border: 1px solid var(--border);
-  padding: 2px 8px;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  transition: all 0.15s;
+  border-radius: var(--radius-pill);
+  padding: 2px 10px;
+  background: var(--bg-surface);
 }}
-.github-link:hover {{
-  color: var(--green);
-  border-color: var(--green-dim);
-}}
-.github-link svg {{ width: 14px; height: 14px; }}
-
-/* Status */
-.status-indicator {{
+.github-link {{
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 5px 10px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
+}}
+.github-link:hover {{
+  color: var(--text-bright);
+  border-color: var(--border-bright);
+  background: var(--bg-hover);
+}}
+.github-link svg {{ width: 15px; height: 15px; }}
+
+/* === Status === */
+.status-indicator {{
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
   font-size: var(--fs-sm);
+  font-weight: 500;
 }}
 .status-dot {{
   width: 8px;
   height: 8px;
   border-radius: 50%;
   display: inline-block;
+  flex-shrink: 0;
 }}
 .status-dot.online {{
   background: var(--green);
-  box-shadow: 0 0 8px var(--green-muted);
-  animation: pulse-glow 2s ease-in-out infinite;
+  box-shadow: 0 0 0 3px var(--green-subtle);
 }}
 .status-dot.offline {{
   background: var(--red);
-  box-shadow: 0 0 8px var(--red-subtle);
-  animation: pulse-glow 2s ease-in-out infinite;
+  box-shadow: 0 0 0 3px var(--red-subtle);
 }}
-.status-label.online {{ color: var(--green); text-shadow: 0 0 6px var(--green-muted); }}
-.status-label.offline {{ color: var(--red); }}
+.status-label.online {{ color: var(--green-dim); }}
+.status-label.offline {{ color: var(--red-dim); }}
 
-@keyframes pulse-glow {{
-  0%, 100% {{ opacity: 1; }}
-  50% {{ opacity: 0.5; }}
-}}
-
-/* Auth badge */
+/* === Auth badge === */
 .auth-badge {{
+  font-family: var(--font-mono);
   font-size: var(--fs-xs);
-  color: var(--cyan);
-  border: 1px solid var(--cyan-dim);
-  padding: 1px 8px;
-  background: var(--cyan-subtle);
+  color: var(--accent);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 2px 10px;
+  background: var(--accent-subtle);
 }}
 
 /* === Cards === */
-.card {{
-  background: var(--bg-raised);
-  border: 1px solid var(--border);
-  padding: 1rem 1.25rem;
-  margin-bottom: 1rem;
-  position: relative;
-}}
-.card::before {{
-  content: '';
-  position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, var(--green-dim), transparent);
-  opacity: 0.4;
-}}
+.card {{ margin-bottom: 1.25rem; }}
 .card-title {{
-  font-size: var(--fs-sm);
+  font-size: var(--fs-xs);
   color: var(--text-dim);
   text-transform: uppercase;
-  letter-spacing: 0.12em;
-  font-weight: 500;
-  margin-bottom: 0.75rem;
-}}
-.card-title::before {{
-  content: '// ';
-  color: var(--text-muted);
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  margin-bottom: 1rem;
 }}
 
 /* === Quick Start === */
 .quickstart-wrapper {{
   position: relative;
-  background: var(--bg);
+  background: var(--bg-surface);
   border: 1px solid var(--border);
-  padding: 1rem;
+  border-radius: var(--radius);
+  padding: 1rem 1.1rem;
   overflow-x: auto;
 }}
 .quickstart-wrapper pre {{
   margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--text);
-  font-family: var(--font);
+  font-family: var(--font-mono);
   font-size: var(--fs-sm);
+  line-height: 1.6;
   white-space: pre-wrap;
-  word-break: break-all;
+  word-break: break-word;
 }}
 .copy-btn {{
   position: absolute;
-  top: 0.5rem;
-  right: 0.5rem;
-  padding: 4px 10px;
-  background: var(--bg-raised);
+  top: 0.6rem;
+  right: 0.6rem;
+  padding: 4px 11px;
+  background: var(--bg);
   border: 1px solid var(--border-bright);
+  border-radius: var(--radius-sm);
   color: var(--text-dim);
   cursor: pointer;
   font-family: var(--font);
   font-size: var(--fs-xs);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  transition: all 0.15s;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: color 0.15s ease, border-color 0.15s ease, background-color 0.15s ease;
 }}
 .copy-btn:hover {{
-  color: var(--green);
-  border-color: var(--green-dim);
-  text-shadow: 0 0 4px var(--green-muted);
+  color: var(--text-bright);
+  border-color: var(--text-dim);
+  background: var(--bg-hover);
 }}
 .copy-btn.copied {{
-  color: var(--green);
-  border-color: var(--green-dim);
+  color: var(--green-dim);
+  border-color: var(--green-muted);
+  background: var(--green-subtle);
 }}
 
 /* === Endpoint List === */
 .endpoint-group-label {{
   font-size: var(--fs-xs);
-  font-weight: 500;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.12em;
+  letter-spacing: 0.08em;
   color: var(--text-muted);
-  padding: 0.75rem 0 0.35rem;
+  padding: 1rem 0 0.4rem;
 }}
 .endpoint-group-label:first-child {{ padding-top: 0; }}
 
 .endpoint-row {{
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  padding: 0.4rem 0;
-  border-bottom: 1px solid var(--border);
+  gap: 0.85rem;
+  padding: 0.5rem 0;
+  border-bottom: 1px solid var(--border-dim);
   font-size: var(--fs-sm);
 }}
 .endpoint-row:last-child {{ border-bottom: none; }}
 
-.badge {{
-  display: inline-block;
-  padding: 1px 8px;
-  font-size: var(--fs-xs);
-  font-weight: 500;
-  font-family: var(--font);
-  letter-spacing: 0.05em;
-  border: 1px solid;
-  flex-shrink: 0;
-  min-width: 44px;
-  text-align: center;
-}}
-.badge-post {{
-  background: var(--green-subtle);
-  color: var(--green);
-  border-color: var(--green-dim);
-  text-shadow: 0 0 4px var(--green-muted);
-}}
-.badge-get {{
-  background: var(--cyan-subtle);
-  color: var(--cyan);
-  border-color: var(--cyan-dim);
-}}
-.badge-del {{
-  background: var(--red-subtle);
-  color: var(--red);
-  border-color: var(--red-dim);
-}}
+.badge {{ min-width: 50px; }}
 
 .endpoint-path {{
   color: var(--text);
-  font-family: var(--font);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
   flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
 }}
 .endpoint-desc {{
   color: var(--text-dim);
@@ -338,117 +252,118 @@ a:hover {{ color: var(--green); text-shadow: 0 0 6px var(--green-muted); }}
 
 /* === Expandable Details === */
 details {{
-  border: 1px solid var(--border);
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-sm);
   background: var(--bg-surface);
-  margin-bottom: 2px;
+  margin-bottom: 4px;
 }}
 details summary {{
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  padding: 0.4rem 0.75rem;
+  gap: 0.85rem;
+  padding: 0.5rem 0.85rem;
   cursor: pointer;
   list-style: none;
   font-size: var(--fs-sm);
-  transition: background 0.1s;
+  border-radius: var(--radius-sm);
+  transition: background-color 0.12s ease;
 }}
 details summary::-webkit-details-marker {{ display: none; }}
 details summary::after {{
-  content: '>';
+  content: '';
+  width: 7px;
+  height: 7px;
   margin-left: auto;
-  color: var(--text-muted);
-  font-size: var(--fs-xs);
-  transition: transform 0.15s;
+  border-right: 1.5px solid var(--text-muted);
+  border-bottom: 1.5px solid var(--text-muted);
+  transform: rotate(-45deg);
+  transition: transform 0.15s ease, border-color 0.15s ease;
+  flex-shrink: 0;
 }}
 details[open] summary::after {{
-  transform: rotate(90deg);
-  color: var(--green-dim);
+  transform: rotate(45deg);
+  border-color: var(--accent);
 }}
 details[open] summary {{
   border-bottom: 1px solid var(--border);
+  border-bottom-left-radius: 0;
+  border-bottom-right-radius: 0;
 }}
 details summary:hover {{
   background: var(--bg-hover);
 }}
 details .detail-body {{
-  padding: 0.75rem;
+  padding: 0.85rem;
   font-size: var(--fs-sm);
 }}
 details .detail-body pre {{
   margin: 0;
   overflow-x: auto;
+  font-family: var(--font-mono);
 }}
 
 /* === Config Grid === */
 .config-grid {{
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 0.75rem;
 }}
 .config-item {{
-  padding: 0.75rem;
+  padding: 0.85rem;
   background: var(--bg-surface);
   border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
 }}
 .config-item .val {{
-  color: var(--green);
+  color: var(--text-bright);
+  font-family: var(--font-mono);
   font-weight: 600;
   font-size: var(--fs-sm);
-  text-shadow: 0 0 4px var(--green-muted);
 }}
 .config-item .label {{
   font-size: var(--fs-xs);
   color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.1em;
-  margin-top: 2px;
+  margin-top: 4px;
+}}
+.config-key {{
+  font-family: var(--font-mono);
+  color: var(--accent);
+  font-weight: 600;
 }}
 
 /* === Footer === */
 footer {{
   border-top: 1px solid var(--border);
-  padding-top: 1rem;
-  margin-top: 1rem;
+  padding-top: 1.25rem;
+  margin-top: 1.5rem;
 }}
 footer nav {{
   display: flex;
   justify-content: center;
-  gap: 2rem;
+  gap: 1.75rem;
   flex-wrap: wrap;
 }}
 footer a {{
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
   font-size: var(--fs-sm);
+  font-weight: 500;
   color: var(--text-dim);
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
   padding: 4px 0;
   border-bottom: 1px solid transparent;
-  transition: all 0.15s;
+  transition: color 0.15s ease, border-color 0.15s ease;
 }}
 footer a:hover {{
-  color: var(--green);
-  border-bottom-color: var(--green-dim);
-  text-shadow: 0 0 4px var(--green-muted);
-}}
-footer a::before {{
-  content: '>';
-  color: var(--text-muted);
-  transition: color 0.15s;
-}}
-footer a:hover::before {{
-  color: var(--green-dim);
+  color: var(--text-bright);
+  border-bottom-color: var(--accent);
 }}
 footer .copyright {{
   text-align: center;
+  font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--text-muted);
-  margin-top: 0.75rem;
+  margin-top: 1rem;
 }}
 
-/* === Loading spinner === */
+/* === Loading indicator === */
 .loader {{
   color: var(--text-dim);
   font-size: var(--fs-xs);
@@ -466,7 +381,7 @@ footer .copyright {{
 
 .hidden {{ display: none !important; }}
 
-/* Shiki overrides */
+/* === Shiki overrides === */
 .shiki {{
   padding: 0 !important;
   margin: 0 !important;
@@ -476,14 +391,14 @@ footer .copyright {{
 .shiki code {{
   white-space: pre-wrap;
   word-break: break-word;
-  font-family: var(--font);
+  font-family: var(--font-mono);
   font-size: var(--fs-sm);
 }}
 
-/* Responsive */
+/* === Responsive === */
 @media (max-width: 640px) {{
-  .container {{ padding: 1rem; }}
-  .ascii-header {{ font-size: 0.45rem; }}
+  .container {{ padding: 1.25rem 1rem 2rem; }}
+  .wordmark {{ font-size: var(--fs-xl); }}
   .endpoint-desc {{ display: none; }}
   .config-grid {{ grid-template-columns: 1fr 1fr; }}
 }}
@@ -491,12 +406,17 @@ footer .copyright {{
 <script type="module">
     import {{ codeToHtml }} from 'https://esm.sh/shiki@3.0.0';
 
-    const theme = 'vitesse-dark';
+    function shikiTheme() {{
+        var t = document.documentElement.getAttribute('data-theme');
+        if (t === 'dark') return 'github-dark';
+        if (t === 'light') return 'github-light';
+        return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'github-dark' : 'github-light';
+    }}
 
     async function highlightJson(json, targetId) {{
         const code = typeof json === 'string' ? json : JSON.stringify(json, null, 2);
         try {{
-            const html = await codeToHtml(code, {{ lang: 'json', theme }});
+            const html = await codeToHtml(code, {{ lang: 'json', theme: shikiTheme() }});
             document.getElementById(targetId).innerHTML = html;
         }} catch (e) {{
             document.getElementById(targetId).innerHTML = '<pre style="color:var(--red);">ERR: ' + e.message + '</pre>';
@@ -531,7 +451,7 @@ footer .copyright {{
 
     async function highlightQuickstart() {{
         try {{
-            const html = await codeToHtml(quickstartCode, {{ lang: 'bash', theme }});
+            const html = await codeToHtml(quickstartCode, {{ lang: 'bash', theme: shikiTheme() }});
             document.getElementById('quickstart-code').innerHTML = html;
         }} catch (e) {{
             document.getElementById('quickstart-code').textContent = quickstartCode;
@@ -558,13 +478,14 @@ footer .copyright {{
         ta.style.cssText = 'position:fixed;opacity:0';
         document.body.appendChild(ta);
         ta.select();
-        try {{ document.execCommand('copy'); showCopied(btn); }} catch (e) {{}}
+        try {{ document.execCommand('copy'); showCopied(btn); }}
+        catch (e) {{ if (window.console && console.debug) console.debug('copy failed', e); }}
         document.body.removeChild(ta);
     }}
 
     function showCopied(btn) {{
         const orig = btn.textContent;
-        btn.textContent = 'COPIED';
+        btn.textContent = 'Copied';
         btn.classList.add('copied');
         setTimeout(() => {{ btn.textContent = orig; btn.classList.remove('copied'); }}, 2000);
     }}
@@ -573,30 +494,25 @@ footer .copyright {{
 <body>
 <main class="container">
 
-    <!-- ASCII Art Header -->
-    <div class="ascii-header" aria-hidden="true">
- ██████╗ ██╗  ██╗    ███╗   ███╗██╗   ██╗     ██████╗  █████╗ ████████╗███████╗██╗    ██╗ █████╗ ██╗   ██╗
-██╔═══██╗██║  ██║    ████╗ ████║╚██╗ ██╔╝    ██╔════╝ ██╔══██╗╚══██╔══╝██╔════╝██║    ██║██╔══██╗╚██╗ ██╔╝
-██║   ██║███████║    ██╔████╔██║ ╚████╔╝     ██║  ███╗███████║   ██║   █████╗  ██║ █╗ ██║███████║ ╚████╔╝
-██║   ██║██╔══██║    ██║╚██╔╝██║  ╚██╔╝      ██║   ██║██╔══██║   ██║   ██╔══╝  ██║███╗██║██╔══██║  ╚██╔╝
-╚██████╔╝██║  ██║    ██║ ╚═╝ ██║   ██║       ╚██████╔╝██║  ██║   ██║   ███████╗╚███╔███╔╝██║  ██║   ██║
- ╚═════╝ ╚═╝  ╚═╝    ╚═╝     ╚═╝   ╚═╝        ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝
-    </div>
-
     <!-- Header Bar -->
     <div class="header-bar">
         <div class="left">
-            <span class="status-indicator">
-                <span class="status-dot {status_class}"></span>
-                <span class="status-label {status_class}">{status_text}</span>
-            </span>
-            <span class="auth-badge">AUTH: {auth_method}</span>
+            <h1 class="wordmark">Oh My <span class="accent">Gateway</span></h1>
+            <p class="tagline">OpenAI-compatible gateway for Claude, OpenCode &amp; Codex backends.</p>
+            <div class="meta">
+                <span class="status-indicator">
+                    <span class="status-dot {status_class}"></span>
+                    <span class="status-label {status_class}">{status_text}</span>
+                </span>
+                <span class="auth-badge">auth: {auth_method}</span>
+            </div>
         </div>
         <div class="right">
+            {toggle_html}
             <span class="version-tag">v{version}</span>
             <a href="https://github.com/JinY0ung-Shin/oh-my-gateway" target="_blank" rel="noopener noreferrer" class="github-link" title="GitHub">
                 <svg fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"/></svg>
-                GITHUB
+                GitHub
             </a>
         </div>
     </div>
@@ -605,7 +521,7 @@ footer .copyright {{
     <div class="card">
         <div class="card-title">Quick Start</div>
         <div class="quickstart-wrapper">
-            <button id="copy-btn" onclick="copyQuickstart()" class="copy-btn" title="Copy">COPY</button>
+            <button id="copy-btn" onclick="copyQuickstart()" class="copy-btn" title="Copy">Copy</button>
             <div id="quickstart-code">
                 <pre>curl -X POST http://localhost:{default_port}/v1/responses \\
   -H "Content-Type: application/json" \\
@@ -730,7 +646,7 @@ footer .copyright {{
     <div class="card">
         <div class="card-title">Configuration</div>
         <p style="color:var(--text-dim);font-size:var(--fs-sm);margin-bottom:0.75rem;">
-            Set <span style="color:var(--amber);">CLAUDE_AUTH_METHOD</span> to choose authentication:
+            Set <span class="config-key">CLAUDE_AUTH_METHOD</span> to choose authentication:
         </p>
         <div class="config-grid" style="margin-bottom:1rem;">
             <div class="config-item">
@@ -756,12 +672,13 @@ footer .copyright {{
         <nav>
             <a href="/docs">API Docs</a>
             <a href="/redoc">ReDoc</a>
-            <a href="/admin">Admin Terminal</a>
+            <a href="/admin">Admin</a>
             <a href="/admin/chat">Chat</a>
         </nav>
-        <div class="copyright">OH MY GATEWAY // v{version}</div>
+        <div class="copyright">Oh My Gateway // v{version}</div>
     </footer>
 
 </main>
+{toggle_js}
 </body>
 </html>"""

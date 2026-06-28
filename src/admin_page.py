@@ -18,6 +18,13 @@ from src.admin_html_skills import get_skills_html
 from src.admin_html_usage import get_usage_html
 from src.admin_js import get_admin_js
 from src.admin_styles import get_admin_css
+from src.theme import (
+    base_css,
+    theme_head_init,
+    theme_tokens_css,
+    theme_toggle_html,
+    theme_toggle_js,
+)
 
 
 @lru_cache(maxsize=1)
@@ -34,11 +41,14 @@ def build_admin_page() -> str:
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Oh My Gateway Admin</title>
+"""
+        + theme_head_init()
+        + """
 <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.14.8/dist/cdn.min.js" integrity="sha384-X9kJyAubVxnP0hcA+AMMs21U445qsnqhnUF8EBlEpP3a42Kh/JwWjlv2ZcvGfphb" crossorigin="anonymous"></script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&display=swap" rel="stylesheet">
 <style>
 """
+        + theme_tokens_css()
+        + base_css()
         + get_admin_css()
         + """
 </style>
@@ -87,6 +97,9 @@ def build_admin_page() -> str:
           <span class="status-line">
             <span class="online"></span> Connected
           </span>
+          """
+        + theme_toggle_html()
+        + """
           <button class="btn btn-sm btn-ghost" @click="refreshAll()" aria-label="Refresh all data">Refresh</button>
           <button class="btn btn-sm btn-ghost" @click="doLogout()" aria-label="Log out">Log out</button>
         </div>
@@ -132,6 +145,9 @@ def build_admin_page() -> str:
         + get_admin_js()
         + """
 </script>
+"""
+        + theme_toggle_js()
+        + """
 </body>
 </html>"""
     )
