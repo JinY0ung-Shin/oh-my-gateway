@@ -33,6 +33,10 @@ services:
       gateway-log:
         condition: service_healthy
         required: false
+    # Let the container reach the host's published ports (e.g. UniBridge edge
+    # on host :3000) via host.docker.internal, used by ANTHROPIC_BASE_URL.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
