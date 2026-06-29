@@ -918,9 +918,20 @@ function renderMarkdown(text) {
   // boundaries, so globs (*.py), math (2 * 3) and a*b are left alone.
   html = html.replace(/(^|[\s(])\*(\S(?:[^*\n]*?\S)?)\*(?=[\s).,!?;:]|$)/g, '$1<em>$2</em>');
   html = renderMarkdownLists(html);
+  // List markup is block-level and carries its own margins; the source
+  // newlines hugging those tags would render as extra blank lines under
+  // `white-space: pre-wrap`. Strip them, then clamp any run of blank lines
+  // to a single one so paragraphs don't spread out.
+  html = html
+    .replace(/\n+(?=<\/?(?:ul|ol|li)\b)/g, '')
+    .replace(/(<\/?(?:ul|ol|li)\b[^>]*>)\n+/g, '$1')
+    .replace(/\n{3,}/g, '\n\n');
   // Restore code blocks; leave a stray sentinel-shaped literal untouched.
   const restore = new RegExp(CB_SENTINEL + '(\\d+)' + CB_SENTINEL, 'g');
   html = html.replace(restore, (m, i) => codeBlocks[+i] !== undefined ? codeBlocks[+i] : m);
+  // <pre> is block-level too; trim the newlines touching its wrapper so the
+  // code block doesn't pick up a blank line above/below from pre-wrap.
+  html = html.replace(/\n+(<pre[\s>])/g, '$1').replace(/(<\/pre>)\n+/g, '$1');
   return html;
 }
 // Group consecutive -/*/+ or 1. lines into <ul>/<ol>; leave other lines intact.
