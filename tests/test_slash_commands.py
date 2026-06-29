@@ -134,6 +134,38 @@ async def test_ttl_cache_reuses_within_window(monkeypatch):
     assert calls["n"] == 1  # subsequent calls within TTL hit cache
 
 
+async def test_fetch_commands_uses_backend_setting_sources(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeOptions:
+        def __init__(self, **kwargs):
+            captured["cwd"] = kwargs["cwd"]
+            captured["setting_sources"] = kwargs["setting_sources"]
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get_server_info(self):
+            return {"commands": [{"name": "brain-search"}]}
+
+    monkeypatch.setenv("CLAUDE_SETTING_SOURCES", "user,project,local")
+    monkeypatch.setattr(sc, "ClaudeAgentOptions", FakeOptions)
+    monkeypatch.setattr(sc, "ClaudeSDKClient", FakeClient)
+
+    names = await sc._fetch_commands(tmp_path)
+
+    assert names == {"brain-search"}
+    assert captured["cwd"] == tmp_path
+    assert captured["setting_sources"] == ["user", "project", "local"]
+
+
 async def test_ttl_cache_refreshes_after_expiry(monkeypatch):
     calls = {"n": 0}
 

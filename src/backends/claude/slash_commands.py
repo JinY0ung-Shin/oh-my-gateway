@@ -86,10 +86,12 @@ _cache = _Cache()
 async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
     """Pull the registered slash-command names from the SDK.
 
-    Uses ``setting_sources=["project", "local"]`` to match the backend's own
-    configuration (see ``src/backends/claude/client.py``).
+    Uses the same setting sources as the backend's SDK calls so user-scope
+    plugin skills installed by the admin panel are visible to the preflight.
     """
-    opts = ClaudeAgentOptions(cwd=cwd, setting_sources=["project", "local"])
+    from src.backends.claude.client import _get_setting_sources
+
+    opts = ClaudeAgentOptions(cwd=cwd, setting_sources=_get_setting_sources())
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
