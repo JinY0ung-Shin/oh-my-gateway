@@ -1,5 +1,6 @@
 services:
   gateway:
+    restart: unless-stopped
     build:
       context: .
       # Inherit proxy settings from the host shell at build time.
