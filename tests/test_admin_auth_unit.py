@@ -9,12 +9,34 @@ from fastapi import HTTPException
 from src.admin_auth import (
     _COOKIE_NAME,
     _make_session_token,
+    _secure_eq,
     _verify_session_token,
     login,
     logout,
     require_admin,
     validate_admin_config,
 )
+
+
+# ---------------------------------------------------------------------------
+# Constant-time comparison (non-ASCII safety)
+# ---------------------------------------------------------------------------
+
+
+class TestSecureEq:
+    def test_matches_and_mismatches_ascii(self):
+        assert _secure_eq("abc", "abc") is True
+        assert _secure_eq("abc", "abd") is False
+
+    def test_non_ascii_does_not_raise(self):
+        # The bug: hmac.compare_digest(str, str) raises TypeError on non-ASCII.
+        assert _secure_eq("키-한글", "키-한글") is True
+        assert _secure_eq("키-한글", "키-다름") is False
+
+    def test_none_never_matches(self):
+        assert _secure_eq(None, "x") is False
+        assert _secure_eq("x", None) is False
+        assert _secure_eq(None, None) is False
 
 
 # ---------------------------------------------------------------------------
@@ -81,6 +103,21 @@ class TestLogin:
             login("wrong-key", response)
         assert exc_info.value.status_code == 401
 
+    @patch("src.admin_auth.ADMIN_API_KEY", "correct-key")
+    def test_non_ascii_provided_key_returns_401_not_500(self):
+        # Regression: a non-ASCII key once raised TypeError -> 500. It must be a
+        # clean 401.
+        response = MagicMock()
+        with pytest.raises(HTTPException) as exc_info:
+            login("틀린-키", response)
+        assert exc_info.value.status_code == 401
+
+    @patch("src.admin_auth.ADMIN_API_KEY", "정답-키")
+    def test_non_ascii_admin_key_authenticates_match(self):
+        response = MagicMock()
+        result = login("정답-키", response)
+        assert result["status"] == "ok"
+
 
 # ---------------------------------------------------------------------------
 # Logout
@@ -130,6 +167,27 @@ class TestRequireAdmin:
         request = MagicMock()
         request.cookies = {}
         request.headers = {"authorization": "Bearer wrong-key"}
+        with pytest.raises(HTTPException) as exc_info:
+            require_admin(request)
+        assert exc_info.value.status_code == 401
+
+    @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
+    def test_non_ascii_bearer_returns_401_not_500(self):
+        # Regression: a non-ASCII bearer token must fail auth cleanly, not 500.
+        request = MagicMock()
+        request.cookies = {}
+        request.headers = {"authorization": "Bearer 틀린-토큰"}
+        with pytest.raises(HTTPException) as exc_info:
+            require_admin(request)
+        assert exc_info.value.status_code == 401
+
+    @patch("src.admin_auth.ADMIN_API_KEY", "test-key")
+    def test_non_ascii_cookie_returns_401_not_500(self):
+        # A crafted cookie with a non-ASCII signature part reaches the HMAC
+        # compare; it must reject cleanly rather than raise TypeError.
+        request = MagicMock()
+        request.cookies = {_COOKIE_NAME: f"{int(time.time())}.틀린서명"}
+        request.headers = {}
         with pytest.raises(HTTPException) as exc_info:
             require_admin(request)
         assert exc_info.value.status_code == 401

@@ -19,6 +19,7 @@ import logging
 import os
 import secrets
 import time
+from typing import Optional
 from fastapi import HTTPException, Request, Response
 
 from src.env_utils import parse_bool_env
@@ -37,6 +38,25 @@ ADMIN_SESSION_TTL = int(os.getenv("ADMIN_SESSION_TTL", "3600"))  # 1 hour defaul
 # which is acceptable for an admin panel.
 _COOKIE_SECRET = secrets.token_bytes(32)
 _COOKIE_NAME = "admin_session"
+
+# ---------------------------------------------------------------------------
+# Constant-time comparison
+# ---------------------------------------------------------------------------
+
+
+def _secure_eq(a: Optional[str], b: Optional[str]) -> bool:
+    """Constant-time string comparison tolerant of non-ASCII input.
+
+    ``hmac.compare_digest`` raises ``TypeError`` for ``str`` operands that
+    contain non-ASCII code points, so a crafted admin key, session cookie, or
+    bearer token would surface as a 500 instead of a clean auth failure.
+    Comparing the UTF-8 encodings avoids that while staying constant-time.
+    ``None`` (e.g. a missing cookie/header) never matches.
+    """
+    if a is None or b is None:
+        return False
+    return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+
 
 # ---------------------------------------------------------------------------
 # Session token helpers
@@ -68,7 +88,7 @@ def _verify_session_token(token: str) -> bool:
 
     # Verify HMAC (timing-safe)
     expected = _make_session_token(issued_at)
-    return hmac.compare_digest(token, expected)
+    return _secure_eq(token, expected)
 
 
 # ---------------------------------------------------------------------------
@@ -91,7 +111,7 @@ def validate_admin_config() -> None:
 
 def login(provided_key: str, response: Response) -> dict:
     """Validate the admin key and set an HttpOnly session cookie."""
-    if not hmac.compare_digest(provided_key, ADMIN_API_KEY):
+    if not _secure_eq(provided_key, ADMIN_API_KEY):
         logger.warning("Admin login failed: invalid API key")
         raise HTTPException(status_code=401, detail="Invalid admin API key")
 
@@ -137,7 +157,7 @@ def require_admin(request: Request) -> bool:
     auth_header = request.headers.get("authorization", "")
     if auth_header.startswith("Bearer "):
         bearer_token = auth_header[7:]
-        if hmac.compare_digest(bearer_token, ADMIN_API_KEY):
+        if _secure_eq(bearer_token, ADMIN_API_KEY):
             return True
 
     raise HTTPException(
