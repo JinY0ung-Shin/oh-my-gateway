@@ -215,6 +215,11 @@ def _writable_extra_roots() -> List[Path]:
 
 
 def _deny(reason: str) -> Dict[str, Any]:
+    # SKILL_DEBUG: surface every workspace-sandbox denial. A plugin skill that
+    # "loads" but then fails often does so because its body reads/writes/execs
+    # a path outside the workspace and this hook blocks it. Temporary WARNING
+    # instrumentation; safe to remove once the skill issue is understood.
+    logger.warning("SKILL_DEBUG sandbox_deny: %s", reason)
     return {
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
