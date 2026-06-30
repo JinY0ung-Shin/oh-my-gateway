@@ -547,7 +547,13 @@ async def openai_stream_to_anthropic_events(
     yield {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"output_tokens": state.output_tokens},
+        # OpenAI delivers ``usage`` on its terminal chunk, so ``input_tokens``
+        # is unknown when ``message_start`` is emitted. Repeat it here (real
+        # Anthropic ``message_delta.usage`` also carries it) so it isn't lost.
+        "usage": {
+            "input_tokens": state.input_tokens,
+            "output_tokens": state.output_tokens,
+        },
     }
     yield {"type": "message_stop"}
 

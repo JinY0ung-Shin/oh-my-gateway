@@ -350,6 +350,10 @@ class TestStreamConversion:
         msg_delta = next(e for e in out if e["type"] == "message_delta")
         assert msg_delta["delta"]["stop_reason"] == "tool_use"
         assert msg_delta["usage"]["output_tokens"] == 30
+        # ``input_tokens`` arrives on the terminal usage chunk, after
+        # ``message_start`` was already emitted with 0 — it must be carried
+        # on ``message_delta`` so it isn't lost.
+        assert msg_delta["usage"]["input_tokens"] == 100
 
     async def test_finish_reason_stop_maps_to_end_turn(self):
         chunks = [
