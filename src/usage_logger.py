@@ -16,8 +16,13 @@ The insert path relies on ``result.lastrowid``, which is supported by
 MySQL/MariaDB/SQLite but not PostgreSQL.  Adding PostgreSQL would
 require switching to ``insert(...).returning(id)``.
 
-Writes are fire-and-forget - failures are swallowed after a warning so a
-flaky database never impacts user-visible chat behaviour.
+Writes are fire-and-forget: ``log_turn_from_context`` records Prometheus
+metrics synchronously, then schedules the DB INSERT on a detached background
+task (``_schedule_log_turn``). Detaching matters - awaiting the write inline in
+the request task let a client disconnect raise ``CancelledError`` through the
+in-flight commit, poisoning the pooled connection. DB errors are swallowed
+after a warning so a flaky database never impacts user-visible chat behaviour;
+in-flight writes are drained on ``close()``.
 """
 
 from __future__ import annotations
@@ -155,6 +160,9 @@ class UsageLogger:
         self._engine: Optional[Any] = None  # AsyncEngine when connected
         self._lock = asyncio.Lock()
         self._disabled_reason: Optional[str] = None
+        # In-flight detached write tasks (see _schedule_log_turn). Tracked so
+        # they survive GC and can be drained on close().
+        self._pending: "set[asyncio.Task[Any]]" = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -209,7 +217,13 @@ class UsageLogger:
         logger.info("Usage logging enabled (%s)", _safe_url(url))
 
     async def close(self) -> None:
-        """Dispose the engine (idempotent)."""
+        """Drain in-flight writes, then dispose the engine (idempotent)."""
+        # Let detached writes finish so a graceful shutdown doesn't drop the
+        # last turns. return_exceptions=True: a failed/cancelled write must not
+        # abort the drain.
+        pending = list(self._pending)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         engine = self._engine
         if engine is None:
             return
@@ -318,8 +332,43 @@ class UsageLogger:
                                 for name, stats in tool_stats.items()
                             ],
                         )
+        except asyncio.CancelledError:
+            # Cancellation (e.g. at shutdown drain) must propagate, not be
+            # swallowed as a generic failure — cooperative cancellation relies
+            # on it. Request cancellation never reaches here: the write runs on
+            # a detached task (see _schedule_log_turn), not the request task.
+            raise
         except Exception:
             logger.warning("usage-log write failed", exc_info=True)
+
+    def _schedule_log_turn(
+        self,
+        *,
+        turn: Dict[str, Any],
+        tool_stats: Optional[Dict[str, Dict[str, int]]] = None,
+    ) -> None:
+        """Run :meth:`log_turn` on a detached background task.
+
+        The INSERT in :meth:`log_turn` runs under ``await``. Awaiting it inline
+        in the request task means a client disconnect raises
+        ``asyncio.CancelledError`` — a ``BaseException`` that the
+        ``except Exception`` guard does **not** catch — straight through the
+        in-flight commit, which can poison the pooled connection (and surface
+        later as ``pymysql`` errors). Detaching the write onto its own task
+        keeps request cancellation from reaching it, so logging is genuinely
+        fire-and-forget as the module docstring promises.
+
+        The task is tracked in ``self._pending`` (and removed on completion) so
+        it is not garbage-collected mid-flight and can be drained by
+        :meth:`close` on shutdown.
+        """
+        try:
+            task = asyncio.create_task(self.log_turn(turn=turn, tool_stats=tool_stats))
+        except RuntimeError:  # pragma: no cover - no running loop (non-async caller)
+            logger.warning("usage-log skipped: no running event loop")
+            return
+        self._pending.add(task)
+        task.add_done_callback(self._pending.discard)
 
     async def log_turn_from_context(
         self,
@@ -373,7 +422,9 @@ class UsageLogger:
         ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         duration_ms = int((time.monotonic() - started_monotonic) * 1000)
 
-        await self.log_turn(
+        # Detach the DB write so request cancellation can't interrupt the
+        # in-flight commit (see ``_schedule_log_turn`` / module docstring).
+        self._schedule_log_turn(
             turn={
                 "ts": ts,
                 "user": user,

@@ -1,5 +1,7 @@
 """Tests for SQLAlchemy-backed usage logging."""
 
+import asyncio
+
 import pytest
 
 from src.usage_logger import (
@@ -437,6 +439,10 @@ async def test_log_turn_from_context_builds_turn_record(monkeypatch):
         error_code="rate_limit",
     )
 
+    # The DB write is now detached onto a background task; drain it before
+    # asserting it ran.
+    await asyncio.gather(*logger._pending)
+
     assert len(calls) == 1
     assert calls[0]["tool_stats"] == {"Read": {"count": 1}}
     turn = calls[0]["turn"]
@@ -521,6 +527,79 @@ async def test_log_turn_from_context_prefers_resolved_model_over_alias(monkeypat
         status="completed",
     )
 
+    # Metrics are recorded synchronously; the DB write is detached, so drain it.
+    await asyncio.gather(*logger._pending)
+
     # Both the DB row and the Prometheus label carry the concrete id, not "sonnet".
     assert calls[0]["turn"]["model"] == "claude-sonnet-4-5-20250929"
     assert metrics[0]["model"] == "claude-sonnet-4-5-20250929"
+
+
+async def test_caller_cancellation_does_not_abort_detached_write():
+    """Regression: a client disconnect mid-turn must not cancel the DB write.
+
+    Before the fix, ``log_turn_from_context`` awaited the write inline in the
+    request task, so cancelling the caller raised ``CancelledError`` straight
+    through the in-flight commit. The write now runs on a detached task, so
+    caller cancellation can't reach it.
+    """
+    logger = UsageLogger()
+    logger._engine = object()
+    in_commit = asyncio.Event()
+    release = asyncio.Event()
+    outcome: list[str] = []
+
+    async def slow_log_turn(**kwargs):
+        in_commit.set()
+        try:
+            await release.wait()  # stand in for the in-flight DB commit
+        except asyncio.CancelledError:
+            outcome.append("cancelled")
+            raise
+        outcome.append("committed")
+
+    logger.log_turn = slow_log_turn
+
+    async def caller():
+        await logger.log_turn_from_context(
+            request_context={"user": "alice", "session_id": "s", "turn": 1},
+            response_id="r",
+            model="m",
+            chunks=[{"type": "result", "usage": {"input_tokens": 1, "output_tokens": 2}}],
+            tool_stats=None,
+            started_monotonic=0.0,
+            status="completed",
+        )
+        await asyncio.sleep(3600)  # caller keeps streaming after scheduling the write
+
+    task = asyncio.create_task(caller())
+    await in_commit.wait()  # the detached write is mid-"commit"
+    task.cancel()  # client disconnects
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The detached write was untouched by the caller's cancellation.
+    assert outcome == []
+    release.set()
+    await asyncio.gather(*logger._pending)
+    assert outcome == ["committed"]
+
+
+async def test_close_drains_pending_writes():
+    """close() awaits in-flight detached writes before disposing the engine."""
+    logger = UsageLogger()
+    logger._engine = _FakeLifecycleEngine(begin_conn=_FakeBeginConnection())
+    done: list[int] = []
+
+    async def slow_log_turn(**kwargs):
+        await asyncio.sleep(0)
+        done.append(1)
+
+    logger.log_turn = slow_log_turn
+    logger._schedule_log_turn(turn=_sample_turn(), tool_stats=None)
+    assert len(logger._pending) == 1
+
+    await logger.close()
+
+    assert done == [1]  # close() waited for the write
+    assert not logger._pending
