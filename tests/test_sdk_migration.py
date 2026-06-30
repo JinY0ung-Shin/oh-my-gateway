@@ -321,6 +321,9 @@ class TestSkillsOptionMigration:
 
         assert "Skill" not in (options.allowed_tools or [])
         assert getattr(options, "skills", None) == "all"
+        # Execution permission needs a *granular* Skill rule; the bare "Skill"
+        # rule that skills="all" adds is ignored by the CLI permission matcher.
+        assert "Skill(:*)" in (options.allowed_tools or [])
 
     def test_no_skill_keeps_skills_unset(self):
         from claude_agent_sdk import ClaudeAgentOptions
@@ -335,6 +338,8 @@ class TestSkillsOptionMigration:
         )
 
         assert getattr(options, "skills", None) is None
+        # No skill access requested → no catch-all skill rule injected.
+        assert "Skill(:*)" not in (options.allowed_tools or [])
 
     def test_skill_in_disallowed_tools_skips_skills_translation(self, monkeypatch):
         """DISALLOWED_TOOLS filter must win over the Skill→skills translation."""
@@ -354,6 +359,8 @@ class TestSkillsOptionMigration:
 
         assert "Skill" not in (options.allowed_tools or [])
         assert getattr(options, "skills", None) is None
+        # Translation skipped entirely → no catch-all skill rule either.
+        assert "Skill(:*)" not in (options.allowed_tools or [])
 
     def test_mcp_default_allowed_tools_translates_skill(self):
         """MCP default allow-list path should not reintroduce deprecated Skill."""
@@ -373,6 +380,25 @@ class TestSkillsOptionMigration:
         # subsumes ``mcp__fs__*``) so plugin-bundled MCP servers loaded via
         # setting_sources are not locked out when MCP_CONFIG is set.
         assert "mcp__*" in (options.allowed_tools or [])
+        assert getattr(options, "skills", None) == "all"
+        assert "Skill(:*)" in (options.allowed_tools or [])
+
+    def test_skill_catch_all_rule_not_duplicated(self):
+        """A caller that already passes ``Skill(:*)`` must not get it twice."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill", "Skill(:*)"],
+            disallowed_tools=None,
+        )
+
+        allowed = options.allowed_tools or []
+        assert allowed.count("Skill(:*)") == 1
+        assert "Skill" not in allowed
         assert getattr(options, "skills", None) == "all"
 
 

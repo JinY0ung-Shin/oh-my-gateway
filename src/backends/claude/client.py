@@ -60,6 +60,14 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
 
+# Catch-all granular permission rule that auto-approves every skill invocation.
+# The CLI matches Skill rules by stripping a trailing ``:*`` and prefix-matching
+# the remainder against the skill name; with an empty prefix this matches all
+# skills (plugin-qualified ``plugin:skill`` and bare ``skill`` alike). A bare
+# ``Skill`` rule does NOT work — the matcher discards content-less rules. See
+# :meth:`ClaudeCodeCLI._set_allowed_tools`.
+SKILL_ALLOW_ALL_RULE = "Skill(:*)"
+
 
 def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
     """Return Claude config sources for SDK calls.
@@ -211,11 +219,28 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.disallowed_tools = list(dict.fromkeys(base_disallowed))
 
     def _set_allowed_tools(self, options: ClaudeAgentOptions, tools: List[str]) -> None:
-        """Set allowed_tools while translating deprecated Skill access."""
+        """Set allowed_tools while translating deprecated Skill access.
+
+        ``skills="all"`` enables and lists every discovered skill, and makes the
+        SDK add a bare ``Skill`` rule to ``--allowedTools``. That bare rule is
+        enough to expose the tool, but **not** to auto-approve a skill *call*:
+        the CLI's permission matcher ignores Skill rules that carry no content
+        (``ruleContent === undefined``) and only honors granular
+        ``Skill(<name>)`` / ``Skill(<name>:*)`` rules. With no granular rule,
+        every invocation falls through to an interactive "ask", which the
+        headless gateway can only resolve as a denial — surfacing to the client
+        as ``Execute skill: <name>``. ``Skill(:*)`` is the catch-all granular
+        rule: the CLI strips the trailing ``:*`` and prefix-matches the skill
+        name against the empty string, so it approves every skill while still
+        leaving the skill's own downstream tool calls (Bash/Read/Write) subject
+        to ``allowed_tools``, ``disallowed_tools`` and the workspace sandbox.
+        """
         filtered = [t for t in tools if t not in DISALLOWED_TOOLS]
         if "Skill" in filtered:
             filtered = [t for t in filtered if t != "Skill"]
             options.skills = "all"
+            if SKILL_ALLOW_ALL_RULE not in filtered:
+                filtered.append(SKILL_ALLOW_ALL_RULE)
         options.allowed_tools = filtered
 
     def _configure_sandbox(self, options: ClaudeAgentOptions) -> None:
