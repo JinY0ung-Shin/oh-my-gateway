@@ -679,6 +679,38 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     # ClaudeSDKClient lifecycle (persistent, bidirectional sessions)
     # ------------------------------------------------------------------
 
+    def _make_skill_allow_hook(self):
+        """Create a PreToolUse hook that force-approves the ``Skill`` tool.
+
+        The gateway has no interactive permission approver, so a skill that the
+        CLI would normally prompt for ("Execute skill: <name>") is otherwise
+        denied. Returning a PreToolUse ``allow`` decision pre-empts the CLI's
+        skill permission matcher regardless of CLI build, plugin source, or
+        skill metadata (e.g. skills whose frontmatter makes them ineligible for
+        the CLI's silent auto-approve). Non-Skill tools are passed through
+        untouched; the skill's own downstream tool calls keep their normal
+        permissions and the workspace sandbox hook still applies to them.
+        """
+
+        async def hook(input_data, _tool_use_id, _context):
+            tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
+            if tool_name != "Skill":
+                return {}
+            tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
+            skill = tool_input.get("skill", "") if isinstance(tool_input, dict) else ""
+            logger.warning("SKILL_DEBUG skill_allow_hook: auto-approving Skill skill=%s", skill)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "allow",
+                    "permissionDecisionReason": (
+                        "Gateway auto-approves skills (headless: no interactive approver)."
+                    ),
+                }
+            }
+
+        return hook
+
     def _make_ask_user_hook(self, session):
         """Create a PreToolUse hook that intercepts AskUserQuestion.
 
@@ -855,7 +887,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             HookMatcher(
                 matcher="AskUserQuestion",
                 hooks=[self._make_ask_user_hook(session)],
-            )
+            ),
+            # Force-approve the Skill tool. The gateway runs headless (no
+            # interactive approver), so the CLI's per-skill permission "ask"
+            # (surfaced to the client as an "Execute skill: <name>" error)
+            # becomes a hard denial. A PreToolUse "allow" decision pre-empts the
+            # rule matcher entirely, which is more robust than the Skill(:*)
+            # allow-rule across CLI builds. The skill's own downstream tool
+            # calls remain governed by their permissions and the sandbox hook.
+            HookMatcher(
+                matcher="Skill",
+                hooks=[self._make_skill_allow_hook()],
+            ),
         ]
         if cwd and sandbox_enabled():
             pre_tool_use.append(
