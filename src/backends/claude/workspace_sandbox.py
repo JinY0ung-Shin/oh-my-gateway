@@ -188,6 +188,21 @@ def _plugin_resource_roots(claude_home: Optional[Path]) -> List[Path]:
     return roots
 
 
+def plugin_resource_roots() -> List[Path]:
+    """Public: absolute plugin/skill/marketplace roots outside the workspace.
+
+    Two consumers share this list: the sandbox hook (as a read/exec allow-list)
+    and the gateway's CLI ``--add-dir`` configuration. Claude Code confines
+    ``cd`` and file operations to the session cwd plus its additional working
+    directories — independently of this hook — so an admin-installed plugin
+    skill that ``cd``s into its own plugin/resource directory is otherwise
+    rejected ("...may only change directories to the allowed working
+    directories..."). Granting these as additional directories unblocks that
+    while writes stay confined by :func:`make_workspace_sandbox_hook`.
+    """
+    return _plugin_resource_roots(_claude_home())
+
+
 def _read_json(path: Path) -> Any:
     """Read and parse a JSON file, returning ``None`` on any error."""
     try:

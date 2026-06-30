@@ -52,6 +52,7 @@ from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
 from src.backends.claude.workspace_sandbox import (
     make_workspace_sandbox_hook,
+    plugin_resource_roots,
     sandbox_enabled,
 )
 
@@ -252,6 +253,39 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
         options.allowed_tools = filtered
+
+    def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
+        """Grant the CLI extra working directories (``--add-dir``).
+
+        Claude Code confines ``cd`` and file operations to the session cwd plus
+        its additional working directories, *independently* of the workspace
+        sandbox hook. Admin-installed plugin skills live outside the per-user
+        workspace, so a skill that ``cd``s into its own plugin/resource
+        directory is otherwise blocked ("...may only change directories to the
+        allowed working directories for this session"). Add the
+        plugin/skill/marketplace roots plus any operator-specified
+        ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. Writes to
+        these stay confined by the sandbox hook (which keeps write tools to the
+        workspace + ``$HOME/.claude``).
+        """
+        dirs: List[str] = []
+        seen: set[str] = set()
+        try:
+            for root in plugin_resource_roots():
+                s = str(root)
+                if s not in seen:
+                    seen.add(s)
+                    dirs.append(s)
+        except Exception:  # pragma: no cover - never block session creation
+            logger.debug("plugin_resource_roots() failed for add_dirs", exc_info=True)
+        for part in os.getenv("CLAUDE_ADD_DIRS", "").split(","):
+            p = part.strip()
+            if p and p not in seen:
+                seen.add(p)
+                dirs.append(p)
+        if dirs:
+            options.add_dirs = list(dirs)
+            logger.warning("SKILL_DEBUG add_dirs: %s", dirs)
 
     def _configure_sandbox(self, options: ClaudeAgentOptions) -> None:
         """Apply bash sandbox configuration to *options*.
@@ -458,6 +492,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         self._configure_thinking(options)
         self._configure_sandbox(options)
+        self._configure_add_dirs(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
 
         if model:
