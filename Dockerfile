@@ -85,5 +85,12 @@ EXPOSE 8000
 
 # Run the app with Uvicorn and honor PORT env var.
 # exec ensures SIGTERM from docker stop reaches uvicorn.
+#
+# Optional start-time hook for private/corporate setup that must run on every
+# container start (e.g. writing ~/.claude/settings.json). Point
+# GATEWAY_STARTUP_SCRIPT at a script (bind-mounted, or added via the build-time
+# install hook) and it runs — as the unprivileged app user, fail-fast — before
+# plugins + server, so overlays don't have to rewrite this CMD. Unset = no-op.
+# Mirrors the build-time GATEWAY_BUILD_INSTALL_SCRIPT hook above.
 ENTRYPOINT ["python", "/usr/local/bin/docker-entrypoint.py"]
-CMD ["sh", "-c", "python /usr/local/bin/install_plugins.py && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "if [ -n \"$GATEWAY_STARTUP_SCRIPT\" ]; then python \"$GATEWAY_STARTUP_SCRIPT\" || exit 1; fi; python /usr/local/bin/install_plugins.py && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
