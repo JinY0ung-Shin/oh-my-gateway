@@ -8,12 +8,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 ARG APT_MIRROR_URL=
 ARG APT_SECURITY_MIRROR_URL=
 
-# Install system dependencies.
+# Install system dependencies. nodejs/npm provide `node`/`npx` so the bundled
+# Claude CLI can spawn plugin-bundled MCP servers (most ship as Node packages
+# launched via `npx -y …`); without them the spawn fails with `ENOENT`.
 COPY docker/apt_mirror_sources.sh /usr/local/bin/apt_mirror_sources.sh
 
 RUN sh /usr/local/bin/apt_mirror_sources.sh \
     && apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq ripgrep \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq nodejs npm ripgrep \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/local/bin/apt_mirror_sources.sh
 
