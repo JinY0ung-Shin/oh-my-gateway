@@ -10,7 +10,7 @@ import fnmatch
 import os
 from dotenv import dotenv_values, load_dotenv
 
-from src.env_utils import parse_bool_env, parse_int_env
+from src.env_utils import parse_bool_env, parse_float_env, parse_int_env
 
 load_dotenv()
 
@@ -64,6 +64,13 @@ USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
 # Path to MCP config JSON file or inline JSON string
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
+
+# MCP connection-test (admin diagnostics). Short + bounded so a hung server
+# cannot wedge the request thread. Do NOT reuse DEFAULT_TIMEOUT_MS (whole-turn budget).
+MCP_TEST_TIMEOUT_SECONDS = parse_float_env("MCP_TEST_TIMEOUT_SECONDS", 5.0)
+# stdio "test" defaults to resolvable-on-PATH ONLY (no spawn). Spawning admin-
+# supplied commands is an RCE surface; gate any actual spawn behind this flag.
+MCP_TEST_ALLOW_SPAWN = parse_bool_env("MCP_TEST_ALLOW_SPAWN", "false")
 
 # SSE keepalive interval (seconds).  During long SDK operations (tool
 # execution, context compaction) no events flow to the client.  Emitting
@@ -154,6 +161,7 @@ ASK_USER_TIMEOUT_SECONDS = parse_int_env("ASK_USER_TIMEOUT_SECONDS", 300)
 DEBUG_MODE = parse_bool_env("DEBUG_MODE", "false")
 VERBOSE = parse_bool_env("VERBOSE", "false")
 
+
 # ---------------------------------------------------------------------------
 # Vision capability gating (text-only model denylist)
 # ---------------------------------------------------------------------------
@@ -173,7 +181,9 @@ def is_text_only_model(model: str | None) -> bool:
     """
     if not model:
         return False
-    patterns = [m.strip() for m in os.getenv("TEXT_ONLY_MODELS", "").split(",") if m.strip()]
+    patterns = [
+        m.strip() for m in os.getenv("TEXT_ONLY_MODELS", "").split(",") if m.strip()
+    ]
     if not patterns:
         return False
     name = model.lower()

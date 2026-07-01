@@ -11,6 +11,7 @@ from functools import lru_cache
 from src.admin_html_config import get_config_html
 from src.admin_html_dashboard import get_dashboard_html
 from src.admin_html_logs import get_logs_html
+from src.admin_html_mcp import get_mcp_html
 from src.admin_html_plugins import get_plugins_html
 from src.admin_html_ratelimits import get_ratelimits_html
 from src.admin_html_sessions import get_sessions_html
@@ -114,6 +115,7 @@ def build_admin_page() -> str:
         <button role="tab" :aria-selected="tab === 'ratelimits'" @click="tab='ratelimits'; loadRateLimits()">Limits</button>
         <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">Skills</button>
         <button role="tab" :aria-selected="tab === 'plugins'" @click="tab='plugins'; loadPlugins(); loadCatalog()">Plugins</button>
+        <button role="tab" :aria-selected="tab === 'mcp'" @click="tab='mcp'; loadMcpDetail()">MCP</button>
         <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">Config</button>
         <a href="/admin/chat" role="tab" class="tab-link">Chat ↗</a>
       </nav>
@@ -130,6 +132,8 @@ def build_admin_page() -> str:
         + get_skills_html()
         + "\n\n"
         + get_plugins_html()
+        + "\n\n"
+        + get_mcp_html()
         + "\n\n"
         + get_sessions_html()
         + "\n\n"

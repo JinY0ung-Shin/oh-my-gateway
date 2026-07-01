@@ -97,14 +97,20 @@ class TestLoadMcpConfig:
 
     def test_sse_with_url_is_accepted(self):
         """sse server with 'url' field is accepted."""
-        config = {"mcpServers": {"good-sse": {"type": "sse", "url": "http://localhost:3000"}}}
+        config = {
+            "mcpServers": {"good-sse": {"type": "sse", "url": "http://localhost:3000"}}
+        }
         with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
             result = load_mcp_config()
             assert "good-sse" in result
 
     def test_http_with_url_is_accepted(self):
         """http server with 'url' field is accepted."""
-        config = {"mcpServers": {"good-http": {"type": "http", "url": "http://localhost:3000"}}}
+        config = {
+            "mcpServers": {
+                "good-http": {"type": "http", "url": "http://localhost:3000"}
+            }
+        }
         with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
             result = load_mcp_config()
             assert "good-http" in result
@@ -136,7 +142,10 @@ class TestStreamableHttpSupport:
         """streamable-http server with 'url' field is accepted."""
         config = {
             "mcpServers": {
-                "sh-server": {"type": "streamable-http", "url": "http://localhost:3000/mcp"}
+                "sh-server": {
+                    "type": "streamable-http",
+                    "url": "http://localhost:3000/mcp",
+                }
             }
         }
         with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
@@ -209,6 +218,253 @@ class TestValidatedMcpConfig:
         assert mcp_config.get_validated_mcp_config()["demo"]["command"] == "uvx"
 
 
+class TestValidateServer:
+    """Exact accept/drop reason strings for the shared validator."""
+
+    def test_non_dict_config_reason(self):
+        import src.mcp_config as mcp_config
+
+        ok, reason = mcp_config.validate_server("x", "not a dict")
+        assert ok is False
+        assert reason == "not a dict"
+
+    def test_unsupported_type_reason(self):
+        import src.mcp_config as mcp_config
+
+        ok, reason = mcp_config.validate_server("x", {"type": "grpc", "command": "y"})
+        assert ok is False
+        assert reason == "unsupported type 'grpc'"
+
+    def test_missing_field_reason_names_field_and_type(self):
+        import src.mcp_config as mcp_config
+
+        ok, reason = mcp_config.validate_server("x", {"type": "stdio"})
+        assert ok is False
+        assert "command" in reason
+        assert "stdio" in reason
+
+    def test_type_defaults_to_stdio(self):
+        """No explicit type is validated as stdio (needs command)."""
+        import src.mcp_config as mcp_config
+
+        ok, _ = mcp_config.validate_server("x", {"command": "echo"})
+        assert ok is True
+        ok, reason = mcp_config.validate_server("x", {})
+        assert ok is False
+        assert "stdio" in reason
+
+    def test_empty_command_rejected(self):
+        import src.mcp_config as mcp_config
+
+        ok, reason = mcp_config.validate_server("x", {"type": "stdio", "command": ""})
+        assert ok is False
+        assert "command" in reason
+
+    def test_valid_server_returns_none_reason(self):
+        import src.mcp_config as mcp_config
+
+        ok, reason = mcp_config.validate_server("x", {"type": "stdio", "command": "ls"})
+        assert ok is True
+        assert reason is None
+
+
+class TestValidateMcpServers:
+    """(validated, dropped) split; dropped carry name/type/reason; warns on drop."""
+
+    def test_split_and_dropped_shape(self):
+        import src.mcp_config as mcp_config
+
+        validated, dropped = mcp_config.validate_mcp_servers(
+            {
+                "good": {"type": "stdio", "command": "ls"},
+                "bad": {"type": "grpc", "command": "x"},
+            }
+        )
+        assert list(validated) == ["good"]
+        assert len(dropped) == 1
+        assert dropped[0]["name"] == "bad"
+        assert dropped[0]["type"] == "grpc"
+        assert "grpc" in dropped[0]["reason"]
+
+    def test_dropped_type_is_none_for_non_dict(self):
+        import src.mcp_config as mcp_config
+
+        _, dropped = mcp_config.validate_mcp_servers({"bad": "a string"})
+        assert dropped[0]["name"] == "bad"
+        assert dropped[0]["type"] is None
+
+    def test_warns_on_each_drop(self):
+        import src.mcp_config as mcp_config
+
+        with patch("src.mcp_config.logger") as mock_logger:
+            mcp_config.validate_mcp_servers({"bad": {"type": "grpc"}})
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("bad" in w for w in warning_calls)
+
+    def test_load_mcp_config_warns_on_drop(self):
+        """Guards the test_edge_cases_unit.py:256-257 warning-scrape contract:
+        load_mcp_config must still route drops through logger.warning."""
+        import src.mcp_config as mcp_config
+
+        config = {"mcpServers": {"bad": {"type": "grpc", "command": "x"}}}
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
+            with patch("src.mcp_config.logger") as mock_logger:
+                result = mcp_config.load_mcp_config()
+        assert "bad" not in result
+        warning_calls = [str(c) for c in mock_logger.warning.call_args_list]
+        assert any("bad" in w for w in warning_calls)
+
+
+class TestReloadMcpConfig:
+    """Overlay-merge (env base + manifest overlay) + rebind-not-mutate hot reload."""
+
+    def test_reload_overlays_env_base_with_manifest(self, tmp_path, monkeypatch):
+        import src.mcp_config as mcp_config
+
+        # pin the singleton for restoration (reload rebinds the module global)
+        monkeypatch.setattr(mcp_config, "_server_mcp_config", {})
+
+        env_config = {"mcpServers": {"env-srv": {"type": "stdio", "command": "envcmd"}}}
+        manifest = {
+            "version": 1,
+            "servers": {"man-srv": {"type": "stdio", "command": "mancmd"}},
+        }
+        manifest_file = tmp_path / "m.json"
+        manifest_file.write_text(json.dumps(manifest))
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", str(manifest_file))
+
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(env_config)):
+            mcp_config.reload_mcp_config()
+            servers = mcp_config.get_mcp_servers()
+
+        # core Proposal-A guarantee: env base still present after overlay
+        assert "env-srv" in servers
+        assert servers["env-srv"]["command"] == "envcmd"
+        # manifest server layered on top
+        assert "man-srv" in servers
+        assert servers["man-srv"]["command"] == "mancmd"
+
+    def test_manifest_wins_on_name_collision(self, tmp_path, monkeypatch):
+        import src.mcp_config as mcp_config
+
+        monkeypatch.setattr(mcp_config, "_server_mcp_config", {})
+
+        env_config = {"mcpServers": {"dup": {"type": "stdio", "command": "from-env"}}}
+        manifest = {
+            "version": 1,
+            "servers": {"dup": {"type": "stdio", "command": "from-manifest"}},
+        }
+        manifest_file = tmp_path / "m.json"
+        manifest_file.write_text(json.dumps(manifest))
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", str(manifest_file))
+
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(env_config)):
+            mcp_config.reload_mcp_config()
+            servers = mcp_config.get_mcp_servers()
+
+        assert servers["dup"]["command"] == "from-manifest"
+
+    def test_reload_rebinds_not_mutates(self, tmp_path, monkeypatch):
+        """An upsert must REBIND the singleton, leaving the dict a prior session
+        pinned unchanged (proves existing-session MCP-set pinning)."""
+        import src.mcp_config as mcp_config
+
+        monkeypatch.setattr(mcp_config, "_server_mcp_config", {})
+
+        manifest_file = tmp_path / "m.json"
+        manifest_file.write_text(json.dumps({"version": 1, "servers": {}}))
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", str(manifest_file))
+
+        with patch("src.mcp_config.MCP_CONFIG", ""):
+            mcp_config.reload_mcp_config()
+            d1 = mcp_config.get_mcp_servers()
+            assert d1 == {}
+
+            # upsert a server via the manifest, then reload
+            manifest_file.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "servers": {"new": {"type": "stdio", "command": "x"}},
+                    }
+                )
+            )
+            mcp_config.reload_mcp_config()
+            d2 = mcp_config.get_mcp_servers()
+
+        assert d2 is not d1  # rebound to a fresh dict
+        assert d1 == {}  # the old dict a pinned session holds is untouched
+        assert "new" in d2
+
+    def test_compute_effective_config_returns_fresh_dict(self, monkeypatch):
+        import src.mcp_config as mcp_config
+
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", "/nonexistent/manifest.json")
+        with patch("src.mcp_config.MCP_CONFIG", ""):
+            a = mcp_config._compute_effective_config()
+            b = mcp_config._compute_effective_config()
+        assert a is not b
+
+
+class TestListDroppedServers:
+    """Diagnostics: env-dropped vs manifest-dropped, with shadowing."""
+
+    def test_env_dropped_surfaces_with_source_env(self, monkeypatch):
+        import src.mcp_config as mcp_config
+
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", "/nonexistent/manifest.json")
+        env_config = {"mcpServers": {"bad-env": {"type": "grpc", "command": "x"}}}
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(env_config)):
+            dropped = mcp_config.list_dropped_servers()
+
+        by_name = {d["name"]: d for d in dropped}
+        assert by_name["bad-env"]["source"] == "env"
+        assert "grpc" in by_name["bad-env"]["reason"]
+
+    def test_manifest_dropped_surfaces_with_source_manifest(
+        self, tmp_path, monkeypatch
+    ):
+        import src.mcp_config as mcp_config
+
+        manifest = {
+            "version": 1,
+            "servers": {"bad-man": {"type": "carrier-pigeon", "command": "fly"}},
+        }
+        manifest_file = tmp_path / "m.json"
+        manifest_file.write_text(json.dumps(manifest))
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", str(manifest_file))
+
+        with patch("src.mcp_config.MCP_CONFIG", ""):
+            dropped = mcp_config.list_dropped_servers()
+
+        by_name = {d["name"]: d for d in dropped}
+        assert by_name["bad-man"]["source"] == "manifest"
+
+    def test_env_drop_shadowed_by_valid_manifest_not_reported(
+        self, tmp_path, monkeypatch
+    ):
+        """An env server that is invalid but supplied validly by the manifest
+        (overlay wins) must NOT be reported as dropped."""
+        import src.mcp_config as mcp_config
+
+        env_config = {"mcpServers": {"shadowed": {"type": "grpc", "command": "x"}}}
+        # manifest supplies the SAME name (even if itself invalid here it is a
+        # manifest entry, so the env drop must be suppressed)
+        manifest = {
+            "version": 1,
+            "servers": {"shadowed": {"type": "stdio", "command": "ok"}},
+        }
+        manifest_file = tmp_path / "m.json"
+        manifest_file.write_text(json.dumps(manifest))
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", str(manifest_file))
+
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(env_config)):
+            dropped = mcp_config.list_dropped_servers()
+
+        # valid manifest entry -> not dropped at all, and the env drop is shadowed
+        assert all(d["name"] != "shadowed" for d in dropped)
+
+
 class TestOpenCodeConfigGeneration:
     """Test conversion from wrapper MCP config into OpenCode config."""
 
@@ -221,7 +477,11 @@ class TestOpenCodeConfigGeneration:
                 "filesystem": {
                     "type": "stdio",
                     "command": "npx",
-                    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+                    "args": [
+                        "-y",
+                        "@modelcontextprotocol/server-filesystem",
+                        "/workspace",
+                    ],
                     "env": {"ROOT": "/workspace"},
                 },
                 "docs": {
@@ -239,7 +499,12 @@ class TestOpenCodeConfigGeneration:
         assert config["model"] == "openai/gpt-5.5"
         assert config["mcp"]["filesystem"] == {
             "type": "local",
-            "command": ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/workspace"],
+            "command": [
+                "npx",
+                "-y",
+                "@modelcontextprotocol/server-filesystem",
+                "/workspace",
+            ],
             "environment": {"ROOT": "/workspace"},
         }
         assert config["mcp"]["docs"] == {
@@ -257,7 +522,9 @@ class TestOpenCodeConfigGeneration:
                 "permission": {"question": "deny"},
                 "mcp": {"filesystem": {"enabled": False}},
             },
-            mcp_servers={"filesystem": {"type": "stdio", "command": "npx", "args": ["demo"]}},
+            mcp_servers={
+                "filesystem": {"type": "stdio", "command": "npx", "args": ["demo"]}
+            },
             default_model="openai/gpt-5.5",
             question_permission="ask",
         )

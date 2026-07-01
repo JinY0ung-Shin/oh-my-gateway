@@ -261,7 +261,9 @@ def _check_api_key() -> List[ConfigIssue]:
 def _check_sanitizer() -> List[ConfigIssue]:
     """SANITIZER_ENABLED without ANTHROPIC_BASE_URL is a documented no-op
     (src/sanitizer/config.py requires an explicit upstream)."""
-    if parse_bool_env("SANITIZER_ENABLED", "false") and not _is_set("ANTHROPIC_BASE_URL"):
+    if parse_bool_env("SANITIZER_ENABLED", "false") and not _is_set(
+        "ANTHROPIC_BASE_URL"
+    ):
         return [
             ConfigIssue(
                 "warning",
@@ -295,6 +297,27 @@ def _check_default_model(backends: List[str]) -> List[ConfigIssue]:
     ]
 
 
+def _check_mcp_manifest() -> List[ConfigIssue]:
+    """The admin-managed MCP manifest is persisted to GATEWAY_MCP_MANIFEST (see
+    src/mcp_manifest.py). If the override points at a directory that does not
+    exist, admin CRUD writes will fail. Only os.environ is read here to keep the
+    module's early-import invariant (no src.mcp_manifest import)."""
+    override = (os.getenv("GATEWAY_MCP_MANIFEST") or "").strip()
+    if (
+        override
+        and not os.path.isfile(override)
+        and not os.path.isdir(os.path.dirname(override) or ".")
+    ):
+        return [
+            ConfigIssue(
+                "warning",
+                f"GATEWAY_MCP_MANIFEST={override!r} directory does not exist; the "
+                "admin-managed MCP manifest cannot be persisted there.",
+            )
+        ]
+    return []
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -307,6 +330,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_api_key())
     issues.extend(_check_sanitizer())
     issues.extend(_check_default_model(backends))
+    issues.extend(_check_mcp_manifest())
     return issues
 
 
@@ -317,7 +341,9 @@ def run_startup_config_check() -> List[ConfigIssue]:
     operators who accept the flagged configuration).
     """
     if parse_bool_env("SKIP_CONFIG_CHECK", "false"):
-        logger.warning("SKIP_CONFIG_CHECK=true — startup configuration validation skipped")
+        logger.warning(
+            "SKIP_CONFIG_CHECK=true — startup configuration validation skipped"
+        )
         return []
 
     issues = check_config()
