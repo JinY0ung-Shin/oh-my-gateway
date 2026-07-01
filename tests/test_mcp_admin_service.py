@@ -338,3 +338,113 @@ class TestConnection:
         )
         assert result["ok"] is False
         assert "timed out" in result["detail"]
+
+
+# ---------------------------------------------------------------------------
+# name validation: '/' is rejected — update/delete/test are single /{name}
+# path segments, so a name with '/' (even percent-encoded) would 404
+# ---------------------------------------------------------------------------
+
+
+class TestSlashInNameRejected:
+    def test_create_rejects_slash(self, manifest_file):
+        with env_servers({}):
+            with pytest.raises(McpAdminError, match="invalid server name"):
+                mcp_admin_service.create_server(
+                    "foo/bar", {"type": "stdio", "command": "echo"}
+                )
+
+    def test_update_rejects_slash(self, manifest_file):
+        with env_servers({}):
+            with pytest.raises(McpAdminError, match="invalid server name"):
+                mcp_admin_service.update_server(
+                    "foo/bar", {"type": "stdio", "command": "echo"}
+                )
+
+    def test_delete_rejects_slash(self, manifest_file):
+        with env_servers({}):
+            with pytest.raises(McpAdminError, match="invalid server name"):
+                mcp_admin_service.delete_server("foo/bar")
+
+    def test_validate_config_flags_slash(self):
+        result = mcp_admin_service.validate_config(
+            "foo/bar", {"type": "stdio", "command": "echo"}
+        )
+        assert result["valid"] is False
+        assert any("invalid name" in e for e in result["errors"])
+
+
+# ---------------------------------------------------------------------------
+# redacted-sentinel merge on update: a ***REDACTED*** value means "keep the
+# stored secret" so the redacted edit view never clobbers a real secret
+# ---------------------------------------------------------------------------
+
+
+class TestRedactedMergeOnUpdate:
+    def test_top_level_secret_preserved(self, manifest_file):
+        from src import mcp_manifest
+
+        with env_servers({}):
+            mcp_admin_service.create_server(
+                "svc", {"type": "stdio", "command": "echo", "token": "s3cret"}
+            )
+            # Edit form round-trips the redacted view (token masked); only the
+            # command changes.
+            mcp_admin_service.update_server(
+                "svc",
+                {"type": "stdio", "command": "ls", "token": "***REDACTED***"},
+            )
+        stored = mcp_manifest.get_server("svc")
+        assert stored["command"] == "ls"
+        assert stored["token"] == "s3cret"  # preserved, not clobbered
+
+    def test_nested_env_and_headers_secret_preserved(self, manifest_file):
+        from src import mcp_manifest
+
+        with env_servers({}):
+            mcp_admin_service.create_server(
+                "api",
+                {
+                    "type": "http",
+                    "url": "https://a.example/mcp",
+                    "headers": {"Authorization": "Bearer real"},
+                    "env": {"API_KEY": "k-real", "REGION": "us"},
+                },
+            )
+            mcp_admin_service.update_server(
+                "api",
+                {
+                    "type": "http",
+                    "url": "https://b.example/mcp",  # changed
+                    "headers": {"Authorization": "***REDACTED***"},
+                    "env": {"API_KEY": "***REDACTED***", "REGION": "eu"},
+                },
+            )
+        stored = mcp_manifest.get_server("api")
+        assert stored["url"] == "https://b.example/mcp"
+        assert stored["headers"]["Authorization"] == "Bearer real"
+        assert stored["env"]["API_KEY"] == "k-real"
+        assert stored["env"]["REGION"] == "eu"  # non-secret change applied
+
+    def test_new_value_overrides_sentinel_semantics(self, manifest_file):
+        from src import mcp_manifest
+
+        with env_servers({}):
+            mcp_admin_service.create_server(
+                "svc", {"type": "stdio", "command": "echo", "token": "old"}
+            )
+            mcp_admin_service.update_server(
+                "svc", {"type": "stdio", "command": "echo", "token": "new"}
+            )
+        assert mcp_manifest.get_server("svc")["token"] == "new"
+
+    def test_create_does_not_merge(self, manifest_file):
+        # No stored value on create: a literal sentinel is stored as-is.
+        from src import mcp_manifest
+
+        with env_servers({}):
+            mcp_admin_service.create_server(
+                "fresh",
+                {"type": "stdio", "command": "echo", "token": "***REDACTED***"},
+            )
+        assert mcp_manifest.get_server("fresh")["token"] == "***REDACTED***"

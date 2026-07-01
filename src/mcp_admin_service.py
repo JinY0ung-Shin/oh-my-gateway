@@ -31,8 +31,15 @@ class McpAdminError(ValueError):
 
 
 # Server names: letters, digits and a small punctuation set. No whitespace, no
-# shell metacharacters. Copy of ``plugin_admin_service._NAME_RE``.
-_NAME_RE = re.compile(r"^[A-Za-z0-9._@/-]+$")
+# shell metacharacters. Unlike ``plugin_admin_service._NAME_RE`` this omits
+# ``/``: update/delete/test address a server as a single ``/{name}`` path
+# segment, so a name containing ``/`` (even percent-encoded) 404s in FastAPI.
+_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+$")
+
+# Sentinel the admin read layer substitutes for secret values (see
+# ``admin_service._redact_mcp_config``). On update it means "keep the stored
+# value" so the redacted edit view never overwrites a real secret with the mask.
+_REDACTED = "***REDACTED***"
 
 
 def _validate_name(name: str) -> str:
@@ -41,7 +48,7 @@ def _validate_name(name: str) -> str:
         raise McpAdminError("server name is required")
     if not _NAME_RE.match(name) or name.startswith("-"):
         raise McpAdminError(
-            f"invalid server name {name!r}: only letters, digits and ._@/- are allowed"
+            f"invalid server name {name!r}: only letters, digits and ._@- are allowed"
         )
     return name
 
@@ -60,12 +67,40 @@ def _collision(name: str, existing: set) -> Optional[str]:
     return None
 
 
+def _merge_redacted(new: Dict[str, Any], existing: Dict[str, Any]) -> Dict[str, Any]:
+    """Restore secrets masked by the admin read layer on update.
+
+    The list/detail API returns configs with secret values replaced by
+    ``_REDACTED`` (``admin_service._redact_mcp_config``), and the edit form
+    round-trips that masked view. So on update any ``_REDACTED`` value means
+    "keep the stored value" rather than persisting the mask over a real secret.
+    Mirrors the redaction shape: top-level keys plus nested ``env``/``headers``.
+    A newly typed value (anything but the sentinel) always wins; dropping a key
+    still drops it.
+    """
+    if not isinstance(existing, dict):
+        return new
+    merged: Dict[str, Any] = {}
+    for k, v in new.items():
+        ev = existing.get(k)
+        if v == _REDACTED and k in existing:
+            merged[k] = ev
+        elif k in ("env", "headers") and isinstance(v, dict) and isinstance(ev, dict):
+            merged[k] = {
+                kk: (ev[kk] if vv == _REDACTED and kk in ev else vv)
+                for kk, vv in v.items()
+            }
+        else:
+            merged[k] = v
+    return merged
+
+
 def validate_config(name: str, config: Any) -> Dict[str, Any]:
     """Pure preview for the /validate endpoint. NEVER raises, NEVER persists."""
     errors: List[str] = []
     n = (name or "").strip()
     if n and (not _NAME_RE.match(n) or n.startswith("-")):
-        errors.append("invalid name: only letters, digits and ._@/- are allowed")
+        errors.append("invalid name: only letters, digits and ._@- are allowed")
     if not isinstance(config, dict):
         errors.append("config must be a JSON object")
     else:
@@ -96,11 +131,9 @@ def _write(name: str, config: Any, *, updating: bool) -> Dict[str, Any]:
     name = _validate_name(name)
     if not isinstance(config, dict):
         raise McpAdminError("config must be a JSON object")
-    ok, reason = validate_server(name, config)
-    if not ok:
-        raise McpAdminError(reason)
     env_names = _env_names()
-    manifest_names = set(mcp_manifest.list_servers().keys())
+    manifest = mcp_manifest.list_servers()
+    manifest_names = set(manifest.keys())
     if name in env_names and name not in manifest_names:
         # env base is immutable (route maps this to 409).
         raise McpAdminError(
@@ -110,6 +143,12 @@ def _write(name: str, config: Any, *, updating: bool) -> Dict[str, Any]:
         raise McpAdminError(f"server '{name}' already exists")
     if updating and name not in manifest_names:
         raise McpAdminError(f"server '{name}' not found")
+    if updating:
+        # The edit form round-trips the redacted view; keep stored secrets.
+        config = _merge_redacted(config, manifest.get(name) or {})
+    ok, reason = validate_server(name, config)
+    if not ok:
+        raise McpAdminError(reason)
     hit = _collision(name, env_names | manifest_names)
     if hit:
         raise McpAdminError(

@@ -784,14 +784,14 @@ def get_admin_js() -> str:
     validateMcpJson() {
       this.mcpJsonError = ''; this.mcpJsonWarning = ''; this.mcpPatternPreview = [];
       const nm = this.mcpForm.name.trim();
-      if (nm && !/^[A-Za-z0-9._@/-]+$/.test(nm)) this.mcpJsonError = 'invalid name: letters, digits, ._@/- only';
+      if (nm && !/^[A-Za-z0-9._@-]+$/.test(nm)) this.mcpJsonError = 'invalid name: letters, digits, ._@- only';
       const raw = this.mcpForm.jsonConfig.trim();
       if (raw) {
         let cfg;
         try { cfg = JSON.parse(raw); }
         catch(e) { this.mcpJsonError = 'invalid JSON: ' + e.message; return; }
         if (typeof cfg !== 'object' || Array.isArray(cfg)) { this.mcpJsonError = 'config must be a JSON object'; return; }
-        const t = cfg.type || 'stdio';
+        const t = cfg.type || this.mcpForm.type || 'stdio';
         if (t === 'stdio' && !cfg.command) this.mcpJsonWarning = "stdio requires 'command'";
         if (['sse','http','streamable-http'].includes(t) && !cfg.url) this.mcpJsonWarning = t + " requires 'url'";
       }
@@ -802,6 +802,7 @@ def get_admin_js() -> str:
       const name = this.mcpForm.name.trim();
       if (!name || this.mcpJsonError) return;
       let config; try { config = JSON.parse(this.mcpForm.jsonConfig || '{}'); } catch(e){ this.mcpJsonError='invalid JSON'; return; }
+      if (config && typeof config === 'object' && !Array.isArray(config) && !config.type) config.type = this.mcpForm.type;
       this.mcpBusy = true;
       try {
         const r = await this.api('/admin/api/mcp-servers', {
@@ -814,7 +815,11 @@ def get_admin_js() -> str:
     },
     editMcpServer(s) {
       this.mcpEditName = s.name;
-      this.mcpForm = { name: s.name, type: s.type, jsonConfig: JSON.stringify(s.config ?? {}, null, 2) };
+      // A type-less stored config surfaces as type "unknown" (admin_service
+      // default); the backend treats it as stdio. Bind a real select option so
+      // the on-save type injection can't produce an invalid "unknown" type.
+      const t = (s.type && s.type !== 'unknown') ? s.type : 'stdio';
+      this.mcpForm = { name: s.name, type: t, jsonConfig: JSON.stringify(s.config ?? {}, null, 2) };
       this.validateMcpJson();
     },
     cancelMcpEdit() { this.mcpEditName = null; this.resetMcpForm(); },
@@ -822,6 +827,7 @@ def get_admin_js() -> str:
     async saveMcpServer() {
       if (!this.mcpEditName || this.mcpJsonError) return;
       let config; try { config = JSON.parse(this.mcpForm.jsonConfig || '{}'); } catch(e){ this.mcpJsonError='invalid JSON'; return; }
+      if (config && typeof config === 'object' && !Array.isArray(config) && !config.type) config.type = this.mcpForm.type;
       this.mcpBusy = true;
       try {
         const r = await this.api('/admin/api/mcp-servers/' + encodeURIComponent(this.mcpEditName), {
