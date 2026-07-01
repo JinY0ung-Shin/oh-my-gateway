@@ -135,6 +135,12 @@ def get_redacted_config() -> Dict[str, Any]:
         "MCP_CONFIG",
         "CLAUDE_SANDBOX_ENABLED",
         "PERMISSION_MODE",
+        "BACKENDS",
+        "OPENCODE_USE_WRAPPER_MCP_CONFIG",
+        "OPENCODE_BASE_URL",
+        "CODEX_APPROVAL_POLICY",
+        "DISALLOWED_TOOLS",
+        "GATEWAY_MCP_MANIFEST",
     ]
 
     env_snapshot = {}
@@ -171,8 +177,8 @@ def get_redacted_config() -> Dict[str, Any]:
         "rate_limits": dict(RATE_LIMITS),
         "mcp_servers": mcp_servers_info,
         "environment": env_snapshot,
-        "_note": "Values marked ***REDACTED*** contain secrets. "
-        "Most settings require server restart to take effect.",
+        "_note": "Values marked ***REDACTED*** contain secrets. MCP servers "
+        "hot-reload for new sessions; most other settings require a server restart.",
     }
 
 
@@ -251,7 +257,9 @@ def get_sandbox_config() -> Dict[str, Any]:
         "sandbox_enabled": os.getenv("CLAUDE_SANDBOX_ENABLED", "true"),
         "sandbox_auto_allow_bash": os.getenv("CLAUDE_SANDBOX_AUTO_ALLOW_BASH", "false"),
         "metadata_env_allowlist": sorted(
-            k.strip() for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",") if k.strip()
+            k.strip()
+            for k in os.getenv("METADATA_ENV_ALLOWLIST", "").split(",")
+            if k.strip()
         ),
     }
 
@@ -287,29 +295,166 @@ def get_tools_registry() -> Dict[str, Any]:
 
 
 def get_mcp_servers_detail() -> List[Dict[str, Any]]:
-    """Return detailed MCP server configuration (names, types, tool patterns)."""
+    """Return detailed MCP server configuration (names, types, tool patterns).
+
+    Also surfaces ``source`` (env vs. manifest), ``editable``, the redacted
+    ``config``, the tool ``pattern``, and per-backend ``reach`` (display only).
+    """
     try:
-        from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
+        from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns, mcp_safe_name
+        from src import mcp_manifest
 
         servers = get_mcp_servers()
         if not servers:
             return []
 
+        try:
+            manifest_names = set(mcp_manifest.list_servers().keys())
+        except Exception:
+            manifest_names = set()
+
         patterns = get_mcp_tool_patterns(servers)
         result = []
         for name, config in servers.items():
-            server_patterns = [p for p in patterns if p.startswith(f"mcp__{name}__")]
+            safe_prefix = f"mcp__{mcp_safe_name(name)}__"
+            server_patterns = [p for p in patterns if p.startswith(safe_prefix)]
+            source = "manifest" if name in manifest_names else "env"
             result.append(
                 {
                     "name": name,
                     "type": config.get("type", "unknown"),
                     "tools": server_patterns,
                     "config_keys": [k for k in config.keys() if k not in ("type",)],
+                    "pattern": f"{safe_prefix}*",
+                    "source": source,
+                    "editable": source == "manifest",
+                    "config": _redact_mcp_config(config),
+                    "reach": compute_mcp_server_reach(name, config),
                 }
             )
         return result
     except Exception:
         logger.warning("Failed to read MCP servers detail", exc_info=True)
+        return []
+
+
+def _redact_mcp_config(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Redact a single MCP server config for display.
+
+    Masks secret-looking top-level keys, every ``headers`` value, and any
+    secret-looking ``env`` value (server configs carry tokens/credentials).
+    """
+    out: Dict[str, Any] = {}
+    for k, v in config.items():
+        if _SECRET_PATTERNS.search(k):
+            out[k] = "***REDACTED***"
+        elif k in ("env", "headers") and isinstance(v, dict):
+            out[k] = {
+                kk: (
+                    "***REDACTED***"
+                    if (_SECRET_PATTERNS.search(kk) or k == "headers")
+                    else vv
+                )
+                for kk, vv in v.items()
+            }
+        else:
+            out[k] = v
+    return out
+
+
+def compute_mcp_server_reach(name: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Per-backend reach for one MCP server. DISPLAY ONLY (no enforcement change).
+
+    Reflects how each enabled backend applies the server: Claude filters at
+    create-time, Codex denies at approval-time, and OpenCode bakes it into the
+    managed server at startup only (not hot-reloaded — restart required).
+    """
+    from src.backends import _enabled_backend_names
+    from src.backends.base import BackendRegistry
+    from src.backends.opencode.constants import use_wrapper_mcp_config
+    from src.mcp_config import ALLOWED_TYPES, mcp_safe_name
+
+    enabled = set(_enabled_backend_names())
+    safe = mcp_safe_name(name)
+    pattern = f"mcp__{safe}__*"
+    stype = config.get("type", "stdio")
+    out: List[Dict[str, Any]] = []
+
+    def _reg(n: str) -> bool:
+        return n in enabled and BackendRegistry.is_registered(n)
+
+    # Claude — create-time allowlist filter
+    out.append(
+        {
+            "backend": "claude",
+            "reaches": _reg("claude"),
+            "mode": "create-time",
+            "pattern": pattern,
+            "condition": "all servers when request sends no allowed_tools; "
+            f"else only if {pattern} is in allowed_tools",
+            "gated_by": ["BACKENDS", "request allowed_tools"],
+        }
+    )
+
+    # Codex — create-time forward + approval-time deny
+    approval = None
+    if _reg("codex"):
+        try:
+            approval = (
+                BackendRegistry.get("codex").runtime_metadata().get("approval_policy")
+            )
+        except Exception:
+            pass
+    out.append(
+        {
+            "backend": "codex",
+            "reaches": _reg("codex"),
+            "mode": "approval-time",
+            "pattern": pattern,
+            "condition": "forwarded at create-time; per-tool deny only when a tool "
+            "policy is active (approvalPolicy off 'never')",
+            "gated_by": ["BACKENDS", "CODEX_APPROVAL_POLICY", "DISALLOWED_TOOLS"],
+            "approval_policy": approval,
+        }
+    )
+
+    # OpenCode — startup-only, doubly gated, type-dependent
+    oc_mode, wrapper = None, use_wrapper_mcp_config()
+    if _reg("opencode"):
+        try:
+            oc_mode = BackendRegistry.get("opencode").runtime_metadata().get("mode")
+        except Exception:
+            oc_mode = None
+    oc_reaches = (
+        _reg("opencode") and oc_mode == "managed" and wrapper and stype in ALLOWED_TYPES
+    )
+    out.append(
+        {
+            "backend": "opencode",
+            "reaches": bool(oc_reaches),
+            "mode": "startup-only",
+            "pattern": None,
+            "condition": "baked into managed server at startup only when "
+            "OPENCODE_USE_WRAPPER_MCP_CONFIG=true; NOT hot-reloaded — restart required",
+            "gated_by": [
+                "BACKENDS",
+                "OPENCODE_USE_WRAPPER_MCP_CONFIG",
+                "OPENCODE_BASE_URL",
+            ],
+            "opencode_mode": oc_mode,
+        }
+    )
+    return out
+
+
+def get_dropped_mcp_servers() -> List[Dict[str, Any]]:
+    """Return MCP servers dropped from the effective config, with reasons."""
+    try:
+        from src.mcp_config import list_dropped_servers
+
+        return list_dropped_servers()
+    except Exception:
+        logger.warning("Failed to read dropped MCP servers", exc_info=True)
         return []
 
 
@@ -327,7 +472,9 @@ def get_session_detail(session_id: str) -> Optional[Dict[str, Any]]:
         "turn_counter": session.turn_counter,
         "ttl_minutes": session.ttl_minutes,
         "created_at": session.created_at.isoformat() if session.created_at else None,
-        "last_accessed": session.last_accessed.isoformat() if session.last_accessed else None,
+        "last_accessed": (
+            session.last_accessed.isoformat() if session.last_accessed else None
+        ),
         "expires_at": session.expires_at.isoformat() if session.expires_at else None,
         "message_count": len(session.messages),
         "has_system_prompt": session.base_system_prompt is not None,
@@ -360,4 +507,3 @@ def export_session_json(session_id: str) -> Optional[Dict[str, Any]]:
         "created_at": session.created_at.isoformat() if session.created_at else None,
         "messages": messages,
     }
-

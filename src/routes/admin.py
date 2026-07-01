@@ -19,6 +19,12 @@ Session msgs:   GET  /admin/api/sessions/{session_id}/messages
 System prompt:  GET/PUT/DELETE /admin/api/system-prompt
 Named prompts:  GET/PUT/DELETE /admin/api/prompts/{name}
                 POST /admin/api/prompts/{name}/activate
+MCP servers:    GET  /admin/api/mcp-servers
+                POST /admin/api/mcp-servers
+                PUT  /admin/api/mcp-servers/{name}
+                DELETE /admin/api/mcp-servers/{name}
+MCP validate:   POST /admin/api/mcp-servers/validate
+MCP test:       POST /admin/api/mcp-servers/{name}/test
 Plugins:        GET  /admin/api/plugins
 Plugin detail:  GET  /admin/api/plugins/{id}
 Plugin skills:  GET  /admin/api/plugins/{id}/skills/{name}
@@ -50,6 +56,7 @@ from src.rate_limiter import rate_limit_endpoint
 from src.admin_service import (
     export_session_json,
     get_backends_health,
+    get_dropped_mcp_servers,
     get_mcp_servers_detail,
     get_redacted_config,
     get_sandbox_config,
@@ -98,6 +105,16 @@ class PluginInstallRequest(BaseModel):
     scope: str = "user"
     repo: str = ""
     branch: str = "main"
+
+
+class McpServerUpsert(BaseModel):
+    name: str
+    config: dict[str, Any]
+
+
+class McpServerValidate(BaseModel):
+    name: str = ""
+    config: dict[str, Any] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -204,7 +221,9 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
     from src.session_manager import session_manager
 
     started_at = getattr(request.app.state, "started_at", None)
-    uptime_seconds = round(time.time() - started_at, 1) if started_at is not None else None
+    uptime_seconds = (
+        round(time.time() - started_at, 1) if started_at is not None else None
+    )
 
     return {
         "version": __version__,
@@ -234,8 +253,97 @@ async def get_backends(_=Depends(require_admin)):
 
 @router.get("/api/mcp-servers")
 async def get_mcp_servers_endpoint(_=Depends(require_admin)):
-    """Return detailed MCP server configuration and tool patterns."""
-    return {"servers": get_mcp_servers_detail()}
+    """Return detailed MCP servers (effective) plus any dropped by overlay merge."""
+    return {
+        "servers": get_mcp_servers_detail(),
+        "dropped": get_dropped_mcp_servers(),
+    }
+
+
+# --- MCP server mutations + diagnostics (admin-managed) -------------------
+#
+# Route ordering: the literal /api/mcp-servers/validate MUST be declared
+# before the parametrised /api/mcp-servers/{name} routes. FastAPI resolves in
+# declaration order, so a single-segment {name} would otherwise capture
+# "validate". Mirrors the plugin-CRUD shape: lazy run_in_threadpool + service
+# import, McpAdminError -> JSONResponse, require_admin dependency last.
+
+
+@router.post("/api/mcp-servers")
+async def create_mcp_server_endpoint(body: McpServerUpsert, _=Depends(require_admin)):
+    """Create a new manifest-layer MCP server (env-base servers are immutable)."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_admin_service
+
+    try:
+        return await run_in_threadpool(
+            mcp_admin_service.create_server, body.name, body.config
+        )
+    except mcp_admin_service.McpAdminError as e:
+        code = 409 if "already exists" in str(e) or "not editable" in str(e) else 400
+        return JSONResponse(status_code=code, content={"error": str(e)})
+
+
+@router.post("/api/mcp-servers/validate")
+async def validate_mcp_server_endpoint(
+    body: McpServerValidate, _=Depends(require_admin)
+):
+    """Pure preview (never persists): always 200 with a valid:false payload for
+    a bad config. Safe to call on every keystroke in the editor UI."""
+    from src import mcp_admin_service
+
+    return mcp_admin_service.validate_config(body.name, body.config)
+
+
+@router.put("/api/mcp-servers/{name}")
+async def update_mcp_server_endpoint(
+    name: str, body: McpServerUpsert, _=Depends(require_admin)
+):
+    """Update an existing manifest-layer MCP server in place."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_admin_service
+
+    try:
+        return await run_in_threadpool(
+            mcp_admin_service.update_server, name, body.config
+        )
+    except mcp_admin_service.McpAdminError as e:
+        if "not found" in str(e):
+            code = 404
+        elif "not editable" in str(e):
+            code = 409
+        else:
+            code = 400
+        return JSONResponse(status_code=code, content={"error": str(e)})
+
+
+@router.delete("/api/mcp-servers/{name}")
+async def delete_mcp_server_endpoint(name: str, _=Depends(require_admin)):
+    """Delete a manifest-layer MCP server (env-base servers cannot be deleted)."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_admin_service
+
+    try:
+        return await run_in_threadpool(mcp_admin_service.delete_server, name)
+    except mcp_admin_service.McpAdminError as e:
+        if "not found" in str(e):
+            code = 404
+        elif "cannot be deleted" in str(e):
+            code = 409
+        else:
+            code = 400
+        return JSONResponse(status_code=code, content={"error": str(e)})
+
+
+@router.post("/api/mcp-servers/{name}/test")
+async def test_mcp_server_endpoint(name: str, _=Depends(require_admin)):
+    """Probe an effective MCP server's connectivity. Self-bounded; never raises."""
+    from src import mcp_admin_service
+
+    return await mcp_admin_service.test_connection(name)
 
 
 # ---------------------------------------------------------------------------
@@ -565,7 +673,9 @@ async def set_system_prompt_endpoint(
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to persist: {e}"})
+        return JSONResponse(
+            status_code=500, content={"error": f"Failed to persist: {e}"}
+        )
     return {
         "status": "updated",
         "mode": get_prompt_mode(),
@@ -581,7 +691,9 @@ async def reset_system_prompt_endpoint(_=Depends(require_admin)):
     try:
         reset_system_prompt()
     except OSError as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to persist: {e}"})
+        return JSONResponse(
+            status_code=500, content={"error": f"Failed to persist: {e}"}
+        )
     return {"status": "reset", "mode": get_prompt_mode()}
 
 
@@ -611,7 +723,9 @@ def get_prompt_endpoint(name: str, _=Depends(require_admin)):
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     if data is None:
-        return JSONResponse(status_code=404, content={"error": f"Prompt not found: {name}"})
+        return JSONResponse(
+            status_code=404, content={"error": f"Prompt not found: {name}"}
+        )
     return data
 
 
@@ -639,9 +753,13 @@ def delete_prompt_endpoint(name: str, _=Depends(require_admin)):
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to delete: {e}"})
+        return JSONResponse(
+            status_code=500, content={"error": f"Failed to delete: {e}"}
+        )
     if not deleted:
-        return JSONResponse(status_code=404, content={"error": f"Prompt not found: {name}"})
+        return JSONResponse(
+            status_code=404, content={"error": f"Prompt not found: {name}"}
+        )
     return {"status": "deleted", "name": name}
 
 
@@ -655,7 +773,9 @@ def activate_prompt_endpoint(name: str, _=Depends(require_admin)):
     except ValueError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
     except OSError as e:
-        return JSONResponse(status_code=500, content={"error": f"Failed to activate: {e}"})
+        return JSONResponse(
+            status_code=500, content={"error": f"Failed to activate: {e}"}
+        )
     return {"status": "activated", "name": name, "mode": get_prompt_mode()}
 
 
@@ -811,7 +931,9 @@ async def get_plugin_skill_endpoint(
 
     result = get_plugin_skill_content(plugin_id, skill_name, scope)
     if result is None:
-        return JSONResponse(status_code=404, content={"error": "Plugin or skill not found"})
+        return JSONResponse(
+            status_code=404, content={"error": "Plugin or skill not found"}
+        )
     return result
 
 

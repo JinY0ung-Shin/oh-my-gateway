@@ -8,7 +8,6 @@ circular dependencies — any module can safely import from here.
 
 import os
 
-
 _BOOL_TRUE = {"true", "1", "yes", "on"}
 
 
@@ -34,5 +33,19 @@ def parse_int_env(name: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except ValueError:
+        return default
+
+
+def parse_float_env(name: str, default: float) -> float:
+    """Parse a float environment variable with a safe fallback.
+
+    If the variable is unset or not a valid float, *default* is returned.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
     except ValueError:
         return default

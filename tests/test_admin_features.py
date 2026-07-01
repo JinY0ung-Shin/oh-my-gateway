@@ -6,13 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from src.admin_service import (
+    compute_mcp_server_reach,
     export_session_json,
+    get_dropped_mcp_servers,
     get_mcp_servers_detail,
     get_sandbox_config,
     get_session_detail,
     get_tools_registry,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -170,7 +171,9 @@ class TestGetMcpServersDetail:
         assert result == []
 
     def test_with_servers(self):
-        servers = {"test-server": {"type": "stdio", "command": "node", "args": ["server.js"]}}
+        servers = {
+            "test-server": {"type": "stdio", "command": "node", "args": ["server.js"]}
+        }
         patterns = ["mcp__test-server__tool1"]
         with (
             patch("src.mcp_config.get_mcp_servers", return_value=servers),
@@ -180,6 +183,235 @@ class TestGetMcpServersDetail:
         assert len(result) == 1
         assert result[0]["name"] == "test-server"
         assert result[0]["type"] == "stdio"
+
+    def test_dash_name_tool_pattern_regression(self, clean_registry):
+        """Dashed server name must normalise dash->underscore in the tool pattern.
+
+        The tool namespace convention is ``mcp__<safe_name>__*`` with dashes
+        turned into underscores. ``get_mcp_tool_patterns`` already emits the
+        normalised form, so ``tools`` (which filters patterns by the normalised
+        prefix) and ``pattern`` must both use ``my_server`` — never ``my-server``.
+        """
+        servers = {"my-server": {"type": "stdio", "command": "node"}}
+        # get_mcp_tool_patterns is the real normaliser; call it for fidelity.
+        from src.mcp_config import get_mcp_tool_patterns
+
+        patterns = get_mcp_tool_patterns(servers)
+        assert patterns == ["mcp__my_server__*"]  # sanity: no dash leaks through
+
+        with (
+            patch("src.mcp_config.get_mcp_servers", return_value=servers),
+            patch("src.mcp_config.get_mcp_tool_patterns", return_value=patterns),
+        ):
+            result = get_mcp_servers_detail()
+
+        assert len(result) == 1
+        entry = result[0]
+        assert entry["name"] == "my-server"  # original name is preserved
+        assert entry["tools"] == ["mcp__my_server__*"]  # the regression assertion
+        assert "my-server" not in entry["tools"][0]
+        assert entry["pattern"] == "mcp__my_server__*"
+
+    def test_source_env_and_editable_false(self, clean_registry):
+        """A server absent from the manifest is env-sourced and not editable."""
+        servers = {"envonly": {"type": "stdio", "command": "node"}}
+        with (
+            patch("src.mcp_config.get_mcp_servers", return_value=servers),
+            patch("src.mcp_manifest.list_servers", return_value={}),
+        ):
+            result = get_mcp_servers_detail()
+        assert result[0]["source"] == "env"
+        assert result[0]["editable"] is False
+
+    def test_source_manifest_and_editable_true(self, clean_registry):
+        """A server present in the manifest is manifest-sourced and editable."""
+        cfg = {"type": "stdio", "command": "node"}
+        servers = {"managed": cfg}
+        with (
+            patch("src.mcp_config.get_mcp_servers", return_value=servers),
+            patch("src.mcp_manifest.list_servers", return_value={"managed": cfg}),
+        ):
+            result = get_mcp_servers_detail()
+        assert result[0]["source"] == "manifest"
+        assert result[0]["editable"] is True
+
+    def test_config_redacts_headers_and_env_tokens(self, clean_registry):
+        """Redacted config: every header value + secret-looking env values are masked."""
+        servers = {
+            "remote": {
+                "type": "http",
+                "url": "https://example.test/mcp",
+                "headers": {"Authorization": "Bearer sk-super-secret"},
+                "env": {"MY_TOKEN": "abc123", "REGION": "us-east"},
+            }
+        }
+        with (
+            patch("src.mcp_config.get_mcp_servers", return_value=servers),
+            patch("src.mcp_manifest.list_servers", return_value={}),
+        ):
+            result = get_mcp_servers_detail()
+
+        cfg = result[0]["config"]
+        # Every headers value is redacted regardless of key name.
+        assert cfg["headers"]["Authorization"] == "***REDACTED***"
+        # Secret-looking env keys are redacted; benign env values pass through.
+        assert cfg["env"]["MY_TOKEN"] == "***REDACTED***"
+        assert cfg["env"]["REGION"] == "us-east"
+        # Non-secret fields survive unchanged.
+        assert cfg["url"] == "https://example.test/mcp"
+
+    def test_reach_is_list_per_backend(self, clean_registry):
+        """``reach`` is a list carrying one entry per backend with a ``reaches`` flag."""
+        servers = {"srv": {"type": "stdio", "command": "node"}}
+        with (
+            patch("src.mcp_config.get_mcp_servers", return_value=servers),
+            patch("src.mcp_manifest.list_servers", return_value={}),
+        ):
+            result = get_mcp_servers_detail()
+        reach = result[0]["reach"]
+        assert isinstance(reach, list)
+        backends = {r["backend"] for r in reach}
+        assert backends == {"claude", "codex", "opencode"}
+        assert all("reaches" in r for r in reach)
+
+
+# ---------------------------------------------------------------------------
+# get_dropped_mcp_servers
+# ---------------------------------------------------------------------------
+
+
+class TestGetDroppedMcpServers:
+    def test_delegates_to_list_dropped_servers(self):
+        dropped = [{"name": "bad", "type": "stdio", "reason": "boom", "source": "env"}]
+        with patch("src.mcp_config.list_dropped_servers", return_value=dropped):
+            result = get_dropped_mcp_servers()
+        assert result == dropped
+
+    def test_empty_when_none_dropped(self):
+        with patch("src.mcp_config.list_dropped_servers", return_value=[]):
+            assert get_dropped_mcp_servers() == []
+
+    def test_swallows_errors(self):
+        with patch(
+            "src.mcp_config.list_dropped_servers", side_effect=RuntimeError("boom")
+        ):
+            assert get_dropped_mcp_servers() == []
+
+
+# ---------------------------------------------------------------------------
+# compute_mcp_server_reach (display-only, gated by BACKENDS + registration)
+# ---------------------------------------------------------------------------
+
+
+def _fake_backend(metadata=None):
+    """A registrable backend stub whose runtime_metadata returns *metadata*."""
+    backend = MagicMock()
+    backend.runtime_metadata.return_value = metadata or {}
+    return backend
+
+
+def _reach_for(reach, backend):
+    return next(r for r in reach if r["backend"] == backend)
+
+
+class TestComputeMcpServerReach:
+    def test_returns_entry_per_backend(self, clean_registry, monkeypatch):
+        monkeypatch.setenv("BACKENDS", "claude")
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        assert {r["backend"] for r in reach} == {"claude", "codex", "opencode"}
+
+    def test_claude_follows_backends_and_registration(
+        self, clean_registry, monkeypatch
+    ):
+        from src.backends.base import BackendRegistry
+
+        # Enabled AND registered -> reaches. clean_registry registers only
+        # descriptors, so a client must be registered too.
+        monkeypatch.setenv("BACKENDS", "claude")
+        BackendRegistry.register("claude", _fake_backend())
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        assert _reach_for(reach, "claude")["reaches"] is True
+
+    def test_claude_not_reached_when_not_in_backends(self, clean_registry, monkeypatch):
+        from src.backends.base import BackendRegistry
+
+        # Registered but disabled via BACKENDS -> does not reach.
+        monkeypatch.setenv("BACKENDS", "codex")
+        BackendRegistry.register("claude", _fake_backend())
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        assert _reach_for(reach, "claude")["reaches"] is False
+
+    def test_claude_not_reached_when_unregistered(self, clean_registry, monkeypatch):
+        # Enabled in BACKENDS but no client registered -> does not reach.
+        monkeypatch.setenv("BACKENDS", "claude")
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        assert _reach_for(reach, "claude")["reaches"] is False
+
+    def test_codex_follows_backends(self, clean_registry, monkeypatch):
+        from src.backends.base import BackendRegistry
+
+        monkeypatch.setenv("BACKENDS", "codex")
+        BackendRegistry.register(
+            "codex", _fake_backend({"approval_policy": "on-request"})
+        )
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        codex = _reach_for(reach, "codex")
+        assert codex["reaches"] is True
+        assert codex["approval_policy"] == "on-request"
+
+    def test_opencode_false_without_wrapper(self, clean_registry, monkeypatch):
+        from src.backends.base import BackendRegistry
+
+        # Managed mode but wrapper disabled -> does not reach.
+        monkeypatch.setenv("BACKENDS", "opencode")
+        monkeypatch.setattr(
+            "src.backends.opencode.constants.use_wrapper_mcp_config",
+            lambda: False,
+        )
+        BackendRegistry.register("opencode", _fake_backend({"mode": "managed"}))
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        assert _reach_for(reach, "opencode")["reaches"] is False
+
+    def test_opencode_false_when_external(self, clean_registry, monkeypatch):
+        from src.backends.base import BackendRegistry
+
+        # Wrapper on but external mode -> does not reach (managed-only).
+        monkeypatch.setenv("BACKENDS", "opencode")
+        monkeypatch.setattr(
+            "src.backends.opencode.constants.use_wrapper_mcp_config",
+            lambda: True,
+        )
+        BackendRegistry.register("opencode", _fake_backend({"mode": "external"}))
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        assert _reach_for(reach, "opencode")["reaches"] is False
+
+    def test_opencode_true_when_managed_and_wrapper(self, clean_registry, monkeypatch):
+        from src.backends.base import BackendRegistry
+
+        # Managed + wrapper + allowed type -> reaches.
+        monkeypatch.setenv("BACKENDS", "opencode")
+        monkeypatch.setattr(
+            "src.backends.opencode.constants.use_wrapper_mcp_config",
+            lambda: True,
+        )
+        BackendRegistry.register("opencode", _fake_backend({"mode": "managed"}))
+        reach = compute_mcp_server_reach("srv", {"type": "stdio", "command": "node"})
+        oc = _reach_for(reach, "opencode")
+        assert oc["reaches"] is True
+        assert oc["opencode_mode"] == "managed"
+
+    def test_opencode_false_for_unsupported_type(self, clean_registry, monkeypatch):
+        from src.backends.base import BackendRegistry
+
+        # Managed + wrapper but a type outside ALLOWED_TYPES -> does not reach.
+        monkeypatch.setenv("BACKENDS", "opencode")
+        monkeypatch.setattr(
+            "src.backends.opencode.constants.use_wrapper_mcp_config",
+            lambda: True,
+        )
+        BackendRegistry.register("opencode", _fake_backend({"mode": "managed"}))
+        reach = compute_mcp_server_reach("srv", {"type": "bogus"})
+        assert _reach_for(reach, "opencode")["reaches"] is False
 
 
 # ---------------------------------------------------------------------------

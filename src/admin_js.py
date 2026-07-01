@@ -37,6 +37,15 @@ def get_admin_js() -> str:
     showAdvancedInstall: false,
     mpForm: { repo: '', branch: 'main', scope: 'user', git_token: '' },
     pluginForm: { name: '', marketplace: '', scope: 'user' },
+    mcpDetail: { servers: [], dropped: [] },
+    mcpForm: { name: '', type: 'stdio', jsonConfig: '' },
+    mcpBusy: false,
+    mcpEditName: null,
+    mcpJsonError: '',
+    mcpJsonWarning: '',
+    mcpPatternPreview: [],
+    mcpTestBusy: {},
+    mcpTestResult: {},
     toolsRegistry: {},
     sandboxConfig: {},
     systemPrompt: { mode: 'preset', prompt: null, resolved_prompt: null, preset_text: null, char_count: 0, active_name: null },
@@ -84,7 +93,7 @@ def get_admin_js() -> str:
       try {
         this.loading.dashboard = true;
         const r = await this.api('/admin/api/summary');
-        if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpServers(); this.loadMetrics(); this.startPolling(); }
+        if (r.ok) { this.authenticated = true; this.summary = await r.json(); this.loadBackends(); this.loadMcpDetail(); this.loadMetrics(); this.startPolling(); }
       } catch(e) { console.error('Failed to load summary', e); this.loginError = 'Failed to load summary'; this.showToast('Failed to load summary', 'err'); } finally { this.loading.dashboard = false; }
     },
 
@@ -100,7 +109,7 @@ def get_admin_js() -> str:
           this.loginKey = '';
           await this.loadSummary();
           this.loadBackends();
-          this.loadMcpServers();
+          this.loadMcpDetail();
           this.loadMetrics();
           this.startPolling();
         } else {
@@ -145,11 +154,15 @@ def get_admin_js() -> str:
       } catch(e) { console.error('Failed to load backends', e); this.showToast('Failed to load backends', 'err'); }
       finally { this.loading.backends = false; }
     },
-    async loadMcpServers() {
+    async loadMcpDetail() {
       this.loading.mcp = true;
       try {
         const r = await this.api('/admin/api/mcp-servers');
-        if (r.ok) { const d = await r.json(); this.mcpServers = d.servers || []; }
+        if (r.ok) {
+          const d = await r.json();
+          this.mcpDetail = { servers: d.servers || [], dropped: d.dropped || [] };
+          this.mcpServers = d.servers || [];
+        }
       } catch(e) { console.error('Failed to load MCP servers', e); this.showToast('Failed to load MCP servers', 'err'); }
       finally { this.loading.mcp = false; }
     },
@@ -171,7 +184,7 @@ def get_admin_js() -> str:
     },
 
     async refreshAll() {
-      await Promise.all([this.loadSummary(), this.loadConfig(), this.loadBackends(), this.loadMcpServers(), this.loadMetrics()]);
+      await Promise.all([this.loadSummary(), this.loadConfig(), this.loadBackends(), this.loadMcpDetail(), this.loadMetrics()]);
       this.showToast('ALL SYSTEMS REFRESHED', 'ok');
     },
 
@@ -763,6 +776,85 @@ def get_admin_js() -> str:
         }
       } catch(e) { this.showToast('Connection error', 'err'); }
       finally { this.pluginBusy = false; }
+    },
+
+    // --- MCP server management (MCP tab) ---
+    async refreshMcp() { await Promise.all([this.loadMcpDetail(), this.loadTools()]); },
+
+    validateMcpJson() {
+      this.mcpJsonError = ''; this.mcpJsonWarning = ''; this.mcpPatternPreview = [];
+      const nm = this.mcpForm.name.trim();
+      if (nm && !/^[A-Za-z0-9._@-]+$/.test(nm)) this.mcpJsonError = 'invalid name: letters, digits, ._@- only';
+      const raw = this.mcpForm.jsonConfig.trim();
+      if (raw) {
+        let cfg;
+        try { cfg = JSON.parse(raw); }
+        catch(e) { this.mcpJsonError = 'invalid JSON: ' + e.message; return; }
+        if (typeof cfg !== 'object' || Array.isArray(cfg)) { this.mcpJsonError = 'config must be a JSON object'; return; }
+        const t = cfg.type || this.mcpForm.type || 'stdio';
+        if (t === 'stdio' && !cfg.command) this.mcpJsonWarning = "stdio requires 'command'";
+        if (['sse','http','streamable-http'].includes(t) && !cfg.url) this.mcpJsonWarning = t + " requires 'url'";
+      }
+      if (nm && !this.mcpJsonError) this.mcpPatternPreview = ['mcp__' + nm.replace(/-/g,'_') + '__*'];
+    },
+
+    async createMcpServer() {
+      const name = this.mcpForm.name.trim();
+      if (!name || this.mcpJsonError) return;
+      let config; try { config = JSON.parse(this.mcpForm.jsonConfig || '{}'); } catch(e){ this.mcpJsonError='invalid JSON'; return; }
+      if (config && typeof config === 'object' && !Array.isArray(config) && !config.type) config.type = this.mcpForm.type;
+      this.mcpBusy = true;
+      try {
+        const r = await this.api('/admin/api/mcp-servers', {
+          method: 'POST', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name, config }) });
+        if (r.ok) { this.showToast('MCP SERVER ADDED: ' + name, 'ok'); this.resetMcpForm(); await this.refreshMcp(); }
+        else { const d = await r.json().catch(()=>({})); this.showToast(d.error || 'Add failed', 'err'); }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.mcpBusy = false; }
+    },
+    editMcpServer(s) {
+      this.mcpEditName = s.name;
+      // A type-less stored config surfaces as type "unknown" (admin_service
+      // default); the backend treats it as stdio. Bind a real select option so
+      // the on-save type injection can't produce an invalid "unknown" type.
+      const t = (s.type && s.type !== 'unknown') ? s.type : 'stdio';
+      this.mcpForm = { name: s.name, type: t, jsonConfig: JSON.stringify(s.config ?? {}, null, 2) };
+      this.validateMcpJson();
+    },
+    cancelMcpEdit() { this.mcpEditName = null; this.resetMcpForm(); },
+    resetMcpForm() { this.mcpForm = { name:'', type:'stdio', jsonConfig:'' }; this.mcpJsonError=''; this.mcpJsonWarning=''; this.mcpPatternPreview=[]; },
+    async saveMcpServer() {
+      if (!this.mcpEditName || this.mcpJsonError) return;
+      let config; try { config = JSON.parse(this.mcpForm.jsonConfig || '{}'); } catch(e){ this.mcpJsonError='invalid JSON'; return; }
+      if (config && typeof config === 'object' && !Array.isArray(config) && !config.type) config.type = this.mcpForm.type;
+      this.mcpBusy = true;
+      try {
+        const r = await this.api('/admin/api/mcp-servers/' + encodeURIComponent(this.mcpEditName), {
+          method: 'PUT', headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({ name: this.mcpEditName, config }) });
+        if (r.ok) { this.showToast('MCP SERVER SAVED', 'ok'); this.mcpEditName=null; this.resetMcpForm(); await this.refreshMcp(); }
+        else { const d = await r.json().catch(()=>({})); this.showToast(d.error || 'Save failed', 'err'); }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.mcpBusy = false; }
+    },
+    async deleteMcpServer(name) {
+      if (!confirm('Delete MCP server "' + name + '"?')) return;
+      try {
+        const r = await this.api('/admin/api/mcp-servers/' + encodeURIComponent(name), { method: 'DELETE' });
+        if (r.ok) { this.showToast('MCP SERVER DELETED', 'ok'); await this.refreshMcp(); }
+        else { const d = await r.json().catch(()=>({})); this.showToast(d.error || 'Delete failed', 'err'); }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+    },
+    async testMcpServer(name) {
+      this.mcpTestBusy[name] = true;
+      try {
+        const r = await this.api('/admin/api/mcp-servers/' + encodeURIComponent(name) + '/test', { method: 'POST' });
+        const d = await r.json().catch(()=>({}));
+        if (r.ok && d.ok) { this.mcpTestResult[name] = {ok:true, message:(d.detail||'reachable')+' ('+(d.latency_ms||0)+'ms)'}; this.showToast('MCP OK: '+name, 'ok'); }
+        else { this.mcpTestResult[name] = {ok:false, message: d.detail || d.error || 'unreachable'}; this.showToast('MCP FAIL: '+name, 'err'); }
+      } catch(e) { this.mcpTestResult[name] = {ok:false, message:'connection error'}; this.showToast('Connection error', 'err'); }
+      finally { delete this.mcpTestBusy[name]; }
     },
 
     async toggleSessionHistory(sessionId) {

@@ -121,10 +121,15 @@ def get_dashboard_html() -> str:
           <div class="card">
             <div class="flex-between mb-md">
               <h3 style="margin:0">MCP Servers</h3>
-              <button class="btn btn-sm btn-ghost" @click="loadMcpServers()" aria-label="Refresh MCP servers">Reload</button>
+              <button class="btn btn-sm btn-ghost" @click="loadMcpDetail()" aria-label="Refresh MCP servers">Reload</button>
             </div>
             <div x-show="loading.mcp" class="text-muted" style="text-align:center; padding:0.5rem">
               Loading MCP servers...
+            </div>
+            <div x-show="mcpDetail.dropped?.length" class="text-xs text-warning" style="margin-bottom:0.5rem">
+              <template x-for="d in (mcpDetail.dropped ?? [])" :key="d.name">
+                <div x-text="'! ' + d.name + ': ' + d.reason"></div>
+              </template>
             </div>
             <template x-for="s in mcpServers" :key="s.name">
               <div style="border:1px solid var(--border); padding:0.75rem; margin-bottom:0.5rem">
