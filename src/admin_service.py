@@ -447,6 +447,104 @@ def compute_mcp_server_reach(name: str, config: Dict[str, Any]) -> List[Dict[str
     return out
 
 
+def compute_plugin_mcp_reach(name: str) -> List[Dict[str, Any]]:
+    """Per-backend reach for a plugin-provided MCP server. DISPLAY ONLY.
+
+    Plugin MCP servers are loaded by the Claude SDK via ``setting_sources``
+    (reading the plugin's ``.mcp.json``), NOT through the gateway's
+    ``mcp_servers`` option. So they reach Claude only; Codex and OpenCode never
+    read Claude plugins and therefore never see these servers.
+    """
+    from src.backends import _enabled_backend_names
+    from src.backends.base import BackendRegistry
+    from src.mcp_config import mcp_safe_name
+
+    enabled = set(_enabled_backend_names())
+    claude_on = "claude" in enabled and BackendRegistry.is_registered("claude")
+    pattern = f"mcp__{mcp_safe_name(name)}__*"
+    return [
+        {
+            "backend": "claude",
+            "reaches": claude_on,
+            "mode": "setting_sources",
+            "pattern": pattern,
+            "condition": "loaded from the plugin's .mcp.json via setting_sources "
+            "when the plugin is enabled; covered by the mcp__* auto-allow",
+            "gated_by": ["BACKENDS", "CLAUDE_SETTING_SOURCES", "plugin enabled"],
+        },
+        {
+            "backend": "codex",
+            "reaches": False,
+            "mode": "n/a",
+            "pattern": None,
+            "condition": "Codex does not read Claude plugins",
+            "gated_by": [],
+        },
+        {
+            "backend": "opencode",
+            "reaches": False,
+            "mode": "n/a",
+            "pattern": None,
+            "condition": "OpenCode does not read Claude plugins",
+            "gated_by": [],
+        },
+    ]
+
+
+def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
+    """MCP servers contributed by installed plugins (read-only, ``source='plugin'``).
+
+    These are loaded by the Claude SDK via ``setting_sources`` and never pass
+    through the gateway's effective MCP config, so ``get_mcp_servers_detail``
+    cannot surface them. Returned as extra rows for the admin MCP tab: not
+    editable/deletable (the plugin owns them), config redacted, tagged with the
+    owning plugin, and flagged ``shadowed`` when a same-named env/manifest server
+    also exists (that one is what non-Claude backends see).
+    """
+    try:
+        from src import plugin_service
+        from src.mcp_config import get_mcp_servers, mcp_safe_name, validate_server
+
+        entries = plugin_service.list_plugin_mcp_servers()
+        if not entries:
+            return []
+
+        try:
+            effective = set(get_mcp_servers().keys())
+        except Exception:
+            effective = set()
+
+        result: List[Dict[str, Any]] = []
+        for entry in entries:
+            name = entry["server_name"]
+            config = entry["config"] if isinstance(entry.get("config"), dict) else {}
+            safe_prefix = f"mcp__{mcp_safe_name(name)}__"
+            ok, reason = validate_server(name, config)
+            result.append(
+                {
+                    "name": name,
+                    "type": config.get("type", "stdio") if config else "unknown",
+                    "tools": [f"{safe_prefix}*"],
+                    "config_keys": [k for k in config.keys() if k != "type"],
+                    "pattern": f"{safe_prefix}*",
+                    "source": "plugin",
+                    "editable": False,
+                    "plugin": entry.get("plugin_id"),
+                    "plugin_name": entry.get("plugin_name"),
+                    "scope": entry.get("scope"),
+                    "config": _redact_mcp_config(config),
+                    "reach": compute_plugin_mcp_reach(name),
+                    "valid": ok,
+                    "invalid_reason": None if ok else reason,
+                    "shadowed": name in effective,
+                }
+            )
+        return result
+    except Exception:
+        logger.warning("Failed to read plugin MCP servers detail", exc_info=True)
+        return []
+
+
 def get_dropped_mcp_servers() -> List[Dict[str, Any]]:
     """Return MCP servers dropped from the effective config, with reasons."""
     try:

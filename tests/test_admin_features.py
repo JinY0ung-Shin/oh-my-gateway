@@ -7,9 +7,11 @@ import pytest
 
 from src.admin_service import (
     compute_mcp_server_reach,
+    compute_plugin_mcp_reach,
     export_session_json,
     get_dropped_mcp_servers,
     get_mcp_servers_detail,
+    get_plugin_mcp_servers_detail,
     get_sandbox_config,
     get_session_detail,
     get_tools_registry,
@@ -273,6 +275,127 @@ class TestGetMcpServersDetail:
         backends = {r["backend"] for r in reach}
         assert backends == {"claude", "codex", "opencode"}
         assert all("reaches" in r for r in reach)
+
+
+# ---------------------------------------------------------------------------
+# get_plugin_mcp_servers_detail (plugin-contributed servers, read-only)
+# ---------------------------------------------------------------------------
+
+
+class TestGetPluginMcpServersDetail:
+    def _entries(self):
+        return [
+            {
+                "plugin_id": "context7@official",
+                "plugin_name": "context7",
+                "marketplace": "official",
+                "scope": "user",
+                "origin": "managed",
+                "server_name": "context7",
+                "config": {
+                    "command": "npx",
+                    "args": ["-y", "@upstash/context7-mcp"],
+                    "env": {"API_KEY": "sekret", "REGION": "us"},
+                },
+            }
+        ]
+
+    def test_empty_when_no_plugin_servers(self):
+        with patch("src.plugin_service.list_plugin_mcp_servers", return_value=[]):
+            assert get_plugin_mcp_servers_detail() == []
+
+    def test_source_plugin_read_only(self, clean_registry):
+        with (
+            patch(
+                "src.plugin_service.list_plugin_mcp_servers",
+                return_value=self._entries(),
+            ),
+            patch("src.mcp_config.get_mcp_servers", return_value={}),
+        ):
+            result = get_plugin_mcp_servers_detail()
+        assert len(result) == 1
+        row = result[0]
+        assert row["source"] == "plugin"
+        assert row["editable"] is False
+        assert row["plugin"] == "context7@official"
+        assert row["tools"] == ["mcp__context7__*"]
+        assert row["pattern"] == "mcp__context7__*"
+        assert row["shadowed"] is False
+        assert row["valid"] is True
+
+    def test_secret_env_redacted(self, clean_registry):
+        with (
+            patch(
+                "src.plugin_service.list_plugin_mcp_servers",
+                return_value=self._entries(),
+            ),
+            patch("src.mcp_config.get_mcp_servers", return_value={}),
+        ):
+            row = get_plugin_mcp_servers_detail()[0]
+        assert row["config"]["env"]["API_KEY"] == "***REDACTED***"
+        assert row["config"]["env"]["REGION"] == "us"
+
+    def test_shadowed_when_name_in_effective_config(self, clean_registry):
+        with (
+            patch(
+                "src.plugin_service.list_plugin_mcp_servers",
+                return_value=self._entries(),
+            ),
+            patch(
+                "src.mcp_config.get_mcp_servers",
+                return_value={"context7": {"command": "x"}},
+            ),
+        ):
+            row = get_plugin_mcp_servers_detail()[0]
+        assert row["shadowed"] is True
+
+    def test_invalid_config_flagged(self, clean_registry):
+        bad = [
+            {**self._entries()[0], "server_name": "bad", "config": {"type": "stdio"}}
+        ]
+        with (
+            patch("src.plugin_service.list_plugin_mcp_servers", return_value=bad),
+            patch("src.mcp_config.get_mcp_servers", return_value={}),
+        ):
+            row = get_plugin_mcp_servers_detail()[0]
+        assert row["valid"] is False
+        assert "command" in (row["invalid_reason"] or "")
+
+    def test_dash_name_normalised_in_pattern(self, clean_registry):
+        entries = [{**self._entries()[0], "server_name": "my-plugin-server"}]
+        with (
+            patch("src.plugin_service.list_plugin_mcp_servers", return_value=entries),
+            patch("src.mcp_config.get_mcp_servers", return_value={}),
+        ):
+            row = get_plugin_mcp_servers_detail()[0]
+        assert row["pattern"] == "mcp__my_plugin_server__*"
+        assert row["name"] == "my-plugin-server"  # original preserved
+
+    def test_reach_is_claude_only(self, clean_registry):
+        reach = compute_plugin_mcp_reach("context7")
+        by = {r["backend"]: r for r in reach}
+        assert set(by) == {"claude", "codex", "opencode"}
+        assert by["codex"]["reaches"] is False
+        assert by["opencode"]["reaches"] is False
+        assert by["claude"]["mode"] == "setting_sources"
+
+    def test_endpoint_appends_plugin_rows(self, admin_client, clean_registry):
+        with (
+            patch(
+                "src.plugin_service.list_plugin_mcp_servers",
+                return_value=self._entries(),
+            ),
+            patch(
+                "src.mcp_config.get_mcp_servers",
+                return_value={"envsrv": {"type": "stdio", "command": "node"}},
+            ),
+            patch("src.mcp_manifest.list_servers", return_value={}),
+        ):
+            r = admin_client.get("/admin/api/mcp-servers")
+        assert r.status_code == 200
+        sources = {s["name"]: s["source"] for s in r.json()["servers"]}
+        assert sources.get("envsrv") == "env"
+        assert sources.get("context7") == "plugin"
 
 
 # ---------------------------------------------------------------------------

@@ -176,12 +176,20 @@ def delete_server(name: str) -> Dict[str, Any]:
 
 
 async def test_connection(name: str) -> Dict[str, Any]:
-    """Look up the server in the effective config and probe it. Never raises."""
+    """Look up the server and probe it. Never raises.
+
+    Checks the effective config (env base + manifest overlay) first, then falls
+    back to plugin-provided servers (loaded by the SDK via ``setting_sources``),
+    so a read-only plugin row in the MCP tab is testable too.
+    """
     from src import mcp_connection_test
     from src.mcp_config import get_mcp_servers
 
-    servers = get_mcp_servers()
-    config = servers.get(name)
+    config = get_mcp_servers().get(name)
+    if config is None:
+        from src import plugin_service
+
+        config = plugin_service.get_plugin_mcp_server_config(name)
     if config is None:
         return {"ok": False, "detail": f"server '{name}' not found"}
     return await mcp_connection_test.test_mcp_server(name, config)

@@ -244,6 +244,73 @@ def _load_manifest(install_path: Path) -> Dict[str, Any]:
     return manifest if isinstance(manifest, dict) else {}
 
 
+# Default file a plugin's MCP servers live in when the manifest points nowhere
+# else (Claude Code convention; see plugin.json ``mcpServers`` default).
+_MCP_DEFAULT_FILE = ".mcp.json"
+
+
+def _safe_plugin_join(base: Path, rel: str) -> Optional[Path]:
+    """Resolve *rel* under *base*, refusing to escape it (or follow a symlink).
+
+    ``mcpServers`` may name a file path; treat it as relative to the plugin
+    root, never absolute, and reject any ``..`` that climbs out of the install
+    tree. Returns the resolved path or ``None``.
+    """
+    rel = (rel or "").strip().lstrip("/")
+    if rel.startswith("./"):
+        rel = rel[2:]
+    if not rel:
+        return None
+    candidate = base / rel
+    try:
+        resolved = candidate.resolve()
+        resolved.relative_to(base.resolve())
+    except (ValueError, OSError):
+        return None
+    if candidate.is_symlink():
+        return None
+    return resolved
+
+
+def _read_mcp_json(path: Path) -> Dict[str, Any]:
+    """Read an ``.mcp.json``-style file into ``{server_name: config}``.
+
+    Tolerates both observed shapes: a top-level ``mcpServers`` wrapper
+    (``{"mcpServers": {name: cfg}}``) and a bare server map (``{name: cfg}``).
+    Never raises; returns ``{}`` on any problem.
+    """
+    data = _read_json(path)
+    if not isinstance(data, dict):
+        return {}
+    inner = data.get("mcpServers", data)
+    if not isinstance(inner, dict):
+        return {}
+    return {k: v for k, v in inner.items() if isinstance(v, dict)}
+
+
+def _plugin_mcp_servers(
+    install_path: Optional[Path], manifest: Dict[str, Any]
+) -> Dict[str, Dict[str, Any]]:
+    """Return a plugin's declared MCP servers as ``{server_name: config}``.
+
+    Resolves the ``mcpServers`` manifest field per the Claude Code plugin
+    schema: an inline object is used directly; a string is a file path
+    (relative to the plugin root); when absent the default ``./.mcp.json`` is
+    tried. Path-safe and non-raising — malformed or missing config yields ``{}``.
+    """
+    if install_path is None:
+        return {}
+    field = manifest.get("mcpServers") if isinstance(manifest, dict) else None
+    if isinstance(field, dict):
+        # Inline definition in plugin.json — already a {name: cfg} map.
+        return {k: v for k, v in field.items() if isinstance(v, dict)}
+    rel = field if isinstance(field, str) and field.strip() else _MCP_DEFAULT_FILE
+    target = _safe_plugin_join(install_path, rel)
+    if target is None:
+        return {}
+    return _read_mcp_json(target)
+
+
 def _discover_skills(install_path: Path) -> List[Dict[str, str]]:
     """Discover skill files inside a plugin's install directory.
 
@@ -413,6 +480,64 @@ def list_plugins() -> List[Dict[str, Any]]:
             )
 
     return results
+
+
+def list_plugin_mcp_servers() -> List[Dict[str, Any]]:
+    """Return MCP servers contributed by installed plugins.
+
+    Each item is ``{plugin_id, plugin_name, marketplace, scope, origin,
+    server_name, config}``. These servers are loaded by the Claude SDK via
+    ``setting_sources`` (reading the plugin's ``.mcp.json``) and never pass
+    through the gateway's ``MCP_CONFIG``/manifest effective config — so they
+    are otherwise invisible to the MCP admin view. Read-only; never raises.
+    """
+    registry = _load_installed_registry()
+    plugins_data = registry.get("plugins", {})
+    if not isinstance(plugins_data, dict):
+        return []
+
+    managed = _managed_plugin_ids()
+    results: List[Dict[str, Any]] = []
+    for key, entries in plugins_data.items():
+        if not isinstance(entries, list):
+            continue
+        for idx in range(len(entries)):
+            resolved = _resolve_plugin_entry(key, entries, idx)
+            if resolved is None:
+                continue
+            servers = _plugin_mcp_servers(
+                resolved["install_path"], resolved["manifest"]
+            )
+            for server_name, config in servers.items():
+                results.append(
+                    {
+                        "plugin_id": resolved["id"],
+                        "plugin_name": resolved["name"],
+                        "marketplace": resolved["marketplace"],
+                        "scope": resolved["scope"],
+                        "origin": (
+                            "managed"
+                            if (resolved["id"], resolved["scope"]) in managed
+                            else "env"
+                        ),
+                        "server_name": server_name,
+                        "config": config,
+                    }
+                )
+    return results
+
+
+def get_plugin_mcp_server_config(server_name: str) -> Optional[Dict[str, Any]]:
+    """Return the config of the first plugin MCP server named *server_name*.
+
+    Used by the admin connection-test to probe a plugin server (which is not in
+    the gateway's effective config). ``None`` when no plugin declares it.
+    """
+    for entry in list_plugin_mcp_servers():
+        if entry["server_name"] == server_name:
+            cfg = entry.get("config")
+            return cfg if isinstance(cfg, dict) else None
+    return None
 
 
 def get_plugin_detail(

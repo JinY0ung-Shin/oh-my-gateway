@@ -58,6 +58,7 @@ from src.admin_service import (
     get_backends_health,
     get_dropped_mcp_servers,
     get_mcp_servers_detail,
+    get_plugin_mcp_servers_detail,
     get_redacted_config,
     get_sandbox_config,
     get_session_detail,
@@ -253,9 +254,14 @@ async def get_backends(_=Depends(require_admin)):
 
 @router.get("/api/mcp-servers")
 async def get_mcp_servers_endpoint(_=Depends(require_admin)):
-    """Return detailed MCP servers (effective) plus any dropped by overlay merge."""
+    """Return detailed MCP servers (effective) plus any dropped by overlay merge.
+
+    Also appends read-only rows for MCP servers contributed by installed
+    plugins (``source='plugin'``): the SDK loads those via ``setting_sources``,
+    so they never appear in the effective (env+manifest) config.
+    """
     return {
-        "servers": get_mcp_servers_detail(),
+        "servers": get_mcp_servers_detail() + get_plugin_mcp_servers_detail(),
         "dropped": get_dropped_mcp_servers(),
     }
 

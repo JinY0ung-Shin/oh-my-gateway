@@ -14,6 +14,7 @@ def get_mcp_html() -> str:
         <p class="text-xs text-muted mb-md">
           Overlay on top of the MCP_CONFIG environment base (manifest wins). Applies to new sessions.
           Existing sessions keep the MCP set pinned at creation. OpenCode requires a restart.
+          Plugin-provided servers are shown read-only (Claude loads them via setting_sources).
         </p>
 
         <!-- Dropped servers banner (diagnostic 2) -->
@@ -42,12 +43,21 @@ def get_mcp_html() -> str:
                     <td style="color:var(--cyan); font-weight:600" x-text="s.name"></td>
                     <td>
                       <span class="badge text-xs" x-text="s.type"></span>
+                      <div x-show="s.valid === false" class="text-xs text-warning"
+                        x-text="s.invalid_reason" :title="s.invalid_reason"></div>
+                      <div x-show="s.shadowed" class="text-xs text-muted"
+                        title="A same-named env/manifest server exists; non-Claude backends use that one.">shadowed</div>
                     </td>
                     <td>
                       <span class="badge text-xs" x-show="s.source === 'manifest'"
                         style="border-color:var(--green); color:var(--green)">MANIFEST</span>
-                      <span class="badge text-xs" x-show="s.source !== 'manifest'"
+                      <span class="badge text-xs" x-show="s.source === 'env'"
                         style="border-color:var(--cyan); color:var(--cyan); opacity:0.7">ENV</span>
+                      <span class="badge text-xs" x-show="s.source === 'plugin'"
+                        style="border-color:var(--magenta); color:var(--magenta)">PLUGIN</span>
+                      <div x-show="s.source === 'plugin' && s.plugin" class="text-xs text-muted"
+                        style="max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap"
+                        x-text="s.plugin" :title="s.plugin"></div>
                       <div class="text-xs text-muted" x-text="s.editable ? 'editable' : 'read-only'"></div>
                     </td>
                     <td>
