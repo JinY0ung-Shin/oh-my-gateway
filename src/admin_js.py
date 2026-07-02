@@ -32,6 +32,7 @@ def get_admin_js() -> str:
     marketplaces: [],
     pluginBusy: false,
     marketplaceBusy: {},
+    marketplaceTokens: {},
     catalogFilter: '',
     catalogBusy: {},
     catalogLoading: false,
@@ -742,9 +743,10 @@ def get_admin_js() -> str:
       if (!name) return;
       this.marketplaceBusy[name] = true;
       try {
+        const token = (this.marketplaceTokens[name] || '').trim();
         const r = await this.api('/admin/api/marketplaces/' + encodeURIComponent(name) + '/refresh', {
           method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ scope: m.scope || '', git_token: '' })
+          body: JSON.stringify({ scope: m.scope || '', git_token: token })
         });
         const d = await r.json().catch(() => ({}));
         if (r.ok) {
@@ -757,7 +759,7 @@ def get_admin_js() -> str:
           this.showToast(d.error || 'Refresh failed', 'err');
         }
       } catch(e) { this.showToast('Connection error', 'err'); }
-      finally { delete this.marketplaceBusy[name]; }
+      finally { this.marketplaceTokens[name] = ''; delete this.marketplaceBusy[name]; }
     },
 
     async installPlugin() {

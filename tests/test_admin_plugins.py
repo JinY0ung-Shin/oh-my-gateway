@@ -109,6 +109,20 @@ class TestRouteOrdering:
         mock_one.assert_not_called()
 
 
+class TestPluginsUi:
+    def test_refresh_uses_one_time_token_field(self):
+        from src.admin_html_plugins import get_plugins_html
+        from src.admin_js import get_admin_js
+
+        html = get_plugins_html()
+        js = get_admin_js()
+        assert "marketplaceTokens[m.name]" in html
+        assert 'placeholder="refresh token"' in html
+        assert "marketplaceTokens: {}" in js
+        assert "git_token: token" in js
+        assert "this.marketplaceTokens[name] = ''" in js
+
+
 # ---------------------------------------------------------------------------
 # Marketplace catalog (read-only)
 # ---------------------------------------------------------------------------

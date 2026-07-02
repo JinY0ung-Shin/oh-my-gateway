@@ -431,6 +431,70 @@ def test_refresh_marketplace_records_failed_plugin_updates(
     assert result["failed_updates"] == [{"spec": "bad@m", "scope": "user", "rc": 9}]
 
 
+def test_refresh_marketplace_uses_env_git_token_fallback(
+    monkeypatch, fake_claude, recorded_runs, fake_manifest
+):
+    from src import plugin_service
+
+    fake_manifest.marketplaces["m"] = {
+        "repo": "https://github.com/acme/m",
+        "branch": "main",
+        "scope": "user",
+    }
+    captured = {}
+
+    def fake_prepare(repo, *, branch, token, root):
+        captured["token"] = token
+        return svc.Path("/clones/m")
+
+    monkeypatch.setenv("CLAUDE_PLUGIN_GIT_TOKEN", "env-token")
+    monkeypatch.setattr(svc, "prepare_repo", fake_prepare)
+    monkeypatch.setattr(plugin_service, "list_plugins", lambda: [])
+
+    svc.refresh_marketplace("m")
+    assert captured["token"] == "env-token"
+
+
+def test_refresh_marketplace_request_token_wins_over_env_token(
+    monkeypatch, fake_claude, recorded_runs, fake_manifest
+):
+    from src import plugin_service
+
+    fake_manifest.marketplaces["m"] = {
+        "repo": "https://github.com/acme/m",
+        "branch": "main",
+        "scope": "user",
+    }
+    captured = {}
+
+    def fake_prepare(repo, *, branch, token, root):
+        captured["token"] = token
+        return svc.Path("/clones/m")
+
+    monkeypatch.setenv("CLAUDE_PLUGIN_GIT_TOKEN", "env-token")
+    monkeypatch.setattr(svc, "prepare_repo", fake_prepare)
+    monkeypatch.setattr(plugin_service, "list_plugins", lambda: [])
+
+    svc.refresh_marketplace("m", git_token="request-token")
+    assert captured["token"] == "request-token"
+
+
+def test_add_marketplace_uses_env_git_token_fallback(
+    monkeypatch, fake_claude, recorded_runs, fake_manifest
+):
+    captured = {}
+
+    def fake_prepare(repo, *, branch, token, root):
+        captured["token"] = token
+        return svc.Path("/clones/m")
+
+    monkeypatch.setenv("CLAUDE_PLUGIN_GIT_TOKEN", "env-token")
+    monkeypatch.setattr(svc, "prepare_repo", fake_prepare)
+
+    svc.add_marketplace("https://github.com/acme/m")
+    assert captured["token"] == "env-token"
+
+
 def test_resolve_marketplace_repo_prefers_full_url(monkeypatch, tmp_path):
     import json as _json
 

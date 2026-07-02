@@ -155,6 +155,14 @@ def _timeout_seconds() -> int:
     return DEFAULT_TIMEOUT_SECONDS
 
 
+def _runtime_git_token(git_token: str = "") -> str:
+    """One-shot request token wins; otherwise use the deployment fallback secret."""
+    token = (git_token or "").strip()
+    if token:
+        return token
+    return os.environ.get("CLAUDE_PLUGIN_GIT_TOKEN", "").strip()
+
+
 def run(cmd: List[str], *, token: str = "") -> subprocess.CompletedProcess:
     """Run *cmd* as an arg list and capture its output.
 
@@ -490,7 +498,12 @@ def add_marketplace(
     scope = _validate_scope(scope)
     claude_bin = _require_claude_bin()
 
-    local_path = prepare_repo(repo, branch=branch, token=git_token, root=clone_root())
+    local_path = prepare_repo(
+        repo,
+        branch=branch,
+        token=_runtime_git_token(git_token),
+        root=clone_root(),
+    )
     try:
         run(
             [
@@ -587,7 +600,7 @@ def refresh_marketplace(
     local_path = prepare_repo(
         repo,
         branch=branch,
-        token=git_token,
+        token=_runtime_git_token(git_token),
         root=clone_root(),
     )
     try:

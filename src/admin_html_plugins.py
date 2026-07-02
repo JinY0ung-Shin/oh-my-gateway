@@ -45,6 +45,11 @@ def get_plugins_html() -> str:
                         :title="m.repo" x-text="m.repo"></div>
                     </div>
                     <span class="text-xs text-muted marketplace-count" style="margin-right:8px" x-text="m.plugin_count + ' plugins'"></span>
+                    <input x-show="m._expanded || catalogFilter" type="password"
+                      x-model="marketplaceTokens[m.name]" placeholder="refresh token"
+                      aria-label="One-time refresh token"
+                      @click.stop
+                      style="width:140px; margin-right:4px">
                     <button class="btn btn-sm btn-ghost marketplace-refresh"
                       @click.stop="refreshMarketplace(m)" :disabled="!!marketplaceBusy[m.name]"
                       aria-label="Refresh marketplace">
