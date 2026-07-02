@@ -526,6 +526,120 @@ def add_marketplace(
     }
 
 
+def _refresh_record(name: str) -> dict:
+    """Return replay metadata for a marketplace refresh.
+
+    Admin-managed manifest records are authoritative because Claude stores
+    clone-then-add marketplaces as local directories. Env bootstrap journals are
+    the next-best source; known_marketplaces.json is only a fallback and may
+    resolve to a local path when the original remote is unknown.
+    """
+    record = plugin_manifest.get_marketplace(name)
+    record = record if isinstance(record, dict) else {}
+    env = _env_marketplace_record(name) if not record.get("repo") else {}
+    repo = str(record.get("repo") or env.get("repo") or "").strip()
+    branch = str(record.get("branch") or env.get("branch") or DEFAULT_BRANCH).strip()
+    scope = str(record.get("scope") or env.get("scope") or "user").strip()
+    if not repo:
+        repo = _resolve_marketplace_repo(name)
+    return {"repo": repo, "branch": branch, "scope": scope}
+
+
+def _installed_plugins_for_marketplace(*names: str) -> list[dict]:
+    """Installed plugin rows whose registry marketplace matches any *names*."""
+    wanted = {n for n in names if n}
+    if not wanted:
+        return []
+    try:
+        from . import plugin_service
+
+        return [
+            p
+            for p in plugin_service.list_plugins()
+            if isinstance(p, dict) and p.get("marketplace") in wanted
+        ]
+    except Exception:
+        logger.debug("Failed to list installed plugins for marketplace refresh", exc_info=True)
+        return []
+
+
+def refresh_marketplace(
+    name: str,
+    *,
+    scope: str = "",
+    git_token: str = "",
+) -> dict:
+    """Refresh a git/local marketplace and update its installed plugins.
+
+    For remote repos this fresh-clones the recorded branch into the clone root,
+    re-registers the marketplace path, then runs ``claude plugin update`` for
+    every currently installed plugin from that marketplace. Local-path
+    marketplaces are re-registered in place and their installed plugins are
+    still updated.
+    """
+    name = _validate_name(name, what="marketplace name")
+    rec = _refresh_record(name)
+    repo = _validate_repo(rec.get("repo", ""))
+    branch = _validate_branch(rec.get("branch", ""))
+    refresh_scope = _validate_scope(scope or rec.get("scope", ""))
+    claude_bin = _require_claude_bin()
+
+    local_path = prepare_repo(
+        repo,
+        branch=branch,
+        token=git_token,
+        root=clone_root(),
+    )
+    try:
+        run(
+            [
+                claude_bin,
+                "plugin",
+                "marketplace",
+                "add",
+                "--scope",
+                refresh_scope,
+                "--",
+                str(local_path),
+            ]
+        )
+    except subprocess.CalledProcessError as exc:
+        raise PluginAdminError(
+            f"claude plugin marketplace add failed for {local_path} "
+            f"(scope {refresh_scope}): rc={exc.returncode}"
+        ) from exc
+
+    actual_name = _marketplace_name_from_clone(Path(local_path), repo)
+    plugin_manifest.set_marketplace(
+        actual_name, repo=repo, branch=branch, scope=refresh_scope
+    )
+
+    updated = []
+    failed = []
+    for plugin in _installed_plugins_for_marketplace(name, actual_name):
+        spec = str(plugin.get("id") or "").strip()
+        if not spec:
+            continue
+        plugin_scope = _validate_scope(str(plugin.get("scope") or refresh_scope))
+        try:
+            run([claude_bin, "plugin", "update", "--scope", plugin_scope, "--", spec])
+            updated.append({"spec": spec, "scope": plugin_scope})
+        except subprocess.CalledProcessError as exc:
+            failed.append({"spec": spec, "scope": plugin_scope, "rc": exc.returncode})
+
+    return {
+        "status": "refreshed",
+        "marketplace": actual_name,
+        "requested_marketplace": name,
+        "repo": repo,
+        "branch": branch,
+        "scope": refresh_scope,
+        "path": str(local_path),
+        "updated_plugins": updated,
+        "failed_updates": failed,
+    }
+
+
 def remove_marketplace(name: str, *, scope: str = "user") -> dict:
     """Remove a configured marketplace and drop its managed ``added`` entries.
 

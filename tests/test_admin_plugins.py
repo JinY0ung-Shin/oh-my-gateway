@@ -55,6 +55,10 @@ class TestAuthGating:
         r = anon_client.delete("/admin/api/marketplaces/foo")
         assert r.status_code in (401, 403)
 
+    def test_refresh_marketplace_requires_admin(self, anon_client):
+        r = anon_client.post("/admin/api/marketplaces/foo/refresh")
+        assert r.status_code in (401, 403)
+
     def test_install_plugin_requires_admin(self, anon_client):
         r = anon_client.post("/admin/api/plugins", json={"name": "octo"})
         assert r.status_code in (401, 403)
@@ -224,6 +228,46 @@ class TestRemoveMarketplace:
             r = admin_client.delete("/admin/api/marketplaces/mp")
         assert r.status_code == 400
         assert r.json() == {"error": "no such marketplace"}
+
+
+# ---------------------------------------------------------------------------
+# refresh_marketplace
+# ---------------------------------------------------------------------------
+
+
+class TestRefreshMarketplace:
+    def test_happy_path(self, admin_client):
+        with patch(
+            "src.plugin_admin_service.refresh_marketplace",
+            return_value={"status": "refreshed", "marketplace": "mp"},
+        ) as mock_refresh:
+            r = admin_client.post(
+                "/admin/api/marketplaces/mp/refresh",
+                json={"scope": "project", "git_token": "tok"},
+            )
+        assert r.status_code == 200
+        assert r.json()["status"] == "refreshed"
+        mock_refresh.assert_called_once_with(
+            "mp", scope="project", git_token="tok"
+        )
+
+    def test_empty_body_uses_defaults(self, admin_client):
+        with patch(
+            "src.plugin_admin_service.refresh_marketplace",
+            return_value={"status": "refreshed", "marketplace": "mp"},
+        ) as mock_refresh:
+            r = admin_client.post("/admin/api/marketplaces/mp/refresh")
+        assert r.status_code == 200
+        mock_refresh.assert_called_once_with("mp", scope="", git_token="")
+
+    def test_plugin_admin_error_400(self, admin_client):
+        with patch(
+            "src.plugin_admin_service.refresh_marketplace",
+            side_effect=PluginAdminError("no repo"),
+        ):
+            r = admin_client.post("/admin/api/marketplaces/mp/refresh")
+        assert r.status_code == 400
+        assert r.json() == {"error": "no repo"}
 
 
 # ---------------------------------------------------------------------------

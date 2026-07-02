@@ -35,6 +35,7 @@ Marketplaces:   GET  /admin/api/marketplaces
                 POST /admin/api/marketplaces
                 GET  /admin/api/marketplaces/catalog
                 GET  /admin/api/marketplaces/{name}/plugins
+                POST /admin/api/marketplaces/{name}/refresh
                 DELETE /admin/api/marketplaces/{name}
 Blocklist:      GET  /admin/api/plugins/blocklist
 """
@@ -97,6 +98,11 @@ class MarketplaceAddRequest(BaseModel):
     repo: str
     branch: str = "main"
     scope: str = "user"
+    git_token: str = ""
+
+
+class MarketplaceRefreshRequest(BaseModel):
+    scope: str = ""
     git_token: str = ""
 
 
@@ -869,6 +875,30 @@ async def remove_marketplace_endpoint(
             plugin_admin_service.remove_marketplace,
             name,
             scope=scope,
+        )
+    except plugin_admin_service.PluginAdminError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+    return result
+
+
+@router.post("/api/marketplaces/{name}/refresh")
+async def refresh_marketplace_endpoint(
+    name: str,
+    body: Optional[MarketplaceRefreshRequest] = None,
+    _=Depends(require_admin),
+):
+    """Re-clone/re-register a marketplace and update its installed plugins."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import plugin_admin_service
+
+    req = body or MarketplaceRefreshRequest()
+    try:
+        result = await run_in_threadpool(
+            plugin_admin_service.refresh_marketplace,
+            name,
+            scope=req.scope,
+            git_token=req.git_token,
         )
     except plugin_admin_service.PluginAdminError as e:
         return JSONResponse(status_code=400, content={"error": str(e)})

@@ -555,6 +555,7 @@ class TestListMarketplaces:
         assert mkts[0]["name"] == "test-mkt"
         assert mkts[0]["source_type"] == "github"
         assert mkts[0]["repo"] == "test/marketplace"
+        assert mkts[0]["branch"] == "main"
 
     def test_scope_defaults_user_without_manifest_record(self, plugins_dir, monkeypatch):
         from src import plugin_manifest
@@ -571,6 +572,24 @@ class TestListMarketplaces:
             lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "project"}},
         )
         assert list_marketplaces()[0]["scope"] == "project"
+
+    def test_repo_and_branch_from_manifest_record(self, plugins_dir, monkeypatch):
+        from src import plugin_manifest
+
+        monkeypatch.setattr(
+            plugin_manifest,
+            "list_marketplace_records",
+            lambda: {
+                "test-mkt": {
+                    "repo": "https://github.com/acme/test-mkt.git",
+                    "branch": "develop",
+                    "scope": "project",
+                }
+            },
+        )
+        mkt = list_marketplaces()[0]
+        assert mkt["repo"] == "https://github.com/acme/test-mkt.git"
+        assert mkt["branch"] == "develop"
 
     def test_scope_from_env_journal_without_manifest_record(
         self, plugins_dir, monkeypatch, tmp_path

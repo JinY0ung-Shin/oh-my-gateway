@@ -186,10 +186,73 @@ async def test_connection(name: str) -> Dict[str, Any]:
     from src.mcp_config import get_mcp_servers
 
     config = get_mcp_servers().get(name)
+    source = "mcp_config"
     if config is None:
         from src import plugin_service
 
         config = plugin_service.get_plugin_mcp_server_config(name)
+        source = "plugin"
     if config is None:
         return {"ok": False, "detail": f"server '{name}' not found"}
-    return await mcp_connection_test.test_mcp_server(name, config)
+    result = await mcp_connection_test.test_mcp_server(name, config)
+    result["agent"] = _agent_availability(name, config, source, result)
+    return result
+
+
+def _agent_availability(
+    name: str, config: Dict[str, Any], source: str, probe: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Explain whether a successful probe can reach new agent sessions.
+
+    This is intentionally not a protocol-level MCP tool invocation. The
+    connection test remains a safe reachability check; this diagnostic adds the
+    gateway/backend exposure conditions that must also be true for a new agent
+    session to see the server.
+    """
+    try:
+        if source == "plugin":
+            from src.admin_service import compute_plugin_mcp_reach
+
+            reach = compute_plugin_mcp_reach(name)
+        else:
+            from src.admin_service import compute_mcp_server_reach
+
+            reach = compute_mcp_server_reach(name, config)
+    except Exception:
+        reach = []
+
+    backends = [
+        str(r.get("backend"))
+        for r in reach
+        if isinstance(r, dict) and r.get("reaches") and r.get("backend")
+    ]
+    reachable = bool(probe.get("ok"))
+    exposed = bool(backends)
+    usable = reachable and exposed
+
+    if not reachable:
+        status = "unreachable"
+        message = "connection test failed; agent use is not available"
+    elif not exposed:
+        status = "not_exposed"
+        message = "reachable, but no enabled backend exposes it to new sessions"
+    else:
+        status = "exposed"
+        message = "reachable and exposed to new agent sessions: " + ", ".join(backends)
+        if source == "plugin":
+            message += " (Claude plugin setting_sources only)"
+        else:
+            message += " (existing sessions keep their pinned MCP set)"
+        detail = str(probe.get("detail") or "")
+        if "not spawned" in detail:
+            message += "; stdio command was not spawned by this safe test"
+
+    return {
+        "usable": usable,
+        "reachable": reachable,
+        "exposed": exposed,
+        "backends": backends,
+        "source": source,
+        "status": status,
+        "message": message,
+    }

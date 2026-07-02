@@ -352,6 +352,85 @@ def test_catalog_install_after_add_marketplace_replays_remote(
     }
 
 
+def test_refresh_marketplace_reclones_and_updates_installed_plugins(
+    monkeypatch, fake_claude, recorded_runs, fake_manifest
+):
+    from src import plugin_service
+
+    fake_manifest.marketplaces["octo-mkt"] = {
+        "repo": "https://github.com/acme/octo-mkt",
+        "branch": "dev",
+        "scope": "project",
+    }
+    monkeypatch.setattr(
+        svc, "prepare_repo", lambda repo, **kw: svc.Path("/clones/octo-mkt-x")
+    )
+    monkeypatch.setattr(
+        plugin_service,
+        "list_plugins",
+        lambda: [
+            {"id": "octo@octo-mkt", "marketplace": "octo-mkt", "scope": "project"},
+            {"id": "other@else", "marketplace": "else", "scope": "user"},
+        ],
+    )
+
+    result = svc.refresh_marketplace("octo-mkt")
+
+    assert result["status"] == "refreshed"
+    assert result["branch"] == "dev"
+    assert result["scope"] == "project"
+    assert result["updated_plugins"] == [
+        {"spec": "octo@octo-mkt", "scope": "project"}
+    ]
+    assert recorded_runs[-2]["cmd"] == [
+        CLAUDE_BIN,
+        "plugin",
+        "marketplace",
+        "add",
+        "--scope",
+        "project",
+        "--",
+        "/clones/octo-mkt-x",
+    ]
+    assert recorded_runs[-1]["cmd"] == [
+        CLAUDE_BIN,
+        "plugin",
+        "update",
+        "--scope",
+        "project",
+        "--",
+        "octo@octo-mkt",
+    ]
+
+
+def test_refresh_marketplace_records_failed_plugin_updates(
+    monkeypatch, fake_claude, fake_manifest
+):
+    from src import plugin_service
+
+    fake_manifest.marketplaces["m"] = {
+        "repo": "https://github.com/acme/m",
+        "branch": "main",
+        "scope": "user",
+    }
+    monkeypatch.setattr(svc, "prepare_repo", lambda repo, **kw: svc.Path("/clones/m"))
+    monkeypatch.setattr(
+        plugin_service,
+        "list_plugins",
+        lambda: [{"id": "bad@m", "marketplace": "m", "scope": "user"}],
+    )
+
+    def fake_run(cmd, *, token=""):
+        if "update" in cmd:
+            raise subprocess.CalledProcessError(9, cmd)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(svc, "run", fake_run)
+    result = svc.refresh_marketplace("m")
+    assert result["updated_plugins"] == []
+    assert result["failed_updates"] == [{"spec": "bad@m", "scope": "user", "rc": 9}]
+
+
 def test_resolve_marketplace_repo_prefers_full_url(monkeypatch, tmp_path):
     import json as _json
 

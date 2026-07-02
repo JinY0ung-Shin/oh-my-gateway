@@ -37,11 +37,19 @@ def get_plugins_html() -> str:
                       <div class="flex-gap-sm" style="align-items:center">
                         <span style="font-size:var(--fs-sm); font-weight:600; color:var(--amber)" x-text="m.name"></span>
                         <span class="badge text-xs" x-text="m.source_type"></span>
+                        <span class="badge text-xs" x-show="m.branch"
+                          style="border-color:var(--border-bright); color:var(--text-dim)"
+                          x-text="m.branch"></span>
                       </div>
                       <div class="text-mono text-xs" style="color:var(--text-dim); overflow:hidden; text-overflow:ellipsis; white-space:nowrap"
                         :title="m.repo" x-text="m.repo"></div>
                     </div>
                     <span class="text-xs text-muted marketplace-count" style="margin-right:8px" x-text="m.plugin_count + ' plugins'"></span>
+                    <button class="btn btn-sm btn-ghost marketplace-refresh"
+                      @click.stop="refreshMarketplace(m)" :disabled="!!marketplaceBusy[m.name]"
+                      aria-label="Refresh marketplace">
+                      <span x-text="marketplaceBusy[m.name] ? 'Refreshing...' : 'Refresh'"></span>
+                    </button>
                     <button class="btn btn-sm btn-ghost marketplace-remove" style="color:var(--red)"
                       @click.stop="removeMarketplace(m.name, m.scope)" aria-label="Remove marketplace">Remove</button>
                   </div>

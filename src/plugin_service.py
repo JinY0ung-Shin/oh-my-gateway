@@ -742,6 +742,37 @@ def _marketplace_scope(
     return "user"
 
 
+def _marketplace_record(
+    marketplace_name: str,
+    records: Optional[Dict] = None,
+    env_records: Optional[Dict] = None,
+) -> Dict[str, str]:
+    """Return manifest/env metadata for a marketplace, normalized to strings."""
+    if records is None:
+        records = _marketplace_records()
+    record = records.get(marketplace_name)
+    if not isinstance(record, dict):
+        if env_records is None:
+            env_records = env_bootstrap_records()
+        record = env_records.get(marketplace_name)
+    if not isinstance(record, dict):
+        return {}
+    return {
+        "repo": str(record.get("repo") or ""),
+        "branch": str(record.get("branch") or ""),
+        "scope": str(record.get("scope") or ""),
+    }
+
+
+def _source_repo(source: Dict[str, Any]) -> str:
+    """Repo/url/path encoded in ``known_marketplaces.json`` source metadata."""
+    for key in ("repo", "url", "path"):
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
 def _strip_url_credentials(repo: str) -> str:
     """Remove embedded credentials from an http(s) repo URL before returning it.
 
@@ -786,14 +817,16 @@ def list_marketplaces() -> List[Dict[str, Any]]:
         if not isinstance(info, dict):
             continue
         source = info.get("source", {})
+        source = source if isinstance(source, dict) else {}
+        record = _marketplace_record(name, records, env_records)
         scope = _marketplace_scope(name, records, env_records)
+        repo = record.get("repo") or _source_repo(source)
         results.append(
             {
                 "name": name,
                 "source_type": source.get("source", "unknown"),
-                "repo": _strip_url_credentials(
-                    source.get("repo", source.get("url", ""))
-                ),
+                "repo": _strip_url_credentials(repo),
+                "branch": record.get("branch") or "main",
                 "last_updated": info.get("lastUpdated"),
                 "scope": scope,
             }

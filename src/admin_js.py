@@ -31,6 +31,7 @@ def get_admin_js() -> str:
     pluginSkillView: null,
     marketplaces: [],
     pluginBusy: false,
+    marketplaceBusy: {},
     catalogFilter: '',
     catalogBusy: {},
     catalogLoading: false,
@@ -736,6 +737,29 @@ def get_admin_js() -> str:
       finally { this.pluginBusy = false; }
     },
 
+    async refreshMarketplace(m) {
+      const name = m.name;
+      if (!name) return;
+      this.marketplaceBusy[name] = true;
+      try {
+        const r = await this.api('/admin/api/marketplaces/' + encodeURIComponent(name) + '/refresh', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ scope: m.scope || '', git_token: '' })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          const updated = (d.updated_plugins || []).length;
+          const failed = (d.failed_updates || []).length;
+          const suffix = failed ? ' (' + updated + ' updated, ' + failed + ' failed)' : ' (' + updated + ' updated)';
+          this.showToast('MARKETPLACE REFRESHED' + suffix, failed ? 'err' : 'ok');
+          await this.refreshPluginViews();
+        } else {
+          this.showToast(d.error || 'Refresh failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { delete this.marketplaceBusy[name]; }
+    },
+
     async installPlugin() {
       const name = this.pluginForm.name.trim();
       if (!name) return;
@@ -851,8 +875,9 @@ def get_admin_js() -> str:
       try {
         const r = await this.api('/admin/api/mcp-servers/' + encodeURIComponent(name) + '/test', { method: 'POST' });
         const d = await r.json().catch(()=>({}));
-        if (r.ok && d.ok) { this.mcpTestResult[name] = {ok:true, message:(d.detail||'reachable')+' ('+(d.latency_ms||0)+'ms)'}; this.showToast('MCP OK: '+name, 'ok'); }
-        else { this.mcpTestResult[name] = {ok:false, message: d.detail || d.error || 'unreachable'}; this.showToast('MCP FAIL: '+name, 'err'); }
+        const agent = d.agent?.message ? ' · Agent: ' + d.agent.message : '';
+        if (r.ok && d.ok) { this.mcpTestResult[name] = {ok:!!d.agent?.usable, message:(d.detail||'reachable')+' ('+(d.latency_ms||0)+'ms)' + agent}; this.showToast(d.agent?.usable ? 'MCP OK: '+name : 'MCP REACHABLE, AGENT BLOCKED: '+name, d.agent?.usable ? 'ok' : 'err'); }
+        else { this.mcpTestResult[name] = {ok:false, message: (d.detail || d.error || 'unreachable') + agent}; this.showToast('MCP FAIL: '+name, 'err'); }
       } catch(e) { this.mcpTestResult[name] = {ok:false, message:'connection error'}; this.showToast('Connection error', 'err'); }
       finally { delete this.mcpTestBusy[name]; }
     },

@@ -251,6 +251,8 @@ class TestConnection:
         assert result["ok"] is True
         assert "not spawned" in result["detail"]
         assert result["transport"] == "stdio"
+        assert result["agent"]["reachable"] is True
+        assert result["agent"]["source"] == "mcp_config"
 
     async def test_stdio_command_not_on_path(self, manifest_file, monkeypatch):
         monkeypatch.setattr(mcp_connection_test.shutil, "which", lambda exe: None)
@@ -288,6 +290,39 @@ class TestConnection:
         assert result["ok"] is True
         assert "405" in result["detail"]
         assert result["transport"] == "http"
+
+    async def test_agent_diagnostic_reports_exposed_backend(
+        self, manifest_file, monkeypatch
+    ):
+        class FakeResponse:
+            status_code = 405
+
+        class FakeClient:
+            def __init__(self, **kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_):
+                return False
+
+            async def get(self, url, headers=None):
+                return FakeResponse()
+
+        monkeypatch.setattr(httpx, "AsyncClient", FakeClient)
+        monkeypatch.setattr(
+            "src.admin_service.compute_mcp_server_reach",
+            lambda name, config: [{"backend": "claude", "reaches": True}],
+        )
+        with env_servers({}):
+            mcp_admin_service.create_server(
+                "docs", {"type": "http", "url": "http://localhost:3000/mcp"}
+            )
+            result = await mcp_admin_service.test_connection("docs")
+        assert result["agent"]["usable"] is True
+        assert result["agent"]["backends"] == ["claude"]
+        assert "new agent sessions" in result["agent"]["message"]
 
     async def test_remote_connect_error_is_unreachable(
         self, manifest_file, monkeypatch
