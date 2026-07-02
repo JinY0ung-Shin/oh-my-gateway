@@ -136,11 +136,19 @@ def get_plugins_html() -> str:
 
             <div class="table-wrapper mb-md">
               <table>
-                <thead><tr><th>PLUGIN</th><th>SCOPE</th><th>ORIGIN</th><th>VERSION</th><th>SKILLS</th><th></th></tr></thead>
-                <tbody>
-                  <template x-for="p in plugins" :key="p.id + '@' + p.scope">
+                <thead><tr><th>PLUGIN</th><th>SCOPE</th><th>ORIGIN</th><th>VERSION</th><th>CAPS</th><th></th></tr></thead>
+                <template x-for="p in plugins" :key="p.id + '@' + p.scope">
+                  <tbody>
                     <tr>
-                      <td style="color:var(--amber); font-weight:600" x-text="p.name"></td>
+                      <td>
+                        <button class="btn btn-sm btn-ghost" style="padding:1px 6px; margin-right:6px"
+                          @click="p._expanded = !p._expanded"
+                          :aria-expanded="p._expanded ? 'true' : 'false'"
+                          aria-label="Toggle plugin skills">
+                          <span x-text="p._expanded ? '-' : '+'"></span>
+                        </button>
+                        <span style="color:var(--amber); font-weight:600" x-text="p.name"></span>
+                      </td>
                       <td class="text-xs text-muted" x-text="p.scope || 'user'"></td>
                       <td>
                         <span class="badge text-xs" x-show="p.origin === 'managed'"
@@ -149,13 +157,101 @@ def get_plugins_html() -> str:
                           style="border-color:var(--amber); color:var(--amber); opacity:0.7">ENV</span>
                       </td>
                       <td class="text-xs text-muted" x-text="p.version ? 'v' + p.version : '-'"></td>
-                      <td class="text-xs text-muted" x-text="(p.skills?.length || 0)"></td>
+                      <td class="text-xs text-muted"
+                        x-text="'S:' + (p.skills?.length || 0) + ' A:' + (p.agents?.length || 0) + ' M:' + (p.mcp_servers?.length || 0)"></td>
                       <td>
                         <button class="btn btn-sm btn-ghost" style="color:var(--red)"
                           @click="uninstallPlugin(p.id, p.scope)" aria-label="Uninstall plugin">Delete</button>
                       </td>
                     </tr>
-                  </template>
+                    <tr x-show="p._expanded">
+                      <td colspan="6" style="padding:0.75rem 1rem; background:var(--bg-surface)">
+                        <div class="flex-between mb-sm">
+                          <div>
+                            <div class="text-xs text-muted">CAPABILITIES</div>
+                            <div class="text-sm" style="color:var(--text-bright)"
+                              x-text="(p.skills?.length || 0) + ' skills / ' + (p.agents?.length || 0) + ' agents / ' + (p.mcp_servers?.length || 0) + ' MCP'"></div>
+                          </div>
+                          <span class="text-xs text-muted" x-text="p.id"></span>
+                        </div>
+                        <div class="text-xs text-muted mb-sm">SKILLS</div>
+                        <div class="file-tree" style="max-height:240px; overflow-y:auto">
+                          <template x-for="sk in (p.skills || [])" :key="p.id + '@' + p.scope + ':' + sk.name">
+                            <div class="file-item"
+                              :class="{ active: pluginSkillView && pluginSkillView.pluginId === p.id && pluginSkillView.scope === p.scope && pluginSkillView.skillName === sk.name }">
+                              <span class="icon" style="color:var(--cyan)">&#9670;</span>
+                              <div style="flex:1; min-width:0">
+                                <div class="flex-gap-sm" style="align-items:center">
+                                  <span style="font-size:var(--fs-sm); color:var(--text); font-weight:600" x-text="sk.name"></span>
+                                  <span class="text-xs text-muted text-mono" x-show="sk.path" x-text="sk.path"></span>
+                                </div>
+                                <div x-show="sk.description" class="text-xs text-muted"
+                                  style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis"
+                                  x-text="sk.description"></div>
+                              </div>
+                              <button class="btn btn-sm btn-ghost" @click="openPluginSkill(p, sk.name)"
+                                aria-label="View plugin skill">View</button>
+                            </div>
+                          </template>
+                          <div x-show="!p.skills || p.skills.length === 0" class="text-xs text-muted" style="padding:4px 12px">
+                            (no skills)
+                          </div>
+                        </div>
+                        <div class="text-xs text-muted mb-sm" style="margin-top:0.75rem">AGENTS</div>
+                        <div class="file-tree">
+                          <template x-for="agent in (p.agents || [])" :key="p.id + '@' + p.scope + ':agent:' + agent.name">
+                            <div class="file-item">
+                              <span class="icon" style="color:var(--magenta)">&#9670;</span>
+                              <div style="flex:1; min-width:0">
+                                <div style="font-size:var(--fs-sm); color:var(--text); font-weight:600" x-text="agent.name"></div>
+                                <div class="text-xs text-muted text-mono" x-show="agent.path"
+                                  style="white-space:nowrap; overflow:hidden; text-overflow:ellipsis"
+                                  x-text="agent.path"></div>
+                              </div>
+                            </div>
+                          </template>
+                          <div x-show="!p.agents || p.agents.length === 0" class="text-xs text-muted" style="padding:4px 12px">
+                            (no agents)
+                          </div>
+                        </div>
+                        <div class="text-xs text-muted mb-sm" style="margin-top:0.75rem">MCP SERVERS</div>
+                        <div class="file-tree">
+                          <template x-for="server in (p.mcp_servers || [])" :key="p.id + '@' + p.scope + ':mcp:' + server.name">
+                            <div class="file-item">
+                              <span class="icon" style="color:var(--green)">&#9670;</span>
+                              <div style="flex:1; min-width:0">
+                                <div class="flex-gap-sm" style="align-items:center">
+                                  <span style="font-size:var(--fs-sm); color:var(--text); font-weight:600" x-text="server.name"></span>
+                                  <span class="badge text-xs" x-text="server.type || 'unknown'"></span>
+                                </div>
+                              </div>
+                            </div>
+                          </template>
+                          <div x-show="!p.mcp_servers || p.mcp_servers.length === 0" class="text-xs text-muted" style="padding:4px 12px">
+                            (no MCP servers)
+                          </div>
+                        </div>
+                        <template x-if="pluginSkillView && pluginSkillView.pluginId === p.id && pluginSkillView.scope === p.scope">
+                          <div style="margin-top:0.75rem">
+                            <div class="editor-toolbar">
+                              <div class="flex-gap-sm">
+                                <span style="color:var(--cyan); font-weight:600"
+                                  x-text="pluginSkillView.pluginName + ':' + pluginSkillView.skillName"></span>
+                                <span class="badge text-xs" style="border-color:var(--amber); color:var(--amber)">SKILL</span>
+                                <span class="text-xs" style="color:var(--text-dim)"
+                                  x-text="pluginSkillView.version ? 'v' + pluginSkillView.version : ''"></span>
+                              </div>
+                              <span class="text-xs text-muted" x-text="(pluginSkillView.content?.length || 0) + ' chars'"></span>
+                            </div>
+                            <textarea readonly :value="pluginSkillView.content || ''" class="readonly-editor"
+                              style="min-height:220px; max-height:34vh"></textarea>
+                          </div>
+                        </template>
+                      </td>
+                    </tr>
+                  </tbody>
+                </template>
+                <tbody>
                   <tr x-show="plugins.length === 0">
                     <td colspan="6" class="text-sm text-muted">No plugins</td>
                   </tr>

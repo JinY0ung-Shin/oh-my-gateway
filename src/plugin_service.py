@@ -11,7 +11,9 @@ Key data sources:
 - ``cache/{marketplace}/{plugin}/{version}/`` — plugin files
   - ``.claude-plugin/plugin.json`` — manifest (name, version, description, skills, commands)
   - ``.claude/skills/*.md`` or ``skills/*/SKILL.md`` — plugin skills
+  - ``.claude/agents/*.md`` or ``agents/*.md`` — plugin agents
   - ``.claude/commands/*.md`` — plugin commands
+  - ``.mcp.json`` — plugin-provided MCP servers
   - ``.claude-plugin/hooks.json`` — hook definitions
   - ``.claude-plugin/settings.json`` — plugin settings
 """
@@ -367,6 +369,57 @@ def _discover_commands(install_path: Path) -> List[Dict[str, str]]:
     return results
 
 
+def _discover_agents(install_path: Path) -> List[Dict[str, str]]:
+    """Discover bundled agent definitions without exposing file contents."""
+    results: List[Dict[str, str]] = []
+
+    def add_agent_file(path: Path, name: str) -> None:
+        if not path.is_file() or path.is_symlink() or path.suffix != ".md":
+            return
+        results.append({"name": name, "path": str(path.relative_to(install_path))})
+
+    flat_dir = install_path / ".claude" / "agents"
+    if flat_dir.is_dir() and not flat_dir.is_symlink():
+        for f in sorted(flat_dir.iterdir()):
+            add_agent_file(f, f.stem)
+
+    portable_dir = install_path / "agents"
+    if portable_dir.is_dir() and not portable_dir.is_symlink():
+        for child in sorted(portable_dir.iterdir()):
+            if child.is_file():
+                add_agent_file(child, child.stem)
+            elif child.is_dir() and not child.is_symlink():
+                for filename in ("AGENT.md", "agent.md"):
+                    agent_file = child / filename
+                    if agent_file.is_file() and not agent_file.is_symlink():
+                        add_agent_file(agent_file, child.name)
+                        break
+
+    return results
+
+
+def _mcp_server_type(config: Dict[str, Any]) -> str:
+    raw_type = str(config.get("type") or "").strip()
+    if raw_type:
+        return raw_type
+    if config.get("command"):
+        return "stdio"
+    if config.get("url"):
+        return "http"
+    return "unknown"
+
+
+def _plugin_mcp_server_summaries(
+    install_path: Optional[Path], manifest: Dict[str, Any]
+) -> List[Dict[str, str]]:
+    """Return safe display metadata for plugin MCP servers."""
+    servers = _plugin_mcp_servers(install_path, manifest)
+    return [
+        {"name": name, "type": _mcp_server_type(config)}
+        for name, config in sorted(servers.items())
+    ]
+
+
 def _parse_plugin_id(plugin_key: str) -> Tuple[str, str]:
     """Split ``name@marketplace`` into ``(name, marketplace)``."""
     if "@" in plugin_key:
@@ -414,7 +467,9 @@ def _resolve_plugin_entry(
 
     manifest = _load_manifest(install_path) if install_path else {}
     skills = _discover_skills(install_path) if install_path else []
+    agents = _discover_agents(install_path) if install_path else []
     commands = _discover_commands(install_path) if install_path else []
+    mcp_servers = _plugin_mcp_server_summaries(install_path, manifest)
 
     return {
         "id": key,
@@ -430,7 +485,9 @@ def _resolve_plugin_entry(
         "install_path": install_path,
         "manifest": manifest,
         "skills": skills,
+        "agents": agents,
         "commands": commands,
+        "mcp_servers": mcp_servers,
     }
 
 
@@ -474,8 +531,12 @@ def list_plugins() -> List[Dict[str, Any]]:
                         else "env"
                     ),
                     "skills": resolved["skills"],
+                    "agents": resolved["agents"],
+                    "mcp_servers": resolved["mcp_servers"],
                     "skill_count": len(resolved["skills"]),
+                    "agent_count": len(resolved["agents"]),
                     "command_count": len(resolved["commands"]),
+                    "mcp_count": len(resolved["mcp_servers"]),
                 }
             )
 
@@ -604,7 +665,9 @@ def get_plugin_detail(
             else "env"
         ),
         "skills": resolved["skills"],
+        "agents": resolved["agents"],
         "commands": resolved["commands"],
+        "mcp_servers": resolved["mcp_servers"],
         "has_hooks": has_hooks,
         "has_settings": has_settings,
         "manifest": {k: v for k, v in manifest.items() if k in _SAFE_MANIFEST_KEYS},

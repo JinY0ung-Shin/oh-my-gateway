@@ -122,6 +122,21 @@ class TestPluginsUi:
         assert "git_token: token" in js
         assert "this.marketplaceTokens[name] = ''" in js
 
+    def test_installed_plugins_show_expandable_skill_details(self):
+        from src.admin_html_plugins import get_plugins_html
+
+        html = get_plugins_html()
+        assert "Toggle plugin skills" in html
+        assert "CAPABILITIES" in html
+        assert "p.skills?.length" in html
+        assert "p.agents?.length" in html
+        assert "p.mcp_servers?.length" in html
+        assert "sk.path" in html
+        assert "agent.path" in html
+        assert "server.type" in html
+        assert "openPluginSkill(p, sk.name)" in html
+        assert "pluginSkillView.pluginName + ':' + pluginSkillView.skillName" in html
+
 
 # ---------------------------------------------------------------------------
 # Marketplace catalog (read-only)

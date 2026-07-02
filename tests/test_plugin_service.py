@@ -7,6 +7,7 @@ from unittest.mock import patch
 import pytest
 
 from src.plugin_service import (
+    _discover_agents,
     _discover_commands,
     _discover_skills,
     _load_manifest,
@@ -81,6 +82,16 @@ def _make_plugin_tree(plugins_root: Path) -> Path:
     commands_dir = cache_dir / ".claude" / "commands"
     commands_dir.mkdir(parents=True)
     (commands_dir / "run.md").write_text("# Run command")
+
+    # Agents
+    agents_dir = cache_dir / ".claude" / "agents"
+    agents_dir.mkdir(parents=True)
+    (agents_dir / "reviewer.md").write_text("# Reviewer agent")
+
+    # MCP servers
+    (cache_dir / ".mcp.json").write_text(
+        json.dumps({"demo-server": {"command": "npx", "args": ["-y", "demo"]}})
+    )
 
     # hooks.json and settings.json
     (meta_dir / "hooks.json").write_text(json.dumps({"event:tool_call": []}))
@@ -333,6 +344,37 @@ class TestDiscoverCommands:
 
 
 # ---------------------------------------------------------------------------
+# _discover_agents
+# ---------------------------------------------------------------------------
+
+
+class TestDiscoverAgents:
+    def test_flat_claude_layout(self, plugins_dir):
+        install_path = next((plugins_dir / "cache").rglob("plugin.json")).parent.parent
+        agents = _discover_agents(install_path)
+        assert agents == [{"name": "reviewer", "path": ".claude/agents/reviewer.md"}]
+
+    def test_portable_agent_layout(self, tmp_path):
+        agents_dir = tmp_path / "agents" / "planner"
+        agents_dir.mkdir(parents=True)
+        (agents_dir / "AGENT.md").write_text("# Planner")
+
+        assert _discover_agents(tmp_path) == [
+            {"name": "planner", "path": "agents/planner/AGENT.md"}
+        ]
+
+    def test_symlink_agent_dir_rejected(self, tmp_path):
+        real = tmp_path / "real_agents"
+        real.mkdir()
+        (real / "reviewer.md").write_text("# Reviewer")
+        link = tmp_path / ".claude" / "agents"
+        link.parent.mkdir(parents=True)
+        link.symlink_to(real)
+
+        assert _discover_agents(tmp_path) == []
+
+
+# ---------------------------------------------------------------------------
 # list_plugins
 # ---------------------------------------------------------------------------
 
@@ -347,7 +389,11 @@ class TestListPlugins:
         assert p["marketplace"] == "test-mkt"
         assert p["version"] == "1.0.0"
         assert p["skill_count"] == 2
+        assert p["agent_count"] == 1
+        assert p["mcp_count"] == 1
         assert p["command_count"] == 1
+        assert p["agents"] == [{"name": "reviewer", "path": ".claude/agents/reviewer.md"}]
+        assert p["mcp_servers"] == [{"name": "demo-server", "type": "stdio"}]
 
     def test_multi_scope_emits_one_row_per_scope(self, plugins_dir):
         # claude stores one entry per scope under a plugin id; each must surface
@@ -487,7 +533,10 @@ class TestGetPluginDetail:
         assert detail["description"] == "A demo plugin for testing"
         assert detail["keywords"] == ["test", "demo"]
         assert len(detail["skills"]) == 2
+        assert len(detail["agents"]) == 1
+        assert len(detail["mcp_servers"]) == 1
         assert len(detail["commands"]) == 1
+        assert detail["mcp_servers"][0] == {"name": "demo-server", "type": "stdio"}
         assert detail["has_hooks"] is True
         assert detail["has_settings"] is True
         assert detail["git_commit_sha"] == "abc123"
