@@ -65,6 +65,13 @@ USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 
+# When set, the gateway injects this HTTP header (value = the request's
+# authenticated user identity) into every http/SSE MCP server config, per
+# request, so downstream MCP servers (e.g. ragaas) can authorize on the user
+# server-side. Unlike a user_id tool argument, the LLM cannot tamper with it.
+# Empty (default) = disabled. Example: "X-OpenWebUI-User-Name".
+MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
+
 # MCP connection-test (admin diagnostics). Short + bounded so a hung server
 # cannot wedge the request thread. Do NOT reuse DEFAULT_TIMEOUT_MS (whole-turn budget).
 MCP_TEST_TIMEOUT_SECONDS = parse_float_env("MCP_TEST_TIMEOUT_SECONDS", 5.0)
