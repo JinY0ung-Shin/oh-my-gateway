@@ -143,6 +143,9 @@ class TestAdminChatPage:
         assert "function upsertTaskStatus(" in r.text
         assert "task-status-line" in r.text
         assert "parent_tool_use_id || evt.tool_use_id" in r.text
+        assert "task_updated" in r.text
+        assert "evt.status || patch.status || 'updated'" in r.text
+        assert "['completed', 'failed', 'stopped', 'killed'].includes(status)" in r.text
 
     def test_admin_chat_page_serves_login_gate_to_unauthenticated_clients(self):
         """Anonymous GET /admin/chat should return 200 with the inline auth gate."""

@@ -537,6 +537,13 @@ async def test_stream_response_chunks_task_events_as_custom_sse():
             "status": "completed",
             "summary": "Done",
         }
+        # Registry patch — the only terminal signal for killed/background tasks
+        yield {
+            "type": "system",
+            "subtype": "task_updated",
+            "task_id": "t2",
+            "patch": {"status": "killed"},
+        }
 
     stream_result = {}
     lines = [
@@ -567,6 +574,15 @@ async def test_stream_response_chunks_task_events_as_custom_sse():
     task_done = next(p for et, p in parsed if et == "response.task_notification")
     assert task_done["type"] == "response.task_notification"
     assert task_done["status"] == "completed"
+
+    # task_updated is forwarded even without a tool_use_id (registry-level
+    # event) — status derived from the patch, raw patch passed through.
+    assert "response.task_updated" in event_types
+    task_updated = next(p for et, p in parsed if et == "response.task_updated")
+    assert task_updated["type"] == "response.task_updated"
+    assert task_updated["task_id"] == "t2"
+    assert task_updated["status"] == "killed"
+    assert task_updated["patch"] == {"status": "killed"}
 
     # Task-only stream has no assistant text → signals empty via stream_result.
     # The route converts that into a response.failed event (see

@@ -45,16 +45,24 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     nests progress under, so we surface it as ``parent_tool_use_id`` (the field
     every other event uses for attribution). An explicit ``parent_tool_use_id``
     on the chunk still wins, for forward-compatibility and synthetic callers.
+    ``task_updated`` is a task-registry patch and carries neither id on the
+    wire; the same derivation applies if a caller supplies them.
     """
     subtype = chunk.get("subtype")
     tool_use_id = chunk.get("tool_use_id")
     parent_tool_use_id = chunk.get("parent_tool_use_id") or tool_use_id
+    # SDK-typed chunks put task_type at the top level and keep the raw CLI
+    # payload (incl. subagent_type) under ``data``; raw dict chunks carry both
+    # at the top level.
+    data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
     if subtype == "task_started":
         return {
             "type": "task_started",
             "task_id": chunk.get("task_id", ""),
             "description": chunk.get("description", ""),
             "session_id": chunk.get("session_id", ""),
+            "task_type": chunk.get("task_type") or data.get("task_type"),
+            "subagent_type": chunk.get("subagent_type") or data.get("subagent_type"),
             "tool_use_id": tool_use_id,
             "parent_tool_use_id": parent_tool_use_id,
         }
@@ -75,6 +83,22 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "status": chunk.get("status", ""),
             "summary": chunk.get("summary", ""),
             "usage": chunk.get("usage"),
+            "tool_use_id": tool_use_id,
+            "parent_tool_use_id": parent_tool_use_id,
+        }
+    if subtype == "task_updated":
+        # Terminal state (completed/failed/killed) can arrive ONLY as a
+        # task_updated patch with no task_notification (e.g. a task killed via
+        # TaskStop, background tasks, in-process teammates), so dropping this
+        # subtype loses the task's ending. Status/patch are passed through raw
+        # (``killed`` is not mapped to ``stopped``), per gateway philosophy.
+        patch = chunk.get("patch") if isinstance(chunk.get("patch"), dict) else {}
+        return {
+            "type": "task_updated",
+            "task_id": chunk.get("task_id", ""),
+            "status": chunk.get("status") or patch.get("status"),
+            "patch": patch,
+            "session_id": chunk.get("session_id"),
             "tool_use_id": tool_use_id,
             "parent_tool_use_id": parent_tool_use_id,
         }

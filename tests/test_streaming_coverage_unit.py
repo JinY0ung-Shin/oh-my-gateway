@@ -300,7 +300,12 @@ class TestBuildTaskEventUnmatched:
     def test_propagates_parent_tool_use_id(self):
         """Subagent task events carry parent_tool_use_id so the UI can attribute
         them to the agent that spawned the subagent."""
-        for subtype in ("task_started", "task_progress", "task_notification"):
+        for subtype in (
+            "task_started",
+            "task_progress",
+            "task_notification",
+            "task_updated",
+        ):
             result = _build_task_event(
                 {"subtype": subtype, "task_id": "t1", "parent_tool_use_id": "agent-1"}
             )
@@ -310,7 +315,12 @@ class TestBuildTaskEventUnmatched:
         """The real SDK task messages expose ``tool_use_id`` (the spawning Task
         tool's id) and no ``parent_tool_use_id``. Surface it as
         parent_tool_use_id so the chat UI nests progress under the agent."""
-        for subtype in ("task_started", "task_progress", "task_notification"):
+        for subtype in (
+            "task_started",
+            "task_progress",
+            "task_notification",
+            "task_updated",
+        ):
             result = _build_task_event(
                 {"subtype": subtype, "task_id": "t1", "tool_use_id": "agent-1"}
             )
@@ -333,6 +343,79 @@ class TestBuildTaskEventUnmatched:
         """Top-level (main-agent) task events have no parent → None."""
         result = _build_task_event({"subtype": "task_started", "task_id": "t1"})
         assert result["parent_tool_use_id"] is None
+
+    def test_task_started_task_type_from_sdk_message(self):
+        """SDK TaskStartedMessage puts task_type at the top level and keeps the
+        raw payload (incl. subagent_type) under ``data``. Both must surface so
+        clients can tell teammate spawns from plain subagent tasks."""
+        result = _build_task_event(
+            {
+                "subtype": "task_started",
+                "task_id": "t1",
+                "task_type": "in_process_teammate",
+                "data": {
+                    "task_type": "in_process_teammate",
+                    "subagent_type": "researcher",
+                },
+            }
+        )
+        assert result["task_type"] == "in_process_teammate"
+        assert result["subagent_type"] == "researcher"
+
+    def test_task_started_task_type_from_raw_dict(self):
+        """Raw CLI dict chunks carry task_type/subagent_type at the top level."""
+        result = _build_task_event(
+            {
+                "subtype": "task_started",
+                "task_id": "t1",
+                "task_type": "local_agent",
+                "subagent_type": "Explore",
+            }
+        )
+        assert result["task_type"] == "local_agent"
+        assert result["subagent_type"] == "Explore"
+
+    def test_task_started_task_type_absent(self):
+        """Older CLIs without task_type still build the event (fields None)."""
+        result = _build_task_event({"subtype": "task_started", "task_id": "t1"})
+        assert result["task_type"] is None
+        assert result["subagent_type"] is None
+
+    def test_task_updated_passthrough(self):
+        """task_updated surfaces the raw registry patch; terminal statuses like
+        ``killed`` may arrive ONLY here (no task_notification), so the event
+        must carry enough to close out task tracking."""
+        result = _build_task_event(
+            {
+                "subtype": "task_updated",
+                "task_id": "t1",
+                "status": "killed",
+                "patch": {"status": "killed", "end_time": "2026-07-06T00:00:00Z"},
+                "session_id": "s1",
+            }
+        )
+        assert result["type"] == "task_updated"
+        assert result["task_id"] == "t1"
+        assert result["status"] == "killed"
+        assert result["patch"] == {
+            "status": "killed",
+            "end_time": "2026-07-06T00:00:00Z",
+        }
+        assert result["session_id"] == "s1"
+
+    def test_task_updated_status_falls_back_to_patch(self):
+        """Raw CLI chunks have no top-level status — derive it from the patch,
+        matching how the SDK's TaskUpdatedMessage populates ``.status``."""
+        result = _build_task_event(
+            {"subtype": "task_updated", "task_id": "t1", "patch": {"status": "completed"}}
+        )
+        assert result["status"] == "completed"
+
+    def test_task_updated_non_dict_patch(self):
+        """A malformed/absent patch never raises; status stays None."""
+        result = _build_task_event({"subtype": "task_updated", "task_id": "t1", "patch": None})
+        assert result["patch"] == {}
+        assert result["status"] is None
 
 
 # ---------------------------------------------------------------------------

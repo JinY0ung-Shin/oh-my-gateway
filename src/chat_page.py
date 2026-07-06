@@ -1183,7 +1183,8 @@ function attachToolResult(card, content, isError) {
 }
 
 // Maintain ONE live status line per subagent, nested under the spawning agent,
-// updated in place across task_started / task_progress / task_notification.
+// updated in place across task_started / task_progress / task_notification /
+// task_updated.
 function upsertTaskStatus(evt) {
   const taskType = String(evt.type || '').slice('response.'.length);
   const parentId = evt.parent_tool_use_id || evt.tool_use_id;
@@ -1198,6 +1199,13 @@ function upsertTaskStatus(evt) {
   } else if (taskType === 'task_notification') {
     state = evt.status === 'failed' ? 'error' : 'done';
     text = (evt.status || 'done') + (evt.summary ? ' · ' + evt.summary : '');
+  } else if (taskType === 'task_updated') {
+    const patch = evt.patch && typeof evt.patch === 'object' ? evt.patch : {};
+    const status = evt.status || patch.status || 'updated';
+    const detail = evt.summary || patch.summary || patch.description || '';
+    const isTerminal = ['completed', 'failed', 'stopped', 'killed'].includes(status);
+    state = status === 'failed' ? 'error' : (isTerminal ? 'done' : 'running');
+    text = status + (detail ? ' · ' + detail : '');
   } else {
     return;
   }

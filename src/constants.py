@@ -166,6 +166,8 @@ SSE_KEEPALIVE_INTERVAL = parse_int_env("SSE_KEEPALIVE_INTERVAL", 15)
 #   Default true — clients can render "View Result" for subagent tool calls.
 # SUBAGENT_STREAM_PROGRESS: Forward task_started/task_progress/task_notification events.
 #   Default true — clients can show subagent execution progress.
+#   Note: task_updated is a registry-level patch with no tool_use_id, so it bypasses
+#   this gate and is always forwarded (a task's terminal state must not be lost).
 SUBAGENT_STREAM_TEXT = parse_bool_env("SUBAGENT_STREAM_TEXT", "false")
 SUBAGENT_STREAM_TOOL_BLOCKS = parse_bool_env("SUBAGENT_STREAM_TOOL_BLOCKS", "true")
 SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")

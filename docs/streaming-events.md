@@ -42,6 +42,7 @@ response.tool_result            # zero or more
 response.task_started           # zero or more
 response.task_progress          # zero or more
 response.task_notification      # zero or more
+response.task_updated           # zero or more
 response.hook_event             # zero or more (liveness)
 response.compaction             # zero or more (liveness)
 response.output_text.done
@@ -214,9 +215,16 @@ Subagent task system messages are forwarded as structured progress events:
   "task_id": "task_abc123",
   "description": "Research API patterns",
   "session_id": "sdk-session-id",
+  "task_type": "local_agent",
+  "subagent_type": "Explore",
   "sequence_number": 8
 }
 ```
+
+`task_type` distinguishes what kind of task spawned: `local_agent` for a
+regular subagent, `in_process_teammate` for an agent-team teammate,
+`local_workflow` for a workflow run. `subagent_type` is the agent definition
+name when applicable. Both are `null` on CLI versions that don't report them.
 
 ```json
 {
@@ -239,6 +247,31 @@ Subagent task system messages are forwarded as structured progress events:
   "sequence_number": 10
 }
 ```
+
+```json
+{
+  "type": "response.task_updated",
+  "task_id": "task_abc123",
+  "status": "killed",
+  "patch": { "status": "killed", "end_time": "2026-07-06T00:00:00Z" },
+  "session_id": null,
+  "tool_use_id": null,
+  "parent_tool_use_id": null,
+  "sequence_number": 11
+}
+```
+
+`response.task_updated` mirrors the SDK's task-registry patches. A task's
+terminal state can arrive **only** here, with no `response.task_notification`
+— e.g. a task killed via `TaskStop`, background tasks, and in-process
+teammates. Clients tracking active tasks should clear a task on a terminal
+`status` from *either* event. Statuses are passed through raw: `task_updated`
+reports `killed` where `task_notification` would report `stopped`; terminal
+values across both are `completed`, `failed`, `stopped`, `killed`. Unlike the
+other task events, `task_updated` is a registry-level patch not tied to a
+spawning `Task` tool call: the CLI reports no `tool_use_id` for it, so it is
+forwarded regardless of `SUBAGENT_STREAM_PROGRESS`. The `tool_use_id` /
+`parent_tool_use_id` keys are still present in the event JSON — always `null`.
 
 Subagent visibility is controlled by:
 
