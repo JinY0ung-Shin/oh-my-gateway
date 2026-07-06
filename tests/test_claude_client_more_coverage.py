@@ -652,6 +652,16 @@ class TestInjectMcpUserHeader:
         assert out["ragaas"]["headers"]["X-User"].startswith("%")
         out["ragaas"]["headers"]["X-User"].encode("ascii")  # must not raise
 
+    def test_crlf_in_user_is_encoded_not_injected(self, monkeypatch):
+        # An ASCII value with CR/LF must be percent-encoded so it cannot smuggle
+        # an extra header into the outbound MCP request (header injection).
+        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-User")
+        cli = _make_cli()
+        out = cli._inject_mcp_user_header(self._mcp(), "alice\r\nX-Injected: evil")
+        value = out["ragaas"]["headers"]["X-User"]
+        assert "\r" not in value and "\n" not in value
+        assert "%0" in value.upper()  # CR/LF percent-encoded
+
     def test_forward_headers_injected_alongside_user(self, monkeypatch):
         monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-OpenWebUI-User-Name")
         cli = _make_cli()
@@ -741,6 +751,14 @@ class TestBuildMcpContextHeaders:
 
         out = build_mcp_context_headers("carol", self._headers())
         assert json.loads(out["X-MCP-Context"]) == {"user_id": "carol"}
+
+    def test_empty_header_name_token_does_not_leak(self, monkeypatch):
+        # A misconfigured {{header:}} must resolve to "" (key dropped), never
+        # leak the literal token into the downstream payload.
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", '{"tok":"{{header:}}"}')
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers("alice", self._headers()) == {}
 
     def test_invalid_json_is_ignored(self, monkeypatch):
         monkeypatch.setenv("MCP_FORWARD_CONTEXT", "{not json")

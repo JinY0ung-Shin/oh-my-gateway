@@ -808,10 +808,11 @@ def _collect_mcp_forward_headers(
 ) -> Dict[str, str]:
     """Build the per-request MCP context header from ``MCP_FORWARD_CONTEXT``.
 
-    Resolves ``{{user}}`` from the server-authoritative identity (``body.user``)
-    and ``{{header:NAME}}`` from inbound request headers (caller-owned
-    credentials the downstream MCP server validates itself), then returns a
-    single JSON header for injection into the MCP server configs.
+    Resolves ``{{user}}`` from the request identity (``body.user`` — trustworthy
+    only when set by a trusted caller, not a direct API caller) and
+    ``{{header:NAME}}`` from inbound request headers (caller-owned credentials
+    the downstream MCP server validates itself), then returns a single JSON
+    header for injection into the MCP server configs.
     """
     from src.constants import build_mcp_context_headers
 
@@ -1351,7 +1352,13 @@ async def create_response(
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
     # Per-request MCP context header (identity + caller-owned credentials).
-    forward_headers = _collect_mcp_forward_headers(request, body)
+    # Only the claude backend consumes it, so skip the env-read + JSON parse for
+    # codex/opencode.
+    forward_headers = (
+        _collect_mcp_forward_headers(request, body)
+        if resolved.backend == "claude"
+        else {}
+    )
 
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)

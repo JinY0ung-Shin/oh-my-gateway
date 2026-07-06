@@ -363,14 +363,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
     @staticmethod
     def _header_safe(value: str) -> str:
-        """Return *value* usable as an HTTP header value (percent-encode non-ascii)."""
-        try:
-            value.encode("ascii")
-            return value
-        except UnicodeEncodeError:
-            from urllib.parse import quote
+        """Return *value* usable as an HTTP header value.
 
-            return quote(value)
+        Percent-encodes non-ascii AND any control characters (CR/LF/NUL/…) so a
+        value derived from request input can neither inject extra headers (CRLF)
+        nor break the outbound MCP request. Plain printable-ascii passes through
+        unchanged.
+        """
+        from urllib.parse import quote
+
+        if value.isascii() and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
+            return value
+        return quote(value)
 
     def _inject_mcp_user_header(
         self,
@@ -384,8 +388,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         ``headers`` so downstream servers (e.g. ragaas) receive them out of the
         LLM's reach:
 
-        - ``MCP_FORWARD_USER_HEADER: <user>`` — the server-authoritative user
-          *identity* (a tool argument would be tamperable).
+        - ``MCP_FORWARD_USER_HEADER: <user>`` — the user *identity*, kept out of
+          the LLM's reach (a tool argument would be tamperable). Its trust rests
+          on ``body.user`` coming from a trusted caller, not a direct API caller.
         - ``forward_headers`` — the caller-supplied context header(s) the route
           resolved from ``MCP_FORWARD_CONTEXT`` (identity + caller-owned
           credentials the downstream validates itself).
@@ -578,7 +583,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if output_format:
             options.output_format = output_format
         self._configure_mcp_servers(
-            options, mcp_servers, allowed_tools, user=user, forward_headers=forward_headers
+            options,
+            mcp_servers,
+            allowed_tools,
+            user=user,
+            forward_headers=forward_headers,
         )
         from src.runtime_config import get_token_streaming
 

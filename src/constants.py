@@ -67,15 +67,19 @@ USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 
-# When set, the gateway injects this HTTP header (value = the request's
-# authenticated user identity) into every http/SSE MCP server config, per
-# request, so downstream MCP servers (e.g. ragaas) can authorize on the user
-# server-side. Unlike a user_id tool argument, the LLM cannot tamper with it.
+# When set, the gateway injects this HTTP header (value = the request's user
+# identity, ``body.user``) into every http/SSE MCP server config, per request, so
+# downstream MCP servers (e.g. ragaas) can authorize on the user server-side.
+# This keeps identity out of the LLM's reach (a user_id *tool argument* is
+# tamperable by the model). NOTE: ``body.user`` is a request-body field, so it is
+# only as trustworthy as the caller — this is safe only when the gateway is
+# reachable solely via a trusted caller (the pipe, which sets it from the
+# authenticated ``__user__``) and not directly by end users.
 # Empty (default) = disabled. Example: "X-OpenWebUI-User-Name".
 MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
 
 # Generalized per-request MCP context. A JSON object template whose values may
-# contain ``{{user}}`` (the server-authoritative authenticated identity) and
+# contain ``{{user}}`` (the authenticated identity, from ``body.user``) and
 # ``{{header:NAME}}`` (an inbound request header, e.g. a caller-owned session
 # token the downstream MCP server validates itself). The gateway resolves the
 # template per request and injects the result as ONE JSON header
@@ -86,13 +90,18 @@ MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
 # Example: {"user_id":"{{user}}","dscrowd_token":"{{header:X-Cookie-dscrowd.token_key}}"}
 #
 # Identity vs credential: use ``{{user}}`` (not ``{{header:...}}``) for identity —
-# it is derived server-side and cannot be spoofed. ``{{header:...}}`` is for the
-# caller's own bearer credentials, which the downstream authenticates.
+# it stays out of the LLM's reach. Its trust still rests on ``body.user`` being
+# set by a trusted caller (see MCP_FORWARD_USER_HEADER note above), not spoofed by
+# a direct API caller. ``{{header:...}}`` is for the caller's own bearer
+# credentials, which the downstream authenticates.
 MCP_FORWARD_CONTEXT = os.getenv("MCP_FORWARD_CONTEXT", "")
 MCP_FORWARD_CONTEXT_HEADER = os.getenv("MCP_FORWARD_CONTEXT_HEADER", "X-MCP-Context")
 
 
-_MCP_CONTEXT_TOKEN_RE = re.compile(r"\{\{\s*(user|header:[^}]+?)\s*\}\}")
+# ``header:`` accepts an empty name (``[^}]*?``) so a misconfigured
+# ``{{header:}}`` resolves to "" (and its key is dropped) rather than leaking the
+# literal token into the downstream context payload.
+_MCP_CONTEXT_TOKEN_RE = re.compile(r"\{\{\s*(user|header:[^}]*?)\s*\}\}")
 
 
 def _resolve_mcp_context_value(template, user, header_getter) -> str:
