@@ -255,6 +255,8 @@ name when applicable. Both are `null` on CLI versions that don't report them.
   "status": "killed",
   "patch": { "status": "killed", "end_time": "2026-07-06T00:00:00Z" },
   "session_id": null,
+  "tool_use_id": null,
+  "parent_tool_use_id": null,
   "sequence_number": 11
 }
 ```
@@ -266,8 +268,10 @@ teammates. Clients tracking active tasks should clear a task on a terminal
 `status` from *either* event. Statuses are passed through raw: `task_updated`
 reports `killed` where `task_notification` would report `stopped`; terminal
 values across both are `completed`, `failed`, `stopped`, `killed`. Unlike the
-other task events, `task_updated` carries no `tool_use_id` on the wire, so it
-is forwarded regardless of `SUBAGENT_STREAM_PROGRESS`.
+other task events, `task_updated` is a registry-level patch not tied to a
+spawning `Task` tool call: the CLI reports no `tool_use_id` for it, so it is
+forwarded regardless of `SUBAGENT_STREAM_PROGRESS`. The `tool_use_id` /
+`parent_tool_use_id` keys are still present in the event JSON — always `null`.
 
 Subagent visibility is controlled by:
 
