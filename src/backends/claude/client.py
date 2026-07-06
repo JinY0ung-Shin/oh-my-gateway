@@ -917,6 +917,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         model_params: Optional[Dict[str, Any]] = None,
         output_format: Optional[Dict[str, Any]] = None,
         _custom_base: object = _UNSET,
+        user: Optional[str] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
@@ -954,6 +955,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             cwd=Path(cwd) if cwd else None,
             extra_env=extra_env,
             _custom_base=_custom_base,
+            user=user,
         )
         pre_tool_use = [
             HookMatcher(

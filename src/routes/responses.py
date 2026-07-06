@@ -832,6 +832,11 @@ async def _ensure_response_session_client(
     create_kwargs: Dict[str, Any] = {}
     if output_format is not None:
         create_kwargs["output_format"] = output_format
+    # Server-authoritative user identity for MCP header injection (persistent
+    # session path). Only the claude backend's create_client accepts ``user``;
+    # gate it so codex/opencode create_client() aren't passed an unknown kwarg.
+    if resolved.backend == "claude":
+        create_kwargs["user"] = body.user
     try:
         session.client = await backend.create_client(
             session=session,
