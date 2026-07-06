@@ -803,6 +803,22 @@ async def _refresh_existing_client_policy(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _collect_mcp_forward_headers(
+    request: Request, body: ResponseCreateRequest
+) -> Dict[str, str]:
+    """Build the per-request MCP context header from ``MCP_FORWARD_CONTEXT``.
+
+    Resolves ``{{user}}`` from the request identity (``body.user`` — trustworthy
+    only when set by a trusted caller, not a direct API caller) and
+    ``{{header:NAME}}`` from inbound request headers (caller-owned credentials
+    the downstream MCP server validates itself), then returns a single JSON
+    header for injection into the MCP server configs.
+    """
+    from src.constants import build_mcp_context_headers
+
+    return build_mcp_context_headers(body.user, request.headers.get)
+
+
 async def _ensure_response_session_client(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
@@ -812,6 +828,7 @@ async def _ensure_response_session_client(
     is_new_session: bool,
     system_prompt: Optional[str],
     workspace_str: str,
+    forward_headers: Optional[Dict[str, str]] = None,
 ) -> None:
     """Create the persistent backend client after session preflight has passed."""
     output_format = _response_output_format(body)
@@ -832,6 +849,14 @@ async def _ensure_response_session_client(
     create_kwargs: Dict[str, Any] = {}
     if output_format is not None:
         create_kwargs["output_format"] = output_format
+    # Per-request MCP header injection (persistent session path). ``user`` is
+    # consumed by the claude backend only (system-prompt identity); the resolved
+    # context header goes to both claude and codex. opencode's create_client
+    # accepts neither, so gate to avoid an unknown-kwarg TypeError.
+    if resolved.backend == "claude":
+        create_kwargs["user"] = body.user
+    if resolved.backend in {"claude", "codex"} and forward_headers:
+        create_kwargs["forward_headers"] = forward_headers
     try:
         session.client = await backend.create_client(
             session=session,
@@ -1327,6 +1352,15 @@ async def create_response(
     validate_model_vision_support(body, resolved)
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
+    # Per-request MCP context header (identity + caller-owned credentials).
+    # Only the claude and codex backends consume it, so skip the env-read + JSON
+    # parse for opencode.
+    forward_headers = (
+        _collect_mcp_forward_headers(request, body)
+        if resolved.backend in {"claude", "codex"}
+        else {}
+    )
+
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
     session_id, session = _resolve_response_session(body, resolved.backend)
@@ -1392,6 +1426,7 @@ async def create_response(
                 is_new_session,
                 system_prompt,
                 workspace_str,
+                forward_headers=forward_headers,
             )
         except Exception:
             if preflight["lock_acquired"]:
@@ -1583,6 +1618,7 @@ async def create_response(
                 is_new_session,
                 system_prompt,
                 workspace_str,
+                forward_headers=forward_headers,
             )
             # Execute backend through the persistent client.
             chunks = []

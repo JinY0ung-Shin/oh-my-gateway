@@ -7,7 +7,9 @@ All configurable values can be overridden via environment variables.
 """
 
 import fnmatch
+import json
 import os
+import re
 from dotenv import dotenv_values, load_dotenv
 
 from src.env_utils import parse_bool_env, parse_float_env, parse_int_env
@@ -64,6 +66,79 @@ USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
 # Path to MCP config JSON file or inline JSON string
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
+
+# Per-request MCP context. A JSON object template whose values may contain
+# ``{{user}}`` (the authenticated identity, from ``body.user``) and
+# ``{{header:NAME}}`` (an inbound request header, e.g. a caller-owned session
+# token the downstream MCP server validates itself). The gateway resolves the
+# template per request and injects the result as ONE JSON header
+# (``MCP_FORWARD_CONTEXT_HEADER``) into every http/SSE MCP server config, so the
+# downstream can read whatever keys it needs — adding a new value is a config-only
+# change (add a key to the JSON), never a code change. Keys whose resolved value
+# is empty are dropped. Empty (default) = disabled.
+# Example: {"user_id":"{{user}}","dscrowd_token":"{{header:X-Cookie-dscrowd.token_key}}"}
+#
+# Identity vs credential: use ``{{user}}`` (not ``{{header:...}}``) for identity —
+# it stays out of the LLM's reach. Its trust still rests on ``body.user`` being
+# set by a trusted caller (the pipe, from the authenticated ``__user__``), not
+# spoofed by a direct API caller reaching the gateway. ``{{header:...}}`` is for
+# the caller's own bearer credentials, which the downstream authenticates.
+MCP_FORWARD_CONTEXT = os.getenv("MCP_FORWARD_CONTEXT", "")
+MCP_FORWARD_CONTEXT_HEADER = os.getenv("MCP_FORWARD_CONTEXT_HEADER", "X-MCP-Context")
+
+
+# ``header:`` accepts an empty name (``[^}]*?``) so a misconfigured
+# ``{{header:}}`` resolves to "" (and its key is dropped) rather than leaking the
+# literal token into the downstream context payload.
+_MCP_CONTEXT_TOKEN_RE = re.compile(r"\{\{\s*(user|header:[^}]*?)\s*\}\}")
+
+
+def _resolve_mcp_context_value(template, user, header_getter) -> str:
+    """Substitute ``{{user}}`` / ``{{header:NAME}}`` tokens in *template*."""
+
+    def repl(match):
+        token = match.group(1).strip()
+        if token == "user":
+            return user or ""
+        name = token[len("header:") :].strip()
+        value = header_getter(name) if header_getter else None
+        return value or ""
+
+    return _MCP_CONTEXT_TOKEN_RE.sub(repl, template)
+
+
+def build_mcp_context_headers(user, header_getter) -> dict:
+    """Resolve ``MCP_FORWARD_CONTEXT`` into the single JSON context header.
+
+    *header_getter* is a callable ``name -> value | None`` (e.g.
+    ``request.headers.get``). Read from the environment on each call so
+    runtime/test overrides take effect without a module reload. Returns an empty
+    dict when disabled, misconfigured, or nothing resolves to a non-empty value.
+    """
+    raw = os.getenv("MCP_FORWARD_CONTEXT", "").strip()
+    if not raw:
+        return {}
+    try:
+        template = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(template, dict):
+        return {}
+
+    resolved = {}
+    for key, value in template.items():
+        if not isinstance(value, str):
+            continue
+        out = _resolve_mcp_context_value(value, user, header_getter)
+        if out:
+            resolved[key] = out
+    if not resolved:
+        return {}
+
+    header_name = os.getenv("MCP_FORWARD_CONTEXT_HEADER", "X-MCP-Context").strip()
+    header_name = header_name or "X-MCP-Context"
+    return {header_name: json.dumps(resolved, ensure_ascii=True, separators=(",", ":"))}
+
 
 # MCP connection-test (admin diagnostics). Short + bounded so a hung server
 # cannot wedge the request thread. Do NOT reuse DEFAULT_TIMEOUT_MS (whole-turn budget).

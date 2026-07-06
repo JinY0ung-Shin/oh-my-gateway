@@ -6,6 +6,7 @@ Targets uncovered lines found in the 88%-coverage run:
 """
 
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -599,3 +600,164 @@ class TestReceiveResponseFromClient:
 
         assert len(result) == 2
         assert result[0]["type"] == "assistant"
+
+
+# ---------------------------------------------------------------------------
+# inject_mcp_headers() — merge per-request context headers into MCP configs
+# ---------------------------------------------------------------------------
+
+
+class TestInjectMcpHeaders:
+    """Shared header injection used by the claude + codex backends (issue #124)."""
+
+    def _mcp(self):
+        return {
+            "ragaas": {"type": "http", "url": "http://127.0.0.1:10074/mcp"},
+            "local": {"type": "stdio", "command": "x"},
+            "sse1": {"type": "sse", "url": "y", "headers": {"A": "1"}},
+        }
+
+    def test_no_op_when_no_forward_headers(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        mcp = self._mcp()
+        # No-op returns the same object untouched.
+        assert inject_mcp_headers(mcp, None) is mcp
+        assert inject_mcp_headers(mcp, {}) is mcp
+
+    def test_no_op_when_no_servers(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        assert inject_mcp_headers(None, {"X-A": "1"}) is None
+
+    def test_injects_into_http_and_sse_only(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        mcp = self._mcp()
+        out = inject_mcp_headers(mcp, {"X-Ctx": "v"})
+
+        assert out["ragaas"]["headers"] == {"X-Ctx": "v"}
+        # Existing headers preserved (merged, not clobbered).
+        assert out["sse1"]["headers"] == {"A": "1", "X-Ctx": "v"}
+        # stdio servers have no headers key added.
+        assert "headers" not in out["local"]
+        # The shared config passed in is never mutated (deep-copied).
+        assert "headers" not in mcp["ragaas"]
+
+    def test_non_ascii_value_is_quoted(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        out = inject_mcp_headers(self._mcp(), {"X-User": "김철수"})
+        assert out["ragaas"]["headers"]["X-User"].startswith("%")
+        out["ragaas"]["headers"]["X-User"].encode("ascii")  # must not raise
+
+    def test_crlf_in_value_is_encoded_not_injected(self):
+        # An ASCII value with CR/LF must be percent-encoded so it cannot smuggle
+        # an extra header into the outbound MCP request (header injection).
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        out = inject_mcp_headers(self._mcp(), {"X-User": "alice\r\nX-Injected: evil"})
+        value = out["ragaas"]["headers"]["X-User"]
+        assert "\r" not in value and "\n" not in value
+        assert "%0" in value.upper()  # CR/LF percent-encoded
+
+    def test_non_dict_existing_headers_is_skipped_with_warning(self, caplog):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        mcp = {"bad": {"type": "http", "url": "u", "headers": "Authorization: x"}}
+        with caplog.at_level("WARNING"):
+            out = inject_mcp_headers(mcp, {"X-Ctx": "v"})
+        # The malformed server is left as-is (string headers untouched)...
+        assert out["bad"]["headers"] == "Authorization: x"
+        # ...and the skip is surfaced, not silent.
+        assert any("non-dict 'headers'" in r.message for r in caplog.records)
+
+    def test_url_only_server_without_type_is_treated_as_stdio(self):
+        # Documents current behavior: a bare {"url": ...} with no explicit type
+        # defaults to stdio and is NOT injected.
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        out = inject_mcp_headers({"s": {"url": "http://x/mcp"}}, {"X-Ctx": "v"})
+        assert "headers" not in out["s"]
+
+
+class TestBuildMcpContextHeaders:
+    """MCP_FORWARD_CONTEXT resolution into a single JSON header (issue #124)."""
+
+    def _headers(self, **kw):
+        # Case-insensitive getter mirroring Starlette request.headers.get.
+        lowered = {k.lower(): v for k, v in kw.items()}
+        return lambda name: lowered.get(name.lower())
+
+    def test_disabled_when_unset(self, monkeypatch):
+        monkeypatch.delenv("MCP_FORWARD_CONTEXT", raising=False)
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers("alice", self._headers()) == {}
+
+    def test_resolves_user_and_header_tokens(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_FORWARD_CONTEXT",
+            '{"user_id":"{{user}}","dscrowd_token":"{{header:X-Cookie-dscrowd.token_key}}"}',
+        )
+        monkeypatch.delenv("MCP_FORWARD_CONTEXT_HEADER", raising=False)
+        from src.constants import build_mcp_context_headers
+
+        out = build_mcp_context_headers(
+            "alice", self._headers(**{"X-Cookie-dscrowd.token_key": "tok123"})
+        )
+        assert set(out) == {"X-MCP-Context"}
+        payload = json.loads(out["X-MCP-Context"])
+        assert payload == {"user_id": "alice", "dscrowd_token": "tok123"}
+
+    def test_custom_header_name(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", '{"user_id":"{{user}}"}')
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT_HEADER", "X-Ctx")
+        from src.constants import build_mcp_context_headers
+
+        out = build_mcp_context_headers("bob", self._headers())
+        assert list(out) == ["X-Ctx"]
+        assert json.loads(out["X-Ctx"]) == {"user_id": "bob"}
+
+    def test_empty_resolved_keys_dropped(self, monkeypatch):
+        # user is None and the header is absent -> both keys resolve empty -> {}.
+        monkeypatch.setenv(
+            "MCP_FORWARD_CONTEXT",
+            '{"user_id":"{{user}}","tok":"{{header:X-Missing}}"}',
+        )
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers(None, self._headers()) == {}
+
+    def test_partial_resolution_keeps_present_keys(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_FORWARD_CONTEXT",
+            '{"user_id":"{{user}}","tok":"{{header:X-Missing}}"}',
+        )
+        from src.constants import build_mcp_context_headers
+
+        out = build_mcp_context_headers("carol", self._headers())
+        assert json.loads(out["X-MCP-Context"]) == {"user_id": "carol"}
+
+    def test_empty_header_name_token_does_not_leak(self, monkeypatch):
+        # A misconfigured {{header:}} must resolve to "" (key dropped), never
+        # leak the literal token into the downstream payload.
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", '{"tok":"{{header:}}"}')
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers("alice", self._headers()) == {}
+
+    def test_invalid_json_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", "{not json")
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers("alice", self._headers()) == {}
+
+    def test_non_ascii_value_is_json_escaped(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", '{"user_id":"{{user}}"}')
+        from src.constants import build_mcp_context_headers
+
+        out = build_mcp_context_headers("김철수", self._headers())
+        # ensure_ascii keeps the header value transmittable; value round-trips.
+        out["X-MCP-Context"].encode("ascii")  # must not raise
+        assert json.loads(out["X-MCP-Context"]) == {"user_id": "김철수"}

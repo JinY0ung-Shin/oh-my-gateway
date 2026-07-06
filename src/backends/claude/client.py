@@ -44,6 +44,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
 from src.backends.common import TokenEstimateMixin, error_chunk
+from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
@@ -366,6 +367,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         options: ClaudeAgentOptions,
         mcp_servers: Optional[Dict[str, Any]],
         allowed_tools: Optional[List[str]],
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         if not mcp_servers:
             return
@@ -382,7 +384,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 logger.debug("No MCP servers match allowed_tools, skipping MCP")
                 return
 
-            options.mcp_servers = filtered
+            options.mcp_servers = inject_mcp_headers(filtered, forward_headers)
             if options.allowed_tools is not None:
                 for pattern in get_mcp_tool_patterns(filtered):
                     if pattern not in options.allowed_tools:
@@ -390,7 +392,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             logger.debug(f"MCP servers filtered to: {list(filtered.keys())}")
             return
 
-        options.mcp_servers = mcp_servers
+        options.mcp_servers = inject_mcp_headers(mcp_servers, forward_headers)
         if not options.allowed_tools:
             self._set_allowed_tools(options, list(DEFAULT_ALLOWED_TOOLS))
         # The caller passed no allowed_tools, so the gateway is choosing the
@@ -481,6 +483,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         task_budget: Optional[int] = None,
         cwd: Optional[Path] = None,
         user: Optional[str] = None,
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
@@ -513,7 +516,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.permission_mode = cast(Any, permission_mode)
         if output_format:
             options.output_format = output_format
-        self._configure_mcp_servers(options, mcp_servers, allowed_tools)
+        self._configure_mcp_servers(
+            options, mcp_servers, allowed_tools, forward_headers=forward_headers
+        )
         from src.runtime_config import get_token_streaming
 
         if get_token_streaming():
@@ -880,6 +885,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         model_params: Optional[Dict[str, Any]] = None,
         output_format: Optional[Dict[str, Any]] = None,
         _custom_base: object = _UNSET,
+        user: Optional[str] = None,
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
@@ -917,6 +924,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             cwd=Path(cwd) if cwd else None,
             extra_env=extra_env,
             _custom_base=_custom_base,
+            user=user,
+            forward_headers=forward_headers,
         )
         pre_tool_use = [
             HookMatcher(

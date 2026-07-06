@@ -33,6 +33,7 @@ from src.backends.codex.constants import (
     sandbox_mode,
 )
 from src.backends.base import SessionHandle
+from src.backends.mcp_headers import inject_mcp_headers
 from src.backends.common import (
     TokenEstimateMixin,
     combine_system_prompt,
@@ -540,9 +541,15 @@ class CodexClient(TokenEstimateMixin):
         extra_env: Optional[Dict[str, str]] = None,
         model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> CodexSessionClient:
         _ = (task_budget,)
         env = self._metadata_env(extra_env)
+        # Inject the gateway-resolved MCP context header (identity + caller-owned
+        # credentials) into http/SSE server configs before forwarding them to the
+        # app-server, mirroring the claude backend. NOTE: this rides on the codex
+        # app-server honoring a per-server ``headers`` field on http MCP configs.
+        mcp_servers = inject_mcp_headers(mcp_servers, forward_headers)
         async with self._rpc_lock:
             try:
                 rpc = await self._ensure_rpc_locked(env)
