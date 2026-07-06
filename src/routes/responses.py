@@ -803,6 +803,27 @@ async def _refresh_existing_client_policy(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+def _collect_mcp_forward_headers(request: Request) -> Dict[str, str]:
+    """Pick configured inbound headers to pass through to MCP servers.
+
+    See ``MCP_FORWARD_REQUEST_HEADERS``. These carry the caller's own
+    credentials (e.g. a session token) that the downstream MCP server
+    validates itself, so forwarding the inbound value verbatim is safe —
+    unlike the user *identity* header, which the gateway derives server-side.
+    """
+    from src.constants import parse_mcp_forward_request_headers
+
+    pairs = parse_mcp_forward_request_headers()
+    if not pairs:
+        return {}
+    result: Dict[str, str] = {}
+    for inbound, outbound in pairs:
+        value = request.headers.get(inbound)
+        if value:
+            result[outbound] = value
+    return result
+
+
 async def _ensure_response_session_client(
     body: ResponseCreateRequest,
     resolved: ResolvedModel,
@@ -812,6 +833,7 @@ async def _ensure_response_session_client(
     is_new_session: bool,
     system_prompt: Optional[str],
     workspace_str: str,
+    forward_headers: Optional[Dict[str, str]] = None,
 ) -> None:
     """Create the persistent backend client after session preflight has passed."""
     output_format = _response_output_format(body)
@@ -837,6 +859,8 @@ async def _ensure_response_session_client(
     # gate it so codex/opencode create_client() aren't passed an unknown kwarg.
     if resolved.backend == "claude":
         create_kwargs["user"] = body.user
+        if forward_headers:
+            create_kwargs["forward_headers"] = forward_headers
     try:
         session.client = await backend.create_client(
             session=session,
@@ -1332,6 +1356,9 @@ async def create_response(
     validate_model_vision_support(body, resolved)
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
+    # Inbound headers to pass through to MCP servers (caller-owned credentials).
+    forward_headers = _collect_mcp_forward_headers(request)
+
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
     session_id, session = _resolve_response_session(body, resolved.backend)
@@ -1397,6 +1424,7 @@ async def create_response(
                 is_new_session,
                 system_prompt,
                 workspace_str,
+                forward_headers=forward_headers,
             )
         except Exception:
             if preflight["lock_acquired"]:
@@ -1588,6 +1616,7 @@ async def create_response(
                 is_new_session,
                 system_prompt,
                 workspace_str,
+                forward_headers=forward_headers,
             )
             # Execute backend through the persistent client.
             chunks = []

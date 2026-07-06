@@ -650,3 +650,66 @@ class TestInjectMcpUserHeader:
         # Value is percent-encoded so it survives as an HTTP header.
         assert out["ragaas"]["headers"]["X-User"].startswith("%")
         out["ragaas"]["headers"]["X-User"].encode("ascii")  # must not raise
+
+    def test_forward_headers_injected_alongside_user(self, monkeypatch):
+        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-OpenWebUI-User-Name")
+        cli = _make_cli()
+        out = cli._inject_mcp_user_header(
+            self._mcp(), "alice", {"X-Cookie-dscrowd.token_key": "tok123"}
+        )
+        assert out["ragaas"]["headers"] == {
+            "X-OpenWebUI-User-Name": "alice",
+            "X-Cookie-dscrowd.token_key": "tok123",
+        }
+        # Forwarded header rides http/SSE only; stdio untouched.
+        assert "headers" not in out["local"]
+        # Shared config never mutated.
+        assert "headers" not in self._mcp()["ragaas"]
+
+    def test_forward_headers_independent_of_user_header(self, monkeypatch):
+        # Even with no user identity header configured, a forwarded credential
+        # header still reaches the MCP server.
+        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "")
+        cli = _make_cli()
+        out = cli._inject_mcp_user_header(
+            self._mcp(), None, {"X-Cookie-dscrowd.token_key": "tok123"}
+        )
+        assert out["ragaas"]["headers"] == {"X-Cookie-dscrowd.token_key": "tok123"}
+
+    def test_no_op_when_nothing_to_inject(self, monkeypatch):
+        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "")
+        cli = _make_cli()
+        mcp = self._mcp()
+        assert cli._inject_mcp_user_header(mcp, None, {}) is mcp
+
+
+class TestParseMcpForwardRequestHeaders:
+    """MCP_FORWARD_REQUEST_HEADERS parsing (issue #124 follow-up)."""
+
+    def test_empty_returns_no_pairs(self, monkeypatch):
+        monkeypatch.delenv("MCP_FORWARD_REQUEST_HEADERS", raising=False)
+        from src.constants import parse_mcp_forward_request_headers
+
+        assert parse_mcp_forward_request_headers() == []
+
+    def test_plain_names_map_to_themselves(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_REQUEST_HEADERS", "X-A, X-B")
+        from src.constants import parse_mcp_forward_request_headers
+
+        assert parse_mcp_forward_request_headers() == [("X-A", "X-A"), ("X-B", "X-B")]
+
+    def test_rename_syntax(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_REQUEST_HEADERS", "X-In:X-Out, X-Same")
+        from src.constants import parse_mcp_forward_request_headers
+
+        assert parse_mcp_forward_request_headers() == [
+            ("X-In", "X-Out"),
+            ("X-Same", "X-Same"),
+        ]
+
+    def test_blank_and_malformed_entries_skipped(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_REQUEST_HEADERS", " , X-A ,:, X-B: ")
+        from src.constants import parse_mcp_forward_request_headers
+
+        # Empty entry, ":" (no names), and "X-B:" (empty outbound) are dropped.
+        assert parse_mcp_forward_request_headers() == [("X-A", "X-A")]

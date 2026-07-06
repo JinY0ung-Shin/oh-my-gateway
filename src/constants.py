@@ -72,6 +72,40 @@ MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 # Empty (default) = disabled. Example: "X-OpenWebUI-User-Name".
 MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
 
+# Comma-separated inbound request headers the gateway passes through, verbatim,
+# to every http/SSE MCP server config (in addition to MCP_FORWARD_USER_HEADER).
+# Unlike the user header (a server-authoritative *identity* the gateway derives
+# and the LLM must not tamper with), these carry the caller's OWN credentials —
+# e.g. a session cookie/token the downstream MCP server validates itself. The
+# caller can only forward their own credential, and the downstream authenticates
+# it, so passing the inbound value through is the correct model here (it is not
+# an authorization claim that could be spoofed to impersonate another user).
+# Each entry is an inbound header name, optionally ``inbound:outbound`` to rename
+# on the way out. Empty (default) = disabled. Example: "X-Cookie-dscrowd.token_key".
+MCP_FORWARD_REQUEST_HEADERS = os.getenv("MCP_FORWARD_REQUEST_HEADERS", "")
+
+
+def parse_mcp_forward_request_headers() -> list[tuple[str, str]]:
+    """Parse ``MCP_FORWARD_REQUEST_HEADERS`` into ``(inbound, outbound)`` pairs.
+
+    Read from the environment on each call so runtime/test overrides take effect
+    without a module reload (mirrors :func:`is_text_only_model`).
+    """
+    raw = os.getenv("MCP_FORWARD_REQUEST_HEADERS", "")
+    pairs: list[tuple[str, str]] = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ":" in entry:
+            inbound, outbound = (part.strip() for part in entry.split(":", 1))
+        else:
+            inbound = outbound = entry
+        if inbound and outbound:
+            pairs.append((inbound, outbound))
+    return pairs
+
+
 # MCP connection-test (admin diagnostics). Short + bounded so a hung server
 # cannot wedge the request thread. Do NOT reuse DEFAULT_TIMEOUT_MS (whole-turn budget).
 MCP_TEST_TIMEOUT_SECONDS = parse_float_env("MCP_TEST_TIMEOUT_SECONDS", 5.0)

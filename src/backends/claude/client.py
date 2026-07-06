@@ -361,30 +361,51 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         else:
             options.system_prompt = {"type": "preset", "preset": "claude_code"}
 
-    def _inject_mcp_user_header(
-        self, mcp_servers: Dict[str, Any], user: Optional[str]
-    ) -> Dict[str, Any]:
-        """Return *mcp_servers* with the authenticated user injected as a header.
-
-        Adds ``MCP_FORWARD_USER_HEADER: <user>`` to every http/SSE MCP server so
-        downstream servers (e.g. ragaas) can authorize on the user server-side,
-        out of the LLM's reach (a tool argument would be tamperable). Deep-copies
-        first so the shared, process-wide MCP config is never mutated per request.
-        No-op when the header is unconfigured or there is no user.
-        """
-        from src.constants import MCP_FORWARD_USER_HEADER
-
-        header_name = (MCP_FORWARD_USER_HEADER or "").strip()
-        if not header_name or not user:
-            return mcp_servers
-
+    @staticmethod
+    def _header_safe(value: str) -> str:
+        """Return *value* usable as an HTTP header value (percent-encode non-ascii)."""
         try:
-            user.encode("ascii")
-            value = user
+            value.encode("ascii")
+            return value
         except UnicodeEncodeError:
             from urllib.parse import quote
 
-            value = quote(user)
+            return quote(value)
+
+    def _inject_mcp_user_header(
+        self,
+        mcp_servers: Dict[str, Any],
+        user: Optional[str],
+        forward_headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Return *mcp_servers* with per-request headers injected.
+
+        Two independent sources are merged into every http/SSE MCP server's
+        ``headers`` so downstream servers (e.g. ragaas) receive them out of the
+        LLM's reach:
+
+        - ``MCP_FORWARD_USER_HEADER: <user>`` — the server-authoritative user
+          *identity* (a tool argument would be tamperable).
+        - ``forward_headers`` — inbound request headers the gateway passes
+          through verbatim (see ``MCP_FORWARD_REQUEST_HEADERS``); these carry the
+          caller's own credentials the downstream validates itself.
+
+        Deep-copies first so the shared, process-wide MCP config is never mutated
+        per request. No-op when neither source yields a header.
+        """
+        from src.constants import MCP_FORWARD_USER_HEADER
+
+        headers_map: Dict[str, str] = {}
+        header_name = (MCP_FORWARD_USER_HEADER or "").strip()
+        if header_name and user:
+            headers_map[header_name] = self._header_safe(user)
+        if forward_headers:
+            for name, value in forward_headers.items():
+                if name and value:
+                    headers_map[name] = self._header_safe(value)
+
+        if not headers_map:
+            return mcp_servers
 
         import copy
 
@@ -394,7 +415,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if isinstance(config, dict) and config.get("type", "stdio") in http_types:
                 headers = config.setdefault("headers", {})
                 if isinstance(headers, dict):
-                    headers[header_name] = value
+                    headers.update(headers_map)
         return result
 
     def _configure_mcp_servers(
@@ -403,6 +424,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         mcp_servers: Optional[Dict[str, Any]],
         allowed_tools: Optional[List[str]],
         user: Optional[str] = None,
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         if not mcp_servers:
             return
@@ -419,7 +441,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 logger.debug("No MCP servers match allowed_tools, skipping MCP")
                 return
 
-            options.mcp_servers = self._inject_mcp_user_header(filtered, user)
+            options.mcp_servers = self._inject_mcp_user_header(
+                filtered, user, forward_headers
+            )
             if options.allowed_tools is not None:
                 for pattern in get_mcp_tool_patterns(filtered):
                     if pattern not in options.allowed_tools:
@@ -427,7 +451,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             logger.debug(f"MCP servers filtered to: {list(filtered.keys())}")
             return
 
-        options.mcp_servers = self._inject_mcp_user_header(mcp_servers, user)
+        options.mcp_servers = self._inject_mcp_user_header(
+            mcp_servers, user, forward_headers
+        )
         if not options.allowed_tools:
             self._set_allowed_tools(options, list(DEFAULT_ALLOWED_TOOLS))
         # The caller passed no allowed_tools, so the gateway is choosing the
@@ -518,6 +544,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         task_budget: Optional[int] = None,
         cwd: Optional[Path] = None,
         user: Optional[str] = None,
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
@@ -550,7 +577,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.permission_mode = cast(Any, permission_mode)
         if output_format:
             options.output_format = output_format
-        self._configure_mcp_servers(options, mcp_servers, allowed_tools, user=user)
+        self._configure_mcp_servers(
+            options, mcp_servers, allowed_tools, user=user, forward_headers=forward_headers
+        )
         from src.runtime_config import get_token_streaming
 
         if get_token_streaming():
@@ -918,6 +947,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         output_format: Optional[Dict[str, Any]] = None,
         _custom_base: object = _UNSET,
         user: Optional[str] = None,
+        forward_headers: Optional[Dict[str, str]] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
@@ -956,6 +986,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             extra_env=extra_env,
             _custom_base=_custom_base,
             user=user,
+            forward_headers=forward_headers,
         )
         pre_tool_use = [
             HookMatcher(
