@@ -44,6 +44,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_WEAKER_NESTED,
 )
 from src.backends.common import TokenEstimateMixin, error_chunk
+from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
@@ -361,74 +362,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         else:
             options.system_prompt = {"type": "preset", "preset": "claude_code"}
 
-    @staticmethod
-    def _header_safe(value: str) -> str:
-        """Return *value* usable as an HTTP header value.
-
-        Percent-encodes non-ascii AND any control characters (CR/LF/NUL/…) so a
-        value derived from request input can neither inject extra headers (CRLF)
-        nor break the outbound MCP request. Plain printable-ascii passes through
-        unchanged.
-        """
-        from urllib.parse import quote
-
-        if value.isascii() and not any(ord(c) < 0x20 or ord(c) == 0x7F for c in value):
-            return value
-        return quote(value)
-
-    def _inject_mcp_user_header(
-        self,
-        mcp_servers: Dict[str, Any],
-        user: Optional[str],
-        forward_headers: Optional[Dict[str, str]] = None,
-    ) -> Dict[str, Any]:
-        """Return *mcp_servers* with per-request headers injected.
-
-        Two independent sources are merged into every http/SSE MCP server's
-        ``headers`` so downstream servers (e.g. ragaas) receive them out of the
-        LLM's reach:
-
-        - ``MCP_FORWARD_USER_HEADER: <user>`` — the user *identity*, kept out of
-          the LLM's reach (a tool argument would be tamperable). Its trust rests
-          on ``body.user`` coming from a trusted caller, not a direct API caller.
-        - ``forward_headers`` — the caller-supplied context header(s) the route
-          resolved from ``MCP_FORWARD_CONTEXT`` (identity + caller-owned
-          credentials the downstream validates itself).
-
-        Deep-copies first so the shared, process-wide MCP config is never mutated
-        per request. No-op when neither source yields a header.
-        """
-        from src.constants import MCP_FORWARD_USER_HEADER
-
-        headers_map: Dict[str, str] = {}
-        header_name = (MCP_FORWARD_USER_HEADER or "").strip()
-        if header_name and user:
-            headers_map[header_name] = self._header_safe(user)
-        if forward_headers:
-            for name, value in forward_headers.items():
-                if name and value:
-                    headers_map[name] = self._header_safe(value)
-
-        if not headers_map:
-            return mcp_servers
-
-        import copy
-
-        result = copy.deepcopy(mcp_servers)
-        http_types = {"http", "sse", "streamable-http"}
-        for config in result.values():
-            if isinstance(config, dict) and config.get("type", "stdio") in http_types:
-                headers = config.setdefault("headers", {})
-                if isinstance(headers, dict):
-                    headers.update(headers_map)
-        return result
-
     def _configure_mcp_servers(
         self,
         options: ClaudeAgentOptions,
         mcp_servers: Optional[Dict[str, Any]],
         allowed_tools: Optional[List[str]],
-        user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         if not mcp_servers:
@@ -446,9 +384,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 logger.debug("No MCP servers match allowed_tools, skipping MCP")
                 return
 
-            options.mcp_servers = self._inject_mcp_user_header(
-                filtered, user, forward_headers
-            )
+            options.mcp_servers = inject_mcp_headers(filtered, forward_headers)
             if options.allowed_tools is not None:
                 for pattern in get_mcp_tool_patterns(filtered):
                     if pattern not in options.allowed_tools:
@@ -456,9 +392,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             logger.debug(f"MCP servers filtered to: {list(filtered.keys())}")
             return
 
-        options.mcp_servers = self._inject_mcp_user_header(
-            mcp_servers, user, forward_headers
-        )
+        options.mcp_servers = inject_mcp_headers(mcp_servers, forward_headers)
         if not options.allowed_tools:
             self._set_allowed_tools(options, list(DEFAULT_ALLOWED_TOOLS))
         # The caller passed no allowed_tools, so the gateway is choosing the
@@ -583,11 +517,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if output_format:
             options.output_format = output_format
         self._configure_mcp_servers(
-            options,
-            mcp_servers,
-            allowed_tools,
-            user=user,
-            forward_headers=forward_headers,
+            options, mcp_servers, allowed_tools, forward_headers=forward_headers
         )
         from src.runtime_config import get_token_streaming
 

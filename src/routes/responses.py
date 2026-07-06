@@ -849,13 +849,14 @@ async def _ensure_response_session_client(
     create_kwargs: Dict[str, Any] = {}
     if output_format is not None:
         create_kwargs["output_format"] = output_format
-    # Server-authoritative user identity for MCP header injection (persistent
-    # session path). Only the claude backend's create_client accepts ``user``;
-    # gate it so codex/opencode create_client() aren't passed an unknown kwarg.
+    # Per-request MCP header injection (persistent session path). ``user`` is
+    # consumed by the claude backend only (system-prompt identity); the resolved
+    # context header goes to both claude and codex. opencode's create_client
+    # accepts neither, so gate to avoid an unknown-kwarg TypeError.
     if resolved.backend == "claude":
         create_kwargs["user"] = body.user
-        if forward_headers:
-            create_kwargs["forward_headers"] = forward_headers
+    if resolved.backend in {"claude", "codex"} and forward_headers:
+        create_kwargs["forward_headers"] = forward_headers
     try:
         session.client = await backend.create_client(
             session=session,
@@ -1352,11 +1353,11 @@ async def create_response(
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
     # Per-request MCP context header (identity + caller-owned credentials).
-    # Only the claude backend consumes it, so skip the env-read + JSON parse for
-    # codex/opencode.
+    # Only the claude and codex backends consume it, so skip the env-read + JSON
+    # parse for opencode.
     forward_headers = (
         _collect_mcp_forward_headers(request, body)
-        if resolved.backend == "claude"
+        if resolved.backend in {"claude", "codex"}
         else {}
     )
 

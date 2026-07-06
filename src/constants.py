@@ -67,19 +67,8 @@ USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
 # Format: {"mcpServers": {"name": {"type": "stdio", "command": "...", "args": [...]}}}
 MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 
-# When set, the gateway injects this HTTP header (value = the request's user
-# identity, ``body.user``) into every http/SSE MCP server config, per request, so
-# downstream MCP servers (e.g. ragaas) can authorize on the user server-side.
-# This keeps identity out of the LLM's reach (a user_id *tool argument* is
-# tamperable by the model). NOTE: ``body.user`` is a request-body field, so it is
-# only as trustworthy as the caller — this is safe only when the gateway is
-# reachable solely via a trusted caller (the pipe, which sets it from the
-# authenticated ``__user__``) and not directly by end users.
-# Empty (default) = disabled. Example: "X-OpenWebUI-User-Name".
-MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
-
-# Generalized per-request MCP context. A JSON object template whose values may
-# contain ``{{user}}`` (the authenticated identity, from ``body.user``) and
+# Per-request MCP context. A JSON object template whose values may contain
+# ``{{user}}`` (the authenticated identity, from ``body.user``) and
 # ``{{header:NAME}}`` (an inbound request header, e.g. a caller-owned session
 # token the downstream MCP server validates itself). The gateway resolves the
 # template per request and injects the result as ONE JSON header
@@ -91,9 +80,9 @@ MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
 #
 # Identity vs credential: use ``{{user}}`` (not ``{{header:...}}``) for identity —
 # it stays out of the LLM's reach. Its trust still rests on ``body.user`` being
-# set by a trusted caller (see MCP_FORWARD_USER_HEADER note above), not spoofed by
-# a direct API caller. ``{{header:...}}`` is for the caller's own bearer
-# credentials, which the downstream authenticates.
+# set by a trusted caller (the pipe, from the authenticated ``__user__``), not
+# spoofed by a direct API caller reaching the gateway. ``{{header:...}}`` is for
+# the caller's own bearer credentials, which the downstream authenticates.
 MCP_FORWARD_CONTEXT = os.getenv("MCP_FORWARD_CONTEXT", "")
 MCP_FORWARD_CONTEXT_HEADER = os.getenv("MCP_FORWARD_CONTEXT_HEADER", "X-MCP-Context")
 

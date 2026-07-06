@@ -603,12 +603,12 @@ class TestReceiveResponseFromClient:
 
 
 # ---------------------------------------------------------------------------
-# _inject_mcp_user_header() — per-request user header into MCP configs
+# inject_mcp_headers() — merge per-request context headers into MCP configs
 # ---------------------------------------------------------------------------
 
 
-class TestInjectMcpUserHeader:
-    """Gateway injects the authenticated user as an MCP header (issue #124)."""
+class TestInjectMcpHeaders:
+    """Shared header injection used by the claude + codex backends (issue #124)."""
 
     def _mcp(self):
         return {
@@ -617,81 +617,68 @@ class TestInjectMcpUserHeader:
             "sse1": {"type": "sse", "url": "y", "headers": {"A": "1"}},
         }
 
-    def test_disabled_when_header_unset(self, monkeypatch):
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "")
-        cli = _make_cli()
+    def test_no_op_when_no_forward_headers(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
         mcp = self._mcp()
         # No-op returns the same object untouched.
-        assert cli._inject_mcp_user_header(mcp, "alice") is mcp
+        assert inject_mcp_headers(mcp, None) is mcp
+        assert inject_mcp_headers(mcp, {}) is mcp
 
-    def test_disabled_when_no_user(self, monkeypatch):
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-OpenWebUI-User-Name")
-        cli = _make_cli()
+    def test_no_op_when_no_servers(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        assert inject_mcp_headers(None, {"X-A": "1"}) is None
+
+    def test_injects_into_http_and_sse_only(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
         mcp = self._mcp()
-        assert cli._inject_mcp_user_header(mcp, None) is mcp
+        out = inject_mcp_headers(mcp, {"X-Ctx": "v"})
 
-    def test_injects_into_http_and_sse_only(self, monkeypatch):
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-OpenWebUI-User-Name")
-        cli = _make_cli()
-        mcp = self._mcp()
-        out = cli._inject_mcp_user_header(mcp, "alice")
-
-        assert out["ragaas"]["headers"] == {"X-OpenWebUI-User-Name": "alice"}
+        assert out["ragaas"]["headers"] == {"X-Ctx": "v"}
         # Existing headers preserved (merged, not clobbered).
-        assert out["sse1"]["headers"] == {"A": "1", "X-OpenWebUI-User-Name": "alice"}
+        assert out["sse1"]["headers"] == {"A": "1", "X-Ctx": "v"}
         # stdio servers have no headers key added.
         assert "headers" not in out["local"]
         # The shared config passed in is never mutated (deep-copied).
         assert "headers" not in mcp["ragaas"]
 
-    def test_non_ascii_user_is_quoted(self, monkeypatch):
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-User")
-        cli = _make_cli()
-        out = cli._inject_mcp_user_header(self._mcp(), "김철수")
-        # Value is percent-encoded so it survives as an HTTP header.
+    def test_non_ascii_value_is_quoted(self):
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        out = inject_mcp_headers(self._mcp(), {"X-User": "김철수"})
         assert out["ragaas"]["headers"]["X-User"].startswith("%")
         out["ragaas"]["headers"]["X-User"].encode("ascii")  # must not raise
 
-    def test_crlf_in_user_is_encoded_not_injected(self, monkeypatch):
+    def test_crlf_in_value_is_encoded_not_injected(self):
         # An ASCII value with CR/LF must be percent-encoded so it cannot smuggle
         # an extra header into the outbound MCP request (header injection).
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-User")
-        cli = _make_cli()
-        out = cli._inject_mcp_user_header(self._mcp(), "alice\r\nX-Injected: evil")
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        out = inject_mcp_headers(self._mcp(), {"X-User": "alice\r\nX-Injected: evil"})
         value = out["ragaas"]["headers"]["X-User"]
         assert "\r" not in value and "\n" not in value
         assert "%0" in value.upper()  # CR/LF percent-encoded
 
-    def test_forward_headers_injected_alongside_user(self, monkeypatch):
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "X-OpenWebUI-User-Name")
-        cli = _make_cli()
-        out = cli._inject_mcp_user_header(
-            self._mcp(), "alice", {"X-Cookie-dscrowd.token_key": "tok123"}
-        )
-        assert out["ragaas"]["headers"] == {
-            "X-OpenWebUI-User-Name": "alice",
-            "X-Cookie-dscrowd.token_key": "tok123",
-        }
-        # Forwarded header rides http/SSE only; stdio untouched.
-        assert "headers" not in out["local"]
-        # Shared config never mutated.
-        assert "headers" not in self._mcp()["ragaas"]
+    def test_non_dict_existing_headers_is_skipped_with_warning(self, caplog):
+        from src.backends.mcp_headers import inject_mcp_headers
 
-    def test_forward_headers_independent_of_user_header(self, monkeypatch):
-        # Even with no user identity header configured, a forwarded credential
-        # header still reaches the MCP server.
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "")
-        cli = _make_cli()
-        out = cli._inject_mcp_user_header(
-            self._mcp(), None, {"X-Cookie-dscrowd.token_key": "tok123"}
-        )
-        assert out["ragaas"]["headers"] == {"X-Cookie-dscrowd.token_key": "tok123"}
+        mcp = {"bad": {"type": "http", "url": "u", "headers": "Authorization: x"}}
+        with caplog.at_level("WARNING"):
+            out = inject_mcp_headers(mcp, {"X-Ctx": "v"})
+        # The malformed server is left as-is (string headers untouched)...
+        assert out["bad"]["headers"] == "Authorization: x"
+        # ...and the skip is surfaced, not silent.
+        assert any("non-dict 'headers'" in r.message for r in caplog.records)
 
-    def test_no_op_when_nothing_to_inject(self, monkeypatch):
-        monkeypatch.setattr("src.constants.MCP_FORWARD_USER_HEADER", "")
-        cli = _make_cli()
-        mcp = self._mcp()
-        assert cli._inject_mcp_user_header(mcp, None, {}) is mcp
+    def test_url_only_server_without_type_is_treated_as_stdio(self):
+        # Documents current behavior: a bare {"url": ...} with no explicit type
+        # defaults to stdio and is NOT injected.
+        from src.backends.mcp_headers import inject_mcp_headers
+
+        out = inject_mcp_headers({"s": {"url": "http://x/mcp"}}, {"X-Ctx": "v"})
+        assert "headers" not in out["s"]
 
 
 class TestBuildMcpContextHeaders:
