@@ -6,6 +6,7 @@ Targets uncovered lines found in the 88%-coverage run:
 """
 
 import asyncio
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -683,33 +684,75 @@ class TestInjectMcpUserHeader:
         assert cli._inject_mcp_user_header(mcp, None, {}) is mcp
 
 
-class TestParseMcpForwardRequestHeaders:
-    """MCP_FORWARD_REQUEST_HEADERS parsing (issue #124 follow-up)."""
+class TestBuildMcpContextHeaders:
+    """MCP_FORWARD_CONTEXT resolution into a single JSON header (issue #124)."""
 
-    def test_empty_returns_no_pairs(self, monkeypatch):
-        monkeypatch.delenv("MCP_FORWARD_REQUEST_HEADERS", raising=False)
-        from src.constants import parse_mcp_forward_request_headers
+    def _headers(self, **kw):
+        # Case-insensitive getter mirroring Starlette request.headers.get.
+        lowered = {k.lower(): v for k, v in kw.items()}
+        return lambda name: lowered.get(name.lower())
 
-        assert parse_mcp_forward_request_headers() == []
+    def test_disabled_when_unset(self, monkeypatch):
+        monkeypatch.delenv("MCP_FORWARD_CONTEXT", raising=False)
+        from src.constants import build_mcp_context_headers
 
-    def test_plain_names_map_to_themselves(self, monkeypatch):
-        monkeypatch.setenv("MCP_FORWARD_REQUEST_HEADERS", "X-A, X-B")
-        from src.constants import parse_mcp_forward_request_headers
+        assert build_mcp_context_headers("alice", self._headers()) == {}
 
-        assert parse_mcp_forward_request_headers() == [("X-A", "X-A"), ("X-B", "X-B")]
+    def test_resolves_user_and_header_tokens(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_FORWARD_CONTEXT",
+            '{"user_id":"{{user}}","dscrowd_token":"{{header:X-Cookie-dscrowd.token_key}}"}',
+        )
+        monkeypatch.delenv("MCP_FORWARD_CONTEXT_HEADER", raising=False)
+        from src.constants import build_mcp_context_headers
 
-    def test_rename_syntax(self, monkeypatch):
-        monkeypatch.setenv("MCP_FORWARD_REQUEST_HEADERS", "X-In:X-Out, X-Same")
-        from src.constants import parse_mcp_forward_request_headers
+        out = build_mcp_context_headers(
+            "alice", self._headers(**{"X-Cookie-dscrowd.token_key": "tok123"})
+        )
+        assert set(out) == {"X-MCP-Context"}
+        payload = json.loads(out["X-MCP-Context"])
+        assert payload == {"user_id": "alice", "dscrowd_token": "tok123"}
 
-        assert parse_mcp_forward_request_headers() == [
-            ("X-In", "X-Out"),
-            ("X-Same", "X-Same"),
-        ]
+    def test_custom_header_name(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", '{"user_id":"{{user}}"}')
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT_HEADER", "X-Ctx")
+        from src.constants import build_mcp_context_headers
 
-    def test_blank_and_malformed_entries_skipped(self, monkeypatch):
-        monkeypatch.setenv("MCP_FORWARD_REQUEST_HEADERS", " , X-A ,:, X-B: ")
-        from src.constants import parse_mcp_forward_request_headers
+        out = build_mcp_context_headers("bob", self._headers())
+        assert list(out) == ["X-Ctx"]
+        assert json.loads(out["X-Ctx"]) == {"user_id": "bob"}
 
-        # Empty entry, ":" (no names), and "X-B:" (empty outbound) are dropped.
-        assert parse_mcp_forward_request_headers() == [("X-A", "X-A")]
+    def test_empty_resolved_keys_dropped(self, monkeypatch):
+        # user is None and the header is absent -> both keys resolve empty -> {}.
+        monkeypatch.setenv(
+            "MCP_FORWARD_CONTEXT",
+            '{"user_id":"{{user}}","tok":"{{header:X-Missing}}"}',
+        )
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers(None, self._headers()) == {}
+
+    def test_partial_resolution_keeps_present_keys(self, monkeypatch):
+        monkeypatch.setenv(
+            "MCP_FORWARD_CONTEXT",
+            '{"user_id":"{{user}}","tok":"{{header:X-Missing}}"}',
+        )
+        from src.constants import build_mcp_context_headers
+
+        out = build_mcp_context_headers("carol", self._headers())
+        assert json.loads(out["X-MCP-Context"]) == {"user_id": "carol"}
+
+    def test_invalid_json_is_ignored(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", "{not json")
+        from src.constants import build_mcp_context_headers
+
+        assert build_mcp_context_headers("alice", self._headers()) == {}
+
+    def test_non_ascii_value_is_json_escaped(self, monkeypatch):
+        monkeypatch.setenv("MCP_FORWARD_CONTEXT", '{"user_id":"{{user}}"}')
+        from src.constants import build_mcp_context_headers
+
+        out = build_mcp_context_headers("김철수", self._headers())
+        # ensure_ascii keeps the header value transmittable; value round-trips.
+        out["X-MCP-Context"].encode("ascii")  # must not raise
+        assert json.loads(out["X-MCP-Context"]) == {"user_id": "김철수"}

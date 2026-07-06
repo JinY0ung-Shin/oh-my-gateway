@@ -803,25 +803,19 @@ async def _refresh_existing_client_policy(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _collect_mcp_forward_headers(request: Request) -> Dict[str, str]:
-    """Pick configured inbound headers to pass through to MCP servers.
+def _collect_mcp_forward_headers(
+    request: Request, body: ResponseCreateRequest
+) -> Dict[str, str]:
+    """Build the per-request MCP context header from ``MCP_FORWARD_CONTEXT``.
 
-    See ``MCP_FORWARD_REQUEST_HEADERS``. These carry the caller's own
-    credentials (e.g. a session token) that the downstream MCP server
-    validates itself, so forwarding the inbound value verbatim is safe —
-    unlike the user *identity* header, which the gateway derives server-side.
+    Resolves ``{{user}}`` from the server-authoritative identity (``body.user``)
+    and ``{{header:NAME}}`` from inbound request headers (caller-owned
+    credentials the downstream MCP server validates itself), then returns a
+    single JSON header for injection into the MCP server configs.
     """
-    from src.constants import parse_mcp_forward_request_headers
+    from src.constants import build_mcp_context_headers
 
-    pairs = parse_mcp_forward_request_headers()
-    if not pairs:
-        return {}
-    result: Dict[str, str] = {}
-    for inbound, outbound in pairs:
-        value = request.headers.get(inbound)
-        if value:
-            result[outbound] = value
-    return result
+    return build_mcp_context_headers(body.user, request.headers.get)
 
 
 async def _ensure_response_session_client(
@@ -1356,8 +1350,8 @@ async def create_response(
     validate_model_vision_support(body, resolved)
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
 
-    # Inbound headers to pass through to MCP servers (caller-owned credentials).
-    forward_headers = _collect_mcp_forward_headers(request)
+    # Per-request MCP context header (identity + caller-owned credentials).
+    forward_headers = _collect_mcp_forward_headers(request, body)
 
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)

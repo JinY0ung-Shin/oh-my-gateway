@@ -7,7 +7,9 @@ All configurable values can be overridden via environment variables.
 """
 
 import fnmatch
+import json
 import os
+import re
 from dotenv import dotenv_values, load_dotenv
 
 from src.env_utils import parse_bool_env, parse_float_env, parse_int_env
@@ -72,38 +74,72 @@ MCP_CONFIG = os.getenv("MCP_CONFIG", "")
 # Empty (default) = disabled. Example: "X-OpenWebUI-User-Name".
 MCP_FORWARD_USER_HEADER = os.getenv("MCP_FORWARD_USER_HEADER", "")
 
-# Comma-separated inbound request headers the gateway passes through, verbatim,
-# to every http/SSE MCP server config (in addition to MCP_FORWARD_USER_HEADER).
-# Unlike the user header (a server-authoritative *identity* the gateway derives
-# and the LLM must not tamper with), these carry the caller's OWN credentials —
-# e.g. a session cookie/token the downstream MCP server validates itself. The
-# caller can only forward their own credential, and the downstream authenticates
-# it, so passing the inbound value through is the correct model here (it is not
-# an authorization claim that could be spoofed to impersonate another user).
-# Each entry is an inbound header name, optionally ``inbound:outbound`` to rename
-# on the way out. Empty (default) = disabled. Example: "X-Cookie-dscrowd.token_key".
-MCP_FORWARD_REQUEST_HEADERS = os.getenv("MCP_FORWARD_REQUEST_HEADERS", "")
+# Generalized per-request MCP context. A JSON object template whose values may
+# contain ``{{user}}`` (the server-authoritative authenticated identity) and
+# ``{{header:NAME}}`` (an inbound request header, e.g. a caller-owned session
+# token the downstream MCP server validates itself). The gateway resolves the
+# template per request and injects the result as ONE JSON header
+# (``MCP_FORWARD_CONTEXT_HEADER``) into every http/SSE MCP server config, so the
+# downstream can read whatever keys it needs — adding a new value is a config-only
+# change (add a key to the JSON), never a code change. Keys whose resolved value
+# is empty are dropped. Empty (default) = disabled.
+# Example: {"user_id":"{{user}}","dscrowd_token":"{{header:X-Cookie-dscrowd.token_key}}"}
+#
+# Identity vs credential: use ``{{user}}`` (not ``{{header:...}}``) for identity —
+# it is derived server-side and cannot be spoofed. ``{{header:...}}`` is for the
+# caller's own bearer credentials, which the downstream authenticates.
+MCP_FORWARD_CONTEXT = os.getenv("MCP_FORWARD_CONTEXT", "")
+MCP_FORWARD_CONTEXT_HEADER = os.getenv("MCP_FORWARD_CONTEXT_HEADER", "X-MCP-Context")
 
 
-def parse_mcp_forward_request_headers() -> list[tuple[str, str]]:
-    """Parse ``MCP_FORWARD_REQUEST_HEADERS`` into ``(inbound, outbound)`` pairs.
+_MCP_CONTEXT_TOKEN_RE = re.compile(r"\{\{\s*(user|header:[^}]+?)\s*\}\}")
 
-    Read from the environment on each call so runtime/test overrides take effect
-    without a module reload (mirrors :func:`is_text_only_model`).
+
+def _resolve_mcp_context_value(template, user, header_getter) -> str:
+    """Substitute ``{{user}}`` / ``{{header:NAME}}`` tokens in *template*."""
+
+    def repl(match):
+        token = match.group(1).strip()
+        if token == "user":
+            return user or ""
+        name = token[len("header:") :].strip()
+        value = header_getter(name) if header_getter else None
+        return value or ""
+
+    return _MCP_CONTEXT_TOKEN_RE.sub(repl, template)
+
+
+def build_mcp_context_headers(user, header_getter) -> dict:
+    """Resolve ``MCP_FORWARD_CONTEXT`` into the single JSON context header.
+
+    *header_getter* is a callable ``name -> value | None`` (e.g.
+    ``request.headers.get``). Read from the environment on each call so
+    runtime/test overrides take effect without a module reload. Returns an empty
+    dict when disabled, misconfigured, or nothing resolves to a non-empty value.
     """
-    raw = os.getenv("MCP_FORWARD_REQUEST_HEADERS", "")
-    pairs: list[tuple[str, str]] = []
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
+    raw = os.getenv("MCP_FORWARD_CONTEXT", "").strip()
+    if not raw:
+        return {}
+    try:
+        template = json.loads(raw)
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(template, dict):
+        return {}
+
+    resolved = {}
+    for key, value in template.items():
+        if not isinstance(value, str):
             continue
-        if ":" in entry:
-            inbound, outbound = (part.strip() for part in entry.split(":", 1))
-        else:
-            inbound = outbound = entry
-        if inbound and outbound:
-            pairs.append((inbound, outbound))
-    return pairs
+        out = _resolve_mcp_context_value(value, user, header_getter)
+        if out:
+            resolved[key] = out
+    if not resolved:
+        return {}
+
+    header_name = os.getenv("MCP_FORWARD_CONTEXT_HEADER", "X-MCP-Context").strip()
+    header_name = header_name or "X-MCP-Context"
+    return {header_name: json.dumps(resolved, ensure_ascii=True, separators=(",", ":"))}
 
 
 # MCP connection-test (admin diagnostics). Short + bounded so a hung server

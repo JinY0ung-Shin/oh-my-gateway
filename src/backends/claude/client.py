@@ -386,9 +386,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         - ``MCP_FORWARD_USER_HEADER: <user>`` — the server-authoritative user
           *identity* (a tool argument would be tamperable).
-        - ``forward_headers`` — inbound request headers the gateway passes
-          through verbatim (see ``MCP_FORWARD_REQUEST_HEADERS``); these carry the
-          caller's own credentials the downstream validates itself.
+        - ``forward_headers`` — the caller-supplied context header(s) the route
+          resolved from ``MCP_FORWARD_CONTEXT`` (identity + caller-owned
+          credentials the downstream validates itself).
 
         Deep-copies first so the shared, process-wide MCP config is never mutated
         per request. No-op when neither source yields a header.
