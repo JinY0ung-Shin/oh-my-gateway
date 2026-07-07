@@ -54,10 +54,26 @@ def test_config_advertises_readonly_no_terminal(client):
     assert r.json() == {"features": {"terminal": False}}
 
 
-def test_cwd_is_virtual_root(client):
+def test_cwd_returns_real_workspace_path(client, workspace):
     r = client.get("/files/cwd", headers={**_AUTH, **_USER})
     assert r.status_code == 200
-    assert r.json()["cwd"] == "/"
+    assert r.json()["cwd"] == str(workspace.resolve())
+
+
+def test_absolute_paths_under_root_work(client, workspace):
+    # The explorer echoes the real cwd, so list/read arrive as absolute paths.
+    d = str(workspace.resolve())
+    r = client.get(f"/files/list?directory={d}/sub", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert [e["name"] for e in r.json()["entries"]] == ["inner.md"]
+    rr = client.get(f"/files/read?path={d}/notes.txt", headers={**_AUTH, **_USER})
+    assert rr.status_code == 200 and rr.json()["content"] == "hello\nworld\n"
+
+
+def test_absolute_path_outside_root_blocked(client, workspace):
+    outside = str((workspace.parent.parent / "secret.txt"))
+    r = client.get(f"/files/read?path={outside}", headers={**_AUTH, **_USER})
+    assert r.status_code == 404
 
 
 def test_list_root_sorts_dirs_first(client):
@@ -201,7 +217,7 @@ def test_upload_creates_file(client, workspace):
         files={"file": ("new.txt", b"content here", "text/plain")},
     )
     assert r.status_code == 200
-    assert r.json() == {"path": "/new.txt", "size": 12}
+    assert r.json() == {"path": str(workspace / "new.txt"), "size": 12}
     assert (workspace / "new.txt").read_bytes() == b"content here"
 
 

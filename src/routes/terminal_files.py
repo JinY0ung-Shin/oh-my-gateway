@@ -129,11 +129,26 @@ def _safe_resolve(root: Path, rel: str) -> Optional[Path]:
     entry can't be reached by typing its path). Returns ``None`` on any escape,
     hidden-path, or resolution error.
     """
-    rel = (rel or "/").lstrip("/")
-    candidate = root / rel if rel else root
     try:
-        resolved = candidate.resolve()
         root_resolved = root.resolve()
+    except (OSError, RuntimeError):
+        return None
+    p = rel or "/"
+    try:
+        # The explorer echoes the real cwd, so most paths arrive absolute; accept
+        # them when they land under the root. Anything else (a leading-slash
+        # workspace-relative path like "/sub", or an absolute path outside the
+        # root) is (re)interpreted as workspace-relative — the containment check
+        # below still guarantees confinement either way.
+        candidate = Path(p)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+            try:
+                resolved.relative_to(root_resolved)
+            except ValueError:
+                resolved = (root_resolved / p.lstrip("/")).resolve()
+        else:
+            resolved = (root_resolved / p).resolve()
     except (OSError, RuntimeError):
         return None
     try:
@@ -143,11 +158,6 @@ def _safe_resolve(root: Path, rel: str) -> Optional[Path]:
     if _hide_dotfiles() and any(part.startswith(".") for part in relative.parts):
         return None
     return resolved
-
-
-def _rel(root: Path, target: Path) -> str:
-    """Workspace-relative path (leading '/') for a resolved *target*."""
-    return "/" + str(target.relative_to(root.resolve()))
 
 
 @router.get("/api/config")
@@ -168,8 +178,10 @@ async def get_cwd(
 ):
     await verify_api_key(request, credentials)
     _ensure_api_key()
-    _require_user(request)  # require identity even though the root is virtual "/"
-    return {"cwd": "/"}
+    root = _workspace_root(_require_user(request))
+    # Report the real workspace path so the explorer's breadcrumb matches the
+    # paths the agent uses (e.g. what MEMORY.md references).
+    return {"cwd": str(root.resolve())}
 
 
 @router.get("/files/list")
@@ -299,7 +311,7 @@ async def upload_file(
 
     data = await file.read()
     target.write_bytes(data)
-    return {"path": _rel(root, target), "size": len(data)}
+    return {"path": str(target), "size": len(data)}
 
 
 @router.post("/files/mkdir")
@@ -315,7 +327,7 @@ async def make_dir(
     if target is None or target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     target.mkdir(parents=True, exist_ok=True)
-    return {"path": _rel(root, target)}
+    return {"path": str(target)}
 
 
 @router.delete("/files/delete")
