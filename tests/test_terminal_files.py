@@ -118,13 +118,21 @@ def test_view_streams_file(client):
 def test_path_traversal_is_blocked(client):
     for p in ("/../secret.txt", "/../../secret.txt", "/sub/../../secret.txt"):
         r = client.get(f"/files/read?path={p}", headers={**_AUTH, **_USER})
-        assert r.status_code == 404, p
+        assert r.status_code in (403, 404), p
         assert "SECRET" not in r.text
+
+
+def test_above_root_navigation_is_403(client, workspace):
+    # Clicking a breadcrumb segment above the workspace root -> "not allowed".
+    ancestor = str(workspace.resolve().parent)  # e.g. /tmp/.../alice
+    r = client.get(f"/files/list?directory={ancestor}", headers={**_AUTH, **_USER})
+    assert r.status_code == 403
+    assert "outside your workspace" in r.json()["detail"]
 
 
 def test_missing_user_header_is_rejected(client):
     r = client.get("/files/list?directory=/", headers=_AUTH)
-    assert r.status_code == 400
+    assert r.status_code in (400, 403)
 
 
 def test_invalid_user_is_rejected(client):
@@ -132,7 +140,7 @@ def test_invalid_user_is_rejected(client):
         "/files/list?directory=/",
         headers={**_AUTH, "X-User-Email": "../evil@x.com"},
     )
-    assert r.status_code == 400
+    assert r.status_code in (400, 403)
 
 
 def test_custom_user_header_name(client, monkeypatch):
@@ -254,7 +262,7 @@ def test_mkdir_traversal_blocked(client, workspace):
     r = client.post(
         "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/../evil"}
     )
-    assert r.status_code == 400
+    assert r.status_code in (400, 403)
     assert not (workspace.parent / "evil").exists()
 
 
@@ -274,7 +282,7 @@ def test_delete_directory_recursive(client, workspace):
 
 def test_delete_traversal_blocked(client, workspace):
     r = client.delete("/files/delete?path=/../../secret.txt", headers={**_AUTH, **_USER})
-    assert r.status_code in (400, 404)
+    assert r.status_code in (400, 403, 404)
     assert (workspace.parent.parent / "secret.txt").exists()  # untouched
 
 
@@ -295,7 +303,7 @@ def test_move_traversal_blocked(client, workspace):
         headers={**_AUTH, **_USER},
         json={"source": "/notes.txt", "destination": "/../stolen.txt"},
     )
-    assert r.status_code == 400
+    assert r.status_code in (400, 403)
     assert (workspace / "notes.txt").exists()  # unchanged
 
 

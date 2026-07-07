@@ -35,9 +35,10 @@ Security:
   these endpoints would expose every user's files unauthenticated, so we fail
   closed here.
 - Every path (read AND write) is confined to the single workspace root via
-  ``_safe_resolve`` (``Path.resolve()`` collapses ``..`` and resolves symlinks
-  before the containment check). Uploaded filenames are reduced to a basename.
-  No extra roots (never ``~/.claude`` etc.).
+  ``_resolve_or_403`` (``Path.resolve()`` collapses ``..`` and resolves symlinks
+  before the containment check); anything above/outside the root is a 403.
+  Uploaded filenames are reduced to a basename. No extra roots (never
+  ``~/.claude`` etc.).
 """
 
 import io
@@ -119,45 +120,72 @@ def _workspace_root(user: str) -> Path:
         raise HTTPException(status_code=400, detail="invalid user identity")
 
 
-def _safe_resolve(root: Path, rel: str) -> Optional[Path]:
-    """Resolve *rel* (relative to the workspace root) and confine it to that root.
+def _is_under(path: Path, base: Path) -> bool:
+    """True when *path* is *base* or nested inside it."""
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
 
-    ``rel`` is treated as workspace-relative; ``"/"`` or ``""`` is the root.
+
+def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
+    """Resolve *rel* and confine it to *root*; ``None`` if it escapes the root.
+
     ``Path.resolve()`` collapses ``..`` and follows symlinks, so an escape via
-    either is caught by the ``relative_to`` containment check. When dotfiles are
-    hidden, any path with a dot-prefixed component is also rejected (so a hidden
-    entry can't be reached by typing its path). Returns ``None`` on any escape,
-    hidden-path, or resolution error.
+    either is caught by the containment check. This is containment only —
+    dotfile hiding is applied separately so callers can distinguish "outside
+    your workspace" (403) from "hidden/not found" (404).
+
+    The explorer echoes the real cwd, so most paths arrive absolute and under
+    the root. An absolute path that is an *ancestor* of the root (breadcrumb
+    navigation above the workspace) is rejected outright; any other stray
+    leading-slash path is reinterpreted as workspace-relative.
     """
     try:
         root_resolved = root.resolve()
     except (OSError, RuntimeError):
         return None
     p = rel or "/"
+    if p in ("/", ""):
+        return root_resolved  # workspace root (virtual "/")
     try:
-        # The explorer echoes the real cwd, so most paths arrive absolute; accept
-        # them when they land under the root. Anything else (a leading-slash
-        # workspace-relative path like "/sub", or an absolute path outside the
-        # root) is (re)interpreted as workspace-relative — the containment check
-        # below still guarantees confinement either way.
         candidate = Path(p)
         if candidate.is_absolute():
             resolved = candidate.resolve()
-            try:
-                resolved.relative_to(root_resolved)
-            except ValueError:
+            if not _is_under(resolved, root_resolved):
+                if _is_under(root_resolved, resolved):
+                    return None  # ancestor of the root -> above-workspace nav
                 resolved = (root_resolved / p.lstrip("/")).resolve()
         else:
             resolved = (root_resolved / p).resolve()
     except (OSError, RuntimeError):
         return None
-    try:
-        relative = resolved.relative_to(root_resolved)
-    except ValueError:
-        return None
-    if _hide_dotfiles() and any(part.startswith(".") for part in relative.parts):
-        return None
-    return resolved
+    return resolved if _is_under(resolved, root_resolved) else None
+
+
+def _resolve_or_403(root: Path, rel: str) -> Path:
+    """Resolve within the workspace root or raise.
+
+    - Outside the root -> **403** ("outside your workspace"), so the explorer can
+      warn the user that navigation there isn't allowed.
+    - A dot-prefixed (hidden) component, when hiding is on -> **404**, so hidden
+      entries stay invisible rather than advertising that something is blocked.
+
+    The returned path may not exist yet (callers that create paths check as
+    needed); callers reading/listing must still verify existence.
+    """
+    target = _resolve_in_root(root, rel)
+    if target is None:
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: this path is outside your workspace.",
+        )
+    if _hide_dotfiles():
+        relative = target.relative_to(root.resolve())
+        if any(part.startswith(".") for part in relative.parts):
+            raise HTTPException(status_code=404, detail="not found")
+    return target
 
 
 @router.get("/api/config")
@@ -193,8 +221,8 @@ async def list_files(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _safe_resolve(root, directory)
-    if target is None or not target.is_dir():
+    target = _resolve_or_403(root, directory)
+    if not target.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
 
     hide_dot = _hide_dotfiles()
@@ -228,8 +256,8 @@ async def read_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _safe_resolve(root, path)
-    if target is None or not target.is_file():
+    target = _resolve_or_403(root, path)
+    if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
     if target.stat().st_size > _MAX_READ_BYTES:
@@ -258,8 +286,8 @@ async def view_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _safe_resolve(root, path)
-    if target is None or not target.is_file():
+    target = _resolve_or_403(root, path)
+    if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
@@ -267,7 +295,7 @@ async def view_file(
 
 
 # ---------------------------------------------------------------------------
-# Write operations (all confined to the workspace root by _safe_resolve)
+# Write operations (all confined to the workspace root by _resolve_or_403)
 # ---------------------------------------------------------------------------
 
 
@@ -277,12 +305,12 @@ async def set_cwd(
     body: _PathBody,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Validate a directory; cwd itself is tracked client-side (root is virtual)."""
+    """Validate a directory; cwd itself is tracked client-side."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _safe_resolve(root, body.path)
-    if target is None or not target.is_dir():
+    target = _resolve_or_403(root, body.path)
+    if not target.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
     return {"cwd": body.path}
 
@@ -297,17 +325,15 @@ async def upload_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    dest_dir = _safe_resolve(root, directory)
-    if dest_dir is None or not dest_dir.is_dir():
+    dest_dir = _resolve_or_403(root, directory)
+    if not dest_dir.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
 
     # Reduce the client filename to a basename so it can't carry path segments.
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = _safe_resolve(root, f"{directory}/{name}")
-    if target is None:
-        raise HTTPException(status_code=400, detail="invalid path")
+    target = _resolve_or_403(root, f"{directory}/{name}")
 
     data = await file.read()
     target.write_bytes(data)
@@ -323,8 +349,8 @@ async def make_dir(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _safe_resolve(root, body.path)
-    if target is None or target == root.resolve():
+    target = _resolve_or_403(root, body.path)
+    if target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     target.mkdir(parents=True, exist_ok=True)
     return {"path": str(target)}
@@ -339,8 +365,8 @@ async def delete_entry(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _safe_resolve(root, path)
-    if target is None or target == root.resolve():
+    target = _resolve_or_403(root, path)
+    if target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
@@ -361,9 +387,9 @@ async def move_entry(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    src = _safe_resolve(root, body.source)
-    dst = _safe_resolve(root, body.destination)
-    if src is None or dst is None or src == root.resolve() or dst == root.resolve():
+    src = _resolve_or_403(root, body.source)
+    dst = _resolve_or_403(root, body.destination)
+    if src == root.resolve() or dst == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not src.exists():
         raise HTTPException(status_code=404, detail="source not found")
@@ -386,8 +412,8 @@ async def archive_entries(
 
     targets = []
     for p in body.paths:
-        t = _safe_resolve(root, p)
-        if t is None or not t.exists():
+        t = _resolve_or_403(root, p)
+        if not t.exists():
             raise HTTPException(status_code=404, detail=f"not found: {p}")
         targets.append(t)
 
