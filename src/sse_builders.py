@@ -7,6 +7,18 @@ from src.constants import STREAM_COMPACTION_EVENTS, STREAM_HOOK_EVENTS
 from src.content_blocks import normalize_tool_result_for_sse
 
 
+def _sse_dumps(data: Any) -> str:
+    """JSON-serialize SSE event data, tolerating non-serializable values.
+
+    Some SDK payloads passed through verbatim (e.g. a ``task_updated`` registry
+    ``patch``, which can carry callables from in-process teammates/background
+    tasks) contain values that are not JSON-serializable. Coerce those to their
+    string form via ``default=str`` so a single stray field degrades gracefully
+    instead of raising ``TypeError`` and killing the entire SSE stream.
+    """
+    return json.dumps(data, default=str)
+
+
 def make_response_sse(
     event_type: str,
     response_obj: Optional[Any] = None,
@@ -33,7 +45,7 @@ def make_response_sse(
 
     data["sequence_number"] = sequence_number
 
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 
 def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -109,7 +121,7 @@ def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int =
     """Build an SSE line for Responses API with a custom task event type."""
     event_type = f"response.{task_event['type']}"
     data = {**task_event, "type": event_type, "sequence_number": sequence_number}
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 
 def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -195,7 +207,7 @@ def make_tool_use_started_response_sse(
     }
     if parent_tool_use_id:
         data["parent_tool_use_id"] = parent_tool_use_id
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 
 def make_tool_use_response_sse(
@@ -215,7 +227,7 @@ def make_tool_use_response_sse(
     }
     if parent_tool_use_id:
         data["parent_tool_use_id"] = parent_tool_use_id
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 
 def _normalize_tool_result(result_block) -> Dict[str, Any]:
@@ -236,7 +248,7 @@ def make_tool_result_response_sse(
     data["sequence_number"] = sequence_number
     if parent_tool_use_id:
         data["parent_tool_use_id"] = parent_tool_use_id
-    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
+    return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 
 def make_function_call_response_sse(
@@ -262,4 +274,4 @@ def make_function_call_response_sse(
         "response_id": response_id,
         "item": item,
     }
-    return f"event: response.output_item.added\ndata: {json.dumps(event_data)}\n\n"
+    return f"event: response.output_item.added\ndata: {_sse_dumps(event_data)}\n\n"
