@@ -18,10 +18,17 @@ Contract (what FileNav calls):
 - ``POST /files/move``  {source,destination} -> ``{source,destination}``
 - ``POST /files/archive`` {paths}     -> zip stream
 
-Identity: the open-webui backend proxy forwards the standard user-info headers
-(when ``ENABLE_FORWARD_USER_INFO_HEADERS`` is on); we read ``X-OpenWebUI-User-Email``
-and take its localpart — the same value the pipe uses to key ``/v1/responses``
-workspaces — so the explorer resolves the very files the agent wrote.
+Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
+default ``X-User-Email``) and take its localpart — the same value the pipe uses to
+key ``/v1/responses`` workspaces — so the explorer resolves the very files the
+agent wrote. The caller (e.g. open-webui) forwards the user's identity under that
+header name; on open-webui set ``FORWARD_USER_INFO_HEADER_USER_EMAIL`` to the same
+name so the two agree (no code coupling to the caller's product).
+
+Config:
+- ``WORKSPACE_USER_HEADER`` — inbound identity header name (default ``X-User-Email``).
+- ``WORKSPACE_HIDE_DOTFILES`` — when true (default), dot-prefixed entries are
+  neither listed nor accessible.
 
 Security:
 - ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
@@ -65,10 +72,25 @@ class _ArchiveBody(BaseModel):
 
 router = APIRouter(tags=["workspace-files"])
 
-_EMAIL_HEADER = "x-openwebui-user-email"
 _BACKEND = "claude"
 # Cap in-band text previews; larger files must be fetched via /files/view.
 _MAX_READ_BYTES = 5 * 1024 * 1024
+
+# Name of the inbound header carrying the user identity. Kept generic and
+# configurable (no hard dependency on the caller's product) — the frontend just
+# has to forward the user's identity under this name. Its value is treated as an
+# email/identity whose localpart (before '@') keys the workspace, matching how
+# the pipe derives body.user. Default is deliberately vendor-neutral.
+_DEFAULT_USER_HEADER = "X-User-Email"
+
+
+def _user_header() -> str:
+    return os.getenv("WORKSPACE_USER_HEADER", _DEFAULT_USER_HEADER)
+
+
+def _hide_dotfiles() -> bool:
+    """When true (default), dot-prefixed entries are neither listed nor accessible."""
+    return os.getenv("WORKSPACE_HIDE_DOTFILES", "true").strip().lower() == "true"
 
 
 def _ensure_api_key() -> None:
@@ -81,10 +103,10 @@ def _ensure_api_key() -> None:
 
 
 def _require_user(request: Request) -> str:
-    # Workspace key = email localpart (strip from '@'), matching how the pipe
+    # Workspace key = identity localpart (strip from '@'), matching how the pipe
     # derives body.user. Falls back to the raw value when there is no '@'.
-    email = (request.headers.get(_EMAIL_HEADER) or "").strip()
-    user = email.split("@")[0]
+    identity = (request.headers.get(_user_header()) or "").strip()
+    user = identity.split("@")[0]
     if not user:
         raise HTTPException(status_code=400, detail="missing user identity header")
     return user
@@ -102,8 +124,10 @@ def _safe_resolve(root: Path, rel: str) -> Optional[Path]:
 
     ``rel`` is treated as workspace-relative; ``"/"`` or ``""`` is the root.
     ``Path.resolve()`` collapses ``..`` and follows symlinks, so an escape via
-    either is caught by the ``relative_to`` containment check. Returns ``None``
-    on any escape or resolution error.
+    either is caught by the ``relative_to`` containment check. When dotfiles are
+    hidden, any path with a dot-prefixed component is also rejected (so a hidden
+    entry can't be reached by typing its path). Returns ``None`` on any escape,
+    hidden-path, or resolution error.
     """
     rel = (rel or "/").lstrip("/")
     candidate = root / rel if rel else root
@@ -113,8 +137,10 @@ def _safe_resolve(root: Path, rel: str) -> Optional[Path]:
     except (OSError, RuntimeError):
         return None
     try:
-        resolved.relative_to(root_resolved)
+        relative = resolved.relative_to(root_resolved)
     except ValueError:
+        return None
+    if _hide_dotfiles() and any(part.startswith(".") for part in relative.parts):
         return None
     return resolved
 
@@ -159,9 +185,12 @@ async def list_files(
     if target is None or not target.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
 
+    hide_dot = _hide_dotfiles()
     entries = []
     with os.scandir(target) as it:
         for entry in it:
+            if hide_dot and entry.name.startswith("."):
+                continue
             try:
                 st = entry.stat()  # follow symlinks; broken links are skipped
             except OSError:

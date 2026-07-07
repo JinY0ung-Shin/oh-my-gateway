@@ -18,6 +18,10 @@ def workspace(tmp_path: Path) -> Path:
     (root / "sub").mkdir()
     (root / "sub" / "inner.md").write_text("# inner")
     (root / "blob.bin").write_bytes(b"\xff\xfe\x00\x01binary")
+    # Hidden entries — filtered/blocked when WORKSPACE_HIDE_DOTFILES is on.
+    (root / ".secret_dir").mkdir()
+    (root / ".secret_dir" / "k.txt").write_text("key")
+    (root / ".env").write_text("TOKEN=abc")
     # A secret OUTSIDE the workspace root, reachable only via traversal.
     (tmp_path / "secret.txt").write_text("TOP SECRET")
     return root
@@ -40,8 +44,8 @@ def client(workspace, monkeypatch):
 
 
 _AUTH = {"Authorization": "Bearer testkey"}
-# The proxy forwards the standard user-info headers; we key off the email localpart.
-_USER = {"X-OpenWebUI-User-Email": "alice@corp.com"}
+# Default identity header (WORKSPACE_USER_HEADER); we key off the localpart.
+_USER = {"X-User-Email": "alice@corp.com"}
 
 
 def test_config_advertises_readonly_no_terminal(client):
@@ -110,9 +114,24 @@ def test_missing_user_header_is_rejected(client):
 def test_invalid_user_is_rejected(client):
     r = client.get(
         "/files/list?directory=/",
-        headers={**_AUTH, "X-OpenWebUI-User-Email": "../evil@x.com"},
+        headers={**_AUTH, "X-User-Email": "../evil@x.com"},
     )
     assert r.status_code == 400
+
+
+def test_custom_user_header_name(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_USER_HEADER", "X-Whoami")
+    r = client.get(
+        "/files/list?directory=/",
+        headers={**_AUTH, "X-Whoami": "alice@corp.com"},
+    )
+    assert r.status_code == 200
+    # The old default name is no longer honored.
+    r2 = client.get(
+        "/files/list?directory=/",
+        headers={**_AUTH, "X-User-Email": "alice@corp.com"},
+    )
+    assert r2.status_code == 400
 
 
 def test_wrong_api_key_is_unauthorized(client):
@@ -137,6 +156,39 @@ def test_fails_closed_when_api_key_unset(workspace, monkeypatch):
 def test_missing_file_is_404(client):
     r = client.get("/files/read?path=/nope.txt", headers={**_AUTH, **_USER})
     assert r.status_code == 404
+
+
+# --- dotfile hiding -----------------------------------------------------------
+
+
+def test_dotfiles_hidden_by_default(client):
+    r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
+    names = [e["name"] for e in r.json()["entries"]]
+    assert ".env" not in names and ".secret_dir" not in names
+    assert names == ["sub", "blob.bin", "notes.txt"]
+
+
+def test_hidden_path_not_accessible_by_default(client):
+    # Even typing the path directly is blocked (list/read/inside-dir).
+    assert client.get("/files/read?path=/.env", headers={**_AUTH, **_USER}).status_code == 404
+    assert (
+        client.get("/files/list?directory=/.secret_dir", headers={**_AUTH, **_USER}).status_code
+        == 404
+    )
+    assert (
+        client.get("/files/read?path=/.secret_dir/k.txt", headers={**_AUTH, **_USER}).status_code
+        == 404
+    )
+
+
+def test_dotfiles_shown_when_disabled(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "false")
+    r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
+    names = [e["name"] for e in r.json()["entries"]]
+    assert ".env" in names and ".secret_dir" in names
+    # ...and now readable.
+    rr = client.get("/files/read?path=/.env", headers={**_AUTH, **_USER})
+    assert rr.status_code == 200 and rr.json()["content"] == "TOKEN=abc"
 
 
 # --- write operations ---------------------------------------------------------
