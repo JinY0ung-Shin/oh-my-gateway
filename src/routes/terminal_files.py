@@ -199,6 +199,28 @@ async def terminal_config(
     return {"features": {"terminal": False}}
 
 
+@router.get("/files/openapi.json")
+async def tool_specs(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Empty OpenAPI so open-webui exposes ZERO LLM tools for this connection.
+
+    A terminal connection's ``path`` (default ``/openapi.json``) is fetched by
+    open-webui, and every operation in it becomes an LLM-callable tool (whose
+    callables it then builds — and can fail to serialize with a manifold/pipe
+    model). This gateway is a file *browser*, not a tool provider — point the
+    connection ``path`` here so no tools are built. The FileNav sidebar calls
+    ``/files/*`` directly and is unaffected.
+    """
+    await verify_api_key(request, credentials)
+    return {
+        "openapi": "3.1.0",
+        "info": {"title": "Oh My Gateway Workspace Files", "version": "1.0.0"},
+        "paths": {},
+    }
+
+
 @router.get("/files/cwd")
 async def get_cwd(
     request: Request,

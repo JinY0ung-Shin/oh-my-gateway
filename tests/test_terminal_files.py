@@ -54,6 +54,16 @@ def test_config_advertises_readonly_no_terminal(client):
     assert r.json() == {"features": {"terminal": False}}
 
 
+def test_tool_specs_openapi_has_no_paths(client):
+    # open-webui builds LLM tools from this; empty paths => zero tools => no
+    # tool callables to serialize (avoids the "function not serializable" crash).
+    r = client.get("/files/openapi.json", headers=_AUTH)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["paths"] == {}
+    assert "openapi" in body
+
+
 def test_cwd_returns_real_workspace_path(client, workspace):
     r = client.get("/files/cwd", headers={**_AUTH, **_USER})
     assert r.status_code == 200
