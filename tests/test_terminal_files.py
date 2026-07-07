@@ -137,3 +137,120 @@ def test_fails_closed_when_api_key_unset(workspace, monkeypatch):
 def test_missing_file_is_404(client):
     r = client.get("/files/read?path=/nope.txt", headers={**_AUTH, **_USER})
     assert r.status_code == 404
+
+
+# --- write operations ---------------------------------------------------------
+
+
+def test_upload_creates_file(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("new.txt", b"content here", "text/plain")},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"path": "/new.txt", "size": 12}
+    assert (workspace / "new.txt").read_bytes() == b"content here"
+
+
+def test_upload_empty_file_is_new_file(client, workspace):
+    # FileNav's "New File" uploads an empty file.
+    r = client.post(
+        "/files/upload?directory=/sub",
+        headers={**_AUTH, **_USER},
+        files={"file": ("empty.md", b"", "text/plain")},
+    )
+    assert r.status_code == 200
+    assert (workspace / "sub" / "empty.md").exists()
+
+
+def test_upload_filename_traversal_reduced_to_basename(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("../../escape.txt", b"x", "text/plain")},
+    )
+    assert r.status_code == 200
+    # Written inside the workspace as a plain basename, not outside it.
+    assert (workspace / "escape.txt").exists()
+    assert not (workspace.parent.parent / "escape.txt").exists()
+
+
+def test_mkdir(client, workspace):
+    r = client.post("/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/newdir"})
+    assert r.status_code == 200
+    assert (workspace / "newdir").is_dir()
+
+
+def test_mkdir_traversal_blocked(client, workspace):
+    r = client.post(
+        "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/../evil"}
+    )
+    assert r.status_code == 400
+    assert not (workspace.parent / "evil").exists()
+
+
+def test_delete_file(client, workspace):
+    r = client.delete("/files/delete?path=/notes.txt", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.json()["type"] == "file"
+    assert not (workspace / "notes.txt").exists()
+
+
+def test_delete_directory_recursive(client, workspace):
+    r = client.delete("/files/delete?path=/sub", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.json()["type"] == "directory"
+    assert not (workspace / "sub").exists()
+
+
+def test_delete_traversal_blocked(client, workspace):
+    r = client.delete("/files/delete?path=/../../secret.txt", headers={**_AUTH, **_USER})
+    assert r.status_code in (400, 404)
+    assert (workspace.parent.parent / "secret.txt").exists()  # untouched
+
+
+def test_move_renames(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/renamed.txt"},
+    )
+    assert r.status_code == 200
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "renamed.txt").read_text() == "hello\nworld\n"
+
+
+def test_move_traversal_blocked(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/../stolen.txt"},
+    )
+    assert r.status_code == 400
+    assert (workspace / "notes.txt").exists()  # unchanged
+
+
+def test_archive_zips_selection(client):
+    r = client.post(
+        "/files/archive",
+        headers={**_AUTH, **_USER},
+        json={"paths": ["/notes.txt", "/sub"]},
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+    import io as _io
+    import zipfile as _zip
+
+    names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
+    assert "notes.txt" in names and "sub/inner.md" in names
+
+
+def test_writes_fail_closed_without_api_key(workspace, monkeypatch):
+    monkeypatch.setattr(tf.auth_manager, "get_api_key", lambda: "")
+    monkeypatch.setattr(tf.workspace_manager, "resolve", lambda user, backend=None: workspace)
+    app = FastAPI()
+    app.include_router(router)
+    c = TestClient(app)
+    r = c.post("/files/mkdir", json={"path": "/x"})
+    assert r.status_code == 503

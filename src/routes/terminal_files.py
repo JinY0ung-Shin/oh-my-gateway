@@ -1,17 +1,22 @@
-"""Open Terminal-compatible, read-only file server over per-user Claude workspaces.
+"""Open Terminal-compatible file server over per-user Claude workspaces.
 
 Implements the subset of the open-webui "Open Terminal" server HTTP contract that
-the ``FileNav`` right-sidebar explorer needs to BROWSE and PREVIEW files, scoped
-to a single user's Claude workspace. It is **read-only**: no write/exec endpoints
-are served, so the gateway can be registered in open-webui as a terminal
-connection and its workspace browsed exactly as the agent sees it.
+the ``FileNav`` right-sidebar explorer uses, scoped to a single user's Claude
+workspace, so the gateway can be registered in open-webui as a terminal
+connection and its workspace browsed/edited exactly as the agent sees it.
 
 Contract (what FileNav calls):
-- ``GET /api/config``                 -> ``{"features": {"terminal": false}}`` (handshake)
-- ``GET /files/cwd``                  -> ``{"cwd": "/"}`` (workspace root is the virtual "/")
-- ``GET /files/list?directory=<p>``   -> ``{"entries": [{name,type,size,modified}]}``
-- ``GET /files/read?path=<p>``        -> text ``{path,total_lines,content}`` | raw bytes (binary)
-- ``GET /files/view?path=<p>``        -> raw bytes (download)
+- ``GET  /api/config``                -> ``{"features": {"terminal": false}}`` (handshake)
+- ``GET  /files/cwd``                 -> ``{"cwd": "/"}`` (workspace root is the virtual "/")
+- ``POST /files/cwd``  {path}         -> ``{"cwd": path}`` (validate; cwd is client-tracked)
+- ``GET  /files/list?directory=<p>``  -> ``{"entries": [{name,type,size,modified}]}``
+- ``GET  /files/read?path=<p>``       -> text ``{path,total_lines,content}`` | raw bytes (binary)
+- ``GET  /files/view?path=<p>``       -> raw bytes (download)
+- ``POST /files/upload?directory=<p>``-> ``{path,size}`` (also how "new file" is created)
+- ``POST /files/mkdir``  {path}       -> ``{path}``
+- ``DELETE /files/delete?path=<p>``   -> ``{path,type}``
+- ``POST /files/move``  {source,destination} -> ``{source,destination}``
+- ``POST /files/archive`` {paths}     -> zip stream
 
 Identity: the open-webui backend proxy forwards the standard user-info headers
 (when ``ENABLE_FORWARD_USER_INFO_HEADERS`` is on); we read ``X-OpenWebUI-User-Email``
@@ -22,23 +27,41 @@ Security:
 - ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
   these endpoints would expose every user's files unauthenticated, so we fail
   closed here.
-- Every path is confined to the single workspace root via ``_safe_resolve``
-  (``Path.resolve()`` collapses ``..`` and follows symlinks before the
-  containment check). No extra roots (never ``~/.claude`` etc.).
+- Every path (read AND write) is confined to the single workspace root via
+  ``_safe_resolve`` (``Path.resolve()`` collapses ``..`` and resolves symlinks
+  before the containment check). Uploaded filenames are reduced to a basename.
+  No extra roots (never ``~/.claude`` etc.).
 """
 
+import io
 import mimetypes
 import os
+import shutil
 import stat as stat_module
+import zipfile
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
+from pydantic import BaseModel
 
 from src.auth import auth_manager, security, verify_api_key
 from src.workspace_manager import workspace_manager
+
+
+class _PathBody(BaseModel):
+    path: str
+
+
+class _MoveBody(BaseModel):
+    source: str
+    destination: str
+
+
+class _ArchiveBody(BaseModel):
+    paths: List[str]
 
 router = APIRouter(tags=["workspace-files"])
 
@@ -94,6 +117,11 @@ def _safe_resolve(root: Path, rel: str) -> Optional[Path]:
     except ValueError:
         return None
     return resolved
+
+
+def _rel(root: Path, target: Path) -> str:
+    """Workspace-relative path (leading '/') for a resolved *target*."""
+    return "/" + str(target.relative_to(root.resolve()))
 
 
 @router.get("/api/config")
@@ -195,3 +223,145 @@ async def view_file(
 
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=media, filename=target.name)
+
+
+# ---------------------------------------------------------------------------
+# Write operations (all confined to the workspace root by _safe_resolve)
+# ---------------------------------------------------------------------------
+
+
+@router.post("/files/cwd")
+async def set_cwd(
+    request: Request,
+    body: _PathBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Validate a directory; cwd itself is tracked client-side (root is virtual)."""
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    target = _safe_resolve(root, body.path)
+    if target is None or not target.is_dir():
+        raise HTTPException(status_code=404, detail="directory not found")
+    return {"cwd": body.path}
+
+
+@router.post("/files/upload")
+async def upload_file(
+    request: Request,
+    directory: str = "/",
+    file: UploadFile = File(...),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    dest_dir = _safe_resolve(root, directory)
+    if dest_dir is None or not dest_dir.is_dir():
+        raise HTTPException(status_code=404, detail="directory not found")
+
+    # Reduce the client filename to a basename so it can't carry path segments.
+    name = os.path.basename(file.filename or "")
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    target = _safe_resolve(root, f"{directory}/{name}")
+    if target is None:
+        raise HTTPException(status_code=400, detail="invalid path")
+
+    data = await file.read()
+    target.write_bytes(data)
+    return {"path": _rel(root, target), "size": len(data)}
+
+
+@router.post("/files/mkdir")
+async def make_dir(
+    request: Request,
+    body: _PathBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    target = _safe_resolve(root, body.path)
+    if target is None or target == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    target.mkdir(parents=True, exist_ok=True)
+    return {"path": _rel(root, target)}
+
+
+@router.delete("/files/delete")
+async def delete_entry(
+    request: Request,
+    path: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    target = _safe_resolve(root, path)
+    if target is None or target == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not target.exists():
+        raise HTTPException(status_code=404, detail="not found")
+    is_dir = target.is_dir() and not target.is_symlink()
+    if is_dir:
+        shutil.rmtree(target)
+    else:
+        target.unlink()
+    return {"path": path, "type": "directory" if is_dir else "file"}
+
+
+@router.post("/files/move")
+async def move_entry(
+    request: Request,
+    body: _MoveBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    src = _safe_resolve(root, body.source)
+    dst = _safe_resolve(root, body.destination)
+    if src is None or dst is None or src == root.resolve() or dst == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source not found")
+    if not dst.parent.is_dir():
+        raise HTTPException(status_code=404, detail="destination directory not found")
+    shutil.move(str(src), str(dst))
+    return {"source": body.source, "destination": body.destination}
+
+
+@router.post("/files/archive")
+async def archive_entries(
+    request: Request,
+    body: _ArchiveBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    root_resolved = root.resolve()
+
+    targets = []
+    for p in body.paths:
+        t = _safe_resolve(root, p)
+        if t is None or not t.exists():
+            raise HTTPException(status_code=404, detail=f"not found: {p}")
+        targets.append(t)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for t in targets:
+            if t.is_dir():
+                for sub in t.rglob("*"):
+                    if sub.is_file() and not sub.is_symlink():
+                        zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
+            elif t.is_file() and not t.is_symlink():
+                zf.write(t, arcname=str(t.relative_to(root_resolved)))
+    buf.seek(0)
+    return StreamingResponse(
+        iter([buf.getvalue()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
+    )
