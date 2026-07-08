@@ -1,5 +1,4 @@
 from typing import Optional
-import os
 import re
 import json
 
@@ -15,7 +14,10 @@ from src.content_blocks import (
 class MessageAdapter:
     """Converts between OpenAI message format and Claude Code prompts."""
 
-    TOOL_RESULT_MAX_LENGTH = int(os.getenv("TOOL_RESULT_MAX_LENGTH", "2000"))
+    # Cap on tool_result content when blocks are rendered to text. Only the
+    # fallback paths hit this (no ResultMessage.result); streaming SSE
+    # tool_result events are never truncated.
+    TOOL_RESULT_MAX_LENGTH = 2000
 
     @staticmethod
     def _truncate_tool_content(content):
