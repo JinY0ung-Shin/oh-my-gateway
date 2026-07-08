@@ -603,6 +603,12 @@ app.include_router(sessions_router)
 app.include_router(general_router)
 app.include_router(admin_router)
 
+# Open Terminal-compatible read-only file server over per-user workspaces, so
+# open-webui can browse a user's Claude workspace in its file-explorer sidebar.
+from src.routes.terminal_files import router as terminal_files_router  # noqa: E402
+
+app.include_router(terminal_files_router)
+
 # Anthropic Messages SSE sanitizer for upstream LiteLLM-like proxies that emit
 # non-spec-conforming streams (LiteLLM #21128). The route is always mounted so
 # the admin panel can flip it on/off at runtime; the handler short-circuits to
