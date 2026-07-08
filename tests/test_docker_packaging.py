@@ -85,7 +85,13 @@ def test_default_dockerfile_does_not_install_opencode():
 
     assert "opencode-builder" not in dockerfile
     assert "opencode-ai" not in dockerfile
-    assert "nodejs npm" not in dockerfile
+
+
+def test_default_dockerfile_installs_node_for_plugin_mcp():
+    """Plugin MCP servers spawn node processes, so the default image needs node."""
+    dockerfile = (ROOT / "Dockerfile").read_text()
+
+    assert "nodejs npm" in dockerfile
 
 
 def test_dockerfile_uses_entrypoint_for_bind_mount_permissions():

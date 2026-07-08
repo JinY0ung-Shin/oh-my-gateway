@@ -58,7 +58,7 @@ async def test_create_client_returns_connected_client():
 
 
 async def test_create_client_sets_hooks():
-    """create_client() sets options.hooks with a PreToolUse entry for AskUserQuestion."""
+    """create_client() sets PreToolUse hooks: AskUserQuestion intercept + Skill auto-approve."""
     cli = _make_cli()
     session = Session(session_id="sess-2")
 
@@ -81,10 +81,11 @@ async def test_create_client_sets_hooks():
     assert options.hooks is not None
     assert "PreToolUse" in options.hooks
     matchers = options.hooks["PreToolUse"]
-    assert len(matchers) == 1
-    assert matchers[0].matcher == "AskUserQuestion"
-    assert len(matchers[0].hooks) == 1
-    assert callable(matchers[0].hooks[0])
+    by_matcher = {m.matcher: m for m in matchers}
+    assert set(by_matcher) == {"AskUserQuestion", "Skill"}
+    for matcher in by_matcher.values():
+        assert len(matcher.hooks) == 1
+        assert callable(matcher.hooks[0])
 
 
 async def test_create_client_uses_gateway_session_id():

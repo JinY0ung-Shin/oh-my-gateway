@@ -8,8 +8,10 @@ These tests use the real Claude Code CLI and SDK to verify that:
 NOTE: can_use_tool callbacks do NOT work — the CLI never sends
 control_request messages. PreToolUse hooks are the correct mechanism.
 
-Requires: Claude Code CLI authenticated locally (claude auth status).
-Skipped automatically if CLI is not available or not authenticated.
+Requires: Claude Code CLI authenticated locally (claude auth status) and a
+reachable model endpoint, so these are marked ``e2e`` and excluded from the
+default suite (addopts -m 'not e2e'); run them with ``uv run pytest -m e2e``.
+Also skipped automatically if the CLI is not available.
 """
 
 import asyncio
@@ -34,10 +36,13 @@ def _cli_authenticated() -> bool:
         return False
 
 
-pytestmark = pytest.mark.skipif(
-    not _cli_authenticated(),
-    reason="Claude Code CLI not available or not authenticated",
-)
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.skipif(
+        not _cli_authenticated(),
+        reason="Claude Code CLI not available or not authenticated",
+    ),
+]
 
 
 async def test_pretooluse_hook_fires_for_ask_user_question():
