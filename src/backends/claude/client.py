@@ -24,6 +24,8 @@ from claude_agent_sdk.types import (
     SystemMessage,
     RateLimitEvent,
     HookMatcher,
+    PermissionResultAllow,
+    PermissionResultDeny,
 )
 from claude_agent_sdk.types import (
     SandboxSettings,
@@ -689,36 +691,42 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
-    def _make_ask_user_hook(self, session):
-        """Create a PreToolUse hook that intercepts AskUserQuestion.
+    def _make_ask_user_can_use_tool(self, session):
+        """Create a ``can_use_tool`` callback that intercepts AskUserQuestion.
 
-        When AskUserQuestion is detected, parks the session and waits for
-        client input. Returns deny + user's response as the reason, which
-        the CLI converts to a tool_result that Claude reads as the answer.
+        AskUserQuestion is *not* surfaced to the model in headless SDK mode by a
+        PreToolUse hook alone — the current CLI only exposes it as a callable
+        tool when a ``can_use_tool`` permission callback is registered. (The
+        model literally reports it has no such tool otherwise; see issue #131.)
+        AskUserQuestion always falls through to this callback, even under
+        ``permission_mode=bypassPermissions`` where ordinary tools are
+        auto-approved without it — verified against claude-agent-sdk==0.2.108.
+
+        For AskUserQuestion we park the session and wait for the client's
+        answer, then deny with the answer as the message — the CLI turns the
+        deny message into a tool_result that Claude reads as the user's reply
+        (the same contract the old PreToolUse hook used). Every other tool that
+        reaches this callback is approved; hooks (workspace sandbox, Skill) run
+        before it, so this does not weaken those gates.
         """
 
-        async def hook(input_data, tool_use_id, _context):
-            tool_name = input_data.get("tool_name", "") if isinstance(input_data, dict) else ""
+        async def can_use_tool(tool_name, input_data, context):
             if tool_name != "AskUserQuestion":
-                return {}  # Allow other tools to proceed
+                return PermissionResultAllow()
 
-            tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
-            actual_tool_use_id = (
-                input_data.get("tool_use_id", tool_use_id)
-                if isinstance(input_data, dict)
-                else tool_use_id
-            )
+            tool_input = input_data if isinstance(input_data, dict) else {}
+            call_id = getattr(context, "tool_use_id", None) or ""
 
             session.pending_tool_call = {
-                "call_id": actual_tool_use_id,
+                "call_id": call_id,
                 "name": "AskUserQuestion",
                 "arguments": tool_input,
             }
             session.input_event = asyncio.Event()
 
-            # Signal the streaming loop to break so the route can
-            # emit function_call + requires_action before the hook
-            # blocks waiting for user input.
+            # Signal the streaming loop to break so the route can emit
+            # function_call + requires_action before this callback blocks
+            # waiting for the user's answer.
             if session.stream_break_event is not None:
                 session.stream_break_event.set()
 
@@ -729,39 +737,27 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "AskUserQuestion hook timed out after %ds for session %s",
+                    "AskUserQuestion timed out after %ds for session %s",
                     ASK_USER_TIMEOUT_SECONDS,
                     session.session_id,
                 )
                 session.input_response = None
                 session.input_event = None
                 session.pending_tool_call = None
-                return {
-                    "hookSpecificOutput": {
-                        "hookEventName": "PreToolUse",
-                        "permissionDecision": "deny",
-                        "permissionDecisionReason": (
-                            "User did not respond within the timeout period."
-                        ),
-                    }
-                }
+                return PermissionResultDeny(
+                    message="User did not respond within the timeout period."
+                )
 
             # Capture response before clearing state
             user_response = session.input_response or ""
             session.input_response = None
             session.input_event = None
 
-            # Deny with user's response as reason — CLI converts this to
-            # a tool_result that Claude reads as the user's answer.
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": f"User responded: {user_response}",
-                }
-            }
+            # Deny with the user's response as the message — the CLI converts
+            # this to a tool_result that Claude reads as the user's answer.
+            return PermissionResultDeny(message=f"User responded: {user_response}")
 
-        return hook
+        return can_use_tool
 
     async def update_request_policy(
         self,
@@ -865,11 +861,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             user=user,
             forward_headers=forward_headers,
         )
+        # AskUserQuestion is intercepted via a can_use_tool callback (below),
+        # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
+        # model as a callable tool when a permission callback is present.
+        options.can_use_tool = self._make_ask_user_can_use_tool(session)
+
         pre_tool_use = [
-            HookMatcher(
-                matcher="AskUserQuestion",
-                hooks=[self._make_ask_user_hook(session)],
-            ),
             # Force-approve the Skill tool. The gateway runs headless (no
             # interactive approver), so the CLI's per-skill permission "ask"
             # (surfaced to the client as an "Execute skill: <name>" error)
