@@ -15,6 +15,9 @@ def manifest_file(tmp_path, monkeypatch):
     return path
 
 
+_AUTO_REFRESH_DEFAULTS = {"enabled": False, "interval_minutes": 60}
+
+
 def test_manifest_path_env_override(manifest_file):
     assert plugin_manifest.manifest_path() == manifest_file
 
@@ -25,6 +28,7 @@ def test_load_missing_returns_defaults(manifest_file):
         "added": [],
         "removed": [],
         "marketplaces": {},
+        "auto_refresh": _AUTO_REFRESH_DEFAULTS,
     }
 
 
@@ -45,7 +49,8 @@ def test_save_load_roundtrip(manifest_file):
     }
     plugin_manifest.save(data)
     assert json.loads(manifest_file.read_text(encoding="utf-8")) == data
-    assert plugin_manifest.load() == data
+    # load() normalizes in the auto_refresh section even when absent on disk
+    assert plugin_manifest.load() == {**data, "auto_refresh": _AUTO_REFRESH_DEFAULTS}
 
 
 def test_load_corrupt_file_fallback(manifest_file):
@@ -55,6 +60,7 @@ def test_load_corrupt_file_fallback(manifest_file):
         "added": [],
         "removed": [],
         "marketplaces": {},
+        "auto_refresh": _AUTO_REFRESH_DEFAULTS,
     }
 
 
@@ -65,6 +71,7 @@ def test_load_wrong_types_fallback(manifest_file):
         "added": [],
         "removed": [],
         "marketplaces": {},
+        "auto_refresh": _AUTO_REFRESH_DEFAULTS,
     }
 
 
@@ -190,6 +197,83 @@ def test_remove_marketplace_entries_drops_record(manifest_file):
     plugin_manifest.remove_marketplace_entries("mkt1")
     assert plugin_manifest.get_marketplace("mkt1") == {}
     assert plugin_manifest.list_added() == []
+
+
+def test_auto_refresh_defaults(manifest_file):
+    assert plugin_manifest.get_auto_refresh() == _AUTO_REFRESH_DEFAULTS
+
+
+def test_auto_refresh_set_get_roundtrip(manifest_file):
+    rec = plugin_manifest.set_auto_refresh(enabled=True, interval_minutes=30)
+    assert rec == {"enabled": True, "interval_minutes": 30}
+    assert plugin_manifest.get_auto_refresh() == rec
+    # survives an unrelated read-modify-write mutation (load() must carry the
+    # section through, or any add_plugin would silently drop it)
+    plugin_manifest.add_plugin(
+        repo="r", name="a", marketplace="m", scope="user", branch="main"
+    )
+    assert plugin_manifest.get_auto_refresh() == rec
+
+
+def test_auto_refresh_clamps_interval(manifest_file):
+    low = plugin_manifest.set_auto_refresh(enabled=True, interval_minutes=1)
+    assert low["interval_minutes"] == plugin_manifest.AUTO_REFRESH_MIN_MINUTES
+    high = plugin_manifest.set_auto_refresh(enabled=True, interval_minutes=10**9)
+    assert high["interval_minutes"] == plugin_manifest.AUTO_REFRESH_MAX_MINUTES
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (True, True),
+        (False, False),
+        (1, True),
+        (0, False),
+        ("true", True),
+        ("1", True),
+        ("yes", True),
+        ("on", True),
+        # the bug: falsy strings must NOT read as True (plain bool() would)
+        ("false", False),
+        ("off", False),
+        ("no", False),
+        ("0", False),
+        (None, False),
+    ],
+)
+def test_auto_refresh_enabled_coercion(manifest_file, value, expected):
+    manifest_file.write_text(
+        json.dumps({"auto_refresh": {"enabled": value, "interval_minutes": 60}}),
+        encoding="utf-8",
+    )
+    assert plugin_manifest.get_auto_refresh()["enabled"] is expected
+
+
+def test_auto_refresh_non_finite_interval_does_not_raise(manifest_file):
+    # json.loads accepts NaN/Infinity literals; int(nan)/int(inf) would raise and
+    # escape load()'s try/except, so _normalize_auto_refresh must reject them.
+    for literal in ("NaN", "Infinity", "-Infinity", "1e400"):
+        manifest_file.write_text(
+            '{"auto_refresh": {"enabled": true, "interval_minutes": ' + literal + "}}",
+            encoding="utf-8",
+        )
+        # must not raise, and must fall back to the default interval
+        rec = plugin_manifest.get_auto_refresh()
+        assert rec["interval_minutes"] == plugin_manifest.AUTO_REFRESH_DEFAULT_MINUTES
+        assert rec["enabled"] is True
+
+
+def test_auto_refresh_normalizes_corrupt_record(manifest_file):
+    manifest_file.write_text(
+        json.dumps({"auto_refresh": {"enabled": 1, "interval_minutes": "soon"}}),
+        encoding="utf-8",
+    )
+    assert plugin_manifest.get_auto_refresh() == {
+        "enabled": True,
+        "interval_minutes": plugin_manifest.AUTO_REFRESH_DEFAULT_MINUTES,
+    }
+    manifest_file.write_text(json.dumps({"auto_refresh": "junk"}), encoding="utf-8")
+    assert plugin_manifest.get_auto_refresh() == _AUTO_REFRESH_DEFAULTS
 
 
 def test_concurrent_add_plugin_no_lost_updates(manifest_file):

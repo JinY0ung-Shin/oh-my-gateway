@@ -8,6 +8,41 @@ def get_plugins_html() -> str:
         <p class="text-xs text-muted" style="margin:0 0 12px 0">
           Admin-managed layer on top of the CLAUDE_PLUGIN_* environment bootstrap. Changes persist via the gateway manifest.
         </p>
+
+        <!-- Marketplace auto-refresh (periodic re-clone + plugin update) -->
+        <div class="card" style="margin-bottom:12px">
+          <div class="flex-between mb-sm">
+            <h3 style="margin:0; color:var(--cyan)">Marketplace Auto-Refresh</h3>
+            <span class="badge text-xs"
+              :style="autoRefresh.enabled ? 'border-color:var(--green); color:var(--green)' : 'border-color:var(--border-bright); color:var(--text-dim)'"
+              x-text="autoRefresh.running ? 'RUNNING' : (autoRefresh.enabled ? 'ON' : 'OFF')"></span>
+          </div>
+          <div class="flex-gap-sm" style="align-items:center; flex-wrap:wrap">
+            <label class="text-sm" style="display:flex; align-items:center; gap:6px; cursor:pointer">
+              <input type="checkbox" x-model="autoRefresh.enabled" aria-label="Enable marketplace auto-refresh">
+              Enabled
+            </label>
+            <label class="text-sm" style="display:flex; align-items:center; gap:6px">
+              every
+              <input type="number" x-model.number="autoRefresh.interval_minutes" min="5" max="10080"
+                style="width:80px" aria-label="Auto-refresh interval in minutes">
+              min
+            </label>
+            <button class="btn btn-sm btn-primary" @click="saveAutoRefresh()" :disabled="autoRefreshBusy"
+              aria-label="Save auto-refresh settings">
+              <span x-text="autoRefreshBusy ? 'Working...' : 'Save'"></span>
+            </button>
+            <button class="btn btn-sm btn-ghost" @click="runAutoRefreshNow()"
+              :disabled="autoRefreshBusy || autoRefresh.running" aria-label="Run refresh cycle now">
+              <span x-text="autoRefresh.running ? 'Refreshing...' : 'Run now'"></span>
+            </button>
+            <span class="text-xs text-muted" x-text="autoRefreshSummary()"></span>
+          </div>
+          <p class="text-xs text-muted" style="margin:8px 0 0 0">
+            Periodically re-clones every gateway-managed marketplace and runs <code>claude plugin update</code> for its installed plugins — the same path as the per-marketplace Refresh button. New sessions pick up updated plugins.
+          </p>
+        </div>
+
         <div class="grid-2">
 
           <!-- Browse / Catalog section -->

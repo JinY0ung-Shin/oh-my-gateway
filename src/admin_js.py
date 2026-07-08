@@ -33,6 +33,9 @@ def get_admin_js() -> str:
     pluginBusy: false,
     marketplaceBusy: {},
     marketplaceTokens: {},
+    autoRefresh: { enabled: false, interval_minutes: 60, running: false, last_run_at: null, next_run_at: null, last_results: [] },
+    autoRefreshBusy: false,
+    autoRefreshPollTimer: null,
     catalogFilter: '',
     catalogBusy: {},
     catalogLoading: false,
@@ -760,6 +763,104 @@ def get_admin_js() -> str:
         }
       } catch(e) { this.showToast('Connection error', 'err'); }
       finally { this.marketplaceTokens[name] = ''; delete this.marketplaceBusy[name]; }
+    },
+
+    // --- Marketplace auto-refresh (PLUGINS tab) ---
+    async loadAutoRefresh() {
+      try {
+        const r = await this.api('/admin/api/plugins/auto-refresh');
+        if (r.ok) {
+          this.autoRefresh = { ...this.autoRefresh, ...(await r.json()) };
+          this._watchAutoRefreshRun();
+        }
+      } catch(e) { console.error('Failed to load auto-refresh', e); }
+    },
+
+    async saveAutoRefresh() {
+      this.autoRefreshBusy = true;
+      try {
+        const r = await this.api('/admin/api/plugins/auto-refresh', {
+          method: 'PUT', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({
+            enabled: !!this.autoRefresh.enabled,
+            interval_minutes: Number(this.autoRefresh.interval_minutes) || 60,
+          })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          this.autoRefresh = { ...this.autoRefresh, ...d };
+          this.showToast('AUTO-REFRESH ' + (d.enabled ? 'ENABLED' : 'DISABLED'), 'ok');
+        } else {
+          this.showToast(d.error || 'Save failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.autoRefreshBusy = false; }
+    },
+
+    async runAutoRefreshNow() {
+      this.autoRefreshBusy = true;
+      try {
+        const r = await this.api('/admin/api/plugins/auto-refresh/run', { method: 'POST' });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok && d.status === 'started') {
+          this.autoRefresh.running = true;
+          this.showToast('REFRESH CYCLE STARTED', 'ok');
+          this._watchAutoRefreshRun();
+        } else if (d.status === 'already_running') {
+          this.showToast('Refresh cycle already running', 'err');
+        } else {
+          this.showToast(d.error || 'Trigger failed', 'err');
+        }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.autoRefreshBusy = false; }
+    },
+
+    _stopAutoRefreshWatch() {
+      if (this.autoRefreshPollTimer) {
+        clearInterval(this.autoRefreshPollTimer);
+        this.autoRefreshPollTimer = null;
+      }
+    },
+
+    // Poll status while a cycle is running so the card flips back to idle and
+    // the plugin lists pick up new versions once it finishes. Only status
+    // fields are synced — never `enabled`/`interval_minutes`, so a poll landing
+    // mid-edit can't clobber the admin's unsaved form. Clears on the server
+    // reporting idle (not a transition the tab-switch merge could swallow) and
+    // on any non-ok response (e.g. auth expiry) so it can never poll forever.
+    _watchAutoRefreshRun() {
+      if (!this.autoRefresh.running || this.autoRefreshPollTimer) return;
+      this.autoRefreshPollTimer = setInterval(async () => {
+        let d;
+        try {
+          const r = await this.api('/admin/api/plugins/auto-refresh');
+          if (!r.ok) { this._stopAutoRefreshWatch(); return; }
+          d = await r.json();
+        } catch(e) { return; /* transient network error: keep polling */ }
+        this.autoRefresh.running = d.running;
+        this.autoRefresh.last_run_at = d.last_run_at;
+        this.autoRefresh.next_run_at = d.next_run_at;
+        this.autoRefresh.last_results = d.last_results;
+        if (!d.running) {
+          this._stopAutoRefreshWatch();
+          const errs = (d.last_results || []).filter(x => x.status !== 'refreshed').length;
+          this.showToast('REFRESH CYCLE FINISHED' + (errs ? ' (' + errs + ' failed)' : ''), errs ? 'err' : 'ok');
+          await this.refreshPluginViews();
+        }
+      }, 4000);
+    },
+
+    autoRefreshSummary() {
+      const a = this.autoRefresh;
+      const parts = [];
+      if (a.last_run_at) {
+        const errs = (a.last_results || []).filter(x => x.status !== 'refreshed').length;
+        parts.push('last: ' + a.last_run_at + (errs ? ' (' + errs + ' failed)' : ''));
+      } else {
+        parts.push('not run yet');
+      }
+      if (a.enabled && a.next_run_at) parts.push('next: ' + a.next_run_at);
+      return parts.join('  |  ');
     },
 
     async installPlugin() {

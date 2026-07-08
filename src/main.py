@@ -283,6 +283,13 @@ async def lifespan(app: FastAPI):
     # Start session cleanup task
     session_manager.start_cleanup_task()
 
+    # Start the marketplace auto-refresh poller. Admin-toggled via the plugin
+    # manifest (re-read every tick), so it idles while disabled and needs no
+    # restart to enable.
+    from src.plugin_autorefresh import auto_refresher
+
+    auto_refresher.start()
+
     # Sweep orphaned anonymous workspaces left behind by prior runs. Sessions are
     # in-memory only, so a restart orphans every active anonymous session's
     # _tmp_ directory; without this they accumulate forever under the base path.
@@ -307,6 +314,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Cleanup on shutdown (async to disconnect SDK clients)
+    await auto_refresher.stop()
     logger.info("Shutting down session manager...")
     await session_manager.async_shutdown()
     await _shutdown_backends()

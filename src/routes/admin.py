@@ -31,6 +31,8 @@ Plugin skills:  GET  /admin/api/plugins/{id}/skills/{name}
 Plugin install: POST /admin/api/plugins
 Plugin remove:  DELETE /admin/api/plugins/{id}
 Plugin manifest: GET /admin/api/plugins/manifest
+Auto-refresh:   GET/PUT /admin/api/plugins/auto-refresh
+                POST /admin/api/plugins/auto-refresh/run
 Marketplaces:   GET  /admin/api/marketplaces
                 POST /admin/api/marketplaces
                 GET  /admin/api/marketplaces/catalog
@@ -112,6 +114,13 @@ class PluginInstallRequest(BaseModel):
     scope: str = "user"
     repo: str = ""
     branch: str = "main"
+
+
+class AutoRefreshUpdate(BaseModel):
+    enabled: bool
+    # None = preserve the stored interval (so a minimal {"enabled": false} body
+    # can't silently reset a configured interval back to a default).
+    interval_minutes: Optional[int] = None
 
 
 class McpServerUpsert(BaseModel):
@@ -834,6 +843,68 @@ async def get_plugin_manifest_endpoint(_=Depends(require_admin)):
         "added": plugin_manifest.list_added(),
         "removed": plugin_manifest.list_removed(),
     }
+
+
+@router.get("/api/plugins/auto-refresh")
+async def get_plugin_auto_refresh_endpoint(_=Depends(require_admin)):
+    """Return the marketplace auto-refresh config + poller status."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src.plugin_autorefresh import auto_refresher
+
+    return await run_in_threadpool(auto_refresher.status)
+
+
+@router.put("/api/plugins/auto-refresh")
+async def update_plugin_auto_refresh_endpoint(
+    body: AutoRefreshUpdate,
+    _=Depends(require_admin),
+):
+    """Persist the auto-refresh config; the poller picks it up next tick."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import plugin_manifest
+    from src.plugin_autorefresh import auto_refresher
+
+    # Omitted interval preserves the stored one rather than snapping to a default.
+    if body.interval_minutes is None:
+        current = await run_in_threadpool(plugin_manifest.get_auto_refresh)
+        interval = current["interval_minutes"]
+    else:
+        interval = body.interval_minutes
+
+    if not (
+        plugin_manifest.AUTO_REFRESH_MIN_MINUTES
+        <= interval
+        <= plugin_manifest.AUTO_REFRESH_MAX_MINUTES
+    ):
+        return JSONResponse(
+            status_code=400,
+            content={
+                "error": (
+                    "interval_minutes must be between "
+                    f"{plugin_manifest.AUTO_REFRESH_MIN_MINUTES} and "
+                    f"{plugin_manifest.AUTO_REFRESH_MAX_MINUTES}"
+                )
+            },
+        )
+    await run_in_threadpool(
+        plugin_manifest.set_auto_refresh,
+        enabled=body.enabled,
+        interval_minutes=interval,
+    )
+    # Restart the countdown so enabling doesn't fire an immediate cycle and
+    # next_run_at reflects the real next run.
+    auto_refresher.reset_schedule()
+    return await run_in_threadpool(auto_refresher.status)
+
+
+@router.post("/api/plugins/auto-refresh/run")
+async def run_plugin_auto_refresh_endpoint(_=Depends(require_admin)):
+    """Trigger an immediate refresh cycle in the background."""
+    from src.plugin_autorefresh import auto_refresher
+
+    return auto_refresher.trigger()
 
 
 @router.post("/api/marketplaces")

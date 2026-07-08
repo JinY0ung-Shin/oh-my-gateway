@@ -79,6 +79,21 @@ class TestAuthGating:
         r = anon_client.get("/admin/api/marketplaces/mp/plugins")
         assert r.status_code in (401, 403)
 
+    def test_auto_refresh_get_requires_admin(self, anon_client):
+        r = anon_client.get("/admin/api/plugins/auto-refresh")
+        assert r.status_code in (401, 403)
+
+    def test_auto_refresh_put_requires_admin(self, anon_client):
+        r = anon_client.put(
+            "/admin/api/plugins/auto-refresh",
+            json={"enabled": True, "interval_minutes": 60},
+        )
+        assert r.status_code in (401, 403)
+
+    def test_auto_refresh_run_requires_admin(self, anon_client):
+        r = anon_client.post("/admin/api/plugins/auto-refresh/run")
+        assert r.status_code in (401, 403)
+
 
 # ---------------------------------------------------------------------------
 # Route ordering: manifest must not be shadowed by the catch-all detail route
@@ -107,6 +122,86 @@ class TestRouteOrdering:
         assert r.status_code == 200
         mock_catalog.assert_called_once_with()
         mock_one.assert_not_called()
+
+    def test_auto_refresh_not_shadowed_by_detail(self, admin_client):
+        """`/plugins/auto-refresh` must beat the `{plugin_id:path}` catch-all."""
+        status = {"enabled": False, "interval_minutes": 60, "running": False}
+        with patch(
+            "src.plugin_autorefresh.auto_refresher.status", return_value=status
+        ) as mock_status:
+            r = admin_client.get("/admin/api/plugins/auto-refresh")
+        assert r.status_code == 200
+        assert r.json() == status
+        mock_status.assert_called_once_with()
+
+
+# ---------------------------------------------------------------------------
+# Marketplace auto-refresh config / trigger
+# ---------------------------------------------------------------------------
+
+
+class TestAutoRefreshRoutes:
+    def test_put_persists_and_returns_status(self, admin_client):
+        status = {"enabled": True, "interval_minutes": 30, "running": False}
+        with patch("src.plugin_manifest.set_auto_refresh") as mock_set:
+            with patch(
+                "src.plugin_autorefresh.auto_refresher.status", return_value=status
+            ):
+                r = admin_client.put(
+                    "/admin/api/plugins/auto-refresh",
+                    json={"enabled": True, "interval_minutes": 30},
+                )
+        assert r.status_code == 200
+        assert r.json() == status
+        mock_set.assert_called_once_with(enabled=True, interval_minutes=30)
+
+    @pytest.mark.parametrize("interval", [1, 10**9])
+    def test_put_rejects_out_of_range_interval(self, admin_client, interval):
+        with patch("src.plugin_manifest.set_auto_refresh") as mock_set:
+            r = admin_client.put(
+                "/admin/api/plugins/auto-refresh",
+                json={"enabled": True, "interval_minutes": interval},
+            )
+        assert r.status_code == 400
+        assert "interval_minutes" in r.json()["error"]
+        mock_set.assert_not_called()
+
+    def test_put_omitting_interval_preserves_stored(self, admin_client):
+        """A minimal {enabled: false} body must not reset the stored interval."""
+        stored = {"enabled": True, "interval_minutes": 1440, "running": False}
+        with patch(
+            "src.plugin_manifest.get_auto_refresh", return_value=stored
+        ):
+            with patch("src.plugin_manifest.set_auto_refresh") as mock_set:
+                with patch(
+                    "src.plugin_autorefresh.auto_refresher.status",
+                    return_value=stored,
+                ):
+                    r = admin_client.put(
+                        "/admin/api/plugins/auto-refresh",
+                        json={"enabled": False},
+                    )
+        assert r.status_code == 200
+        mock_set.assert_called_once_with(enabled=False, interval_minutes=1440)
+
+    def test_run_triggers_cycle(self, admin_client):
+        with patch(
+            "src.plugin_autorefresh.auto_refresher.trigger",
+            return_value={"status": "started"},
+        ) as mock_trigger:
+            r = admin_client.post("/admin/api/plugins/auto-refresh/run")
+        assert r.status_code == 200
+        assert r.json() == {"status": "started"}
+        mock_trigger.assert_called_once_with()
+
+    def test_run_reports_already_running(self, admin_client):
+        with patch(
+            "src.plugin_autorefresh.auto_refresher.trigger",
+            return_value={"status": "already_running"},
+        ):
+            r = admin_client.post("/admin/api/plugins/auto-refresh/run")
+        assert r.status_code == 200
+        assert r.json() == {"status": "already_running"}
 
 
 class TestPluginsUi:

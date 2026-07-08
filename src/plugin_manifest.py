@@ -13,6 +13,10 @@ container start). The admin panel mutates it at runtime; startup replays it.
   given a local clone path and records ``source: directory`` (losing the
   remote), so this map is the authoritative record for replay and for telling
   the UI a marketplace's scope.
+- ``auto_refresh`` = the marketplace auto-refresh config
+  (``{"enabled", "interval_minutes"}``) consumed by the
+  :mod:`src.plugin_autorefresh` poller; admin-toggled at runtime, no restart
+  needed.
 
 The file is JSON at ``CLAUDE_PLUGIN_MANIFEST`` (or ``<project>/data/
 gateway-plugins.json``). ``load()`` never raises; ``save()`` is atomic
@@ -22,6 +26,7 @@ never corrupt the manifest under a Docker bind mount.
 
 import json
 import logging
+import math
 import os
 import tempfile
 from pathlib import Path
@@ -38,6 +43,13 @@ _lock = RLock()
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _DEFAULT_PATH = _DATA_DIR / "gateway-plugins.json"
 
+# Auto-refresh interval bounds (minutes). Clamped on read AND write so a
+# hand-edited manifest can never drive the refresh poller into a hot loop of
+# git clones and claude CLI calls.
+AUTO_REFRESH_DEFAULT_MINUTES = 60
+AUTO_REFRESH_MIN_MINUTES = 5
+AUTO_REFRESH_MAX_MINUTES = 10080  # one week
+
 
 def manifest_path() -> Path:
     """Resolve the manifest path (env override > project ``data/`` default)."""
@@ -48,7 +60,52 @@ def manifest_path() -> Path:
 
 
 def _defaults() -> dict:
-    return {"version": 1, "added": [], "removed": [], "marketplaces": {}}
+    return {
+        "version": 1,
+        "added": [],
+        "removed": [],
+        "marketplaces": {},
+        "auto_refresh": _normalize_auto_refresh(None),
+    }
+
+
+def _coerce_bool(value) -> bool:
+    """Coerce a hand-edited JSON value to a bool without Python truthiness traps.
+
+    A real bool passes through; a number is nonzero; a string is matched against
+    an explicit truthy set so ``"false"``/``"off"``/``"no"``/``"0"`` read as
+    False (plain ``bool("false")`` would be True). Anything else is False.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return math.isfinite(value) and value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return False
+
+
+def _normalize_auto_refresh(raw) -> dict:
+    """Coerce ``auto_refresh`` into ``{"enabled": bool, "interval_minutes": int}``.
+
+    Off by default; a non-numeric or non-finite interval falls back to the
+    default and a numeric one is clamped into the allowed range. Must tolerate
+    arbitrary hand-edited JSON — ``load()`` relies on this never raising (NaN and
+    Infinity are accepted by ``json.loads`` and would blow up a bare ``int()``).
+    """
+    out = {"enabled": False, "interval_minutes": AUTO_REFRESH_DEFAULT_MINUTES}
+    if not isinstance(raw, dict):
+        return out
+    out["enabled"] = _coerce_bool(raw.get("enabled"))
+    interval = raw.get("interval_minutes")
+    if isinstance(interval, bool) or not isinstance(interval, (int, float)):
+        return out
+    if not math.isfinite(interval):
+        return out
+    out["interval_minutes"] = max(
+        AUTO_REFRESH_MIN_MINUTES, min(AUTO_REFRESH_MAX_MINUTES, int(interval))
+    )
+    return out
 
 
 def _normalize_removed(removed) -> list:
@@ -106,6 +163,7 @@ def load() -> dict:
         "added": added,
         "removed": removed,
         "marketplaces": marketplaces,
+        "auto_refresh": _normalize_auto_refresh(data.get("auto_refresh")),
     }
 
 
@@ -241,6 +299,23 @@ def get_marketplace(name: str) -> dict:
 def list_marketplace_records() -> dict:
     """Return the full marketplace-name -> record map."""
     return load()["marketplaces"]
+
+
+def get_auto_refresh() -> dict:
+    """Return the normalized auto-refresh config record."""
+    return load()["auto_refresh"]
+
+
+def set_auto_refresh(*, enabled: bool, interval_minutes: int) -> dict:
+    """Persist the auto-refresh config; returns the stored (clamped) record."""
+    record = _normalize_auto_refresh(
+        {"enabled": enabled, "interval_minutes": interval_minutes}
+    )
+    with _lock:
+        data = load()
+        data["auto_refresh"] = record
+        save(data)
+    return record
 
 
 def list_added() -> list:
