@@ -1148,3 +1148,27 @@ class TestStreamResponseChunksSDKUsage:
         usage = completed[1]["response"]["usage"]
         assert usage["input_tokens"] == 100
         assert usage["output_tokens"] == 50
+
+
+class TestTaskEventSerializationResilience:
+    """task_updated passes the SDK patch through raw; a callable in it must not
+    crash the SSE stream (regression: 'object of type function is not JSON
+    serializable')."""
+
+    def test_task_updated_with_callable_in_patch_does_not_crash(self):
+        from src.sse_builders import _build_task_event, make_task_response_sse
+
+        chunk = {
+            "subtype": "task_updated",
+            "task_id": "t1",
+            "status": "completed",
+            "patch": {"status": "completed", "on_done": lambda: None},
+        }
+        event = _build_task_event(chunk)
+        assert event is not None
+        line = make_task_response_sse(event, sequence_number=1)  # must not raise
+        payload = json.loads(line.split("data: ", 1)[1])
+        assert payload["type"] == "response.task_updated"
+        assert payload["status"] == "completed"
+        # The callable is coerced to a string rather than crashing serialization.
+        assert isinstance(payload["patch"]["on_done"], str)
