@@ -6,8 +6,17 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+import src.auth as auth_module
 from src.routes.terminal_files import router
 from src.routes import terminal_files as tf
+
+
+def _patch_api_key(monkeypatch, value: str) -> None:
+    # test_auth_unit.py importlib.reload(src.auth)s mid-suite, splitting the
+    # singleton: verify_api_key reads the live src.auth.auth_manager while this
+    # module's import-time binding feeds _ensure_api_key — patch both objects.
+    for manager in {tf.auth_manager, auth_module.auth_manager}:
+        monkeypatch.setattr(manager, "get_api_key", lambda: value)
 
 
 @pytest.fixture
@@ -29,7 +38,7 @@ def workspace(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def client(workspace, monkeypatch):
-    monkeypatch.setattr(tf.auth_manager, "get_api_key", lambda: "testkey")
+    _patch_api_key(monkeypatch, "testkey")
 
     def _resolve(user, backend=None):
         if user == "alice":
@@ -177,7 +186,7 @@ def test_wrong_api_key_is_unauthorized(client):
 
 
 def test_fails_closed_when_api_key_unset(workspace, monkeypatch):
-    monkeypatch.setattr(tf.auth_manager, "get_api_key", lambda: "")
+    _patch_api_key(monkeypatch, "")
     monkeypatch.setattr(tf.workspace_manager, "resolve", lambda user, backend=None: workspace)
     app = FastAPI()
     app.include_router(router)
@@ -333,7 +342,7 @@ def test_archive_zips_selection(client):
 
 
 def test_writes_fail_closed_without_api_key(workspace, monkeypatch):
-    monkeypatch.setattr(tf.auth_manager, "get_api_key", lambda: "")
+    _patch_api_key(monkeypatch, "")
     monkeypatch.setattr(tf.workspace_manager, "resolve", lambda user, backend=None: workspace)
     app = FastAPI()
     app.include_router(router)
