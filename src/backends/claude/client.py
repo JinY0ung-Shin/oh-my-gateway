@@ -62,15 +62,6 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
 
-def _skilldbg_short(value: object, limit: int = 800) -> str:
-    """Render *value* as a single-line, length-capped string for diagnostics."""
-    try:
-        s = value if isinstance(value, str) else repr(value)
-    except Exception:  # pragma: no cover - defensive
-        s = "<unrepr>"
-    s = s.replace("\n", "\\n")
-    return s if len(s) <= limit else f"{s[:limit]}...(+{len(s) - limit} chars)"
-
 
 # Catch-all granular permission rule that auto-approves every skill invocation.
 # The CLI matches Skill rules by stripping a trailing ``:*`` and prefix-matching
@@ -286,7 +277,6 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 dirs.append(p)
         if dirs:
             options.add_dirs = list(dirs)
-            logger.warning("SKILL_DEBUG add_dirs: %s", dirs)
 
     def _configure_sandbox(self, options: ClaudeAgentOptions) -> None:
         """Apply bash sandbox configuration to *options*.
@@ -575,60 +565,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     error_msg = "; ".join(result["errors"])
                 if error_msg:
                     result["error_message"] = error_msg
-            self._log_skill_observability(result)
             return result
         return message
-
-    def _log_skill_observability(self, result: Dict[str, Any]) -> None:
-        """SKILL_DEBUG: log tool calls and (especially) error tool results.
-
-        Temporary instrumentation for diagnosing plugin-skill failures. Only
-        full ``assistant``/``user`` messages are inspected (partial stream
-        events are skipped to avoid duplicate noise). Logged at WARNING with the
-        ``SKILL_DEBUG`` prefix; never allowed to raise into the stream.
-        """
-        try:
-            if result.get("type") not in ("assistant", "user"):
-                return
-            content = result.get("content")
-            if not isinstance(content, list):
-                return
-            for block in content:
-                if isinstance(block, dict):
-                    btype = block.get("type")
-                    name = block.get("name")
-                    binput = block.get("input")
-                    is_err = block.get("is_error")
-                    bcontent = block.get("content")
-                    tuid = block.get("tool_use_id")
-                else:
-                    btype = getattr(block, "type", None)
-                    name = getattr(block, "name", None)
-                    binput = getattr(block, "input", None)
-                    is_err = getattr(block, "is_error", None)
-                    bcontent = getattr(block, "content", None)
-                    tuid = getattr(block, "tool_use_id", None)
-
-                is_tool_use = btype == "tool_use" or (name is not None and binput is not None)
-                is_tool_result = (
-                    btype == "tool_result" or (tuid is not None) or is_err is not None
-                ) and not is_tool_use
-
-                if is_tool_use:
-                    logger.warning(
-                        "SKILL_DEBUG tool_use: name=%s input=%s",
-                        name,
-                        _skilldbg_short(binput),
-                    )
-                elif is_tool_result:
-                    logger.warning(
-                        "SKILL_DEBUG tool_result: is_error=%s tool_use_id=%s content=%s",
-                        is_err,
-                        tuid,
-                        _skilldbg_short(bcontent),
-                    )
-        except Exception:  # pragma: no cover - diagnostics must never break streaming
-            pass
 
     # ------------------------------------------------------------------
     # Environment management
@@ -738,7 +676,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 return {}
             tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
             skill = tool_input.get("skill", "") if isinstance(tool_input, dict) else ""
-            logger.warning("SKILL_DEBUG skill_allow_hook: auto-approving Skill skill=%s", skill)
+            logger.info("Auto-approving Skill tool invocation: skill=%s", skill)
             return {
                 "hookSpecificOutput": {
                     "hookEventName": "PreToolUse",
@@ -952,22 +890,6 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
             )
         options.hooks = {"PreToolUse": pre_tool_use}
-
-        # SKILL_DEBUG: temporary diagnostics for plugin-skill execution. Logged
-        # at WARNING with a unique prefix so it surfaces under any log level and
-        # is trivial to grep/remove. Confirms which code is deployed (look for
-        # ``Skill(:*)`` in allowed_tools) and the exact policy handed to the CLI.
-        logger.warning(
-            "SKILL_DEBUG create_client: backend_cls=%s allowed_tools=%s skills=%s "
-            "setting_sources=%s permission_mode=%s sandbox_hook=%s cwd=%s",
-            type(self).__name__,
-            options.allowed_tools,
-            getattr(options, "skills", None),
-            options.setting_sources,
-            getattr(options, "permission_mode", None),
-            bool(cwd and sandbox_enabled()),
-            cwd,
-        )
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
