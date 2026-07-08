@@ -1,12 +1,15 @@
 """Tests for ClaudeSDKClient integration methods on ClaudeCodeCLI.
 
-Covers create_client(), run_completion_with_client(), and _make_ask_user_hook().
+Covers create_client(), run_completion_with_client(), and
+_make_ask_user_can_use_tool().
 All SDK interactions are mocked — no real subprocess or Anthropic credentials required.
 """
 
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 from src.session_manager import Session
 
@@ -58,7 +61,12 @@ async def test_create_client_returns_connected_client():
 
 
 async def test_create_client_sets_hooks():
-    """create_client() sets PreToolUse hooks: AskUserQuestion intercept + Skill auto-approve."""
+    """create_client() sets a can_use_tool callback (AskUserQuestion intercept)
+    and a Skill auto-approve PreToolUse hook.
+
+    AskUserQuestion is handled via can_use_tool — not a PreToolUse hook — because
+    the CLI only surfaces it as a callable tool when a permission callback is
+    present (issue #131)."""
     cli = _make_cli()
     session = Session(session_id="sess-2")
 
@@ -75,14 +83,17 @@ async def test_create_client_sets_hooks():
         MockSDKClient.side_effect = capture_init
         await cli.create_client(session)
 
-    # The options object passed to ClaudeSDKClient must have hooks set
     options = captured_options.get("options")
     assert options is not None
+    # AskUserQuestion is intercepted via can_use_tool, no longer a hook.
+    assert callable(options.can_use_tool)
     assert options.hooks is not None
     assert "PreToolUse" in options.hooks
     matchers = options.hooks["PreToolUse"]
     by_matcher = {m.matcher: m for m in matchers}
-    assert set(by_matcher) == {"AskUserQuestion", "Skill"}
+    # AskUserQuestion must NOT be a PreToolUse hook anymore; Skill remains.
+    assert "AskUserQuestion" not in by_matcher
+    assert "Skill" in by_matcher
     for matcher in by_matcher.values():
         assert len(matcher.hooks) == 1
         assert callable(matcher.hooks[0])
@@ -262,106 +273,93 @@ async def test_run_completion_with_client_error_during_receive():
 
 
 # ---------------------------------------------------------------------------
-# _make_ask_user_hook (PreToolUse hook)
+# _make_ask_user_can_use_tool (can_use_tool permission callback)
 # ---------------------------------------------------------------------------
 
 
-async def test_hook_allows_other_tools():
-    """Non-AskUserQuestion tools get an empty dict (allow and proceed)."""
+def _ctx(tool_use_id):
+    """Minimal stand-in for the SDK's ToolPermissionContext."""
+    return SimpleNamespace(tool_use_id=tool_use_id)
+
+
+async def test_can_use_tool_allows_other_tools():
+    """Non-AskUserQuestion tools are approved (PermissionResultAllow)."""
     cli = _make_cli()
     session = Session(session_id="sess-other-tool")
 
-    hook = cli._make_ask_user_hook(session)
+    can_use_tool = cli._make_ask_user_can_use_tool(session)
 
-    # input_data is a plain dict (not a dataclass) per SDK contract
-    input_data = {
-        "tool_name": "BashTool",
-        "tool_input": {"command": "ls"},
-        "tool_use_id": "tu_123",
-    }
-    result = await hook(input_data, "tu_123", {})
+    # can_use_tool receives the tool input dict directly (not wrapped).
+    result = await can_use_tool("BashTool", {"command": "ls"}, _ctx("tu_123"))
 
-    assert result == {}
+    assert isinstance(result, PermissionResultAllow)
     # Session fields should NOT be modified
     assert session.pending_tool_call is None
     assert session.input_event is None
 
 
-async def test_hook_intercepts_ask_user_question():
-    """AskUserQuestion hook sets pending_tool_call, waits, then returns deny+reason."""
+async def test_can_use_tool_intercepts_ask_user_question():
+    """AskUserQuestion parks pending_tool_call, waits, then denies with the answer."""
     cli = _make_cli()
     session = Session(session_id="sess-ask")
 
-    hook = cli._make_ask_user_hook(session)
+    can_use_tool = cli._make_ask_user_can_use_tool(session)
 
-    # input_data is a plain dict per SDK contract
-    input_data = {
-        "tool_name": "AskUserQuestion",
-        "tool_input": {"question": "Continue?"},
-        "tool_use_id": "tu_ask_1",
-    }
+    input_data = {"question": "Continue?"}
 
-    # Run hook in a task — it will block on input_event.wait()
+    # Run the callback in a task — it will block on input_event.wait()
     result_holder = []
 
-    async def run_hook():
-        result = await hook(input_data, None, {})
+    async def run_cb():
+        result = await can_use_tool("AskUserQuestion", input_data, _ctx("tu_ask_1"))
         result_holder.append(result)
 
-    task = asyncio.create_task(run_hook())
+    task = asyncio.create_task(run_cb())
 
-    # Allow the hook to start and park
+    # Allow the callback to start and park
     await asyncio.sleep(0.05)
 
-    # Verify the session was updated with pending_tool_call
+    # Verify the session was updated with pending_tool_call. call_id comes from
+    # context.tool_use_id; arguments are the input_data dict verbatim.
     assert session.pending_tool_call is not None
     assert session.pending_tool_call["call_id"] == "tu_ask_1"
     assert session.pending_tool_call["name"] == "AskUserQuestion"
     assert session.pending_tool_call["arguments"] == {"question": "Continue?"}
 
-    # Verify input_event was created
     assert session.input_event is not None
 
     # Simulate the HTTP layer providing a response
     session.input_response = "Yes, continue"
     session.input_event.set()
 
-    # Wait for hook to complete
     await task
 
-    # Hook should have returned deny + reason (user's answer)
+    # Callback should have returned deny + the user's answer as the message
     assert len(result_holder) == 1
     result = result_holder[0]
-    assert "hookSpecificOutput" in result
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "Yes, continue" in result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert isinstance(result, PermissionResultDeny)
+    assert "Yes, continue" in result.message
 
-    # After hook completes, input_response and input_event are reset
+    # After completion, input_response and input_event are reset
     assert session.input_response is None
     assert session.input_event is None
 
 
-async def test_hook_times_out_when_client_does_not_respond():
-    """Hook returns deny with timeout message when wait exceeds timeout."""
+async def test_can_use_tool_times_out_when_client_does_not_respond():
+    """Callback returns deny with a timeout message when the wait exceeds timeout."""
     cli = _make_cli()
     session = Session(session_id="sess-timeout")
 
-    hook = cli._make_ask_user_hook(session)
-
-    input_data = {
-        "tool_name": "AskUserQuestion",
-        "tool_input": {"question": "Respond?"},
-        "tool_use_id": "tu_timeout_1",
-    }
+    can_use_tool = cli._make_ask_user_can_use_tool(session)
 
     # Patch timeout to a very short value so the test completes quickly
     with patch("src.backends.claude.client.ASK_USER_TIMEOUT_SECONDS", 0.05):
-        result = await hook(input_data, None, {})
+        result = await can_use_tool(
+            "AskUserQuestion", {"question": "Respond?"}, _ctx("tu_timeout_1")
+        )
 
-    # Should have returned a deny with timeout message
-    assert "hookSpecificOutput" in result
-    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "timeout" in result["hookSpecificOutput"]["permissionDecisionReason"].lower()
+    assert isinstance(result, PermissionResultDeny)
+    assert "timeout" in result.message.lower()
 
     # Session state should be cleaned up
     assert session.pending_tool_call is None
