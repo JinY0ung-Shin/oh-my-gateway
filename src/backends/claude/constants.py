@@ -63,6 +63,39 @@ CLAUDE_MODELS = [
     "haiku",
 ]
 
+# Optional alias exposure via ANTHROPIC_DEFAULT_*_MODEL.
+# The Claude CLI maps the bare opus/sonnet/haiku aliases to a concrete model id
+# (or a custom upstream alias) through these env vars — see the pass-through in
+# ``src/constants.py`` and ``extract_model_id`` in ``src/usage_logger.py``. When
+# an override is set we ALSO advertise that name as a public model id so callers
+# can request the model by its configured name; resolution maps it back to the
+# bare alias so the CLI stays the single source of truth for alias resolution.
+_ALIAS_MODEL_ENV = {
+    "opus": "ANTHROPIC_DEFAULT_OPUS_MODEL",
+    "sonnet": "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+}
+
+
+def configured_model_aliases() -> dict[str, str]:
+    """Map each configured ``ANTHROPIC_DEFAULT_*_MODEL`` value to its bare alias.
+
+    Reads the env on each call. Returns an empty dict when none are set, so the
+    default surface (bare ``opus``/``sonnet``/``haiku``) is unchanged. A value
+    equal to a bare alias is skipped to avoid a self-referential entry.
+    """
+    mapping: dict[str, str] = {}
+    for alias, env_name in _ALIAS_MODEL_ENV.items():
+        value = (os.getenv(env_name) or "").strip()
+        if value and value not in CLAUDE_MODELS:
+            mapping[value] = alias
+    return mapping
+
+
+def configured_public_models() -> list[str]:
+    """Public Claude model ids: bare aliases plus any configured override names."""
+    return list(CLAUDE_MODELS) + list(configured_model_aliases().keys())
+
 # Thinking Mode Configuration
 # Options: "adaptive" (recommended for Opus 4.6/Sonnet 4.6), "enabled", "disabled"
 THINKING_MODE = os.getenv("THINKING_MODE", "adaptive")

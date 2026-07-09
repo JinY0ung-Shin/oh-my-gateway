@@ -32,7 +32,7 @@ from claude_agent_sdk.types import (
     SandboxNetworkConfig,
 )
 from src.backends.claude.constants import (
-    CLAUDE_MODELS,
+    configured_public_models,
     DEFAULT_ALLOWED_TOOLS,
     DEFAULT_TASK_BUDGET,
     THINKING_BUDGET_TOKENS,
@@ -180,7 +180,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         return "claude"
 
     def supported_models(self) -> List[str]:
-        return list(CLAUDE_MODELS)
+        return configured_public_models()
 
     def get_auth_provider(self):
         """Return a ClaudeAuthProvider instance."""

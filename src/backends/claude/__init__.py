@@ -11,7 +11,11 @@ it loops back to ``src.auth`` → ``src.backends.claude.auth`` (circular).
 import logging
 from typing import Optional
 
-from src.backends.claude.constants import CLAUDE_MODELS
+from src.backends.claude.constants import (
+    CLAUDE_MODELS,
+    configured_model_aliases,
+    configured_public_models,
+)
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
 
 logger = logging.getLogger(__name__)
@@ -19,6 +23,13 @@ logger = logging.getLogger(__name__)
 
 def _claude_resolve(model: str) -> Optional[ResolvedModel]:
     """Resolve function for the Claude descriptor."""
+    # Names configured via ANTHROPIC_DEFAULT_*_MODEL resolve back to their bare
+    # alias so the Claude CLI performs the real alias->model resolution. Checked
+    # first so a configured name containing "/" is not swallowed by the
+    # claude/<sub-model> heuristic below.
+    alias = configured_model_aliases().get(model)
+    if alias is not None:
+        return ResolvedModel(public_model=model, backend="claude", provider_model=alias)
     if "/" in model:
         prefix, sub_model = model.split("/", 1)
         if prefix == "claude":
@@ -32,7 +43,7 @@ def _claude_resolve(model: str) -> Optional[ResolvedModel]:
 CLAUDE_DESCRIPTOR = BackendDescriptor(
     name="claude",
     owned_by="anthropic",
-    models=list(CLAUDE_MODELS),
+    models=configured_public_models(),
     resolve_fn=_claude_resolve,
     # Image input is supported via the client's image_handler (see
     # validate_image_request in src/routes/deps.py).
