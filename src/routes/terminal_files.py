@@ -439,12 +439,26 @@ async def archive_entries(
             raise HTTPException(status_code=404, detail=f"not found: {p}")
         targets.append(t)
 
+    hide_dot = _hide_dotfiles()
+
+    def _is_hidden(p: Path) -> bool:
+        # Same rule as listing/_resolve_or_403: any dot-prefixed component
+        # relative to the workspace root is hidden. Keeps downloads consistent
+        # with the browser view — e.g. ``.claude`` never ends up in the zip.
+        return hide_dot and any(
+            part.startswith(".") for part in p.relative_to(root_resolved).parts
+        )
+
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for t in targets:
             if t.is_dir():
                 for sub in t.rglob("*"):
-                    if sub.is_file() and not sub.is_symlink():
+                    if (
+                        sub.is_file()
+                        and not sub.is_symlink()
+                        and not _is_hidden(sub)
+                    ):
                         zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
             elif t.is_file() and not t.is_symlink():
                 zf.write(t, arcname=str(t.relative_to(root_resolved)))
