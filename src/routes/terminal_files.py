@@ -10,6 +10,7 @@ Contract (what FileNav calls):
 - ``GET  /files/cwd``                 -> ``{"cwd": "/"}`` (workspace root is the virtual "/")
 - ``POST /files/cwd``  {path}         -> ``{"cwd": path}`` (validate; cwd is client-tracked)
 - ``GET  /files/list?directory=<p>``  -> ``{"entries": [{name,type,size,modified}]}``
+- ``GET  /files/search?query=<q>``    -> ``{"results": [{path,name,type,size,modified}], "truncated"}``
 - ``GET  /files/read?path=<p>``       -> text ``{path,total_lines,content}`` | raw bytes (binary)
 - ``GET  /files/view?path=<p>``       -> raw bytes (download)
 - ``POST /files/upload?directory=<p>``-> ``{path,size}`` (also how "new file" is created)
@@ -284,6 +285,89 @@ async def list_files(
         return entries
 
     return {"entries": await run_in_threadpool(_scan)}
+
+
+@router.get("/files/search")
+async def search_files(
+    request: Request,
+    query: str = "",
+    limit: int = 50,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Recursive filename search under the workspace root.
+
+    Case-insensitive substring match on entry names. Hidden entries follow
+    the same rule as listing (dot-prefixed components pruned while hiding is
+    on), symlinks are skipped like the archive walk, and results are capped
+    at ``limit`` (1-200) with a ``truncated`` flag. Name-prefix matches sort
+    before substring matches, shallower paths before deeper ones.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    root_resolved = root.resolve()
+
+    q = query.strip().lower()
+    if not q:
+        return {"results": [], "truncated": False}
+    limit = max(1, min(limit, 200))
+
+    hide_dot = _hide_dotfiles()
+    _SCAN_CAP = 1000  # stop collecting beyond this many matches
+
+    # The recursive walk is the most expensive scan this router does — run it
+    # in the threadpool like the other filesystem work so it cannot stall the
+    # event loop.
+    def _search() -> dict:
+        matches: List[dict] = []
+        scan_capped = False
+
+        for dirpath, dirnames, filenames in os.walk(root_resolved):
+            if hide_dot:
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            dirnames.sort()
+            base = Path(dirpath)
+            candidates = [(d, True) for d in dirnames] + [
+                (f, False) for f in sorted(filenames)
+            ]
+            for name, is_dir in candidates:
+                if hide_dot and name.startswith("."):
+                    continue
+                if q not in name.lower():
+                    continue
+                p = base / name
+                if p.is_symlink():
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                matches.append(
+                    {
+                        "path": str(p),
+                        "name": name,
+                        "type": "directory" if is_dir else "file",
+                        "size": st.st_size,
+                        "modified": int(st.st_mtime),
+                    }
+                )
+                if len(matches) >= _SCAN_CAP:
+                    scan_capped = True
+                    break
+            if scan_capped:
+                break
+
+        matches.sort(
+            key=lambda e: (
+                not e["name"].lower().startswith(q),
+                e["path"].count("/"),
+                e["name"].lower(),
+            )
+        )
+        truncated = scan_capped or len(matches) > limit
+        return {"results": matches[:limit], "truncated": truncated}
+
+    return await run_in_threadpool(_search)
 
 
 @router.get("/files/read")
