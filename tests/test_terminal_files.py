@@ -341,6 +341,39 @@ def test_archive_zips_selection(client):
     assert "notes.txt" in names and "sub/inner.md" in names
 
 
+def test_archive_excludes_hidden_entries(client):
+    """Directory downloads must not sweep in dotfiles (e.g. .claude) that the
+    browser hides — the zip mirrors the visible listing."""
+    r = client.post(
+        "/files/archive",
+        headers={**_AUTH, **_USER},
+        json={"paths": ["/"]},
+    )
+    assert r.status_code == 200
+    import io as _io
+    import zipfile as _zip
+
+    names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
+    assert "notes.txt" in names and "sub/inner.md" in names
+    assert ".env" not in names
+    assert not any(n.startswith(".secret_dir/") for n in names)
+
+
+def test_archive_includes_hidden_when_disabled(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "false")
+    r = client.post(
+        "/files/archive",
+        headers={**_AUTH, **_USER},
+        json={"paths": ["/"]},
+    )
+    assert r.status_code == 200
+    import io as _io
+    import zipfile as _zip
+
+    names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
+    assert ".env" in names and ".secret_dir/k.txt" in names
+
+
 def test_writes_fail_closed_without_api_key(workspace, monkeypatch):
     _patch_api_key(monkeypatch, "")
     monkeypatch.setattr(tf.workspace_manager, "resolve", lambda user, backend=None: workspace)
