@@ -171,7 +171,7 @@ class OutputItem(BaseModel):
     id: str
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    status: Literal["completed", "in_progress", "failed"] = "completed"
+    status: Literal["completed", "in_progress", "incomplete", "failed"] = "completed"
     content: List[ResponseContentPart] = Field(default_factory=list)
 
 
@@ -213,6 +213,12 @@ class ResponseErrorDetail(BaseModel):
     message: str
 
 
+class ResponseIncompleteDetails(BaseModel):
+    """Why a response stopped before normal completion."""
+
+    reason: str
+
+
 class FunctionCallOutputItem(BaseModel):
     """A function_call output item in the response (e.g. AskUserQuestion)."""
 
@@ -238,12 +244,17 @@ class ResponseObject(BaseModel):
     id: str
     object: Literal["response"] = "response"
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    status: Literal["completed", "in_progress", "failed", "requires_action"] = "completed"
+    status: Literal["completed", "in_progress", "incomplete", "failed", "requires_action"] = (
+        "completed"
+    )
     model: str = ""
-    output: List[Union[OutputItem, FunctionCallOutputItem, ReasoningOutputItem]] = Field(default_factory=list)
+    output: List[Union[OutputItem, FunctionCallOutputItem, ReasoningOutputItem]] = Field(
+        default_factory=list
+    )
     usage: ResponseUsage = Field(default_factory=ResponseUsage)
     metadata: Dict[str, str] = Field(default_factory=dict)
     error: Optional[ResponseErrorDetail] = None
+    incomplete_details: Optional[ResponseIncompleteDetails] = None
     structured_output: Any = Field(
         default=None,
         description=(

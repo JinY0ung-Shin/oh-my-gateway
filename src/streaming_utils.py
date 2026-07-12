@@ -18,6 +18,7 @@ from src.response_models import (
     ReasoningOutputItem,
     ReasoningSummary,
     ResponseErrorDetail,
+    ResponseIncompleteDetails,
     ResponseObject,
     ResponseUsage,
 )
@@ -500,11 +501,13 @@ def _remember_tool_use(tool_names_by_id: Dict[str, str], tool_block: Dict[str, A
 
 def _generate_rs_id() -> str:
     import uuid
+
     return f"rs_{uuid.uuid4().hex[:24]}"
 
 
 def _generate_msg_id() -> str:
     import uuid
+
     return f"msg_{uuid.uuid4().hex[:24]}"
 
 
@@ -841,15 +844,14 @@ async def stream_response_chunks(
         if full_text:
             thinking_texts.append(full_text)
             logger.info(
-                "Responses stream captured thinking block: response_id=%s "
-                "block_index=%d chars=%d",
+                "Responses stream captured thinking block: response_id=%s block_index=%d chars=%d",
                 response_id,
                 len(thinking_texts) - 1,
                 len(full_text),
             )
         thinking_capture_buf = []
 
-    def _close_reasoning() -> list[str]:
+    def _close_reasoning(status: str = "completed") -> list[str]:
         """Emit the four close events for the open reasoning item, bump output_index."""
         nonlocal reasoning_open, reasoning_item_id, reasoning_text_buf, output_index
         if not reasoning_open:
@@ -858,7 +860,7 @@ async def stream_response_chunks(
         full_text = "".join(reasoning_text_buf)
         item = ReasoningOutputItem(
             id=reasoning_item_id,
-            status="completed",
+            status=status,
             summary=[ReasoningSummary(text=full_text)],
             content=[ReasoningContent(text=full_text)],
         )
@@ -901,7 +903,7 @@ async def stream_response_chunks(
         output_index += 1
         return lines
 
-    def _close_message_item() -> list[str]:
+    def _close_message_item(status: str = "completed") -> list[str]:
         """Close the currently-open message item and record it.
 
         Flushes the collab filter into the segment, emits
@@ -929,7 +931,7 @@ async def stream_response_chunks(
         seg_text = "".join(full_text)
         item = OutputItem(
             id=output_item_id,
-            status="completed",
+            status=status,
             content=[ResponseContentPart(text=seg_text)],
         )
         lines.append(
@@ -978,6 +980,50 @@ async def stream_response_chunks(
                 yield _SSE_KEEPALIVE
                 continue
 
+            # ClaudeSDKClient.interrupt() ends the active SDK turn with an
+            # is_error ResultMessage.  The backend marks that result only when
+            # it corresponds to an explicit gateway cancel request, allowing
+            # us to preserve partial output as an incomplete turn instead of
+            # misclassifying it as a backend failure.
+            if isinstance(chunk, dict) and chunk.get("gateway_interrupted"):
+                chunks_buffer.append(chunk)
+                _close_thinking_capture()
+                if reasoning_open:
+                    for line in _close_reasoning(status="incomplete"):
+                        yield line
+                if message_item_opened:
+                    for line in _close_message_item(status="incomplete"):
+                        yield line
+
+                partial_text = "".join(all_visible_text)
+                prompt_tokens, completion_tokens = resolve_token_usage(
+                    chunks_buffer, prompt_text or "", partial_text
+                )
+                incomplete_resp = ResponseObject(
+                    id=response_id,
+                    model=model,
+                    status="incomplete",
+                    output=list(completed_output_items),
+                    usage=ResponseUsage(
+                        input_tokens=prompt_tokens,
+                        output_tokens=completion_tokens,
+                    ),
+                    metadata=_metadata,
+                    incomplete_details=ResponseIncompleteDetails(reason="user_cancelled"),
+                )
+                stream_result["success"] = False
+                stream_result["interrupted"] = True
+                stream_result["assistant_text"] = partial_text
+                stream_result["thinking_texts"] = thinking_texts
+                stream_result["response_obj"] = incomplete_resp
+                yield make_response_sse(
+                    "response.incomplete",
+                    response_obj=incomplete_resp,
+                    sequence_number=_next_seq(),
+                )
+                await _log_usage("incomplete", "user_cancelled")
+                return
+
             # Detect terminal error chunks: SDK in-band errors (is_error),
             # AssistantMessage.error (auth failures, rate limits, etc.) and
             # rejected SDK rate-limit events.  Classification is shared with
@@ -1003,9 +1049,7 @@ async def stream_response_chunks(
             # Non-rejected SDK rate-limit events (new in SDK 0.1.49) are
             # informational only — rejected ones fail above.
             if chunk.get("type") == "rate_limit":
-                logger.warning(
-                    "SDK rate limit event: status=%s", _extract_rate_limit_status(chunk)
-                )
+                logger.warning("SDK rate limit event: status=%s", _extract_rate_limit_status(chunk))
                 continue
 
             # Handle task system messages (structured JSON, not content)
@@ -1085,9 +1129,7 @@ async def stream_response_chunks(
                     reasoning_open = True
                     reasoning_text_buf = []
                     thinking_seen = True
-                    reasoning_item = ReasoningOutputItem(
-                        id=reasoning_item_id, status="in_progress"
-                    )
+                    reasoning_item = ReasoningOutputItem(id=reasoning_item_id, status="in_progress")
                     yield make_response_sse(
                         "response.output_item.added",
                         output_index=output_index,

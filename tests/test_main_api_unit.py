@@ -2730,6 +2730,99 @@ def test_responses_streaming_error_disconnects_persistent_client(isolated_sessio
     sdk_client.disconnect.assert_awaited_once()
 
 
+def test_cancel_active_response_calls_backend_interrupt(isolated_session_manager):
+    """Cancel uses active-response state rather than committed-turn lookup."""
+    session_id = str(uuid.uuid4())
+    response_id = f"resp_{session_id}_1"
+    active_client = object()
+
+    with client_context() as (client, mock_cli):
+        session = isolated_session_manager.get_or_create_session(session_id)
+        session.backend = "claude"
+        session.active_response_id = response_id
+        session.active_response_turn = 1
+        session.active_response_state = "running"
+        session.active_response_client = active_client
+        mock_cli.interrupt_client = AsyncMock()
+
+        response = client.post(f"/v1/responses/{response_id}/cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "cancelling"
+    assert session.active_response_state == "cancelling"
+    mock_cli.interrupt_client.assert_awaited_once_with(active_client)
+
+
+def test_interrupted_stream_commits_partial_turn_and_reuses_client(
+    isolated_session_manager,
+):
+    """An explicit interrupt remains continuable from its response id."""
+    sdk_client = MagicMock()
+    sdk_client.disconnect = AsyncMock()
+    calls = []
+
+    async def fake_run_with_client(client, prompt, session):
+        calls.append((client, prompt))
+        if len(calls) == 1:
+            yield {
+                "type": "assistant",
+                "content": [{"type": "text", "text": "partial answer"}],
+            }
+            session.active_response_state = "cancelling"
+            yield {
+                "type": "result",
+                "subtype": "error_during_execution",
+                "is_error": True,
+                "error_message": "Interrupted by user",
+                "gateway_interrupted": True,
+            }
+            return
+        yield {"type": "assistant", "content": [{"type": "text", "text": "new answer"}]}
+        yield {"type": "result", "subtype": "success", "result": "new answer"}
+
+    with (
+        client_context() as (client, mock_cli),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(responses_module, "get_mcp_servers", return_value={}),
+    ):
+        mock_cli.create_client = AsyncMock(return_value=sdk_client)
+        mock_cli.run_completion_with_client = fake_run_with_client
+
+        first = client.post(
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "start", "stream": True},
+        )
+        events = [
+            json.loads(line[6:])
+            for line in first.text.splitlines()
+            if line.startswith("data: ") and line[6:] != "[DONE]"
+        ]
+        incomplete = next(e for e in events if e["type"] == "response.incomplete")
+        response_id = incomplete["response"]["id"]
+
+        stored = client.get(f"/v1/responses/{response_id}")
+        followup = client.post(
+            "/v1/responses",
+            json={
+                "model": DEFAULT_MODEL,
+                "input": "do this instead",
+                "previous_response_id": response_id,
+            },
+        )
+
+    assert first.status_code == 200
+    assert incomplete["response"]["status"] == "incomplete"
+    assert incomplete["response"]["incomplete_details"]["reason"] == "user_cancelled"
+    assert "partial answer" in first.text
+    assert stored.status_code == 200
+    assert stored.json()["status"] == "incomplete"
+    assert followup.status_code == 200
+    assert followup.json()["status"] == "completed"
+    assert calls[0][0] is sdk_client and calls[1][0] is sdk_client
+    mock_cli.create_client.assert_awaited_once()
+    sdk_client.disconnect.assert_not_awaited()
+
+
 def test_responses_nonstreaming_error_disconnects_cleared_persistent_client(
     isolated_session_manager,
 ):

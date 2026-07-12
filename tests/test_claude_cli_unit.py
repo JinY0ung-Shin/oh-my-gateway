@@ -36,6 +36,52 @@ def _make_cli(cli_class):
     return cli
 
 
+async def test_interrupt_result_is_marked_only_for_explicit_cancel(cli_instance):
+    """The SDK's generic execution error becomes an interrupt only by intent."""
+    from claude_agent_sdk.types import ResultMessage
+
+    class FakeClient:
+        async def query(self, prompt):
+            self.prompt = prompt
+
+        def receive_response(self):
+            async def messages():
+                yield ResultMessage(
+                    subtype="error_during_execution",
+                    duration_ms=1,
+                    duration_api_ms=1,
+                    is_error=True,
+                    num_turns=1,
+                    session_id="session",
+                    result="Interrupted by user",
+                )
+
+            return messages()
+
+    session = SimpleNamespace(
+        active_response_state="cancelling",
+        stream_break_event=None,
+        client=None,
+    )
+    chunks = [
+        chunk
+        async for chunk in cli_instance.run_completion_with_client(FakeClient(), "prompt", session)
+    ]
+
+    assert chunks[0]["gateway_interrupted"] is True
+
+
+async def test_interrupt_client_keeps_sdk_client_connected(cli_instance):
+    from unittest.mock import AsyncMock
+
+    sdk_client = MagicMock()
+    sdk_client.interrupt = AsyncMock()
+
+    await cli_instance.interrupt_client(sdk_client)
+
+    sdk_client.interrupt.assert_awaited_once_with()
+
+
 @pytest.fixture
 def cli_instance():
     """Create a CLI instance with mocked auth (tempdir + auth mock pattern)."""
@@ -675,9 +721,7 @@ class TestBuildSdkOptions:
         finally:
             runtime_config.reset("sanitizer_enabled")
 
-    def test_sdk_options_preserve_base_url_when_sanitizer_disabled(
-        self, cli_instance, monkeypatch
-    ):
+    def test_sdk_options_preserve_base_url_when_sanitizer_disabled(self, cli_instance, monkeypatch):
         """Disabled sanitizer leaves Claude's upstream base URL untouched."""
         from src.runtime_config import runtime_config
 
@@ -1005,9 +1049,7 @@ class TestConfigureHelpers:
         from claude_agent_sdk import ClaudeAgentOptions
 
         opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
-        with patch(
-            "src.backends.claude.client.DISALLOWED_TOOLS", ["WebFetch", "WebSearch"]
-        ):
+        with patch("src.backends.claude.client.DISALLOWED_TOOLS", ["WebFetch", "WebSearch"]):
             cli_instance._configure_tools(opts, None, None)
         assert "WebFetch" in opts.disallowed_tools
         assert "WebSearch" in opts.disallowed_tools
@@ -1227,9 +1269,7 @@ class TestUpdateRequestPolicy:
         sdk_client = MagicMock()
         sdk_client.set_permission_mode = AsyncMock()
 
-        await cli_instance.update_request_policy(
-            sdk_client, permission_mode="acceptEdits"
-        )
+        await cli_instance.update_request_policy(sdk_client, permission_mode="acceptEdits")
 
         sdk_client.set_permission_mode.assert_awaited_once_with("acceptEdits")
 
@@ -1253,14 +1293,10 @@ class TestUpdateRequestPolicy:
         from unittest.mock import AsyncMock
 
         sdk_client = MagicMock()
-        sdk_client.set_permission_mode = AsyncMock(
-            side_effect=RuntimeError("not connected")
-        )
+        sdk_client.set_permission_mode = AsyncMock(side_effect=RuntimeError("not connected"))
 
         with pytest.raises(RuntimeError, match="not connected"):
-            await cli_instance.update_request_policy(
-                sdk_client, permission_mode="acceptEdits"
-            )
+            await cli_instance.update_request_policy(sdk_client, permission_mode="acceptEdits")
 
     @pytest.mark.asyncio
     async def test_tool_list_change_raises_unsupported(self, cli_instance):
@@ -1272,10 +1308,6 @@ class TestUpdateRequestPolicy:
 
         sdk_client = MagicMock()
         with pytest.raises(UnsupportedContinuationPolicy):
-            await cli_instance.update_request_policy(
-                sdk_client, disallowed_tools=["Bash"]
-            )
+            await cli_instance.update_request_policy(sdk_client, disallowed_tools=["Bash"])
         with pytest.raises(UnsupportedContinuationPolicy):
-            await cli_instance.update_request_policy(
-                sdk_client, allowed_tools=["Read"]
-            )
+            await cli_instance.update_request_policy(sdk_client, allowed_tools=["Read"])

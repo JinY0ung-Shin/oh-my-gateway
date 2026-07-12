@@ -180,14 +180,27 @@ class Session:
     pending_tool_call: Optional[Dict[str, Any]] = None
     stream_break_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
 
+    # In-flight Responses API turn.  This state is deliberately guarded by a
+    # separate lock from ``lock``: streaming turns hold ``lock`` for their
+    # whole lifetime, while a concurrent cancel request must still be able to
+    # deliver an interrupt to the active backend client.
+    active_response_id: Optional[str] = None
+    active_response_turn: Optional[int] = None
+    active_response_state: Optional[str] = None
+    active_response_client: Optional[Any] = field(default=None, repr=False, compare=False)
+    active_response_done: asyncio.Event = field(
+        default_factory=asyncio.Event, repr=False, compare=False
+    )
+    response_control_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, repr=False, compare=False
+    )
+
     # Per-turn stored ResponseObject payloads, keyed by 1-based turn number.
     # Populated by the responses route at turn-commit time and served by
     # ``GET /v1/responses/{response_id}``. Turns created with ``store=false``
     # are never recorded, and sessions rehydrated from the on-disk jsonl
     # transcript start empty (only the turn counter survives rehydration).
-    turn_records: Dict[int, Dict[str, Any]] = field(
-        default_factory=dict, repr=False, compare=False
-    )
+    turn_records: Dict[int, Dict[str, Any]] = field(default_factory=dict, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         self.created_at = _ensure_utc(self.created_at)
@@ -281,9 +294,7 @@ class SessionManager:
         extended) between the snapshot and the deletion.
         """
         with self.lock:
-            expired = [
-                (sid, s) for sid, s in self.sessions.items() if s.is_expired()
-            ]
+            expired = [(sid, s) for sid, s in self.sessions.items() if s.is_expired()]
         doomed = []
         with self.lock:
             for sid, session in expired:

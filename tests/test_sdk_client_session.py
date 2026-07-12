@@ -20,6 +20,10 @@ def test_session_new_fields_default_to_none():
     assert session.input_event is None
     assert session.input_response is None
     assert session.pending_tool_call is None
+    assert session.active_response_id is None
+    assert session.active_response_state is None
+    assert session.active_response_client is None
+    assert not session.active_response_done.is_set()
 
 
 def test_session_new_fields_can_be_set():

@@ -591,6 +591,15 @@ body {
   opacity: 0.4;
   cursor: not-allowed;
 }
+.stop-btn {
+  background: transparent;
+  color: var(--color-danger);
+  border-color: var(--color-danger);
+}
+.stop-btn:hover:not(:disabled) {
+  background: var(--color-danger-subtle);
+  border-color: var(--color-danger);
+}
 
 /* Status bar */
 .status-bar {
@@ -784,6 +793,7 @@ body {
 <div class="input-area">
   <div class="input-row">
     <textarea id="input" rows="1" placeholder="Message..." autofocus aria-label="Message"></textarea>
+    <button class="send-btn stop-btn" id="stop-btn" onclick="stopGeneration()" aria-label="Stop response" disabled>Stop</button>
     <button class="send-btn" id="send-btn" onclick="sendMessage()" aria-label="Send message">Send</button>
   </div>
 </div>
@@ -813,6 +823,7 @@ let previousResponseId = null;
 let sessionId = null;
 let isStreaming = false;
 let currentAbortController = null;
+let currentResponseId = null;
 let pendingAsk = null;
 // tool_use_id -> tool-event card. Lets a tool_result merge back into the card
 // that invoked it, and a subagent's calls nest under the agent that spawned them.
@@ -829,6 +840,7 @@ let lastIdlessTaskKey = null;       // groups id-less task lifecycle events toge
 const chatEl = document.getElementById('chat');
 const inputEl = document.getElementById('input');
 const sendBtn = document.getElementById('send-btn');
+const stopBtn = document.getElementById('stop-btn');
 const statusDot = document.getElementById('status-dot');
 const statusText = document.getElementById('status-text');
 const tokenInfo = document.getElementById('token-info');
@@ -851,6 +863,7 @@ function setStatus(state, text) {
 function setStreaming(v) {
   isStreaming = v;
   sendBtn.disabled = v;
+  stopBtn.disabled = !v || !currentResponseId;
   inputEl.disabled = v;
   setStatus(v ? 'streaming' : 'idle', v ? 'Streaming...' : 'Idle');
 }
@@ -1411,6 +1424,29 @@ async function sendMessage() {
   await streamRequest(body);
 }
 
+async function stopGeneration() {
+  if (!isStreaming || !currentResponseId || stopBtn.disabled) return;
+  stopBtn.disabled = true;
+  setStatus('streaming', 'Stopping...');
+  try {
+    const resp = await fetch(
+      API_BASE + '/v1/responses/' + encodeURIComponent(currentResponseId) + '/cancel',
+      { method: 'POST', headers: getHeaders() },
+    );
+    if (!resp.ok) {
+      const detail = await resp.text();
+      throw new Error('Stop failed (' + resp.status + '): ' + detail);
+    }
+    // Keep consuming the original SSE until response.incomplete arrives.
+    // Aborting the fetch here would cancel the reader before the SDK's
+    // interrupt ResultMessage can be drained and committed.
+    setStatus('streaming', 'Stopping...');
+  } catch (err) {
+    setStatus('error', err.message || 'Stop failed');
+    stopBtn.disabled = false;
+  }
+}
+
 async function streamRequest(body) {
   setStreaming(true);
   let activeBubble = null;
@@ -1421,6 +1457,7 @@ async function streamRequest(body) {
   let reasoningText = '';
   let reasoningTextDeltaSeen = false;
   let responseId = null;
+  let wasInterrupted = false;
 
   function messageHasThinking(messageEl) {
     const panel = messageEl && messageEl.querySelector('.thinking-panel');
@@ -1506,6 +1543,8 @@ async function streamRequest(body) {
         // --- response.created: extract IDs ---
         if (type === 'response.created' && evt.response) {
           responseId = evt.response.id;
+          currentResponseId = responseId;
+          stopBtn.disabled = !currentResponseId;
           if (responseId) {
             const parts = responseId.split('-');
             if (parts.length >= 2) {
@@ -1638,6 +1677,18 @@ async function streamRequest(body) {
           }
         }
 
+        // --- response.incomplete (explicit user interrupt) ---
+        if (type === 'response.incomplete' && evt.response) {
+          wasInterrupted = true;
+          if (evt.response.id) previousResponseId = evt.response.id;
+          setStatus('idle', 'Stopped');
+          if (evt.response.usage) {
+            const u = evt.response.usage;
+            const tin = u.input_tokens || 0, tout = u.output_tokens || 0;
+            tokenInfo.textContent = 'tokens · in ' + tin + ' · out ' + tout;
+          }
+        }
+
         // --- response.failed ---
         if (type === 'response.failed' && evt.response && evt.response.error) {
           const e = evt.response.error;
@@ -1666,7 +1717,9 @@ async function streamRequest(body) {
   }
 
   finalizeActiveBubble();
+  currentResponseId = null;
   setStreaming(false);
+  if (wasInterrupted) setStatus('idle', 'Stopped');
   if (!pendingAsk) inputEl.focus();
 }
 

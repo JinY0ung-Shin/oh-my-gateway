@@ -234,6 +234,7 @@ uv run pytest tests/integration/test_opencode_smoke.py -q
 Primary endpoints:
 
 - `POST /v1/responses`
+- `POST /v1/responses/{response_id}/cancel` (Claude streaming responses)
 - `GET /v1/models`
 - `GET /v1/sessions`
 - `GET /v1/auth/status`
@@ -268,6 +269,12 @@ Notable deviations from OpenAI Responses API behavior:
 - `instructions`, `system`, or `developer` input items cannot be used with `previous_response_id`; the session prompt is fixed after turn one.
 - A stale `previous_response_id` returns `409` with the latest valid response ID for client recovery.
 - Mixing backends inside one session is rejected.
+- A streamed Claude response can be interrupted with
+  `POST /v1/responses/{response_id}/cancel`. The stream terminates with
+  `response.incomplete`; that response id remains valid for
+  `previous_response_id`, so the client can immediately redirect the same
+  conversation. Keep reading the original SSE stream until its terminal event
+  instead of aborting the fetch first.
 
 ## Terms
 

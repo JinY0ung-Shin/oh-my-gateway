@@ -19,7 +19,7 @@ from src.models import Message
 from src.message_adapter import MessageAdapter
 from src.auth import verify_api_key, security
 from src.session_manager import session_manager
-from src.backends import BackendClient, ResolvedModel
+from src.backends import BackendClient, BackendRegistry, ResolvedModel
 from src.backends.claude.client import UnsupportedContinuationPolicy
 from src.backends.claude.slash_commands import (
     SlashCommandError,
@@ -119,10 +119,7 @@ def _previous_response_not_found(previous_response_id: Optional[str]) -> HTTPExc
     """
     return HTTPException(
         status_code=404,
-        detail=(
-            f"Session for previous_response_id "
-            f"'{previous_response_id}' not found or expired"
-        ),
+        detail=(f"Session for previous_response_id '{previous_response_id}' not found or expired"),
     )
 
 
@@ -405,6 +402,33 @@ async def _disconnect_session_client(session, reason: str, client=None) -> None:
         await asyncio.wait_for(disconnect(), timeout=2.0)
     except Exception:
         logger.debug("SDK client disconnect failed after %s", reason, exc_info=True)
+
+
+async def _begin_active_response(session, response_id: str, turn: int, client: Any) -> None:
+    """Publish an in-flight response for concurrent cancel requests."""
+    async with session.response_control_lock:
+        if session.active_response_id is not None:
+            raise RuntimeError(
+                f"Session {session.session_id} already has active response "
+                f"{session.active_response_id}"
+            )
+        session.active_response_id = response_id
+        session.active_response_turn = turn
+        session.active_response_state = "running"
+        session.active_response_client = client
+        session.active_response_done.clear()
+
+
+async def _finish_active_response(session, response_id: str, terminal_state: str) -> None:
+    """Clear active response state without racing a concurrent cancel call."""
+    async with session.response_control_lock:
+        if session.active_response_id != response_id:
+            return
+        session.active_response_state = terminal_state
+        session.active_response_id = None
+        session.active_response_turn = None
+        session.active_response_client = None
+        session.active_response_done.set()
 
 
 def _configure_client_streaming(client: Any, enabled: bool) -> None:
@@ -803,9 +827,7 @@ async def _refresh_existing_client_policy(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
-def _collect_mcp_forward_headers(
-    request: Request, body: ResponseCreateRequest
-) -> Dict[str, str]:
+def _collect_mcp_forward_headers(request: Request, body: ResponseCreateRequest) -> Dict[str, str]:
     """Build the per-request MCP context header from ``MCP_FORWARD_CONTEXT``.
 
     Resolves ``{{user}}`` from the request identity (``body.user`` — trustworthy
@@ -1436,6 +1458,12 @@ async def create_response(
         next_turn = preflight["next_turn"]
         resp_id = _make_response_id(session_id, next_turn)
         output_item_id = _generate_msg_id()
+        try:
+            await _begin_active_response(session, resp_id, next_turn, session.client)
+        except Exception:
+            if preflight["lock_acquired"]:
+                session.lock.release()
+            raise
 
         async def _run_stream():
             lock_acquired = preflight["lock_acquired"]
@@ -1503,6 +1531,34 @@ async def create_response(
                         session, next_turn, requires_action_resp, store=body.store
                     )
                     stream_result["success"] = True
+                elif stream_result.get("interrupted"):
+                    # A user interrupt is a committed, continuable turn.  The
+                    # Claude SDK retained the partial assistant output and the
+                    # synthetic interrupt marker in its conversation; mirror
+                    # that boundary in the gateway's response-id chain.
+                    assistant_text = stream_result.get("assistant_text") or ""
+                    assistant_message = _build_session_assistant_message(
+                        assistant_text,
+                        stream_result.get("thinking_texts"),
+                    ) or Message(role="assistant", content="")
+                    session.turn_counter = next_turn
+                    session.add_messages([Message(role="user", content=prompt)])
+                    session_manager.add_assistant_response(session_id, assistant_message)
+                    response_obj = stream_result.get("response_obj")
+                    if response_obj is not None:
+                        _record_turn_response(
+                            session,
+                            next_turn,
+                            response_obj,
+                            store=body.store,
+                        )
+                    _log_session_assistant_write(
+                        path="responses.stream.interrupted",
+                        session_id=session_id,
+                        turn=next_turn,
+                        visible_text=assistant_text,
+                        thinking_texts=stream_result.get("thinking_texts"),
+                    )
                 elif stream_result.get("empty"):
                     # Stream ended with no text and no pending tool call —
                     # same empty-response condition the non-stream path
@@ -1568,10 +1624,18 @@ async def create_response(
                     sequence_number=0,
                 )
             finally:
-                if not stream_result.get("success"):
+                if not stream_result.get("success") and not stream_result.get("interrupted"):
                     await _disconnect_session_client(
                         session, "responses stream failure", client=active_client
                     )
+                terminal_state = (
+                    "completed"
+                    if stream_result.get("success")
+                    else "incomplete"
+                    if stream_result.get("interrupted")
+                    else "failed"
+                )
+                await _finish_active_response(session, resp_id, terminal_state)
                 if lock_acquired:
                     session.lock.release()
 
@@ -1657,9 +1721,7 @@ async def create_response(
                 requires_action_resp = _build_requires_action_response(
                     resp_id, body.model, tc, body.metadata
                 )
-                _record_turn_response(
-                    session, pf.next_turn, requires_action_resp, store=body.store
-                )
+                _record_turn_response(session, pf.next_turn, requires_action_resp, store=body.store)
                 return requires_action_resp.model_dump()
 
             # Extract assistant text
@@ -1813,6 +1875,11 @@ async def _handle_function_call_output(
     active_client = session.client
 
     if body.stream:
+        try:
+            await _begin_active_response(session, resp_id, next_turn, active_client)
+        except Exception:
+            session.lock.release()
+            raise
 
         async def _run_continuation_stream():
             stream_result = {"success": False}
@@ -1878,6 +1945,29 @@ async def _handle_function_call_output(
                         session, next_turn, requires_action_resp, store=body.store
                     )
                     stream_result["success"] = True
+                elif stream_result.get("interrupted"):
+                    assistant_text = stream_result.get("assistant_text") or ""
+                    assistant_message = _build_session_assistant_message(
+                        assistant_text,
+                        stream_result.get("thinking_texts"),
+                    ) or Message(role="assistant", content="")
+                    session.turn_counter = next_turn
+                    session_manager.add_assistant_response(session_id, assistant_message)
+                    response_obj = stream_result.get("response_obj")
+                    if response_obj is not None:
+                        _record_turn_response(
+                            session,
+                            next_turn,
+                            response_obj,
+                            store=body.store,
+                        )
+                    _log_session_assistant_write(
+                        path="responses.continuation_stream.interrupted",
+                        session_id=session_id,
+                        turn=next_turn,
+                        visible_text=assistant_text,
+                        thinking_texts=stream_result.get("thinking_texts"),
+                    )
                 elif stream_result.get("success"):
                     # Commit the turn on success even when the assistant
                     # produced no visible text or thinking — the client has
@@ -1920,12 +2010,20 @@ async def _handle_function_call_output(
                     sequence_number=0,
                 )
             finally:
-                if not stream_result.get("success"):
+                if not stream_result.get("success") and not stream_result.get("interrupted"):
                     await _disconnect_session_client(
                         session,
                         "responses continuation stream failure",
                         client=active_client,
                     )
+                terminal_state = (
+                    "completed"
+                    if stream_result.get("success")
+                    else "incomplete"
+                    if stream_result.get("interrupted")
+                    else "failed"
+                )
+                await _finish_active_response(session, resp_id, terminal_state)
                 session.lock.release()
 
         return StreamingResponse(_run_continuation_stream(), media_type="text/event-stream")
@@ -1956,9 +2054,7 @@ async def _handle_function_call_output(
             requires_action_resp = _build_requires_action_response(
                 resp_id, body.model, tc, body.metadata
             )
-            _record_turn_response(
-                session, next_turn, requires_action_resp, store=body.store
-            )
+            _record_turn_response(session, next_turn, requires_action_resp, store=body.store)
             return requires_action_resp.model_dump()
 
         # Check for backend errors — SDK in-band error chunks plus
@@ -2042,6 +2138,89 @@ async def _handle_function_call_output(
         logger.warning("usage-log emit failed (non-stream continuation)", exc_info=True)
 
     return response_obj.model_dump()
+
+
+@router.post("/v1/responses/{response_id}/cancel")
+@rate_limit_endpoint("responses")
+async def cancel_response(
+    request: Request,
+    response_id: str,
+    user: Optional[str] = None,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Interrupt an active streamed response while preserving its session.
+
+    The active turn has not yet advanced ``session.turn_counter``, so this
+    endpoint intentionally does not use ``_lookup_stored_response``.  It
+    resolves the session encoded in the response id, verifies ownership, then
+    transitions the separate active-response state machine before sending the
+    backend control request.
+    """
+    await verify_api_key(request, credentials)
+    parsed = _parse_response_id(response_id)
+    if parsed is None:
+        raise _response_not_found(response_id)
+    session_id, turn = parsed
+    session = session_manager.get_session(session_id)
+    if session is None or (user is not None and session.user != user):
+        raise _response_not_found(response_id)
+
+    async with session.response_control_lock:
+        if session.active_response_id != response_id:
+            if turn <= session.turn_counter:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "error": {
+                            "message": f"Response '{response_id}' is no longer in progress.",
+                            "type": "invalid_request_error",
+                            "param": "response_id",
+                            "code": "response_not_cancellable",
+                        }
+                    },
+                )
+            raise _response_not_found(response_id)
+
+        if session.active_response_state == "cancelling":
+            return {
+                "id": response_id,
+                "object": "response",
+                "status": "cancelling",
+            }
+        if session.active_response_state != "running":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Response '{response_id}' is not running",
+            )
+
+        try:
+            backend = BackendRegistry.get(session.backend)
+        except ValueError as exc:
+            raise HTTPException(status_code=503, detail="Backend unavailable") from exc
+        interrupt_client = getattr(backend, "interrupt_client", None)
+        if not callable(interrupt_client):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Backend '{session.backend}' does not support response cancellation",
+            )
+        active_client = session.active_response_client
+        if active_client is None:
+            raise HTTPException(status_code=409, detail="Active response has no client")
+        session.active_response_state = "cancelling"
+
+    try:
+        await asyncio.wait_for(interrupt_client(active_client), timeout=2.0)
+    except Exception as exc:
+        async with session.response_control_lock:
+            if (
+                session.active_response_id == response_id
+                and session.active_response_state == "cancelling"
+            ):
+                session.active_response_state = "running"
+        logger.error("Response interrupt failed for %s", response_id, exc_info=True)
+        raise HTTPException(status_code=502, detail="Failed to interrupt response") from exc
+
+    return {"id": response_id, "object": "response", "status": "cancelling"}
 
 
 @router.get("/v1/responses/{response_id}")

@@ -54,6 +54,10 @@ response.completed
 Failures emit `response.failed`. Empty SDK output is also surfaced as
 `response.failed` so clients receive a definite terminal event.
 
+An explicitly interrupted Claude response emits `response.incomplete`. Partial
+assistant text remains in the output, the turn is committed, and its response
+id can be used as the next request's `previous_response_id`.
+
 Reasoning (thinking) blocks are emitted as `reasoning` output items with
 `response.reasoning_summary_text.delta` / `response.reasoning_text.delta`
 events. A turn that interleaves thinking and text (think → text → think → text)
@@ -432,6 +436,41 @@ latest response id and a `function_call_output` input item:
   "sequence_number": 8
 }
 ```
+
+`response.incomplete` is the terminal event for an explicit user interrupt:
+
+```json
+{
+  "type": "response.incomplete",
+  "response": {
+    "id": "resp_00000000-0000-0000-0000-000000000000_1",
+    "object": "response",
+    "status": "incomplete",
+    "model": "sonnet",
+    "output": [
+      {
+        "id": "msg_abc123",
+        "type": "message",
+        "role": "assistant",
+        "status": "incomplete",
+        "content": [
+          { "type": "output_text", "text": "Partial answer", "annotations": [] }
+        ]
+      }
+    ],
+    "incomplete_details": { "reason": "user_cancelled" },
+    "usage": { "input_tokens": 50, "output_tokens": 4 },
+    "metadata": {}
+  },
+  "sequence_number": 8
+}
+```
+
+To stop a response, wait for its `response.created` event, call
+`POST /v1/responses/{response_id}/cancel`, and continue consuming the original
+SSE connection until `response.incomplete`. Do not abort the SSE fetch first:
+the gateway must drain the SDK's interrupt result before the same backend
+client can accept the next query.
 
 ## Tool Names
 

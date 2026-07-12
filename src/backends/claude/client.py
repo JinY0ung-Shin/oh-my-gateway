@@ -570,6 +570,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             return result
         return message
 
+    @staticmethod
+    def _mark_gateway_interrupt(converted: Dict[str, Any], session) -> Dict[str, Any]:
+        """Tag the SDK error result paired with an explicit cancel request."""
+        if (
+            getattr(session, "active_response_state", None) == "cancelling"
+            and converted.get("type") == "result"
+            and converted.get("subtype") == "error_during_execution"
+        ):
+            converted["gateway_interrupted"] = True
+        return converted
+
     # ------------------------------------------------------------------
     # Environment management
     # ------------------------------------------------------------------
@@ -948,13 +959,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                         message = get_next.result()
                     except StopAsyncIteration:
                         break  # Stream ended normally (ResultMessage received)
-                    yield self._convert_message(message)
+                    converted = self._convert_message(message)
+                    # The SDK reports user interrupts as an error result. Mark
+                    # only one paired with an explicit gateway cancel request
+                    # so genuine execution errors retain failure semantics.
+                    yield self._mark_gateway_interrupt(converted, session)
         except Exception as exc:
             logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
             session.client = None
             yield error_chunk(str(exc))
         finally:
             session.stream_break_event = None
+
+    async def interrupt_client(self, client: ClaudeSDKClient) -> None:
+        """Interrupt the active turn without disconnecting the conversation."""
+        await client.interrupt()
 
     async def receive_response_from_client(
         self,
@@ -969,7 +988,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         """
         try:
             async for message in client.receive_response():
-                yield self._convert_message(message)
+                converted = self._convert_message(message)
+                yield self._mark_gateway_interrupt(converted, session)
         except Exception as exc:
             logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
             session.client = None

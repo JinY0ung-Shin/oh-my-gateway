@@ -65,6 +65,9 @@ class TestAdminChatPage:
         html = build_chat_page()
         assert isinstance(html, str)
         assert "GATEWAY CHAT" in html
+        assert 'id="stop-btn"' in html
+        assert "/cancel" in html
+        assert "response.incomplete" in html
         assert html.lstrip().startswith("<!DOCTYPE html>")
 
     def test_get_admin_chat_page(self, admin_client):
