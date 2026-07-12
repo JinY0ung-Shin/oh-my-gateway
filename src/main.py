@@ -43,7 +43,7 @@ from src.mcp_config import get_mcp_servers
 from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
 
-# Note: load_dotenv() is called in constants.py at import time
+# Note: load_dotenv() runs in src/__init__.py, before any src submodule import
 # DEBUG_MODE and VERBOSE are imported from src.constants (single source of truth)
 
 # Set logging level based on debug/verbose mode

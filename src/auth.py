@@ -7,7 +7,7 @@ from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 logger = logging.getLogger(__name__)
-# Note: load_dotenv() is called in constants.py at import time
+# Note: load_dotenv() runs in src/__init__.py, before any src submodule import
 
 
 # ============================================================================

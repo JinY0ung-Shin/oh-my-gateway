@@ -1,5 +1,13 @@
 """Shared fixtures for tests that mutate module-level application state."""
 
+import os
+
+# Must precede the first src import: src/__init__.py loads .env at package
+# import time, and a developer's local .env (DISALLOWED_TOOLS,
+# USAGE_LOG_DB_URL, ...) would otherwise leak into every test. Subprocess
+# integration tests inherit this env, so their gateways skip .env too.
+os.environ.setdefault("GATEWAY_SKIP_DOTENV", "1")
+
 import pytest
 
 import src.main as main

@@ -10,28 +10,12 @@ import fnmatch
 import json
 import os
 import re
-from dotenv import dotenv_values, load_dotenv
 
 from src.env_utils import parse_bool_env, parse_float_env, parse_int_env
 
-load_dotenv()
-
-# Selected Anthropic-related keys: .env wins over pre-existing shell env.
-# Why: shell-injected values (e.g. corp defaults) silently override .env,
-# making local routing/model overrides ineffective without this opt-in.
-_DOTENV_OVERRIDE_KEYS = (
-    "ANTHROPIC_BASE_URL",
-    "ANTHROPIC_AUTH_TOKEN",
-    "ANTHROPIC_CUSTOM_HEADERS",
-    "ANTHROPIC_DEFAULT_OPUS_MODEL",
-    "ANTHROPIC_DEFAULT_SONNET_MODEL",
-    "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-)
-_dotenv_file_values = dotenv_values()
-for _k in _DOTENV_OVERRIDE_KEYS:
-    _v = _dotenv_file_values.get(_k)
-    if _v is not None:
-        os.environ[_k] = _v
+# .env loading (and the Anthropic-key shell-env override) lives in
+# src/__init__.py so it precedes import-time os.getenv reads in every module,
+# not just the ones that happen to import this one first.
 
 # Default model (recommended for most use cases)
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "sonnet")
