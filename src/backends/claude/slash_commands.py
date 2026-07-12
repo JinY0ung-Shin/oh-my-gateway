@@ -18,7 +18,8 @@ This module validates the prompt before it reaches the SDK:
   command. The SDK passes it to the model as a plain message, so the gateway
   lets it through unchanged (issue #117). Only a command-name-shaped token
   (alphanumeric/kebab, optional ``:namespace``) is treated as a command.
-* A small **blocklist** of destructive built-ins is always rejected with
+* A small **blocklist** of destructive built-ins — plus any names in the
+  ``BLOCKED_SLASH_COMMANDS`` env var — is always rejected with
   ``blocked_command``.
 * For other (command-shaped) slash prompts, the name is checked against a
   **TTL-cached allowlist** pulled from ``ClaudeSDKClient.get_server_info()``.
@@ -30,6 +31,7 @@ This module validates the prompt before it reaches the SDK:
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 from pathlib import Path
@@ -37,7 +39,24 @@ from typing import Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
-BLOCKED_COMMANDS: frozenset[str] = frozenset({"compact", "init", "heapdump"})
+# Destructive built-ins are always blocked. Operators extend the set with the
+# BLOCKED_SLASH_COMMANDS env var (comma-separated names, leading slash
+# optional) to disable additional skills/commands gateway-wide. This gates the
+# client-typed ``/name`` path only; blocking the model-initiated path takes a
+# ``Skill(<name>)`` entry in DISALLOWED_TOOLS.
+_BUILTIN_BLOCKED_COMMANDS: frozenset[str] = frozenset({"compact", "init", "heapdump"})
+
+
+def _parse_blocked_commands_env(raw: str) -> frozenset[str]:
+    """Parse BLOCKED_SLASH_COMMANDS: comma-separated, slash prefix optional."""
+    return frozenset(
+        name for name in (c.strip().lstrip("/") for c in raw.split(",")) if name
+    )
+
+
+BLOCKED_COMMANDS: frozenset[str] = _BUILTIN_BLOCKED_COMMANDS | (
+    _parse_blocked_commands_env(os.getenv("BLOCKED_SLASH_COMMANDS", ""))
+)
 CACHE_TTL_SECONDS: float = 60.0
 
 # A slash-command name is alphanumeric/kebab-case, optionally namespaced with
@@ -156,10 +175,9 @@ async def validate_prompt(prompt: str, cwd: Optional[Path] = None) -> None:
         raise SlashCommandError(
             code="blocked_command",
             message=(
-                f"Slash command '/{name}' is blocked by this server because it "
-                "has side effects (history compaction, file creation, etc.). "
-                "Prefix your message with a non-slash character if you intended "
-                "a plain user message."
+                f"Slash command '/{name}' is blocked by this server. "
+                "Prefix your message with a non-slash character if you "
+                "intended a plain user message."
             ),
         )
 

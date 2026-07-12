@@ -141,6 +141,20 @@ DISALLOWED_SUBAGENT_TYPES = [f"Agent({t.strip()})" for t in _raw_disallowed.spli
 _raw_disallowed_tools = os.getenv("DISALLOWED_TOOLS", "")
 DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.strip()]
 
+# Hidden Skills
+# Comma-separated skill names removed from the model's skill catalog. A
+# ``Skill(<name>)`` deny in DISALLOWED_TOOLS blocks execution but leaves the
+# skill listed in the system prompt; hiding requires the SDK ``skills``
+# allowlist (a context filter: unlisted skills are dropped from the listing
+# and rejected by the Skill tool). Keep the deny entries in sync for defense
+# in depth, and BLOCKED_SLASH_COMMANDS for the client-typed ``/name`` path.
+_raw_hidden_skills = os.getenv("HIDDEN_SKILLS", "")
+HIDDEN_SKILLS = frozenset(
+    name
+    for name in (s.strip().lstrip("/") for s in _raw_hidden_skills.split(","))
+    if name
+)
+
 # ---------------------------------------------------------------------------
 # Bash Sandbox Configuration
 # ---------------------------------------------------------------------------

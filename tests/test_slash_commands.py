@@ -72,6 +72,32 @@ async def test_blocked_command_raises(monkeypatch):
     assert ei.value.code == "blocked_command"
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("", frozenset()),
+        ("verify", frozenset({"verify"})),
+        ("verify, /run,,code-review ", frozenset({"verify", "run", "code-review"})),
+    ],
+)
+def test_parse_blocked_commands_env(raw, expected):
+    assert sc._parse_blocked_commands_env(raw) == expected
+
+
+async def test_env_blocked_command_raises(monkeypatch):
+    """Names from BLOCKED_SLASH_COMMANDS reject even when the skill is registered."""
+
+    async def _fake_fetch(cwd):
+        return {"verify"}
+
+    monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
+    monkeypatch.setattr(sc, "BLOCKED_COMMANDS", sc.BLOCKED_COMMANDS | {"verify"})
+
+    with pytest.raises(sc.SlashCommandError) as ei:
+        await sc.validate_prompt("/verify the last change")
+    assert ei.value.code == "blocked_command"
+
+
 async def test_known_command_passes(monkeypatch):
     async def _fake_fetch(cwd):
         return {"dev-server", "review"}

@@ -325,6 +325,42 @@ class TestSkillsOptionMigration:
         # rule that skills="all" adds is ignored by the CLI permission matcher.
         assert "Skill(:*)" in (options.allowed_tools or [])
 
+    async def test_hidden_skills_converts_to_allowlist(self, monkeypatch):
+        """HIDDEN_SKILLS rewrites skills into discovered-minus-hidden allowlist."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude import slash_commands
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        async def _fake_available(cwd=None, force=False):
+            return {"verify", "simplify", "compact", "review"}
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"verify"}))
+        monkeypatch.setattr(slash_commands, "get_available_commands", _fake_available)
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = "all"
+        await backend._apply_hidden_skills(options)
+
+        # "verify" hidden, "compact" dropped as an always-blocked builtin.
+        assert options.skills == ["review", "simplify"]
+
+    async def test_hidden_skills_unset_is_noop(self, monkeypatch):
+        """Without HIDDEN_SKILLS the skills option is left untouched."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset())
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = "all"
+        await backend._apply_hidden_skills(options)
+
+        assert options.skills == "all"
+
     def test_no_skill_keeps_skills_unset(self):
         from claude_agent_sdk import ClaudeAgentOptions
         from src.backends.claude.client import ClaudeCodeCLI

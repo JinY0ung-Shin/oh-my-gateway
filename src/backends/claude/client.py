@@ -38,6 +38,7 @@ from src.backends.claude.constants import (
     THINKING_BUDGET_TOKENS,
     DISALLOWED_SUBAGENT_TYPES,
     DISALLOWED_TOOLS,
+    HIDDEN_SKILLS,
     CLAUDE_SANDBOX_ENABLED,
     CLAUDE_SANDBOX_AUTO_ALLOW_BASH,
     CLAUDE_SANDBOX_EXCLUDED_COMMANDS,
@@ -247,6 +248,25 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
         options.allowed_tools = filtered
+
+    async def _apply_hidden_skills(self, options: ClaudeAgentOptions) -> None:
+        """Convert ``options.skills`` into an allowlist excluding HIDDEN_SKILLS.
+
+        The SDK ``skills`` allowlist is the only surface that removes a skill
+        from the model's catalog (deny rules block execution but keep the
+        listing). The allowlist is the discovered command set minus hidden and
+        slash-blocked names; builtin command names left in the remainder are
+        inert — their ``Skill(<name>)`` allow rules match no skill.
+        """
+        if not HIDDEN_SKILLS:
+            return
+        from src.backends.claude import slash_commands
+
+        cwd = Path(options.cwd) if options.cwd else None
+        names = await slash_commands.get_available_commands(cwd)
+        options.skills = sorted(
+            names - HIDDEN_SKILLS - slash_commands.BLOCKED_COMMANDS
+        )
 
     def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
         """Grant the CLI extra working directories (``--add-dir``).
@@ -872,6 +892,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             user=user,
             forward_headers=forward_headers,
         )
+        await self._apply_hidden_skills(options)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
         # model as a callable tool when a permission callback is present.
