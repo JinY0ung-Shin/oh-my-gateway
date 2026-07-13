@@ -30,6 +30,7 @@ from src.constants import RATE_LIMITS
 # are intentionally absent so the monitoring view doesn't overreport.
 _PATH_BUCKET_MAP: Dict[str, str] = {
     "/v1/responses": "responses",
+    "/v1/agents/messages": "responses",
     "/health": "health",
     "/version": "health",
     "/v1/mcp/servers": "general",

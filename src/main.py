@@ -601,12 +601,14 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
 
 from src.routes import (  # noqa: E402
     responses_router,
+    agent_messages_router,
     sessions_router,
     general_router,
     admin_router,
 )
 
 app.include_router(responses_router)
+app.include_router(agent_messages_router)
 app.include_router(sessions_router)
 app.include_router(general_router)
 app.include_router(admin_router)

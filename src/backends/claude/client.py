@@ -496,6 +496,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         cwd: Optional[Path] = None,
         user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
+        include_partial_messages: Optional[bool] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
@@ -533,7 +534,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         )
         from src.runtime_config import get_token_streaming
 
-        if get_token_streaming():
+        token_streaming = (
+            get_token_streaming()
+            if include_partial_messages is None
+            else include_partial_messages
+        )
+        if token_streaming:
             options.include_partial_messages = True
 
         # Surface hook lifecycle events (PreToolUse/PostToolUse/Stop/…) into the
@@ -852,6 +858,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         _custom_base: object = _UNSET,
         user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
+        include_partial_messages: Optional[bool] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
@@ -891,6 +898,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             _custom_base=_custom_base,
             user=user,
             forward_headers=forward_headers,
+            include_partial_messages=include_partial_messages,
         )
         await self._apply_hidden_skills(options)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),

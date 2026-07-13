@@ -5,7 +5,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/JinY0ung-Shin/oh-my-gateway)
 [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-OpenAI-compatible gateway for coding agent backends. It exposes Claude Agent SDK, OpenCode, and Codex through one `/v1/responses` API with streaming, multi-turn `previous_response_id` chaining, MCP integration, workspace isolation, and an admin dashboard.
+OpenAI-compatible gateway for coding agent backends. It exposes Claude Agent SDK, OpenCode, and Codex through `/v1/responses`, plus a stateless Claude SDK event stream at `/v1/agents/messages`, with MCP integration, workspace isolation, and an admin dashboard.
 
 > Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose service is now `gateway`; update commands such as `docker compose logs claude-wrapper` to use `gateway`.
 
@@ -33,6 +33,7 @@ curl http://localhost:8000/v1/responses \
 ## What It Provides
 
 - **Responses API**: `/v1/responses` with non-streaming and SSE streaming responses.
+- **Stateless agent API**: `/v1/agents/messages` with caller-owned history and Claude SDK events.
 - **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`), OpenCode (`opencode/<provider>/<model>`), and experimental Codex (`codex/<model>`).
 - **Session continuity**: `previous_response_id` and server-side session tracking.
 - **Workspace isolation**: temporary sessions by default, or per-user directories with `USER_WORKSPACES_DIR`.
@@ -235,6 +236,7 @@ Primary endpoints:
 
 - `POST /v1/responses`
 - `POST /v1/responses/{response_id}/cancel` (Claude streaming responses)
+- `POST /v1/agents/messages` (stateless Claude SDK event stream)
 - `GET /v1/models`
 - `GET /v1/sessions`
 - `GET /v1/auth/status`
@@ -245,6 +247,45 @@ Primary endpoints:
 Admin endpoints live under `/admin` and `/admin/api/*`.
 
 When `USAGE_LOG_DB_URL` is configured, usage analytics are available under `/admin/api/usage/*`: `summary`, `users`, `tools`, `series`, `tools-series`, and `turns`.
+
+### Stateless agent Messages
+
+`POST /v1/agents/messages` accepts a complete text conversation on every call
+and never creates a gateway session or continuation ID:
+
+```json
+{
+  "agent": "claude",
+  "model": "sonnet",
+  "system": "Optional per-request instructions",
+  "messages": [
+    {"role": "user", "content": "First question"},
+    {"role": "assistant", "content": "First answer"},
+    {"role": "user", "content": "Follow-up"}
+  ],
+  "stream": true
+}
+```
+
+Version 1 supports only `agent: "claude"`, Claude models, string or `text`
+block content, and `stream: true`. It uses the same bearer authentication and
+rate-limit setting as `/v1/responses`, but its execution path is independent of
+Responses session storage. Each request runs in an isolated temporary
+workspace; the SDK client, workspace, JSONL transcript, and tool-result
+artifacts are removed when the stream ends.
+
+The SSE sequence is `message_start`, one or more `sdk_message` events, then
+`message_stop`; setup/backend failures use a terminal `error` event. The
+`X-Agent-Message-Schema` response header identifies the
+`claude-agent-sdk-message-v1` payload contract. SDK dataclasses are recursively
+serialized into the envelope shape used by Noah's Claude SDK handlers. Session
+IDs and internal transcript/plugin paths are omitted, secret-looking values are
+redacted, and `tool_result` bodies are not exposed (tool ID and error status
+remain available for UI lifecycle handling).
+
+`AskUserQuestion` is disabled because a stateless request cannot resume a
+parked SDK callback. Agents should ask the user in normal assistant text and
+receive the answer in the next full-history request.
 
 ## Response Compatibility
 
