@@ -374,6 +374,54 @@ def test_archive_includes_hidden_when_disabled(client, monkeypatch):
     assert ".env" in names and ".secret_dir/k.txt" in names
 
 
+def test_search_finds_nested_files(client):
+    r = client.get("/files/search?query=inner", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["truncated"] is False
+    names = [e["name"] for e in body["results"]]
+    assert "inner.md" in names
+    hit = next(e for e in body["results"] if e["name"] == "inner.md")
+    assert hit["type"] == "file"
+    assert hit["path"].endswith("/sub/inner.md")
+
+
+def test_search_is_case_insensitive_and_matches_dirs(client):
+    r = client.get("/files/search?query=SUB", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    results = r.json()["results"]
+    assert any(e["name"] == "sub" and e["type"] == "directory" for e in results)
+
+
+def test_search_excludes_hidden_entries(client):
+    r = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.json()["results"] == []
+    # ...but finds them when hiding is disabled.
+
+
+def test_search_includes_hidden_when_disabled(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "false")
+    r = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
+    names = [e["name"] for e in r.json()["results"]]
+    assert ".secret_dir" in names
+
+
+def test_search_empty_query_returns_nothing(client):
+    r = client.get("/files/search?query=", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.json() == {"results": [], "truncated": False}
+
+
+def test_search_respects_limit_and_flags_truncation(client, workspace):
+    for i in range(5):
+        (workspace / f"match_{i}.txt").write_text("x")
+    r = client.get("/files/search?query=match&limit=3", headers={**_AUTH, **_USER})
+    body = r.json()
+    assert len(body["results"]) == 3
+    assert body["truncated"] is True
+
+
 def test_writes_fail_closed_without_api_key(workspace, monkeypatch):
     _patch_api_key(monkeypatch, "")
     monkeypatch.setattr(tf.workspace_manager, "resolve", lambda user, backend=None: workspace)
