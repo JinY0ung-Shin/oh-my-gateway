@@ -30,6 +30,13 @@ Config:
 - ``WORKSPACE_HIDE_DOTFILES`` — when true (default), dot-prefixed entries are
   neither listed nor accessible.
 
+Concurrency:
+- Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
+  in the threadpool via ``run_in_threadpool``. FileNav polls ``/files/list``
+  continuously for every connected user; done synchronously that I/O would
+  block the gateway event loop and stall everything else it serves
+  (``/v1/responses`` streams, terminal websockets).
+
 Security:
 - ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
   these endpoints would expose every user's files unauthenticated, so we fail
@@ -51,6 +58,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -248,25 +256,34 @@ async def list_files(
         raise HTTPException(status_code=404, detail="directory not found")
 
     hide_dot = _hide_dotfiles()
-    entries = []
-    with os.scandir(target) as it:
-        for entry in it:
-            if hide_dot and entry.name.startswith("."):
-                continue
-            try:
-                st = entry.stat()  # follow symlinks; broken links are skipped
-            except OSError:
-                continue
-            entries.append(
-                {
-                    "name": entry.name,
-                    "type": "directory" if stat_module.S_ISDIR(st.st_mode) else "file",
-                    "size": st.st_size,
-                    "modified": int(st.st_mtime),
-                }
-            )
-    entries.sort(key=lambda e: (e["type"] != "directory", e["name"].lower()))
-    return {"entries": entries}
+
+    # Run the directory scan off the event loop: FileNav polls this endpoint
+    # continuously across all users, and a synchronous scandir would stall
+    # every other request (chat streams, terminal websockets) on the loop.
+    def _scan() -> list:
+        entries = []
+        with os.scandir(target) as it:
+            for entry in it:
+                if hide_dot and entry.name.startswith("."):
+                    continue
+                try:
+                    st = entry.stat()  # follow symlinks; broken links are skipped
+                except OSError:
+                    continue
+                entries.append(
+                    {
+                        "name": entry.name,
+                        "type": (
+                            "directory" if stat_module.S_ISDIR(st.st_mode) else "file"
+                        ),
+                        "size": st.st_size,
+                        "modified": int(st.st_mtime),
+                    }
+                )
+        entries.sort(key=lambda e: (e["type"] != "directory", e["name"].lower()))
+        return entries
+
+    return {"entries": await run_in_threadpool(_scan)}
 
 
 @router.get("/files/read")
@@ -288,7 +305,7 @@ async def read_file(
             detail=f"file too large to preview (> {_MAX_READ_BYTES} bytes); use download",
         )
 
-    data = target.read_bytes()
+    data = await run_in_threadpool(target.read_bytes)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -358,7 +375,7 @@ async def upload_file(
     target = _resolve_or_403(root, f"{directory}/{name}")
 
     data = await file.read()
-    target.write_bytes(data)
+    await run_in_threadpool(target.write_bytes, data)
     return {"path": str(target), "size": len(data)}
 
 
@@ -393,10 +410,11 @@ async def delete_entry(
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
     is_dir = target.is_dir() and not target.is_symlink()
+    # rmtree over a large workspace subtree can take seconds — keep it off the loop.
     if is_dir:
-        shutil.rmtree(target)
+        await run_in_threadpool(shutil.rmtree, target)
     else:
-        target.unlink()
+        await run_in_threadpool(target.unlink)
     return {"path": path, "type": "directory" if is_dir else "file"}
 
 
@@ -417,7 +435,7 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="source not found")
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
-    shutil.move(str(src), str(dst))
+    await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
 
 
@@ -449,22 +467,27 @@ async def archive_entries(
             part.startswith(".") for part in p.relative_to(root_resolved).parts
         )
 
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for t in targets:
-            if t.is_dir():
-                for sub in t.rglob("*"):
-                    if (
-                        sub.is_file()
-                        and not sub.is_symlink()
-                        and not _is_hidden(sub)
-                    ):
-                        zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
-            elif t.is_file() and not t.is_symlink():
-                zf.write(t, arcname=str(t.relative_to(root_resolved)))
-    buf.seek(0)
+    # Walking the tree and deflating can take seconds on big workspaces — keep
+    # the whole zip build off the event loop.
+    def _build_zip() -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            for t in targets:
+                if t.is_dir():
+                    for sub in t.rglob("*"):
+                        if (
+                            sub.is_file()
+                            and not sub.is_symlink()
+                            and not _is_hidden(sub)
+                        ):
+                            zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
+                elif t.is_file() and not t.is_symlink():
+                    zf.write(t, arcname=str(t.relative_to(root_resolved)))
+        return buf.getvalue()
+
+    payload = await run_in_threadpool(_build_zip)
     return StreamingResponse(
-        iter([buf.getvalue()]),
+        iter([payload]),
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
     )
