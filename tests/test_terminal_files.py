@@ -430,3 +430,44 @@ def test_writes_fail_closed_without_api_key(workspace, monkeypatch):
     c = TestClient(app)
     r = c.post("/files/mkdir", json={"path": "/x"})
     assert r.status_code == 503
+
+
+# ---------------------------------------------------------------------------
+# /files/serve — inline serving for the HTML iframe preview
+# ---------------------------------------------------------------------------
+
+
+def test_serve_html_inline_with_content_type(client, workspace):
+    (workspace / "page.html").write_text("<h1>hi</h1>")
+    d = str(workspace.resolve())
+    r = client.get(f"/files/serve{d}/page.html", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.text == "<h1>hi</h1>"
+    assert r.headers["content-type"].startswith("text/html")
+    assert "attachment" not in r.headers.get("content-disposition", "")
+
+
+def test_serve_resolves_sibling_asset(client, workspace):
+    # Relative references inside a served HTML document resolve through the
+    # same route — e.g. ./app.css next to the page.
+    (workspace / "site").mkdir()
+    (workspace / "site" / "index.html").write_text('<link href="./app.css">')
+    (workspace / "site" / "app.css").write_text("body{}")
+    d = str(workspace.resolve())
+    r = client.get(f"/files/serve{d}/site/app.css", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/css")
+    assert r.text == "body{}"
+
+
+def test_serve_outside_root_never_leaks(client, workspace):
+    outside = str(workspace.parent.parent / "secret.txt")
+    r = client.get(f"/files/serve{outside}", headers={**_AUTH, **_USER})
+    assert r.status_code in (403, 404)
+    assert "SECRET" not in r.text
+
+
+def test_serve_hidden_file_is_404(client, workspace):
+    d = str(workspace.resolve())
+    r = client.get(f"/files/serve{d}/.env", headers={**_AUTH, **_USER})
+    assert r.status_code == 404

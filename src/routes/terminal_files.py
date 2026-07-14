@@ -13,6 +13,7 @@ Contract (what FileNav calls):
 - ``GET  /files/search?query=<q>``    -> ``{"results": [{path,name,type,size,modified}], "truncated"}``
 - ``GET  /files/read?path=<p>``       -> text ``{path,total_lines,content}`` | raw bytes (binary)
 - ``GET  /files/view?path=<p>``       -> raw bytes (download)
+- ``GET  /files/serve/<path>``        -> raw bytes, inline (HTML iframe preview; relative assets)
 - ``POST /files/upload?directory=<p>``-> ``{path,size}`` (also how "new file" is created)
 - ``POST /files/mkdir``  {path}       -> ``{path}``
 - ``DELETE /files/delete?path=<p>``   -> ``{path,type}``
@@ -415,6 +416,33 @@ async def view_file(
 
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=media, filename=target.name)
+
+
+@router.get("/files/serve/{path:path}")
+async def serve_file(
+    request: Request,
+    path: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Serve a file inline for in-browser preview.
+
+    FileNav previews HTML documents via ``<iframe src=".../files/serve/<path>">``
+    (path-based, unlike the query-based ``/files/view`` download endpoint) so
+    that relative references inside the document — ``./style.css``, images,
+    scripts — resolve to sibling files through this same route. The leading
+    slash of the absolute workspace path is consumed by the URL, so re-anchor
+    before resolving; confinement and dotfile hiding are the same as every
+    other endpoint.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    target = _resolve_or_403(root, path if path.startswith("/") else f"/{path}")
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="file not found")
+
+    media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+    return FileResponse(target, media_type=media, content_disposition_type="inline")
 
 
 # ---------------------------------------------------------------------------
