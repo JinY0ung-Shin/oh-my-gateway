@@ -257,6 +257,7 @@ def _build_completed_response(
     *,
     input_tokens: int,
     output_tokens: int,
+    context_tokens: Optional[int] = None,
     thinking_texts: Optional[List[str]] = None,
     structured_output: Any = None,
 ) -> ResponseObject:
@@ -283,6 +284,7 @@ def _build_completed_response(
         usage=ResponseUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            context_tokens=context_tokens,
         ),
         metadata=metadata or {},
         structured_output=structured_output,
@@ -339,6 +341,7 @@ def _record_stream_turn_response(
         metadata,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        context_tokens=streaming_utils.extract_context_tokens(chunks_buffer),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks_buffer),
     )
@@ -1778,6 +1781,7 @@ async def create_response(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
+        context_tokens=streaming_utils.extract_context_tokens(chunks),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks),
     )
@@ -2112,6 +2116,7 @@ async def _handle_function_call_output(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
+        context_tokens=streaming_utils.extract_context_tokens(chunks),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks),
     )

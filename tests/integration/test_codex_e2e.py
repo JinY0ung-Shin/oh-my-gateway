@@ -326,7 +326,11 @@ def test_codex_responses_e2e_approval_continuation(tmp_path, prompt, expected_ki
         assert second_body["status"] == "completed"
         assert second_body["output"][0]["content"][0]["text"] == "Codex e2e approved."
         # Reasoning tokens (2) roll into output (3) for OpenAI-compatible usage reporting.
-        assert second_body["usage"] == {"input_tokens": 2, "output_tokens": 5}
+        assert second_body["usage"] == {
+            "input_tokens": 2,
+            "output_tokens": 5,
+            "context_tokens": 7,
+        }
 
 
 def test_codex_streaming_approval_exposes_only_ask_user_question(tmp_path):

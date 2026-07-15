@@ -231,6 +231,28 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     return None
 
 
+def extract_context_tokens(chunks: list) -> Optional[int]:
+    """Context-window occupancy of the turn's *last* model call, if known.
+
+    ``extract_sdk_usage`` reports run-cumulative totals — an agentic turn
+    with many tool calls sums every call's input (cache reads repeatedly),
+    which wildly overstates how full the context window is. For a gauge we
+    want the last AssistantMessage's usage: its input side (uncached +
+    cache-created + cache-read) is exactly the prompt that call carried,
+    plus its output joins the context for the next call.
+    """
+    for msg in reversed(chunks):
+        if isinstance(msg, dict) and msg.get("type") == "assistant" and msg.get("usage"):
+            usage = msg["usage"]
+            return (
+                usage.get("input_tokens", 0)
+                + usage.get("cache_creation_input_tokens", 0)
+                + usage.get("cache_read_input_tokens", 0)
+                + usage.get("output_tokens", 0)
+            )
+    return None
+
+
 def extract_structured_output(chunks: list) -> Any:
     """Return ``ResultMessage.structured_output`` from SDK chunks, if present.
 
@@ -1336,6 +1358,7 @@ async def stream_response_chunks(
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
+            context_tokens=extract_context_tokens(chunks_buffer),
         ),
         metadata=_metadata,
         structured_output=extract_structured_output(chunks_buffer),

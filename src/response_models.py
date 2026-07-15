@@ -200,10 +200,18 @@ class ReasoningOutputItem(BaseModel):
 
 
 class ResponseUsage(BaseModel):
-    """Token usage for a response."""
+    """Token usage for a response.
+
+    ``input_tokens``/``output_tokens`` are run-cumulative (an agentic turn
+    spanning many model calls sums each call's tokens, cache reads included).
+    ``context_tokens`` is different: the context-window occupancy of the
+    *last* model call in the turn — what a "context fullness" gauge should
+    show. Extension field; OpenAI clients ignore it.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    context_tokens: Optional[int] = None
 
 
 class ResponseErrorDetail(BaseModel):

@@ -15,6 +15,7 @@ from src.streaming_utils import (
     ToolUseAccumulator,
     bridge_sse_stream,
     extract_embedded_tool_blocks,
+    extract_context_tokens,
     extract_sdk_usage,
     extract_user_tool_results,
     format_chunk_content,
@@ -487,6 +488,37 @@ class TestExtractSdkUsage:
         result = extract_sdk_usage(chunks)
         assert result["prompt_tokens"] == 180  # 100 + 50 + 30
         assert result["completion_tokens"] == 40
+
+
+class TestExtractContextTokens:
+    def test_none_without_assistant_usage(self):
+        assert extract_context_tokens([]) is None
+        assert extract_context_tokens([{"type": "assistant"}]) is None
+        # ResultMessage usage is run-cumulative — deliberately NOT used.
+        assert (
+            extract_context_tokens(
+                [{"type": "result", "usage": {"input_tokens": 10, "output_tokens": 5}}]
+            )
+            is None
+        )
+
+    def test_uses_last_assistant_call_only(self):
+        chunks = [
+            {"type": "assistant", "usage": {"input_tokens": 900, "output_tokens": 10}},
+            {"type": "user"},
+            {
+                "type": "assistant",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 40,
+                    "cache_creation_input_tokens": 50,
+                    "cache_read_input_tokens": 30,
+                },
+            },
+            {"type": "result", "usage": {"input_tokens": 99999, "output_tokens": 50}},
+        ]
+        # Last assistant call: 100 + 50 + 30 + 40 — not the cumulative result.
+        assert extract_context_tokens(chunks) == 220
 
 
 @pytest.mark.asyncio
