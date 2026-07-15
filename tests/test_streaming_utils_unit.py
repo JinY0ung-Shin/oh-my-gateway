@@ -520,6 +520,32 @@ class TestExtractContextTokens:
         # Last assistant call: 100 + 50 + 30 + 40 — not the cumulative result.
         assert extract_context_tokens(chunks) == 220
 
+    def test_reads_usage_nested_under_message(self):
+        """SDK assistant chunks carry usage under message.usage, not top-level."""
+        chunks = [
+            {
+                "type": "assistant",
+                "message": {
+                    "usage": {
+                        "input_tokens": 45470,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 49,
+                    }
+                },
+            },
+        ]
+        assert extract_context_tokens(chunks) == 45519
+
+    def test_assistant_fallback_reads_nested_usage_too(self):
+        """extract_sdk_usage's assistant fallback handles message.usage as well."""
+        chunks = [
+            {"type": "assistant", "message": {"usage": {"input_tokens": 10, "output_tokens": 5}}},
+            {"type": "assistant", "usage": {"input_tokens": 20, "output_tokens": 15}},
+        ]
+        result = extract_sdk_usage(chunks)
+        assert result == {"prompt_tokens": 30, "completion_tokens": 20, "total_tokens": 50}
+
 
 @pytest.mark.asyncio
 async def test_stream_response_chunks_assistant_error_emits_failed():

@@ -183,6 +183,24 @@ def _buffer_summary(buf: list, limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _assistant_usage(msg: Any) -> Optional[dict]:
+    """Usage dict of an assistant chunk, wherever the SDK put it.
+
+    Depending on SDK version/transport the assistant chunk carries usage at
+    the top level or nested under ``message.usage`` (the raw Anthropic
+    message payload — observed with claude-agent-sdk 0.2.108 token
+    streaming). Result chunks keep top-level usage and are not handled here.
+    """
+    if not isinstance(msg, dict) or msg.get("type") != "assistant":
+        return None
+    usage = msg.get("usage")
+    if not usage:
+        message = msg.get("message")
+        if isinstance(message, dict):
+            usage = message.get("usage")
+    return usage if isinstance(usage, dict) else None
+
+
 def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     """Extract real token usage from SDK messages if available.
 
@@ -212,9 +230,9 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     total_output = 0
     found_any = False
     for msg in chunks:
-        if isinstance(msg, dict) and msg.get("type") == "assistant" and msg.get("usage"):
+        usage = _assistant_usage(msg)
+        if usage:
             found_any = True
-            usage = msg["usage"]
             total_input += (
                 usage.get("input_tokens", 0)
                 + usage.get("cache_creation_input_tokens", 0)
@@ -242,8 +260,8 @@ def extract_context_tokens(chunks: list) -> Optional[int]:
     plus its output joins the context for the next call.
     """
     for msg in reversed(chunks):
-        if isinstance(msg, dict) and msg.get("type") == "assistant" and msg.get("usage"):
-            usage = msg["usage"]
+        usage = _assistant_usage(msg)
+        if usage:
             return (
                 usage.get("input_tokens", 0)
                 + usage.get("cache_creation_input_tokens", 0)
@@ -1267,7 +1285,7 @@ async def stream_response_chunks(
                 if chunk.get("type") == "stream_event":
                     continue
                 if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
-                    if chunk.get("type") == "assistant" and chunk.get("usage"):
+                    if _assistant_usage(chunk):
                         chunks_buffer.append(chunk)
                     continue
 
