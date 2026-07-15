@@ -520,6 +520,30 @@ class TestExtractContextTokens:
         # Last assistant call: 100 + 50 + 30 + 40 — not the cumulative result.
         assert extract_context_tokens(chunks) == 220
 
+    def test_skips_trailing_zero_usage_chunks(self):
+        """Backends may append assistant chunks with all-zero usage after the
+        real one (observed with GLM via LiteLLM) — walk back past them."""
+        chunks = [
+            {
+                "type": "assistant",
+                "usage": {"input_tokens": 45468, "output_tokens": 46},
+            },
+            {
+                "type": "assistant",
+                "usage": {
+                    "input_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                    "output_tokens": 0,
+                },
+            },
+        ]
+        assert extract_context_tokens(chunks) == 45514
+
+    def test_none_when_all_usage_is_zero(self):
+        chunks = [{"type": "assistant", "usage": {"input_tokens": 0, "output_tokens": 0}}]
+        assert extract_context_tokens(chunks) is None
+
     def test_reads_usage_nested_under_message(self):
         """SDK assistant chunks carry usage under message.usage, not top-level."""
         chunks = [

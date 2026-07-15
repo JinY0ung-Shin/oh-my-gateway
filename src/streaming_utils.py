@@ -261,13 +261,20 @@ def extract_context_tokens(chunks: list) -> Optional[int]:
     """
     for msg in reversed(chunks):
         usage = _assistant_usage(msg)
-        if usage:
-            return (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
-                + usage.get("output_tokens", 0)
-            )
+        if not usage:
+            continue
+        total = (
+            (usage.get("input_tokens") or 0)
+            + (usage.get("cache_creation_input_tokens") or 0)
+            + (usage.get("cache_read_input_tokens") or 0)
+            + (usage.get("output_tokens") or 0)
+        )
+        # Some backends (observed with GLM via LiteLLM) emit trailing
+        # assistant chunks whose usage is all zeros after the chunk that
+        # carries the real numbers — a zero context is meaningless, so keep
+        # walking back to the last call that actually reported tokens.
+        if total > 0:
+            return total
     return None
 
 
