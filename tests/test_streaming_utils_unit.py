@@ -491,15 +491,17 @@ class TestExtractSdkUsage:
 
 
 class TestExtractContextTokens:
-    def test_none_without_assistant_usage(self):
+    def test_none_without_any_usage(self):
         assert extract_context_tokens([]) is None
         assert extract_context_tokens([{"type": "assistant"}]) is None
-        # ResultMessage usage is run-cumulative — deliberately NOT used.
+
+    def test_result_totals_used_when_no_assistant_chunks(self):
+        # No per-call usage anywhere -> fall back to the result totals.
         assert (
             extract_context_tokens(
                 [{"type": "result", "usage": {"input_tokens": 10, "output_tokens": 5}}]
             )
-            is None
+            == 15
         )
 
     def test_uses_last_assistant_call_only(self):
@@ -543,6 +545,25 @@ class TestExtractContextTokens:
     def test_none_when_all_usage_is_zero(self):
         chunks = [{"type": "assistant", "usage": {"input_tokens": 0, "output_tokens": 0}}]
         assert extract_context_tokens(chunks) is None
+
+    def test_falls_back_to_result_totals_when_assistant_usage_empty(self):
+        """GLM via LiteLLM: assistant chunks carry zero/absent usage at runtime;
+        the real numbers exist only on the result chunk (upper bound, but the
+        only signal available)."""
+        chunks = [
+            {"type": "assistant", "usage": None},
+            {"type": "assistant", "usage": {"input_tokens": 0, "output_tokens": 0}},
+            {"type": "result", "usage": {"input_tokens": 45468, "output_tokens": 46}},
+        ]
+        assert extract_context_tokens(chunks) == 45514
+
+    def test_prefers_assistant_usage_over_result_totals(self):
+        """When per-call usage exists, the cumulative result must NOT win."""
+        chunks = [
+            {"type": "assistant", "usage": {"input_tokens": 100, "output_tokens": 40}},
+            {"type": "result", "usage": {"input_tokens": 99999, "output_tokens": 50}},
+        ]
+        assert extract_context_tokens(chunks) == 140
 
     def test_reads_usage_nested_under_message(self):
         """SDK assistant chunks carry usage under message.usage, not top-level."""

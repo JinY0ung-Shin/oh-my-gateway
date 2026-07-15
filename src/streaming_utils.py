@@ -275,6 +275,15 @@ def extract_context_tokens(chunks: list) -> Optional[int]:
         # walking back to the last call that actually reported tokens.
         if total > 0:
             return total
+
+    # Fallback: backends that never populate per-call AssistantMessage.usage
+    # (GLM via LiteLLM reports real numbers only on the result chunk). The
+    # run-cumulative total is an upper bound for multi-call turns — inputs
+    # are summed per call — but it is the only signal available, and a gauge
+    # that errs toward "fuller" beats no gauge.
+    sdk_usage = extract_sdk_usage(chunks)
+    if sdk_usage and sdk_usage.get("total_tokens", 0) > 0:
+        return sdk_usage["total_tokens"]
     return None
 
 
