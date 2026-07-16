@@ -313,12 +313,15 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
         except Exception:
             manifest_names = set()
 
+        from src.mcp_config import mcp_secret_maps_meta
+
         patterns = get_mcp_tool_patterns(servers)
         result = []
         for name, config in servers.items():
             safe_prefix = f"mcp__{mcp_safe_name(name)}__"
             server_patterns = [p for p in patterns if p.startswith(safe_prefix)]
             source = "manifest" if name in manifest_names else "env"
+            meta = mcp_secret_maps_meta(config)
             result.append(
                 {
                     "name": name,
@@ -330,6 +333,7 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "editable": source == "manifest",
                     "config": _redact_mcp_config(config),
                     "reach": compute_mcp_server_reach(name, config),
+                    **meta,
                 }
             )
         return result
@@ -343,20 +347,27 @@ def _redact_mcp_config(config: Dict[str, Any]) -> Dict[str, Any]:
 
     Masks secret-looking top-level keys, every ``headers`` value, and any
     secret-looking ``env`` value (server configs carry tokens/credentials).
+
+    Values that are (or embed) ``{{env:NAME}}`` templates are left visible so
+    operators can see gateway-env references without storing resolved secrets in
+    the admin response.
     """
+    from src.mcp_config import contains_env_ref
+
     out: Dict[str, Any] = {}
     for k, v in config.items():
-        if _SECRET_PATTERNS.search(k):
+        if _SECRET_PATTERNS.search(k) and not contains_env_ref(v):
             out[k] = "***REDACTED***"
         elif k in ("env", "headers") and isinstance(v, dict):
-            out[k] = {
-                kk: (
-                    "***REDACTED***"
-                    if (_SECRET_PATTERNS.search(kk) or k == "headers")
-                    else vv
-                )
-                for kk, vv in v.items()
-            }
+            redacted: Dict[str, Any] = {}
+            for kk, vv in v.items():
+                if contains_env_ref(vv):
+                    redacted[kk] = vv
+                elif _SECRET_PATTERNS.search(kk) or k == "headers":
+                    redacted[kk] = "***REDACTED***"
+                else:
+                    redacted[kk] = vv
+            out[k] = redacted
         else:
             out[k] = v
     return out
@@ -519,7 +530,10 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
             name = entry["server_name"]
             config = entry["config"] if isinstance(entry.get("config"), dict) else {}
             safe_prefix = f"mcp__{mcp_safe_name(name)}__"
+            from src.mcp_config import mcp_secret_maps_meta
+
             ok, reason = validate_server(name, config)
+            meta = mcp_secret_maps_meta(config)
             result.append(
                 {
                     "name": name,
@@ -537,6 +551,7 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "valid": ok,
                     "invalid_reason": None if ok else reason,
                     "shadowed": name in effective,
+                    **meta,
                 }
             )
         return result

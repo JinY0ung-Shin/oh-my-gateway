@@ -43,12 +43,19 @@ def get_admin_js() -> str:
     mpForm: { repo: '', branch: 'main', scope: 'user', git_token: '' },
     pluginForm: { name: '', marketplace: '', scope: 'user' },
     mcpDetail: { servers: [], dropped: [] },
-    mcpForm: { name: '', type: 'stdio', jsonConfig: '' },
+    mcpForm: {
+      name: '', type: 'stdio', jsonConfig: '',
+      envPairs: [], headerPairs: [],
+      command: '', argsText: '', url: ''
+    },
     mcpBusy: false,
     mcpEditName: null,
     mcpJsonError: '',
     mcpJsonWarning: '',
     mcpPatternPreview: [],
+    mcpEnvRefPreview: [],
+    mcpShowAdvanced: false,
+    mcpSyncLock: false,
     mcpTestBusy: {},
     mcpTestResult: {},
     toolsRegistry: {},
@@ -908,8 +915,188 @@ def get_admin_js() -> str:
     // --- MCP server management (MCP tab) ---
     async refreshMcp() { await Promise.all([this.loadMcpDetail(), this.loadTools()]); },
 
+    mcpEnvRefBadge(ref) {
+      // Built via concat so static HTML never embeds mustache-like {{ }} tokens.
+      return '{{' + 'env:' + ref + '}}';
+    },
+    _mcpEmptyForm() {
+      return {
+        name: '', type: 'stdio', jsonConfig: '',
+        envPairs: [], headerPairs: [],
+        command: '', argsText: '', url: ''
+      };
+    },
+    _mcpPairsFromMap(map) {
+      if (!map || typeof map !== 'object' || Array.isArray(map)) return [];
+      return Object.keys(map).map(k => ({ key: k, value: map[k] == null ? '' : String(map[k]) }));
+    },
+    _mcpMapFromPairs(pairs) {
+      const out = {};
+      for (const p of (pairs || [])) {
+        const k = (p.key || '').trim();
+        if (!k) continue;
+        out[k] = p.value == null ? '' : String(p.value);
+      }
+      return out;
+    },
+    _mcpParseArgs(text) {
+      const raw = (text || '').trim();
+      if (!raw) return [];
+      try {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) return parsed.map(String);
+      } catch (_) {}
+      return raw.split(/\s+/).filter(Boolean);
+    },
+    _mcpCollectEnvRefs(cfg) {
+      const refs = new Set();
+      const re = /\{\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}/g;
+      for (const field of ['env', 'headers']) {
+        const m = cfg && cfg[field];
+        if (!m || typeof m !== 'object') continue;
+        for (const v of Object.values(m)) {
+          if (typeof v !== 'string') continue;
+          let match;
+          re.lastIndex = 0;
+          while ((match = re.exec(v)) !== null) refs.add(match[1]);
+        }
+      }
+      return Array.from(refs).sort();
+    },
+    _mcpBuildConfigFromForm() {
+      let cfg = {};
+      try {
+        const raw = (this.mcpForm.jsonConfig || '').trim();
+        if (raw) cfg = JSON.parse(raw);
+      } catch (e) {
+        throw e;
+      }
+      if (typeof cfg !== 'object' || Array.isArray(cfg) || cfg === null) cfg = {};
+      cfg.type = this.mcpForm.type || cfg.type || 'stdio';
+      if (cfg.type === 'stdio') {
+        if (this.mcpForm.command) cfg.command = this.mcpForm.command;
+        const args = this._mcpParseArgs(this.mcpForm.argsText);
+        if (args.length) cfg.args = args;
+        else if ('args' in cfg && !this.mcpForm.argsText) { /* keep existing from json */ }
+        const env = this._mcpMapFromPairs(this.mcpForm.envPairs);
+        if (Object.keys(env).length) cfg.env = env;
+        else delete cfg.env;
+      } else {
+        if (this.mcpForm.url) cfg.url = this.mcpForm.url;
+        const headers = this._mcpMapFromPairs(this.mcpForm.headerPairs);
+        if (Object.keys(headers).length) cfg.headers = headers;
+        else delete cfg.headers;
+      }
+      return cfg;
+    },
+    _mcpApplyConfigToForm(cfg, name, type) {
+      const c = (cfg && typeof cfg === 'object' && !Array.isArray(cfg)) ? cfg : {};
+      const t = type || c.type || 'stdio';
+      let argsText = '';
+      if (Array.isArray(c.args)) {
+        try { argsText = JSON.stringify(c.args); } catch (_) { argsText = c.args.join(' '); }
+      }
+      this.mcpForm = {
+        name: name || '',
+        type: t,
+        jsonConfig: JSON.stringify(c, null, 2),
+        envPairs: this._mcpPairsFromMap(c.env),
+        headerPairs: this._mcpPairsFromMap(c.headers),
+        command: c.command ? String(c.command) : '',
+        argsText,
+        url: c.url ? String(c.url) : '',
+      };
+    },
+    _mcpSyncJsonFromEditors() {
+      if (this.mcpSyncLock) return;
+      this.mcpSyncLock = true;
+      try {
+        let cfg = {};
+        try {
+          const raw = (this.mcpForm.jsonConfig || '').trim();
+          if (raw) cfg = JSON.parse(raw);
+        } catch (_) {
+          cfg = {};
+        }
+        if (typeof cfg !== 'object' || Array.isArray(cfg) || cfg === null) cfg = {};
+        cfg.type = this.mcpForm.type || 'stdio';
+        if (cfg.type === 'stdio') {
+          if (this.mcpForm.command) cfg.command = this.mcpForm.command;
+          else delete cfg.command;
+          const args = this._mcpParseArgs(this.mcpForm.argsText);
+          if (args.length) cfg.args = args;
+          else delete cfg.args;
+          const env = this._mcpMapFromPairs(this.mcpForm.envPairs);
+          if (Object.keys(env).length) cfg.env = env;
+          else delete cfg.env;
+        } else {
+          if (this.mcpForm.url) cfg.url = this.mcpForm.url;
+          else delete cfg.url;
+          const headers = this._mcpMapFromPairs(this.mcpForm.headerPairs);
+          if (Object.keys(headers).length) cfg.headers = headers;
+          else delete cfg.headers;
+        }
+        this.mcpForm.jsonConfig = JSON.stringify(cfg, null, 2);
+      } finally {
+        this.mcpSyncLock = false;
+      }
+    },
+    onMcpPairsChange() { this._mcpSyncJsonFromEditors(); this.validateMcpJson(); },
+    onMcpSimpleFieldsChange() { this._mcpSyncJsonFromEditors(); this.validateMcpJson(); },
+    onMcpTypeChange() {
+      this._mcpSyncJsonFromEditors();
+      this.validateMcpJson();
+    },
+    onMcpJsonChange() {
+      if (this.mcpSyncLock) return;
+      this.mcpSyncLock = true;
+      try {
+        const raw = (this.mcpForm.jsonConfig || '').trim();
+        if (!raw) {
+          this.mcpForm.envPairs = [];
+          this.mcpForm.headerPairs = [];
+          return;
+        }
+        let cfg;
+        try { cfg = JSON.parse(raw); } catch (_) { return; }
+        if (typeof cfg !== 'object' || Array.isArray(cfg) || cfg === null) return;
+        if (cfg.type) this.mcpForm.type = cfg.type;
+        this.mcpForm.command = cfg.command ? String(cfg.command) : '';
+        if (Array.isArray(cfg.args)) {
+          try { this.mcpForm.argsText = JSON.stringify(cfg.args); }
+          catch (_) { this.mcpForm.argsText = cfg.args.join(' '); }
+        } else {
+          this.mcpForm.argsText = '';
+        }
+        this.mcpForm.url = cfg.url ? String(cfg.url) : '';
+        this.mcpForm.envPairs = this._mcpPairsFromMap(cfg.env);
+        this.mcpForm.headerPairs = this._mcpPairsFromMap(cfg.headers);
+      } finally {
+        this.mcpSyncLock = false;
+      }
+      this.validateMcpJson();
+    },
+    addMcpEnvPair() {
+      this.mcpForm.envPairs.push({ key: '', value: '' });
+      this.onMcpPairsChange();
+    },
+    removeMcpEnvPair(idx) {
+      this.mcpForm.envPairs.splice(idx, 1);
+      this.onMcpPairsChange();
+    },
+    addMcpHeaderPair() {
+      this.mcpForm.headerPairs.push({ key: '', value: '' });
+      this.onMcpPairsChange();
+    },
+    removeMcpHeaderPair(idx) {
+      this.mcpForm.headerPairs.splice(idx, 1);
+      this.onMcpPairsChange();
+    },
+
     validateMcpJson() {
-      this.mcpJsonError = ''; this.mcpJsonWarning = ''; this.mcpPatternPreview = [];
+      // Does not rebuild jsonConfig — pair/simple editors call _mcpSyncJsonFromEditors
+      // first so free-form advanced JSON is not clobbered mid-edit.
+      this.mcpJsonError = ''; this.mcpJsonWarning = ''; this.mcpPatternPreview = []; this.mcpEnvRefPreview = [];
       const nm = this.mcpForm.name.trim();
       if (nm && !/^[A-Za-z0-9._@-]+$/.test(nm)) this.mcpJsonError = 'invalid name: letters, digits, ._@- only';
       const raw = this.mcpForm.jsonConfig.trim();
@@ -921,6 +1108,18 @@ def get_admin_js() -> str:
         const t = cfg.type || this.mcpForm.type || 'stdio';
         if (t === 'stdio' && !cfg.command) this.mcpJsonWarning = "stdio requires 'command'";
         if (['sse','http','streamable-http'].includes(t) && !cfg.url) this.mcpJsonWarning = t + " requires 'url'";
+        for (const field of ['env', 'headers']) {
+          if (!(field in cfg)) continue;
+          if (typeof cfg[field] !== 'object' || Array.isArray(cfg[field]) || cfg[field] === null) {
+            this.mcpJsonError = "'" + field + "' must be an object of string values";
+            return;
+          }
+          for (const [k, v] of Object.entries(cfg[field])) {
+            if (!k || typeof k !== 'string') { this.mcpJsonError = "'" + field + "' keys must be non-empty strings"; return; }
+            if (typeof v !== 'string') { this.mcpJsonError = "'" + field + "' values must be strings (key " + k + ")"; return; }
+          }
+        }
+        this.mcpEnvRefPreview = this._mcpCollectEnvRefs(cfg);
       }
       if (nm && !this.mcpJsonError) this.mcpPatternPreview = ['mcp__' + nm.replace(/-/g,'_') + '__*'];
     },
@@ -928,7 +1127,10 @@ def get_admin_js() -> str:
     async createMcpServer() {
       const name = this.mcpForm.name.trim();
       if (!name || this.mcpJsonError) return;
-      let config; try { config = JSON.parse(this.mcpForm.jsonConfig || '{}'); } catch(e){ this.mcpJsonError='invalid JSON'; return; }
+      this._mcpSyncJsonFromEditors();
+      let config;
+      try { config = this._mcpBuildConfigFromForm(); }
+      catch(e){ this.mcpJsonError='invalid JSON'; return; }
       if (config && typeof config === 'object' && !Array.isArray(config) && !config.type) config.type = this.mcpForm.type;
       this.mcpBusy = true;
       try {
@@ -946,14 +1148,22 @@ def get_admin_js() -> str:
       // default); the backend treats it as stdio. Bind a real select option so
       // the on-save type injection can't produce an invalid "unknown" type.
       const t = (s.type && s.type !== 'unknown') ? s.type : 'stdio';
-      this.mcpForm = { name: s.name, type: t, jsonConfig: JSON.stringify(s.config ?? {}, null, 2) };
+      this._mcpApplyConfigToForm(s.config ?? {}, s.name, t);
+      this.mcpShowAdvanced = false;
       this.validateMcpJson();
     },
     cancelMcpEdit() { this.mcpEditName = null; this.resetMcpForm(); },
-    resetMcpForm() { this.mcpForm = { name:'', type:'stdio', jsonConfig:'' }; this.mcpJsonError=''; this.mcpJsonWarning=''; this.mcpPatternPreview=[]; },
+    resetMcpForm() {
+      this.mcpForm = this._mcpEmptyForm();
+      this.mcpJsonError=''; this.mcpJsonWarning=''; this.mcpPatternPreview=[]; this.mcpEnvRefPreview=[];
+      this.mcpShowAdvanced = false;
+    },
     async saveMcpServer() {
       if (!this.mcpEditName || this.mcpJsonError) return;
-      let config; try { config = JSON.parse(this.mcpForm.jsonConfig || '{}'); } catch(e){ this.mcpJsonError='invalid JSON'; return; }
+      this._mcpSyncJsonFromEditors();
+      let config;
+      try { config = this._mcpBuildConfigFromForm(); }
+      catch(e){ this.mcpJsonError='invalid JSON'; return; }
       if (config && typeof config === 'object' && !Array.isArray(config) && !config.type) config.type = this.mcpForm.type;
       this.mcpBusy = true;
       try {
@@ -1051,6 +1261,16 @@ def get_admin_js() -> str:
       if (!t) return '-';
       try { return new Date(t).toLocaleString('ko-KR', { hour12: false }); }
       catch(e) { return t; }
+    },
+
+    formatKstTime(t) {
+      if (!t) return '-';
+      try {
+        return new Date(t).toLocaleString('ko-KR', {
+          hour12: false,
+          timeZone: 'Asia/Seoul'
+        });
+      } catch(e) { return t; }
     },
 
     formatNum(n) {

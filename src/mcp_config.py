@@ -1,13 +1,20 @@
 """MCP server configuration management.
 
 Loads server-level MCP config from the MCP_CONFIG environment variable.
+
+Per-server ``env`` (stdio) and ``headers`` (http/sse/streamable-http) maps are
+validated as ``dict[str, str]``. Values may reference gateway process env vars
+via ``{{env:NAME}}`` templates; those are resolved at session create (Claude /
+Codex) or managed OpenCode startup — never into the gateway process environ.
 """
 
 import copy
 import json
 import logging
+import os
+import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 from src.constants import MCP_CONFIG
 
@@ -16,6 +23,7 @@ logger = logging.getLogger(__name__)
 McpServersDict = Dict[str, Dict[str, Any]]
 
 ALLOWED_TYPES = {"stdio", "sse", "http", "streamable-http"}
+_STRING_MAP_FIELDS = ("env", "headers")
 
 # Required fields per server type (module-level: shared by the loader, the
 # manifest overlay, and the diagnostics).
@@ -26,10 +34,139 @@ REQUIRED_FIELDS: Dict[str, tuple] = {
     "streamable-http": ("url",),
 }
 
+# Gateway env interpolation inside per-MCP env/headers values.
+# Matches ``{{env:NAME}}`` (optional surrounding whitespace inside braces).
+_ENV_REF_RE = re.compile(r"\{\{\s*env:([A-Za-z_][A-Za-z0-9_]*)\s*\}\}")
+# Whole-string pure template (admin redaction may show these unmasked).
+_ENV_REF_PURE_RE = re.compile(r"^\{\{\s*env:[A-Za-z_][A-Za-z0-9_]*\s*\}\}$")
+
 
 def mcp_safe_name(name: str) -> str:
     """Dash->underscore: the Claude/Codex MCP tool-namespace convention (mcp__<name>__*)."""
     return "_".join(name.split("-"))
+
+
+def validate_string_map(value: Any, field: str) -> Tuple[bool, Optional[str]]:
+    """Require ``field`` to be a ``dict[str, str]`` (non-empty keys, string values)."""
+    if not isinstance(value, dict):
+        return False, f"'{field}' must be a JSON object of string keys to string values"
+    for k, v in value.items():
+        if not isinstance(k, str) or not k.strip():
+            return False, f"'{field}' keys must be non-empty strings"
+        if not isinstance(v, str):
+            return (
+                False,
+                f"'{field}' values must be strings "
+                f"(key {k!r} has {type(v).__name__})",
+            )
+    return True, None
+
+
+def is_env_ref_template(value: Any) -> bool:
+    """True when *value* is a pure ``{{env:NAME}}`` template (whole string)."""
+    return isinstance(value, str) and bool(_ENV_REF_PURE_RE.match(value.strip()))
+
+
+def contains_env_ref(value: Any) -> bool:
+    """True when *value* embeds at least one ``{{env:NAME}}`` token."""
+    return isinstance(value, str) and bool(_ENV_REF_RE.search(value))
+
+
+def list_env_refs(config: Mapping[str, Any]) -> List[str]:
+    """Sorted unique gateway env var names referenced in ``env``/``headers`` values."""
+    names: set[str] = set()
+    if not isinstance(config, Mapping):
+        return []
+    for field in _STRING_MAP_FIELDS:
+        mapping = config.get(field)
+        if not isinstance(mapping, dict):
+            continue
+        for v in mapping.values():
+            if not isinstance(v, str):
+                continue
+            for match in _ENV_REF_RE.finditer(v):
+                names.add(match.group(1))
+    return sorted(names)
+
+
+def resolve_env_refs_in_string(
+    value: str, environ: Optional[Mapping[str, str]] = None
+) -> str:
+    """Substitute ``{{env:NAME}}`` tokens from *environ* (default: ``os.environ``).
+
+    Missing names resolve to ``""`` and log a warning (never raise).
+    """
+    env = os.environ if environ is None else environ
+
+    def repl(match: re.Match) -> str:
+        name = match.group(1)
+        if name not in env:
+            logger.warning("MCP {{env:%s}} is not set in the gateway environment", name)
+            return ""
+        return env[name]
+
+    return _ENV_REF_RE.sub(repl, value)
+
+
+def resolve_string_map_env_refs(
+    mapping: Mapping[str, Any],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, str]:
+    """Return a new map with string values env-ref-resolved. Non-strings kept out."""
+    out: Dict[str, str] = {}
+    for k, v in mapping.items():
+        if not isinstance(k, str) or not isinstance(v, str):
+            continue
+        out[k] = resolve_env_refs_in_string(v, environ)
+    return out
+
+
+def resolve_mcp_server_config(
+    config: Dict[str, Any],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
+    """Deep-copy one server config and resolve ``{{env:…}}`` in ``env``/``headers``.
+
+    Other fields are left unchanged. Does not mutate the input. Does not inject
+    values into the gateway process environment.
+    """
+    resolved = copy.deepcopy(config)
+    for field in _STRING_MAP_FIELDS:
+        mapping = resolved.get(field)
+        if isinstance(mapping, dict):
+            resolved[field] = resolve_string_map_env_refs(mapping, environ=environ)
+    return resolved
+
+
+def resolve_mcp_servers(
+    servers: Optional[McpServersDict],
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Optional[McpServersDict]:
+    """Resolve env refs for every server config. Returns ``None`` when input is empty."""
+    if not servers:
+        return servers
+    return {
+        name: resolve_mcp_server_config(cfg, environ=environ)
+        if isinstance(cfg, dict)
+        else cfg
+        for name, cfg in servers.items()
+    }
+
+
+def mcp_secret_maps_meta(config: Mapping[str, Any]) -> Dict[str, Any]:
+    """Admin-display metadata for per-server env/headers maps (counts + refs)."""
+    env = config.get("env") if isinstance(config.get("env"), dict) else {}
+    headers = config.get("headers") if isinstance(config.get("headers"), dict) else {}
+    return {
+        "env_key_count": len(env),
+        "header_key_count": len(headers),
+        "env_keys": list(env.keys()) if isinstance(env, dict) else [],
+        "header_keys": list(headers.keys()) if isinstance(headers, dict) else [],
+        "env_refs": list_env_refs(config),
+    }
 
 
 def validate_server(name: str, config: Any) -> Tuple[bool, Optional[str]]:
@@ -42,6 +179,12 @@ def validate_server(name: str, config: Any) -> Tuple[bool, Optional[str]]:
     missing = [f for f in REQUIRED_FIELDS.get(server_type, ()) if not config.get(f)]
     if missing:
         return False, f"missing required field(s) {missing} for type '{server_type}'"
+    for field in _STRING_MAP_FIELDS:
+        if field not in config:
+            continue
+        ok, reason = validate_string_map(config[field], field)
+        if not ok:
+            return False, reason
     return True, None
 
 

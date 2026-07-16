@@ -261,6 +261,31 @@ class TestGetMcpServersDetail:
         assert cfg["env"]["REGION"] == "us-east"
         # Non-secret fields survive unchanged.
         assert cfg["url"] == "https://example.test/mcp"
+        # Counts for admin ENV/HEADERS column.
+        assert result[0]["env_key_count"] == 2
+        assert result[0]["header_key_count"] == 1
+
+    def test_config_keeps_env_ref_templates_visible(self, clean_registry):
+        """``{{env:NAME}}`` templates stay visible so operators can edit refs."""
+        servers = {
+            "remote": {
+                "type": "http",
+                "url": "https://example.test/mcp",
+                "headers": {"Authorization": "Bearer {{env:MCP_TOKEN}}"},
+                "env": {"MY_TOKEN": "{{env:GITHUB_TOKEN}}", "REGION": "us-east"},
+            }
+        }
+        with (
+            patch("src.mcp_config.get_mcp_servers", return_value=servers),
+            patch("src.mcp_manifest.list_servers", return_value={}),
+        ):
+            result = get_mcp_servers_detail()
+
+        cfg = result[0]["config"]
+        assert cfg["headers"]["Authorization"] == "Bearer {{env:MCP_TOKEN}}"
+        assert cfg["env"]["MY_TOKEN"] == "{{env:GITHUB_TOKEN}}"
+        assert cfg["env"]["REGION"] == "us-east"
+        assert result[0]["env_refs"] == ["GITHUB_TOKEN", "MCP_TOKEN"]
 
     def test_reach_is_list_per_backend(self, clean_registry):
         """``reach`` is a list carrying one entry per backend with a ``reaches`` flag."""

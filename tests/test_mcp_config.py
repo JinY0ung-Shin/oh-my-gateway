@@ -614,3 +614,110 @@ class TestOpenCodeConfigGeneration:
         assert parse_opencode_config_content('{"share": "disabled"}') == {
             "share": "disabled"
         }
+
+
+# ---------------------------------------------------------------------------
+# env/headers validation + {{env:VAR}} resolve
+# ---------------------------------------------------------------------------
+
+
+class TestValidateStringMapAndEnv:
+    def test_env_must_be_string_values(self):
+        from src.mcp_config import validate_server
+
+        ok, reason = validate_server(
+            "x", {"type": "stdio", "command": "echo", "env": {"N": 1}}
+        )
+        assert ok is False
+        assert "env" in (reason or "")
+
+    def test_headers_must_be_object(self):
+        from src.mcp_config import validate_server
+
+        ok, reason = validate_server(
+            "x",
+            {
+                "type": "http",
+                "url": "https://example.test",
+                "headers": ["not", "a", "map"],
+            },
+        )
+        assert ok is False
+        assert "headers" in (reason or "")
+
+    def test_valid_env_and_headers_accepted(self):
+        from src.mcp_config import validate_server
+
+        ok, reason = validate_server(
+            "x",
+            {
+                "type": "stdio",
+                "command": "echo",
+                "env": {"A": "1", "B": "{{env:TOKEN}}"},
+            },
+        )
+        assert ok is True
+        assert reason is None
+
+    def test_invalid_env_drops_server_from_load(self):
+        config = {
+            "mcpServers": {
+                "bad": {"type": "stdio", "command": "echo", "env": {"X": 99}},
+                "good": {"type": "stdio", "command": "echo", "env": {"X": "ok"}},
+            }
+        }
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps(config)):
+            result = load_mcp_config()
+        assert "bad" not in result
+        assert "good" in result
+
+
+class TestResolveEnvRefs:
+    def test_resolve_string_and_maps(self):
+        from src.mcp_config import (
+            list_env_refs,
+            resolve_env_refs_in_string,
+            resolve_mcp_server_config,
+            resolve_mcp_servers,
+        )
+
+        env = {"TOKEN": "secret", "REGION": "ap"}
+        assert resolve_env_refs_in_string("Bearer {{env:TOKEN}}", env) == "Bearer secret"
+        assert resolve_env_refs_in_string("{{ env:REGION }}", env) == "ap"
+        assert resolve_env_refs_in_string("{{env:MISSING}}", env) == ""
+
+        cfg = {
+            "type": "stdio",
+            "command": "echo",
+            "env": {"API_KEY": "{{env:TOKEN}}", "REGION": "{{env:REGION}}"},
+            "headers": {"Authorization": "Bearer {{env:TOKEN}}"},
+        }
+        assert list_env_refs(cfg) == ["REGION", "TOKEN"]
+        resolved = resolve_mcp_server_config(cfg, environ=env)
+        assert resolved["env"]["API_KEY"] == "secret"
+        assert resolved["env"]["REGION"] == "ap"
+        assert resolved["headers"]["Authorization"] == "Bearer secret"
+        # Input not mutated
+        assert cfg["env"]["API_KEY"] == "{{env:TOKEN}}"
+
+        multi = resolve_mcp_servers({"a": cfg}, environ=env)
+        assert multi["a"]["env"]["API_KEY"] == "secret"
+
+    def test_resolve_none_passthrough(self):
+        from src.mcp_config import resolve_mcp_servers
+
+        assert resolve_mcp_servers(None) is None
+        assert resolve_mcp_servers({}) == {}
+
+    def test_mcp_secret_maps_meta(self):
+        from src.mcp_config import mcp_secret_maps_meta
+
+        meta = mcp_secret_maps_meta(
+            {
+                "env": {"A": "1", "B": "{{env:X}}"},
+                "headers": {"Authorization": "{{env:Y}}"},
+            }
+        )
+        assert meta["env_key_count"] == 2
+        assert meta["header_key_count"] == 1
+        assert meta["env_refs"] == ["X", "Y"]

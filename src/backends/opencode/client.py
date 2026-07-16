@@ -169,6 +169,10 @@ class OpenCodeClient(TokenEstimateMixin):
     def _managed_config_content(self) -> str:
         base_config = parse_opencode_config_content(os.getenv("OPENCODE_CONFIG_CONTENT"))
         mcp_servers = mcp_config.get_validated_mcp_config() if use_wrapper_mcp_config() else {}
+        # Resolve ``{{env:NAME}}`` at managed-server startup (not hot-reloaded —
+        # restart OpenCode / the gateway to pick up env or MCP changes).
+        if mcp_servers:
+            mcp_servers = mcp_config.resolve_mcp_servers(mcp_servers) or mcp_servers
         config = build_opencode_config(
             base_config=base_config,
             mcp_servers=mcp_servers,

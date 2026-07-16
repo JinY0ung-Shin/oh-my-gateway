@@ -483,3 +483,41 @@ class TestRedactedMergeOnUpdate:
                 {"type": "stdio", "command": "echo", "token": "***REDACTED***"},
             )
         assert mcp_manifest.get_server("fresh")["token"] == "***REDACTED***"
+
+
+class TestEnvHeadersValidation:
+    def test_create_rejects_non_string_env_value(self, manifest_file):
+        with env_servers({}):
+            with pytest.raises(McpAdminError, match="env"):
+                mcp_admin_service.create_server(
+                    "badenv",
+                    {"type": "stdio", "command": "echo", "env": {"N": 123}},
+                )
+
+    def test_create_accepts_env_ref_template(self, manifest_file):
+        from src import mcp_manifest
+
+        with env_servers({}):
+            mcp_admin_service.create_server(
+                "withref",
+                {
+                    "type": "stdio",
+                    "command": "echo",
+                    "env": {"TOKEN": "{{env:GITHUB_TOKEN}}"},
+                },
+            )
+        stored = mcp_manifest.get_server("withref")
+        assert stored["env"]["TOKEN"] == "{{env:GITHUB_TOKEN}}"
+
+    def test_validate_config_reports_env_refs(self):
+        result = mcp_admin_service.validate_config(
+            "svc",
+            {
+                "type": "http",
+                "url": "https://example.test",
+                "headers": {"Authorization": "Bearer {{env:MCP_TOKEN}}"},
+            },
+        )
+        assert result["valid"] is True
+        assert result["env_refs"] == ["MCP_TOKEN"]
+        assert result["header_key_count"] == 1

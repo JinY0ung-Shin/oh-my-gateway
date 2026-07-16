@@ -51,7 +51,7 @@ from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
-from src.mcp_config import get_mcp_tool_patterns
+from src.mcp_config import get_mcp_tool_patterns, resolve_mcp_servers
 from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
 from src.backends.claude.workspace_sandbox import (
@@ -383,6 +383,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     ) -> None:
         if not mcp_servers:
             return
+
+        # Resolve ``{{env:NAME}}`` in per-server env/headers at session create so
+        # secrets stay in the gateway process env (or K8s secrets) rather than
+        # only as plaintext in the MCP manifest. Does not mutate the shared
+        # get_mcp_servers() singleton.
+        mcp_servers = resolve_mcp_servers(mcp_servers) or mcp_servers
 
         if allowed_tools is not None:
             allowed_set = set(allowed_tools)
@@ -954,6 +960,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # Provide an event the hook can signal to break streaming
         break_event = asyncio.Event()
         session.stream_break_event = break_event
+        get_next = None
+        wait_break = None
         try:
             await client.query(prompt)
             response_iter = client.receive_response().__aiter__()
@@ -998,6 +1006,14 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             session.client = None
             yield error_chunk(str(exc))
         finally:
+            # A cancellation (consumer disconnected mid-turn) exits the loop
+            # between the asyncio.wait race and the pending-task cleanup.
+            # Cancel the leftovers: an orphaned __anext__ would log "Task
+            # exception was never retrieved" and, on a persistent session,
+            # could steal the first message of the next turn.
+            for leftover in (get_next, wait_break):
+                if leftover is not None and not leftover.done():
+                    leftover.cancel()
             session.stream_break_event = None
 
     async def interrupt_client(self, client: ClaudeSDKClient) -> None:

@@ -236,6 +236,26 @@ class TestClaudeCodeCLIConfigureMcpServers:
 
         assert "mcp__*" not in options.allowed_tools
 
+    def test_env_refs_resolved_at_configure_time(self, monkeypatch):
+        """``{{env:NAME}}`` in per-server env is resolved before SDK options."""
+        monkeypatch.setenv("MCP_TEST_TOKEN", "from-gateway")
+        cli = _make_cli()
+        options = self._fresh_options()
+        mcp_servers = {
+            "srv1": {
+                "type": "stdio",
+                "command": "s1",
+                "env": {"TOKEN": "{{env:MCP_TEST_TOKEN}}", "PLAIN": "x"},
+            }
+        }
+
+        cli._configure_mcp_servers(options, mcp_servers, None)
+
+        assert options.mcp_servers["srv1"]["env"]["TOKEN"] == "from-gateway"
+        assert options.mcp_servers["srv1"]["env"]["PLAIN"] == "x"
+        # Shared input config is not mutated (session pin / singleton safety).
+        assert mcp_servers["srv1"]["env"]["TOKEN"] == "{{env:MCP_TEST_TOKEN}}"
+
 
 # ---------------------------------------------------------------------------
 # ClaudeCodeCLI._configure_metadata_env() — lines 346-350

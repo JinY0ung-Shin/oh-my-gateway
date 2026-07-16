@@ -13,7 +13,7 @@ import asyncio
 import os
 import shutil
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -30,12 +30,20 @@ async def test_mcp_server(
 
     Returns ``{ok, detail, latency_ms, transport}``. Secrets in the config
     (env, headers, tokens) are never echoed into ``detail``.
+
+    Resolves ``{{env:NAME}}`` in env/headers before probing so admin tests match
+    session-create behavior for remote Authorization headers.
     """
+    from src.mcp_config import resolve_mcp_server_config
+
+    config = resolve_mcp_server_config(config)
     transport = config.get("type", "stdio")
     start = time.monotonic()
     try:
         if transport == "stdio":
-            result = await asyncio.wait_for(_test_stdio(config), timeout=timeout)
+            result = await asyncio.wait_for(
+                _test_stdio(config), timeout=timeout
+            )
         else:
             result = await asyncio.wait_for(
                 _test_remote(config, timeout), timeout=timeout
@@ -73,21 +81,29 @@ async def _test_stdio(config: Dict[str, Any]) -> Dict[str, Any]:
                 "(not spawned; set MCP_TEST_ALLOW_SPAWN to launch)"
             ),
         }
-    return await _spawn_stdio(resolved, [str(a) for a in args])
+    mcp_env = config.get("env") if isinstance(config.get("env"), dict) else {}
+    return await _spawn_stdio(
+        resolved, [str(a) for a in args], mcp_env={str(k): str(v) for k, v in mcp_env.items()}
+    )
 
 
-async def _spawn_stdio(resolved: str, args: list) -> Dict[str, Any]:
-    """Opt-in spawn: minimal env, short-lived, success == stayed alive briefly.
+async def _spawn_stdio(
+    resolved: str, args: list, *, mcp_env: Optional[Dict[str, str]] = None
+) -> Dict[str, Any]:
+    """Opt-in spawn: minimal env + optional MCP ``env`` map, short-lived.
 
     NEVER uses shell=True: the resolved path and args are passed as an arg list
-    to ``create_subprocess_exec``. The child gets a minimal env (no inherited
-    secrets) and is hard-killed regardless of outcome.
+    to ``create_subprocess_exec``. The child gets a minimal base env (no full
+    gateway secret inheritance) plus the server's own ``env`` map, and is
+    hard-killed regardless of outcome.
     """
     minimal_env = {
         k: os.environ[k]
         for k in ("PATH", "HOME", "LANG", "LC_ALL", "SYSTEMROOT")
         if k in os.environ
     }
+    if mcp_env:
+        minimal_env.update(mcp_env)
     proc = await asyncio.create_subprocess_exec(
         resolved,
         *args,

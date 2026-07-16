@@ -97,6 +97,8 @@ def _merge_redacted(new: Dict[str, Any], existing: Dict[str, Any]) -> Dict[str, 
 
 def validate_config(name: str, config: Any) -> Dict[str, Any]:
     """Pure preview for the /validate endpoint. NEVER raises, NEVER persists."""
+    from src.mcp_config import mcp_secret_maps_meta
+
     errors: List[str] = []
     n = (name or "").strip()
     if n and (not _NAME_RE.match(n) or n.startswith("-")):
@@ -108,6 +110,17 @@ def validate_config(name: str, config: Any) -> Dict[str, Any]:
         if not ok:
             errors.append(reason)
     safe = mcp_safe_name(n) if n else ""
+    meta = (
+        mcp_secret_maps_meta(config)
+        if isinstance(config, dict)
+        else {
+            "env_key_count": 0,
+            "header_key_count": 0,
+            "env_keys": [],
+            "header_keys": [],
+            "env_refs": [],
+        }
+    )
     return {
         "valid": not errors,
         "errors": errors,
@@ -116,6 +129,7 @@ def validate_config(name: str, config: Any) -> Dict[str, Any]:
         "server_type": (
             config.get("type", "stdio") if isinstance(config, dict) else None
         ),
+        **meta,
     }
 
 
