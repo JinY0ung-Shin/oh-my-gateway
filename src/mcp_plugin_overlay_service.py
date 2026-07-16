@@ -126,8 +126,8 @@ def upsert_overlay(
         "patterns": [f"mcp__{mcp_safe_name(name)}__*"],
         "note": (
             "Applies to new Claude sessions: materializes this plugin server into "
-            "gateway mcp_servers with merged env/headers, and injects env into the "
-            "Claude process environment. Existing sessions keep their pinned set."
+            "gateway mcp_servers with merged env/headers, scoped to the MCP server "
+            "process. Existing sessions keep their pinned set."
         ),
     }
 
