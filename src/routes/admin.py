@@ -25,6 +25,7 @@ MCP servers:    GET  /admin/api/mcp-servers
                 DELETE /admin/api/mcp-servers/{name}
 MCP validate:   POST /admin/api/mcp-servers/validate
 MCP test:       POST /admin/api/mcp-servers/{name}/test
+MCP plugin overlay: GET/PUT/DELETE /admin/api/mcp-servers/{name}/plugin-overlay
 Plugins:        GET  /admin/api/plugins
 Plugin detail:  GET  /admin/api/plugins/{id}
 Plugin skills:  GET  /admin/api/plugins/{id}/skills/{name}
@@ -131,6 +132,14 @@ class McpServerUpsert(BaseModel):
 class McpServerValidate(BaseModel):
     name: str = ""
     config: dict[str, Any] = {}
+
+
+class McpPluginOverlayUpsert(BaseModel):
+    """Credentials-only overlay for a plugin-provided MCP server."""
+
+    env: dict[str, str] = {}
+    headers: dict[str, str] = {}
+    plugin_id: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +374,66 @@ async def test_mcp_server_endpoint(name: str, _=Depends(require_admin)):
     from src import mcp_admin_service
 
     return await mcp_admin_service.test_connection(name)
+
+
+# --- Plugin MCP credential overlays ---------------------------------------
+# Env/headers only; plugin command/url stay owned by the plugin. Hot-reloads
+# into NEW Claude sessions (materialize + process env inject).
+
+
+@router.get("/api/mcp-servers/{name}/plugin-overlay")
+async def get_mcp_plugin_overlay_endpoint(name: str, _=Depends(require_admin)):
+    """Return the admin credential overlay for a plugin MCP server (redacted)."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_plugin_overlay_service
+
+    try:
+        return await run_in_threadpool(
+            mcp_plugin_overlay_service.get_overlay_detail, name
+        )
+    except mcp_plugin_overlay_service.McpPluginOverlayError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+@router.put("/api/mcp-servers/{name}/plugin-overlay")
+async def put_mcp_plugin_overlay_endpoint(
+    name: str, body: McpPluginOverlayUpsert, _=Depends(require_admin)
+):
+    """Create or replace env/headers overlay for a plugin MCP server."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_plugin_overlay_service
+
+    try:
+        return await run_in_threadpool(
+            mcp_plugin_overlay_service.upsert_overlay,
+            name,
+            env=body.env,
+            headers=body.headers,
+            plugin_id=body.plugin_id,
+        )
+    except mcp_plugin_overlay_service.McpPluginOverlayError as e:
+        msg = str(e)
+        code = 404 if "not a plugin-provided" in msg else 400
+        return JSONResponse(status_code=code, content={"error": msg})
+
+
+@router.delete("/api/mcp-servers/{name}/plugin-overlay")
+async def delete_mcp_plugin_overlay_endpoint(name: str, _=Depends(require_admin)):
+    """Remove the admin credential overlay for a plugin MCP server."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_plugin_overlay_service
+
+    try:
+        return await run_in_threadpool(
+            mcp_plugin_overlay_service.delete_overlay, name
+        )
+    except mcp_plugin_overlay_service.McpPluginOverlayError as e:
+        msg = str(e)
+        code = 404 if "no overlay" in msg else 400
+        return JSONResponse(status_code=code, content={"error": msg})
 
 
 # ---------------------------------------------------------------------------

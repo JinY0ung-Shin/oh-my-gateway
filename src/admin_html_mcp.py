@@ -14,7 +14,8 @@ def get_mcp_html() -> str:
         <p class="text-xs text-muted mb-md">
           Overlay on top of the MCP_CONFIG environment base (manifest wins). Applies to new sessions.
           Existing sessions keep the MCP set pinned at creation. OpenCode requires a restart.
-          Plugin-provided servers are shown read-only (Claude loads them via setting_sources).
+          Plugin-provided servers keep command/url from the plugin; use
+          <strong>Credentials</strong> to inject env/headers dynamically (new Claude sessions).
           Per-server env/headers stay on the MCP config only (not the gateway process).
           Use <code style="font-size:0.75em">{{env:VAR}}</code> to pull from the gateway environment at session create
           (Claude/Codex) or OpenCode managed startup.
@@ -61,7 +62,9 @@ def get_mcp_html() -> str:
                       <div x-show="s.source === 'plugin' && s.plugin" class="text-xs text-muted"
                         style="max-width:180px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap"
                         x-text="s.plugin" :title="s.plugin"></div>
-                      <div class="text-xs text-muted" x-text="s.editable ? 'editable' : 'read-only'"></div>
+                      <div class="text-xs text-muted"
+                        x-text="s.editable ? 'editable' : (s.source === 'plugin' ? 'def read-only' : 'read-only')"></div>
+                      <div x-show="s.has_overlay" class="text-xs" style="color:var(--green)">+ credentials</div>
                     </td>
                     <td>
                       <div class="flex-wrap-gap" style="gap:0.25rem">
@@ -73,12 +76,15 @@ def get_mcp_html() -> str:
                           style="padding:1px 6px; border:1px solid var(--border-bright); background:var(--bg-surface); color:var(--text-dim)"
                           :title="(s.header_keys || []).join(', ')"
                           x-text="'hdr:' + (s.header_key_count || 0)"></span>
+                        <span x-show="s.has_overlay" class="text-xs text-mono"
+                          style="padding:1px 6px; border:1px solid var(--green); color:var(--green)"
+                          title="Admin credential overlay active">overlay</span>
                         <template x-for="ref in (s.env_refs || [])" :key="s.name + ':ref:' + ref">
                           <span class="text-xs text-mono" style="padding:1px 6px; border:1px solid var(--cyan); color:var(--cyan)"
                             title="Resolved from gateway env at session create / OpenCode startup"
                             x-text="mcpEnvRefBadge(ref)"></span>
                         </template>
-                        <span x-show="!(s.env_key_count || s.header_key_count)" class="text-xs text-muted">-</span>
+                        <span x-show="!(s.env_key_count || s.header_key_count || s.has_overlay)" class="text-xs text-muted">-</span>
                       </div>
                     </td>
                     <td>
@@ -106,6 +112,10 @@ def get_mcp_html() -> str:
                         </button>
                         <button x-show="s.editable" class="btn btn-sm btn-ghost" @click="editMcpServer(s)"
                           aria-label="Edit MCP server">Edit</button>
+                        <button x-show="s.source === 'plugin'" class="btn btn-sm btn-ghost"
+                          @click="editPluginMcpOverlay(s)" aria-label="Edit plugin MCP credentials">
+                          Credentials
+                        </button>
                         <button x-show="s.editable" class="btn btn-sm btn-ghost" style="color:var(--red)"
                           @click="deleteMcpServer(s.name)" aria-label="Delete MCP server">Delete</button>
                       </div>
@@ -246,6 +256,62 @@ def get_mcp_html() -> str:
               <span x-text="mcpBusy ? 'Working...' : (mcpEditName ? 'Save' : 'Add server')"></span>
             </button>
             <button x-show="mcpEditName" class="btn btn-sm btn-ghost" @click="cancelMcpEdit()">Cancel</button>
+          </div>
+        </div>
+
+        <!-- Plugin MCP credentials overlay form -->
+        <div class="card" style="margin-top:1rem" x-show="mcpOverlayName">
+          <div class="flex-between mb-md">
+            <h3 style="margin:0" x-text="'Plugin credentials: ' + mcpOverlayName"></h3>
+            <span class="badge text-xs" style="border-color:var(--magenta); color:var(--magenta)">PLUGIN OVERLAY</span>
+          </div>
+          <p class="text-xs text-muted mb-md">
+            Inject env/headers for this plugin MCP without editing the plugin files.
+            Command/url stay owned by the plugin. Applies to <strong>new Claude sessions</strong>
+            (materialized into gateway mcp_servers + process env). Use
+            <code style="font-size:0.75em">{{env:VAR}}</code> to reference gateway env vars.
+          </p>
+          <div class="mb-md">
+            <div class="flex-between mb-sm">
+              <label class="text-xs text-muted" style="margin:0">ENVIRONMENT VARIABLES</label>
+              <button type="button" class="btn btn-sm btn-ghost" @click="mcpOverlayForm.envPairs.push({key:'',value:''})">+ Add</button>
+            </div>
+            <template x-for="(pair, idx) in mcpOverlayForm.envPairs" :key="'oenv-'+idx">
+              <div class="flex-gap-sm mb-sm" style="align-items:center">
+                <input type="text" x-model="pair.key" placeholder="KEY" aria-label="Overlay env key"
+                  style="flex:1; font-family:var(--font-mono); font-size:0.78rem">
+                <input type="text" x-model="pair.value" placeholder="value or env ref" aria-label="Overlay env value"
+                  style="flex:2; font-family:var(--font-mono); font-size:0.78rem">
+                <button type="button" class="btn btn-sm btn-ghost" style="color:var(--red)"
+                  @click="mcpOverlayForm.envPairs.splice(idx,1)">×</button>
+              </div>
+            </template>
+            <div x-show="!mcpOverlayForm.envPairs.length" class="text-xs text-muted">No env vars</div>
+          </div>
+          <div class="mb-md">
+            <div class="flex-between mb-sm">
+              <label class="text-xs text-muted" style="margin:0">HEADERS (remote MCP)</label>
+              <button type="button" class="btn btn-sm btn-ghost" @click="mcpOverlayForm.headerPairs.push({key:'',value:''})">+ Add</button>
+            </div>
+            <template x-for="(pair, idx) in mcpOverlayForm.headerPairs" :key="'ohdr-'+idx">
+              <div class="flex-gap-sm mb-sm" style="align-items:center">
+                <input type="text" x-model="pair.key" placeholder="Header-Name" aria-label="Overlay header name"
+                  style="flex:1; font-family:var(--font-mono); font-size:0.78rem">
+                <input type="text" x-model="pair.value" placeholder="value or env ref" aria-label="Overlay header value"
+                  style="flex:2; font-family:var(--font-mono); font-size:0.78rem">
+                <button type="button" class="btn btn-sm btn-ghost" style="color:var(--red)"
+                  @click="mcpOverlayForm.headerPairs.splice(idx,1)">×</button>
+              </div>
+            </template>
+            <div x-show="!mcpOverlayForm.headerPairs.length" class="text-xs text-muted">No headers</div>
+          </div>
+          <div class="flex-gap-sm">
+            <button class="btn btn-sm btn-primary" @click="savePluginMcpOverlay()" :disabled="mcpOverlayBusy">
+              <span x-text="mcpOverlayBusy ? 'Saving...' : 'Save credentials'"></span>
+            </button>
+            <button class="btn btn-sm btn-ghost" style="color:var(--red)" @click="clearPluginMcpOverlay()"
+              :disabled="mcpOverlayBusy" x-show="mcpOverlayHadExisting">Clear overlay</button>
+            <button class="btn btn-sm btn-ghost" @click="cancelPluginMcpOverlay()">Cancel</button>
           </div>
         </div>
       </div>"""

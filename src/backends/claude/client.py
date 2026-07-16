@@ -374,6 +374,54 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         else:
             options.system_prompt = {"type": "preset", "preset": "claude_code"}
 
+    def _merge_plugin_mcp_overlays(
+        self,
+        mcp_servers: Optional[Dict[str, Any]],
+        options: ClaudeAgentOptions,
+    ) -> Optional[Dict[str, Any]]:
+        """Materialize plugin MCP credential overlays into *mcp_servers*.
+
+        Admin overlays (env/headers only) are stored separately from the plugin
+        ``.mcp.json``. For each overlay we deep-copy the plugin base config,
+        merge the overlay, and add it to the gateway ``mcp_servers`` map so it
+        rides the same path as MCP_CONFIG/manifest servers. Resolved overlay
+        env keys are also injected into ``options.env`` so stdio children that
+        inherit the Claude process environment still see credentials when the
+        plugin path also loads via ``setting_sources``.
+        """
+        try:
+            from src import mcp_plugin_overlay
+            from src.mcp_config import resolve_string_map_env_refs
+
+            overlaid = mcp_plugin_overlay.materialize_overlaid_plugin_servers()
+            process_env = mcp_plugin_overlay.collect_overlay_env_for_process()
+        except Exception:
+            logger.warning("Plugin MCP overlay merge failed", exc_info=True)
+            return mcp_servers
+
+        if process_env:
+            resolved_env = resolve_string_map_env_refs(process_env)
+            if resolved_env:
+                options.env.update(resolved_env)
+                logger.debug(
+                    "Injected %d plugin-MCP overlay env key(s) into Claude process env",
+                    len(resolved_env),
+                )
+
+        if not overlaid:
+            return mcp_servers
+
+        merged: Dict[str, Any] = dict(mcp_servers or {})
+        # Overlay materialization wins on name collision with gateway MCP so
+        # admin credentials attach to the plugin-defined command/url.
+        merged.update(overlaid)
+        logger.debug(
+            "Materialized %d plugin MCP server(s) with admin overlays: %s",
+            len(overlaid),
+            list(overlaid.keys()),
+        )
+        return merged
+
     def _configure_mcp_servers(
         self,
         options: ClaudeAgentOptions,
@@ -381,6 +429,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         allowed_tools: Optional[List[str]],
         forward_headers: Optional[Dict[str, str]] = None,
     ) -> None:
+        # Merge plugin credential overlays even when gateway MCP_CONFIG is empty.
+        mcp_servers = self._merge_plugin_mcp_overlays(mcp_servers, options)
+
         if not mcp_servers:
             return
 

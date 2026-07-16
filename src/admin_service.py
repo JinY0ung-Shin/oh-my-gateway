@@ -534,6 +534,35 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
 
             ok, reason = validate_server(name, config)
             meta = mcp_secret_maps_meta(config)
+            # Admin credential overlay (env/headers only) for this plugin server.
+            overlay_meta: Dict[str, Any] = {
+                "has_overlay": False,
+                "overlay_env_key_count": 0,
+                "overlay_header_key_count": 0,
+                "overlay_env_refs": [],
+                "overlay": {},
+            }
+            try:
+                from src import mcp_plugin_overlay
+
+                overlay = mcp_plugin_overlay.get_overlay(name)
+                if overlay:
+                    ometa = mcp_secret_maps_meta(overlay)
+                    overlay_meta = {
+                        "has_overlay": True,
+                        "overlay_env_key_count": ometa["env_key_count"],
+                        "overlay_header_key_count": ometa["header_key_count"],
+                        "overlay_env_refs": ometa["env_refs"],
+                        "overlay": _redact_mcp_config(overlay),
+                    }
+                    # Effective env/headers for display = base merged with overlay.
+                    from src.mcp_plugin_overlay import merge_overlay_into_config
+
+                    effective_cfg = merge_overlay_into_config(config, overlay)
+                    meta = mcp_secret_maps_meta(effective_cfg)
+            except Exception:
+                logger.debug("Failed to read plugin MCP overlay for %s", name, exc_info=True)
+
             result.append(
                 {
                     "name": name,
@@ -543,6 +572,9 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "pattern": f"{safe_prefix}*",
                     "source": "plugin",
                     "editable": False,
+                    # Overlay credentials are editable even though the plugin
+                    # definition (command/url) is not.
+                    "overlay_editable": True,
                     "plugin": entry.get("plugin_id"),
                     "plugin_name": entry.get("plugin_name"),
                     "scope": entry.get("scope"),
@@ -552,6 +584,7 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "invalid_reason": None if ok else reason,
                     "shadowed": name in effective,
                     **meta,
+                    **overlay_meta,
                 }
             )
         return result

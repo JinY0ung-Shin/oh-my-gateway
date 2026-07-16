@@ -58,6 +58,11 @@ def get_admin_js() -> str:
     mcpSyncLock: false,
     mcpTestBusy: {},
     mcpTestResult: {},
+    mcpOverlayName: null,
+    mcpOverlayPluginId: null,
+    mcpOverlayHadExisting: false,
+    mcpOverlayBusy: false,
+    mcpOverlayForm: { envPairs: [], headerPairs: [] },
     toolsRegistry: {},
     sandboxConfig: {},
     systemPrompt: { mode: 'preset', prompt: null, resolved_prompt: null, preset_text: null, char_count: 0, active_name: null },
@@ -1193,6 +1198,85 @@ def get_admin_js() -> str:
         else { this.mcpTestResult[name] = {ok:false, message: (d.detail || d.error || 'unreachable') + agent}; this.showToast('MCP FAIL: '+name, 'err'); }
       } catch(e) { this.mcpTestResult[name] = {ok:false, message:'connection error'}; this.showToast('Connection error', 'err'); }
       finally { delete this.mcpTestBusy[name]; }
+    },
+
+    // --- Plugin MCP credential overlay ---
+    editPluginMcpOverlay(s) {
+      this.mcpOverlayName = s.name;
+      this.mcpOverlayPluginId = s.plugin || null;
+      this.mcpOverlayHadExisting = !!s.has_overlay;
+      const ov = s.overlay || {};
+      this.mcpOverlayForm = {
+        envPairs: this._mcpPairsFromMap(ov.env),
+        headerPairs: this._mcpPairsFromMap(ov.headers),
+      };
+      if (!this.mcpOverlayForm.envPairs.length && !this.mcpOverlayForm.headerPairs.length) {
+        this.mcpOverlayForm.envPairs = [{ key: '', value: '' }];
+      }
+      // Scroll overlay card into view after Alpine paints.
+      this.$nextTick && this.$nextTick(() => {
+        const el = document.querySelector('[x-show="mcpOverlayName"]');
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+      });
+    },
+    cancelPluginMcpOverlay() {
+      this.mcpOverlayName = null;
+      this.mcpOverlayPluginId = null;
+      this.mcpOverlayHadExisting = false;
+      this.mcpOverlayForm = { envPairs: [], headerPairs: [] };
+    },
+    async savePluginMcpOverlay() {
+      if (!this.mcpOverlayName) return;
+      const env = this._mcpMapFromPairs(this.mcpOverlayForm.envPairs);
+      const headers = this._mcpMapFromPairs(this.mcpOverlayForm.headerPairs);
+      if (!Object.keys(env).length && !Object.keys(headers).length) {
+        this.showToast('Add at least one env or header entry', 'err');
+        return;
+      }
+      this.mcpOverlayBusy = true;
+      try {
+        const body = { env, headers };
+        if (this.mcpOverlayPluginId) body.plugin_id = this.mcpOverlayPluginId;
+        const r = await this.api(
+          '/admin/api/mcp-servers/' + encodeURIComponent(this.mcpOverlayName) + '/plugin-overlay',
+          { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }
+        );
+        if (r.ok) {
+          this.showToast('PLUGIN CREDENTIALS SAVED: ' + this.mcpOverlayName, 'ok');
+          this.cancelPluginMcpOverlay();
+          await this.refreshMcp();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Save failed', 'err');
+        }
+      } catch (e) {
+        this.showToast('Connection error', 'err');
+      } finally {
+        this.mcpOverlayBusy = false;
+      }
+    },
+    async clearPluginMcpOverlay() {
+      if (!this.mcpOverlayName) return;
+      if (!confirm('Clear credential overlay for "' + this.mcpOverlayName + '"?')) return;
+      this.mcpOverlayBusy = true;
+      try {
+        const r = await this.api(
+          '/admin/api/mcp-servers/' + encodeURIComponent(this.mcpOverlayName) + '/plugin-overlay',
+          { method: 'DELETE' }
+        );
+        if (r.ok) {
+          this.showToast('PLUGIN CREDENTIALS CLEARED', 'ok');
+          this.cancelPluginMcpOverlay();
+          await this.refreshMcp();
+        } else {
+          const d = await r.json().catch(() => ({}));
+          this.showToast(d.error || 'Clear failed', 'err');
+        }
+      } catch (e) {
+        this.showToast('Connection error', 'err');
+      } finally {
+        this.mcpOverlayBusy = false;
+      }
     },
 
     async toggleSessionHistory(sessionId) {

@@ -206,6 +206,19 @@ async def test_connection(name: str) -> Dict[str, Any]:
 
         config = plugin_service.get_plugin_mcp_server_config(name)
         source = "plugin"
+        # Apply admin credential overlay for plugin servers so Test matches
+        # new Claude session materialization.
+        if config is not None:
+            try:
+                from src import mcp_plugin_overlay
+
+                overlay = mcp_plugin_overlay.get_overlay(name)
+                if overlay:
+                    config = mcp_plugin_overlay.merge_overlay_into_config(
+                        config, overlay
+                    )
+            except Exception:
+                pass
     if config is None:
         return {"ok": False, "detail": f"server '{name}' not found"}
     result = await mcp_connection_test.test_mcp_server(name, config)
