@@ -387,14 +387,23 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         rides the same path as MCP_CONFIG/manifest servers. Resolved overlay
         env keys are also injected into ``options.env`` so stdio children that
         inherit the Claude process environment still see credentials when the
-        plugin path also loads via ``setting_sources``.
+        plugin path also loads via ``setting_sources``. Both effects are scoped
+        to overlays that actually materialized: a stale overlay (plugin no
+        longer installed) contributes neither a server nor process env.
         """
         try:
             from src import mcp_plugin_overlay
             from src.mcp_config import resolve_string_map_env_refs
 
             overlaid = mcp_plugin_overlay.materialize_overlaid_plugin_servers()
-            process_env = mcp_plugin_overlay.collect_overlay_env_for_process()
+            active_overlays = {
+                name: rec
+                for name, rec in mcp_plugin_overlay.get_overlays().items()
+                if name in overlaid
+            }
+            process_env = mcp_plugin_overlay.collect_overlay_env_for_process(
+                active_overlays
+            )
         except Exception:
             logger.warning("Plugin MCP overlay merge failed", exc_info=True)
             return mcp_servers

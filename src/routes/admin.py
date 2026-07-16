@@ -413,10 +413,10 @@ async def put_mcp_plugin_overlay_endpoint(
             headers=body.headers,
             plugin_id=body.plugin_id,
         )
+    except mcp_plugin_overlay_service.McpPluginOverlayNotFound as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
     except mcp_plugin_overlay_service.McpPluginOverlayError as e:
-        msg = str(e)
-        code = 404 if "not a plugin-provided" in msg else 400
-        return JSONResponse(status_code=code, content={"error": msg})
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 @router.delete("/api/mcp-servers/{name}/plugin-overlay")
@@ -427,13 +427,11 @@ async def delete_mcp_plugin_overlay_endpoint(name: str, _=Depends(require_admin)
     from src import mcp_plugin_overlay_service
 
     try:
-        return await run_in_threadpool(
-            mcp_plugin_overlay_service.delete_overlay, name
-        )
+        return await run_in_threadpool(mcp_plugin_overlay_service.delete_overlay, name)
+    except mcp_plugin_overlay_service.McpPluginOverlayNotFound as e:
+        return JSONResponse(status_code=404, content={"error": str(e)})
     except mcp_plugin_overlay_service.McpPluginOverlayError as e:
-        msg = str(e)
-        code = 404 if "no overlay" in msg else 400
-        return JSONResponse(status_code=code, content={"error": msg})
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 # ---------------------------------------------------------------------------

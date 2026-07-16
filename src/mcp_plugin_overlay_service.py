@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional
 
 from src import mcp_plugin_overlay
@@ -17,14 +18,19 @@ class McpPluginOverlayError(ValueError):
     """Invalid plugin MCP overlay input."""
 
 
+class McpPluginOverlayNotFound(McpPluginOverlayError):
+    """Overlay target missing: not a plugin server, or no stored overlay."""
+
+
+# Same character class as mcp_admin_service server names.
+_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+$")
+
+
 def _validate_name(name: str) -> str:
     name = (name or "").strip()
     if not name:
         raise McpPluginOverlayError("server name is required")
-    # Same character class as mcp_admin_service server names.
-    import re
-
-    if not re.match(r"^[A-Za-z0-9._@-]+$", name) or name.startswith("-"):
+    if not _NAME_RE.match(name) or name.startswith("-"):
         raise McpPluginOverlayError(
             f"invalid server name {name!r}: only letters, digits and ._@- are allowed"
         )
@@ -82,10 +88,18 @@ def upsert_overlay(
         ok, reason = validate_string_map(mapping, field)
         if not ok:
             raise McpPluginOverlayError(reason or f"invalid {field}")
+        # A leftover placeholder means the key has no stored secret to restore
+        # (new or renamed key) — storing the literal mask would break the server.
+        for k, v in mapping.items():
+            if v == _REDACTED:
+                raise McpPluginOverlayError(
+                    f"{field} key {k!r} still holds the redaction placeholder; "
+                    "enter the actual value (a renamed key cannot reuse a stored secret)"
+                )
 
     plugins = _plugin_server_names()
     if name not in plugins:
-        raise McpPluginOverlayError(
+        raise McpPluginOverlayNotFound(
             f"server '{name}' is not a plugin-provided MCP server "
             "(overlay is only for source=plugin rows)"
         )
@@ -122,7 +136,7 @@ def delete_overlay(name: str) -> Dict[str, Any]:
     name = _validate_name(name)
     existed = mcp_plugin_overlay.delete_overlay(name)
     if not existed:
-        raise McpPluginOverlayError(f"no overlay for server '{name}'")
+        raise McpPluginOverlayNotFound(f"no overlay for server '{name}'")
     return {"status": "deleted", "server": name}
 
 

@@ -270,6 +270,9 @@ def get_mcp_html() -> str:
             Command/url stay owned by the plugin. Applies to <strong>new Claude sessions</strong>
             (materialized into gateway mcp_servers + process env). Use
             <code style="font-size:0.75em">{{env:VAR}}</code> to reference gateway env vars.
+            Note: resolved env values land in the session's process environment, so
+            they are visible to anything the session runs (e.g. Bash). Overlays for
+            uninstalled plugins are ignored.
           </p>
           <div class="mb-md">
             <div class="flex-between mb-sm">

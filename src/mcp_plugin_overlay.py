@@ -10,9 +10,15 @@ by MCP server name. On new Claude sessions the gateway:
 
 1. Reads the plugin's base server config
 2. Merges the overlay (overlay wins on key collision)
-3. Materializes the result into ``options.mcp_servers`` (same path as gateway MCP)
-4. Also injects resolved overlay ``env`` into ``ClaudeAgentOptions.env`` so
+3. Expands ``${CLAUDE_PLUGIN_ROOT}`` to the plugin's install path — the CLI only
+   defines that variable while loading plugin-scoped config, so the materialized
+   copy must be self-contained
+4. Materializes the result into ``options.mcp_servers`` (same path as gateway MCP)
+5. Also injects resolved overlay ``env`` into ``ClaudeAgentOptions.env`` so
    stdio children that inherit the CLI process environment still see the values
+
+Overlays whose plugin is no longer installed are stale: they neither materialize
+nor contribute process env.
 
 Hot-reload: overlay mutations rebind the in-memory map; already-running sessions
 keep the MCP set pinned at create time (same model as the main MCP manifest).
@@ -228,10 +234,39 @@ def merge_overlay_into_config(
     return merged
 
 
+_PLUGIN_ROOT_TOKEN = "${CLAUDE_PLUGIN_ROOT}"
+
+
+def _expand_plugin_root(value: Any, root: str) -> Any:
+    """Replace ``${CLAUDE_PLUGIN_ROOT}`` in every string leaf of *value*.
+
+    The CLI only defines that variable while loading a plugin's own config, so
+    a config materialized into gateway ``mcp_servers`` must carry the resolved
+    install path itself or its command/args would not resolve.
+    """
+    if isinstance(value, str):
+        return value.replace(_PLUGIN_ROOT_TOKEN, root)
+    if isinstance(value, dict):
+        return {k: _expand_plugin_root(v, root) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_expand_plugin_root(v, root) for v in value]
+    return value
+
+
+def _merged_expanded(
+    base: Dict[str, Any], overlay: Mapping[str, Any], install_path: Any
+) -> Dict[str, Any]:
+    merged = merge_overlay_into_config(base, overlay)
+    if isinstance(install_path, str) and install_path:
+        merged = _expand_plugin_root(merged, install_path)
+    return merged
+
+
 def materialize_overlaid_plugin_servers() -> Dict[str, Dict[str, Any]]:
     """Build ``{server_name: config}`` for plugin MCP servers that have overlays.
 
-    Base config comes from installed plugins; overlay env/headers are merged in.
+    Base config comes from installed plugins; overlay env/headers are merged in
+    and ``${CLAUDE_PLUGIN_ROOT}`` is expanded to the plugin's install path.
     Servers without a matching installed plugin are skipped (stale overlay).
     Never raises.
     """
@@ -253,19 +288,49 @@ def materialize_overlaid_plugin_servers() -> Dict[str, Dict[str, Any]]:
         if not isinstance(name, str) or not isinstance(cfg, dict):
             continue
         if name not in by_name:
-            by_name[name] = cfg
+            by_name[name] = entry
 
     out: Dict[str, Dict[str, Any]] = {}
     for name, overlay in _overlays.items():
-        base = by_name.get(name)
-        if base is None:
+        entry = by_name.get(name)
+        if entry is None:
             logger.warning(
                 "Plugin MCP overlay for %r has no matching installed plugin server; skipping",
                 name,
             )
             continue
-        out[name] = merge_overlay_into_config(base, overlay)
+        out[name] = _merged_expanded(
+            entry["config"], overlay, entry.get("install_path")
+        )
     return out
+
+
+def materialize_plugin_server(server_name: str) -> Optional[Dict[str, Any]]:
+    """Session-equivalent config for one plugin MCP server, or ``None``.
+
+    Same materialization as :func:`materialize_overlaid_plugin_servers` — admin
+    overlay (if any) merged in, ``${CLAUDE_PLUGIN_ROOT}`` expanded — but also
+    for servers without an overlay, so the admin connection test probes exactly
+    what a new Claude session would run. ``None`` when no installed plugin
+    declares *server_name*. Never raises.
+    """
+    try:
+        from src import plugin_service
+
+        entries = plugin_service.list_plugin_mcp_servers()
+    except Exception:
+        logger.warning("Failed to list plugin MCP servers for overlay", exc_info=True)
+        return None
+    for entry in entries:
+        if entry.get("server_name") != server_name:
+            continue
+        cfg = entry.get("config")
+        if not isinstance(cfg, dict):
+            continue
+        return _merged_expanded(
+            cfg, _overlays.get(server_name) or {}, entry.get("install_path")
+        )
+    return None
 
 
 def collect_overlay_env_for_process(
