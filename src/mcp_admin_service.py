@@ -14,6 +14,7 @@ CRUD.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Dict, List, Optional
 
@@ -24,6 +25,8 @@ from src.mcp_config import (
     mcp_safe_name,
     validate_server,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class McpAdminError(ValueError):
@@ -206,6 +209,22 @@ async def test_connection(name: str) -> Dict[str, Any]:
 
         config = plugin_service.get_plugin_mcp_server_config(name)
         source = "plugin"
+        # Probe the session-equivalent config: admin credential overlay merged
+        # and ${CLAUDE_PLUGIN_ROOT} expanded, matching what a new Claude
+        # session materializes.
+        if config is not None:
+            try:
+                from src import mcp_plugin_overlay
+
+                materialized = mcp_plugin_overlay.materialize_plugin_server(name)
+                if materialized is not None:
+                    config = materialized
+            except Exception:
+                logger.debug(
+                    "Plugin MCP overlay materialization failed for %s",
+                    name,
+                    exc_info=True,
+                )
     if config is None:
         return {"ok": False, "detail": f"server '{name}' not found"}
     result = await mcp_connection_test.test_mcp_server(name, config)

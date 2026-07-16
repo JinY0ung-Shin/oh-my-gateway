@@ -42,6 +42,26 @@ def register_all_descriptors():
     BackendRegistry.register_descriptor(CODEX_DESCRIPTOR)
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_plugin_mcp_overlay(tmp_path_factory):
+    """Point the plugin MCP overlay store at a per-run temp file.
+
+    ``src.mcp_plugin_overlay`` loads ``data/gateway-mcp-plugin-overlay.json``
+    at import time; without this, a developer's real overlay file (live
+    credentials) would leak into every test that materializes plugin MCP
+    servers or builds Claude session options.
+    """
+    path = tmp_path_factory.mktemp("mcp-plugin-overlay") / "overlay.json"
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GATEWAY_MCP_PLUGIN_OVERLAY", str(path))
+
+    from src import mcp_plugin_overlay
+
+    mcp_plugin_overlay.reload_overlays()
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def reset_main_state():
     """Restore mutable module state and clean shared session state between tests."""

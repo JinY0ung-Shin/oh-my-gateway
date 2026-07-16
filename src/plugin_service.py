@@ -547,7 +547,7 @@ def list_plugin_mcp_servers() -> List[Dict[str, Any]]:
     """Return MCP servers contributed by installed plugins.
 
     Each item is ``{plugin_id, plugin_name, marketplace, scope, origin,
-    server_name, config}``. These servers are loaded by the Claude SDK via
+    server_name, config, install_path}``. These servers are loaded by the Claude SDK via
     ``setting_sources`` (reading the plugin's ``.mcp.json``) and never pass
     through the gateway's ``MCP_CONFIG``/manifest effective config — so they
     are otherwise invisible to the MCP admin view. Read-only; never raises.
@@ -583,6 +583,7 @@ def list_plugin_mcp_servers() -> List[Dict[str, Any]]:
                         ),
                         "server_name": server_name,
                         "config": config,
+                        "install_path": str(resolved["install_path"]),
                     }
                 )
     return results

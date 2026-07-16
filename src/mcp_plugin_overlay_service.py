@@ -1,0 +1,166 @@
+"""Admin API logic for plugin MCP env/headers overlays."""
+
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, List, Optional
+
+from src import mcp_plugin_overlay
+from src.mcp_config import (
+    list_env_refs,
+    mcp_safe_name,
+    mcp_secret_maps_meta,
+    validate_string_map,
+)
+
+
+class McpPluginOverlayError(ValueError):
+    """Invalid plugin MCP overlay input."""
+
+
+class McpPluginOverlayNotFound(McpPluginOverlayError):
+    """Overlay target missing: not a plugin server, or no stored overlay."""
+
+
+# Same character class as mcp_admin_service server names.
+_NAME_RE = re.compile(r"^[A-Za-z0-9._@-]+$")
+
+
+def _validate_name(name: str) -> str:
+    name = (name or "").strip()
+    if not name:
+        raise McpPluginOverlayError("server name is required")
+    if not _NAME_RE.match(name) or name.startswith("-"):
+        raise McpPluginOverlayError(
+            f"invalid server name {name!r}: only letters, digits and ._@- are allowed"
+        )
+    return name
+
+
+def _plugin_server_names() -> Dict[str, Dict[str, Any]]:
+    """Map server_name -> first matching plugin entry metadata."""
+    from src import plugin_service
+
+    out: Dict[str, Dict[str, Any]] = {}
+    for entry in plugin_service.list_plugin_mcp_servers():
+        name = entry.get("server_name")
+        if isinstance(name, str) and name not in out:
+            out[name] = entry
+    return out
+
+
+_REDACTED = "***REDACTED***"
+
+
+def _restore_redacted_map(
+    new: Dict[str, Any], existing: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Keep stored secrets when the admin form round-trips ``***REDACTED***``."""
+    out: Dict[str, Any] = {}
+    for k, v in new.items():
+        if v == _REDACTED and k in existing:
+            out[k] = existing[k]
+        else:
+            out[k] = v
+    return out
+
+
+def upsert_overlay(
+    name: str,
+    *,
+    env: Optional[Dict[str, Any]] = None,
+    headers: Optional[Dict[str, Any]] = None,
+    plugin_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Validate and persist an overlay for a plugin MCP server."""
+    name = _validate_name(name)
+    env = env if isinstance(env, dict) else {}
+    headers = headers if isinstance(headers, dict) else {}
+
+    existing = mcp_plugin_overlay.get_overlay(name)
+    if existing:
+        env = _restore_redacted_map(env, existing.get("env") or {})
+        headers = _restore_redacted_map(headers, existing.get("headers") or {})
+
+    for field, mapping in (("env", env), ("headers", headers)):
+        if not mapping:
+            continue
+        ok, reason = validate_string_map(mapping, field)
+        if not ok:
+            raise McpPluginOverlayError(reason or f"invalid {field}")
+        # A leftover placeholder means the key has no stored secret to restore
+        # (new or renamed key) — storing the literal mask would break the server.
+        for k, v in mapping.items():
+            if v == _REDACTED:
+                raise McpPluginOverlayError(
+                    f"{field} key {k!r} still holds the redaction placeholder; "
+                    "enter the actual value (a renamed key cannot reuse a stored secret)"
+                )
+
+    plugins = _plugin_server_names()
+    if name not in plugins:
+        raise McpPluginOverlayNotFound(
+            f"server '{name}' is not a plugin-provided MCP server "
+            "(overlay is only for source=plugin rows)"
+        )
+
+    # Reject empty body after string-map filter.
+    if not env and not headers:
+        raise McpPluginOverlayError(
+            "overlay must include at least one env or headers entry"
+        )
+
+    entry = plugins[name]
+    resolved_plugin_id = plugin_id or entry.get("plugin_id")
+    stored = mcp_plugin_overlay.upsert_overlay(
+        name,
+        env=env,
+        headers=headers,
+        plugin_id=resolved_plugin_id if isinstance(resolved_plugin_id, str) else None,
+    )
+    return {
+        "status": "saved",
+        "server": name,
+        "plugin_id": stored.get("plugin_id") or resolved_plugin_id,
+        "overlay": _public_overlay(stored),
+        "patterns": [f"mcp__{mcp_safe_name(name)}__*"],
+        "note": (
+            "Applies to new Claude sessions: materializes this plugin server into "
+            "gateway mcp_servers with merged env/headers, and injects env into the "
+            "Claude process environment. Existing sessions keep their pinned set."
+        ),
+    }
+
+
+def delete_overlay(name: str) -> Dict[str, Any]:
+    name = _validate_name(name)
+    existed = mcp_plugin_overlay.delete_overlay(name)
+    if not existed:
+        raise McpPluginOverlayNotFound(f"no overlay for server '{name}'")
+    return {"status": "deleted", "server": name}
+
+
+def get_overlay_detail(name: str) -> Dict[str, Any]:
+    name = _validate_name(name)
+    from src.admin_service import _redact_mcp_config
+
+    stored = mcp_plugin_overlay.get_overlay(name)
+    plugins = _plugin_server_names()
+    meta = plugins.get(name)
+    return {
+        "server": name,
+        "exists": bool(stored),
+        "plugin": meta.get("plugin_id") if meta else None,
+        "overlay": _public_overlay(stored),
+        "config_redacted": _redact_mcp_config(stored) if stored else {},
+        **mcp_secret_maps_meta(stored or {}),
+        "env_refs": list_env_refs(stored or {}),
+    }
+
+
+def _public_overlay(stored: Dict[str, Any]) -> Dict[str, Any]:
+    from src.admin_service import _redact_mcp_config
+
+    if not stored:
+        return {}
+    return _redact_mcp_config(stored)
