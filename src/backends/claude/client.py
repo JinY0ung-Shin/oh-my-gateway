@@ -377,45 +377,30 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     def _merge_plugin_mcp_overlays(
         self,
         mcp_servers: Optional[Dict[str, Any]],
-        options: ClaudeAgentOptions,
     ) -> Optional[Dict[str, Any]]:
         """Materialize plugin MCP credential overlays into *mcp_servers*.
 
         Admin overlays (env/headers only) are stored separately from the plugin
         ``.mcp.json``. For each overlay we deep-copy the plugin base config,
         merge the overlay, and add it to the gateway ``mcp_servers`` map so it
-        rides the same path as MCP_CONFIG/manifest servers. Resolved overlay
-        env keys are also injected into ``options.env`` so stdio children that
-        inherit the Claude process environment still see credentials when the
-        plugin path also loads via ``setting_sources``. Both effects are scoped
-        to overlays that actually materialized: a stale overlay (plugin no
-        longer installed) contributes neither a server nor process env.
+        rides the same path as MCP_CONFIG/manifest servers. Overlay values stay
+        scoped to that server config; nothing is injected into the session
+        process environment. A stale overlay (plugin no longer installed)
+        contributes nothing.
+
+        Verified live (CLI 2.1.187, the SDK 0.2.108 bundle, 2026-07-16): when
+        ``--mcp-config`` names a server also declared by a plugin, the CLI
+        drops the plugin registration entirely — only the materialized copy is
+        registered and spawned, so merged env/headers are authoritative and no
+        duplicate server runs.
         """
         try:
             from src import mcp_plugin_overlay
-            from src.mcp_config import resolve_string_map_env_refs
 
             overlaid = mcp_plugin_overlay.materialize_overlaid_plugin_servers()
-            active_overlays = {
-                name: rec
-                for name, rec in mcp_plugin_overlay.get_overlays().items()
-                if name in overlaid
-            }
-            process_env = mcp_plugin_overlay.collect_overlay_env_for_process(
-                active_overlays
-            )
         except Exception:
             logger.warning("Plugin MCP overlay merge failed", exc_info=True)
             return mcp_servers
-
-        if process_env:
-            resolved_env = resolve_string_map_env_refs(process_env)
-            if resolved_env:
-                options.env.update(resolved_env)
-                logger.debug(
-                    "Injected %d plugin-MCP overlay env key(s) into Claude process env",
-                    len(resolved_env),
-                )
 
         if not overlaid:
             return mcp_servers
@@ -424,32 +409,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # Overlay materialization wins on name collision with gateway MCP so
         # admin credentials attach to the plugin-defined command/url.
         merged.update(overlaid)
-        # The plugin's own .mcp.json copy still loads via setting_sources, so
-        # the CLI sees two configs per materialized name and its precedence is
-        # unverified. Env credentials survive either way via the process-env
-        # injection above; header overlays on remote servers only apply if the
-        # materialized copy wins.
-        logger.warning(
-            "Materialized %d plugin MCP server(s) with admin overlays: %s; "
-            "each also loads from its plugin .mcp.json via setting_sources "
-            "(duplicate registration, CLI precedence unverified)",
+        logger.info(
+            "Materialized %d plugin MCP server(s) with admin overlays: %s "
+            "(replaces the plugin's own setting_sources registration)",
             len(overlaid),
             sorted(overlaid),
         )
-        header_risk = sorted(
-            name
-            for name, cfg in overlaid.items()
-            if isinstance(cfg, dict)
-            and cfg.get("type", "stdio") != "stdio"
-            and (active_overlays.get(name) or {}).get("headers")
-        )
-        if header_risk:
-            logger.warning(
-                "Header overlay(s) on remote plugin MCP server(s) %s may not "
-                "take effect if the CLI prefers the plugin's own config; "
-                "verify tool connectivity in a new session",
-                header_risk,
-            )
         return merged
 
     def _configure_mcp_servers(
@@ -460,7 +425,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         forward_headers: Optional[Dict[str, str]] = None,
     ) -> None:
         # Merge plugin credential overlays even when gateway MCP_CONFIG is empty.
-        mcp_servers = self._merge_plugin_mcp_overlays(mcp_servers, options)
+        mcp_servers = self._merge_plugin_mcp_overlays(mcp_servers)
 
         if not mcp_servers:
             return

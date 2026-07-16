@@ -14,11 +14,13 @@ by MCP server name. On new Claude sessions the gateway:
    defines that variable while loading plugin-scoped config, so the materialized
    copy must be self-contained
 4. Materializes the result into ``options.mcp_servers`` (same path as gateway MCP)
-5. Also injects resolved overlay ``env`` into ``ClaudeAgentOptions.env`` so
-   stdio children that inherit the CLI process environment still see the values
 
-Overlays whose plugin is no longer installed are stale: they neither materialize
-nor contribute process env.
+The CLI then drops the plugin's own registration for that server name — only
+the materialized copy is registered and spawned (verified live 2026-07-16 on
+CLI 2.1.187, the SDK 0.2.108 bundle) — so overlay values stay scoped to that
+server config and are never injected into the session process environment.
+
+Overlays whose plugin is no longer installed are stale: they do not materialize.
 
 Hot-reload: overlay mutations rebind the in-memory map; already-running sessions
 keep the MCP set pinned at create time (same model as the main MCP manifest).
@@ -331,29 +333,6 @@ def materialize_plugin_server(server_name: str) -> Optional[Dict[str, Any]]:
             cfg, _overlays.get(server_name) or {}, entry.get("install_path")
         )
     return None
-
-
-def collect_overlay_env_for_process(
-    overlays: Optional[Mapping[str, Mapping[str, Any]]] = None,
-) -> Dict[str, str]:
-    """Flatten all overlay ``env`` maps for ClaudeAgentOptions.env injection.
-
-    Later servers overwrite earlier keys on collision (deterministic sorted names).
-    Values are **not** resolved here — call :func:`resolve_string_map_env_refs`.
-    """
-    src = overlays if overlays is not None else _overlays
-    flat: Dict[str, str] = {}
-    for name in sorted(src.keys()):
-        rec = src[name]
-        if not isinstance(rec, Mapping):
-            continue
-        env = rec.get("env")
-        if not isinstance(env, dict):
-            continue
-        for k, v in env.items():
-            if isinstance(k, str) and isinstance(v, str):
-                flat[k] = v
-    return flat
 
 
 # Load at import so get_overlays() works without an explicit reload.

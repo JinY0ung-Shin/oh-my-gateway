@@ -47,15 +47,6 @@ def _plugin_entry(name="ctx", plugin_id="p@mp", config=None, install_path=None):
     }
 
 
-class _FakeOptions:
-    """Minimal stand-in for ClaudeAgentOptions in merge tests."""
-
-    def __init__(self):
-        self.env = {}
-        self.mcp_servers = None
-        self.allowed_tools = None
-
-
 class TestOverlayStore:
     def test_upsert_and_get(self, overlay_file):
         mcp_plugin_overlay.upsert_overlay("ctx", env={"TOKEN": "secret"}, headers={})
@@ -214,8 +205,7 @@ class TestOverlayService:
 
 
 class TestClaudeMerge:
-    def test_merge_plugin_overlays_into_mcp_servers(self, overlay_file, monkeypatch):
-        monkeypatch.setenv("TOK", "from-env")
+    def test_merge_plugin_overlays_into_mcp_servers(self, overlay_file):
         mcp_plugin_overlay.upsert_overlay(
             "ctx", env={"TOKEN": "{{env:TOK}}", "PLAIN": "x"}
         )
@@ -227,36 +217,32 @@ class TestClaudeMerge:
 
             # Minimal instance without full init
             cli = object.__new__(ClaudeCodeCLI)
-            options = _FakeOptions()
             merged = cli._merge_plugin_mcp_overlays(
-                {"gw": {"type": "stdio", "command": "gw"}}, options
+                {"gw": {"type": "stdio", "command": "gw"}}
             )
             assert "gw" in merged
             assert "ctx" in merged
+            # Env refs stay templated here; _configure_mcp_servers resolves
+            # the merged map at session create.
             assert merged["ctx"]["env"]["TOKEN"] == "{{env:TOK}}"
-            # Process env injection resolves templates.
-            assert options.env["TOKEN"] == "from-env"
-            assert options.env["PLAIN"] == "x"
+            assert merged["ctx"]["env"]["PLAIN"] == "x"
 
-    def test_stale_overlay_injects_nothing(self, overlay_file):
-        """An overlay without an installed plugin neither materializes a
-        server nor leaks env into the session process."""
+    def test_stale_overlay_materializes_nothing(self, overlay_file):
+        """An overlay without an installed plugin does not materialize."""
         mcp_plugin_overlay.upsert_overlay("gone", env={"LEAK": "v"})
         with patch("src.plugin_service.list_plugin_mcp_servers", return_value=[]):
             from src.backends.claude.client import ClaudeCodeCLI
 
             cli = object.__new__(ClaudeCodeCLI)
-            options = _FakeOptions()
             merged = cli._merge_plugin_mcp_overlays(
-                {"gw": {"type": "stdio", "command": "gw"}}, options
+                {"gw": {"type": "stdio", "command": "gw"}}
             )
         assert merged == {"gw": {"type": "stdio", "command": "gw"}}
-        assert options.env == {}
 
-    def test_materialization_warns_duplicate_registration(self, overlay_file, caplog):
-        """Materializing an overlay dual-registers the server (gateway map +
-        setting_sources); stdio/env-only overlays get the generic warning but
-        not the remote-headers one."""
+    def test_materialization_logs_replacement(self, overlay_file, caplog):
+        """Materialization notes that the CLI runs the materialized copy in
+        place of the plugin's own setting_sources registration (verified live
+        on CLI 2.1.187, the pinned SDK bundle)."""
         mcp_plugin_overlay.upsert_overlay("ctx", env={"TOKEN": "t"})
         with patch(
             "src.plugin_service.list_plugin_mcp_servers",
@@ -265,15 +251,17 @@ class TestClaudeMerge:
             from src.backends.claude.client import ClaudeCodeCLI
 
             cli = object.__new__(ClaudeCodeCLI)
-            with caplog.at_level(logging.WARNING):
-                cli._merge_plugin_mcp_overlays(None, _FakeOptions())
-        messages = [r.getMessage() for r in caplog.records]
-        assert any("duplicate registration" in m and "'ctx'" in m for m in messages)
-        assert not any("may not take effect" in m for m in messages)
+            with caplog.at_level(logging.INFO):
+                cli._merge_plugin_mcp_overlays(None)
+        assert any(
+            "replaces the plugin's own setting_sources registration"
+            in r.getMessage()
+            for r in caplog.records
+        )
 
-    def test_materialization_warns_remote_header_overlay(self, overlay_file, caplog):
-        """Header overlays on remote plugin servers get the extra silent-no-op
-        warning (headers cannot ride the process env if the plugin copy wins)."""
+    def test_remote_header_overlay_lands_in_config(self, overlay_file):
+        """Header overlays ride the materialized config — the copy the CLI
+        actually registers and runs — so they apply to remote plugin servers."""
         mcp_plugin_overlay.upsert_overlay(
             "ctx", headers={"Authorization": "Bearer x"}
         )
@@ -282,11 +270,29 @@ class TestClaudeMerge:
             from src.backends.claude.client import ClaudeCodeCLI
 
             cli = object.__new__(ClaudeCodeCLI)
-            with caplog.at_level(logging.WARNING):
-                merged = cli._merge_plugin_mcp_overlays(None, _FakeOptions())
+            merged = cli._merge_plugin_mcp_overlays(None)
         assert merged["ctx"]["headers"]["Authorization"] == "Bearer x"
-        messages = [r.getMessage() for r in caplog.records]
-        assert any("may not take effect" in m for m in messages)
+
+    def test_overlay_env_never_reaches_session_process_env(self, overlay_file):
+        """Regression for the scoped-env fix: overlay credentials must land in
+        the materialized server config only. If session-process env injection
+        is ever reintroduced, the agent's Bash would see the secret via `env`
+        — this asserts options.env stays clean through the real MCP configure
+        path."""
+        mcp_plugin_overlay.upsert_overlay("ctx", env={"TOKEN": "s3cret"})
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            from claude_agent_sdk import ClaudeAgentOptions
+
+            from src.backends.claude.client import ClaudeCodeCLI
+
+            cli = object.__new__(ClaudeCodeCLI)
+            options = ClaudeAgentOptions()
+            cli._configure_mcp_servers(options, None, ["mcp__ctx__*"])
+        assert options.mcp_servers["ctx"]["env"]["TOKEN"] == "s3cret"
+        assert "TOKEN" not in options.env
 
 
 class TestOverlayRoutes:
