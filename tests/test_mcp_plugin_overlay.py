@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 from unittest.mock import patch
 
@@ -251,6 +252,41 @@ class TestClaudeMerge:
             )
         assert merged == {"gw": {"type": "stdio", "command": "gw"}}
         assert options.env == {}
+
+    def test_materialization_warns_duplicate_registration(self, overlay_file, caplog):
+        """Materializing an overlay dual-registers the server (gateway map +
+        setting_sources); stdio/env-only overlays get the generic warning but
+        not the remote-headers one."""
+        mcp_plugin_overlay.upsert_overlay("ctx", env={"TOKEN": "t"})
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            from src.backends.claude.client import ClaudeCodeCLI
+
+            cli = object.__new__(ClaudeCodeCLI)
+            with caplog.at_level(logging.WARNING):
+                cli._merge_plugin_mcp_overlays(None, _FakeOptions())
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("duplicate registration" in m and "'ctx'" in m for m in messages)
+        assert not any("may not take effect" in m for m in messages)
+
+    def test_materialization_warns_remote_header_overlay(self, overlay_file, caplog):
+        """Header overlays on remote plugin servers get the extra silent-no-op
+        warning (headers cannot ride the process env if the plugin copy wins)."""
+        mcp_plugin_overlay.upsert_overlay(
+            "ctx", headers={"Authorization": "Bearer x"}
+        )
+        entry = _plugin_entry(config={"type": "http", "url": "https://mcp.example"})
+        with patch("src.plugin_service.list_plugin_mcp_servers", return_value=[entry]):
+            from src.backends.claude.client import ClaudeCodeCLI
+
+            cli = object.__new__(ClaudeCodeCLI)
+            with caplog.at_level(logging.WARNING):
+                merged = cli._merge_plugin_mcp_overlays(None, _FakeOptions())
+        assert merged["ctx"]["headers"]["Authorization"] == "Bearer x"
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("may not take effect" in m for m in messages)
 
 
 class TestOverlayRoutes:

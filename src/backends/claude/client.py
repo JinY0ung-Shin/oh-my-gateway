@@ -424,11 +424,32 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # Overlay materialization wins on name collision with gateway MCP so
         # admin credentials attach to the plugin-defined command/url.
         merged.update(overlaid)
-        logger.debug(
-            "Materialized %d plugin MCP server(s) with admin overlays: %s",
+        # The plugin's own .mcp.json copy still loads via setting_sources, so
+        # the CLI sees two configs per materialized name and its precedence is
+        # unverified. Env credentials survive either way via the process-env
+        # injection above; header overlays on remote servers only apply if the
+        # materialized copy wins.
+        logger.warning(
+            "Materialized %d plugin MCP server(s) with admin overlays: %s; "
+            "each also loads from its plugin .mcp.json via setting_sources "
+            "(duplicate registration, CLI precedence unverified)",
             len(overlaid),
-            list(overlaid.keys()),
+            sorted(overlaid),
         )
+        header_risk = sorted(
+            name
+            for name, cfg in overlaid.items()
+            if isinstance(cfg, dict)
+            and cfg.get("type", "stdio") != "stdio"
+            and (active_overlays.get(name) or {}).get("headers")
+        )
+        if header_risk:
+            logger.warning(
+                "Header overlay(s) on remote plugin MCP server(s) %s may not "
+                "take effect if the CLI prefers the plugin's own config; "
+                "verify tool connectivity in a new session",
+                header_risk,
+            )
         return merged
 
     def _configure_mcp_servers(
