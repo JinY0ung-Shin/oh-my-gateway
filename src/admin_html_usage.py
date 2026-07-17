@@ -253,11 +253,11 @@ def get_usage_html() -> str:
               </div>
               <div class="table-wrapper">
                 <table>
-                  <thead><tr><th>TIME</th><th>USER</th><th>SESSION</th><th>TURN</th><th>IN</th><th>OUT</th><th>CACHE R</th><th>MS</th><th>STATUS</th></tr></thead>
+                  <thead><tr><th>TIME (KST)</th><th>USER</th><th>SESSION</th><th>TURN</th><th>IN</th><th>OUT</th><th>CACHE R</th><th>MS</th><th>STATUS</th></tr></thead>
                   <tbody>
                     <template x-for="r in (usage.turns ?? [])" :key="r.id">
                       <tr>
-                        <td class="text-xs" style="white-space:nowrap; color:var(--text-dim)" x-text="formatTime(r.ts)"></td>
+                        <td class="text-xs" style="white-space:nowrap; color:var(--text-dim)" x-text="formatKstTime(r.ts)"></td>
                         <td class="text-mono" style="color:var(--text-bright)" x-text="r.user"></td>
                         <td class="text-mono text-xs" style="color:var(--cyan)" x-text="(r.session_id || '').substring(0,8)"></td>
                         <td class="text-sm" x-text="r.turn"></td>

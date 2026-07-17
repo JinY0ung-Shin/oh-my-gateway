@@ -246,7 +246,7 @@ Primary endpoints:
 
 Admin endpoints live under `/admin` and `/admin/api/*`.
 
-When `USAGE_LOG_DB_URL` is configured, usage analytics are available under `/admin/api/usage/*`: `summary`, `users`, `tools`, `series`, `tools-series`, and `turns`.
+When `USAGE_LOG_DB_URL` is configured, usage analytics are available under `/admin/api/usage/*`: `summary`, `users`, `tools`, `series`, `tools-series`, and `turns`. Usage timestamps are stored in UTC, while dashboard date filters, buckets, and displayed turn times use KST (UTC+09:00) regardless of the server, database, or browser timezone. Older gateway versions stored process-local timestamps without timezone metadata; verify the originating runtime timezone before converting historical rows because their timezone cannot be inferred from the column value alone.
 
 ### Stateless agent Messages
 

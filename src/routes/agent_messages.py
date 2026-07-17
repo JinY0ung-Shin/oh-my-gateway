@@ -11,6 +11,7 @@ import re
 import shutil
 import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -457,16 +458,133 @@ def _render_transcript(body: AgentMessagesRequest) -> str:
     )
 
 
-async def _disconnect_client(client: Any) -> None:
+# The SDK transport's close() escalation ladder is: stdin EOF → up to 5s
+# graceful wait → SIGTERM → up to 5s → SIGKILL → reap. A disconnect budget
+# shorter than that ladder cancels close() BEFORE terminate() ever runs, so a
+# mid-turn CLI subprocess is never signalled and keeps executing (and billing)
+# the rest of the turn in the background with its workspace already deleted.
+_INTERRUPT_TIMEOUT_S = 3.0
+_DISCONNECT_TIMEOUT_S = 15.0
+# Shorter budget when the turn is already known to be wedged (interrupt timed
+# out): graceful close is unlikely to work, get to the direct kill sooner.
+_DISCONNECT_WEDGED_TIMEOUT_S = 5.0
+_KILL_WAIT_TIMEOUT_S = 5.0
+
+
+def _client_process(client: Any) -> Any:
+    """Reach the CLI subprocess handle behind a connected ClaudeSDKClient.
+
+    Private SDK attributes by necessity: the public disconnect() can wedge
+    inside its pre-transport steps, and this endpoint must be able to assert
+    the process is dead regardless. Returns None when unavailable.
+    """
+    transport = getattr(client, "_transport", None)
+    return getattr(transport, "_process", None)
+
+
+async def _interrupt_client(client: Any) -> bool:
+    """Best-effort turn interrupt before disconnect on client abort.
+
+    interrupt() asks the CLI to end the in-flight turn now, so the following
+    disconnect()'s stdin-EOF grace period exits the process without having to
+    escalate to SIGTERM/SIGKILL. Returns True when the CLI acknowledged.
+    """
+    if client is None:
+        return False
+    interrupt = getattr(client, "interrupt", None)
+    if interrupt is None:
+        return False
+    try:
+        await asyncio.wait_for(interrupt(), timeout=_INTERRUPT_TIMEOUT_S)
+        return True
+    except Exception:
+        logger.info("Stateless agent interrupt failed", exc_info=True)
+        return False
+
+
+async def _disconnect_client(
+    client: Any, timeout: float = _DISCONNECT_TIMEOUT_S
+) -> None:
     if client is None:
         return
     disconnect = getattr(client, "disconnect", None)
     if disconnect is None:
         return
     try:
-        await asyncio.wait_for(disconnect(), timeout=2.0)
+        await asyncio.wait_for(disconnect(), timeout=timeout)
     except Exception:
-        logger.debug("Stateless agent client disconnect failed", exc_info=True)
+        logger.info("Stateless agent client disconnect failed", exc_info=True)
+
+
+async def _kill_client_process(process: Any) -> None:
+    """Directly terminate the CLI subprocess that outlived SDK teardown."""
+    logger.warning(
+        "Stateless agent CLI pid %s survived disconnect; terminating",
+        getattr(process, "pid", "?"),
+    )
+    with suppress(ProcessLookupError):
+        process.terminate()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_KILL_WAIT_TIMEOUT_S)
+    except (TimeoutError, asyncio.TimeoutError):
+        with suppress(ProcessLookupError):
+            process.kill()
+        with suppress(Exception):
+            await process.wait()
+    except Exception:
+        logger.info("Stateless agent CLI terminate wait failed", exc_info=True)
+
+
+async def _stop_cancelled_turn(client: Any) -> None:
+    """Stop the in-flight CLI turn after the consumer went away.
+
+    interrupt (graceful) → disconnect (SDK teardown) → direct terminate/kill
+    if the subprocess still runs. The last step is the actual guarantee; the
+    first two keep the common path clean and flush-friendly.
+    """
+    if client is None:
+        return
+    process = _client_process(client)
+    interrupted = await _interrupt_client(client)
+    await _disconnect_client(
+        client,
+        timeout=_DISCONNECT_TIMEOUT_S if interrupted else _DISCONNECT_WEDGED_TIMEOUT_S,
+    )
+    if process is not None and process.returncode is None:
+        await _kill_client_process(process)
+    else:
+        logger.info("Stateless agent turn stopped after client abort")
+
+
+# Teardowns detached from cancelled request contexts; strong refs so they
+# cannot be garbage-collected mid-flight.
+_BACKGROUND_TEARDOWNS: set = set()
+
+
+def _spawn_cancelled_turn_teardown(client: Any, session, workspace) -> None:
+    """Stop the turn and clean up from a FRESH task, not the dying one.
+
+    The cancelled generator unwind cannot await anything reliably: its task
+    can carry a further pending cancellation that instantly aborts the first
+    await in a finally (observed: teardown died in the same millisecond).
+    A detached task has a clean cancellation state, so its timeouts and the
+    interrupt→disconnect→kill ladder actually run. Cleanup happens here too,
+    strictly AFTER the subprocess is dead — never delete a live agent's cwd.
+    """
+
+    async def _teardown() -> None:
+        try:
+            await _stop_cancelled_turn(client)
+        except Exception:
+            logger.exception("Stateless agent cancelled-turn teardown failed")
+        finally:
+            _cleanup_sdk_transcript(session)
+            if workspace is not None:
+                workspace_manager.cleanup_temp_workspace(workspace)
+
+    task = asyncio.get_running_loop().create_task(_teardown())
+    _BACKGROUND_TEARDOWNS.add(task)
+    task.add_done_callback(_BACKGROUND_TEARDOWNS.discard)
 
 
 def _cleanup_sdk_transcript(session: Optional[Session]) -> None:
@@ -495,6 +613,7 @@ async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):
     session = None
     saw_result = False
     failed = False
+    cancelled = False
 
     yield _sse(
         "message_start",
@@ -576,7 +695,10 @@ async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):
                 "status": "failed" if failed else "completed",
             },
         )
-    except asyncio.CancelledError:
+    except (asyncio.CancelledError, GeneratorExit):
+        # The consumer went away mid-turn (viewer pressed stop / connection
+        # dropped): the SDK turn is still running and must be stopped below.
+        cancelled = True
         raise
     except Exception:
         logger.error("Stateless agent message stream failed", exc_info=True)
@@ -587,10 +709,18 @@ async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):
     finally:
         if session is not None:
             session.client = None
-        await _disconnect_client(client)
-        _cleanup_sdk_transcript(session)
-        if workspace is not None:
-            workspace_manager.cleanup_temp_workspace(workspace)
+        if cancelled:
+            # No awaits here: the dying task may hold another pending
+            # cancellation that would abort the teardown mid-flight.
+            logger.info(
+                "Stateless agent turn cancelled by client; stopping CLI in background"
+            )
+            _spawn_cancelled_turn_teardown(client, session, workspace)
+        else:
+            await _disconnect_client(client)
+            _cleanup_sdk_transcript(session)
+            if workspace is not None:
+                workspace_manager.cleanup_temp_workspace(workspace)
 
 
 @router.post("/v1/agents/messages")

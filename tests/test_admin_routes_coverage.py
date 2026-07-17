@@ -27,6 +27,9 @@ class TestAdminPage:
         assert r.status_code == 200
         assert "text/html" in r.headers["content-type"]
         assert "OH MY GATEWAY" in r.text
+        assert "TIME (KST)" in r.text
+        assert "formatKstTime(r.ts)" in r.text
+        assert "timeZone: 'Asia/Seoul'" in r.text
 
     def test_get_admin_page_includes_integrity_and_crossorigin_for_cdn_assets(self, admin_client):
         r = admin_client.get("/admin")

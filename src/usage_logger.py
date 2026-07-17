@@ -28,11 +28,12 @@ in-flight writes are drained on ``close()``.
 from __future__ import annotations
 
 import asyncio
-import datetime as _dt
 import logging
 import os
 import time
 from typing import Any, Dict, Optional
+
+from src.usage_time import current_db_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -419,7 +420,7 @@ class UsageLogger:
         if not session_id or turn is None or not response_id:
             return
 
-        ts = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        ts = current_db_timestamp()
         duration_ms = int((time.monotonic() - started_monotonic) * 1000)
 
         # Detach the DB write so request cancellation can't interrupt the

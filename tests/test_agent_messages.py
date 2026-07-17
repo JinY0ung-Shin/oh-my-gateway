@@ -431,3 +431,64 @@ def test_partial_message_override_does_not_change_default_responses_behavior():
 
     assert default_options.include_partial_messages is False
     assert endpoint_options.include_partial_messages is True
+
+
+async def test_cancelled_stream_interrupts_and_stops_the_turn(monkeypatch, tmp_path):
+    """Client abort mid-turn must stop the CLI turn, not just the HTTP stream.
+
+    The cancelled generator unwind cannot await reliably (a further pending
+    cancellation aborts the first await in its finally), so the teardown runs
+    in a detached task: interrupt → disconnect → cleanup, in that order.
+    """
+    import asyncio
+    from types import SimpleNamespace
+
+    import pytest
+
+    from src.agent_message_models import AgentMessagesRequest
+
+    class _HangingBackend(_FakeBackend):
+        async def run_completion_with_client(self, client, prompt, session):
+            self.run_session = session
+            n = 0
+            while True:
+                n += 1
+                yield {
+                    "type": "stream_event",
+                    "event": {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": f"chunk {n} "},
+                    },
+                }
+                await asyncio.sleep(0.005)
+
+    backend = _HangingBackend([])
+    backend.client.interrupt = AsyncMock()
+    workspace, _ = _install_endpoint_fakes(monkeypatch, tmp_path, backend)
+
+    body = AgentMessagesRequest(messages=[{"role": "user", "content": "멈춰볼 턴"}])
+    resolved = SimpleNamespace(backend="claude", provider_model="sonnet")
+    stream = agent_messages._stream_agent_messages(body, resolved, backend)
+    received = []
+
+    async def consume():
+        async for chunk in stream:
+            received.append(chunk)
+
+    task = asyncio.create_task(consume())
+    while len(received) < 3:
+        await asyncio.sleep(0.005)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The detached teardown finishes on its own; cleanup is its LAST step.
+    for _ in range(200):
+        if workspace.cleaned:
+            break
+        await asyncio.sleep(0.01)
+
+    backend.client.interrupt.assert_awaited_once()
+    backend.client.disconnect.assert_awaited_once()
+    assert workspace.cleaned == [workspace.path]

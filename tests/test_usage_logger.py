@@ -1,6 +1,7 @@
 """Tests for SQLAlchemy-backed usage logging."""
 
 import asyncio
+import datetime as dt
 
 import pytest
 
@@ -11,6 +12,13 @@ from src.usage_logger import (
     _safe_url,
     extract_model_id,
     extract_sdk_usage_detail,
+)
+from src.usage_time import (
+    db_timestamp,
+    kst_day_start_utc,
+    kst_iso_timestamp,
+    kst_today_bounds_utc,
+    kst_today_start_utc,
 )
 
 
@@ -153,6 +161,25 @@ def test_safe_url_masks_password_and_falls_back_for_invalid_url():
         "mysql+aiomysql://user:***@example.com/db"
     )
     assert _safe_url("not a database url") == "not a database url"
+
+
+def test_usage_time_normalizes_utc_storage_and_kst_day_boundaries():
+    kst = dt.timezone(dt.timedelta(hours=9))
+    instant = dt.datetime(2026, 7, 14, 0, 30, tzinfo=kst)
+
+    assert db_timestamp(instant) == "2026-07-13 15:30:00.000"
+    assert kst_day_start_utc(dt.date(2026, 7, 14)) == "2026-07-13 15:00:00.000"
+    assert kst_today_start_utc(instant) == "2026-07-13 15:00:00.000"
+    assert kst_today_bounds_utc(instant) == (
+        "2026-07-13 15:00:00.000",
+        "2026-07-14 15:00:00.000",
+    )
+    assert kst_iso_timestamp("2026-07-13 15:30:00.000") == ("2026-07-14T00:30:00.000+09:00")
+
+
+def test_usage_time_rejects_naive_instants():
+    with pytest.raises(ValueError, match="timezone-aware"):
+        db_timestamp(dt.datetime(2026, 7, 14, 0, 30))
 
 
 def test_extract_sdk_usage_detail_prefers_final_result_usage():
@@ -420,6 +447,10 @@ async def test_log_turn_from_context_builds_turn_record(monkeypatch):
 
     logger.log_turn = fake_log_turn
     monkeypatch.setattr("src.usage_logger.time.monotonic", lambda: 105.0)
+    monkeypatch.setattr(
+        "src.usage_logger.current_db_timestamp",
+        lambda: "2026-07-13 15:30:00.000",
+    )
 
     await logger.log_turn_from_context(
         request_context={
@@ -446,6 +477,7 @@ async def test_log_turn_from_context_builds_turn_record(monkeypatch):
     assert len(calls) == 1
     assert calls[0]["tool_stats"] == {"Read": {"count": 1}}
     turn = calls[0]["turn"]
+    assert turn["ts"] == "2026-07-13 15:30:00.000"
     assert turn["user"] == "alice"
     assert turn["session_id"] == "sess-1"
     assert turn["response_id"] == "resp-1"

@@ -9,6 +9,8 @@ CREATE DATABASE IF NOT EXISTS gateway_log
 USE gateway_log;
 
 -- One row per /v1/responses turn (streaming or non-streaming).
+-- ts is stored as a timezone-less UTC value; admin calendar views convert it
+-- to KST (UTC+09:00).
 CREATE TABLE IF NOT EXISTS usage_turn (
   id                    BIGINT PRIMARY KEY AUTO_INCREMENT,
   ts                    DATETIME(3) NOT NULL,

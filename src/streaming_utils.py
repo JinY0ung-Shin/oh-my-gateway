@@ -409,6 +409,25 @@ async def bridge_sse_stream(
 # SSE comment line — compliant clients silently ignore these.
 _SSE_KEEPALIVE = ": keepalive\n\n"
 
+logger = logging.getLogger(__name__)
+
+# Strong references to reader tasks that outlive their wrapper. On client
+# disconnect the response task is cancelled and `await task` below re-raises
+# immediately, so the reader finishes the source generator's teardown
+# (interrupt/disconnect of the SDK subprocess, up to ~18s) detached. asyncio
+# only holds tasks weakly — without a strong reference a detached reader can
+# be garbage-collected mid-teardown ("Task was destroyed but it is pending!").
+_BACKGROUND_READERS: set = set()
+
+
+def _reap_background_reader(task) -> None:
+    _BACKGROUND_READERS.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.info("SSE reader task ended with error", exc_info=exc)
+
 
 async def _keepalive_wrapper(
     source: AsyncGenerator,
@@ -467,6 +486,8 @@ async def _keepalive_wrapper(
             yield item
     finally:
         task.cancel()
+        _BACKGROUND_READERS.add(task)
+        task.add_done_callback(_reap_background_reader)
         try:
             await task
         except (asyncio.CancelledError, Exception):

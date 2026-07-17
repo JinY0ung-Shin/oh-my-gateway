@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 
 import src.usage_queries as uq
 from src.usage_logger import usage_logger
+from src.usage_time import KST
 
 # Portable SQLite mirror of docker/mysql_init/01_schema.sql.
 _DDL = [
@@ -55,8 +56,8 @@ _DDL = [
 
 
 def _ts(days_ago: int) -> str:
-    """A ``YYYY-MM-DD HH:MM:SS.mmm`` timestamp ``days_ago`` days in the past."""
-    when = _dt.datetime.now() - _dt.timedelta(days=days_ago)
+    """A UTC DB timestamp ``days_ago`` days in the past."""
+    when = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(days=days_ago)
     return when.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
@@ -201,13 +202,68 @@ async def test_get_summary_on_sqlite(sqlite_usage_logger):
 
 
 async def test_get_summary_explicit_date_range_on_sqlite(sqlite_usage_logger):
-    today = _dt.date.today()
+    today = _dt.datetime.now(KST).date()
     start = (today - _dt.timedelta(days=3)).isoformat()
     end = today.isoformat()
     summary = await uq.get_summary(start_date=start, end_date=end)
     assert summary is not None
-    # The inclusive range covers all three turns (uses date(%s, '+1 day')).
+    # The inclusive KST range is converted to UTC bounds and covers all rows.
     assert summary["turns_window"] == 3
+
+
+async def test_kst_boundary_is_used_for_filters_buckets_and_turn_timestamps(
+    sqlite_usage_logger,
+):
+    async with sqlite_usage_logger.begin() as conn:
+        await conn.execute(
+            text("""
+                INSERT INTO usage_turn
+                  (ts, user, session_id, response_id, turn, status)
+                VALUES
+                  (:ts, :user, :session_id, :response_id, :turn, :status)
+                """),
+            [
+                {
+                    # Still 2026-12-31 in KST, one millisecond before midnight.
+                    "ts": "2026-12-31 14:59:59.999",
+                    "user": "boundary-before",
+                    "session_id": "s-boundary-before",
+                    "response_id": "r-boundary-before",
+                    "turn": 1,
+                    "status": "completed",
+                },
+                {
+                    # Exact KST midnight: 2027-01-01 00:00:00+09:00.
+                    "ts": "2026-12-31 15:00:00.000",
+                    "user": "boundary",
+                    "session_id": "s-boundary",
+                    "response_id": "r-boundary",
+                    "turn": 1,
+                    "status": "completed",
+                },
+            ],
+        )
+
+    summary = await uq.get_summary(start_date="2027-01-01", end_date="2027-01-01")
+    assert summary is not None
+    assert summary["turns_window"] == 1
+
+    boundary_day = _dt.date(2027, 1, 1)
+    iso = boundary_day.isocalendar()
+    assert (iso.year, iso.week) == (2026, 53)
+    expected_buckets = {
+        "day": "2027-01-01",
+        "week": f"{iso.year}-W{iso.week:02d}",
+        "month": "2027-01",
+    }
+    for granularity, expected in expected_buckets.items():
+        series = await uq.get_time_series(granularity=granularity, buckets=60)
+        assert series is not None
+        assert any(row["bucket"] == expected for row in series)
+
+    turns = await uq.get_recent_turns(user="boundary", limit=1)
+    assert turns is not None
+    assert turns[0]["ts"] == "2027-01-01T00:00:00.000+09:00"
 
 
 async def test_get_top_users_on_sqlite(sqlite_usage_logger):
