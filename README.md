@@ -33,6 +33,7 @@ curl http://localhost:8000/v1/responses \
 ## What It Provides
 
 - **Responses API**: `/v1/responses` with non-streaming and SSE streaming responses.
+- **Background mode**: `background: true` returns a `queued` response immediately and runs the turn server-side; poll `GET /v1/responses/{response_id}`, cancel with `POST /v1/responses/{response_id}/cancel`.
 - **Stateless agent API**: `/v1/agents/messages` with caller-owned history and Claude SDK events.
 - **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`), OpenCode (`opencode/<provider>/<model>`), and experimental Codex (`codex/<model>`).
 - **Session continuity**: `previous_response_id` and server-side session tracking.
@@ -114,6 +115,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `DEFAULT_MODEL` | Default model for requests without `model` |
 | `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
 | `MAX_TIMEOUT` | Backend timeout in milliseconds |
+| `BACKGROUND_RESPONSE_TIMEOUT_S` | Wall-clock cap for one `background: true` turn in seconds; default `3600` |
 | `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
 | `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
 | `GATEWAY_HOST` | Host bind address; falls back to legacy `CLAUDE_WRAPPER_HOST` |
@@ -235,7 +237,8 @@ uv run pytest tests/integration/test_opencode_smoke.py -q
 Primary endpoints:
 
 - `POST /v1/responses`
-- `POST /v1/responses/{response_id}/cancel` (Claude streaming responses)
+- `GET /v1/responses/{response_id}` (retrieve a stored turn; poll background turns)
+- `POST /v1/responses/{response_id}/cancel` (Claude streaming or background responses)
 - `POST /v1/agents/messages` (stateless Claude SDK event stream)
 - `GET /v1/models`
 - `GET /v1/sessions`
@@ -296,6 +299,7 @@ Effective `/v1/responses` request fields:
 - `instructions`: system/developer prompt for a new session only.
 - `previous_response_id`: continue the latest turn of an existing session.
 - `stream`: emit Responses-style SSE events.
+- `background`: return a `queued` response immediately and run the turn server-side (see below).
 - `metadata`: stored on responses; allowlisted keys can be forwarded to Claude with `METADATA_ENV_ALLOWLIST`.
 - `allowed_tools`: explicit tool allowlist for backends that support tool policy enforcement.
 - `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
@@ -316,6 +320,42 @@ Notable deviations from OpenAI Responses API behavior:
   `previous_response_id`, so the client can immediately redirect the same
   conversation. Keep reading the original SSE stream until its terminal event
   instead of aborting the fetch first.
+
+### Background mode
+
+`background: true` detaches the turn from the HTTP connection: POST returns a
+response object with `status: "queued"` immediately, the turn keeps running
+server-side, and the session stays pinned (it cannot expire) until the turn
+finishes.
+
+```bash
+resp_id=$(curl -s http://localhost:8000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model": "sonnet", "input": "Long analysis...", "background": true}' | jq -r .id)
+
+# Poll until terminal: queued → in_progress → completed | incomplete | failed
+curl -s "http://localhost:8000/v1/responses/${resp_id}"
+
+# Optional: interrupt it (commits the partial output as a continuable turn)
+curl -s -X POST "http://localhost:8000/v1/responses/${resp_id}/cancel"
+```
+
+Semantics:
+
+- Requires `store: true` (the default); `stream: true` and `function_call_output`
+  continuations are not supported with `background` yet.
+- Terminal statuses mirror the connected paths: `completed` commits the turn
+  exactly like a non-streaming request; cancel commits a continuable
+  `incomplete` turn (`incomplete_details.reason: "user_cancelled"`); a backend
+  failure leaves the turn uncommitted — the response id stays retrievable with
+  `status: "failed"` and retrying the same `previous_response_id` reuses it.
+- A paused `AskUserQuestion` surfaces as `status: "requires_action"`; answer it
+  with a normal (non-background) `function_call_output` POST.
+- One turn per session at a time (the session lock applies to background turns
+  too); `BACKGROUND_RESPONSE_TIMEOUT_S` (default 3600) bounds a wedged turn.
+- Results live in the in-memory session store: polling refreshes the session
+  TTL, but a gateway restart drops unfetched results (the conversation itself
+  rehydrates from the on-disk transcript).
 
 ## Terms
 

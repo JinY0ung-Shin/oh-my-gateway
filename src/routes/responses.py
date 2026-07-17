@@ -33,6 +33,7 @@ from src.response_models import (
     FunctionCallOutputInput,
     FunctionCallOutputItem,
     ResponseDeletedObject,
+    ResponseIncompleteDetails,
     ResponseObject,
     OutputItem,
     ReasoningContent,
@@ -60,6 +61,51 @@ router = APIRouter()
 
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
 NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_MS / 1000
+
+
+def _background_response_timeout_s() -> float:
+    """Wall-clock cap for one background turn (``BACKGROUND_RESPONSE_TIMEOUT_S``).
+
+    A background turn has no HTTP connection whose disconnect would bound it,
+    so a wedged backend would otherwise hold the session lock and its SDK
+    subprocess forever.
+    """
+    try:
+        return float(os.getenv("BACKGROUND_RESPONSE_TIMEOUT_S", "3600"))
+    except ValueError:
+        return 3600.0
+
+
+# In-flight and failed background turns keyed by response id. Every mutation
+# happens on the event loop with no await between read and write, so no lock
+# is needed. Committed turns leave the registry (GET serves them from the
+# session's turn store); failed turns stay retrievable until their session
+# expires or the turn is retried — a retry reuses the same response id (the
+# turn counter never advanced) and simply overwrites the entry.
+_BACKGROUND_RUNS: Dict[str, Dict[str, Any]] = {}
+# Strong refs: asyncio holds tasks weakly, and a GC'd task would kill a
+# background turn mid-flight.
+_BACKGROUND_RESPONSE_TASKS: set = set()
+
+
+def _register_background_run(response_id: str, session_id: str, payload: Dict[str, Any]) -> None:
+    _BACKGROUND_RUNS[response_id] = {"session_id": session_id, "payload": payload}
+
+
+def _set_background_run_status(response_id: str, status: str) -> None:
+    run = _BACKGROUND_RUNS.get(response_id)
+    if run is not None:
+        run["payload"]["status"] = status
+
+
+def _set_background_run_payload(response_id: str, payload: Dict[str, Any]) -> None:
+    run = _BACKGROUND_RUNS.get(response_id)
+    if run is not None:
+        run["payload"] = payload
+
+
+def _drop_background_run(response_id: str) -> None:
+    _BACKGROUND_RUNS.pop(response_id, None)
 
 
 def _generate_msg_id() -> str:
@@ -510,6 +556,23 @@ def _validate_response_continuation(body: ResponseCreateRequest) -> None:
                         "to the original session."
                     ),
                 )
+
+
+def _validate_background_request(body: ResponseCreateRequest) -> None:
+    """400 on request shapes background mode does not support."""
+    if body.stream:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "background=true does not support stream=true yet. Create the "
+                "response without stream and poll GET /v1/responses/{response_id}."
+            ),
+        )
+    if body.store is False:
+        raise HTTPException(
+            status_code=400,
+            detail="background=true requires store=true so the result can be retrieved.",
+        )
 
 
 def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tuple[str, Any]:
@@ -1347,6 +1410,329 @@ async def _raise_for_error_chunks(
         )
 
 
+async def _create_background_response(
+    body: ResponseCreateRequest,
+    resolved: ResolvedModel,
+    backend: "BackendClient",
+    session,
+    session_id: str,
+    is_new_session: bool,
+    prompt: Any,
+    system_prompt: Optional[str],
+    workspace_str: str,
+    forward_headers: Optional[Dict[str, str]],
+) -> Dict[str, Any]:
+    """Accept a background turn: guard, lock, spawn the runner, return queued.
+
+    Mirrors the streaming path's manual lock protocol: preflight acquires
+    ``session.lock`` here and the detached runner's ``finally`` releases it,
+    so the session serializes turns exactly as it does for connected
+    requests. All session-guard errors (stale/future turn, backend mismatch,
+    client creation failure) surface synchronously as proper HTTP statuses —
+    only backend execution happens after the queued response is returned.
+    """
+    preflight = await _responses_streaming_preflight(
+        body,
+        resolved,
+        session,
+        session_id,
+        is_new_session,
+        workspace_str=workspace_str,
+    )
+    try:
+        await _ensure_response_session_client(
+            body,
+            resolved,
+            backend,
+            session,
+            session_id,
+            is_new_session,
+            system_prompt,
+            workspace_str,
+            forward_headers=forward_headers,
+        )
+        next_turn = preflight["next_turn"]
+        resp_id = _make_response_id(session_id, next_turn)
+        await _begin_active_response(session, resp_id, next_turn, session.client)
+    except Exception:
+        if preflight["lock_acquired"]:
+            session.lock.release()
+        raise
+
+    queued = ResponseObject(
+        id=resp_id,
+        status="queued",
+        model=body.model,
+        metadata=body.metadata or {},
+        background=True,
+    )
+    # Two separate dumps: the registry copy is mutated by the runner
+    # (queued → in_progress) and must not alias the object being returned.
+    _register_background_run(resp_id, session_id, queued.model_dump())
+
+    task = asyncio.get_running_loop().create_task(
+        _run_background_response(
+            body,
+            resolved,
+            backend,
+            session,
+            session_id,
+            resp_id,
+            next_turn,
+            prompt,
+            lock_acquired=preflight["lock_acquired"],
+        )
+    )
+    _BACKGROUND_RESPONSE_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_RESPONSE_TASKS.discard)
+    return queued.model_dump()
+
+
+async def _run_background_response(
+    body: ResponseCreateRequest,
+    resolved: ResolvedModel,
+    backend: "BackendClient",
+    session,
+    session_id: str,
+    resp_id: str,
+    next_turn: int,
+    prompt: Any,
+    *,
+    lock_acquired: bool,
+) -> None:
+    """Detached runner for one background turn.
+
+    Owns the session lock acquired by the accept path and the session's
+    active-response slot; both are always released in ``finally``. Terminal
+    outcomes mirror the connected paths: success commits the turn exactly
+    like the non-stream handler, a cancel (POST .../cancel) commits a
+    continuable ``incomplete`` turn like a streamed interrupt, and failures
+    leave the turn uncommitted (retry reuses the same previous_response_id)
+    but keep a retrievable ``failed`` payload in the run registry.
+    """
+    import time as _time
+
+    _usage_start = _time.monotonic()
+    request_context = {
+        "session_id": session_id,
+        "user": body.user,
+        "backend": resolved.backend,
+        "provider_model": resolved.provider_model,
+        "previous_response_id": body.previous_response_id,
+        "turn": next_turn,
+    }
+    active_client = session.client
+    chunks: List[Any] = []
+    terminal_state = "failed"
+
+    async def _log_usage(status: str, error_code: Optional[str] = None) -> None:
+        try:
+            await usage_logger.log_turn_from_context(
+                request_context=request_context,
+                response_id=resp_id,
+                model=body.model,
+                chunks=chunks,
+                tool_stats=None,
+                started_monotonic=_usage_start,
+                status=status,
+                error_code=error_code,
+            )
+        except Exception:
+            logger.warning("usage-log emit failed (background)", exc_info=True)
+
+    def _fail(code: str, message: str) -> None:
+        failed = _build_failed_response(
+            resp_id, body.model, body.metadata, code=code, message=message
+        )
+        failed.background = True
+        _set_background_run_payload(resp_id, failed.model_dump())
+
+    def _commit_user_turn(assistant_message: Optional[Message]) -> None:
+        session.turn_counter = next_turn
+        session.add_messages([Message(role="user", content=prompt)])
+        if assistant_message is not None:
+            session_manager.add_assistant_response(session_id, assistant_message)
+
+    try:
+        _set_background_run_status(resp_id, "in_progress")
+        _configure_client_streaming(active_client, False)
+
+        async def _collect() -> None:
+            backend_source = backend.run_completion_with_client(active_client, prompt, session)
+            async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
+                chunks.append(chunk)
+                # No HTTP connection refreshes this session while the turn
+                # runs — keep it alive as long as the backend is producing.
+                session.touch()
+
+        try:
+            # wait_for (not asyncio.timeout) — the gateway supports 3.10, and
+            # its inner task keeps SDK anyio cancel scopes task-local.
+            await asyncio.wait_for(_collect(), timeout=_background_response_timeout_s())
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.error("Background response %s timed out", resp_id)
+            _fail("timeout", "Background response timed out")
+            await _log_usage("failed", "timeout")
+            await _disconnect_session_client(session, "background timeout", client=active_client)
+            return
+
+        # Cancel endpoint interrupt → committed, continuable incomplete turn
+        # (same semantics as a streamed interrupt).
+        if any(isinstance(chunk, dict) and chunk.get("gateway_interrupted") for chunk in chunks):
+            assistant_text = backend.parse_message(chunks) or ""
+            visible_text, thinking_texts = _split_assistant_text_and_thinking(
+                chunks, assistant_text
+            )
+            prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
+                chunks,
+                prompt,
+                visible_text or "\n".join(thinking_texts),
+                body.model,
+                backend=backend,
+            )
+            incomplete_resp = ResponseObject(
+                id=resp_id,
+                model=body.model,
+                status="incomplete",
+                output=[
+                    OutputItem(
+                        id=_generate_msg_id(),
+                        status="incomplete",
+                        content=[ResponseContentPart(text=visible_text)],
+                    )
+                ],
+                usage=ResponseUsage(
+                    input_tokens=prompt_tokens, output_tokens=completion_tokens
+                ),
+                metadata=body.metadata or {},
+                incomplete_details=ResponseIncompleteDetails(reason="user_cancelled"),
+                background=True,
+            )
+            _commit_user_turn(
+                _build_session_assistant_message(visible_text, thinking_texts)
+                or Message(role="assistant", content="")
+            )
+            _record_turn_response(session, next_turn, incomplete_resp, store=body.store)
+            _log_session_assistant_write(
+                path="responses.background.interrupted",
+                session_id=session_id,
+                turn=next_turn,
+                visible_text=visible_text,
+                thinking_texts=thinking_texts,
+            )
+            await _log_usage("incomplete", "user_cancelled")
+            _drop_background_run(resp_id)
+            terminal_state = "incomplete"
+            return
+
+        # Terminal backend error chunks → failed, turn uncommitted. The
+        # classifier's messages are SDK-curated (rate limit, auth, ...), safe
+        # to store for retrieval — same policy as the synchronous path.
+        error_info = None
+        for chunk in chunks:
+            error_info = classify_error_chunk(chunk)
+            if error_info is not None:
+                break
+        if error_info is not None:
+            logger.error(
+                "Background response %s: backend error chunk: %s (code=%s)",
+                resp_id,
+                error_info["message"],
+                error_info["code"],
+            )
+            _fail(error_info["code"], f"Backend error: {error_info['message']}")
+            await _log_usage("failed", error_info["code"])
+            await _disconnect_session_client(
+                session, "background backend error", client=active_client
+            )
+            return
+
+        # SDK paused on AskUserQuestion → requires_action, continuable with a
+        # normal (non-background) function_call_output POST.
+        if session.pending_tool_call is not None:
+            tc = session.pending_tool_call
+            requires_action_resp = _build_requires_action_response(
+                resp_id, body.model, tc, body.metadata
+            )
+            requires_action_resp.background = True
+            # Like the sync paths: a paused turn commits the user prompt but
+            # no assistant message — the answer arrives on the continuation.
+            _commit_user_turn(None)
+            _record_turn_response(session, next_turn, requires_action_resp, store=body.store)
+            _drop_background_run(resp_id)
+            terminal_state = "completed"
+            return
+
+        assistant_text = backend.parse_message(chunks) or ""
+        visible_text, thinking_texts = _split_assistant_text_and_thinking(chunks, assistant_text)
+        assistant_message = _build_session_assistant_message(visible_text, thinking_texts)
+        if assistant_message is None:
+            _fail("server_error", "No response from backend")
+            await _log_usage("failed", "empty_response")
+            await _disconnect_session_client(
+                session, "background empty response", client=active_client
+            )
+            return
+
+        _commit_user_turn(assistant_message)
+        _log_session_assistant_write(
+            path="responses.background",
+            session_id=session_id,
+            turn=next_turn,
+            visible_text=visible_text,
+            thinking_texts=thinking_texts,
+        )
+        usage_text = assistant_text or visible_text or "\n".join(thinking_texts)
+        prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(
+            chunks, prompt, usage_text, body.model, backend=backend
+        )
+        response_obj = _build_completed_response(
+            resp_id,
+            body.model,
+            visible_text,
+            body.metadata,
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            thinking_texts=thinking_texts,
+            structured_output=streaming_utils.extract_structured_output(chunks),
+        )
+        response_obj.background = True
+        _record_turn_response(session, next_turn, response_obj, store=body.store)
+        await _log_usage("completed")
+        _drop_background_run(resp_id)
+        terminal_state = "completed"
+    except asyncio.CancelledError:
+        # Server shutdown or task cancellation — leave a retrievable failed
+        # payload; the uncommitted turn stays continuable from the previous id.
+        _fail("server_error", "Background response aborted by server shutdown")
+        raise
+    except Exception:
+        logger.error("Background response %s failed", resp_id, exc_info=True)
+        # Never store raw exception text — same redaction policy as the
+        # synchronous path (backend errors can leak paths or commands).
+        _fail("server_error", "Internal server error")
+        await _log_usage("failed", "server_error")
+        await _disconnect_session_client(session, "background failure", client=active_client)
+    finally:
+        try:
+            session.touch()
+            try:
+                await _finish_active_response(session, resp_id, terminal_state)
+            except BaseException:
+                # Cancelled during teardown — clear the slot synchronously so
+                # ``is_expired``'s active-turn pin cannot outlive the run.
+                if session.active_response_id == resp_id:
+                    session.active_response_state = terminal_state
+                    session.active_response_id = None
+                    session.active_response_turn = None
+                    session.active_response_client = None
+                    session.active_response_done.set()
+                raise
+        finally:
+            if lock_acquired:
+                session.lock.release()
+
+
 @router.post("/v1/responses")
 @rate_limit_endpoint("responses")
 async def create_response(
@@ -1385,6 +1771,8 @@ async def create_response(
 
     is_new_session = body.previous_response_id is None
     _validate_response_continuation(body)
+    if body.background:
+        _validate_background_request(body)
     session_id, session = _resolve_response_session(body, resolved.backend)
     workspace = await _resolve_response_workspace(
         body, session, session_id, is_new_session, resolved.backend
@@ -1398,6 +1786,14 @@ async def create_response(
     # ------------------------------------------------------------------
     fc_output = _detect_function_call_output(body.input)
     if fc_output is not None:
+        if body.background:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "background=true cannot continue a function_call_output "
+                    "turn; send the continuation without background."
+                ),
+            )
         return await _handle_function_call_output(
             body, resolved, backend, session, session_id, workspace_str, fc_output
         )
@@ -1426,6 +1822,20 @@ async def create_response(
     # backend; other backends pass through unchanged.
     if isinstance(prompt, str):
         await _validate_backend_prompt(resolved, prompt, workspace_str)
+
+    if body.background:
+        return await _create_background_response(
+            body,
+            resolved,
+            backend,
+            session,
+            session_id,
+            is_new_session,
+            prompt,
+            system_prompt,
+            workspace_str,
+            forward_headers,
+        )
 
     if body.stream:
         # Run preflight BEFORE StreamingResponse so HTTPExceptions produce
@@ -2148,13 +2558,14 @@ async def cancel_response(
     user: Optional[str] = None,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Interrupt an active streamed response while preserving its session.
+    """Interrupt an active streamed or background response, preserving its session.
 
     The active turn has not yet advanced ``session.turn_counter``, so this
     endpoint intentionally does not use ``_lookup_stored_response``.  It
     resolves the session encoded in the response id, verifies ownership, then
     transitions the separate active-response state machine before sending the
-    backend control request.
+    backend control request. Background turns commit the partial output as a
+    continuable ``incomplete`` turn, exactly like a streamed interrupt.
     """
     await verify_api_key(request, credentials)
     parsed = _parse_response_id(response_id)
@@ -2233,6 +2644,12 @@ async def get_response(
 ):
     """OpenAI-compatible retrieve: return the stored response for a past turn.
 
+    Background turns (``background=true``) are served from the in-flight run
+    registry while they are ``queued``/``in_progress`` and after a failure;
+    once committed they are read from the session's turn store like any other
+    turn. Polling a background response refreshes the session TTL, so an
+    actively watched run cannot expire out from under its poller.
+
     Responses are recorded per turn on the in-memory session at commit time,
     so retrieval is subject to the session TTL. Turns created with
     ``store=false`` and sessions rehydrated from the on-disk jsonl transcript
@@ -2245,6 +2662,15 @@ async def get_response(
     alone grants access, matching GET /v1/sessions semantics.
     """
     await verify_api_key(request, credentials)
+    run = _BACKGROUND_RUNS.get(response_id)
+    if run is not None:
+        run_session = session_manager.get_session(run["session_id"])
+        if run_session is None:
+            _drop_background_run(response_id)
+            raise _response_not_found(response_id)
+        if user is not None and run_session.user != user:
+            raise _response_not_found(response_id)
+        return dict(run["payload"])
     session, _session_id, turn = _lookup_stored_response(response_id, user)
     payload = session.get_turn_response(turn)
     if payload is None:

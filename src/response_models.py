@@ -123,6 +123,16 @@ class ResponseCreateRequest(BaseModel):
     stream: Optional[bool] = False
     metadata: Optional[Dict[str, str]] = None
     store: Optional[bool] = True
+    background: Optional[bool] = Field(
+        default=False,
+        description=(
+            "Run the turn in the background: POST returns immediately with a "
+            "'queued' response object and the turn continues server-side. "
+            "Poll GET /v1/responses/{response_id} for progress and the final "
+            "payload; POST /v1/responses/{response_id}/cancel interrupts it. "
+            "Requires store=true; stream=true is not supported yet."
+        ),
+    )
     temperature: Optional[float] = None
     max_output_tokens: Optional[int] = None
     allowed_tools: Optional[List[str]] = Field(
@@ -244,9 +254,9 @@ class ResponseObject(BaseModel):
     id: str
     object: Literal["response"] = "response"
     created_at: int = Field(default_factory=lambda: int(time.time()))
-    status: Literal["completed", "in_progress", "incomplete", "failed", "requires_action"] = (
-        "completed"
-    )
+    status: Literal[
+        "queued", "in_progress", "completed", "incomplete", "failed", "requires_action"
+    ] = "completed"
     model: str = ""
     output: List[Union[OutputItem, FunctionCallOutputItem, ReasoningOutputItem]] = Field(
         default_factory=list
@@ -261,4 +271,8 @@ class ResponseObject(BaseModel):
             "Parsed Structured Outputs payload from the backend (ResultMessage"
             ".structured_output) when the request set text.format json_schema."
         ),
+    )
+    background: Optional[bool] = Field(
+        default=None,
+        description="True when the turn was created with background=true.",
     )

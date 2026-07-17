@@ -236,6 +236,12 @@ class Session:
     def is_expired(self) -> bool:
         """Check if the session has expired."""
         assert self.expires_at is not None
+        if self.active_response_id is not None:
+            # An in-flight turn (streamed or background) pins the session:
+            # expiring it would orphan the running SDK client and strand the
+            # response id a client may still poll or cancel. The turn's
+            # teardown always clears the slot and touches the session.
+            return False
         return _utcnow() > self.expires_at
 
     def to_session_info(self) -> SessionInfo:
