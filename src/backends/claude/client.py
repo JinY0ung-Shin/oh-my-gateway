@@ -1003,6 +1003,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         ``session.stream_break_event`` to signal this loop to stop
         yielding so the route can emit function_call + requires_action.
         """
+        # The between-turn idle reader (src.session_outbox) must release the
+        # client's message stream before this turn reads it — and before
+        # query() is written, so it can never consume this turn's messages.
+        from src.session_outbox import pause_idle_reader
+
+        await pause_idle_reader(session)
+
         # Provide an event the hook can signal to break streaming
         break_event = asyncio.Event()
         session.stream_break_event = break_event
@@ -1077,6 +1084,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         continues processing from where it left off.  A new ``query()``
         call is unnecessary because the original request is still active.
         """
+        from src.session_outbox import pause_idle_reader
+
+        await pause_idle_reader(session)
         try:
             async for message in client.receive_response():
                 converted = self._convert_message(message)

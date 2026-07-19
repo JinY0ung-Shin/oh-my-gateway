@@ -42,6 +42,7 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.rate_limiter import rate_limit_endpoint
+from src import session_outbox
 from src.chunk_processing import classify_error_chunk
 from src.constants import DEFAULT_TIMEOUT_MS
 from src.mcp_config import get_mcp_servers
@@ -435,6 +436,7 @@ def _log_session_assistant_write(
 
 async def _disconnect_session_client(session, reason: str, client=None) -> None:
     """Drop and disconnect a persistent SDK client after stream failure/cancel."""
+    await session_outbox.pause_idle_reader(session)
     if client is None:
         client = getattr(session, "client", None)
     if client is None:
@@ -475,6 +477,11 @@ async def _finish_active_response(session, response_id: str, terminal_state: str
         session.active_response_turn = None
         session.active_response_client = None
         session.active_response_done.set()
+    # Turn over — hand the client's message stream back to the between-turn
+    # idle reader so background task events keep flowing into the outbox.
+    # (No-op for non-Claude clients, paused AskUserQuestion turns, and dropped
+    # clients; a queued next turn pauses it again before reading.)
+    session_outbox.resume_idle_reader(session)
 
 
 def _configure_client_streaming(client: Any, enabled: bool) -> None:
@@ -1315,6 +1322,9 @@ def _is_codex_pending_approval_chunk(
 
 async def _capture_pending_tool_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
+        # Keep the outbox's active-task registry aware of tasks started
+        # mid-turn (they outlive the turn while the idle reader is off).
+        session_outbox.apply_turn_task_chunk(session, chunk)
         if _is_codex_pending_approval_chunk(resolved, session, chunk):
             close = getattr(chunk_source, "aclose", None)
             if callable(close):
@@ -2213,6 +2223,7 @@ async def create_response(
     except Exception:
         logger.warning("usage-log emit failed (non-stream)", exc_info=True)
 
+    session_outbox.resume_idle_reader(session)
     return response_obj.model_dump()
 
 
@@ -2509,6 +2520,7 @@ async def _handle_function_call_output(
                 session, "responses continuation non-stream failure", client=active_client
             )
         session.lock.release()
+        session_outbox.resume_idle_reader(session)
 
     usage_text = assistant_text or visible_text or "\n".join(thinking_texts)
     prompt_tokens, completion_tokens = streaming_utils.resolve_token_usage(

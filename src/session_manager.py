@@ -139,6 +139,26 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
         return None
 
 
+def _cancel_idle_reader(session: "Session") -> None:
+    """Stop a session's between-turn idle reader without awaiting it.
+
+    Teardown paths call this before disconnecting the SDK client so the
+    reader task never outlives the session. Field-level (no
+    ``src.session_outbox`` import) to keep this module dependency-free.
+    """
+    stop_event = getattr(session, "idle_reader_stop", None)
+    if stop_event is not None:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+    task = getattr(session, "idle_reader_task", None)
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        session.idle_reader_task = None
+
+
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.now(timezone.utc)
@@ -179,6 +199,12 @@ class Session:
     input_response: Optional[str] = None
     pending_tool_call: Optional[Dict[str, Any]] = None
     stream_break_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
+
+    # Between-turn idle reader + captured-event outbox (src.session_outbox).
+    # ``outbox`` is a SessionOutbox created lazily by the reader/endpoint.
+    outbox: Optional[Any] = field(default=None, repr=False, compare=False)
+    idle_reader_task: Optional[Any] = field(default=None, repr=False, compare=False)
+    idle_reader_stop: Optional[Any] = field(default=None, repr=False, compare=False)
 
     # In-flight Responses API turn.  This state is deliberately guarded by a
     # separate lock from ``lock``: streaming turns hold ``lock`` for their
@@ -311,6 +337,7 @@ class SessionManager:
                     logger.info(f"Cleaned up expired session: {sid}")
                     doomed.append((sid, session))
         for sid, session in doomed:
+            _cancel_idle_reader(session)
             if session.client is not None:
                 try:
                     await session.client.disconnect()
@@ -422,6 +449,7 @@ class SessionManager:
         # can hang if its internal anyio channel is already dead (common after long-running
         # servers accumulate stale sessions).
         async def _disconnect(session: "Session") -> None:
+            _cancel_idle_reader(session)
             if session.client is None:
                 return
             try:
@@ -536,6 +564,7 @@ class SessionManager:
             session = self.sessions.pop(session_id, None)
             if session is None:
                 return False
+        _cancel_idle_reader(session)
         if session.client is not None:
             logger.warning(
                 "Deleted session %s with an active client; use delete_session_async "
@@ -554,6 +583,7 @@ class SessionManager:
         if session is None:
             return False
 
+        _cancel_idle_reader(session)
         if session.client is not None:
             try:
                 await asyncio.wait_for(session.client.disconnect(), timeout=2.0)

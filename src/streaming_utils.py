@@ -1132,6 +1132,17 @@ async def stream_response_chunks(
                     event.get("type"),
                 )
             text_delta, in_thinking = extract_stream_event_delta(chunk, in_thinking)
+            # Subagent text/thinking deltas are internal narration — suppress
+            # them like the citations gate above (SUBAGENT_STREAM_TEXT).
+            # ``extract_stream_event_delta`` already advanced ``in_thinking``
+            # so block tracking stays consistent. Tool-block events still
+            # stream below (SUBAGENT_STREAM_TOOL_BLOCKS governs those).
+            if (
+                text_delta is not None
+                and chunk.get("parent_tool_use_id") is not None
+                and not SUBAGENT_STREAM_TEXT
+            ):
+                continue
             if text_delta is not None:
                 token_streaming = True
                 # Open a reasoning output_item on the first thinking delta of a
@@ -1272,6 +1283,15 @@ async def stream_response_chunks(
 
             # Content chunks (assistant messages, results)
             chunks_buffer.append(chunk)
+            # Same subagent-text suppression for whole assistant chunks (the
+            # non-token-streaming path a background agent's buffered messages
+            # arrive through).
+            if (
+                chunk.get("parent_tool_use_id") is not None
+                and not SUBAGENT_STREAM_TEXT
+                and chunk.get("type") == "assistant"
+            ):
+                continue
             text = format_chunk_content(chunk, content_sent)
             if text:
                 if not message_item_opened:

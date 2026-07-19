@@ -242,6 +242,7 @@ Primary endpoints:
 - `POST /v1/agents/messages` (stateless Claude SDK event stream)
 - `GET /v1/models`
 - `GET /v1/sessions`
+- `GET /v1/sessions/{session_id}/pending-events?after=<seq>&user=<name>` (between-turn outbox: background task lifecycle + assistant messages captured by the session's idle reader; cursor-paged, polling refreshes the session TTL)
 - `GET /v1/auth/status`
 - `GET /v1/mcp/servers`
 - `GET /health`
