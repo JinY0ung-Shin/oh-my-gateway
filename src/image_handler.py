@@ -105,6 +105,42 @@ class ImageHandler:
         return self.save_base64_image(b64data, media_type)
 
     # ------------------------------------------------------------------
+    # Native content-block conversion (no disk round-trip)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def data_url_to_image_block(image_url: str) -> dict:
+        """Convert a ``data:`` URL into a native Anthropic image content block.
+
+        Runs the same validation as the save path (supported media type,
+        well-formed base64, size limit) but never touches disk — the block is
+        sent inline to the SDK so the model receives pixels directly instead
+        of depending on a Read-tool round-trip (issue #140).
+        """
+        media_type, b64data = ImageHandler.parse_data_url(image_url)
+
+        if media_type not in SUPPORTED_MEDIA_TYPES:
+            raise ValueError(
+                f"Unsupported image type: {media_type}. "
+                f"Supported: {', '.join(sorted(SUPPORTED_MEDIA_TYPES))}"
+            )
+
+        try:
+            image_bytes = base64.b64decode(b64data, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("Malformed image base64 payload") from exc
+
+        if len(image_bytes) > MAX_IMAGE_SIZE:
+            raise ValueError(
+                f"Image size {len(image_bytes)} bytes exceeds {MAX_IMAGE_SIZE} byte limit"
+            )
+
+        return {
+            "type": "image",
+            "source": {"type": "base64", "media_type": media_type, "data": b64data},
+        }
+
+    # ------------------------------------------------------------------
     # Cleanup
     # ------------------------------------------------------------------
 

@@ -10,7 +10,7 @@ import tempfile
 import atexit
 import shutil
 import contextlib
-from typing import AsyncGenerator, Dict, Any, Literal, Optional, List, cast
+from typing import AsyncGenerator, Dict, Any, Literal, Optional, List, Union, cast
 from pathlib import Path
 import logging
 
@@ -986,16 +986,34 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return client
 
+    @staticmethod
+    async def _stream_user_content_blocks(
+        content_blocks: List[Dict[str, Any]],
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Wrap Anthropic content blocks as a single SDK streaming-input message.
+
+        Mirrors the message shape ``ClaudeSDKClient.query()`` builds for plain
+        strings, but with block-list content so inline image blocks reach the
+        model directly (issue #140). ``query()`` fills in ``session_id``.
+        """
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": content_blocks},
+            "parent_tool_use_id": None,
+        }
+
     async def run_completion_with_client(
         self,
         client: ClaudeSDKClient,
-        prompt: str,
+        prompt: Union[str, List[Dict[str, Any]]],
         session,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Run a completion turn on an existing *client*.
 
         Sends *prompt* via ``client.query()`` then yields converted
-        message dicts from ``client.receive_response()``.  On error the
+        message dicts from ``client.receive_response()``.  A list prompt is
+        a list of native Anthropic content blocks (multimodal turn) and is
+        sent as SDK streaming input.  On error the
         session's client reference is cleared so the caller can detect
         the broken connection and create a fresh client.
 
@@ -1016,7 +1034,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         get_next = None
         wait_break = None
         try:
-            await client.query(prompt)
+            if isinstance(prompt, str):
+                await client.query(prompt)
+            else:
+                await client.query(self._stream_user_content_blocks(prompt))
             response_iter = client.receive_response().__aiter__()
             while True:
                 # Race: next message vs hook-fired break signal
