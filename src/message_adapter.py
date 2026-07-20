@@ -214,6 +214,70 @@ class MessageAdapter:
         return "\n\n".join(parts)
 
     @staticmethod
+    def response_input_to_claude_blocks(input_data) -> list:
+        """Convert Responses API input to native Anthropic content blocks.
+
+        Used for multimodal Claude turns: ``input_image`` parts become inline
+        ``{"type": "image", "source": {...}}`` blocks (no disk round-trip, no
+        ``<attached_image>`` placeholder — issue #140), text parts become
+        ``{"type": "text", ...}`` blocks with the same ``filter_content``
+        treatment as the collapsed-string path. Part order within and across
+        messages is preserved; no separator text is injected — content blocks
+        are already structurally delimited for the model.
+
+        Raises ``ValueError`` for invalid image payloads (non-``data:`` URL,
+        unsupported media type, malformed base64, oversize).
+        """
+        from src.image_handler import ImageHandler
+
+        if isinstance(input_data, str):
+            filtered = MessageAdapter.filter_content(input_data)
+            return [{"type": "text", "text": filtered}] if filtered else []
+
+        blocks: list = []
+        for item in input_data:
+            content = item.content
+
+            if isinstance(content, str):
+                parts: list = [{"type": "text", "text": content}] if content else []
+            elif isinstance(content, list):
+                parts = []
+                for part in content:
+                    ptype = (
+                        part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
+                    )
+                    text_part = (
+                        part.get("text") if isinstance(part, dict) else getattr(part, "text", "")
+                    )
+
+                    if text_part:
+                        parts.append({"type": "text", "text": text_part})
+                    elif ptype == "input_image":
+                        image_url = (
+                            part.get("image_url", "")
+                            if isinstance(part, dict)
+                            else getattr(part, "image_url", "")
+                        )
+                        if image_url:
+                            parts.append(ImageHandler.data_url_to_image_block(image_url))
+            else:
+                continue
+
+            blocks.extend(parts)
+
+        # Apply the same content filtering the string path gets, per text block.
+        filtered_blocks: list = []
+        for block in blocks:
+            if block.get("type") == "text":
+                text = MessageAdapter.filter_content(block["text"])
+                if not text:
+                    continue
+                filtered_blocks.append({"type": "text", "text": text})
+            else:
+                filtered_blocks.append(block)
+        return filtered_blocks
+
+    @staticmethod
     def estimate_tokens(text: str) -> int:
         """
         Rough estimation of token count.

@@ -125,10 +125,11 @@ class BackendClient(Protocol):
         """Execute a turn against an existing backend client.
 
         ``prompt`` may be either a plain string or a list of backend-native
-        input items. Backends that don't carry multimodal payloads natively
-        (Claude, OpenCode) should ignore the list shape; only Codex emits a
-        list, and only when the request body carried Codex-supported
-        multimodal parts.
+        input items, emitted only when the request body carried natively
+        supported multimodal parts: Codex receives Codex turn-input items,
+        Claude receives Anthropic content blocks (inline images, issue #140).
+        Backends that don't carry multimodal payloads natively (OpenCode)
+        never see the list shape.
         """
         ...
 

@@ -763,12 +763,12 @@ def _response_prompt_and_system(
     return MessageAdapter.filter_content(prompt), system_prompt
 
 
-_CODEX_SUPPORTED_INPUT_PART_TYPES = frozenset({"input_image"})
+_NATIVE_IMAGE_INPUT_PART_TYPES = frozenset({"input_image"})
 
 
 def _has_multimodal_input(body: ResponseCreateRequest) -> bool:
-    """True when the request carries an input part Codex can carry natively
-    (currently only ``input_image``).
+    """True when the request carries an input part a backend can carry
+    natively (currently only ``input_image``; Claude and Codex).
 
     Narrow on purpose: an unknown type alone would otherwise route us into
     the multimodal branch and then drop out as an empty items list.
@@ -781,9 +781,27 @@ def _has_multimodal_input(body: ResponseCreateRequest) -> bool:
             continue
         for part in content:
             ptype = part.get("type") if isinstance(part, dict) else getattr(part, "type", None)
-            if ptype in _CODEX_SUPPORTED_INPUT_PART_TYPES:
+            if ptype in _NATIVE_IMAGE_INPUT_PART_TYPES:
                 return True
     return False
+
+
+def _response_prompt_blocks_and_system(
+    body: ResponseCreateRequest,
+) -> tuple[list, Optional[str]]:
+    """Build native Anthropic content blocks from a multimodal Responses request.
+
+    Claude counterpart of ``_response_input_to_codex_items``: ``input_image``
+    parts become inline ``{"type": "image", ...}`` blocks passed to the SDK as
+    streaming input, so the model receives pixels directly instead of a
+    ``<attached_image>`` path placeholder + Read-tool round-trip (issue #140).
+    """
+    system_prompt, input_for_prompt = _split_response_input(body)
+    try:
+        blocks = MessageAdapter.response_input_to_claude_blocks(input_for_prompt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return blocks, system_prompt
 
 
 def _response_input_to_codex_items(
@@ -1824,6 +1842,17 @@ async def create_response(
                 detail="Codex multimodal input produced no usable items",
             )
         prompt: Any = codex_items
+    elif resolved.backend == "claude" and _has_multimodal_input(body):
+        # Claude carries images as native inline content blocks (issue #140) —
+        # no disk round-trip, no <attached_image> placeholder, no Read-tool
+        # dependency for the model to see the pixels.
+        prompt, system_prompt = _response_prompt_blocks_and_system(body)
+        if not prompt:
+            # Defensive — same rationale as the Codex branch above.
+            raise HTTPException(
+                status_code=400,
+                detail="Multimodal input produced no usable content blocks",
+            )
     else:
         prompt, system_prompt = _response_prompt_and_system(body, workspace)
 
@@ -1832,6 +1861,17 @@ async def create_response(
     # backend; other backends pass through unchanged.
     if isinstance(prompt, str):
         await _validate_backend_prompt(resolved, prompt, workspace_str)
+    elif resolved.backend == "claude":
+        # Block-mode prompts get the same slash validation on their text.
+        await _validate_backend_prompt(
+            resolved,
+            "\n".join(
+                b.get("text", "")
+                for b in prompt
+                if isinstance(b, dict) and b.get("type") == "text"
+            ),
+            workspace_str,
+        )
 
     if body.background:
         return await _create_background_response(
