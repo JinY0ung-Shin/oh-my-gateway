@@ -1,5 +1,9 @@
 # Codex Backend
 
+> **STALE — frozen since 2026-07.** This backend is unmaintained: its tests are excluded from the
+> default suite and the code receives no updates. It still registers when enabled but may break
+> without notice. These docs describe the state at freeze time.
+
 The Codex backend is an opt-in gateway backend for the local Codex harness.
 It uses `codex app-server --listen stdio://` and drives the app-server JSON-RPC
 protocol directly.

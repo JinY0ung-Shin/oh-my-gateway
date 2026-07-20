@@ -1,7 +1,7 @@
 [project]
 name = "oh-my-gateway"
 version = "2.3.0"
-description = "OpenAI-compatible gateway for Claude Agent SDK, OpenCode, and Codex"
+description = "OpenAI-compatible gateway for the Claude Agent SDK (OpenCode/Codex backends are stale)"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
@@ -56,6 +56,9 @@ addopts = "-m 'not e2e'"
 
 [tool.coverage.run]
 source = ["src"]
+# Stale backends (frozen 2026-07): their tests are deselected by default, so
+# keep them out of the coverage denominator.
+omit = ["src/backends/opencode/*", "src/backends/codex/*"]
 
 [tool.coverage.report]
 exclude_lines = ["pragma: no cover", "if __name__"]

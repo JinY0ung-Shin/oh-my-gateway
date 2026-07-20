@@ -5,7 +5,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/JinY0ung-Shin/oh-my-gateway)
 [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-OpenAI-compatible gateway for coding agent backends. It exposes Claude Agent SDK, OpenCode, and Codex through `/v1/responses`, plus a stateless Claude SDK event stream at `/v1/agents/messages`, with MCP integration, workspace isolation, and an admin dashboard.
+OpenAI-compatible gateway for coding agent backends. It exposes the Claude Agent SDK through `/v1/responses`, plus a stateless Claude SDK event stream at `/v1/agents/messages`, with MCP integration, workspace isolation, and an admin dashboard. OpenCode and Codex backends are still in the tree but **stale** (frozen since July 2026, unmaintained).
 
 > Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose service is now `gateway`; update commands such as `docker compose logs claude-wrapper` to use `gateway`.
 
@@ -35,7 +35,7 @@ curl http://localhost:8000/v1/responses \
 - **Responses API**: `/v1/responses` with non-streaming and SSE streaming responses.
 - **Background mode**: `background: true` returns a `queued` response immediately and runs the turn server-side; poll `GET /v1/responses/{response_id}`, cancel with `POST /v1/responses/{response_id}/cancel`.
 - **Stateless agent API**: `/v1/agents/messages` with caller-owned history and Claude SDK events.
-- **Multiple backends**: Claude (`sonnet`, `opus`, `haiku`), OpenCode (`opencode/<provider>/<model>`), and experimental Codex (`codex/<model>`).
+- **Backends**: Claude (`sonnet`, `opus`, `haiku`) is the maintained backend. OpenCode (`opencode/<provider>/<model>`) and Codex (`codex/<model>`) are stale — kept frozen, unmaintained.
 - **Session continuity**: `previous_response_id` and server-side session tracking.
 - **Workspace isolation**: temporary sessions by default, or per-user directories with `USER_WORKSPACES_DIR`.
 - **MCP support**: shared gateway `MCP_CONFIG`, with optional OpenCode managed-mode config generation.
@@ -47,11 +47,11 @@ curl http://localhost:8000/v1/responses \
 | Topic | Doc |
 |-------|-----|
 | Claude backend setup, auth, workspaces, sandbox, MCP, subagents | [docs/claude-code/](docs/claude-code/) |
-| OpenCode backend overview and mode selection | [docs/opencode/](docs/opencode/) |
-| OpenCode managed mode | [docs/opencode/managed.md](docs/opencode/managed.md) |
-| OpenCode external mode | [docs/opencode/external.md](docs/opencode/external.md) |
-| OpenCode + LiteLLM recipes | [docs/opencode/litellm.md](docs/opencode/litellm.md) |
-| Experimental Codex backend setup and SDK status | [docs/codex/](docs/codex/) |
+| OpenCode backend overview and mode selection (stale) | [docs/opencode/](docs/opencode/) |
+| OpenCode managed mode (stale) | [docs/opencode/managed.md](docs/opencode/managed.md) |
+| OpenCode external mode (stale) | [docs/opencode/external.md](docs/opencode/external.md) |
+| OpenCode + LiteLLM recipes (stale) | [docs/opencode/litellm.md](docs/opencode/litellm.md) |
+| Codex backend setup and SDK status (stale) | [docs/codex/](docs/codex/) |
 | Streaming event reference | [docs/streaming-events.md](docs/streaming-events.md) |
 | System prompt presets | [docs/](docs/) |
 
@@ -64,21 +64,25 @@ BACKENDS=claude
 DEFAULT_MODEL=sonnet
 ```
 
-Enable OpenCode alongside Claude:
+> **Stale backends.** OpenCode and Codex are frozen as of July 2026 and receive no maintenance:
+> their tests are excluded from the default suite and the code is kept for reference only.
+> Enabling them still works today (with a startup warning) but they may break without notice.
+
+Enable the stale OpenCode backend alongside Claude:
 
 ```bash
 BACKENDS=claude,opencode
 OPENCODE_MODELS=openai/gpt-5.5
 ```
 
-Enable the experimental Codex backend alongside Claude:
+Enable the stale Codex backend alongside Claude:
 
 ```bash
 BACKENDS=claude,codex
 CODEX_MODELS=gpt-5.5
 ```
 
-The Codex backend is experimental. It is intended for local evaluation while the Codex CLI and SDK integration surface are still changing, so request behavior and configuration may change between releases. It uses the local `codex app-server` harness through JSON-RPC, not the OpenAI Responses API. The official Python SDK exists but is experimental and may not be installable from PyPI; see [docs/codex/](docs/codex/) for the current integration notes.
+The Codex backend uses the local `codex app-server` harness through JSON-RPC, not the OpenAI Responses API. It was still experimental when frozen; see [docs/codex/](docs/codex/) for the freeze-time integration notes.
 
 OpenCode has two modes:
 
@@ -111,7 +115,7 @@ Most settings are environment variables. Start with `.env.example`.
 |----------|---------|
 | `ANTHROPIC_AUTH_TOKEN` | Claude API key auth |
 | `CLAUDE_AUTH_METHOD` | Force `api_key` or `cli` auth |
-| `BACKENDS` | Backend allowlist, for example `claude,opencode,codex` |
+| `BACKENDS` | Backend allowlist; `claude` is the only maintained backend (`opencode`/`codex` are stale) |
 | `DEFAULT_MODEL` | Default model for requests without `model` |
 | `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
 | `MAX_TIMEOUT` | Backend timeout in milliseconds |
@@ -123,10 +127,10 @@ Most settings are environment variables. Start with `.env.example`.
 | `MCP_CONFIG` | Shared MCP server config |
 | `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
-| `OPENCODE_BASE_URL` | Enables OpenCode external mode |
-| `OPENCODE_MODELS` | Gateway allowlist for OpenCode models |
-| `CODEX_BIN` | Experimental Codex CLI binary name/path; default `codex` |
-| `CODEX_MODELS` | Gateway allowlist for Codex models; default `gpt-5.5` |
+| `OPENCODE_BASE_URL` | Enables OpenCode external mode (stale backend) |
+| `OPENCODE_MODELS` | Gateway allowlist for OpenCode models (stale backend) |
+| `CODEX_BIN` | Codex CLI binary name/path; default `codex` (stale backend) |
+| `CODEX_MODELS` | Gateway allowlist for Codex models; default `gpt-5.5` (stale backend) |
 | `CODEX_APPROVAL_POLICY` | Codex approval policy; default `never` |
 | `CODEX_SANDBOX` | Codex thread sandbox mode; default `danger-full-access` for local experimental use |
 | `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |

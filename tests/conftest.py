@@ -17,6 +17,38 @@ from src.auth import auth_manager
 from src.backend_registry import BackendRegistry
 from src.session_manager import SessionManager
 
+# ---------------------------------------------------------------------------
+# Stale backends: opencode and codex are frozen (unmaintained) as of 2026-07;
+# claude is the only maintained backend. Their tests are removed from every
+# default run so shared-code changes never require fixing them. Set
+# RUN_STALE_BACKEND_TESTS=1 to collect and run them again.
+# ---------------------------------------------------------------------------
+RUN_STALE_BACKEND_TESTS = bool(os.getenv("RUN_STALE_BACKEND_TESTS"))
+
+if not RUN_STALE_BACKEND_TESTS:
+    collect_ignore_glob = ["*test_opencode*", "*test_codex*"]
+
+
+def pytest_collection_modifyitems(config, items):
+    """Deselect every test whose id mentions a stale backend (opencode/codex).
+
+    Dedicated stale test files are already skipped at collection via
+    ``collect_ignore_glob``; this catches the opencode/codex cases living in
+    shared test modules (test_main_api_unit, test_responses_more_coverage, …).
+    """
+    if RUN_STALE_BACKEND_TESTS:
+        return
+    selected, deselected = [], []
+    for item in items:
+        node_id = item.nodeid.lower()
+        if "opencode" in node_id or "codex" in node_id:
+            deselected.append(item)
+        else:
+            selected.append(item)
+    if deselected:
+        config.hook.pytest_deselected(items=deselected)
+        items[:] = selected
+
 
 def _cleanup_manager(manager):
     """Cancel cleanup task and clear sessions for a session manager instance."""

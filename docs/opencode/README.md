@@ -1,5 +1,9 @@
 # OpenCode Backend
 
+> **STALE — frozen since 2026-07.** This backend is unmaintained: its tests are excluded from the
+> default suite and the code receives no updates. It still registers when enabled but may break
+> without notice. These docs describe the state at freeze time.
+
 [OpenCode](https://opencode.ai) is a coding-agent runtime similar to Claude Code, but it can talk to any provider behind an OpenAI-compatible API (LiteLLM, vLLM, OpenAI, Anthropic, Bedrock, etc.). This gateway treats OpenCode as a second backend, sitting alongside Claude.
 
 ## When to use OpenCode vs Claude

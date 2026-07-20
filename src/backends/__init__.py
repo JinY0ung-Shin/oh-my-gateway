@@ -19,6 +19,10 @@ from src.backends.base import (  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
+# Frozen 2026-07: still registerable, but unmaintained and excluded from the
+# default test suite (tests/conftest.py). Only 'claude' is maintained.
+STALE_BACKENDS = ("opencode", "codex")
+
 
 def _enabled_backend_names() -> list[str]:
     """Return backend names enabled by BACKENDS, preserving order."""
@@ -37,6 +41,12 @@ def discover_backends(registry_cls=None) -> None:
         registry_cls = BackendRegistry
 
     for name in _enabled_backend_names():
+        if name in STALE_BACKENDS:
+            logger.warning(
+                "Backend %r is stale: frozen since 2026-07 and unmaintained; "
+                "it may break without notice. Only 'claude' is supported.",
+                name,
+            )
         if name == "claude":
             from src.backends import claude
 
