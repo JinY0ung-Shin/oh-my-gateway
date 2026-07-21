@@ -471,9 +471,38 @@ async def _shielded_stream_teardown(coro, description: str) -> None:
         raise
 
 
+def _clear_stale_pending_tool_call(session, reason: str) -> None:
+    """Release an AskUserQuestion pause whose owning client is going away.
+
+    The pause lives inside the dropped client's ``can_use_tool`` callback; once
+    that client is gone the question can never be answered. Left in place, the
+    stale ``pending_tool_call`` makes EVERY later turn re-emit the same
+    requires_action card at stream end (the post-stream check does not know
+    which turn the pause belongs to) and keeps the idle reader gated off.
+    """
+    if session.pending_tool_call is None and getattr(session, "input_event", None) is None:
+        return
+    logger.warning(
+        "Clearing stale AskUserQuestion state after %s (session=%s, call_id=%s)",
+        reason,
+        getattr(session, "session_id", "?"),
+        (session.pending_tool_call or {}).get("call_id", "?"),
+    )
+    session.pending_tool_call = None
+    session.input_response = None
+    pending_event = getattr(session, "input_event", None)
+    session.input_event = None
+    if pending_event is not None:
+        # If the hook coroutine is somehow still alive, unblock it — it reads
+        # a null response and denies gracefully instead of waiting out the
+        # full ASK_USER_TIMEOUT.
+        pending_event.set()
+
+
 async def _disconnect_session_client(session, reason: str, client=None) -> None:
     """Drop and disconnect a persistent SDK client after stream failure/cancel."""
     await session_outbox.pause_idle_reader(session)
+    _clear_stale_pending_tool_call(session, reason)
     if client is None:
         client = getattr(session, "client", None)
     if client is None:
@@ -983,6 +1012,11 @@ async def _ensure_response_session_client(
         _validate_continuation_output_format(session.client, output_format)
         await _refresh_existing_client_policy(body, backend, session.client)
         return
+
+    # About to create a FRESH client: any pending AskUserQuestion belonged to
+    # the previous (dead) client and can never be answered — a teardown path
+    # that skipped _disconnect_session_client may have left it behind.
+    _clear_stale_pending_tool_call(session, "client replacement")
 
     from src.system_prompt import get_system_prompt, resolve_request_placeholders
 
