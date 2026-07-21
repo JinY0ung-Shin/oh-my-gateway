@@ -47,6 +47,11 @@ OUTBOX_MAX_EVENTS_PER_POLL = 200
 _STOP_GRACE_S = 0.2
 _PAUSE_TIMEOUT_S = 3.0
 
+# Turn-start sweep: how long to wait for one more buffered message before
+# concluding the backlog is drained. Buffered messages resolve instantly, so
+# this only bounds the final "is there more?" probe.
+_DRAIN_QUIET_S = 0.05
+
 # Task statuses that mean the task has finished (mirrors the SDK's
 # TERMINAL_TASK_STATUSES across both lifecycle vocabularies).
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
@@ -369,6 +374,79 @@ async def _idle_pump(session, client) -> None:
 def idle_reader_running(session) -> bool:
     task = getattr(session, "idle_reader_task", None)
     return task is not None and not task.done()
+
+
+async def drain_backlog_to_outbox(session, client) -> int:
+    """Route unread SDK messages into the outbox before a turn reader starts.
+
+    A reader gap — a consumer disconnect whose stream teardown was itself
+    cancelled, an AskUserQuestion pause (the idle reader is gated off while
+    ``pending_tool_call`` is set), or a crashed idle pump — leaves whatever
+    the CLI emitted sitting unread in the SDK's bounded message stream. The
+    next turn's ``receive_response()`` would otherwise drain that backlog
+    into *its* response: stale tool events surface as the new turn's
+    activity, stale assistant text prepends to the new answer, and a stale
+    ResultMessage terminates the new turn's read before its real output
+    arrives.
+
+    Call sites must run before the new turn can produce messages of its own
+    (before ``client.query()`` / before the AskUserQuestion wake-up), so
+    everything captured here is by construction between-turn output. Never
+    raises; returns the number of captured messages.
+    """
+    if client is None or not hasattr(client, "receive_messages"):
+        return 0
+    captured = 0
+    get_next: Optional[asyncio.Task] = None
+    try:
+        message_iter = client.receive_messages().__aiter__()
+        while captured < OUTBOX_MAX_EVENTS:
+            get_next = asyncio.ensure_future(message_iter.__anext__())
+            done, _pending = await asyncio.wait({get_next}, timeout=_DRAIN_QUIET_S)
+            if get_next not in done:
+                # Stream quiet — grant the same grace the idle pump's stop
+                # protocol grants, so a message mid-handoff is captured
+                # instead of lost to the cancel-during-delivery window.
+                done, _pending = await asyncio.wait({get_next}, timeout=_STOP_GRACE_S)
+                if get_next not in done:
+                    return captured  # backlog drained; finally cancels the read
+            try:
+                message = get_next.result()
+            except StopAsyncIteration:
+                get_next = None
+                return captured  # client stream closed
+            get_next = None
+            _handle_idle_message(session, message)
+            captured += 1
+        return captured
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "[backlog-drain] session=%s sweep failed",
+            getattr(session, "session_id", "?"),
+            exc_info=True,
+        )
+        return captured
+    finally:
+        if get_next is not None:
+            if get_next.done():
+                # Landed between the timeout and cleanup — capture, don't drop.
+                with suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+                    _handle_idle_message(session, get_next.result())
+                    captured += 1
+            else:
+                get_next.cancel()
+                with suppress(asyncio.CancelledError, StopAsyncIteration, Exception):
+                    await get_next
+        if captured:
+            # Count = messages consumed off the stream; noise (SystemMessage,
+            # subagent narration) is swept but not forwarded to the outbox.
+            logger.info(
+                "[backlog-drain] session=%s swept %d stale message(s)",
+                getattr(session, "session_id", "?"),
+                captured,
+            )
 
 
 def resume_idle_reader(session) -> bool:

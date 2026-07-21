@@ -24,6 +24,7 @@ from src.session_outbox import (
     SessionOutbox,
     _message_to_event,
     apply_turn_task_chunk,
+    drain_backlog_to_outbox,
     get_outbox,
     idle_reader_running,
     pause_idle_reader,
@@ -529,3 +530,55 @@ class TestPendingEventsEndpoint:
             assert body["turn_in_progress"] is True
         finally:
             stored_session.active_response_id = None
+
+
+# ---------------------------------------------------------------------------
+# Turn-start backlog sweep
+# ---------------------------------------------------------------------------
+
+
+class TestBacklogDrain:
+    @pytest.mark.asyncio
+    async def test_drains_stale_backlog_into_outbox(self):
+        """Messages piled while no reader was attached go to the outbox, not
+        to the next turn's reader — including a stale ResultMessage that would
+        otherwise terminate the next turn's receive_response() early."""
+        client = FakeSDKClient()
+        session = _make_session(client)
+        await client.queue.put(_task_started())
+        await client.queue.put(_assistant())
+        await client.queue.put(_result())
+
+        captured = await drain_backlog_to_outbox(session, client)
+
+        assert captured == 3
+        types = [e["type"] for e in get_outbox(session).events_after(0)]
+        assert types == ["task_started", "assistant_message", "turn_result"]
+        # Nothing left in the stream for the next turn's reader to steal.
+        assert client.queue.qsize() == 0
+
+    @pytest.mark.asyncio
+    async def test_quiet_stream_returns_zero(self):
+        client = FakeSDKClient()
+        session = _make_session(client)
+        assert await drain_backlog_to_outbox(session, client) == 0
+        assert get_outbox(session).events_after(0) == []
+
+    @pytest.mark.asyncio
+    async def test_clients_without_receive_messages_are_noops(self):
+        session = _make_session(None)
+        assert await drain_backlog_to_outbox(session, None) == 0
+        assert await drain_backlog_to_outbox(session, object()) == 0
+
+    @pytest.mark.asyncio
+    async def test_stream_end_stops_drain(self):
+        client = FakeSDKClient()
+        session = _make_session(client)
+        await client.queue.put(_assistant())
+        await client.queue.put(None)  # sentinel: stream closed
+
+        captured = await drain_backlog_to_outbox(session, client)
+
+        assert captured == 1
+        types = [e["type"] for e in get_outbox(session).events_after(0)]
+        assert types == ["assistant_message"]

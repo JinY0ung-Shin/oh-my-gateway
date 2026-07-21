@@ -1024,8 +1024,22 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # The between-turn idle reader (src.session_outbox) must release the
         # client's message stream before this turn reads it — and before
         # query() is written, so it can never consume this turn's messages.
-        from src.session_outbox import pause_idle_reader
+        from src.session_outbox import (
+            drain_backlog_to_outbox,
+            idle_reader_running,
+            pause_idle_reader,
+        )
 
+        if not idle_reader_running(session):
+            # Reader gap (cancelled stream teardown, stale active-response
+            # state, crashed pump): unread between-turn output is sitting in
+            # the SDK stream. Sweep it into the outbox now — otherwise this
+            # turn's receive_response() would drain the stale backlog into
+            # its own response (old tool events as this turn's activity, old
+            # assistant text as this turn's answer, and a stale ResultMessage
+            # ending this turn's read early). Runs before query(), so nothing
+            # captured here can belong to this turn.
+            await drain_backlog_to_outbox(session, client)
         await pause_idle_reader(session)
 
         # Provide an event the hook can signal to break streaming

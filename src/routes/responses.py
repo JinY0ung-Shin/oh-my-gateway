@@ -434,6 +434,43 @@ def _log_session_assistant_write(
     )
 
 
+# Strong refs to detached stream-teardown tasks — the event loop holds only
+# weak refs, so without this a teardown running past its cancelled generator
+# could be garbage-collected mid-flight.
+_teardown_tasks: set = set()
+
+
+def _log_teardown_result(task: "asyncio.Task") -> None:
+    _teardown_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Detached stream teardown failed", exc_info=exc)
+
+
+async def _shielded_stream_teardown(coro, description: str) -> None:
+    """Run stream teardown so a consumer disconnect cannot skip it.
+
+    A StreamingResponse generator cancelled by a client disconnect unwinds
+    inside an already-cancelled anyio scope, where every ``await`` in its
+    ``finally`` re-raises CancelledError immediately. Cleanup that must never
+    be skipped — dropping the SDK client, clearing active-response state,
+    releasing the session lock — therefore runs in its own task: the
+    generator's cancellation still propagates, but the teardown continues to
+    completion detached. (Skipping it leaves a zombie CLI turn piling unread
+    messages that the next turn's reader would steal.)
+    """
+    task = asyncio.get_running_loop().create_task(coro, name=description)
+    _teardown_tasks.add(task)
+    task.add_done_callback(_log_teardown_result)
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        logger.info("Stream teardown continues detached: %s", description)
+        raise
+
+
 async def _disconnect_session_client(session, reason: str, client=None) -> None:
     """Drop and disconnect a persistent SDK client after stream failure/cancel."""
     await session_outbox.pause_idle_reader(session)
@@ -2084,20 +2121,30 @@ async def create_response(
                     sequence_number=0,
                 )
             finally:
-                if not stream_result.get("success") and not stream_result.get("interrupted"):
-                    await _disconnect_session_client(
-                        session, "responses stream failure", client=active_client
-                    )
-                terminal_state = (
-                    "completed"
-                    if stream_result.get("success")
-                    else "incomplete"
-                    if stream_result.get("interrupted")
-                    else "failed"
+
+                async def _teardown():
+                    try:
+                        if not stream_result.get("success") and not stream_result.get(
+                            "interrupted"
+                        ):
+                            await _disconnect_session_client(
+                                session, "responses stream failure", client=active_client
+                            )
+                        terminal_state = (
+                            "completed"
+                            if stream_result.get("success")
+                            else "incomplete"
+                            if stream_result.get("interrupted")
+                            else "failed"
+                        )
+                        await _finish_active_response(session, resp_id, terminal_state)
+                    finally:
+                        if lock_acquired:
+                            session.lock.release()
+
+                await _shielded_stream_teardown(
+                    _teardown(), f"stream-teardown:{resp_id}"
                 )
-                await _finish_active_response(session, resp_id, terminal_state)
-                if lock_acquired:
-                    session.lock.release()
 
         return StreamingResponse(_run_stream(), media_type="text/event-stream")
 
@@ -2327,6 +2374,14 @@ async def _handle_function_call_output(
     # UnsupportedContinuationPolicy semantics, so there's nothing to roll
     # back).
     if resolved.backend not in {"opencode", "codex"}:
+        # The idle reader is gated off for the whole AskUserQuestion pause
+        # (pending_tool_call set), so background tasks that kept running have
+        # piled their output unread in the SDK stream. Sweep it into the
+        # outbox BEFORE waking the SDK — the continuation reader would
+        # otherwise drain that backlog into this turn's response. Safe here:
+        # the SDK is still parked in the PreToolUse hook, so nothing captured
+        # can belong to the continuation.
+        await session_outbox.drain_backlog_to_outbox(session, session.client)
         _commit_pending_tool_call_locked(session)
 
     # --- Stream continuation from the client ---
@@ -2471,21 +2526,31 @@ async def _handle_function_call_output(
                     sequence_number=0,
                 )
             finally:
-                if not stream_result.get("success") and not stream_result.get("interrupted"):
-                    await _disconnect_session_client(
-                        session,
-                        "responses continuation stream failure",
-                        client=active_client,
-                    )
-                terminal_state = (
-                    "completed"
-                    if stream_result.get("success")
-                    else "incomplete"
-                    if stream_result.get("interrupted")
-                    else "failed"
+
+                async def _teardown():
+                    try:
+                        if not stream_result.get("success") and not stream_result.get(
+                            "interrupted"
+                        ):
+                            await _disconnect_session_client(
+                                session,
+                                "responses continuation stream failure",
+                                client=active_client,
+                            )
+                        terminal_state = (
+                            "completed"
+                            if stream_result.get("success")
+                            else "incomplete"
+                            if stream_result.get("interrupted")
+                            else "failed"
+                        )
+                        await _finish_active_response(session, resp_id, terminal_state)
+                    finally:
+                        session.lock.release()
+
+                await _shielded_stream_teardown(
+                    _teardown(), f"continuation-teardown:{resp_id}"
                 )
-                await _finish_active_response(session, resp_id, terminal_state)
-                session.lock.release()
 
         return StreamingResponse(_run_continuation_stream(), media_type="text/event-stream")
 
