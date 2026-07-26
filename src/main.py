@@ -216,6 +216,25 @@ async def lifespan(app: FastAPI):
     # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
 
+    # Project the gateway-managed env block into the Claude settings file so a
+    # GATEWAY_CLAUDE_SETTINGS_ENV declaration applies without any admin action.
+    try:
+        from src import claude_settings_env
+
+        report = claude_settings_env.project_at_startup()
+        if report.get("error"):
+            logger.warning(
+                "Claude settings env not projected: %s", report.get("error")
+            )
+        elif report.get("written"):
+            logger.info(
+                "Claude settings env projected into %s: %s",
+                report.get("path"),
+                report.get("written"),
+            )
+    except Exception:
+        logger.warning("Claude settings env projection failed", exc_info=True)
+
     # Validate Claude authentication first
     auth_valid, auth_info = validate_claude_code_auth()
 

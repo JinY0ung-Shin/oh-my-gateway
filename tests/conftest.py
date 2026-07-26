@@ -96,6 +96,27 @@ def _isolate_plugin_mcp_overlay(tmp_path_factory):
     mp.undo()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_claude_settings_env(tmp_path_factory):
+    """Point the Claude settings env store AND the settings file at temp paths.
+
+    Without this, a test that projects the managed env block would rewrite the
+    developer's own ``~/.claude/settings.json``. ``GATEWAY_CLAUDE_SETTINGS_ENV``
+    is cleared so a local .env declaration cannot leak in either.
+    """
+    base = tmp_path_factory.mktemp("claude-settings-env")
+    mp = pytest.MonkeyPatch()
+    mp.setenv("GATEWAY_CLAUDE_SETTINGS_PATH", str(base / "claude" / "settings.json"))
+    mp.setenv("GATEWAY_CLAUDE_SETTINGS_ENV_STORE", str(base / "store.json"))
+    mp.delenv("GATEWAY_CLAUDE_SETTINGS_ENV", raising=False)
+
+    from src import claude_settings_env
+
+    claude_settings_env.reload()
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def reset_main_state():
     """Restore mutable module state and clean shared session state between tests."""

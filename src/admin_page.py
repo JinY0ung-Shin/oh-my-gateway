@@ -116,7 +116,7 @@ def build_admin_page() -> str:
         <button role="tab" :aria-selected="tab === 'skills'" @click="tab='skills'; loadSkills()">Skills</button>
         <button role="tab" :aria-selected="tab === 'plugins'" @click="tab='plugins'; loadPlugins(); loadCatalog(); loadAutoRefresh()">Plugins</button>
         <button role="tab" :aria-selected="tab === 'mcp'" @click="tab='mcp'; loadMcpDetail()">MCP</button>
-        <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox()">Config</button>
+        <button role="tab" :aria-selected="tab === 'config'" @click="tab='config'; loadConfig(); loadRuntimeConfig(); loadSystemPrompt(); loadTools(); loadSandbox(); loadClaudeSettingsEnv()">Config</button>
         <a href="/admin/chat" role="tab" class="tab-link">Chat ↗</a>
       </nav>
 

@@ -65,6 +65,9 @@ def get_admin_js() -> str:
     mcpOverlayForm: { envPairs: [], headerPairs: [] },
     toolsRegistry: {},
     sandboxConfig: {},
+    claudeEnv: null,
+    claudeEnvForm: { pairs: [] },
+    claudeEnvBusy: false,
     systemPrompt: { mode: 'preset', prompt: null, resolved_prompt: null, preset_text: null, char_count: 0, active_name: null },
     promptTemplates: [],
     namedPrompts: [],
@@ -379,6 +382,58 @@ def get_admin_js() -> str:
         const r = await this.api('/admin/api/tools');
         if (r.ok) this.toolsRegistry = await r.json();
       } catch(e) { console.error('Failed to load tools', e); this.showToast('Failed to load tools', 'err'); }
+    },
+
+    // --- Claude session env (~/.claude/settings.json "env") ---
+    async loadClaudeSettingsEnv() {
+      try {
+        const r = await this.api('/admin/api/claude-settings-env');
+        if (r.ok) {
+          this.claudeEnv = await r.json();
+          // Only the admin-managed keys are editable; the GATEWAY_CLAUDE_SETTINGS_ENV
+          // layer is shown read-only so a redacted value never round-trips into it.
+          this.claudeEnvForm = { pairs: this._mcpPairsFromMap(this.claudeEnv.admin) };
+          if (!this.claudeEnvForm.pairs.length) this.claudeEnvForm.pairs = [{ key: '', value: '' }];
+        }
+      } catch(e) { console.error('Failed to load Claude settings env', e); this.showToast('Failed to load Claude session env', 'err'); }
+    },
+    claudeEnvAddPair() { this.claudeEnvForm.pairs.push({ key: '', value: '' }); },
+    claudeEnvRemovePair(i) { this.claudeEnvForm.pairs.splice(i, 1); },
+    async saveClaudeSettingsEnv() {
+      const env = this._mcpMapFromPairs(this.claudeEnvForm.pairs);
+      this.claudeEnvBusy = true;
+      try {
+        const r = await this.api('/admin/api/claude-settings-env', {
+          method: 'PUT', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ env })
+        });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          const n = (d.report?.written || []).length;
+          this.showToast('CLAUDE SESSION ENV SAVED (' + n + ' key' + (n === 1 ? '' : 's') + ')', 'ok');
+          await this.loadClaudeSettingsEnv();
+        } else { this.showToast(d.error || 'Save failed', 'err'); }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.claudeEnvBusy = false; }
+    },
+    async clearClaudeSettingsEnv() {
+      if (!confirm('Remove every admin-managed env var from ~/.claude/settings.json?')) return;
+      this.claudeEnvBusy = true;
+      try {
+        const r = await this.api('/admin/api/claude-settings-env', { method: 'DELETE' });
+        if (r.ok) { this.showToast('ADMIN ENV CLEARED', 'ok'); await this.loadClaudeSettingsEnv(); }
+        else { const d = await r.json().catch(() => ({})); this.showToast(d.error || 'Clear failed', 'err'); }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.claudeEnvBusy = false; }
+    },
+    async reprojectClaudeSettingsEnv() {
+      this.claudeEnvBusy = true;
+      try {
+        const r = await this.api('/admin/api/claude-settings-env/reproject', { method: 'POST' });
+        if (r.ok) { this.showToast('SETTINGS FILE REWRITTEN', 'ok'); await this.loadClaudeSettingsEnv(); }
+        else { const d = await r.json().catch(() => ({})); this.showToast(d.error || 'Reproject failed', 'err'); }
+      } catch(e) { this.showToast('Connection error', 'err'); }
+      finally { this.claudeEnvBusy = false; }
     },
 
     async loadRuntimeConfig() {

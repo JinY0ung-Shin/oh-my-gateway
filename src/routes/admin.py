@@ -26,6 +26,8 @@ MCP servers:    GET  /admin/api/mcp-servers
 MCP validate:   POST /admin/api/mcp-servers/validate
 MCP test:       POST /admin/api/mcp-servers/{name}/test
 MCP plugin overlay: GET/PUT/DELETE /admin/api/mcp-servers/{name}/plugin-overlay
+Claude settings env: GET/PUT/DELETE /admin/api/claude-settings-env
+                POST /admin/api/claude-settings-env/reproject
 Plugins:        GET  /admin/api/plugins
 Plugin detail:  GET  /admin/api/plugins/{id}
 Plugin skills:  GET  /admin/api/plugins/{id}/skills/{name}
@@ -132,6 +134,12 @@ class McpServerUpsert(BaseModel):
 class McpServerValidate(BaseModel):
     name: str = ""
     config: dict[str, Any] = {}
+
+
+class ClaudeSettingsEnvReplace(BaseModel):
+    """Full replacement of the admin-managed Claude settings ``env`` map."""
+
+    env: dict[str, str] = {}
 
 
 class McpPluginOverlayUpsert(BaseModel):
@@ -374,6 +382,64 @@ async def test_mcp_server_endpoint(name: str, _=Depends(require_admin)):
     from src import mcp_admin_service
 
     return await mcp_admin_service.test_connection(name)
+
+
+# --- Claude settings env (~/.claude/settings.json "env" block) -------------
+# Applies to the whole Claude session process (the agent's Bash can read these),
+# unlike the MCP credential overlays above which stay scoped to one server.
+
+
+@router.get("/api/claude-settings-env")
+async def get_claude_settings_env_endpoint(_=Depends(require_admin)):
+    """Managed env vars with their source, plus unmanaged keys in the file."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import claude_settings_env_service
+
+    return await run_in_threadpool(claude_settings_env_service.get_detail)
+
+
+@router.put("/api/claude-settings-env")
+async def put_claude_settings_env_endpoint(
+    body: ClaudeSettingsEnvReplace, _=Depends(require_admin)
+):
+    """Replace the admin-managed env map and project it into the settings file."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import claude_settings_env_service
+
+    try:
+        return await run_in_threadpool(
+            claude_settings_env_service.replace_env, body.env
+        )
+    except claude_settings_env_service.ClaudeSettingsEnvError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+@router.delete("/api/claude-settings-env")
+async def delete_claude_settings_env_endpoint(_=Depends(require_admin)):
+    """Drop every admin-managed key (a GATEWAY_CLAUDE_SETTINGS_ENV layer stays)."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import claude_settings_env_service
+
+    try:
+        return await run_in_threadpool(claude_settings_env_service.clear_env)
+    except claude_settings_env_service.ClaudeSettingsEnvError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
+
+
+@router.post("/api/claude-settings-env/reproject")
+async def reproject_claude_settings_env_endpoint(_=Depends(require_admin)):
+    """Re-resolve {{env:NAME}} values and rewrite the settings file."""
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import claude_settings_env_service
+
+    try:
+        return await run_in_threadpool(claude_settings_env_service.reproject)
+    except claude_settings_env_service.ClaudeSettingsEnvError as e:
+        return JSONResponse(status_code=400, content={"error": str(e)})
 
 
 # --- Plugin MCP credential overlays ---------------------------------------

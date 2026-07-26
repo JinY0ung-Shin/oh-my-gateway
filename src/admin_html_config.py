@@ -277,6 +277,86 @@ def get_config_html() -> str:
         </div>
 
         <details class="config-section">
+          <summary>
+            Claude Session Env
+            <span class="text-xs text-muted">~/.claude/settings.json &rarr; "env"</span>
+            <span x-show="(claudeEnv?.effective && Object.keys(claudeEnv.effective).length)" class="text-xs"
+              style="color:var(--green)"
+              x-text="'(' + Object.keys(claudeEnv?.effective ?? {}).length + ' var' + (Object.keys(claudeEnv?.effective ?? {}).length === 1 ? '' : 's') + ')'"></span>
+          </summary>
+          <div class="config-body">
+            <p class="text-xs text-muted" style="margin-top:0">
+              Applied to the whole Claude session process, so the agent's own Bash can read them
+              and they override the same key in the inherited environment. Values scoped to a single
+              MCP server belong in the MCP tab's credential overlay instead.
+            </p>
+            <div class="text-xs text-mono" style="margin-bottom:0.5rem; color:var(--text-dim)">
+              <span x-text="'file: ' + (claudeEnv?.settings_path || '(unresolved)')"></span>
+              <span x-show="claudeEnv?.env_layer_declared" style="color:var(--cyan)"
+                x-text="' | ' + (claudeEnv?.env_layer_var || '') + ' declares ' + Object.keys(claudeEnv?.env_layer ?? {}).length"></span>
+            </div>
+            <template x-for="w in (claudeEnv?.warnings ?? [])" :key="w">
+              <p class="text-sm" style="margin:0 0 0.5rem 0; color:var(--amber)" x-text="'! ' + w"></p>
+            </template>
+
+            <h3>Effective</h3>
+            <div class="table-wrapper">
+              <table>
+                <thead><tr><th>NAME</th><th>VALUE</th><th>SOURCE</th></tr></thead>
+                <tbody>
+                  <template x-for="(v, k) in (claudeEnv?.effective ?? {})" :key="k">
+                    <tr>
+                      <td class="config-key" x-text="k"></td>
+                      <td :class="{ redacted: v === '***REDACTED***' }"
+                        :style="v !== '***REDACTED***' ? 'color:var(--text-bright)' : ''" x-text="v"></td>
+                      <td>
+                        <span class="badge text-xs"
+                          :style="(claudeEnv?.sources?.[k] === 'env') ? 'border-color:var(--cyan); color:var(--cyan)' : 'border-color:var(--green); color:var(--green)'"
+                          x-text="claudeEnv?.sources?.[k] === 'env' ? 'ENV-DECLARED' : (claudeEnv?.sources?.[k] === 'env+admin' ? 'ADMIN (over env)' : 'ADMIN')"></span>
+                      </td>
+                    </tr>
+                  </template>
+                  <template x-if="!Object.keys(claudeEnv?.effective ?? {}).length">
+                    <tr><td colspan="3" class="text-xs text-muted">No gateway-managed env vars.</td></tr>
+                  </template>
+                </tbody>
+              </table>
+            </div>
+            <p x-show="(claudeEnv?.unmanaged_keys ?? []).length" class="text-xs text-muted" style="margin-top:0.5rem">
+              <span x-text="'Also in the file, not managed here (left untouched): ' + (claudeEnv?.unmanaged_keys ?? []).join(', ')"></span>
+            </p>
+
+            <h3 style="margin-top:1rem">Admin-managed</h3>
+            <template x-for="(p, i) in claudeEnvForm.pairs" :key="'cenv-' + i">
+              <div class="flex-gap-sm mb-sm" style="align-items:center">
+                <input type="text" x-model="p.key" placeholder="NAME" aria-label="Session env var name"
+                  style="flex:1; font-family:var(--font-mono); font-size:0.78rem">
+                <input type="text" x-model="p.value" placeholder="value or {{env:GATEWAY_VAR}}"
+                  aria-label="Session env var value"
+                  style="flex:2; font-family:var(--font-mono); font-size:0.78rem">
+                <button type="button" class="btn btn-sm btn-ghost" style="color:var(--red)"
+                  @click="claudeEnvRemovePair(i)" aria-label="Remove session env var">&times;</button>
+              </div>
+            </template>
+            <div class="flex-between" style="margin-top:0.5rem">
+              <div class="flex-gap-sm">
+                <button class="btn btn-sm btn-ghost" @click="claudeEnvAddPair()">+ Add</button>
+                <button class="btn btn-sm btn-primary" @click="saveClaudeSettingsEnv()" :disabled="claudeEnvBusy">
+                  <span x-text="claudeEnvBusy ? 'Saving...' : 'Save &amp; project'"></span>
+                </button>
+                <button class="btn btn-sm btn-ghost" @click="reprojectClaudeSettingsEnv()" :disabled="claudeEnvBusy"
+                  title="Re-resolve {{env:NAME}} values and rewrite the settings file">Re-project</button>
+              </div>
+              <button class="btn btn-sm btn-danger-ghost" @click="clearClaudeSettingsEnv()"
+                :disabled="claudeEnvBusy || !Object.keys(claudeEnv?.admin ?? {}).length">Clear admin keys</button>
+            </div>
+            <p class="text-xs text-muted" style="margin-top:0.5rem">
+              <span x-text="'Reserved (refused): ' + (claudeEnv?.reserved_keys ?? []).join(', ')"></span>
+            </p>
+          </div>
+        </details>
+
+        <details class="config-section">
           <summary>System Information <span class="text-xs text-muted">runtime, rate_limits, env</span></summary>
           <div class="config-body">
             <div class="grid-2 mb-lg">

@@ -366,6 +366,72 @@ def _check_mcp_server_env() -> List[ConfigIssue]:
     return []
 
 
+def _check_claude_settings_env() -> List[ConfigIssue]:
+    """``GATEWAY_CLAUDE_SETTINGS_ENV`` must parse, and needs the ``user`` source.
+
+    The declared vars are projected into ``$HOME/.claude/settings.json``, which
+    only reaches sessions when ``setting_sources`` includes ``user`` (the gateway
+    default is project,local; Docker Compose sets user,project,local). Stdlib-only
+    parsing keeps this module's early-import invariant.
+    """
+    raw = (os.getenv("GATEWAY_CLAUDE_SETTINGS_ENV") or "").strip()
+    if not raw:
+        return []
+
+    issues: List[ConfigIssue] = []
+    if os.path.isfile(raw):
+        try:
+            with open(raw, encoding="utf-8") as f:
+                parsed = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            return [
+                ConfigIssue(
+                    "warning",
+                    f"GATEWAY_CLAUDE_SETTINGS_ENV={raw!r} is not readable JSON ({e}); "
+                    "the declared Claude session env will be ignored.",
+                )
+            ]
+    else:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return [
+                ConfigIssue(
+                    "warning",
+                    f"GATEWAY_CLAUDE_SETTINGS_ENV={raw!r} is neither an existing file "
+                    f"nor valid inline JSON ({e}); the declared Claude session env "
+                    "will be ignored.",
+                )
+            ]
+    if not isinstance(parsed, dict):
+        return [
+            ConfigIssue(
+                "warning",
+                "GATEWAY_CLAUDE_SETTINGS_ENV must be a JSON object of {NAME: value}; "
+                "the declared Claude session env will be ignored.",
+            )
+        ]
+
+    sources_raw = (os.getenv("CLAUDE_SETTING_SOURCES") or "").strip()
+    sources = (
+        [p.strip() for p in sources_raw.split(",") if p.strip()]
+        if sources_raw
+        # Mirrors src.backends.claude.client._DEFAULT_SETTING_SOURCES.
+        else ["project", "local"]
+    )
+    if "user" not in sources:
+        issues.append(
+            ConfigIssue(
+                "warning",
+                "GATEWAY_CLAUDE_SETTINGS_ENV is set but CLAUDE_SETTING_SOURCES "
+                f"({','.join(sources)}) does not include 'user', so Claude sessions "
+                "will not read ~/.claude/settings.json and the declared env will "
+                "have no effect.",
+            )
+        )
+    return issues
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -380,6 +446,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_default_model(backends))
     issues.extend(_check_mcp_manifest())
     issues.extend(_check_mcp_server_env())
+    issues.extend(_check_claude_settings_env())
     return issues
 
 

@@ -34,6 +34,8 @@ _CHECKED_VARS = [
     "SKIP_CONFIG_CHECK",
     "GATEWAY_MCP_MANIFEST",
     "GATEWAY_MCP_SERVER_ENV",
+    "GATEWAY_CLAUDE_SETTINGS_ENV",
+    "CLAUDE_SETTING_SOURCES",
 ]
 
 
@@ -363,6 +365,56 @@ def test_mcp_server_env_unreadable_file_warns(clean_env, tmp_path):
     assert _has(
         check_config(), "warning", "GATEWAY_MCP_SERVER_ENV", "not readable JSON"
     )
+
+
+# ---------------------------------------------------------------------------
+# GATEWAY_CLAUDE_SETTINGS_ENV (env vars projected into ~/.claude/settings.json)
+# ---------------------------------------------------------------------------
+
+
+def test_claude_settings_env_with_user_source_is_quiet(clean_env):
+    clean_env.setenv("GATEWAY_CLAUDE_SETTINGS_ENV", '{"TEAM_ID": "platform"}')
+    clean_env.setenv("CLAUDE_SETTING_SOURCES", "user,project,local")
+
+    assert not _has(check_config(), "warning", "GATEWAY_CLAUDE_SETTINGS_ENV")
+
+
+def test_claude_settings_env_without_user_source_warns(clean_env):
+    """Default sources omit 'user', so the projected file would never be read."""
+    clean_env.setenv("GATEWAY_CLAUDE_SETTINGS_ENV", '{"TEAM_ID": "platform"}')
+    # CLAUDE_SETTING_SOURCES unset -> project,local
+
+    assert _has(
+        check_config(),
+        "warning",
+        "GATEWAY_CLAUDE_SETTINGS_ENV",
+        "does not include 'user'",
+    )
+
+
+def test_claude_settings_env_invalid_json_warns(clean_env):
+    clean_env.setenv("GATEWAY_CLAUDE_SETTINGS_ENV", "{oops")
+    clean_env.setenv("CLAUDE_SETTING_SOURCES", "user")
+
+    assert _has(
+        check_config(), "warning", "GATEWAY_CLAUDE_SETTINGS_ENV", "valid inline JSON"
+    )
+
+
+def test_claude_settings_env_non_object_warns(clean_env):
+    clean_env.setenv("GATEWAY_CLAUDE_SETTINGS_ENV", '["TEAM_ID"]')
+    clean_env.setenv("CLAUDE_SETTING_SOURCES", "user")
+
+    assert _has(check_config(), "warning", "GATEWAY_CLAUDE_SETTINGS_ENV", "JSON object")
+
+
+def test_claude_settings_env_file_path_is_quiet(clean_env, tmp_path):
+    path = tmp_path / "session-env.json"
+    path.write_text('{"TEAM_ID": "platform"}', encoding="utf-8")
+    clean_env.setenv("GATEWAY_CLAUDE_SETTINGS_ENV", str(path))
+    clean_env.setenv("CLAUDE_SETTING_SOURCES", "user,project,local")
+
+    assert not _has(check_config(), "warning", "GATEWAY_CLAUDE_SETTINGS_ENV")
 
 
 # ---------------------------------------------------------------------------

@@ -141,6 +141,9 @@ def get_redacted_config() -> Dict[str, Any]:
         "CODEX_APPROVAL_POLICY",
         "DISALLOWED_TOOLS",
         "GATEWAY_MCP_MANIFEST",
+        "GATEWAY_MCP_SERVER_ENV",
+        "GATEWAY_CLAUDE_SETTINGS_ENV",
+        "CLAUDE_SETTING_SOURCES",
     ]
 
     env_snapshot = {}
