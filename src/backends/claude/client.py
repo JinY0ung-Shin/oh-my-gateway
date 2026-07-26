@@ -378,14 +378,16 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self,
         mcp_servers: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """Materialize plugin MCP credential overlays into *mcp_servers*.
+        """Merge per-server MCP credential overlays into *mcp_servers*.
 
-        Admin overlays (env/headers only) are stored separately from the plugin
-        ``.mcp.json``. For each overlay we deep-copy the plugin base config,
-        merge the overlay, and add it to the gateway ``mcp_servers`` map so it
-        rides the same path as MCP_CONFIG/manifest servers. Overlay values stay
-        scoped to that server config; nothing is injected into the session
-        process environment. A stale overlay (plugin no longer installed)
+        Overlays (env/headers only) come from ``GATEWAY_MCP_SERVER_ENV`` and the
+        admin overlay file, stored separately from the plugin ``.mcp.json`` and
+        from MCP_CONFIG. For a plugin-declared name we deep-copy the plugin base
+        config, merge the overlay, and add it to the gateway ``mcp_servers`` map
+        so it rides the same path as MCP_CONFIG/manifest servers; for a
+        gateway-declared name the env/headers merge into that config. Overlay
+        values stay scoped to that server config; nothing is injected into the
+        session process environment. A stale overlay (name declared nowhere)
         contributes nothing.
 
         Verified live (CLI 2.1.187, the SDK 0.2.108 bundle, 2026-07-16): when
@@ -397,24 +399,26 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         try:
             from src import mcp_plugin_overlay
 
-            overlaid = mcp_plugin_overlay.materialize_overlaid_plugin_servers()
+            merged, applied = mcp_plugin_overlay.apply_overlays(mcp_servers)
         except Exception:
-            logger.warning("Plugin MCP overlay merge failed", exc_info=True)
+            logger.warning("MCP credential overlay merge failed", exc_info=True)
             return mcp_servers
 
-        if not overlaid:
+        if applied["plugin"]:
+            logger.info(
+                "Materialized %d plugin MCP server(s) with credential overlays: %s "
+                "(replaces the plugin's own setting_sources registration)",
+                len(applied["plugin"]),
+                applied["plugin"],
+            )
+        if applied["gateway"]:
+            logger.info(
+                "Applied credential overlay(s) to %d gateway MCP server(s): %s",
+                len(applied["gateway"]),
+                applied["gateway"],
+            )
+        if not applied["plugin"] and not applied["gateway"]:
             return mcp_servers
-
-        merged: Dict[str, Any] = dict(mcp_servers or {})
-        # Overlay materialization wins on name collision with gateway MCP so
-        # admin credentials attach to the plugin-defined command/url.
-        merged.update(overlaid)
-        logger.info(
-            "Materialized %d plugin MCP server(s) with admin overlays: %s "
-            "(replaces the plugin's own setting_sources registration)",
-            len(overlaid),
-            sorted(overlaid),
-        )
         return merged
 
     def _configure_mcp_servers(

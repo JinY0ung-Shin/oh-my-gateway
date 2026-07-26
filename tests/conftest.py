@@ -81,11 +81,13 @@ def _isolate_plugin_mcp_overlay(tmp_path_factory):
     ``src.mcp_plugin_overlay`` loads ``data/gateway-mcp-plugin-overlay.json``
     at import time; without this, a developer's real overlay file (live
     credentials) would leak into every test that materializes plugin MCP
-    servers or builds Claude session options.
+    servers or builds Claude session options. ``GATEWAY_MCP_SERVER_ENV`` is
+    cleared for the same reason — it is the env-declared layer of the same map.
     """
     path = tmp_path_factory.mktemp("mcp-plugin-overlay") / "overlay.json"
     mp = pytest.MonkeyPatch()
     mp.setenv("GATEWAY_MCP_PLUGIN_OVERLAY", str(path))
+    mp.delenv("GATEWAY_MCP_SERVER_ENV", raising=False)
 
     from src import mcp_plugin_overlay
 

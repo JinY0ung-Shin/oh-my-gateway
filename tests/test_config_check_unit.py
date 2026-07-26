@@ -32,6 +32,8 @@ _CHECKED_VARS = [
     "ANTHROPIC_BASE_URL",
     "DEFAULT_MODEL",
     "SKIP_CONFIG_CHECK",
+    "GATEWAY_MCP_MANIFEST",
+    "GATEWAY_MCP_SERVER_ENV",
 ]
 
 
@@ -307,6 +309,60 @@ def test_default_model_matching_enabled_backend_is_quiet(clean_env):
     clean_env.setenv("DEFAULT_MODEL", "codex/gpt-5.5")
 
     assert not _has(check_config(), "warning", "DEFAULT_MODEL")
+
+
+# ---------------------------------------------------------------------------
+# GATEWAY_MCP_SERVER_ENV (per-MCP-server credential overlay declared in env)
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_server_env_valid_inline_json_is_quiet(clean_env):
+    clean_env.setenv(
+        "GATEWAY_MCP_SERVER_ENV", '{"context7": {"env": {"K": "{{env:TOK}}"}}}'
+    )
+
+    assert not _has(check_config(), "warning", "GATEWAY_MCP_SERVER_ENV")
+
+
+def test_mcp_server_env_invalid_json_warns(clean_env):
+    clean_env.setenv("GATEWAY_MCP_SERVER_ENV", '{"context7": ')
+
+    assert _has(
+        check_config(), "warning", "GATEWAY_MCP_SERVER_ENV", "valid inline JSON"
+    )
+
+
+def test_mcp_server_env_non_object_warns(clean_env):
+    clean_env.setenv("GATEWAY_MCP_SERVER_ENV", '["context7"]')
+
+    assert _has(check_config(), "warning", "GATEWAY_MCP_SERVER_ENV", "JSON object")
+
+
+def test_mcp_server_env_missing_file_warns(clean_env):
+    """A path typo parses as neither file nor JSON — the loader would drop it."""
+    clean_env.setenv("GATEWAY_MCP_SERVER_ENV", "/nope/mcp-server-env.json")
+
+    assert _has(
+        check_config(), "warning", "GATEWAY_MCP_SERVER_ENV", "neither an existing file"
+    )
+
+
+def test_mcp_server_env_file_path_is_quiet(clean_env, tmp_path):
+    path = tmp_path / "mcp-server-env.json"
+    path.write_text('{"context7": {"env": {"K": "v"}}}', encoding="utf-8")
+    clean_env.setenv("GATEWAY_MCP_SERVER_ENV", str(path))
+
+    assert not _has(check_config(), "warning", "GATEWAY_MCP_SERVER_ENV")
+
+
+def test_mcp_server_env_unreadable_file_warns(clean_env, tmp_path):
+    path = tmp_path / "broken.json"
+    path.write_text("{", encoding="utf-8")
+    clean_env.setenv("GATEWAY_MCP_SERVER_ENV", str(path))
+
+    assert _has(
+        check_config(), "warning", "GATEWAY_MCP_SERVER_ENV", "not readable JSON"
+    )
 
 
 # ---------------------------------------------------------------------------

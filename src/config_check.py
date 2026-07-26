@@ -318,6 +318,54 @@ def _check_mcp_manifest() -> List[ConfigIssue]:
     return []
 
 
+def _check_mcp_server_env() -> List[ConfigIssue]:
+    """``GATEWAY_MCP_SERVER_ENV`` is a JSON object or a path to one.
+
+    An unparseable value is dropped at load with an error log and the declared
+    credentials silently never reach any MCP server, so flag it up front. Parsed
+    here with the stdlib only, keeping the module's early-import invariant (no
+    ``src.mcp_plugin_overlay`` import).
+    """
+    raw = (os.getenv("GATEWAY_MCP_SERVER_ENV") or "").strip()
+    if not raw:
+        return []
+    # Same order as the loader: existing file first, else inline JSON.
+    if os.path.isfile(raw):
+        try:
+            with open(raw, encoding="utf-8") as f:
+                parsed = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            return [
+                ConfigIssue(
+                    "warning",
+                    f"GATEWAY_MCP_SERVER_ENV={raw!r} is not readable JSON ({e}); "
+                    "the MCP credential overlay layer will be ignored.",
+                )
+            ]
+    else:
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            return [
+                ConfigIssue(
+                    "warning",
+                    f"GATEWAY_MCP_SERVER_ENV={raw!r} is neither an existing file "
+                    f"nor valid inline JSON ({e}); the MCP credential overlay "
+                    "layer will be ignored.",
+                )
+            ]
+    if not isinstance(parsed, dict):
+        return [
+            ConfigIssue(
+                "warning",
+                "GATEWAY_MCP_SERVER_ENV must be a JSON object of "
+                "{server: {env, headers}}; the MCP credential overlay layer will "
+                "be ignored.",
+            )
+        ]
+    return []
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -331,6 +379,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_sanitizer())
     issues.extend(_check_default_model(backends))
     issues.extend(_check_mcp_manifest())
+    issues.extend(_check_mcp_server_env())
     return issues
 
 

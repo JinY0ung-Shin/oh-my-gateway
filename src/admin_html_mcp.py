@@ -65,6 +65,8 @@ def get_mcp_html() -> str:
                       <div class="text-xs text-muted"
                         x-text="s.editable ? 'editable' : (s.source === 'plugin' ? 'def read-only' : 'read-only')"></div>
                       <div x-show="s.has_overlay" class="text-xs" style="color:var(--green)">+ credentials</div>
+                      <div x-show="s.has_env_overlay" class="text-xs" style="color:var(--cyan)"
+                        title="Declared in GATEWAY_MCP_SERVER_ENV (read-only here)">+ env-declared</div>
                     </td>
                     <td>
                       <div class="flex-wrap-gap" style="gap:0.25rem">
@@ -79,12 +81,15 @@ def get_mcp_html() -> str:
                         <span x-show="s.has_overlay" class="text-xs text-mono"
                           style="padding:1px 6px; border:1px solid var(--green); color:var(--green)"
                           title="Admin credential overlay active">overlay</span>
+                        <span x-show="s.has_env_overlay" class="text-xs text-mono"
+                          style="padding:1px 6px; border:1px solid var(--cyan); color:var(--cyan)"
+                          title="GATEWAY_MCP_SERVER_ENV overlay active (read-only)">env-overlay</span>
                         <template x-for="ref in (s.env_refs || [])" :key="s.name + ':ref:' + ref">
                           <span class="text-xs text-mono" style="padding:1px 6px; border:1px solid var(--cyan); color:var(--cyan)"
                             title="Resolved from gateway env at session create / OpenCode startup"
                             x-text="mcpEnvRefBadge(ref)"></span>
                         </template>
-                        <span x-show="!(s.env_key_count || s.header_key_count || s.has_overlay)" class="text-xs text-muted">-</span>
+                        <span x-show="!(s.env_key_count || s.header_key_count || s.has_overlay || s.has_env_overlay)" class="text-xs text-muted">-</span>
                       </div>
                     </td>
                     <td>

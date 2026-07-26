@@ -321,6 +321,22 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
             safe_prefix = f"mcp__{mcp_safe_name(name)}__"
             server_patterns = [p for p in patterns if p.startswith(safe_prefix)]
             source = "manifest" if name in manifest_names else "env"
+            # A GATEWAY_MCP_SERVER_ENV overlay for a name no plugin declares
+            # merges into this config at session create — display it merged.
+            has_env_overlay = False
+            try:
+                from src import mcp_plugin_overlay
+
+                env_overlay = mcp_plugin_overlay.get_env_overlay(name)
+                if env_overlay:
+                    has_env_overlay = True
+                    config = mcp_plugin_overlay.merge_overlay_into_config(
+                        config, env_overlay
+                    )
+            except Exception:
+                logger.debug(
+                    "Failed to read MCP env overlay for %s", name, exc_info=True
+                )
             meta = mcp_secret_maps_meta(config)
             result.append(
                 {
@@ -331,6 +347,7 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "pattern": f"{safe_prefix}*",
                     "source": source,
                     "editable": source == "manifest",
+                    "has_env_overlay": has_env_overlay,
                     "config": _redact_mcp_config(config),
                     "reach": compute_mcp_server_reach(name, config),
                     **meta,
@@ -534,9 +551,12 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
 
             ok, reason = validate_server(name, config)
             meta = mcp_secret_maps_meta(config)
-            # Admin credential overlay (env/headers only) for this plugin server.
+            # Credential overlay (env/headers only) for this plugin server:
+            # ``overlay`` is the stored admin layer the edit form round-trips,
+            # ``has_env_overlay`` flags the read-only GATEWAY_MCP_SERVER_ENV layer.
             overlay_meta: Dict[str, Any] = {
                 "has_overlay": False,
+                "has_env_overlay": False,
                 "overlay_env_key_count": 0,
                 "overlay_header_key_count": 0,
                 "overlay_env_refs": [],
@@ -546,19 +566,23 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
                 from src import mcp_plugin_overlay
 
                 overlay = mcp_plugin_overlay.get_overlay(name)
-                if overlay:
-                    ometa = mcp_secret_maps_meta(overlay)
+                effective_overlay = mcp_plugin_overlay.get_effective_overlay(name)
+                if effective_overlay:
+                    ometa = mcp_secret_maps_meta(effective_overlay)
                     overlay_meta = {
-                        "has_overlay": True,
+                        "has_overlay": bool(overlay),
+                        "has_env_overlay": bool(
+                            mcp_plugin_overlay.get_env_overlay(name)
+                        ),
                         "overlay_env_key_count": ometa["env_key_count"],
                         "overlay_header_key_count": ometa["header_key_count"],
                         "overlay_env_refs": ometa["env_refs"],
-                        "overlay": _redact_mcp_config(overlay),
+                        "overlay": _redact_mcp_config(overlay) if overlay else {},
                     }
                     # Effective env/headers for display = base merged with overlay.
                     from src.mcp_plugin_overlay import merge_overlay_into_config
 
-                    effective_cfg = merge_overlay_into_config(config, overlay)
+                    effective_cfg = merge_overlay_into_config(config, effective_overlay)
                     meta = mcp_secret_maps_meta(effective_cfg)
             except Exception:
                 logger.debug("Failed to read plugin MCP overlay for %s", name, exc_info=True)

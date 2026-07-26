@@ -204,6 +204,19 @@ async def test_connection(name: str) -> Dict[str, Any]:
 
     config = get_mcp_servers().get(name)
     source = "mcp_config"
+    if config is not None:
+        # A GATEWAY_MCP_SERVER_ENV overlay for this name merges into the config at
+        # session create; probe with it or the credentials would be missing here.
+        try:
+            from src import mcp_plugin_overlay
+
+            env_overlay = mcp_plugin_overlay.get_env_overlay(name)
+            if env_overlay:
+                config = mcp_plugin_overlay.merge_overlay_into_config(
+                    config, env_overlay
+                )
+        except Exception:
+            logger.debug("MCP env overlay merge failed for %s", name, exc_info=True)
     if config is None:
         from src import plugin_service
 

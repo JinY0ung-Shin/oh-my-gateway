@@ -118,17 +118,24 @@ def upsert_overlay(
         headers=headers,
         plugin_id=resolved_plugin_id if isinstance(resolved_plugin_id, str) else None,
     )
+    note = (
+        "Applies to new Claude sessions: materializes this plugin server into "
+        "gateway mcp_servers with merged env/headers, scoped to the MCP server "
+        "process. Existing sessions keep their pinned set."
+    )
+    env_overlay = mcp_plugin_overlay.get_env_overlay(name)
+    if env_overlay:
+        note += (
+            f" This server also has a {mcp_plugin_overlay.ENV_OVERLAY_VAR} layer; "
+            "these saved keys win over it, other env-declared keys still apply."
+        )
     return {
         "status": "saved",
         "server": name,
         "plugin_id": stored.get("plugin_id") or resolved_plugin_id,
         "overlay": _public_overlay(stored),
         "patterns": [f"mcp__{mcp_safe_name(name)}__*"],
-        "note": (
-            "Applies to new Claude sessions: materializes this plugin server into "
-            "gateway mcp_servers with merged env/headers, scoped to the MCP server "
-            "process. Existing sessions keep their pinned set."
-        ),
+        "note": note,
     }
 
 
@@ -136,6 +143,14 @@ def delete_overlay(name: str) -> Dict[str, Any]:
     name = _validate_name(name)
     existed = mcp_plugin_overlay.delete_overlay(name)
     if not existed:
+        # An env-declared layer is not deletable from here: say so instead of
+        # reporting "no overlay" while the server visibly still has credentials.
+        if mcp_plugin_overlay.get_env_overlay(name):
+            raise McpPluginOverlayNotFound(
+                f"no stored overlay for server '{name}'; its credentials are "
+                f"declared in {mcp_plugin_overlay.ENV_OVERLAY_VAR} and must be "
+                "removed from the gateway environment"
+            )
         raise McpPluginOverlayNotFound(f"no overlay for server '{name}'")
     return {"status": "deleted", "server": name}
 
@@ -147,6 +162,11 @@ def get_overlay_detail(name: str) -> Dict[str, Any]:
     stored = mcp_plugin_overlay.get_overlay(name)
     plugins = _plugin_server_names()
     meta = plugins.get(name)
+    # ``overlay`` stays the stored (file) layer — it is what the admin form
+    # round-trips, and an env-declared value must not be written back to disk.
+    # The env layer is reported alongside, read-only.
+    env_overlay = mcp_plugin_overlay.get_env_overlay(name)
+    effective = mcp_plugin_overlay.get_effective_overlay(name)
     return {
         "server": name,
         "exists": bool(stored),
@@ -155,6 +175,13 @@ def get_overlay_detail(name: str) -> Dict[str, Any]:
         "config_redacted": _redact_mcp_config(stored) if stored else {},
         **mcp_secret_maps_meta(stored or {}),
         "env_refs": list_env_refs(stored or {}),
+        "env_declared": bool(env_overlay),
+        "env_declared_var": mcp_plugin_overlay.ENV_OVERLAY_VAR,
+        "env_overlay": _public_overlay(env_overlay),
+        "env_overlay_env_keys": sorted((env_overlay.get("env") or {}).keys()),
+        "env_overlay_header_keys": sorted((env_overlay.get("headers") or {}).keys()),
+        "effective": _public_overlay(effective),
+        "effective_env_refs": list_env_refs(effective or {}),
     }
 
 

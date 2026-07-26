@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from unittest.mock import patch
@@ -25,6 +26,23 @@ def overlay_file(tmp_path, monkeypatch):
     # path that never exists and reload — otherwise overlays this test saved
     # would stay in the module singleton and leak into later tests.
     monkeypatch.setenv("GATEWAY_MCP_PLUGIN_OVERLAY", str(tmp_path / "absent.json"))
+    mcp_plugin_overlay.reload_overlays()
+
+
+@pytest.fixture
+def env_overlay(monkeypatch):
+    """Setter for the ``GATEWAY_MCP_SERVER_ENV`` layer (inline JSON or a path).
+
+    Teardown clears the var and reloads BEFORE monkeypatch undo, so a declared
+    layer never leaks into later tests through the module singleton.
+    """
+
+    def _set(value: str) -> None:
+        monkeypatch.setenv(mcp_plugin_overlay.ENV_OVERLAY_VAR, value)
+        mcp_plugin_overlay.reload_overlays()
+
+    yield _set
+    monkeypatch.delenv(mcp_plugin_overlay.ENV_OVERLAY_VAR, raising=False)
     mcp_plugin_overlay.reload_overlays()
 
 
@@ -293,6 +311,193 @@ class TestClaudeMerge:
             cli._configure_mcp_servers(options, None, ["mcp__ctx__*"])
         assert options.mcp_servers["ctx"]["env"]["TOKEN"] == "s3cret"
         assert "TOKEN" not in options.env
+
+
+class TestEnvDeclaredOverlay:
+    """The GATEWAY_MCP_SERVER_ENV layer: deploy-time credentials by server name."""
+
+    def test_inline_json_lands_on_plugin_server(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"TOKEN": "from-env"}}}')
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            merged, applied = mcp_plugin_overlay.apply_overlays(None)
+        assert applied["plugin"] == ["ctx"]
+        assert merged["ctx"]["command"] == "npx"  # plugin base preserved
+        assert merged["ctx"]["env"]["BASE"] == "1"
+        assert merged["ctx"]["env"]["TOKEN"] == "from-env"
+
+    def test_file_path_source(self, overlay_file, env_overlay, tmp_path):
+        path = tmp_path / "mcp-server-env.json"
+        path.write_text('{"ctx": {"env": {"TOKEN": "from-file"}}}', encoding="utf-8")
+        env_overlay(str(path))
+        assert mcp_plugin_overlay.get_env_overlay("ctx")["env"]["TOKEN"] == "from-file"
+        assert mcp_plugin_overlay.list_env_overlay_names() == ["ctx"]
+
+    def test_overlay_file_wrapper_shape_accepted(self, overlay_file, env_overlay):
+        """The on-disk overlay document can be mounted and pointed at directly."""
+        env_overlay('{"version": 1, "overlays": {"ctx": {"env": {"A": "1"}}}}')
+        assert mcp_plugin_overlay.get_env_overlay("ctx")["env"]["A"] == "1"
+
+    def test_invalid_json_is_ignored(self, overlay_file, env_overlay, caplog):
+        with caplog.at_level(logging.ERROR):
+            env_overlay("{not json")
+        assert mcp_plugin_overlay.list_env_overlay_names() == []
+        assert any("GATEWAY_MCP_SERVER_ENV" in r.getMessage() for r in caplog.records)
+
+    def test_non_object_json_is_ignored(self, overlay_file, env_overlay):
+        env_overlay('["ctx"]')
+        assert mcp_plugin_overlay.list_env_overlay_names() == []
+
+    def test_entry_without_usable_values_is_skipped(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"N": 5}}, "ok": {"env": {"A": "1"}}}')
+        assert mcp_plugin_overlay.list_env_overlay_names() == ["ok"]
+
+    def test_admin_file_wins_per_key(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"TOKEN": "from-env", "KEEP": "env"}}}')
+        mcp_plugin_overlay.upsert_overlay("ctx", env={"TOKEN": "from-admin"})
+        effective = mcp_plugin_overlay.get_effective_overlay("ctx")
+        assert effective["env"]["TOKEN"] == "from-admin"
+        assert effective["env"]["KEEP"] == "env"
+        # Stored layer stays file-only — the admin edit form's contract.
+        assert mcp_plugin_overlay.get_overlay("ctx")["env"] == {"TOKEN": "from-admin"}
+
+    def test_admin_save_never_persists_env_declared_keys(
+        self, overlay_file, env_overlay
+    ):
+        """Regression: freezing an env-declared value into the file would pin a
+        rotated secret forever."""
+        env_overlay('{"ctx": {"env": {"FROM_ENV": "v"}}}')
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            mcp_plugin_overlay_service.upsert_overlay("ctx", env={"FROM_ADMIN": "w"})
+        on_disk = json.loads(overlay_file.read_text(encoding="utf-8"))
+        assert on_disk["overlays"]["ctx"]["env"] == {"FROM_ADMIN": "w"}
+
+    def test_gateway_server_gets_the_overlay(self, overlay_file, env_overlay):
+        """A name no plugin declares falls back to the gateway-declared server."""
+        env_overlay('{"gw": {"env": {"TOKEN": "t"}, "headers": {"X-A": "1"}}}')
+        with patch("src.plugin_service.list_plugin_mcp_servers", return_value=[]):
+            merged, applied = mcp_plugin_overlay.apply_overlays(
+                {"gw": {"type": "stdio", "command": "gw", "env": {"BASE": "1"}}}
+            )
+        assert applied == {"plugin": [], "gateway": ["gw"], "stale": []}
+        assert merged["gw"]["env"] == {"BASE": "1", "TOKEN": "t"}
+        assert merged["gw"]["headers"] == {"X-A": "1"}
+
+    def test_plugin_wins_over_gateway_server_of_same_name(
+        self, overlay_file, env_overlay
+    ):
+        env_overlay('{"ctx": {"env": {"TOKEN": "t"}}}')
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            merged, applied = mcp_plugin_overlay.apply_overlays(
+                {"ctx": {"type": "stdio", "command": "gateway-copy"}}
+            )
+        assert applied["plugin"] == ["ctx"]
+        assert merged["ctx"]["command"] == "npx"
+
+    def test_stale_name_warns_and_changes_nothing(
+        self, overlay_file, env_overlay, caplog
+    ):
+        env_overlay('{"nowhere": {"env": {"LEAK": "v"}}}')
+        with patch("src.plugin_service.list_plugin_mcp_servers", return_value=[]):
+            with caplog.at_level(logging.WARNING):
+                merged, applied = mcp_plugin_overlay.apply_overlays(
+                    {"gw": {"type": "stdio", "command": "gw"}}
+                )
+        assert applied["stale"] == ["nowhere"]
+        assert merged == {"gw": {"type": "stdio", "command": "gw"}}
+        assert any("nowhere" in r.getMessage() for r in caplog.records)
+
+    def test_env_ref_resolves_at_session_create_and_stays_scoped(
+        self, overlay_file, env_overlay, monkeypatch
+    ):
+        """{{env:NAME}} keeps the real secret in a plain gateway env var, and the
+        resolved value must reach the MCP server config only."""
+        monkeypatch.setenv("MCP_TOK", "s3cret")
+        env_overlay('{"gw": {"env": {"TOKEN": "{{env:MCP_TOK}}"}}}')
+        with patch("src.plugin_service.list_plugin_mcp_servers", return_value=[]):
+            from claude_agent_sdk import ClaudeAgentOptions
+
+            from src.backends.claude.client import ClaudeCodeCLI
+
+            cli = object.__new__(ClaudeCodeCLI)
+            options = ClaudeAgentOptions()
+            cli._configure_mcp_servers(
+                options, {"gw": {"type": "stdio", "command": "gw"}}, ["mcp__gw__*"]
+            )
+        assert options.mcp_servers["gw"]["env"]["TOKEN"] == "s3cret"
+        assert "TOKEN" not in options.env
+        assert "MCP_TOK" not in options.env
+
+    def test_reload_picks_up_env_changes(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"A": "1"}}}')
+        env_overlay('{"ctx": {"env": {"A": "2"}}}')
+        assert mcp_plugin_overlay.get_env_overlay("ctx")["env"]["A"] == "2"
+
+    def test_detail_reports_env_layer_separately(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"FROM_ENV": "v"}}}')
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            detail = mcp_plugin_overlay_service.get_overlay_detail("ctx")
+        # No stored overlay: the edit form sees nothing to round-trip.
+        assert detail["exists"] is False
+        assert detail["overlay"] == {}
+        assert detail["env_declared"] is True
+        assert detail["env_declared_var"] == "GATEWAY_MCP_SERVER_ENV"
+        assert detail["env_overlay_env_keys"] == ["FROM_ENV"]
+        assert "FROM_ENV" in detail["effective"]["env"]
+
+    def test_delete_points_at_the_env_var(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"A": "1"}}}')
+        with pytest.raises(McpPluginOverlayNotFound) as exc:
+            mcp_plugin_overlay_service.delete_overlay("ctx")
+        assert "GATEWAY_MCP_SERVER_ENV" in str(exc.value)
+
+    async def test_connection_test_probes_with_env_overlay(
+        self, overlay_file, env_overlay
+    ):
+        """The admin probe must see the same credentials a session would get,
+        otherwise an authenticated remote server tests as unreachable."""
+        env_overlay('{"gw": {"headers": {"Authorization": "Bearer x"}}}')
+        probed = {}
+
+        async def fake_probe(name, config):
+            probed[name] = config
+            return {"ok": True, "detail": "probed"}
+
+        with patch(
+            "src.mcp_config.get_mcp_servers",
+            return_value={"gw": {"type": "http", "url": "https://mcp.example"}},
+        ):
+            with patch("src.mcp_connection_test.test_mcp_server", fake_probe):
+                from src import mcp_admin_service
+
+                result = await mcp_admin_service.test_connection("gw")
+        assert result["ok"] is True
+        assert probed["gw"]["headers"] == {"Authorization": "Bearer x"}
+
+    def test_admin_row_flags_env_layer(self, overlay_file, env_overlay):
+        env_overlay('{"ctx": {"env": {"A": "1"}}}')
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            from src.admin_service import get_plugin_mcp_servers_detail
+
+            rows = {r["name"]: r for r in get_plugin_mcp_servers_detail()}
+        assert rows["ctx"]["has_env_overlay"] is True
+        assert rows["ctx"]["has_overlay"] is False
+        assert rows["ctx"]["overlay"] == {}  # form prefill stays file-only
+        assert rows["ctx"]["overlay_env_key_count"] == 1
 
 
 class TestOverlayRoutes:
