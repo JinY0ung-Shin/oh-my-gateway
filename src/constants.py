@@ -42,6 +42,15 @@ PERMISSION_MODE_BYPASS = "bypassPermissions"
 SESSION_CLEANUP_INTERVAL_MINUTES = parse_int_env("SESSION_CLEANUP_INTERVAL_MINUTES", 5)
 SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 
+# Concurrency admission control (see src/concurrency.py for the rationale).
+# Every live session pins a Claude CLI subprocess (~400 MB measured) for its
+# whole TTL, so MAX_LIVE_SESSIONS — not the in-flight turn cap — is what keeps
+# the gateway from running the host out of memory. Defaults are sized for an
+# 8 GB host at ~0.5 GB per session. Set any of them to 0 to disable that limit.
+MAX_LIVE_SESSIONS = parse_int_env("MAX_LIVE_SESSIONS", 12)
+MAX_CONCURRENT_TURNS = parse_int_env("MAX_CONCURRENT_TURNS", 8)
+MAX_CONCURRENT_TURNS_PER_USER = parse_int_env("MAX_CONCURRENT_TURNS_PER_USER", 3)
+
 # Per-user workspace isolation
 # Base directory for user workspaces. Empty means a per-process system temp dir.
 USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 from dataclasses import dataclass, field
 from threading import Lock
 
+from src import metrics
 from src.models import Message, SessionInfo
 from src.constants import SESSION_CLEANUP_INTERVAL_MINUTES, SESSION_MAX_AGE_MINUTES
 
@@ -487,7 +488,16 @@ class SessionManager:
         """Get existing session or create a new one.
 
         If the session exists but is expired it is replaced with a fresh one.
+
+        Raises :class:`~src.concurrency.SessionLimitExceeded` when creating a
+        *new* session would exceed ``MAX_LIVE_SESSIONS``.  Reaching an
+        existing session never fails: the cap bounds how many Claude CLI
+        subprocesses are alive, and an established conversation already owns
+        one.
         """
+        from src.concurrency import SessionLimitExceeded
+        from src.constants import MAX_LIVE_SESSIONS
+
         with self.lock:
             if session_id in self.sessions:
                 if self._remove_if_expired(session_id):
@@ -495,6 +505,23 @@ class SessionManager:
                 else:
                     self.sessions[session_id].touch()
                     return self.sessions[session_id]
+
+            if MAX_LIVE_SESSIONS > 0 and len(self.sessions) >= MAX_LIVE_SESSIONS:
+                # Reclaim expired-but-not-yet-swept sessions before refusing —
+                # the cleanup task only runs every few minutes, so without this
+                # the gateway would reject while holding dead ones. This only
+                # frees sessions with no live SDK client; the rest need the
+                # async cycle to await disconnect() and are left in place.
+                self._purge_all_expired_sync()
+            if MAX_LIVE_SESSIONS > 0 and len(self.sessions) >= MAX_LIVE_SESSIONS:
+                logger.warning(
+                    "Refusing new session %s: %d live sessions at MAX_LIVE_SESSIONS=%d",
+                    session_id,
+                    len(self.sessions),
+                    MAX_LIVE_SESSIONS,
+                )
+                metrics.record_session_rejected()
+                raise SessionLimitExceeded(MAX_LIVE_SESSIONS)
 
             # Use runtime override if admin changed it, otherwise honor
             # the constructor-provided default_ttl_minutes so non-global

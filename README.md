@@ -121,6 +121,9 @@ Most settings are environment variables. Start with `.env.example`.
 | `MAX_TIMEOUT` | Backend timeout in milliseconds |
 | `BACKGROUND_RESPONSE_TIMEOUT_S` | Wall-clock cap for one `background: true` turn in seconds; default `3600` |
 | `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
+| `MAX_LIVE_SESSIONS` | Sessions held in memory before new ones get `503`; default `12` (see Capacity) |
+| `MAX_CONCURRENT_TURNS` | Agent turns allowed to run simultaneously; default `8` |
+| `MAX_CONCURRENT_TURNS_PER_USER` | Per-caller in-flight ceiling, keyed on `user`; default `3` |
 | `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
 | `GATEWAY_HOST` | Host bind address; falls back to legacy `CLAUDE_WRAPPER_HOST` |
 | `USER_WORKSPACES_DIR` | Per-user workspace root (per-session temp dir if unset) |
@@ -137,6 +140,38 @@ Most settings are environment variables. Start with `.env.example`.
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
 | `USAGE_LOG_DB_URL` | Optional SQLAlchemy URL for usage logging |
+
+## Capacity
+
+Sizing the gateway is driven by one fact: a session keeps its Claude CLI
+subprocess alive for its whole TTL (`SESSION_MAX_AGE_MINUTES`, default 60),
+not just while a turn runs. A live subprocess measures ~400 MB RSS, so budget
+**~0.5 GB per live session** including headroom for MCP child processes.
+
+| Host memory | `MAX_LIVE_SESSIONS` |
+|---|---|
+| 4 GB | 6 |
+| 8 GB | 12 (default) |
+| 16 GB | 24 |
+
+`MAX_LIVE_SESSIONS` is what prevents an OOM. `MAX_CONCURRENT_TURNS` bounds CPU
+and upstream API pressure instead — capping in-flight turns alone would not
+help, since idle sessions still hold their subprocess.
+
+Both limits are fail-fast: a refused caller gets `503` with `Retry-After`
+rather than being queued. Continuations (`previous_response_id`) are never
+refused, and non-agent endpoints (`/health`, `/admin`, `/v1/models`,
+`/files/*`) stay reachable so a saturated gateway remains diagnosable. Set any
+limit to `0` to disable it.
+
+The gateway logs a startup warning when `MAX_LIVE_SESSIONS` exceeds what the
+detected cgroup (or host) memory can hold. Watch `gateway_live_sessions`,
+`gateway_turns_in_flight`, `gateway_turns_rejected_total`, and
+`gateway_sessions_rejected_total` on `/metrics` to tune it.
+
+> Single process only. Sessions, the rate limiter, and the Prometheus registry
+> are all in-memory, so these limits are per-process and running multiple
+> uvicorn workers will not behave as expected.
 
 ## Docker
 

@@ -39,6 +39,8 @@ from src.constants import (
 )
 from src import __version__
 from src import metrics
+from src.concurrency import SessionLimitExceeded
+from src.concurrency_middleware import ConcurrencyLimitMiddleware
 from src.mcp_config import get_mcp_servers
 from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
@@ -298,6 +300,26 @@ async def lifespan(app: FastAPI):
         logger.info(f"MCP servers configured: {list(mcp_servers.keys())}")
     else:
         logger.info("No MCP servers configured (set MCP_CONFIG to enable)")
+
+    # Warn when MAX_LIVE_SESSIONS cannot fit in the memory this process
+    # actually has. Sessions pin a Claude CLI subprocess for their whole TTL,
+    # so an over-large cap means the host OOMs before the cap ever trips.
+    from src.concurrency import check_session_limit_fits_memory
+    from src.constants import (
+        MAX_CONCURRENT_TURNS,
+        MAX_CONCURRENT_TURNS_PER_USER,
+        MAX_LIVE_SESSIONS,
+    )
+
+    check_session_limit_fits_memory()
+    logger.info(
+        "Concurrency limits: live sessions=%s, in-flight turns=%s, per-user turns=%s "
+        "(0 = unlimited)",
+        MAX_LIVE_SESSIONS or "unlimited",
+        MAX_CONCURRENT_TURNS or "unlimited",
+        MAX_CONCURRENT_TURNS_PER_USER or "unlimited",
+    )
+    metrics.bind_live_sessions_source(lambda: len(session_manager.sessions))
 
     # Start session cleanup task
     session_manager.start_cleanup_task()
@@ -560,6 +582,12 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RequestIDMiddleware)
 app.add_middleware(RequestSizeLimitMiddleware)
 
+# Admission control for agent runs. Registered before the logging middlewares
+# so it sits *inside* them: a 503 from a full gateway must still be counted in
+# request metrics and the admin log, which would not happen if this were the
+# outermost layer.
+app.add_middleware(ConcurrencyLimitMiddleware)
+
 # Add the debug middleware
 app.add_middleware(DebugLoggingMiddleware)
 
@@ -600,6 +628,34 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     }
 
     return JSONResponse(status_code=422, content=error_response)
+
+
+@app.exception_handler(SessionLimitExceeded)
+async def session_limit_exception_handler(_request: Request, exc: SessionLimitExceeded):
+    """Translate the live-session cap into a retryable 503.
+
+    Registered globally rather than at the single call site so any future
+    caller of ``get_or_create_session`` gets the same wire behavior. The
+    payload mirrors ConcurrencyLimitMiddleware's 503 so clients can treat
+    both forms of backpressure identically. The configured limit is not
+    echoed — capacity is operator information, not caller information.
+    """
+    retry_after = 30
+    return JSONResponse(
+        status_code=503,
+        headers={"Retry-After": str(retry_after)},
+        content={
+            "error": {
+                "message": (
+                    "Gateway is at capacity — no free session slots. "
+                    f"Retry in {retry_after} seconds."
+                ),
+                "type": "server_overloaded",
+                "code": "session_limit_exceeded",
+                "retry_after": retry_after,
+            }
+        },
+    )
 
 
 @app.exception_handler(HTTPException)
