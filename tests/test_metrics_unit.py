@@ -26,11 +26,19 @@ class TestPathGroup:
         "path,expected",
         [
             ("/v1/responses", "responses"),
+            ("/v1/responses/resp_123/cancel", "responses"),
             ("/v1/sessions", "sessions"),
             ("/v1/sessions/abc-123", "sessions"),
             ("/v1/models", "models"),
             ("/v1/auth/status", "auth"),
             ("/v1/mcp/servers", "mcp"),
+            # Endpoints that previously collapsed into "other", leaving them
+            # unobservable in request metrics.
+            ("/v1/agents/messages", "agent_messages"),
+            ("/files/list", "workspace_files"),
+            ("/files/serve/a/b.html", "workspace_files"),
+            ("/admin/api/status", "admin"),
+            ("/v1/messages", "sanitizer"),
             ("/health", "health"),
             ("/health/ready", "health"),
             ("/version", "version"),

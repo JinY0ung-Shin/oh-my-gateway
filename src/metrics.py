@@ -12,11 +12,12 @@ token metrics are recorded from the usage-accounting path in
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
     Counter,
+    Gauge,
     Histogram,
     generate_latest,
 )
@@ -26,13 +27,20 @@ from prometheus_client import (
 # other per-request path segments would explode label cardinality).
 # ---------------------------------------------------------------------------
 
+# Longest-prefix wins is NOT applied — entries are matched in order, so more
+# specific prefixes must come first (``/v1/agents/messages`` before any
+# hypothetical ``/v1/agents``).
 _PATH_GROUP_PREFIXES: Tuple[Tuple[str, str], ...] = (
     ("/v1/responses", "responses"),
+    ("/v1/agents/messages", "agent_messages"),
     ("/v1/sessions", "sessions"),
     ("/v1/models", "models"),
     ("/v1/auth", "auth"),
     ("/v1/mcp", "mcp"),
     ("/v1/debug", "debug"),
+    ("/v1/messages", "sanitizer"),
+    ("/files", "workspace_files"),
+    ("/admin", "admin"),
     ("/health", "health"),
     ("/version", "version"),
     ("/metrics", "metrics"),
@@ -76,6 +84,36 @@ TOKENS_TOTAL = Counter(
     "gateway_tokens_total",
     "Token usage per backend, model, and token kind.",
     ["backend", "model", "kind"],
+)
+
+TURNS_IN_FLIGHT = Gauge(
+    "gateway_turns_in_flight",
+    "Agent turns currently executing (admission-controlled by src.concurrency).",
+)
+
+TURNS_REJECTED_TOTAL = Counter(
+    "gateway_turns_rejected_total",
+    "Agent runs rejected with 503 because a concurrency limit was reached.",
+    ["scope"],
+)
+
+LIVE_SESSIONS = Gauge(
+    "gateway_live_sessions",
+    "Sessions held in memory. Each pins a Claude CLI subprocess (~400 MB) for "
+    "its whole TTL, so this — not turns_in_flight — tracks the memory ceiling.",
+)
+
+SESSIONS_REJECTED_TOTAL = Counter(
+    "gateway_sessions_rejected_total",
+    "Session creations refused because MAX_LIVE_SESSIONS was reached.",
+)
+
+STREAM_DURATION = Histogram(
+    "gateway_stream_duration_seconds",
+    "Wall-clock duration of a streaming agent response, first byte to last. "
+    "gateway_request_latency_seconds only covers handler creation for these.",
+    ["path_group"],
+    buckets=(0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800),
 )
 
 # Maps the metric ``kind`` label to the key used in usage dicts produced by
@@ -136,6 +174,39 @@ def record_token_usage(
             TOKENS_TOTAL.labels(
                 backend=backend_label, model=model_label, kind=kind
             ).inc(amount)
+
+
+def set_turns_in_flight(value: int) -> None:
+    """Publish the current in-flight turn count."""
+    TURNS_IN_FLIGHT.set(value)
+
+
+def record_turn_rejected(scope: str) -> None:
+    """Record one agent run refused by admission control.
+
+    *scope* is ``"global"`` or ``"per_user"`` — a bounded label set.
+    """
+    TURNS_REJECTED_TOTAL.labels(scope=scope).inc()
+
+
+def bind_live_sessions_source(source: Callable[[], float]) -> None:
+    """Have ``gateway_live_sessions`` read *source* at scrape time.
+
+    A pull-based gauge cannot drift: sessions are added and removed from
+    several paths (create, delete, expiry sweep, shutdown) and any missed
+    call site would leave a wrong value published indefinitely.
+    """
+    LIVE_SESSIONS.set_function(source)
+
+
+def record_session_rejected() -> None:
+    """Record one session creation refused by ``MAX_LIVE_SESSIONS``."""
+    SESSIONS_REJECTED_TOTAL.inc()
+
+
+def record_stream_duration(*, path: str, duration_seconds: float) -> None:
+    """Record end-to-end duration of a streaming response."""
+    STREAM_DURATION.labels(path_group=path_group(path)).observe(duration_seconds)
 
 
 def render_latest() -> Tuple[bytes, str]:
