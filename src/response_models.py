@@ -212,14 +212,23 @@ class ReasoningOutputItem(BaseModel):
 class InputTokensDetails(BaseModel):
     """Breakdown of ``input_tokens`` (OpenAI shape plus a Claude extension).
 
+    Both fields are *subsets* of ``input_tokens``, never additions to it.
+    ``extract_sdk_usage`` folds every cache counter into the reported prompt
+    total, so the decomposition is::
+
+        input_tokens = uncached + cache_creation_tokens + cached_tokens
+
+    A cost calculator wants ``input_tokens - cached_tokens -
+    cache_creation_tokens`` for the full-price remainder; subtracting only
+    ``cached_tokens`` overstates it and double-counts the cache writes.
+
     ``cached_tokens`` is the OpenAI-standard field and maps exactly onto the
-    SDK's ``cache_read_input_tokens``: both count prompt tokens served from
-    cache, and both are a *subset* of ``input_tokens``.
+    SDK's ``cache_read_input_tokens``.
 
     ``cache_creation_tokens`` is a gateway extension with no OpenAI
-    equivalent. Cache writes are billed at a premium, so cost-tracking
-    clients need them separated from ordinary input tokens. Clients that
-    only know the OpenAI shape ignore the extra key.
+    equivalent, broken out because cache writes bill at a premium. Clients
+    that only know the OpenAI shape ignore the extra key and still read a
+    correct ``input_tokens`` total.
     """
 
     cached_tokens: int = 0

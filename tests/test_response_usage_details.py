@@ -74,6 +74,29 @@ class TestResolveUsageDetails:
         assert usage.input_tokens_details.cached_tokens <= usage.input_tokens
         assert usage.total_tokens == 650
 
+    def test_both_detail_fields_are_subsets_of_input_tokens(self):
+        """input_tokens = uncached + cache_creation + cached.
+
+        Cache-creation tokens are folded into the prompt total just like
+        cache reads, so a cost calculator must subtract *both* to get the
+        full-price remainder. Documenting only ``cached_tokens`` as a subset
+        led a reviewer to compute 3x the true uncached count.
+        """
+        from src.streaming_utils import resolve_token_usage
+
+        chunks = _result_chunk(
+            input_tokens=100,  # the uncached remainder
+            output_tokens=50,
+            cache_creation_input_tokens=200,
+            cache_read_input_tokens=300,
+        )
+        input_tokens, _ = resolve_token_usage(chunks, "", "")
+        details = resolve_usage_details(chunks)
+
+        assert input_tokens == 600
+        uncached = input_tokens - details.cached_tokens - details.cache_creation_tokens
+        assert uncached == 100
+
     def test_zeroes_when_turn_carried_no_sdk_usage(self):
         """The estimation fallback has no cache information to report."""
         details = resolve_usage_details([{"type": "assistant"}])

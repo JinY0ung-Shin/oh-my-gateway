@@ -18,10 +18,27 @@ was removed.
 }
 ```
 
-- `cached_tokens` follows OpenAI semantics: it is a **subset** of
-  `input_tokens`, not an addition to it.
-- `cache_creation_tokens` is separated out because cache writes bill at a
-  premium; clients that only know the OpenAI shape can ignore it.
+**Both detail fields are subsets of `input_tokens`, not additions to it.**
+`input_tokens` is the full prompt total, so the decomposition is:
+
+```
+input_tokens = uncached_tokens + cache_creation_tokens + cached_tokens
+```
+
+For the example above: `600 = 100 uncached + 200 written + 300 read`. A cost
+calculator therefore wants
+
+```
+uncached_full_price = input_tokens - cached_tokens - cache_creation_tokens
+```
+
+Subtracting only `cached_tokens` overstates full-price input and double-counts
+the cache-write tokens.
+
+- `cached_tokens` follows OpenAI semantics for the standard field.
+- `cache_creation_tokens` is broken out because cache writes bill at a
+  premium; clients that only know the OpenAI shape can ignore it and still
+  get a correct (if less granular) `input_tokens` total.
 - Turns with no SDK usage (the character-estimation fallback) report zeros
   here rather than guessing.
 
