@@ -148,15 +148,29 @@ subprocess alive for its whole TTL (`SESSION_MAX_AGE_MINUTES`, default 60),
 not just while a turn runs. A live subprocess measures ~400 MB RSS, so budget
 **~0.5 GB per live session** including headroom for MCP child processes.
 
-| Host memory | `MAX_LIVE_SESSIONS` |
-|---|---|
-| 4 GB | 6 |
-| 8 GB | 12 (default) |
-| 16 GB | 24 |
+`MAX_LIVE_SESSIONS` is what prevents an OOM on the `/v1/responses` path.
+`MAX_CONCURRENT_TURNS` bounds CPU and upstream API pressure there — capping
+in-flight turns alone would not help, since idle sessions still hold their
+subprocess.
 
-`MAX_LIVE_SESSIONS` is what prevents an OOM. `MAX_CONCURRENT_TURNS` bounds CPU
-and upstream API pressure instead — capping in-flight turns alone would not
-help, since idle sessions still hold their subprocess.
+**`/v1/agents/messages` is stateless**: every call builds a fresh SDK client,
+never enters the session manager, and so counts against neither
+`MAX_LIVE_SESSIONS` nor `gateway_live_sessions`. Those runs are bounded only
+by `MAX_CONCURRENT_TURNS`, which makes the worst case a **sum**:
+
+```
+peak subprocesses = MAX_LIVE_SESSIONS + MAX_CONCURRENT_TURNS
+```
+
+| Host memory | Peak subprocesses it fits | Example |
+|---|---|---|
+| 4 GB | ~4 | `MAX_LIVE_SESSIONS=3`, `MAX_CONCURRENT_TURNS=2` |
+| 8 GB | ~9 | `MAX_LIVE_SESSIONS=6`, `MAX_CONCURRENT_TURNS=4` |
+| 16 GB | ~19 | `MAX_LIVE_SESSIONS=12`, `MAX_CONCURRENT_TURNS=8` (defaults) |
+
+If you never call `/v1/agents/messages`, budget `MAX_LIVE_SESSIONS` alone and
+the defaults are comfortable on 8 GB. Startup warns whenever the sum exceeds
+what the detected cgroup/host memory can hold, so trust that over this table.
 
 A `background: true` turn holds its slot for the life of the detached run,
 not just until the `queued` reply is sent — otherwise background mode would
@@ -188,7 +202,9 @@ They bound resource use; they are not an authorization boundary. Deploy behind
 - **`MAX_CONCURRENT_TURNS_PER_USER` is a fairness hint, not a security
   control.** `user` is caller-supplied and tied to no credential — rotating
   it evades the limit, and claiming another caller's value burns their share.
-  Only `MAX_CONCURRENT_TURNS` is load-bearing against a hostile caller.
+  Opting out entirely is also trivial: omit `user`, or send the body with
+  `Transfer-Encoding: chunked` so there is no content-length to peek at. Only
+  `MAX_CONCURRENT_TURNS` is load-bearing against a hostile caller.
 - **Session slots have no eviction or fairness.** `touch()` refreshes the TTL
   on every access, so a caller that keeps `MAX_LIVE_SESSIONS` conversations
   warm holds them indefinitely and everyone else gets `503`. With the defaults

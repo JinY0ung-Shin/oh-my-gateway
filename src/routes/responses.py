@@ -1582,20 +1582,29 @@ async def _create_background_response(
     # escaping it the moment the queued response is sent.
     turn_slot = take_turn_slot(request) if request is not None else None
 
-    task = asyncio.get_running_loop().create_task(
-        _run_background_response(
-            body,
-            resolved,
-            backend,
-            session,
-            session_id,
-            resp_id,
-            next_turn,
-            prompt,
-            lock_acquired=preflight["lock_acquired"],
-            turn_slot=turn_slot,
+    try:
+        task = asyncio.get_running_loop().create_task(
+            _run_background_response(
+                body,
+                resolved,
+                backend,
+                session,
+                session_id,
+                resp_id,
+                next_turn,
+                prompt,
+                lock_acquired=preflight["lock_acquired"],
+                turn_slot=turn_slot,
+            )
         )
-    )
+    except BaseException:
+        # The transfer above already told the middleware not to release, so
+        # a failed spawn would strand the slot for the process lifetime with
+        # no runner to hand it back. Reachable only on a closing event loop,
+        # but a permanent capacity loss is not worth the three lines saved.
+        if turn_slot is not None:
+            turn_slot.release()
+        raise
     _BACKGROUND_RESPONSE_TASKS.add(task)
     task.add_done_callback(_BACKGROUND_RESPONSE_TASKS.discard)
     return queued.model_dump()

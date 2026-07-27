@@ -21,9 +21,16 @@ control.** It keys on the request's ``user`` field, which is caller-supplied
 and bound to no credential: rotating the value evades it entirely, and
 claiming someone else's value burns their share. It keeps well-behaved
 clients from starving each other; it stops no one who does not want to be
-stopped. It is enforced only for requests that actually carry a ``user`` —
-unidentified callers share one bucket, so enforcing there would cap a whole
-endpoint at ``per_user`` instead of sharing it.
+stopped.
+
+It is enforced only for requests that actually carry a ``user``. Unidentified
+callers share one bucket, so enforcing there would cap a whole endpoint at
+``per_user`` rather than share it — ``/v1/agents/messages`` forbids the field
+outright and would have been pinned at three concurrent turns for every
+caller combined. The trade-off is that opting out is trivial: omit ``user``,
+or send the body with ``Transfer-Encoding: chunked`` so there is no
+content-length to peek at. That costs nothing extra, because the cap was
+already advisory. ``MAX_CONCURRENT_TURNS`` is the real bound.
 
 Both default to values that are safe on an 8 GB box at roughly 0.5 GB per
 live session (measured 400 MB plus headroom for MCP child processes).
@@ -48,6 +55,16 @@ from src.constants import (
     MAX_CONCURRENT_TURNS_PER_USER,
     MAX_LIVE_SESSIONS,
 )
+
+__all__ = [
+    "SessionLimitExceeded",
+    "TurnLimiter",
+    "TurnSlot",
+    "check_session_limit_fits_memory",
+    "detect_memory_limit_bytes",
+    "peak_subprocess_count",
+    "turn_limiter",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -213,17 +230,37 @@ def detect_memory_limit_bytes() -> Optional[int]:
     return None
 
 
-def check_session_limit_fits_memory() -> Optional[str]:
-    """Warn when ``MAX_LIVE_SESSIONS`` cannot fit in available memory.
+def peak_subprocess_count() -> int:
+    """Worst-case concurrent Claude CLI subprocesses across both agent paths.
 
-    Returns the warning text (also logged), or ``None`` when the configured
-    limit fits or memory could not be detected.
+    ``/v1/responses`` turns reuse their session's persistent client, so the
+    session cap already covers them. ``/v1/agents/messages`` is stateless:
+    every call builds a fresh SDK client, never enters the session manager,
+    and is therefore invisible to ``MAX_LIVE_SESSIONS`` and to the
+    ``gateway_live_sessions`` gauge. Those runs are bounded only by
+    ``MAX_CONCURRENT_TURNS``, so the true ceiling is the sum.
+
+    A limit set to 0 is unbounded and cannot be budgeted; it contributes 0
+    here and is warned about separately.
     """
-    if MAX_LIVE_SESSIONS <= 0:
+    return max(MAX_LIVE_SESSIONS, 0) + max(MAX_CONCURRENT_TURNS, 0)
+
+
+def check_session_limit_fits_memory() -> Optional[str]:
+    """Warn when the configured limits cannot fit in available memory.
+
+    Returns the warning text (also logged), or ``None`` when the limits fit
+    or memory could not be detected.
+    """
+    if MAX_LIVE_SESSIONS <= 0 or MAX_CONCURRENT_TURNS <= 0:
         logger.warning(
-            "MAX_LIVE_SESSIONS=0 disables the live-session cap. Each session "
-            "holds a persistent Claude CLI subprocess (~500 MB); the gateway "
-            "can exhaust host memory under load."
+            "MAX_LIVE_SESSIONS=%s / MAX_CONCURRENT_TURNS=%s: a 0 disables that "
+            "cap. Each live session and each stateless /v1/agents/messages run "
+            "holds a Claude CLI subprocess (~%d MB); with a cap disabled the "
+            "gateway can exhaust host memory under load.",
+            MAX_LIVE_SESSIONS or "unlimited",
+            MAX_CONCURRENT_TURNS or "unlimited",
+            BYTES_PER_LIVE_SESSION // (1024**2),
         )
         return None
 
@@ -232,15 +269,19 @@ def check_session_limit_fits_memory() -> Optional[str]:
         return None
 
     affordable = int(total * _SESSION_MEMORY_SHARE) // BYTES_PER_LIVE_SESSION
-    if MAX_LIVE_SESSIONS <= affordable:
+    peak = peak_subprocess_count()
+    if peak <= affordable:
         return None
 
     message = (
-        f"MAX_LIVE_SESSIONS={MAX_LIVE_SESSIONS} exceeds what this host can hold: "
-        f"{total // (1024 ** 3)} GiB detected fits about {affordable} live session(s) "
-        f"at ~{BYTES_PER_LIVE_SESSION // (1024 ** 2)} MB each. Sessions keep their "
-        f"Claude CLI subprocess alive for the whole TTL, so the gateway may OOM "
-        f"before the cap is reached. Lower MAX_LIVE_SESSIONS or give the host more memory."
+        f"Configured limits can reach {peak} concurrent Claude CLI subprocesses "
+        f"(MAX_LIVE_SESSIONS={MAX_LIVE_SESSIONS} + MAX_CONCURRENT_TURNS="
+        f"{MAX_CONCURRENT_TURNS} stateless /v1/agents/messages runs, which never "
+        f"enter the session manager), but the {total // (1024 ** 3)} GiB detected "
+        f"here fits about {affordable} at ~{BYTES_PER_LIVE_SESSION // (1024 ** 2)} MB "
+        f"each. Sessions hold their subprocess for the whole TTL, so the gateway "
+        f"may OOM before either cap is reached. Lower MAX_LIVE_SESSIONS (or "
+        f"MAX_CONCURRENT_TURNS if you serve /v1/agents/messages), or add memory."
     )
     logger.warning(message)
     return message

@@ -19,6 +19,7 @@ from src.concurrency import (
     TurnLimiter,
     check_session_limit_fits_memory,
     detect_memory_limit_bytes,
+    peak_subprocess_count,
 )
 from src.concurrency_middleware import logger as concurrency_middleware_logger
 from src.constants import DEFAULT_MODEL
@@ -128,6 +129,48 @@ class TestTurnLimiter:
         limiter = TurnLimiter(total=10, per_user=2)
         slot, _ = limiter.try_acquire("transient")
         slot.release()
+        assert limiter.snapshot()["distinct_users"] == 0
+
+    def test_accounting_holds_under_contention(self):
+        """The limiter is a threading.Lock counter reached from an async app.
+
+        Slots are held (not acquired-and-freed) so threads genuinely compete:
+        the count must reach the cap, never exceed it, return to zero, and
+        leave no per-user keys behind even with double releases in flight.
+        """
+        import threading
+
+        limiter = TurnLimiter(total=8, per_user=0)
+        peak = 0
+        violations = []
+        guard = threading.Lock()
+        start = threading.Barrier(16)
+
+        def worker(n):
+            nonlocal peak
+            start.wait()
+            for _ in range(25):
+                slot, _ = limiter.try_acquire(f"u{n % 5}")
+                if slot is None:
+                    continue
+                with guard:
+                    current = limiter.in_flight
+                    peak = max(peak, current)
+                    if current > 8:
+                        violations.append(current)
+                time.sleep(0.001)
+                slot.release()
+                slot.release()
+
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(16)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert not violations, f"cap exceeded: {violations[:3]}"
+        assert peak > 1, "threads never overlapped — test proved nothing"
+        assert limiter.in_flight == 0
         assert limiter.snapshot()["distinct_users"] == 0
 
     def test_context_manager_releases(self):
@@ -334,6 +377,49 @@ class TestConcurrencyMiddleware:
 
         assert "3 more suppressed" in warn.call_args.args[4]
 
+    async def test_client_disconnect_is_not_replayed_as_an_empty_body(self):
+        """http.disconnect carries no body and no more_body. Treating it as a
+        clean end-of-body handed the route an empty payload, turning a dropped
+        request into a fabricated 422 in the logs and request metrics.
+        """
+        from src import concurrency
+        from src.concurrency_middleware import ConcurrencyLimitMiddleware
+
+        seen = []
+
+        async def app(scope, receive, send):
+            seen.append((await receive())["type"])
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        frames = iter(
+            [
+                {"type": "http.request", "body": b'{"mo', "more_body": True},
+                {"type": "http.disconnect"},
+            ]
+        )
+
+        async def receive():
+            return next(frames)
+
+        async def send(_message):
+            pass
+
+        await ConcurrencyLimitMiddleware(app)(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": [(b"content-length", b"40")],
+                "state": {},
+            },
+            receive,
+            send,
+        )
+
+        assert seen == ["http.disconnect"]
+        assert concurrency.turn_limiter.in_flight == 0
+
     def test_unguarded_paths_are_never_blocked(self):
         """A saturated gateway must stay diagnosable."""
         from src import concurrency
@@ -371,7 +457,7 @@ class TestLiveSessionLimit:
                 manager.get_or_create_session(f"s{i}")
         assert len(manager.sessions) == 30
 
-    def test_expired_sessions_are_reclaimed_before_refusing(self):
+    def test_expired_client_less_sessions_are_reclaimed_inline(self):
         """The sweep task runs every few minutes; without an inline reclaim
         the gateway would reject while holding dead sessions."""
         manager = SessionManager()
@@ -381,6 +467,40 @@ class TestLiveSessionLimit:
             fresh = manager.get_or_create_session("fresh")
         assert fresh.session_id == "fresh"
         assert "stale" not in manager.sessions
+
+    def test_expired_sessions_holding_a_client_still_refuse(self):
+        """The inline sweep cannot drop a session with a live SDK client —
+        disconnecting one has to be awaited — and *every* session that has
+        served a turn holds one. The earlier version of this test used a
+        client-less session and so never exercised the real case.
+        """
+        manager = SessionManager()
+        with patch("src.constants.MAX_LIVE_SESSIONS", 1):
+            stale = manager.get_or_create_session("stale")
+            stale.client = object()  # as if it had served a turn
+            stale.expires_at = stale.created_at
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("fresh")
+        assert "stale" in manager.sessions
+
+    async def test_capacity_pressure_kicks_an_async_sweep(self):
+        """Rather than wait up to SESSION_CLEANUP_INTERVAL_MINUTES, hitting the
+        cap on expired-but-client-holding sessions schedules the async cleanup
+        so the *next* caller succeeds in about a second."""
+        manager = SessionManager()
+        with patch("src.constants.MAX_LIVE_SESSIONS", 1):
+            stale = manager.get_or_create_session("stale")
+            stale.client = object()
+            stale.expires_at = stale.created_at
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("fresh")
+
+            sweep = manager._sweep_task
+            assert sweep is not None
+            await sweep
+
+            # The awaited sweep disconnected and dropped it, so a retry fits.
+            assert manager.get_or_create_session("fresh").session_id == "fresh"
 
     def test_rehydrate_respects_the_cap(self):
         """Rehydration materializes a session that pins its own subprocess, so
@@ -458,6 +578,25 @@ class TestMemorySizingCheck:
         with patch("builtins.open", fake_open):
             # Falls through to /proc/meminfo, which is a real host value.
             assert (detect_memory_limit_bytes() or 0) > 0
+
+    def test_peak_counts_the_stateless_path_too(self):
+        """/v1/agents/messages builds a fresh SDK client per call and never
+        enters the session manager, so it is invisible to MAX_LIVE_SESSIONS.
+        Budgeting sessions alone understated the ceiling."""
+        with patch("src.concurrency.MAX_LIVE_SESSIONS", 12):
+            with patch("src.concurrency.MAX_CONCURRENT_TURNS", 8):
+                assert peak_subprocess_count() == 20
+
+    def test_warns_when_the_stateless_path_pushes_past_memory(self):
+        """8 GB fits ~9 subprocesses; the defaults can reach 20."""
+        with patch("src.concurrency.MAX_LIVE_SESSIONS", 12):
+            with patch("src.concurrency.MAX_CONCURRENT_TURNS", 8):
+                with patch(
+                    "src.concurrency.detect_memory_limit_bytes", return_value=8 * 1024**3
+                ):
+                    message = check_session_limit_fits_memory()
+        assert message is not None
+        assert "agents/messages" in message
 
     def test_warns_when_the_cap_cannot_fit_in_memory(self):
         with patch("src.concurrency.MAX_LIVE_SESSIONS", 10_000):

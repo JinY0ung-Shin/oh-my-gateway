@@ -97,14 +97,37 @@ def _is_guarded(scope: Scope) -> bool:
     return scope.get("path", "") in GUARDED_PATHS
 
 
-async def _buffer_body(receive: Receive) -> bytes:
+async def _buffer_body(receive: Receive) -> Tuple[bytes, Optional[Message]]:
+    """Drain the request body, returning ``(body, disconnect_message)``.
+
+    A client that vanishes mid-upload sends ``http.disconnect``, which carries
+    neither ``body`` nor ``more_body``. Treating it as a clean end-of-body
+    would hand the route an empty payload and turn a dropped request into a
+    fabricated 422 in the logs and request metrics, so it is returned
+    separately for the caller to replay verbatim.
+    """
     body = b""
     while True:
         message = await receive()
+        if message.get("type") == "http.disconnect":
+            return body, message
         body += message.get("body", b"")
         if not message.get("more_body", False):
-            break
-    return body
+            return body, None
+
+
+def _replay_message(message: Message, original: Receive) -> Receive:
+    """Return a ``receive`` that re-delivers *message* once, then delegates."""
+    sent = False
+
+    async def receive() -> Message:
+        nonlocal sent
+        if not sent:
+            sent = True
+            return message
+        return await original()
+
+    return receive
 
 
 def _replay(body: bytes, original: Receive) -> Receive:
@@ -218,7 +241,12 @@ class ConcurrencyLimitMiddleware:
         if length is None or length > _MAX_PEEK_BYTES:
             return None, receive
 
-        body = await _buffer_body(receive)
+        body, disconnected = await _buffer_body(receive)
+        if disconnected is not None:
+            # Let the disconnect reach the app instead of replaying an empty
+            # body as if the client had sent one.
+            return None, _replay_message(disconnected, receive)
+
         replayed = _replay(body, receive)
         if not body:
             return None, replayed

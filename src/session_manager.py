@@ -305,6 +305,9 @@ class SessionManager:
         self.default_ttl_minutes: int = default_ttl_minutes
         self.cleanup_interval_minutes: int = cleanup_interval_minutes
         self._cleanup_task: Optional[asyncio.Task[None]] = None
+        # Out-of-band sweep kicked when the live-session cap is hit; see
+        # _schedule_expired_sweep.
+        self._sweep_task: Optional[asyncio.Task[int]] = None
         self._rehydrate_hits: int = 0
         self._rehydrate_misses: int = 0
 
@@ -315,18 +318,46 @@ class SessionManager:
     def _has_room_for_new_session(self) -> bool:
         """Whether another session may be admitted.  Caller must hold the lock.
 
-        Sweeps expired sessions before answering: the cleanup task only runs
-        every few minutes, so without this the gateway would refuse while
-        holding dead ones. The sweep only frees sessions with no live SDK
-        client; the rest need the async cycle to await ``disconnect()``.
+        Sweeps expired sessions before answering, because the periodic
+        cleanup task only runs every ``SESSION_CLEANUP_INTERVAL_MINUTES``
+        (default 5) and the gateway must not refuse while holding dead ones.
+
+        The synchronous sweep can only drop sessions with no live SDK client
+        — which in practice is almost none, since any session that has served
+        a turn owns one and disconnecting it has to be awaited. So when
+        expired-but-client-holding sessions are what's filling the cap, kick
+        the async cleanup instead: this request still fails, but the slot is
+        freed in about a second rather than up to five minutes.
         """
         limit = _max_live_sessions()
         if limit <= 0:
             return True
         if len(self.sessions) < limit:
             return True
+
         self._purge_all_expired_sync()
-        return len(self.sessions) < limit
+        if len(self.sessions) < limit:
+            return True
+
+        if any(s.is_expired() for s in self.sessions.values()):
+            self._schedule_expired_sweep()
+        return False
+
+    def _schedule_expired_sweep(self) -> None:
+        """Kick an out-of-band async cleanup, at most one at a time.
+
+        ``get_or_create_session`` is synchronous but always reached from an
+        async handler, so a loop is normally running. Outside one (unit tests,
+        sync callers) this is a no-op — the periodic task still covers it.
+        """
+        existing = getattr(self, "_sweep_task", None)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._sweep_task = loop.create_task(self.cleanup_expired_sessions())
 
     def _remove_if_expired(self, session_id: str) -> bool:
         """Remove *session_id* if present and expired.
