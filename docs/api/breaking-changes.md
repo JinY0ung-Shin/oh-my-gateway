@@ -1,5 +1,40 @@
 # Breaking Changes for API Consumers
 
+## 2026-07-27 — `/v1/responses` usage gains a token breakdown (additive)
+
+`response.usage` now carries two more keys. Existing readers of
+`input_tokens` / `output_tokens` are unaffected — no field changed meaning or
+was removed.
+
+```jsonc
+"usage": {
+  "input_tokens": 600,
+  "output_tokens": 50,
+  "total_tokens": 650,              // new: always input + output
+  "input_tokens_details": {          // new
+    "cached_tokens": 300,            // OpenAI-standard; SDK cache_read_input_tokens
+    "cache_creation_tokens": 200     // gateway extension, no OpenAI equivalent
+  }
+}
+```
+
+- `cached_tokens` follows OpenAI semantics: it is a **subset** of
+  `input_tokens`, not an addition to it.
+- `cache_creation_tokens` is separated out because cache writes bill at a
+  premium; clients that only know the OpenAI shape can ignore it.
+- Turns with no SDK usage (the character-estimation fallback) report zeros
+  here rather than guessing.
+
+**`output_tokens_details.reasoning_tokens` is deliberately absent.** Claude's
+usage payload folds thinking tokens into `output_tokens` and never reports
+them separately, so the gateway has no honest value to emit. A hard-coded `0`
+would misreport billed thinking tokens as zero, which is worse for cost
+tracking than the field being missing. Clients should not infer that a
+response used zero thinking tokens.
+
+Scope: `/v1/responses` only. `/v1/agents/messages` and the `/v1/messages`
+sanitizer keep their existing usage shapes.
+
 ## 2026-05-16 — Claude Agent SDK 0.2.82 upgrade
 
 ### Task tools are now available (opt-in)

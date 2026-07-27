@@ -3,7 +3,7 @@
 import time
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
 
 from src.runtime_config import get_default_model
 
@@ -209,11 +209,44 @@ class ReasoningOutputItem(BaseModel):
     content: Optional[List[ReasoningContent]] = None
 
 
+class InputTokensDetails(BaseModel):
+    """Breakdown of ``input_tokens`` (OpenAI shape plus a Claude extension).
+
+    ``cached_tokens`` is the OpenAI-standard field and maps exactly onto the
+    SDK's ``cache_read_input_tokens``: both count prompt tokens served from
+    cache, and both are a *subset* of ``input_tokens``.
+
+    ``cache_creation_tokens`` is a gateway extension with no OpenAI
+    equivalent. Cache writes are billed at a premium, so cost-tracking
+    clients need them separated from ordinary input tokens. Clients that
+    only know the OpenAI shape ignore the extra key.
+    """
+
+    cached_tokens: int = 0
+    cache_creation_tokens: int = 0
+
+
 class ResponseUsage(BaseModel):
-    """Token usage for a response."""
+    """Token usage for a response.
+
+    ``total_tokens`` is derived, never supplied by callers.
+
+    Note the deliberate omission of ``output_tokens_details.reasoning_tokens``:
+    Claude's usage payload folds thinking tokens into ``output_tokens`` and
+    never reports them separately, so the gateway has no honest value to put
+    there. Emitting a hard-coded ``0`` would misreport billed thinking tokens
+    as zero, which is worse for cost tracking than the field being absent.
+    """
 
     input_tokens: int = 0
     output_tokens: int = 0
+    total_tokens: int = 0
+    input_tokens_details: InputTokensDetails = Field(default_factory=InputTokensDetails)
+
+    @model_validator(mode="after")
+    def _derive_total(self) -> "ResponseUsage":
+        self.total_tokens = self.input_tokens + self.output_tokens
+        return self
 
 
 class ResponseErrorDetail(BaseModel):

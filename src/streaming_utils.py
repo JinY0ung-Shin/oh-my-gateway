@@ -12,6 +12,7 @@ from src.constants import (
 )
 from src.message_adapter import MessageAdapter
 from src.response_models import (
+    InputTokensDetails,
     ResponseContentPart,
     OutputItem,
     ReasoningContent,
@@ -23,7 +24,7 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.tool_stats import ToolStatsCollector
-from src.usage_logger import usage_logger
+from src.usage_logger import extract_sdk_usage_detail, usage_logger
 
 # Backward-compat re-exports from split modules.
 # External callers continue to use `from src.streaming_utils import X`.
@@ -348,6 +349,24 @@ def resolve_token_usage(
         est = backend.estimate_token_usage(prompt, completion_text, model)
         return est["prompt_tokens"], est["completion_tokens"]
     return MessageAdapter.estimate_tokens(prompt), MessageAdapter.estimate_tokens(completion_text)
+
+
+def resolve_usage_details(chunks: list) -> InputTokensDetails:
+    """Return the ``input_tokens`` cache breakdown for a Responses payload.
+
+    Reuses :func:`src.usage_logger.extract_sdk_usage_detail` rather than
+    re-walking the chunk list, so the usage-log rows and the API response can
+    never disagree about the same turn.
+
+    Returns all-zero details when the turn carried no SDK usage (the
+    estimation fallback in :func:`resolve_token_usage`) — the gateway has no
+    cache information to report in that case.
+    """
+    detail = extract_sdk_usage_detail(chunks)
+    return InputTokensDetails(
+        cached_tokens=detail["cache_read_tokens"],
+        cache_creation_tokens=detail["cache_creation_tokens"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1047,7 @@ async def stream_response_chunks(
                     usage=ResponseUsage(
                         input_tokens=prompt_tokens,
                         output_tokens=completion_tokens,
+                        input_tokens_details=resolve_usage_details(chunks_buffer),
                     ),
                     metadata=_metadata,
                     incomplete_details=ResponseIncompleteDetails(reason="user_cancelled"),
@@ -1377,6 +1397,7 @@ async def stream_response_chunks(
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
+            input_tokens_details=resolve_usage_details(chunks_buffer),
         ),
         metadata=_metadata,
         structured_output=extract_structured_output(chunks_buffer),

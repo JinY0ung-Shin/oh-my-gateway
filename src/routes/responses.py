@@ -26,6 +26,7 @@ from src.backends.claude.slash_commands import (
     validate_prompt as validate_slash_prompt,
 )
 from src.response_models import (
+    InputTokensDetails,
     ResponseCreateRequest,
     ResponseContentPart,
     ResponseErrorDetail,
@@ -304,6 +305,7 @@ def _build_completed_response(
     *,
     input_tokens: int,
     output_tokens: int,
+    usage_details: Optional[InputTokensDetails] = None,
     thinking_texts: Optional[List[str]] = None,
     structured_output: Any = None,
 ) -> ResponseObject:
@@ -330,6 +332,7 @@ def _build_completed_response(
         usage=ResponseUsage(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
+            input_tokens_details=usage_details or InputTokensDetails(),
         ),
         metadata=metadata or {},
         structured_output=structured_output,
@@ -386,6 +389,7 @@ def _record_stream_turn_response(
         metadata,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        usage_details=streaming_utils.resolve_usage_details(chunks_buffer),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks_buffer),
     )
@@ -1701,7 +1705,9 @@ async def _run_background_response(
                     )
                 ],
                 usage=ResponseUsage(
-                    input_tokens=prompt_tokens, output_tokens=completion_tokens
+                    input_tokens=prompt_tokens,
+                    output_tokens=completion_tokens,
+                    input_tokens_details=streaming_utils.resolve_usage_details(chunks),
                 ),
                 metadata=body.metadata or {},
                 incomplete_details=ResponseIncompleteDetails(reason="user_cancelled"),
@@ -1792,6 +1798,7 @@ async def _run_background_response(
             body.metadata,
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
+            usage_details=streaming_utils.resolve_usage_details(chunks),
             thinking_texts=thinking_texts,
             structured_output=streaming_utils.extract_structured_output(chunks),
         )
@@ -2319,6 +2326,7 @@ async def create_response(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
+        usage_details=streaming_utils.resolve_usage_details(chunks),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks),
     )
@@ -2673,6 +2681,7 @@ async def _handle_function_call_output(
         body.metadata,
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
+        usage_details=streaming_utils.resolve_usage_details(chunks),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks),
     )
