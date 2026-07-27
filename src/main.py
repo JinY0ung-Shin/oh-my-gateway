@@ -580,13 +580,16 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 # Add security middleware (order matters - first added = last executed)
 app.add_middleware(RequestIDMiddleware)
-app.add_middleware(RequestSizeLimitMiddleware)
 
-# Admission control for agent runs. Registered before the logging middlewares
-# so it sits *inside* them: a 503 from a full gateway must still be counted in
-# request metrics and the admin log, which would not happen if this were the
-# outermost layer.
+# Admission control for agent runs. Placement is load-bearing in both
+# directions (last added = outermost):
+#   - inside the logging middlewares, so a 503 from a full gateway is still
+#     counted in request metrics and the admin log;
+#   - inside RequestSizeLimitMiddleware, so an oversized body is rejected with
+#     413 on its own merits instead of being masked by a 503 whenever the
+#     gateway happens to be at capacity.
 app.add_middleware(ConcurrencyLimitMiddleware)
+app.add_middleware(RequestSizeLimitMiddleware)
 
 # Add the debug middleware
 app.add_middleware(DebugLoggingMiddleware)

@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 
 from src import metrics
+from src.concurrency import SessionLimitExceeded
 from src.models import Message, SessionInfo
 from src.constants import SESSION_CLEANUP_INTERVAL_MINUTES, SESSION_MAX_AGE_MINUTES
 
@@ -158,6 +159,13 @@ def _cancel_idle_reader(session: "Session") -> None:
         if not task.done():
             task.cancel()
         session.idle_reader_task = None
+
+
+def _max_live_sessions() -> int:
+    """Read ``MAX_LIVE_SESSIONS`` fresh so tests can patch the constant."""
+    from src.constants import MAX_LIVE_SESSIONS
+
+    return MAX_LIVE_SESSIONS
 
 
 def _utcnow() -> datetime:
@@ -303,6 +311,22 @@ class SessionManager:
     # ------------------------------------------------------------------
     # Internal helpers (caller must hold self.lock)
     # ------------------------------------------------------------------
+
+    def _has_room_for_new_session(self) -> bool:
+        """Whether another session may be admitted.  Caller must hold the lock.
+
+        Sweeps expired sessions before answering: the cleanup task only runs
+        every few minutes, so without this the gateway would refuse while
+        holding dead ones. The sweep only frees sessions with no live SDK
+        client; the rest need the async cycle to await ``disconnect()``.
+        """
+        limit = _max_live_sessions()
+        if limit <= 0:
+            return True
+        if len(self.sessions) < limit:
+            return True
+        self._purge_all_expired_sync()
+        return len(self.sessions) < limit
 
     def _remove_if_expired(self, session_id: str) -> bool:
         """Remove *session_id* if present and expired.
@@ -495,9 +519,6 @@ class SessionManager:
         subprocesses are alive, and an established conversation already owns
         one.
         """
-        from src.concurrency import SessionLimitExceeded
-        from src.constants import MAX_LIVE_SESSIONS
-
         with self.lock:
             if session_id in self.sessions:
                 if self._remove_if_expired(session_id):
@@ -506,22 +527,15 @@ class SessionManager:
                     self.sessions[session_id].touch()
                     return self.sessions[session_id]
 
-            if MAX_LIVE_SESSIONS > 0 and len(self.sessions) >= MAX_LIVE_SESSIONS:
-                # Reclaim expired-but-not-yet-swept sessions before refusing —
-                # the cleanup task only runs every few minutes, so without this
-                # the gateway would reject while holding dead ones. This only
-                # frees sessions with no live SDK client; the rest need the
-                # async cycle to await disconnect() and are left in place.
-                self._purge_all_expired_sync()
-            if MAX_LIVE_SESSIONS > 0 and len(self.sessions) >= MAX_LIVE_SESSIONS:
+            if not self._has_room_for_new_session():
                 logger.warning(
                     "Refusing new session %s: %d live sessions at MAX_LIVE_SESSIONS=%d",
                     session_id,
                     len(self.sessions),
-                    MAX_LIVE_SESSIONS,
+                    _max_live_sessions(),
                 )
                 metrics.record_session_rejected()
-                raise SessionLimitExceeded(MAX_LIVE_SESSIONS)
+                raise SessionLimitExceeded(_max_live_sessions())
 
             # Use runtime override if admin changed it, otherwise honor
             # the constructor-provided default_ttl_minutes so non-global
@@ -563,6 +577,20 @@ class SessionManager:
                 return None
             session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
             if session is not None:
+                # Rehydration materializes a session that will pin its own
+                # Claude CLI subprocess, so it has to respect the same cap as
+                # get_or_create_session. Without this, replaying stored
+                # previous_response_ids walks straight past MAX_LIVE_SESSIONS
+                # and defeats the memory guard.
+                if not self._has_room_for_new_session():
+                    logger.warning(
+                        "Refusing to rehydrate session %s: %d live sessions at "
+                        "MAX_LIVE_SESSIONS",
+                        session_id,
+                        len(self.sessions),
+                    )
+                    metrics.record_session_rejected()
+                    raise SessionLimitExceeded(_max_live_sessions())
                 self.sessions[session_id] = session
                 self._rehydrate_hits = getattr(self, "_rehydrate_hits", 0) + 1
                 return session

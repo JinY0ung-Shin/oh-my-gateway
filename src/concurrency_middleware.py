@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -29,6 +30,12 @@ logger = logging.getLogger(__name__)
 # Endpoints that spawn agent work. Everything else (models, health, admin,
 # workspace file I/O) is cheap and must never be blocked by a full gateway —
 # in particular ``/admin`` has to stay reachable to diagnose the overload.
+#
+# Matched EXACTLY, never by prefix. ``POST /v1/responses/{id}/cancel`` lives
+# under the same prefix but spawns no work — it is the control that *frees* a
+# slot. Admission-controlling it deadlocks the gateway: a saturated pool
+# (background turns can hold slots for BACKGROUND_RESPONSE_TIMEOUT_S) would
+# 503 the only request able to drain it.
 GUARDED_PATHS: Tuple[str, ...] = ("/v1/responses", "/v1/agents/messages")
 
 # Only peek at bodies small enough to buffer cheaply, matching the existing
@@ -38,14 +45,56 @@ _MAX_PEEK_BYTES = 100_000
 
 _RETRY_AFTER_SECONDS = 30
 
+# Minimum gap between rejection WARNINGs. Overload is a sustained condition,
+# not a per-request event, so one line per window plus a suppressed count says
+# everything the log needs to; the Prometheus counter carries the exact rate.
+_REJECTION_LOG_WINDOW_S = 10.0
+
+# Throttle state is module-level, not per-instance: the middleware is
+# constructed once per app and the condition it reports (gateway overloaded)
+# is global, so one window across the process is the right granularity.
+_log_lock = threading.Lock()
+_last_warned = float("-inf")
+_suppressed = 0
+
+
+def reset_rejection_log_throttle() -> None:
+    """Clear the rejection-warning throttle.  Tests only."""
+    global _last_warned, _suppressed
+    with _log_lock:
+        _last_warned = float("-inf")
+        _suppressed = 0
+
+# Keys placed on the ASGI ``scope["state"]`` dict (surfaced to routes as
+# ``request.state``) so a handler can take over the slot's lifetime.
+SLOT_KEY = "turn_slot"
+TRANSFERRED_KEY = "turn_slot_transferred"
+
+
+def take_turn_slot(request) -> Optional[Any]:
+    """Transfer ownership of this request's admission slot to the caller.
+
+    ``background: true`` returns a ``queued`` response immediately and keeps
+    running the turn in a detached task. Without this handoff the middleware
+    would free the slot when the queued response is sent, and background turns
+    would escape ``MAX_CONCURRENT_TURNS`` entirely.
+
+    The caller becomes responsible for calling ``release()`` — always from a
+    ``finally``. Returns ``None`` when no slot is held (limits disabled, or an
+    unguarded path), so callers can treat it as optional.
+    """
+    slot = getattr(request.state, SLOT_KEY, None)
+    if slot is not None:
+        setattr(request.state, TRANSFERRED_KEY, True)
+    return slot
+
 
 def _is_guarded(scope: Scope) -> bool:
     if scope.get("type") != "http":
         return False
     if scope.get("method") != "POST":
         return False
-    path = scope.get("path", "")
-    return any(path == p or path.startswith(p + "/") for p in GUARDED_PATHS)
+    return scope.get("path", "") in GUARDED_PATHS
 
 
 async def _buffer_body(receive: Receive) -> bytes:
@@ -95,22 +144,25 @@ class ConcurrencyLimitMiddleware:
 
         slot, reason = self.limiter.try_acquire(user)
         if slot is None:
-            logger.warning(
-                "Rejecting %s: gateway at %s concurrency limit (in-flight=%d)",
-                scope.get("path"),
-                reason,
-                self.limiter.in_flight,
-            )
             metrics.record_turn_rejected(reason)
+            self._log_rejection(scope.get("path", ""), reason)
             await self._send_503(send)
             return
 
         metrics.set_turns_in_flight(self.limiter.in_flight)
+        # Published on request.state so a handler that outlives the response
+        # (background mode) can take ownership; see take_turn_slot().
+        state = scope.setdefault("state", {})
+        state[SLOT_KEY] = slot
+        state.pop(TRANSFERRED_KEY, None)
+
         started = time.monotonic()
         try:
             await self.app(scope, receive, send)
         finally:
-            slot.release()
+            if not state.get(TRANSFERRED_KEY):
+                slot.release()
+            state.pop(SLOT_KEY, None)
             metrics.set_turns_in_flight(self.limiter.in_flight)
             # This middleware is one of the few places that observes a
             # streaming response all the way to its final body chunk, so it
@@ -119,6 +171,36 @@ class ConcurrencyLimitMiddleware:
                 path=scope.get("path", ""),
                 duration_seconds=time.monotonic() - started,
             )
+
+    def _log_rejection(self, path: str, reason: str) -> None:
+        """Warn about a rejection at most once per window, with a suppressed count.
+
+        Rejections short-circuit before the per-IP rate limiter, so the
+        limiter structurally cannot damp this: a client retrying against a
+        full gateway would otherwise write one WARNING per attempt and turn
+        an overload into a log flood. ``gateway_turns_rejected_total`` still
+        counts every single rejection exactly.
+        """
+        global _last_warned, _suppressed
+
+        now = time.monotonic()
+        with _log_lock:
+            _suppressed += 1
+            if now - _last_warned < _REJECTION_LOG_WINDOW_S:
+                return
+            suppressed = _suppressed - 1
+            _suppressed = 0
+            _last_warned = now
+
+        logger.warning(
+            "Rejecting %s: gateway at %s concurrency limit (in-flight=%d)%s",
+            path,
+            reason,
+            self.limiter.in_flight,
+            f"; {suppressed} more suppressed in the last {_REJECTION_LOG_WINDOW_S:g}s"
+            if suppressed
+            else "",
+        )
 
     async def _extract_user(self, scope: Scope, receive: Receive) -> Tuple[Optional[str], Receive]:
         """Return ``(user, receive)`` — the body is replayed when consumed.

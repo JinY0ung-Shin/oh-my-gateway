@@ -14,6 +14,16 @@ Two independent limits guard two independent resources:
 
 ``MAX_CONCURRENT_TURNS``
     The CPU and upstream-API ceiling — how many turns may execute at once.
+    Against a hostile caller this is the *only* load-bearing limit.
+
+``MAX_CONCURRENT_TURNS_PER_USER`` is a **fairness hint, not a security
+control.** It keys on the request's ``user`` field, which is caller-supplied
+and bound to no credential: rotating the value evades it entirely, and
+claiming someone else's value burns their share. It keeps well-behaved
+clients from starving each other; it stops no one who does not want to be
+stopped. It is enforced only for requests that actually carry a ``user`` —
+unidentified callers share one bucket, so enforcing there would cap a whole
+endpoint at ``per_user`` instead of sharing it.
 
 Both default to values that are safe on an 8 GB box at roughly 0.5 GB per
 live session (measured 400 MB plus headroom for MCP child processes).
@@ -106,7 +116,14 @@ class TurnLimiter:
         with self._lock:
             if self.total > 0 and self._in_flight >= self.total:
                 return None, "global"
-            if self.per_user > 0 and self._by_user.get(key, 0) >= self.per_user:
+            # Enforced only for callers that actually identified themselves.
+            # Unidentified requests all hash to one bucket, so enforcing there
+            # would cap an entire endpoint at ``per_user`` rather than share
+            # it fairly: /v1/agents/messages forbids a ``user`` field
+            # outright, and a chunked request has no content-length to peek.
+            # Both would silently collapse to 3 concurrent turns for every
+            # caller combined. They are bounded by ``total`` instead.
+            if user and self.per_user > 0 and self._by_user.get(key, 0) >= self.per_user:
                 return None, "per_user"
             self._in_flight += 1
             self._by_user[key] = self._by_user.get(key, 0) + 1

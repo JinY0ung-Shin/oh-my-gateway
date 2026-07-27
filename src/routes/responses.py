@@ -42,6 +42,7 @@ from src.response_models import (
     ReasoningSummary,
     ResponseUsage,
 )
+from src.concurrency_middleware import take_turn_slot
 from src.rate_limiter import rate_limit_endpoint
 from src import session_outbox
 from src.chunk_processing import classify_error_chunk
@@ -1524,6 +1525,7 @@ async def _create_background_response(
     system_prompt: Optional[str],
     workspace_str: str,
     forward_headers: Optional[Dict[str, str]],
+    request: Optional[Request] = None,
 ) -> Dict[str, Any]:
     """Accept a background turn: guard, lock, spawn the runner, return queued.
 
@@ -1573,6 +1575,13 @@ async def _create_background_response(
     # (queued → in_progress) and must not alias the object being returned.
     _register_background_run(resp_id, session_id, queued.model_dump())
 
+    # Take over the admission slot only now: everything above can still raise,
+    # and until the runner exists the middleware must stay responsible for
+    # releasing it. From here the runner's ``finally`` owns the slot, which is
+    # what keeps background turns inside MAX_CONCURRENT_TURNS instead of
+    # escaping it the moment the queued response is sent.
+    turn_slot = take_turn_slot(request) if request is not None else None
+
     task = asyncio.get_running_loop().create_task(
         _run_background_response(
             body,
@@ -1584,6 +1593,7 @@ async def _create_background_response(
             next_turn,
             prompt,
             lock_acquired=preflight["lock_acquired"],
+            turn_slot=turn_slot,
         )
     )
     _BACKGROUND_RESPONSE_TASKS.add(task)
@@ -1602,6 +1612,7 @@ async def _run_background_response(
     prompt: Any,
     *,
     lock_acquired: bool,
+    turn_slot: Optional[Any] = None,
 ) -> None:
     """Detached runner for one background turn.
 
@@ -1835,8 +1846,16 @@ async def _run_background_response(
                     session.active_response_done.set()
                 raise
         finally:
-            if lock_acquired:
-                session.lock.release()
+            try:
+                if lock_acquired:
+                    session.lock.release()
+            finally:
+                # Held on behalf of this detached run since the accept path
+                # handed it over; releasing here is what makes background
+                # turns count against MAX_CONCURRENT_TURNS for their real
+                # duration rather than just until the queued reply is sent.
+                if turn_slot is not None:
+                    turn_slot.release()
 
 
 @router.post("/v1/responses")
@@ -1963,6 +1982,7 @@ async def create_response(
             system_prompt,
             workspace_str,
             forward_headers,
+            request=request,
         )
 
     if body.stream:

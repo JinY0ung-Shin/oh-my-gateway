@@ -123,7 +123,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
 | `MAX_LIVE_SESSIONS` | Sessions held in memory before new ones get `503`; default `12` (see Capacity) |
 | `MAX_CONCURRENT_TURNS` | Agent turns allowed to run simultaneously; default `8` |
-| `MAX_CONCURRENT_TURNS_PER_USER` | Per-caller in-flight ceiling, keyed on `user`; default `3` |
+| `MAX_CONCURRENT_TURNS_PER_USER` | Per-caller fairness hint keyed on `user` — not a security control; default `3` |
 | `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
 | `GATEWAY_HOST` | Host bind address; falls back to legacy `CLAUDE_WRAPPER_HOST` |
 | `USER_WORKSPACES_DIR` | Per-user workspace root (per-session temp dir if unset) |
@@ -158,6 +158,13 @@ not just while a turn runs. A live subprocess measures ~400 MB RSS, so budget
 and upstream API pressure instead — capping in-flight turns alone would not
 help, since idle sessions still hold their subprocess.
 
+A `background: true` turn holds its slot for the life of the detached run,
+not just until the `queued` reply is sent — otherwise background mode would
+be a free bypass of `MAX_CONCURRENT_TURNS`. A wedged background run therefore
+occupies a slot until `BACKGROUND_RESPONSE_TIMEOUT_S` (default 3600) expires,
+so with the defaults eight stuck runs can saturate the turn cap for an hour.
+Lower that timeout if your workload makes it likely.
+
 Both limits are fail-fast: a refused caller gets `503` with `Retry-After`
 rather than being queued. Continuations (`previous_response_id`) are never
 refused, and non-agent endpoints (`/health`, `/admin`, `/v1/models`,
@@ -172,6 +179,27 @@ detected cgroup (or host) memory can hold. Watch `gateway_live_sessions`,
 > Single process only. Sessions, the rate limiter, and the Prometheus registry
 > are all in-memory, so these limits are per-process and running multiple
 > uvicorn workers will not behave as expected.
+
+### Known limits of these controls
+
+They bound resource use; they are not an authorization boundary. Deploy behind
+`API_KEY` (and a trusted network) if callers are not trusted.
+
+- **`MAX_CONCURRENT_TURNS_PER_USER` is a fairness hint, not a security
+  control.** `user` is caller-supplied and tied to no credential — rotating
+  it evades the limit, and claiming another caller's value burns their share.
+  Only `MAX_CONCURRENT_TURNS` is load-bearing against a hostile caller.
+- **Session slots have no eviction or fairness.** `touch()` refreshes the TTL
+  on every access, so a caller that keeps `MAX_LIVE_SESSIONS` conversations
+  warm holds them indefinitely and everyone else gets `503`. With the defaults
+  that is 12 cheap requests per hour. Recovering needs an admin session
+  delete.
+- **`/metrics` is unauthenticated and now publishes capacity.**
+  `gateway_turns_in_flight` and `gateway_live_sessions` let anyone who can
+  reach the endpoint read the exact number of free slots, and the
+  `gateway_turns_rejected_total` `scope` label reveals which limit binds —
+  information the `503` bodies deliberately withhold. Restrict `/metrics` at
+  the reverse proxy on any deployment where that matters.
 
 ## Docker
 

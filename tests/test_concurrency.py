@@ -7,6 +7,7 @@ sessions pin a Claude CLI subprocess for their whole TTL — so its tests
 assert that continuations are *never* refused.
 """
 
+import time
 from unittest.mock import patch
 
 import pytest
@@ -19,9 +20,17 @@ from src.concurrency import (
     check_session_limit_fits_memory,
     detect_memory_limit_bytes,
 )
+from src.concurrency_middleware import logger as concurrency_middleware_logger
 from src.constants import DEFAULT_MODEL
 from src.session_manager import SessionManager
 from tests.test_main_api_unit import client_context
+
+
+def _drain(limiter, timeout=5.0):
+    """Block until every detached background run has released its slot."""
+    deadline = time.monotonic() + timeout
+    while limiter.in_flight and time.monotonic() < deadline:
+        time.sleep(0.02)
 
 
 @pytest.fixture(autouse=True)
@@ -36,6 +45,11 @@ def _admin_key_present():
 @pytest.fixture(autouse=True)
 def _reset_turn_limiter():
     from src import concurrency
+    from src.concurrency_middleware import reset_rejection_log_throttle
+
+    # The middleware is built once with the app, so its rejection-warning
+    # throttle would otherwise carry across tests.
+    reset_rejection_log_throttle()
 
     original_total = concurrency.turn_limiter.total
     original_per_user = concurrency.turn_limiter.per_user
@@ -83,10 +97,26 @@ class TestTurnLimiter:
         # A different user still gets in — the global pool is not exhausted.
         assert limiter.try_acquire("grace")[0] is not None
 
-    def test_anonymous_callers_share_one_bucket(self):
+    def test_unidentified_callers_are_not_per_user_capped(self):
+        """All anonymous requests hash to one bucket, so enforcing per_user
+        there would cap a whole endpoint at that number rather than share it.
+
+        /v1/agents/messages forbids a ``user`` field outright, and chunked
+        requests have no content-length to peek — both would silently collapse
+        to ``per_user`` concurrent turns for every caller combined. They are
+        bounded by the global limit instead.
+        """
         limiter = TurnLimiter(total=10, per_user=1)
-        assert limiter.try_acquire(None)[0] is not None
-        assert limiter.try_acquire(None)[0] is None
+        slots = [limiter.try_acquire(None)[0] for _ in range(10)]
+        assert all(s is not None for s in slots)
+        blocked, reason = limiter.try_acquire(None)
+        assert blocked is None
+        assert reason == "global"
+
+    def test_identified_callers_are_still_per_user_capped(self):
+        limiter = TurnLimiter(total=10, per_user=1)
+        assert limiter.try_acquire("ada")[0] is not None
+        assert limiter.try_acquire("ada")[1] == "per_user"
 
     def test_zero_disables_a_limit(self):
         limiter = TurnLimiter(total=0, per_user=0)
@@ -162,6 +192,148 @@ class TestConcurrencyMiddleware:
         assert resp.status_code == 200
         assert concurrency.turn_limiter.in_flight == 0
 
+    def test_background_turn_holds_its_slot_past_the_queued_reply(self):
+        """``background: true`` answers immediately and keeps working in a
+        detached task. Without a handoff the middleware would free the slot at
+        the queued reply and background turns would escape the cap entirely.
+        """
+        import asyncio
+
+        from src import concurrency
+
+        async def slow(client, prompt, session):
+            await asyncio.sleep(0.3)
+            yield {"content": [{"type": "text", "text": "done"}]}
+            yield {"subtype": "success", "result": "done"}
+
+        with client_context() as (client, mock_cli):
+            mock_cli.run_completion_with_client = slow
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hi",
+                    "background": True,
+                    "store": True,
+                },
+            )
+            assert resp.json()["status"] == "queued"
+            assert concurrency.turn_limiter.in_flight == 1
+            _drain(concurrency.turn_limiter)
+            assert concurrency.turn_limiter.in_flight == 0
+
+    def test_background_slot_is_released_when_the_backend_fails(self):
+        """A leaked slot permanently shrinks capacity — worse than no cap."""
+        import asyncio
+
+        from src import concurrency
+
+        async def boom(client, prompt, session):
+            await asyncio.sleep(0.05)
+            raise RuntimeError("backend exploded")
+            yield  # pragma: no cover
+
+        with client_context() as (client, mock_cli):
+            mock_cli.run_completion_with_client = boom
+            client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hi",
+                    "background": True,
+                    "store": True,
+                },
+            )
+            _drain(concurrency.turn_limiter)
+            assert concurrency.turn_limiter.in_flight == 0
+
+    def test_cancel_stays_reachable_when_the_pool_is_full(self):
+        """Guarding by prefix would deadlock the gateway: background turns can
+        pin every slot for BACKGROUND_RESPONSE_TIMEOUT_S, and cancel is the
+        only request able to drain them. It must never need a slot itself.
+        """
+        from src.concurrency_middleware import _is_guarded
+
+        assert _is_guarded({"type": "http", "method": "POST", "path": "/v1/responses"})
+        assert not _is_guarded(
+            {"type": "http", "method": "POST", "path": "/v1/responses/resp_abc_1/cancel"}
+        )
+
+    def test_agents_messages_is_not_capped_at_per_user(self):
+        """AgentMessagesRequest forbids a ``user`` field, so every call is
+        unidentified. Bucketing those together capped the whole endpoint at 3.
+        """
+        from src.agent_message_models import AgentMessagesRequest
+
+        assert "user" not in AgentMessagesRequest.model_fields
+
+        limiter = TurnLimiter(total=8, per_user=3)
+        slots = [limiter.try_acquire(None)[0] for _ in range(8)]
+        assert all(s is not None for s in slots), "endpoint collapsed below the global cap"
+
+    def test_oversized_body_is_413_even_at_capacity(self):
+        """Admission control must sit inside the size limit, or a saturated
+        gateway masks every oversized request as a transient 503."""
+        from src import concurrency
+        from src.constants import MAX_REQUEST_SIZE
+
+        concurrency.turn_limiter.total = 1
+        with client_context() as (client, _mock_cli):
+            concurrency.turn_limiter.try_acquire("hog")
+            resp = client.post(
+                "/v1/responses",
+                content=b"x" * 16,
+                headers={
+                    "content-type": "application/json",
+                    "content-length": str(MAX_REQUEST_SIZE + 1),
+                },
+            )
+        assert resp.status_code == 413
+
+    def test_rejection_logging_is_throttled(self):
+        """Rejections short-circuit before the per-IP rate limiter, so without
+        throttling a retrying client turns an overload into a log flood."""
+        import io
+        import logging
+
+        from src import concurrency
+
+        buf = io.StringIO()
+        handler = logging.StreamHandler(buf)
+        handler.setLevel(logging.WARNING)
+        log = logging.getLogger("src.concurrency_middleware")
+        log.addHandler(handler)
+
+        concurrency.turn_limiter.total = 1
+        try:
+            with client_context() as (client, _mock_cli):
+                concurrency.turn_limiter.try_acquire("hog")
+                for _ in range(40):
+                    client.post("/v1/responses", json={"model": DEFAULT_MODEL, "input": "x"})
+        finally:
+            log.removeHandler(handler)
+
+        lines = [line for line in buf.getvalue().splitlines() if line.strip()]
+        assert len(lines) == 1, f"expected one throttled warning, got {len(lines)}"
+        assert "global concurrency limit" in lines[0]
+        # The first warning fires with nothing suppressed yet, so the count
+        # only appears once a later rejection reopens the window.
+        assert "suppressed" not in lines[0]
+
+    def test_suppressed_rejections_are_counted_in_the_next_warning(self):
+        import src.concurrency_middleware as cm
+
+        mw = cm.ConcurrencyLimitMiddleware(app=None)
+        mw._log_rejection("/v1/responses", "global")  # opens the window
+        for _ in range(3):
+            mw._log_rejection("/v1/responses", "global")  # suppressed
+
+        with patch.object(cm, "_REJECTION_LOG_WINDOW_S", 0.0):
+            with patch.object(concurrency_middleware_logger, "warning") as warn:
+                mw._log_rejection("/v1/responses", "global")
+
+        assert "3 more suppressed" in warn.call_args.args[4]
+
     def test_unguarded_paths_are_never_blocked(self):
         """A saturated gateway must stay diagnosable."""
         from src import concurrency
@@ -209,6 +381,25 @@ class TestLiveSessionLimit:
             fresh = manager.get_or_create_session("fresh")
         assert fresh.session_id == "fresh"
         assert "stale" not in manager.sessions
+
+    def test_rehydrate_respects_the_cap(self):
+        """Rehydration materializes a session that pins its own subprocess, so
+        replaying stored previous_response_ids must not walk past the cap.
+        """
+        from src.session_manager import Session
+
+        manager = SessionManager()
+        with patch("src.constants.MAX_LIVE_SESSIONS", 2):
+            with patch(
+                "src.session_manager._try_rehydrate_from_jsonl",
+                lambda sid, *, user, cwd: Session(session_id=sid, user=user),
+            ):
+                assert manager.get_session("s1", user="u", cwd="/w") is not None
+                assert manager.get_session("s2", user="u", cwd="/w") is not None
+                with pytest.raises(SessionLimitExceeded):
+                    manager.get_session("s3", user="u", cwd="/w")
+
+        assert len(manager.sessions) == 2
 
     def test_maps_to_503_with_retry_after(self):
         with client_context() as (client, _mock_cli):
