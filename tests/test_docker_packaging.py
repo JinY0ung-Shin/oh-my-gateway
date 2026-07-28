@@ -248,8 +248,12 @@ def test_docker_build_docs_match_pinned_debian_suite():
 
     assert "bookworm" not in build_options
     assert "trixie" in build_options
-    assert "OPENCODE_VERSION" in build_options
-    assert "host environment" in build_options
+    # Stale-backend build args are intentionally undocumented in .env.example
+    # (OpenCode/Codex frozen 2026-07); the args still exist in the stale
+    # Dockerfile.opencode / Dockerfile.codex variants.
+    assert "OPENCODE_VERSION" not in build_options
+    assert "CODEX_VERSION" not in build_options
+    assert "NPM_CONFIG_REGISTRY" not in build_options
 
 
 def test_compose_forwards_corporate_build_mirror_args():
