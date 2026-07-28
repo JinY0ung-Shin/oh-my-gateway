@@ -288,13 +288,16 @@ class TestPluginServiceGaps:
     # ------------------------------------------------------------------
 
     def test_plugins_root_returns_none_when_dir_missing(self, tmp_path, monkeypatch):
-        """Lines 48-49: _plugins_root() returns None when ~/.claude/plugins/ absent."""
+        """_plugins_root() returns None when ~/.claude/plugins/ is absent.
+
+        Uses ``_plugins_root_real`` because the conftest hermeticity fixture
+        replaces ``_plugins_root`` with a stub for every test.
+        """
         from src import plugin_service
 
-        # Point home to a tmp dir that has no plugins subdir
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-        result = plugin_service._plugins_root()
-        assert result is None
+        assert plugin_service._plugins_root_real() is None
 
     def test_plugins_root_returns_path_when_dir_exists(self, tmp_path, monkeypatch):
         """_plugins_root() returns the path when ~/.claude/plugins/ exists."""
@@ -302,10 +305,22 @@ class TestPluginServiceGaps:
 
         plugins = tmp_path / ".claude" / "plugins"
         plugins.mkdir(parents=True)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
         monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
-        result = plugin_service._plugins_root()
-        assert result is not None
+        result = plugin_service._plugins_root_real()
+        assert result == plugins
         assert result.is_dir()
+
+    def test_plugins_root_honors_claude_config_dir(self, tmp_path, monkeypatch):
+        """CLAUDE_CONFIG_DIR overrides ~/.claude, matching the CLI the gateway
+        spawns, so both sides read the same plugin registry."""
+        from src import plugin_service
+
+        override = tmp_path / "custom-config"
+        (override / "plugins").mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(override))
+        result = plugin_service._plugins_root_real()
+        assert result == override / "plugins"
 
 
 # ===========================================================================

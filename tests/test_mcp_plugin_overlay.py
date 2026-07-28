@@ -257,10 +257,51 @@ class TestClaudeMerge:
             )
         assert merged == {"gw": {"type": "stdio", "command": "gw"}}
 
-    def test_materialization_logs_replacement(self, overlay_file, caplog):
-        """Materialization notes that the CLI runs the materialized copy in
-        place of the plugin's own setting_sources registration (verified live
-        on CLI 2.1.187, the pinned SDK bundle)."""
+    def test_plugin_server_materializes_without_overlay(self, overlay_file):
+        """Every installed plugin MCP server rides mcp_servers now (strict MCP
+        config) — an overlay is no longer required for materialization."""
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            merged, applied = mcp_plugin_overlay.apply_overlays(None)
+        assert "ctx" in merged
+        assert applied["plugin"] == ["ctx"]
+        assert applied["plugin_overlaid"] == []
+        assert applied["overridden"] == []
+
+    def test_first_plugin_wins_for_duplicate_server_name(self, overlay_file):
+        """Two plugins declaring the same server name: the first installed
+        entry is materialized (same first-wins rule as
+        ``get_plugin_mcp_server_config``)."""
+        first = _plugin_entry(config={"type": "stdio", "command": "first"})
+        second = _plugin_entry(
+            plugin_id="q@mp", config={"type": "stdio", "command": "second"}
+        )
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[first, second],
+        ):
+            merged, applied = mcp_plugin_overlay.apply_overlays(None)
+        assert merged["ctx"]["command"] == "first"
+        assert applied["plugin"] == ["ctx"]
+
+    def test_gateway_config_overrides_plugin_without_overlay(self, overlay_file):
+        """A same-named gateway server wins over the plugin bundle unless a
+        credential overlay says otherwise (operator config > bundle default)."""
+        gw = {"ctx": {"type": "stdio", "command": "operator-defined"}}
+        with patch(
+            "src.plugin_service.list_plugin_mcp_servers",
+            return_value=[_plugin_entry()],
+        ):
+            merged, applied = mcp_plugin_overlay.apply_overlays(gw)
+        assert merged["ctx"]["command"] == "operator-defined"
+        assert applied["overridden"] == ["ctx"]
+        assert applied["plugin"] == []
+
+    def test_materialization_logs_counts(self, overlay_file, caplog):
+        """Materialization logs how many plugin servers were materialized and
+        how many of them carried credential overlays."""
         mcp_plugin_overlay.upsert_overlay("ctx", env={"TOKEN": "t"})
         with patch(
             "src.plugin_service.list_plugin_mcp_servers",
@@ -272,8 +313,8 @@ class TestClaudeMerge:
             with caplog.at_level(logging.INFO):
                 cli._merge_plugin_mcp_overlays(None)
         assert any(
-            "replaces the plugin's own setting_sources registration"
-            in r.getMessage()
+            "Materialized 1 plugin MCP server(s) into mcp_servers "
+            "(1 with credential overlays)" in r.getMessage()
             for r in caplog.records
         )
 
@@ -384,7 +425,13 @@ class TestEnvDeclaredOverlay:
             merged, applied = mcp_plugin_overlay.apply_overlays(
                 {"gw": {"type": "stdio", "command": "gw", "env": {"BASE": "1"}}}
             )
-        assert applied == {"plugin": [], "gateway": ["gw"], "stale": []}
+        assert applied == {
+            "plugin": [],
+            "plugin_overlaid": [],
+            "overridden": [],
+            "gateway": ["gw"],
+            "stale": [],
+        }
         assert merged["gw"]["env"] == {"BASE": "1", "TOKEN": "t"}
         assert merged["gw"]["headers"] == {"X-A": "1"}
 

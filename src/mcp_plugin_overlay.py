@@ -17,23 +17,32 @@ the admin manifest, so an operator can ship defaults in the environment and
 still hot-fix one key from the panel. The two maps stay separate in memory: an
 admin save must never freeze an env-declared value into the overlay file.
 
-On new Claude sessions the gateway:
+On new Claude sessions the gateway materializes **every** installed plugin MCP
+server into ``options.mcp_servers`` (base config, overlay merged where one
+exists, ``${CLAUDE_PLUGIN_ROOT}`` expanded to the registry install path — the
+CLI only defines that variable while loading plugin-scoped config, so the
+materialized copy must be self-contained) and the Claude backend sets
+``strict_mcp_config`` so the CLI loads MCP servers from ``--mcp-config`` only.
+The plugin's own ``setting_sources`` registration never loads, so exactly one
+copy of each server runs and overlay values stay scoped to that server config —
+never injected into the session process environment.
 
-1. Reads the plugin's base server config
-2. Merges the overlay (overlay wins on key collision)
-3. Expands ``${CLAUDE_PLUGIN_ROOT}`` to the plugin's install path — the CLI only
-   defines that variable while loading plugin-scoped config, so the materialized
-   copy must be self-contained
-4. Materializes the result into ``options.mcp_servers`` (same path as gateway MCP)
+History: the design used to materialize only overlaid servers and rely on the
+CLI deregistering the plugin's same-named copy. That dedup turned out to be
+conditional on the configs matching exactly (command/args; env/headers
+differences are ignored), and the CLI resolves ``${CLAUDE_PLUGIN_ROOT}`` to the
+**marketplace source/clone directory** while the registry ``installPath``
+points at ``plugins/cache/...`` — different path strings, so the dedup never
+fired for directory-source marketplaces and both copies ran (found live
+2026-07-28; the two copies can even run different code, since clones
+auto-refresh while the cache is pinned). ``strict_mcp_config`` removes the
+dependence on both undocumented behaviors.
 
-The CLI then drops the plugin's own registration for that server name — only
-the materialized copy is registered and spawned (verified live 2026-07-16 on
-CLI 2.1.187, the SDK 0.2.108 bundle) — so overlay values stay scoped to that
-server config and are never injected into the session process environment.
-That drop is conditional on the materialized command/args matching the
-plugin's resolved config (which step 3 guarantees); a same-named config whose
-command/args diverge registers alongside the plugin copy and BOTH servers run
-(verified 2026-07-28). env/headers differences do not affect the comparison.
+Per plugin server name, the first installed plugin that declares it wins. A
+same-named gateway server (``MCP_CONFIG``/manifest) is overridden by the
+materialized plugin copy when an overlay exists (credentials attach to the
+plugin-defined command/url); without an overlay the gateway config wins — the
+operator's explicit definition overrides the bundle.
 
 An overlay whose name no plugin declares falls back to the gateway-declared
 server of that name (``MCP_CONFIG``/manifest): the env/headers merge into that
@@ -454,41 +463,61 @@ def materialize_overlaid_plugin_servers() -> Dict[str, Dict[str, Any]]:
 def apply_overlays(
     mcp_servers: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, List[str]]]:
-    """Apply every effective overlay to the gateway ``mcp_servers`` map.
+    """Materialize every installed plugin MCP server into the gateway map.
 
-    Per overlay name:
+    The Claude backend sets ``strict_mcp_config`` whenever the merged map is
+    non-empty, so this map is the session's complete MCP set — a plugin server
+    that is not materialized here does not exist for the session.
 
-    * a name an installed plugin declares is materialized from the plugin base
-      (overlay merged, ``${CLAUDE_PLUGIN_ROOT}`` expanded) and wins over a
-      gateway server of the same name, so credentials attach to the
-      plugin-defined command/url;
-    * otherwise the env/headers merge into the gateway-declared config
-      (``MCP_CONFIG``/manifest) of that name;
-    * a name neither declares is stale — warned about and skipped.
+    Per plugin server name (first installed plugin wins):
 
-    Returns ``(merged_servers, {"plugin": [...], "gateway": [...], "stale":
-    [...]})``. Does not mutate the input. Never raises.
+    * with an effective overlay, the plugin base + overlay is materialized and
+      wins over a same-named gateway server (credentials attach to the
+      plugin-defined command/url);
+    * without an overlay, a same-named gateway (``MCP_CONFIG``/manifest)
+      server wins — the operator's explicit config overrides the bundle;
+    * otherwise the plugin base is materialized as-is.
+
+    Overlay names no plugin declares merge into the gateway config of that
+    name; a name neither side declares is stale — warned about and skipped.
+
+    Returns ``(merged_servers, applied)`` where ``applied`` maps ``plugin``
+    (materialized plugin servers), ``plugin_overlaid`` (the subset that had an
+    overlay), ``overridden`` (plugin servers skipped for a same-named gateway
+    config), ``gateway`` (gateway servers that received overlay values) and
+    ``stale``. Does not mutate the input. Never raises.
     """
     merged: Dict[str, Any] = dict(mcp_servers or {})
-    applied: Dict[str, List[str]] = {"plugin": [], "gateway": [], "stale": []}
+    applied: Dict[str, List[str]] = {
+        "plugin": [],
+        "plugin_overlaid": [],
+        "overridden": [],
+        "gateway": [],
+        "stale": [],
+    }
 
     overlays = get_effective_overlays()
-    if not overlays:
-        return merged, applied
     by_name = _plugin_entries_by_name()
 
+    for name in sorted(by_name):
+        overlay = overlays.get(name) or {}
+        if not overlay and isinstance(merged.get(name), dict):
+            applied["overridden"].append(name)
+            continue
+        entry = by_name[name]
+        merged[name] = _merged_expanded(
+            entry["config"], overlay, entry.get("install_path")
+        )
+        applied["plugin"].append(name)
+        if overlay:
+            applied["plugin_overlaid"].append(name)
+
     for name in sorted(overlays):
-        overlay = overlays[name]
-        entry = by_name.get(name)
-        if entry is not None:
-            merged[name] = _merged_expanded(
-                entry["config"], overlay, entry.get("install_path")
-            )
-            applied["plugin"].append(name)
+        if name in by_name:
             continue
         base = merged.get(name)
         if isinstance(base, dict):
-            merged[name] = merge_overlay_into_config(base, overlay)
+            merged[name] = merge_overlay_into_config(base, overlays[name])
             applied["gateway"].append(name)
             continue
         applied["stale"].append(name)

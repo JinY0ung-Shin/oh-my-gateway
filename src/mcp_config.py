@@ -54,13 +54,15 @@ def mcp_safe_name(name: str) -> str:
 
 
 def plugin_mcp_tool_pattern(plugin_name: str, server_name: str) -> str:
-    """Tool pattern for a plugin-loaded MCP server.
+    """Tool pattern a plugin-loaded (``setting_sources``) MCP server would use.
 
     The Claude CLI registers plugin servers as ``plugin:<plugin>:<server>`` and
     names their tools ``mcp__plugin_<plugin>_<server>__<tool>`` with both names
-    verbatim (verified live 2026-07-28 on CLI 2.1.187 and 2.1.220). A gateway
-    ``mcp_servers`` entry with the same server name replaces the plugin copy
-    and moves the tools to the bare ``mcp__<server>__*`` namespace.
+    verbatim (verified live 2026-07-28 on CLI 2.1.187 and 2.1.220). Gateway
+    sessions never expose this form anymore: every plugin server is
+    materialized into ``mcp_servers`` under ``strict_mcp_config``, which puts
+    its tools on the bare ``mcp__<server>__*`` namespace. Kept for diagnostics
+    and for reasoning about non-gateway (plain CLI) sessions.
     """
     return f"mcp__plugin_{plugin_name}_{server_name}__*"
 

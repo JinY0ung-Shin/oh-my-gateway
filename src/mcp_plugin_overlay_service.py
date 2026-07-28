@@ -9,7 +9,6 @@ from src import mcp_plugin_overlay
 from src.mcp_config import (
     list_env_refs,
     mcp_secret_maps_meta,
-    plugin_mcp_tool_pattern,
     validate_string_map,
 )
 
@@ -118,14 +117,11 @@ def upsert_overlay(
         headers=headers,
         plugin_id=resolved_plugin_id if isinstance(resolved_plugin_id, str) else None,
     )
-    plugin_label = entry.get("plugin_name") or "<plugin>"
     note = (
-        "Applies to new Claude sessions: materializes this plugin server into "
-        "gateway mcp_servers with merged env/headers, scoped to the MCP server "
-        "process. This moves the server's tools from "
-        f"{plugin_mcp_tool_pattern(plugin_label, name)} to mcp__{name}__* — "
-        "update any name-keyed tool allowlists. Existing sessions keep their "
-        "pinned set."
+        "Applies to new Claude sessions: the gateway materializes every plugin "
+        "MCP server into mcp_servers (strict MCP config), and these credentials "
+        "merge into this server's config — scoped to the MCP server process. "
+        "Existing sessions keep their pinned set."
     )
     env_overlay = mcp_plugin_overlay.get_env_overlay(name)
     if env_overlay:

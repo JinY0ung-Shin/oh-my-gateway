@@ -96,6 +96,27 @@ def _isolate_plugin_mcp_overlay(tmp_path_factory):
     mp.undo()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_plugins_root(monkeypatch):
+    """Keep tests hermetic: never read the developer's real ``~/.claude/plugins``.
+
+    Every Claude session build now materializes plugin MCP servers
+    (``mcp_plugin_overlay.apply_overlays`` lists the installed registry), so an
+    MCP-bearing plugin on the developer's machine would otherwise leak into any
+    test that configures session options. Tests that need a registry patch
+    ``src.plugin_service._plugins_root`` (or ``list_plugin_mcp_servers``)
+    themselves — an inner ``with patch(...)`` overrides this default. The real
+    resolver stays reachable as ``_plugins_root_real`` for its own unit tests.
+    """
+    import src.plugin_service as plugin_service
+
+    monkeypatch.setattr(
+        plugin_service, "_plugins_root_real", plugin_service._plugins_root,
+        raising=False,
+    )
+    monkeypatch.setattr(plugin_service, "_plugins_root", lambda: None)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _isolate_claude_settings_env(tmp_path_factory):
     """Point the Claude settings env store AND the settings file at temp paths.

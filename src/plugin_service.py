@@ -47,8 +47,15 @@ _SAFE_MANIFEST_KEYS = frozenset(
 
 
 def _plugins_root() -> Optional[Path]:
-    """Return ``~/.claude/plugins`` if it exists."""
-    p = Path.home() / ".claude" / "plugins"
+    """Return the Claude plugins dir if it exists.
+
+    Honors ``CLAUDE_CONFIG_DIR`` (the CLI's config-dir override) so the
+    gateway reads the same registry the CLI it spawns will read; defaults to
+    ``~/.claude/plugins``.
+    """
+    override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    base = Path(override) if override else Path.home() / ".claude"
+    p = base / "plugins"
     return p if p.is_dir() else None
 
 

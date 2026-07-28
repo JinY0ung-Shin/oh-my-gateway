@@ -378,32 +378,30 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self,
         mcp_servers: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """Merge per-server MCP credential overlays into *mcp_servers*.
+        """Materialize plugin MCP servers and credential overlays into *mcp_servers*.
 
-        Overlays (env/headers only) come from ``GATEWAY_MCP_SERVER_ENV`` and the
-        admin overlay file, stored separately from the plugin ``.mcp.json`` and
-        from MCP_CONFIG. For a plugin-declared name we deep-copy the plugin base
-        config, merge the overlay, and add it to the gateway ``mcp_servers`` map
-        so it rides the same path as MCP_CONFIG/manifest servers; for a
-        gateway-declared name the env/headers merge into that config. Overlay
-        values stay scoped to that server config; nothing is injected into the
-        session process environment. A stale overlay (name declared nowhere)
-        contributes nothing.
+        Every installed plugin MCP server is copied into the gateway map (base
+        config, overlay env/headers merged where one exists,
+        ``${CLAUDE_PLUGIN_ROOT}`` expanded), and ``_configure_mcp_servers``
+        sets ``strict_mcp_config`` so the CLI loads MCP servers from
+        ``--mcp-config`` only — the plugin's own ``setting_sources`` copy never
+        registers. Overlay values stay scoped to that server config; nothing is
+        injected into the session process environment. A same-named gateway
+        server is overridden by the plugin copy only when an overlay exists;
+        otherwise the operator's explicit config wins. A stale overlay (name
+        declared nowhere) contributes nothing.
 
-        Verified live (CLI 2.1.187, the SDK 0.2.108 bundle, 2026-07-16): when
-        ``--mcp-config`` names a server also declared by a plugin, the CLI
-        drops the plugin registration entirely — only the materialized copy is
-        registered and spawned, so merged env/headers are authoritative and no
-        duplicate server runs.
-
-        CAVEAT (verified 2026-07-28, same CLI): that drop happens only while
-        the materialized command/args match the plugin's resolved config —
-        which this materialization guarantees by copying the plugin base.
-        A same-named ``mcp_servers`` entry whose command/args DIFFER from the
-        plugin's registers ALONGSIDE the plugin copy: both servers run and the
-        session exposes both ``mcp__<server>__*`` and
-        ``mcp__plugin_<plugin>_<server>__*`` tools. env/headers differences do
-        not affect the comparison.
+        Why strict: the CLI deregisters a plugin's same-named server only when
+        the external config matches the plugin's resolved config exactly
+        (command/args), and the CLI resolves ``${CLAUDE_PLUGIN_ROOT}`` to the
+        marketplace source/clone directory while the registry ``installPath``
+        points into ``plugins/cache/`` — so the paths never match for
+        directory-source marketplaces and both copies ran (verified live
+        2026-07-28 on CLI 2.1.187: duplicate tools ``mcp__<server>__*`` AND
+        ``mcp__plugin_<plugin>_<server>__*``, two server processes on
+        different code). ``strict_mcp_config`` (verified same day: MCP-only,
+        plugin skills/commands unaffected) removes the dependence on that
+        undocumented dedup entirely.
         """
         try:
             from src import mcp_plugin_overlay
@@ -415,10 +413,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         if applied["plugin"]:
             logger.info(
-                "Materialized %d plugin MCP server(s) with credential overlays: %s "
-                "(replaces the plugin's own setting_sources registration)",
+                "Materialized %d plugin MCP server(s) into mcp_servers "
+                "(%d with credential overlays): %s",
                 len(applied["plugin"]),
+                len(applied.get("plugin_overlaid") or []),
                 applied["plugin"],
+            )
+        if applied.get("overridden"):
+            logger.info(
+                "%d plugin MCP server(s) overridden by same-named gateway "
+                "config: %s",
+                len(applied["overridden"]),
+                applied["overridden"],
             )
         if applied["gateway"]:
             logger.info(
@@ -437,11 +443,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         allowed_tools: Optional[List[str]],
         forward_headers: Optional[Dict[str, str]] = None,
     ) -> None:
-        # Merge plugin credential overlays even when gateway MCP_CONFIG is empty.
+        # Materialize plugin MCP servers + credential overlays even when
+        # gateway MCP_CONFIG is empty.
         mcp_servers = self._merge_plugin_mcp_overlays(mcp_servers)
 
         if not mcp_servers:
+            # Nothing to own: leave strict off so an MCP-less deployment keeps
+            # the CLI's default source behavior.
             return
+
+        # The merged map is the session's complete MCP set: strict makes the
+        # CLI load MCP servers from --mcp-config only, so the plugin copies
+        # resolved via setting_sources can never dual-register (their
+        # ${CLAUDE_PLUGIN_ROOT} resolves to the marketplace clone, not the
+        # registry installPath used here — see _merge_plugin_mcp_overlays).
+        options.strict_mcp_config = True
 
         # Resolve ``{{env:NAME}}`` in per-server env/headers at session create so
         # secrets stay in the gateway process env (or K8s secrets) rather than
@@ -460,6 +476,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 if {f"mcp__{name}__*", f"mcp__{legacy_name}__*"} & allowed_set:
                     filtered[name] = config
             if not filtered:
+                # strict stays on: the caller's allowlist excluded every
+                # server, so the session gets no MCP at all rather than
+                # unfiltered plugin copies sneaking back via setting_sources.
                 logger.debug("No MCP servers match allowed_tools, skipping MCP")
                 return
 
@@ -475,14 +494,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if not options.allowed_tools:
             self._set_allowed_tools(options, list(DEFAULT_ALLOWED_TOOLS))
         # The caller passed no allowed_tools, so the gateway is choosing the
-        # default surface here. Allow *all* MCP tools rather than only the
-        # MCP_CONFIG servers' patterns: the SDK also loads plugin-bundled MCP
-        # servers via setting_sources, and pinning a narrow allowlist would
-        # silently lock those out the moment MCP_CONFIG is set. The CLI treats
-        # ``mcp__*`` as "every MCP tool" (covering MCP_CONFIG and plugin
-        # servers alike), so configuring MCP_CONFIG no longer narrows the MCP
-        # surface. Callers who pass an explicit allowed_tools take the branch
-        # above and keep full control.
+        # default surface here. Allow *all* MCP tools rather than enumerating
+        # per-server patterns: plugin servers now ride this same map, and the
+        # blanket also covers SDK-defined in-process servers. Callers who pass
+        # an explicit allowed_tools take the branch above and keep full
+        # control.
         if "mcp__*" not in options.allowed_tools:
             options.allowed_tools.append("mcp__*")
         logger.debug("MCP tools enabled (mcp__*); servers=%s", list(mcp_servers))

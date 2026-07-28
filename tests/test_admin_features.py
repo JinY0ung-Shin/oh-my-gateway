@@ -341,11 +341,11 @@ class TestGetPluginMcpServersDetail:
         assert row["source"] == "plugin"
         assert row["editable"] is False
         assert row["plugin"] == "context7@official"
-        # Plugin-loaded servers expose plugin-qualified tool names
-        # (mcp__plugin_<plugin>_<server>__*), verified CLI 2.1.187/2.1.220.
-        assert row["tools"] == ["mcp__plugin_context7_context7__*"]
-        assert row["pattern"] == "mcp__plugin_context7_context7__*"
-        assert row["materialized"] is False
+        # Every plugin server is materialized into gateway mcp_servers under
+        # strict MCP config, so the tools use the bare server namespace.
+        assert row["tools"] == ["mcp__context7__*"]
+        assert row["pattern"] == "mcp__context7__*"
+        assert row["materialized"] is True
         assert row["shadowed"] is False
         assert row["valid"] is True
 
@@ -362,6 +362,8 @@ class TestGetPluginMcpServersDetail:
         assert row["config"]["env"]["REGION"] == "us"
 
     def test_shadowed_when_name_in_effective_config(self, clean_registry):
+        """No overlay + same-named gateway server: the operator's config wins,
+        so the plugin row is shadowed and NOT materialized."""
         with (
             patch(
                 "src.plugin_service.list_plugin_mcp_servers",
@@ -374,6 +376,30 @@ class TestGetPluginMcpServersDetail:
         ):
             row = get_plugin_mcp_servers_detail()[0]
         assert row["shadowed"] is True
+        assert row["materialized"] is False
+
+    def test_overlay_keeps_plugin_materialized_over_gateway_name(
+        self, clean_registry
+    ):
+        """With a credential overlay the plugin copy wins even when a
+        same-named gateway server exists — the row stays materialized."""
+        with (
+            patch(
+                "src.plugin_service.list_plugin_mcp_servers",
+                return_value=self._entries(),
+            ),
+            patch(
+                "src.mcp_config.get_mcp_servers",
+                return_value={"context7": {"command": "x"}},
+            ),
+            patch(
+                "src.mcp_plugin_overlay.get_effective_overlay",
+                return_value={"env": {"K": "v"}},
+            ),
+        ):
+            row = get_plugin_mcp_servers_detail()[0]
+        assert row["materialized"] is True
+        assert row["shadowed"] is False
 
     def test_invalid_config_flagged(self, clean_registry):
         bad = [
@@ -394,7 +420,7 @@ class TestGetPluginMcpServersDetail:
             patch("src.mcp_config.get_mcp_servers", return_value={}),
         ):
             row = get_plugin_mcp_servers_detail()[0]
-        assert row["pattern"] == "mcp__plugin_context7_my-plugin-server__*"
+        assert row["pattern"] == "mcp__my-plugin-server__*"
         assert row["name"] == "my-plugin-server"  # original preserved
 
     def test_reach_is_claude_only(self, clean_registry):
@@ -403,7 +429,19 @@ class TestGetPluginMcpServersDetail:
         assert set(by) == {"claude", "codex", "opencode"}
         assert by["codex"]["reaches"] is False
         assert by["opencode"]["reaches"] is False
-        assert by["claude"]["mode"] == "setting_sources"
+        assert by["claude"]["mode"] == "mcp_servers (materialized)"
+
+    def test_reach_reports_gateway_override(self, clean_registry):
+        """No overlay + same-named gateway server: reach says the gateway
+        config wins and the plugin definition is unused."""
+        with patch(
+            "src.mcp_config.get_mcp_servers",
+            return_value={"context7": {"command": "x"}},
+        ):
+            reach = compute_plugin_mcp_reach("context7")
+        by = {r["backend"]: r for r in reach}
+        assert by["claude"]["mode"] == "gateway config"
+        assert "wins" in by["claude"]["condition"]
 
     def test_endpoint_appends_plugin_rows(self, admin_client, clean_registry):
         with (

@@ -157,6 +157,41 @@ class TestClaudeCodeCLIConfigureMcpServers:
         assert "my-server" in options.mcp_servers
         assert "other-server" not in options.mcp_servers
 
+    def test_strict_mcp_config_set_when_servers_configured(self):
+        """The merged map is the session's complete MCP set: strict makes the
+        CLI ignore setting_sources MCP configs, so a materialized plugin
+        server can never dual-register with its own plugin copy (whose
+        ``${CLAUDE_PLUGIN_ROOT}`` resolves to the marketplace clone, not the
+        registry installPath)."""
+        cli = _make_cli()
+        options = self._fresh_options()
+        assert options.strict_mcp_config is False
+        cli._configure_mcp_servers(
+            options, {"srv": {"type": "stdio", "command": "x"}}, None
+        )
+        assert options.strict_mcp_config is True
+
+    def test_strict_mcp_config_untouched_without_servers(self):
+        """An MCP-less deployment keeps the CLI's default source behavior."""
+        cli = _make_cli()
+        options = self._fresh_options()
+        cli._configure_mcp_servers(options, None, None)
+        assert options.strict_mcp_config is False
+
+    def test_strict_stays_on_when_filter_empties_servers(self):
+        """An allowlist that excludes every server yields NO MCP at all —
+        strict must stay on or plugin copies would sneak back in via
+        setting_sources, unfiltered."""
+        cli = _make_cli()
+        options = self._fresh_options()
+        cli._configure_mcp_servers(
+            options,
+            {"srv": {"type": "stdio", "command": "x"}},
+            ["mcp__other__*"],
+        )
+        assert options.strict_mcp_config is True
+        assert not (getattr(options, "mcp_servers", {}) or {})
+
     def test_no_matching_servers_skips_mcp(self, caplog):
         """When no MCP server matches allowed_tools, mcp_servers is not set (lines 300-302)."""
         import logging

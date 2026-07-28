@@ -485,55 +485,53 @@ def compute_mcp_server_reach(name: str, config: Dict[str, Any]) -> List[Dict[str
 def compute_plugin_mcp_reach(name: str) -> List[Dict[str, Any]]:
     """Per-backend reach for a plugin-provided MCP server. DISPLAY ONLY.
 
-    Plugin MCP servers are loaded by the Claude SDK via ``setting_sources``
-    (reading the plugin's ``.mcp.json``), NOT through the gateway's
-    ``mcp_servers`` option — their tools live under
-    ``mcp__plugin_<plugin>_<server>__*`` (verified CLI 2.1.187/2.1.220). A
-    credential overlay materializes the server into gateway ``mcp_servers``
-    instead, which moves the tools to the bare ``mcp__<server>__*`` namespace.
+    The gateway materializes every plugin MCP server into
+    ``options.mcp_servers`` and sets ``strict_mcp_config``, so the plugin's own
+    ``setting_sources`` copy never registers and the tools live under the bare
+    ``mcp__<server>__*`` namespace. Without a credential overlay, a same-named
+    gateway (``MCP_CONFIG``/manifest) server wins over the plugin definition.
     Codex and OpenCode never read Claude plugins and never see these servers.
     """
     from src.backends import _enabled_backend_names
     from src.backends.base import BackendRegistry
-    from src.mcp_config import plugin_mcp_tool_pattern
 
     enabled = set(_enabled_backend_names())
     claude_on = "claude" in enabled and BackendRegistry.is_registered("claude")
+    pattern = f"mcp__{name}__*"
 
-    materialized = False
+    has_overlay = False
     try:
         from src import mcp_plugin_overlay
 
-        materialized = bool(mcp_plugin_overlay.get_effective_overlay(name))
+        has_overlay = bool(mcp_plugin_overlay.get_effective_overlay(name))
     except Exception:
         pass
-    plugin_name = None
-    try:
-        from src import plugin_service
+    overridden = False
+    if not has_overlay:
+        try:
+            from src.mcp_config import get_mcp_servers
 
-        for entry in plugin_service.list_plugin_mcp_servers():
-            if entry.get("server_name") == name:
-                plugin_name = entry.get("plugin_name")
-                break
-    except Exception:
-        pass
+            overridden = name in get_mcp_servers()
+        except Exception:
+            pass
 
-    if materialized:
+    if overridden:
         claude_row = {
-            "mode": "mcp_servers (overlay)",
-            "pattern": f"mcp__{name}__*",
-            "condition": "credential overlay materializes this plugin server "
-            "into gateway mcp_servers; tools use the bare server namespace; "
-            "covered by the mcp__* auto-allow",
-            "gated_by": ["BACKENDS", "plugin installed"],
+            "mode": "gateway config",
+            "pattern": pattern,
+            "condition": "a same-named gateway MCP server is configured and "
+            "wins; this plugin's definition is not used (add a credential "
+            "overlay to prefer the plugin definition)",
+            "gated_by": ["BACKENDS", "MCP_CONFIG/manifest"],
         }
     else:
         claude_row = {
-            "mode": "setting_sources",
-            "pattern": plugin_mcp_tool_pattern(plugin_name or "*", name),
-            "condition": "loaded from the plugin's .mcp.json via setting_sources "
-            "when the plugin is enabled; covered by the mcp__* auto-allow",
-            "gated_by": ["BACKENDS", "CLAUDE_SETTING_SOURCES", "plugin enabled"],
+            "mode": "mcp_servers (materialized)",
+            "pattern": pattern,
+            "condition": "materialized into gateway mcp_servers under strict "
+            "MCP config (the plugin's own registration never loads); covered "
+            "by the mcp__* auto-allow",
+            "gated_by": ["BACKENDS", "plugin installed"],
         }
     return [
         {
@@ -563,26 +561,20 @@ def compute_plugin_mcp_reach(name: str) -> List[Dict[str, Any]]:
 def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
     """MCP servers contributed by installed plugins (read-only, ``source='plugin'``).
 
-    These are loaded by the Claude SDK via ``setting_sources`` and never pass
-    through the gateway's effective MCP config, so ``get_mcp_servers_detail``
-    cannot surface them. Returned as extra rows for the admin MCP tab: not
-    editable/deletable (the plugin owns them), config redacted, tagged with the
-    owning plugin, and flagged ``shadowed`` when a same-named env/manifest server
-    also exists (that one is what non-Claude backends see).
+    These live outside the gateway's effective MCP config (``MCP_CONFIG``/
+    manifest), so ``get_mcp_servers_detail`` cannot surface them. Returned as
+    extra rows for the admin MCP tab: not editable/deletable (the plugin owns
+    them), config redacted, tagged with the owning plugin.
 
-    ``pattern``/``tools`` show the real Claude tool namespace: plugin-loaded
-    servers expose ``mcp__plugin_<plugin>_<server>__*``; a credential overlay
-    materializes the server into gateway ``mcp_servers``, moving new sessions'
-    tools to the bare ``mcp__<server>__*`` namespace (``materialized`` flags
-    this).
+    Every plugin server is materialized into gateway ``mcp_servers`` under
+    strict MCP config, so ``pattern``/``tools`` always use the bare
+    ``mcp__<server>__*`` namespace. ``materialized`` is False — and
+    ``shadowed`` True — only when a same-named env/manifest server exists and
+    the plugin server has no credential overlay (the operator's config wins).
     """
     try:
         from src import plugin_service
-        from src.mcp_config import (
-            get_mcp_servers,
-            plugin_mcp_tool_pattern,
-            validate_server,
-        )
+        from src.mcp_config import get_mcp_servers, validate_server
 
         entries = plugin_service.list_plugin_mcp_servers()
         if not entries:
@@ -639,19 +631,13 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
             except Exception:
                 logger.debug("Failed to read plugin MCP overlay for %s", name, exc_info=True)
 
-            # Real Claude tool namespace: plugin-qualified while loaded via
-            # setting_sources; bare once an overlay materializes the server
-            # into gateway mcp_servers (verified CLI 2.1.187/2.1.220).
-            plugin_name = (
-                entry.get("plugin_name")
-                or str(entry.get("plugin_id") or "").split("@")[0]
-                or "*"
-            )
-            pattern = (
-                f"mcp__{name}__*"
-                if materialized
-                else plugin_mcp_tool_pattern(plugin_name, name)
-            )
+            # ``materialized`` was set True above when an effective overlay
+            # exists (plugin copy wins even over a same-named gateway server);
+            # otherwise a same-named env/manifest server overrides the plugin.
+            shadowed = (name in effective) and not materialized
+            if not shadowed:
+                materialized = True
+            pattern = f"mcp__{name}__*"
             result.append(
                 {
                     "name": name,
@@ -672,7 +658,7 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "reach": compute_plugin_mcp_reach(name),
                     "valid": ok,
                     "invalid_reason": None if ok else reason,
-                    "shadowed": name in effective,
+                    "shadowed": shadowed,
                     **meta,
                     **overlay_meta,
                 }
