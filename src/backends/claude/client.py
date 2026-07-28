@@ -395,6 +395,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         drops the plugin registration entirely — only the materialized copy is
         registered and spawned, so merged env/headers are authoritative and no
         duplicate server runs.
+
+        CAVEAT (verified 2026-07-28, same CLI): that drop happens only while
+        the materialized command/args match the plugin's resolved config —
+        which this materialization guarantees by copying the plugin base.
+        A same-named ``mcp_servers`` entry whose command/args DIFFER from the
+        plugin's registers ALONGSIDE the plugin copy: both servers run and the
+        session exposes both ``mcp__<server>__*`` and
+        ``mcp__plugin_<plugin>_<server>__*`` tools. env/headers differences do
+        not affect the comparison.
         """
         try:
             from src import mcp_plugin_overlay

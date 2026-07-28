@@ -30,6 +30,10 @@ The CLI then drops the plugin's own registration for that server name — only
 the materialized copy is registered and spawned (verified live 2026-07-16 on
 CLI 2.1.187, the SDK 0.2.108 bundle) — so overlay values stay scoped to that
 server config and are never injected into the session process environment.
+That drop is conditional on the materialized command/args matching the
+plugin's resolved config (which step 3 guarantees); a same-named config whose
+command/args diverge registers alongside the plugin copy and BOTH servers run
+(verified 2026-07-28). env/headers differences do not affect the comparison.
 
 An overlay whose name no plugin declares falls back to the gateway-declared
 server of that name (``MCP_CONFIG``/manifest): the env/headers merge into that
