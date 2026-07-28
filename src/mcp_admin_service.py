@@ -62,7 +62,13 @@ def _env_names() -> set:
 
 
 def _collision(name: str, existing: set) -> Optional[str]:
-    """A different name that normalizes to the same ``mcp__<safe>__`` namespace."""
+    """A different existing name that differs only by dash vs underscore.
+
+    Claude tool names keep the server name verbatim, so such names occupy
+    distinct real namespaces — but they are trivially confusable and the legacy
+    normalized pattern form (still accepted by the create-time filter) cannot
+    tell them apart, so creation is rejected.
+    """
     safe = mcp_safe_name(name)
     for other in existing:
         if other != name and mcp_safe_name(other) == safe:
@@ -127,8 +133,10 @@ def validate_config(name: str, config: Any) -> Dict[str, Any]:
     return {
         "valid": not errors,
         "errors": errors,
+        # Legacy Codex-style normalization, kept for API shape; real Claude
+        # tool names use the raw name (see tool_pattern).
         "normalized_name": safe,
-        "tool_pattern": f"mcp__{safe}__*" if safe else "",
+        "tool_pattern": f"mcp__{n}__*" if n else "",
         "server_type": (
             config.get("type", "stdio") if isinstance(config, dict) else None
         ),
@@ -169,8 +177,8 @@ def _write(name: str, config: Any, *, updating: bool) -> Dict[str, Any]:
     hit = _collision(name, env_names | manifest_names)
     if hit:
         raise McpAdminError(
-            f"name collides with '{hit}': both map to tool namespace "
-            f"'mcp__{mcp_safe_name(name)}__*'"
+            f"name collides with '{hit}': the names differ only by '-' vs '_' "
+            f"(legacy normalized patterns cannot tell them apart)"
         )
     mcp_manifest.upsert_server(name, config)  # reloads
     return {

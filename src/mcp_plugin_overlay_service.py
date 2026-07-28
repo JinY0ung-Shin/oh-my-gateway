@@ -8,8 +8,8 @@ from typing import Any, Dict, List, Optional
 from src import mcp_plugin_overlay
 from src.mcp_config import (
     list_env_refs,
-    mcp_safe_name,
     mcp_secret_maps_meta,
+    plugin_mcp_tool_pattern,
     validate_string_map,
 )
 
@@ -118,10 +118,14 @@ def upsert_overlay(
         headers=headers,
         plugin_id=resolved_plugin_id if isinstance(resolved_plugin_id, str) else None,
     )
+    plugin_label = entry.get("plugin_name") or "<plugin>"
     note = (
         "Applies to new Claude sessions: materializes this plugin server into "
         "gateway mcp_servers with merged env/headers, scoped to the MCP server "
-        "process. Existing sessions keep their pinned set."
+        "process. This moves the server's tools from "
+        f"{plugin_mcp_tool_pattern(plugin_label, name)} to mcp__{name}__* — "
+        "update any name-keyed tool allowlists. Existing sessions keep their "
+        "pinned set."
     )
     env_overlay = mcp_plugin_overlay.get_env_overlay(name)
     if env_overlay:
@@ -134,7 +138,7 @@ def upsert_overlay(
         "server": name,
         "plugin_id": stored.get("plugin_id") or resolved_plugin_id,
         "overlay": _public_overlay(stored),
-        "patterns": [f"mcp__{mcp_safe_name(name)}__*"],
+        "patterns": [f"mcp__{name}__*"],
         "note": note,
     }
 

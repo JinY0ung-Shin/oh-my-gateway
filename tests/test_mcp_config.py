@@ -169,7 +169,7 @@ class TestGetMcpToolPatterns:
     def test_single_server_pattern(self):
         servers = {"my-router": {"type": "stdio", "command": "echo"}}
         patterns = get_mcp_tool_patterns(servers)
-        assert patterns == ["mcp__my_router__*"]
+        assert patterns == ["mcp__my-router__*"]
 
     def test_multiple_servers_patterns(self):
         servers = {
@@ -179,12 +179,14 @@ class TestGetMcpToolPatterns:
         patterns = get_mcp_tool_patterns(servers)
         assert len(patterns) == 2
         assert "mcp__docs__*" in patterns
-        assert "mcp__mcp_router__*" in patterns
+        assert "mcp__mcp-router__*" in patterns
 
-    def test_hyphenated_names_converted_to_underscores(self):
+    def test_hyphenated_names_preserved(self):
+        """The Claude CLI keeps dashes in tool names (verified live on CLI
+        2.1.187 and 2.1.220); a normalized pattern would match nothing."""
         servers = {"my-cool-server": {"type": "stdio", "command": "echo"}}
         patterns = get_mcp_tool_patterns(servers)
-        assert patterns == ["mcp__my_cool_server__*"]
+        assert patterns == ["mcp__my-cool-server__*"]
 
     def test_underscore_names_preserved(self):
         servers = {"my_server": {"type": "stdio", "command": "echo"}}

@@ -1181,7 +1181,7 @@ def get_admin_js() -> str:
         }
         this.mcpEnvRefPreview = this._mcpCollectEnvRefs(cfg);
       }
-      if (nm && !this.mcpJsonError) this.mcpPatternPreview = ['mcp__' + nm.replace(/-/g,'_') + '__*'];
+      if (nm && !this.mcpJsonError) this.mcpPatternPreview = ['mcp__' + nm + '__*'];
     },
 
     async createMcpServer() {

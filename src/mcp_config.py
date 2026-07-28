@@ -42,8 +42,27 @@ _ENV_REF_PURE_RE = re.compile(r"^\{\{\s*env:[A-Za-z_][A-Za-z0-9_]*\s*\}\}$")
 
 
 def mcp_safe_name(name: str) -> str:
-    """Dash->underscore: the Claude/Codex MCP tool-namespace convention (mcp__<name>__*)."""
+    """Dash->underscore normalization (the Codex MCP tool-namespace convention).
+
+    The Claude CLI does NOT do this: its MCP tool names carry the server name
+    verbatim, dashes included (``mcp__my-server__<tool>``; verified live
+    2026-07-28 on CLI 2.1.187 and 2.1.220). Kept for the stale Codex paths,
+    the confusable-name guard in ``mcp_admin_service``, and for accepting the
+    legacy normalized pattern form from older callers.
+    """
     return "_".join(name.split("-"))
+
+
+def plugin_mcp_tool_pattern(plugin_name: str, server_name: str) -> str:
+    """Tool pattern for a plugin-loaded MCP server.
+
+    The Claude CLI registers plugin servers as ``plugin:<plugin>:<server>`` and
+    names their tools ``mcp__plugin_<plugin>_<server>__<tool>`` with both names
+    verbatim (verified live 2026-07-28 on CLI 2.1.187 and 2.1.220). A gateway
+    ``mcp_servers`` entry with the same server name replaces the plugin copy
+    and moves the tools to the bare ``mcp__<server>__*`` namespace.
+    """
+    return f"mcp__plugin_{plugin_name}_{server_name}__*"
 
 
 def validate_string_map(value: Any, field: str) -> Tuple[bool, Optional[str]]:
@@ -271,12 +290,15 @@ def load_mcp_config() -> McpServersDict:
 def get_mcp_tool_patterns(servers: McpServersDict) -> List[str]:
     """Return symbolic MCP tool patterns for allowed_tools.
 
-    The Claude Agent SDK resolves MCP tools using the naming convention
-    ``mcp__<server_name>__*``.  By adding these patterns to ``allowed_tools``
-    the SDK manages tool schemas internally — the gateway never needs to
-    serialize full MCP tool JSON schemas into the API request payload.
+    The Claude CLI names MCP tools ``mcp__<server_name>__<tool>`` with the
+    server name verbatim — dashes are NOT normalized to underscores (verified
+    live 2026-07-28 on CLI 2.1.187 and 2.1.220), so patterns must carry the
+    raw name or they match nothing. By adding these patterns to
+    ``allowed_tools`` the SDK manages tool schemas internally — the gateway
+    never needs to serialize full MCP tool JSON schemas into the API request
+    payload.
     """
-    return [f"mcp__{mcp_safe_name(name)}__*" for name in servers]
+    return [f"mcp__{name}__*" for name in servers]
 
 
 def _validated_manifest_servers() -> McpServersDict:

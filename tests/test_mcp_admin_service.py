@@ -45,14 +45,17 @@ def env_servers(servers):
 
 
 class TestValidateConfig:
-    def test_valid_stdio_gives_pattern_with_dash_to_underscore(self):
+    def test_valid_stdio_gives_verbatim_pattern(self):
         result = mcp_admin_service.validate_config(
             "my-server", {"type": "stdio", "command": "echo"}
         )
         assert result["valid"] is True
         assert result["errors"] == []
+        # normalized_name keeps the legacy dash->underscore form; the real
+        # Claude tool pattern uses the raw name (dashes preserved, verified
+        # CLI 2.1.187/2.1.220).
         assert result["normalized_name"] == "my_server"
-        assert result["tool_pattern"] == "mcp__my_server__*"
+        assert result["tool_pattern"] == "mcp__my-server__*"
         assert result["server_type"] == "stdio"
 
     def test_valid_remote_gives_pattern(self):
@@ -114,7 +117,7 @@ class TestCreateServer:
             )
         assert result["status"] == "created"
         assert result["server"] == "my-router"
-        assert result["patterns"] == ["mcp__my_router__*"]
+        assert result["patterns"] == ["mcp__my-router__*"]
         # Persisted to the manifest.
         from src import mcp_manifest
 
@@ -136,8 +139,9 @@ class TestCreateServer:
                 )
 
     def test_collision_dash_vs_underscore(self, manifest_file):
-        # Env base has "foo_bar"; a new "foo-bar" maps to the same
-        # mcp__foo_bar__* namespace and must be rejected.
+        # Env base has "foo_bar"; a new "foo-bar" differs only by dash vs
+        # underscore (confusable, and legacy normalized patterns cannot tell
+        # them apart) and must be rejected.
         with env_servers({"foo_bar": {"type": "stdio", "command": "echo"}}):
             with pytest.raises(McpAdminError, match="collides"):
                 mcp_admin_service.create_server(

@@ -186,20 +186,19 @@ class TestGetMcpServersDetail:
         assert result[0]["name"] == "test-server"
         assert result[0]["type"] == "stdio"
 
-    def test_dash_name_tool_pattern_regression(self, clean_registry):
-        """Dashed server name must normalise dash->underscore in the tool pattern.
+    def test_dash_name_kept_verbatim_in_tool_pattern(self, clean_registry):
+        """Dashed server names stay verbatim in the tool pattern.
 
-        The tool namespace convention is ``mcp__<safe_name>__*`` with dashes
-        turned into underscores. ``get_mcp_tool_patterns`` already emits the
-        normalised form, so ``tools`` (which filters patterns by the normalised
-        prefix) and ``pattern`` must both use ``my_server`` — never ``my-server``.
+        The Claude CLI names MCP tools ``mcp__<server_name>__<tool>`` with the
+        server name unmodified — dashes are NOT normalized to underscores
+        (verified live on CLI 2.1.187 and 2.1.220). A normalized pattern like
+        ``mcp__my_server__*`` would match nothing for server ``my-server``.
         """
         servers = {"my-server": {"type": "stdio", "command": "node"}}
-        # get_mcp_tool_patterns is the real normaliser; call it for fidelity.
         from src.mcp_config import get_mcp_tool_patterns
 
         patterns = get_mcp_tool_patterns(servers)
-        assert patterns == ["mcp__my_server__*"]  # sanity: no dash leaks through
+        assert patterns == ["mcp__my-server__*"]  # sanity: dash preserved
 
         with (
             patch("src.mcp_config.get_mcp_servers", return_value=servers),
@@ -210,9 +209,8 @@ class TestGetMcpServersDetail:
         assert len(result) == 1
         entry = result[0]
         assert entry["name"] == "my-server"  # original name is preserved
-        assert entry["tools"] == ["mcp__my_server__*"]  # the regression assertion
-        assert "my-server" not in entry["tools"][0]
-        assert entry["pattern"] == "mcp__my_server__*"
+        assert entry["tools"] == ["mcp__my-server__*"]
+        assert entry["pattern"] == "mcp__my-server__*"
 
     def test_source_env_and_editable_false(self, clean_registry):
         """A server absent from the manifest is env-sourced and not editable."""
@@ -343,8 +341,11 @@ class TestGetPluginMcpServersDetail:
         assert row["source"] == "plugin"
         assert row["editable"] is False
         assert row["plugin"] == "context7@official"
-        assert row["tools"] == ["mcp__context7__*"]
-        assert row["pattern"] == "mcp__context7__*"
+        # Plugin-loaded servers expose plugin-qualified tool names
+        # (mcp__plugin_<plugin>_<server>__*), verified CLI 2.1.187/2.1.220.
+        assert row["tools"] == ["mcp__plugin_context7_context7__*"]
+        assert row["pattern"] == "mcp__plugin_context7_context7__*"
+        assert row["materialized"] is False
         assert row["shadowed"] is False
         assert row["valid"] is True
 
@@ -386,14 +387,14 @@ class TestGetPluginMcpServersDetail:
         assert row["valid"] is False
         assert "command" in (row["invalid_reason"] or "")
 
-    def test_dash_name_normalised_in_pattern(self, clean_registry):
+    def test_dash_name_kept_verbatim_in_pattern(self, clean_registry):
         entries = [{**self._entries()[0], "server_name": "my-plugin-server"}]
         with (
             patch("src.plugin_service.list_plugin_mcp_servers", return_value=entries),
             patch("src.mcp_config.get_mcp_servers", return_value={}),
         ):
             row = get_plugin_mcp_servers_detail()[0]
-        assert row["pattern"] == "mcp__my_plugin_server__*"
+        assert row["pattern"] == "mcp__plugin_context7_my-plugin-server__*"
         assert row["name"] == "my-plugin-server"  # original preserved
 
     def test_reach_is_claude_only(self, clean_registry):

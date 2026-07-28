@@ -304,7 +304,7 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
     ``config``, the tool ``pattern``, and per-backend ``reach`` (display only).
     """
     try:
-        from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns, mcp_safe_name
+        from src.mcp_config import get_mcp_servers, get_mcp_tool_patterns
         from src import mcp_manifest
 
         servers = get_mcp_servers()
@@ -321,8 +321,10 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
         patterns = get_mcp_tool_patterns(servers)
         result = []
         for name, config in servers.items():
-            safe_prefix = f"mcp__{mcp_safe_name(name)}__"
-            server_patterns = [p for p in patterns if p.startswith(safe_prefix)]
+            # Real CLI tool names carry the server name verbatim (no dash
+            # normalization).
+            prefix = f"mcp__{name}__"
+            server_patterns = [p for p in patterns if p.startswith(prefix)]
             source = "manifest" if name in manifest_names else "env"
             # A GATEWAY_MCP_SERVER_ENV overlay for a name no plugin declares
             # merges into this config at session create — display it merged.
@@ -347,7 +349,7 @@ def get_mcp_servers_detail() -> List[Dict[str, Any]]:
                     "type": config.get("type", "unknown"),
                     "tools": server_patterns,
                     "config_keys": [k for k in config.keys() if k not in ("type",)],
-                    "pattern": f"{safe_prefix}*",
+                    "pattern": f"{prefix}*",
                     "source": source,
                     "editable": source == "manifest",
                     "has_env_overlay": has_env_overlay,
@@ -406,8 +408,10 @@ def compute_mcp_server_reach(name: str, config: Dict[str, Any]) -> List[Dict[str
     from src.mcp_config import ALLOWED_TYPES, mcp_safe_name
 
     enabled = set(_enabled_backend_names())
-    safe = mcp_safe_name(name)
-    pattern = f"mcp__{safe}__*"
+    # Claude keeps the server name verbatim in tool names; Codex normalizes
+    # dash->underscore — each backend row shows its own convention.
+    pattern = f"mcp__{name}__*"
+    codex_pattern = f"mcp__{mcp_safe_name(name)}__*"
     stype = config.get("type", "stdio")
     out: List[Dict[str, Any]] = []
 
@@ -441,7 +445,7 @@ def compute_mcp_server_reach(name: str, config: Dict[str, Any]) -> List[Dict[str
             "backend": "codex",
             "reaches": _reg("codex"),
             "mode": "approval-time",
-            "pattern": pattern,
+            "pattern": codex_pattern,
             "condition": "forwarded at create-time; per-tool deny only when a tool "
             "policy is active (approvalPolicy off 'never')",
             "gated_by": ["BACKENDS", "CODEX_APPROVAL_POLICY", "DISALLOWED_TOOLS"],
@@ -483,25 +487,59 @@ def compute_plugin_mcp_reach(name: str) -> List[Dict[str, Any]]:
 
     Plugin MCP servers are loaded by the Claude SDK via ``setting_sources``
     (reading the plugin's ``.mcp.json``), NOT through the gateway's
-    ``mcp_servers`` option. So they reach Claude only; Codex and OpenCode never
-    read Claude plugins and therefore never see these servers.
+    ``mcp_servers`` option — their tools live under
+    ``mcp__plugin_<plugin>_<server>__*`` (verified CLI 2.1.187/2.1.220). A
+    credential overlay materializes the server into gateway ``mcp_servers``
+    instead, which moves the tools to the bare ``mcp__<server>__*`` namespace.
+    Codex and OpenCode never read Claude plugins and never see these servers.
     """
     from src.backends import _enabled_backend_names
     from src.backends.base import BackendRegistry
-    from src.mcp_config import mcp_safe_name
+    from src.mcp_config import plugin_mcp_tool_pattern
 
     enabled = set(_enabled_backend_names())
     claude_on = "claude" in enabled and BackendRegistry.is_registered("claude")
-    pattern = f"mcp__{mcp_safe_name(name)}__*"
+
+    materialized = False
+    try:
+        from src import mcp_plugin_overlay
+
+        materialized = bool(mcp_plugin_overlay.get_effective_overlay(name))
+    except Exception:
+        pass
+    plugin_name = None
+    try:
+        from src import plugin_service
+
+        for entry in plugin_service.list_plugin_mcp_servers():
+            if entry.get("server_name") == name:
+                plugin_name = entry.get("plugin_name")
+                break
+    except Exception:
+        pass
+
+    if materialized:
+        claude_row = {
+            "mode": "mcp_servers (overlay)",
+            "pattern": f"mcp__{name}__*",
+            "condition": "credential overlay materializes this plugin server "
+            "into gateway mcp_servers; tools use the bare server namespace; "
+            "covered by the mcp__* auto-allow",
+            "gated_by": ["BACKENDS", "plugin installed"],
+        }
+    else:
+        claude_row = {
+            "mode": "setting_sources",
+            "pattern": plugin_mcp_tool_pattern(plugin_name or "*", name),
+            "condition": "loaded from the plugin's .mcp.json via setting_sources "
+            "when the plugin is enabled; covered by the mcp__* auto-allow",
+            "gated_by": ["BACKENDS", "CLAUDE_SETTING_SOURCES", "plugin enabled"],
+        }
     return [
         {
             "backend": "claude",
             "reaches": claude_on,
-            "mode": "setting_sources",
-            "pattern": pattern,
-            "condition": "loaded from the plugin's .mcp.json via setting_sources "
-            "when the plugin is enabled; covered by the mcp__* auto-allow",
-            "gated_by": ["BACKENDS", "CLAUDE_SETTING_SOURCES", "plugin enabled"],
+            **claude_row,
         },
         {
             "backend": "codex",
@@ -531,10 +569,20 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
     editable/deletable (the plugin owns them), config redacted, tagged with the
     owning plugin, and flagged ``shadowed`` when a same-named env/manifest server
     also exists (that one is what non-Claude backends see).
+
+    ``pattern``/``tools`` show the real Claude tool namespace: plugin-loaded
+    servers expose ``mcp__plugin_<plugin>_<server>__*``; a credential overlay
+    materializes the server into gateway ``mcp_servers``, moving new sessions'
+    tools to the bare ``mcp__<server>__*`` namespace (``materialized`` flags
+    this).
     """
     try:
         from src import plugin_service
-        from src.mcp_config import get_mcp_servers, mcp_safe_name, validate_server
+        from src.mcp_config import (
+            get_mcp_servers,
+            plugin_mcp_tool_pattern,
+            validate_server,
+        )
 
         entries = plugin_service.list_plugin_mcp_servers()
         if not entries:
@@ -549,7 +597,6 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
         for entry in entries:
             name = entry["server_name"]
             config = entry["config"] if isinstance(entry.get("config"), dict) else {}
-            safe_prefix = f"mcp__{mcp_safe_name(name)}__"
             from src.mcp_config import mcp_secret_maps_meta
 
             ok, reason = validate_server(name, config)
@@ -565,12 +612,14 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
                 "overlay_env_refs": [],
                 "overlay": {},
             }
+            materialized = False
             try:
                 from src import mcp_plugin_overlay
 
                 overlay = mcp_plugin_overlay.get_overlay(name)
                 effective_overlay = mcp_plugin_overlay.get_effective_overlay(name)
                 if effective_overlay:
+                    materialized = True
                     ometa = mcp_secret_maps_meta(effective_overlay)
                     overlay_meta = {
                         "has_overlay": bool(overlay),
@@ -590,13 +639,27 @@ def get_plugin_mcp_servers_detail() -> List[Dict[str, Any]]:
             except Exception:
                 logger.debug("Failed to read plugin MCP overlay for %s", name, exc_info=True)
 
+            # Real Claude tool namespace: plugin-qualified while loaded via
+            # setting_sources; bare once an overlay materializes the server
+            # into gateway mcp_servers (verified CLI 2.1.187/2.1.220).
+            plugin_name = (
+                entry.get("plugin_name")
+                or str(entry.get("plugin_id") or "").split("@")[0]
+                or "*"
+            )
+            pattern = (
+                f"mcp__{name}__*"
+                if materialized
+                else plugin_mcp_tool_pattern(plugin_name, name)
+            )
             result.append(
                 {
                     "name": name,
                     "type": config.get("type", "stdio") if config else "unknown",
-                    "tools": [f"{safe_prefix}*"],
+                    "tools": [pattern],
                     "config_keys": [k for k in config.keys() if k != "type"],
-                    "pattern": f"{safe_prefix}*",
+                    "pattern": pattern,
+                    "materialized": materialized,
                     "source": "plugin",
                     "editable": False,
                     # Overlay credentials are editable even though the plugin

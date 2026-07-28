@@ -444,9 +444,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             allowed_set = set(allowed_tools)
             filtered = {}
             for name, config in mcp_servers.items():
-                safe_name = "_".join(name.split("-"))
-                pattern = f"mcp__{safe_name}__*"
-                if pattern in allowed_set:
+                # Real CLI tool names keep the server name verbatim (dashes
+                # included); also accept the legacy dash->underscore form the
+                # gateway used to document, so older callers keep working.
+                legacy_name = "_".join(name.split("-"))
+                if {f"mcp__{name}__*", f"mcp__{legacy_name}__*"} & allowed_set:
                     filtered[name] = config
             if not filtered:
                 logger.debug("No MCP servers match allowed_tools, skipping MCP")
