@@ -640,50 +640,15 @@ class TestListMarketplaces:
         assert mkt["repo"] == "https://github.com/acme/test-mkt.git"
         assert mkt["branch"] == "develop"
 
-    def test_scope_from_env_journal_without_manifest_record(
-        self, plugins_dir, monkeypatch, tmp_path
+    def test_scope_defaults_to_user_without_manifest_record(
+        self, plugins_dir, monkeypatch
     ):
-        # No manifest record -> fall back to the startup installer's env journal
-        # so an env-bootstrapped marketplace keeps its declared (non-user) scope.
+        # The manifest is the only scope source; a marketplace registered
+        # outside the gateway (no manifest record) is assumed user scope.
         from src import plugin_manifest
 
         monkeypatch.setattr(plugin_manifest, "list_marketplace_records", lambda: {})
-        journal = tmp_path / "gateway-plugins-env.json"
-        journal.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "marketplaces": {
-                        "test-mkt": {
-                            "scope": "project",
-                            "branch": "main",
-                            "repo": "test/marketplace",
-                        }
-                    },
-                }
-            )
-        )
-        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
-        assert list_marketplaces()[0]["scope"] == "project"
-
-    def test_manifest_record_wins_over_env_journal(
-        self, plugins_dir, monkeypatch, tmp_path
-    ):
-        from src import plugin_manifest
-
-        monkeypatch.setattr(
-            plugin_manifest,
-            "list_marketplace_records",
-            lambda: {"test-mkt": {"repo": "r", "branch": "main", "scope": "local"}},
-        )
-        journal = tmp_path / "gateway-plugins-env.json"
-        journal.write_text(
-            json.dumps(
-                {"version": 1, "marketplaces": {"test-mkt": {"scope": "project"}}}
-            )
-        )
-        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
-        assert list_marketplaces()[0]["scope"] == "local"
+        assert list_marketplaces()[0]["scope"] == "user"
 
     def test_credential_url_is_stripped_from_repo_field(self, plugins_dir):
         # A known_marketplaces.json source.url with embedded credentials must not
@@ -727,45 +692,6 @@ class TestStripUrlCredentials:
         assert f("git@host:o/r.git") == "git@host:o/r.git"
         assert f("/clones/local") == "/clones/local"
         assert f("") == ""
-
-
-class TestEnvBootstrapRecords:
-    def test_missing_journal_returns_empty(self, monkeypatch, tmp_path):
-        from src.plugin_service import env_bootstrap_records
-
-        monkeypatch.setenv(
-            "CLAUDE_PLUGIN_ENV_JOURNAL", str(tmp_path / "nope.json")
-        )
-        assert env_bootstrap_records() == {}
-
-    def test_reads_and_normalizes(self, monkeypatch, tmp_path):
-        from src.plugin_service import env_bootstrap_records
-
-        journal = tmp_path / "env.json"
-        journal.write_text(
-            json.dumps(
-                {
-                    "version": 1,
-                    "marketplaces": {
-                        "mkt": {"scope": "project", "branch": "dev", "repo": "o/r"},
-                        "bare": {},
-                    },
-                }
-            )
-        )
-        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
-        recs = env_bootstrap_records()
-        assert recs["mkt"] == {"scope": "project", "branch": "dev", "repo": "o/r"}
-        # missing fields default to user/main/empty
-        assert recs["bare"] == {"scope": "user", "branch": "main", "repo": ""}
-
-    def test_corrupt_journal_returns_empty(self, monkeypatch, tmp_path):
-        from src.plugin_service import env_bootstrap_records
-
-        journal = tmp_path / "env.json"
-        journal.write_text("not json{")
-        monkeypatch.setenv("CLAUDE_PLUGIN_ENV_JOURNAL", str(journal))
-        assert env_bootstrap_records() == {}
 
 
 # ---------------------------------------------------------------------------

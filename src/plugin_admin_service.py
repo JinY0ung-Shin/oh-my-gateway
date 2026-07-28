@@ -387,11 +387,11 @@ def _strip_url_credentials(repo: str) -> str:
     """Remove embedded credentials from an http(s) repo URL.
 
     ``_validate_repo`` rejects credential URLs on the interactive admin-add path,
-    but env-bootstrap (``CLAUDE_PLUGIN_REPO*``) and ``known_marketplaces.json``
-    fallbacks are not validated, so a ``https://user:token@host/...`` value could
-    otherwise be persisted to the journal/manifest and returned by the admin API.
+    but the ``known_marketplaces.json`` fallback is not validated, so a
+    ``https://user:token@host/...`` value could otherwise be persisted to the
+    manifest and returned by the admin API.
     Strip the userinfo before storing/returning; replay credentials must come
-    from ``CLAUDE_PLUGIN_GIT_TOKEN*``, never the URL. Non-http(s) values (ssh,
+    from ``CLAUDE_PLUGIN_GIT_TOKEN``, never the URL. Non-http(s) values (ssh,
     scp-like ``git@host:org/repo``, local paths) are returned unchanged — their
     userinfo is the ssh login, not a secret. Never raises.
     """
@@ -411,23 +411,6 @@ def _strip_url_credentials(repo: str) -> str:
     return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
 
 
-def _env_marketplace_record(marketplace: str) -> dict:
-    """Env-bootstrap journal record (``{scope, branch, repo}``) for *marketplace*.
-
-    Returns ``{}`` when there is no env-bootstrapped marketplace by that name or
-    the journal is unavailable; never raises.
-    """
-    if not marketplace:
-        return {}
-    try:
-        from . import plugin_service
-
-        rec = plugin_service.env_bootstrap_records().get(marketplace)
-        return rec if isinstance(rec, dict) else {}
-    except Exception:
-        return {}
-
-
 def _resolve_marketplace_repo(marketplace: str) -> str:
     """Best-effort: resolve a registered marketplace name to a clonable repo.
 
@@ -437,7 +420,7 @@ def _resolve_marketplace_repo(marketplace: str) -> str:
     the original remote even though ``claude plugin marketplace add`` is handed a
     local clone path and records ``source: directory``. Falls back to
     ``~/.claude/plugins/known_marketplaces.json`` (converting a GitHub
-    ``owner/repo`` shorthand to a clone URL) for env/externally-added
+    ``owner/repo`` shorthand to a clone URL) for externally-added
     marketplaces. Returns ``""`` when nothing replayable is found. Never raises.
 
     Any embedded http(s) credential is stripped before returning, since the
@@ -452,11 +435,6 @@ def _resolve_marketplace_repo_raw(marketplace: str) -> str:
     record = plugin_manifest.get_marketplace(marketplace)
     if record.get("repo", "").strip():
         return record["repo"].strip()
-    # Env-bootstrapped marketplace: the startup installer journals its remote,
-    # which known_marketplaces.json (source: directory) does not preserve.
-    env = _env_marketplace_record(marketplace)
-    if env.get("repo", "").strip():
-        return env["repo"].strip()
     home = os.environ.get("HOME", "").strip() or str(Path.home())
     known = Path(home) / ".claude" / "plugins" / "known_marketplaces.json"
     try:
@@ -543,16 +521,15 @@ def _refresh_record(name: str) -> dict:
     """Return replay metadata for a marketplace refresh.
 
     Admin-managed manifest records are authoritative because Claude stores
-    clone-then-add marketplaces as local directories. Env bootstrap journals are
-    the next-best source; known_marketplaces.json is only a fallback and may
-    resolve to a local path when the original remote is unknown.
+    clone-then-add marketplaces as local directories; known_marketplaces.json
+    is only a fallback and may resolve to a local path when the original
+    remote is unknown.
     """
     record = plugin_manifest.get_marketplace(name)
     record = record if isinstance(record, dict) else {}
-    env = _env_marketplace_record(name) if not record.get("repo") else {}
-    repo = str(record.get("repo") or env.get("repo") or "").strip()
-    branch = str(record.get("branch") or env.get("branch") or DEFAULT_BRANCH).strip()
-    scope = str(record.get("scope") or env.get("scope") or "user").strip()
+    repo = str(record.get("repo") or "").strip()
+    branch = str(record.get("branch") or DEFAULT_BRANCH).strip()
+    scope = str(record.get("scope") or "user").strip()
     if not repo:
         repo = _resolve_marketplace_repo(name)
     return {"repo": repo, "branch": branch, "scope": scope}
@@ -749,12 +726,6 @@ def install_plugin(
         record = plugin_manifest.get_marketplace(marketplace)
         if record.get("branch", "").strip():
             manifest_branch = record["branch"].strip()
-        else:
-            # Env-bootstrapped marketplace: replay the branch it was cloned at,
-            # not the default, so a `down -v` self-heal clones the same content.
-            env = _env_marketplace_record(marketplace)
-            if env.get("branch", "").strip():
-                manifest_branch = env["branch"].strip()
     if not manifest_repo:
         logger.warning(
             "could not resolve a repo for marketplace %r; manifest entry for %r "
@@ -783,9 +754,9 @@ def install_plugin(
 def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
     """Uninstall *plugin_id* (registry key ``name@marketplace``).
 
-    If the spec is an admin-managed ``added`` entry it is dropped from the
-    manifest; otherwise it is marked ``removed`` (it came from env bootstrap, so
-    startup must skip reinstalling it).
+    Any admin-managed ``added`` entry for the spec is dropped from the
+    manifest, and the removal is recorded so startup keeps the uninstall
+    applied even when a copy survives in the plugin cache.
     """
     spec = _validate_name(plugin_id, what="plugin id")
     scope = _validate_scope(scope)
@@ -800,9 +771,11 @@ def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
         ) from exc
 
     # scope is part of the identity. Drop any managed entry for THIS (spec,
-    # scope) AND always record the removal: if the same plugin is also declared
-    # by the env bootstrap, only the recorded removal stops startup from
-    # resurrecting it. A later admin re-install clears the mark via add_plugin.
+    # scope) AND record the removal: startup actively uninstalls marked specs,
+    # so the uninstall stays applied even for a plugin that entered the
+    # registry outside manifest.added (e.g. a manual `claude plugin install`
+    # in the container). A later admin re-install clears the mark via
+    # add_plugin.
     plugin_manifest.remove_added(spec, scope)
     plugin_manifest.mark_removed(spec, scope)
 

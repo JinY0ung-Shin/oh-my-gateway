@@ -52,9 +52,9 @@ COPY src ./src
 # The admin system-prompt UI loads these templates at runtime.
 COPY docs/*system-prompt*.md ./docs/
 
-# Optional marketplace plugin auto-install on container start. Supports multiple
-# repos and multiple plugins per repo, and fresh-clones each repo on every start
-# so the latest plugin version is installed (see CLAUDE_PLUGIN_* env vars).
+# Marketplace plugin install on container start: replays the admin-managed
+# plugin manifest (manifest.added / manifest.removed) and fresh-clones each
+# marketplace repo on every start so the latest plugin version is installed.
 COPY docker/install_plugins.py /usr/local/bin/install_plugins.py
 
 # Optional build-time install hook for private/corporate additions. Compose

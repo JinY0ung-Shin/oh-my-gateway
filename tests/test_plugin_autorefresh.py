@@ -25,7 +25,6 @@ _REFRESH_OK = {
 def manifest_file(tmp_path, monkeypatch):
     path = tmp_path / "gateway-plugins.json"
     monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(path))
-    monkeypatch.delenv("CLAUDE_PLUGIN_ENV_JOURNAL", raising=False)
     return path
 
 
@@ -54,7 +53,9 @@ async def test_cycle_refreshes_managed_marketplaces(manifest_file):
     assert mock_refresh.call_count == 2
 
 
-async def test_cycle_includes_env_journal_marketplaces(manifest_file):
+async def test_cycle_ignores_stale_env_journal(manifest_file):
+    # The env-bootstrap journal is no longer read; a stale file left on disk by
+    # an older deployment must not feed marketplaces into the refresh set.
     journal = manifest_file.with_name("gateway-plugins-env.json")
     journal.write_text(
         json.dumps(
@@ -78,8 +79,8 @@ async def test_cycle_includes_env_journal_marketplaces(manifest_file):
     ) as mock_refresh:
         result = await refresher.run_cycle()
 
-    assert sorted(r["marketplace"] for r in result["results"]) == ["env-mkt", "mkt-a"]
-    assert mock_refresh.call_count == 2
+    assert [r["marketplace"] for r in result["results"]] == ["mkt-a"]
+    assert mock_refresh.call_count == 1
 
 
 async def test_cycle_noop_when_nothing_managed(manifest_file):

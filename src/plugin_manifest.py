@@ -1,13 +1,13 @@
 """Persistent managed plugin manifest.
 
-The manifest is the admin-managed layer that sits on top of the env-var
-bootstrap (``CLAUDE_PLUGIN_*`` read by ``docker/install_plugins.py`` at
-container start). The admin panel mutates it at runtime; startup replays it.
+The manifest is the persistent record of admin-panel plugin management, read
+by ``docker/install_plugins.py`` at container start. The admin panel mutates
+it at runtime; startup replays it.
 
 - ``added``  = plugins the admin explicitly installed, so startup reinstalls
   them (survives a wipe of the plugin cache volume).
-- ``removed`` = specs the admin uninstalled that ALSO came from the env
-  bootstrap, so startup uninstalls them and skips reinstall.
+- ``removed`` = specs the admin uninstalled, so startup skips reinstall and
+  actively uninstalls any copy that survives in the plugin cache.
 - ``marketplaces`` = the original remote/branch/scope the admin used to add each
   marketplace, keyed by marketplace name. ``claude plugin marketplace add`` is
   given a local clone path and records ``source: directory`` (losing the

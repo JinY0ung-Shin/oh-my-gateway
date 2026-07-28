@@ -531,16 +531,30 @@ def test_strip_url_credentials():
     assert f("") == ""
 
 
-def test_resolve_marketplace_repo_strips_journal_credentials(monkeypatch, tmp_path):
-    from src import plugin_service
+def test_resolve_marketplace_repo_strips_known_repo_field_credentials(
+    monkeypatch, tmp_path
+):
+    import json as _json
 
+    # known_marketplaces.json source.repo (unlike source.url) may hold a full
+    # credential URL; the resolver must strip the userinfo before returning it.
+    plugins_dir = tmp_path / ".claude" / "plugins"
+    plugins_dir.mkdir(parents=True)
+    (plugins_dir / "known_marketplaces.json").write_text(
+        _json.dumps(
+            {
+                "m": {
+                    "source": {
+                        "source": "git",
+                        "repo": "https://user:tok@host/o/r.git",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
-    monkeypatch.setattr(
-        plugin_service,
-        "env_bootstrap_records",
-        lambda: {"m": {"repo": "https://user:tok@host/o/r.git"}},
-    )
     assert svc._resolve_marketplace_repo("m") == "https://host/o/r.git"
 
 
@@ -562,46 +576,22 @@ def test_resolve_marketplace_repo_strips_known_marketplaces_credentials(
     assert svc._resolve_marketplace_repo("m") == "https://git.example/m.git"
 
 
-def test_resolve_marketplace_repo_falls_back_to_env_journal(monkeypatch, tmp_path):
-    # An env-bootstrapped marketplace (clone-then-add records source: directory)
-    # has no remote in known_marketplaces.json; the startup installer's journal
-    # supplies it so the catalog-install manifest entry stays replayable.
-    from src import plugin_service
-
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.setenv("CLAUDE_PLUGIN_MANIFEST", str(tmp_path / "manifest.json"))
-    monkeypatch.setattr(
-        plugin_service,
-        "env_bootstrap_records",
-        lambda: {"envmkt": {"scope": "project", "branch": "dev", "repo": "o/r.git"}},
-    )
-    assert svc._resolve_marketplace_repo("envmkt") == "o/r.git"
-
-
-def test_catalog_install_from_env_marketplace_replays_branch_and_repo(
-    monkeypatch, fake_claude, recorded_runs, fake_manifest
+def test_catalog_install_replays_manifest_branch_and_repo(
+    fake_claude, recorded_runs, fake_manifest
 ):
-    # Catalog install from an env-bootstrapped (non-main) marketplace must record
-    # the journaled branch + remote, not the main/local defaults, so a `down -v`
-    # self-heal clones the same content.
-    from src import plugin_service
-
-    monkeypatch.setattr(
-        plugin_service,
-        "env_bootstrap_records",
-        lambda: {
-            "envmkt": {
-                "scope": "project",
-                "branch": "develop",
-                "repo": "https://host/o/r.git",
-            }
-        },
-    )
-    svc.install_plugin("octo", marketplace="envmkt", scope="project")
+    # Catalog install (the caller passes only a marketplace name) must record
+    # the manifest marketplace's repo + branch, not the main/local defaults, so
+    # a `down -v` self-heal clones the same content.
+    fake_manifest.marketplaces["mkt"] = {
+        "repo": "https://host/o/r.git",
+        "branch": "develop",
+        "scope": "project",
+    }
+    svc.install_plugin("octo", marketplace="mkt", scope="project")
     assert fake_manifest.add_plugin_calls[-1] == {
         "repo": "https://host/o/r.git",
         "name": "octo",
-        "marketplace": "envmkt",
+        "marketplace": "mkt",
         "scope": "project",
         "branch": "develop",
     }
@@ -640,13 +630,15 @@ def test_uninstall_managed_plugin_removes_added(
         "--",
         "octo@nyldn-plugins",
     ]
-    # uninstall always drops any managed entry AND records the removal, so an
-    # env-bootstrap declaration of the same plugin can't resurrect it on restart.
+    # uninstall always drops any managed entry AND records the removal, so the
+    # startup installer keeps the uninstall applied on restart.
     assert fake_manifest.remove_added_calls == [("octo@nyldn-plugins", "user")]
     assert fake_manifest.mark_removed_calls == [("octo@nyldn-plugins", "user")]
 
 
-def test_uninstall_env_plugin_marks_removed(fake_claude, recorded_runs, fake_manifest):
+def test_uninstall_unmanaged_plugin_marks_removed(
+    fake_claude, recorded_runs, fake_manifest
+):
     # Not present in manifest.added -> remove_added is a harmless no-op, but the
     # removal is still recorded so startup skips/uninstalls it.
     fake_manifest.added_entries = []

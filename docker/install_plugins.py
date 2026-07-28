@@ -1,38 +1,34 @@
 #!/usr/bin/env python3
-"""Install Claude Code marketplace plugins at container startup.
+"""Install admin-managed Claude Code marketplace plugins at container startup.
 
-Supports **multiple marketplace repos** and **multiple plugins per repo**, and
-**fresh-clones every remote repo on each run** so the latest plugin version is
-always installed.
+Reinstalls every plugin recorded in the admin-managed manifest
+(``manifest.added``) on each run, and **fresh-clones every remote repo on each
+run** so the latest plugin version is always installed. Plugins are added and
+removed from the admin panel; this script makes those choices survive container
+restarts and a plugin-cache volume wipe (``docker compose down -v``).
 
-Indexed form (repeat the ``_1``, ``_2``, ... suffix for each repo)::
+Environment::
 
-    CLAUDE_PLUGIN_REPO_1         marketplace clone URL / local path (defines entry 1)
-    CLAUDE_PLUGIN_NAME_1         comma-separated plugin names (default: repo basename)
-    CLAUDE_PLUGIN_MARKETPLACE_1  marketplace name from marketplace.json (optional)
-    CLAUDE_PLUGIN_SCOPE_1        install scope: user | project | local (default: user)
-    CLAUDE_PLUGIN_BRANCH_1       git branch/tag to clone for a remote repo (default: main)
-    CLAUDE_PLUGIN_GIT_TOKEN_1    HTTPS git token for a private repo (optional)
-
-The legacy single-repo form (no suffix) is still honored as one additional
-entry, so existing deployments keep working unchanged::
-
-    CLAUDE_PLUGIN_REPO, CLAUDE_PLUGIN_NAME, CLAUDE_PLUGIN_MARKETPLACE,
-    CLAUDE_PLUGIN_SCOPE, CLAUDE_PLUGIN_BRANCH, CLAUDE_PLUGIN_GIT_TOKEN
-
-Global (not per-entry)::
-
-    CLAUDE_PLUGIN_CLAUDE_BIN     claude CLI path override
-    CLAUDE_PLUGIN_CLONE_ROOT     clone root for remote repos
-                                 (default: $HOME/.claude/plugin-marketplaces)
+    CLAUDE_PLUGIN_MANIFEST         admin-managed manifest path
+                                   (default: /app/data/gateway-plugins.json)
+    CLAUDE_PLUGIN_GIT_TOKEN        HTTPS git token; the admin panel never
+                                   persists tokens, so PRIVATE manifest
+                                   marketplaces inherit this as their clone
+                                   credential
+    CLAUDE_PLUGIN_CLAUDE_BIN       claude CLI path override
+    CLAUDE_PLUGIN_CLONE_ROOT       clone root for remote repos
+                                   (default: $HOME/.claude/plugin-marketplaces)
+    CLAUDE_PLUGIN_TIMEOUT_SECONDS  per git/claude call timeout (default: 300)
 
 Behavior:
-    * ``CLAUDE_PLUGIN_REPO`` values that point at a clone URL are removed and
-      freshly ``git clone --depth 1 --branch <branch>``'d on every run (branch
-      defaults to ``main``; override per entry with ``CLAUDE_PLUGIN_BRANCH*``);
-      values that point at an existing local path are used in place (no clone).
+    * Manifest repos that point at a clone URL are removed and freshly
+      ``git clone --depth 1 --branch <branch>``'d on every run (branch defaults
+      to ``main``); values that point at an existing local path are used in
+      place (no clone).
     * Each plugin is ``install``'d (first run) and then ``update``'d (later
       runs) so the installed version always tracks the marketplace's latest.
+    * Specs in ``manifest.removed`` are skipped and actively uninstalled so an
+      admin uninstall stays applied after a plugin-cache wipe.
     * A failure for one plugin or one repo is logged and skipped; it never
       aborts the run, so the gateway always starts. Exit status is always 0.
 
@@ -51,7 +47,6 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
-from urllib.parse import urlsplit, urlunsplit
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -62,16 +57,13 @@ LOG_PREFIX = "[install_plugins]"
 # CLAUDE_PLUGIN_MANIFEST so both sides agree exactly.
 DEFAULT_MANIFEST_PATH = "/app/data/gateway-plugins.json"
 
-# Safety cap on how many indexed entries (CLAUDE_PLUGIN_REPO_1..N) we scan for.
-MAX_INDEX = 64
-
 # Per-subprocess timeout (seconds). Bounds every git/claude call so a stuck
 # clone or credential challenge can never wedge container startup. Override with
 # CLAUDE_PLUGIN_TIMEOUT_SECONDS.
 DEFAULT_TIMEOUT_SECONDS = 300
 
-# Branch/tag fresh-cloned from a remote marketplace repo when CLAUDE_PLUGIN_BRANCH*
-# is unset. Local-path repos ignore this (they are used in place).
+# Branch/tag fresh-cloned from a remote marketplace repo when the manifest
+# entry has no branch. Local-path repos ignore this (they are used in place).
 DEFAULT_BRANCH = "main"
 
 # Helper that answers git's credential prompts using a token supplied via the
@@ -106,7 +98,7 @@ class PluginEntry:
 
 
 # ---------------------------------------------------------------------------
-# Environment parsing
+# Entry construction
 # ---------------------------------------------------------------------------
 
 
@@ -124,67 +116,13 @@ def _default_name(repo: str) -> str:
     return base
 
 
-def _entry_from_suffix(suffix: str) -> Optional[PluginEntry]:
-    """Build a :class:`PluginEntry` from ``CLAUDE_PLUGIN_*{suffix}`` vars.
-
-    Returns ``None`` when ``CLAUDE_PLUGIN_REPO{suffix}`` is unset/empty.
-    """
-    repo = os.environ.get(f"CLAUDE_PLUGIN_REPO{suffix}", "").strip()
-    if not repo:
-        return None
-
-    label = f"CLAUDE_PLUGIN_REPO{suffix}"
-    names_raw = os.environ.get(f"CLAUDE_PLUGIN_NAME{suffix}", "")
-    names = [n.strip() for n in names_raw.split(",") if n.strip()]
-    if not names:
-        inferred = _default_name(repo)
-        if not inferred:
-            log(
-                f"{label}: cannot infer a plugin name from {repo!r}; "
-                f"set CLAUDE_PLUGIN_NAME{suffix}"
-            )
-            return None
-        names = [inferred]
-
-    return PluginEntry(
-        repo=repo,
-        names=names,
-        marketplace=os.environ.get(f"CLAUDE_PLUGIN_MARKETPLACE{suffix}", "").strip(),
-        scope=os.environ.get(f"CLAUDE_PLUGIN_SCOPE{suffix}", "").strip() or "user",
-        branch=os.environ.get(f"CLAUDE_PLUGIN_BRANCH{suffix}", "").strip()
-        or DEFAULT_BRANCH,
-        git_token=os.environ.get(f"CLAUDE_PLUGIN_GIT_TOKEN{suffix}", ""),
-        source_label=label,
-    )
-
-
 def collect_entries() -> List[PluginEntry]:
-    """Collect the legacy un-indexed entry plus all indexed ``_N`` entries.
+    """Build the install list from the admin-managed manifest (``manifest.added``).
 
-    Entries from the admin-managed manifest (``manifest.added``) are appended
-    after the env bootstrap so admin-installed plugins are reinstalled on every
-    boot (self-healing after a plugin-cache volume wipe).
+    Reinstalling every added plugin on each boot is what makes admin installs
+    self-healing after a plugin-cache volume wipe.
     """
-    entries: List[PluginEntry] = []
-
-    legacy = _entry_from_suffix("")
-    if legacy is not None:
-        entries.append(legacy)
-
-    for index in range(1, MAX_INDEX + 1):
-        entry = _entry_from_suffix(f"_{index}")
-        if entry is not None:
-            entries.append(entry)
-
-    if os.environ.get(f"CLAUDE_PLUGIN_REPO_{MAX_INDEX + 1}", "").strip():
-        log(
-            f"ignoring CLAUDE_PLUGIN_REPO_{MAX_INDEX + 1}+; "
-            f"only indices 1..{MAX_INDEX} are scanned"
-        )
-
-    entries.extend(_manifest_entries())
-
-    return entries
+    return _manifest_entries()
 
 
 # ---------------------------------------------------------------------------
@@ -248,9 +186,8 @@ def _manifest_entries() -> List[PluginEntry]:
 
     The admin panel never persists a git token, so a PRIVATE admin-added
     marketplace would otherwise clone unauthenticated and fail. As a fallback,
-    manifest entries inherit the un-indexed ``CLAUDE_PLUGIN_GIT_TOKEN`` (the same
-    credential the legacy env-bootstrap entry uses) so a private marketplace
-    replays when that token is provided at startup.
+    manifest entries inherit ``CLAUDE_PLUGIN_GIT_TOKEN`` so a private
+    marketplace replays when that token is provided at startup.
     """
     manifest_token = os.environ.get("CLAUDE_PLUGIN_GIT_TOKEN", "")
     entries: List[PluginEntry] = []
@@ -279,105 +216,6 @@ def _manifest_entries() -> List[PluginEntry]:
 def _spec(name: str, marketplace: str) -> str:
     """``name@marketplace`` when *marketplace* is truthy, else ``name``."""
     return f"{name}@{marketplace}" if marketplace else name
-
-
-# ---------------------------------------------------------------------------
-# Env-bootstrap marketplace journal (consumed by the running app)
-# ---------------------------------------------------------------------------
-
-
-def env_journal_path() -> Path:
-    """Path of the env-bootstrap marketplace journal (beside the manifest).
-
-    ``known_marketplaces.json`` persists neither an env marketplace's scope/branch
-    nor its original remote (clone-then-add records only the local path). This
-    journal hands that metadata to the running app, keyed by the marketplace's
-    real ``marketplace.json`` name. Overridable with ``CLAUDE_PLUGIN_ENV_JOURNAL``.
-    """
-    configured = os.environ.get("CLAUDE_PLUGIN_ENV_JOURNAL", "").strip()
-    if configured:
-        return Path(configured)
-    return manifest_path().with_name("gateway-plugins-env.json")
-
-
-def _strip_url_credentials(repo: str) -> str:
-    """Remove embedded credentials from an http(s) repo URL before journaling.
-
-    A deployment may put a token in ``CLAUDE_PLUGIN_REPO*`` (e.g.
-    ``https://user:token@host/org/repo.git``); git uses it to clone, but it must
-    not be persisted to the journal (which the app reads and replays into the
-    manifest/API). Strip the userinfo here — replay credentials come from
-    ``CLAUDE_PLUGIN_GIT_TOKEN*``. Non-http(s) values are returned unchanged.
-    """
-    repo = (repo or "").strip()
-    scheme = repo.split("://", 1)[0].lower() if "://" in repo else ""
-    if scheme not in ("http", "https"):
-        return repo
-    try:
-        parts = urlsplit(repo)
-    except ValueError:
-        return repo
-    if not (parts.username or parts.password):
-        return repo
-    host = parts.hostname or ""
-    if parts.port:
-        host = f"{host}:{parts.port}"
-    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
-
-
-def _marketplace_name_for(local_path: Path, entry: PluginEntry) -> str:
-    """Resolve the name claude keys this marketplace by (its marketplace.json name).
-
-    Falls back to the explicit ``CLAUDE_PLUGIN_MARKETPLACE*`` value, then the repo
-    basename, so the journal always has a usable key.
-    """
-    try:
-        raw = (local_path / ".claude-plugin" / "marketplace.json").read_text(
-            encoding="utf-8"
-        )
-        data = json.loads(raw)
-        name = data.get("name") if isinstance(data, dict) else None
-        if isinstance(name, str) and name.strip():
-            return name.strip()
-    except (OSError, ValueError):
-        pass
-    return entry.marketplace or _default_name(entry.repo)
-
-
-def write_env_journal(entries: List[PluginEntry], root: Path) -> None:
-    """Write the env-bootstrap marketplace journal (overwrites fully each run).
-
-    Only ENV-declared entries are recorded; ``manifest.added`` entries are already
-    persisted in the manifest. Best-effort: a write failure is logged, not fatal —
-    the app simply falls back to user/main defaults.
-    """
-    records: Dict[str, Dict[str, str]] = {}
-    for entry in entries:
-        if entry.source_label == "manifest" or not entry.repo:
-            continue
-        local_path = (
-            Path(entry.repo)
-            if Path(entry.repo).exists()
-            else _clone_dir(root, entry.repo)
-        )
-        name = _marketplace_name_for(local_path, entry)
-        if not name:
-            continue
-        records[name] = {
-            "scope": entry.scope,
-            "branch": entry.branch,
-            # Never persist credentials embedded in the repo URL to the journal.
-            "repo": _strip_url_credentials(entry.repo),
-        }
-    payload = {"version": 1, "marketplaces": records}
-    path = env_journal_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
-    except OSError as exc:
-        log(f"could not write env journal {path}: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -647,8 +485,7 @@ def process_entry(
 def main() -> int:
     entries = collect_entries()
     if not entries:
-        write_env_journal([], clone_root())  # clear any stale journal
-        return 0  # nothing configured — no-op, same as the legacy installer
+        return 0  # nothing in the manifest — no-op
 
     total_plugins = sum(len(entry.names) for entry in entries)
     claude_bin = resolve_claude_bin()
@@ -673,7 +510,6 @@ def main() -> int:
         total_failed += failed
 
     apply_removed(claude_bin, removed_set)
-    write_env_journal(entries, root)
 
     log(
         f"done: {total_ok} plugin(s) ensured, {total_failed} failed, across {len(entries)} repo(s)"
@@ -684,11 +520,11 @@ def main() -> int:
 def apply_removed(claude_bin: str, removed_set: set) -> None:
     """Best-effort uninstall every spec the admin marked removed.
 
-    These specs came from the env bootstrap (so install was skipped above); this
-    actively uninstalls them at the scope they were removed from so a `down -v`
-    plugin-cache wipe stays consistent with the admin's intent. Failures are
-    logged and ignored — uninstalling an already-absent plugin is expected and
-    must never block startup.
+    Install for these specs was skipped above; this actively uninstalls them at
+    the scope they were removed from so an admin uninstall stays applied even
+    when the plugin survives in the plugin cache from an earlier run. Failures
+    are logged and ignored — uninstalling an already-absent plugin is expected
+    and must never block startup.
 
     *removed_set* is a set of ``(spec, scope)`` tuples.
     """

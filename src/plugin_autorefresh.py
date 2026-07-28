@@ -10,8 +10,8 @@ interval has elapsed, refreshes every gateway-managed marketplace through
 ``claude plugin update`` path the button uses.
 
 Only gateway-managed marketplaces are refreshed: names recorded in the managed
-manifest (admin-added) plus names journaled by the env bootstrap installer.
-Marketplaces registered outside the gateway are left alone.
+manifest (admin-added). Marketplaces registered outside the gateway are left
+alone.
 
 The first automatic cycle runs one full interval after process start — the
 startup installer has just refreshed everything, so refreshing again at boot
@@ -220,12 +220,8 @@ class PluginAutoRefresher:
 
     @staticmethod
     def _managed_marketplace_names() -> set:
-        """Marketplaces the gateway manages: manifest records ∪ env journal."""
-        from src import plugin_service
-
-        names = {n for n in plugin_manifest.list_marketplace_records() if n}
-        names |= {n for n in plugin_service.env_bootstrap_records() if n}
-        return names
+        """Marketplaces the gateway manages: the manifest's marketplace records."""
+        return {n for n in plugin_manifest.list_marketplace_records() if n}
 
     # ------------------------------------------------------------------
     # Status

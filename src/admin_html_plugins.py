@@ -6,7 +6,7 @@ def get_plugins_html() -> str:
     return """      <!-- Plugins Tab -->
       <div x-show="tab==='plugins'" role="tabpanel">
         <p class="text-xs text-muted" style="margin:0 0 12px 0">
-          Admin-managed layer on top of the CLAUDE_PLUGIN_* environment bootstrap. Changes persist via the gateway manifest.
+          Marketplaces and plugins are managed here; changes persist via the gateway manifest and are replayed at container startup.
         </p>
 
         <!-- Marketplace auto-refresh (periodic re-clone + plugin update) -->
