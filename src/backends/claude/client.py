@@ -6,6 +6,7 @@ implementation registered as the ``claude`` backend.
 
 import asyncio
 import os
+import re
 import tempfile
 import atexit
 import shutil
@@ -73,6 +74,10 @@ _VALID_SETTING_SOURCES = {"user", "project", "local"}
 # ``Skill`` rule does NOT work — the matcher discards content-less rules. See
 # :meth:`ClaudeCodeCLI._set_allowed_tools`.
 SKILL_ALLOW_ALL_RULE = "Skill(:*)"
+
+# Granular per-skill rule: ``Skill(<name>)`` / ``Skill(<name>:*)``. Requires at
+# least one non-``:`` character so the ``Skill(:*)`` catch-all never matches.
+_GRANULAR_SKILL_RULE_RE = re.compile(r"^Skill\((?P<name>[^:)]+)(?::\*)?\)$")
 
 
 def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
@@ -240,13 +245,39 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         name against the empty string, so it approves every skill while still
         leaving the skill's own downstream tool calls (Bash/Read/Write) subject
         to ``allowed_tools``, ``disallowed_tools`` and the workspace sandbox.
+
+        Granular selection: ``Skill(<name>)`` / ``Skill(<name>:*)`` entries
+        *without* a bare ``Skill`` set ``options.skills`` to exactly those
+        names. The catalog allowlist is the real enforcement point — a skill
+        not in the list is invisible to the model (the gateway's PreToolUse
+        force-approve hook then only ever sees listed skills). A bare
+        ``Skill`` entry keeps its existing allow-everything meaning and wins
+        over granular entries if both are present.
         """
         filtered = [t for t in tools if t not in DISALLOWED_TOOLS]
         if "Skill" in filtered:
-            filtered = [t for t in filtered if t != "Skill"]
+            filtered = [
+                t
+                for t in filtered
+                if t != "Skill" and _GRANULAR_SKILL_RULE_RE.match(t) is None
+            ]
             options.skills = "all"
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
+        else:
+            granular = sorted(
+                {
+                    match.group("name")
+                    for t in filtered
+                    if (match := _GRANULAR_SKILL_RULE_RE.match(t)) is not None
+                }
+            )
+            if granular:
+                options.skills = granular
+                filtered = [
+                    t for t in filtered if _GRANULAR_SKILL_RULE_RE.match(t) is None
+                ]
+                filtered.extend(f"Skill({name}:*)" for name in granular)
         options.allowed_tools = filtered
 
     async def _apply_hidden_skills(self, options: ClaudeAgentOptions) -> None:
@@ -257,13 +288,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         listing). The allowlist is the discovered command set minus hidden and
         slash-blocked names; builtin command names left in the remainder are
         inert — their ``Skill(<name>)`` allow rules match no skill.
+
+        An options.skills that is already a granular allowlist (set from
+        ``Skill(<name>)`` allowed_tools entries) is narrowed in place rather
+        than replaced — hidden skills must not resurrect, and non-selected
+        skills must not appear.
         """
         if not HIDDEN_SKILLS:
             return
         from src.backends.claude import slash_commands
 
-        cwd = Path(options.cwd) if options.cwd else None
-        names = await slash_commands.get_available_commands(cwd)
+        if isinstance(options.skills, list):
+            names = set(options.skills)
+        else:
+            cwd = Path(options.cwd) if options.cwd else None
+            names = await slash_commands.get_available_commands(cwd)
         options.skills = sorted(
             names - HIDDEN_SKILLS - slash_commands.BLOCKED_COMMANDS
         )
