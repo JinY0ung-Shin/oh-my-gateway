@@ -48,6 +48,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
     FORCE_FOREGROUND_SUBAGENTS,
+    SUBAGENT_TOOL_NAMES,
 )
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
@@ -300,9 +301,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # Subagent selection: ``Task(<agent>)`` entries are the gateway's own
         # allowlist (enforced by a PreToolUse hook), not CLI rules — strip them
         # and expose the bare tool so the model can still call it.
-        if _has_granular_agent_rule(filtered) and "Task" not in filtered:
+        if _has_granular_agent_rule(filtered) and not any(
+            name in filtered for name in SUBAGENT_TOOL_NAMES
+        ):
             filtered = [t for t in filtered if _GRANULAR_AGENT_RULE_RE.match(t) is None]
-            filtered.append("Task")
+            # Both spellings: the rule name that reaches the CLI depends on the
+            # build's rename map, and an unknown name is inert rather than fatal.
+            filtered.extend(SUBAGENT_TOOL_NAMES)
         else:
             filtered = [t for t in filtered if _GRANULAR_AGENT_RULE_RE.match(t) is None]
         if "Skill" in filtered:
@@ -901,7 +906,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         return hook
 
     def _make_task_hook(self, allowed: Optional[set]):
-        """PreToolUse hook governing the ``Task`` tool (subagents).
+        """PreToolUse hook governing the subagent tool (``Agent``/``Task``).
 
         Two jobs, both about the gateway's headless single-turn shape:
 
@@ -918,11 +923,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
            going silent). ``updatedInput`` rewrites the call to
            ``run_in_background: false`` so the work happens inside this turn.
 
-        Non-Task tools pass through untouched.
+        Both tool names are handled: the CLI renamed ``Task`` to ``Agent`` and a
+        hook that checks only the old name is a no-op on current builds
+        (``SUBAGENT_TOOL_NAMES``). Other tools pass through untouched.
         """
 
         async def hook(input_data, _tool_use_id, _context):
-            if not isinstance(input_data, dict) or input_data.get("tool_name") != "Task":
+            if not isinstance(input_data, dict):
+                return {}
+            if input_data.get("tool_name") not in SUBAGENT_TOOL_NAMES:
                 return {}
             tool_input = input_data.get("tool_input") or {}
             if not isinstance(tool_input, dict):
@@ -930,7 +939,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
             agent = tool_input.get("subagent_type", "")
             if allowed and agent and agent not in allowed:
-                logger.info("Denying Task subagent outside allowlist: %s", agent)
+                logger.info("Denying subagent outside allowlist: %s", agent)
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
@@ -976,13 +985,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             # allow-rule across CLI builds. The skill's own downstream tool
             # calls remain governed by their permissions and the sandbox hook.
             HookMatcher(matcher="Skill", hooks=[self._make_skill_allow_hook()]),
-            # Task is governed on every session, not just when the client
-            # narrowed subagents: forcing foreground delivery is needed on its own.
-            HookMatcher(
-                matcher="Task",
-                hooks=[self._make_task_hook(agent_allowlist(allowed_tools))],
-            ),
         ]
+        # The subagent tool is governed on every session, not just when the
+        # client narrowed subagents: forcing foreground delivery is needed on
+        # its own. One matcher per name — matcher strings are compared against
+        # the tool's real name, and current CLI builds call it "Agent".
+        task_hook = self._make_task_hook(agent_allowlist(allowed_tools))
+        matchers.extend(
+            HookMatcher(matcher=name, hooks=[task_hook]) for name in SUBAGENT_TOOL_NAMES
+        )
         if cwd and sandbox_enabled():
             matchers.append(
                 HookMatcher(matcher="", hooks=[make_workspace_sandbox_hook(Path(cwd))])

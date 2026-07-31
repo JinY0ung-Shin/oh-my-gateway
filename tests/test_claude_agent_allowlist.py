@@ -144,26 +144,66 @@ class TestForegroundForcing:
         assert out == {}
 
 
+class TestRenamedSubagentTool:
+    """The CLI renamed ``Task`` to ``Agent``; a hook bound to the old name is a no-op.
+
+    This is the shape of a real regression: subagents kept running in the
+    background (turn ends with "I'll report back", the Task row stays
+    "결과 미수신") and the selection allowlist silently stopped enforcing,
+    because the PreToolUse matcher never fired on the new tool name.
+    """
+
+    async def _run(self, cli, tool_name, tool_input, allowed=None):
+        hook = cli._make_task_hook(allowed)
+        return await hook({"tool_name": tool_name, "tool_input": tool_input}, None, None)
+
+    async def test_agent_spelling_is_forced_to_foreground(self, cli):
+        out = await self._run(cli, "Agent", {"subagent_type": "Explore", "prompt": "go"})
+        assert out["hookSpecificOutput"]["updatedInput"]["run_in_background"] is False
+
+    async def test_agent_spelling_enforces_the_allowlist(self, cli):
+        out = await self._run(cli, "Agent", {"subagent_type": "nope"}, allowed={"Explore"})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_legacy_task_spelling_still_governed(self, cli):
+        out = await self._run(cli, "Task", {"subagent_type": "Explore"})
+        assert out["hookSpecificOutput"]["updatedInput"]["run_in_background"] is False
+
+    def test_both_names_reach_allowed_tools(self, cli):
+        """Availability must not depend on which name the installed CLI uses."""
+        options = _Options()
+        cli._set_allowed_tools(options, ["Read", "Task(Explore)"])
+        assert "Task" in options.allowed_tools and "Agent" in options.allowed_tools
+        assert not any(t.startswith(("Task(", "Agent(")) for t in options.allowed_tools)
+
+
 class TestHookWiring:
     """Which tools the gateway governs on every session."""
 
-    def test_skill_and_task_are_always_governed(self, cli):
+    def test_skill_and_subagent_tools_are_always_governed(self, cli):
         matchers = cli._pre_tool_use_hooks(None, ["Read"])
-        assert [m.matcher for m in matchers] == ["Skill", "Task"]
+        # Both subagent spellings: hook matchers fire on the tool's real name and
+        # current CLI builds renamed Task -> Agent.
+        assert [m.matcher for m in matchers] == ["Skill", "Task", "Agent"]
 
     def test_task_hook_present_without_any_allowlist(self, cli):
         """Foreground forcing must not depend on subagent selection."""
         matchers = cli._pre_tool_use_hooks(None, None)
-        assert any(m.matcher == "Task" and m.hooks for m in matchers)
+        for name in ("Task", "Agent"):
+            assert any(m.matcher == name and m.hooks for m in matchers)
 
     def test_sandbox_hook_added_when_enabled(self, cli, monkeypatch):
         monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
         matchers = cli._pre_tool_use_hooks("/tmp/ws", ["Read"])
-        assert [m.matcher for m in matchers] == ["Skill", "Task", ""]
+        assert [m.matcher for m in matchers] == ["Skill", "Task", "Agent", ""]
 
     def test_sandbox_hook_skipped_without_cwd(self, cli, monkeypatch):
         monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
-        assert [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])] == ["Skill", "Task"]
+        assert [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])] == [
+            "Skill",
+            "Task",
+            "Agent",
+        ]
 
 
 class TestSessionEffort:

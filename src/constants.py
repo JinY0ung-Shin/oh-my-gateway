@@ -27,7 +27,11 @@ SYSTEM_PROMPT_FILE = os.getenv("SYSTEM_PROMPT_FILE", "")
 PROMPT_LANGUAGE = os.getenv("PROMPT_LANGUAGE", "English")
 
 # API Configuration
-DEFAULT_MAX_TURNS = parse_int_env("DEFAULT_MAX_TURNS", 10)
+# Agentic turns per request. A subagent-heavy turn spends turns on orchestration
+# before any real work lands (Skill -> Agent -> tool -> report), so the old
+# default of 10 truncated complex requests mid-flight — which reached the client
+# as a dangling tool row and no answer. Lower it for cost-capped deployments.
+DEFAULT_MAX_TURNS = parse_int_env("DEFAULT_MAX_TURNS", 40)
 DEFAULT_TIMEOUT_MS = parse_int_env("MAX_TIMEOUT", 600_000)  # 10 minutes
 DEFAULT_PORT = parse_int_env("PORT", 8000)
 DEFAULT_HOST = (

@@ -1065,6 +1065,57 @@ async def stream_response_chunks(
                 await _log_usage("incomplete", "user_cancelled")
                 return
 
+            # Turn-limit truncation is NOT a failure: the work done so far is
+            # real and the partial text is worth keeping. The SDK reports it as
+            # a result chunk with ``is_error``, which the generic classifier
+            # below would turn into an opaque "Unknown SDK error" — a complex
+            # subagent turn then looks like it died for no reason. Report it as
+            # ``incomplete`` with the reason so the client can say so.
+            if chunk.get("type") == "result" and str(chunk.get("subtype", "")).startswith(
+                "error_max_turns"
+            ):
+                _close_thinking_capture()
+                if reasoning_open:
+                    for line in _close_reasoning(status="incomplete"):
+                        yield line
+                if message_item_opened:
+                    for line in _close_message_item(status="incomplete"):
+                        yield line
+                partial_text = "".join(all_visible_text)
+                prompt_tokens, completion_tokens = resolve_token_usage(
+                    chunks_buffer, prompt_text or "", partial_text
+                )
+                truncated_resp = ResponseObject(
+                    id=response_id,
+                    model=model,
+                    status="incomplete",
+                    output=list(completed_output_items),
+                    usage=ResponseUsage(
+                        input_tokens=prompt_tokens,
+                        output_tokens=completion_tokens,
+                        input_tokens_details=resolve_usage_details(chunks_buffer),
+                    ),
+                    metadata=_metadata,
+                    incomplete_details=ResponseIncompleteDetails(reason="max_turns"),
+                )
+                logger.warning(
+                    "Responses stream hit the agentic turn limit: response_id=%s "
+                    "assistant_chars=%d (raise DEFAULT_MAX_TURNS for deeper subagent work)",
+                    response_id,
+                    len(partial_text),
+                )
+                stream_result["success"] = False
+                stream_result["assistant_text"] = partial_text
+                stream_result["thinking_texts"] = thinking_texts
+                stream_result["response_obj"] = truncated_resp
+                yield make_response_sse(
+                    "response.incomplete",
+                    response_obj=truncated_resp,
+                    sequence_number=_next_seq(),
+                )
+                await _log_usage("incomplete", "max_turns")
+                return
+
             # Detect terminal error chunks: SDK in-band errors (is_error),
             # AssistantMessage.error (auth failures, rate limits, etc.) and
             # rejected SDK rate-limit events.  Classification is shared with

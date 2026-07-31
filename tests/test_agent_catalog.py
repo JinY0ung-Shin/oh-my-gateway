@@ -284,3 +284,45 @@ def test_mcp_health_endpoint_returns_the_snapshot(monkeypatch):
             "checked_at": body["servers"][0]["checked_at"],
         }
     ]
+
+
+# ---------------------------------------------- turn-limit truncation
+
+
+async def test_max_turns_result_is_reported_as_incomplete():
+    """A turn cut off by the agentic limit must say so, not die as sdk_error.
+
+    Complex subagent turns hit the limit while a tool row is still open; the
+    generic error path reported "Unknown SDK error" and the client showed a
+    dangling call with no explanation.
+    """
+    import logging
+
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunks():
+        yield {"type": "assistant", "content": [{"type": "text", "text": "부분 답변"}]}
+        yield {"type": "result", "subtype": "error_max_turns", "is_error": True}
+
+    stream_result: dict = {}
+    with patch("src.usage_logger.usage_logger.log_turn_from_context", new=AsyncMock()):
+        events = [
+            line
+            async for line in stream_response_chunks(
+                chunk_source=chunks(),
+                model="claude-test",
+                response_id="resp_1",
+                output_item_id="msg_1",
+                chunks_buffer=[],
+                logger=logging.getLogger("test-max-turns"),
+                stream_result=stream_result,
+            )
+        ]
+    body = "".join(events)
+
+    assert "response.incomplete" in body
+    assert '"reason":"max_turns"' in body.replace(" ", "")
+    assert "response.failed" not in body
+    # 지금까지의 텍스트는 버리지 않는다 (SSE 본문은 \uXXXX로 이스케이프된다)
+    assert stream_result["assistant_text"] == "부분 답변"
+    assert stream_result["success"] is False

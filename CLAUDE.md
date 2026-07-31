@@ -46,6 +46,16 @@ uv run pytest --cov=src                            # with coverage
   the Python SDK objects are not wire-compatible with Noah's JavaScript SDK handlers. Never move that
   mapper into the shared Responses conversion path.
 
+## Gotchas
+
+- The CLI renames tools across builds (`Task` → `Agent`, `KillShell` → `TaskStop`, …).
+  Permission *rules* pass through that rename map, but **PreToolUse hook matchers fire on
+  the tool's real name** — bind hooks to every spelling (`SUBAGENT_TOOL_NAMES`) or they
+  become silent no-ops on a new CLI.
+- A turn cut off by the agentic limit is reported as `response.incomplete` with
+  `incomplete_details.reason = "max_turns"`, not `response.failed`: the partial text is
+  real work. `DEFAULT_MAX_TURNS` (40) has to accommodate subagent orchestration.
+
 ## API Compatibility Boundaries
 
 - `/v1/responses` owns OpenAI response semantics, `previous_response_id`, cancellation, and stored

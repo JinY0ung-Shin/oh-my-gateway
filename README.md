@@ -398,8 +398,11 @@ Effective `/v1/responses` request fields:
   omits skills the session can still run.
   Subagents always run **in the foreground**: the CLI's background default promises the
   model a completion notification that would land after the HTTP turn closed, so the
-  gateway rewrites `Task` calls to `run_in_background: false`
-  (`FORCE_FOREGROUND_SUBAGENTS=false` to opt out).
+  gateway rewrites subagent calls to `run_in_background: false`
+  (`FORCE_FOREGROUND_SUBAGENTS=false` to opt out). Both tool spellings are governed —
+  current CLI builds renamed `Task` to `Agent`, and a hook bound to the old name alone
+  is a silent no-op that lets subagents drift back into the background *and* stops
+  enforcing the selection allowlist.
 - `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
 - `reasoning.effort`: thinking effort for the session (`low|medium|high|xhigh|max`, Claude backend).
   Baked at session creation — a continuation keeps what its first turn set. The gateway also sets

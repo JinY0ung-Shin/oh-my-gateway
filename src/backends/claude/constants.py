@@ -126,6 +126,16 @@ else:
 # instead of waiting for complete messages
 TOKEN_STREAMING = parse_bool_env("TOKEN_STREAMING", "true")
 
+# Subagent Tool Names
+# The CLI renamed the subagent tool: recent builds ship it as ``Agent`` and keep
+# ``Task`` only as a legacy alias (the binary carries the rename map
+# ``{Task:"Agent", KillShell:"TaskStop", AgentOutputTool:"TaskOutput", …}``).
+# Permission *rules* are translated through that map, but PreToolUse hook
+# matchers fire on the tool's real name — so a hook registered for "Task" alone
+# silently never runs on a build that calls it "Agent", taking the gateway's
+# subagent allowlist and foreground forcing down with it. Govern both names.
+SUBAGENT_TOOL_NAMES = ("Task", "Agent")
+
 # Disallowed Subagent Types
 # Comma-separated list of subagent types to block via Agent(type) syntax
 # Example: "statusline-setup,Plan"
