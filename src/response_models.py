@@ -106,6 +106,25 @@ class ResponseTextConfig(BaseModel):
     ] = None
 
 
+class ReasoningConfig(BaseModel):
+    """OpenAI Responses-shaped reasoning control.
+
+    Only ``effort`` is honored, mapped to the SDK's session-level ``effort``
+    option ("how much effort Claude puts into its response", which guides
+    adaptive thinking depth). Applied when the session is created, so a
+    continuation keeps the effort its first turn set.
+    """
+
+    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = Field(
+        default=None,
+        description=(
+            "Thinking/response effort for this session: low | medium | high | "
+            "xhigh | max. Applied at session creation (the first turn of a "
+            "conversation); continuations keep it."
+        ),
+    )
+
+
 class ResponseCreateRequest(BaseModel):
     """POST /v1/responses request body."""
 
@@ -164,6 +183,10 @@ class ResponseCreateRequest(BaseModel):
             "Text response configuration. format.type 'json_schema' enables "
             "Structured Outputs (Claude backend only); 'text' is the default."
         ),
+    )
+    reasoning: Optional[ReasoningConfig] = Field(
+        default=None,
+        description="Reasoning controls. Only 'effort' is honored (Claude backend).",
     )
 
 

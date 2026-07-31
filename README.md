@@ -396,6 +396,14 @@ Effective `/v1/responses` request fields:
   gateway rewrites `Task` calls to `run_in_background: false`
   (`FORCE_FOREGROUND_SUBAGENTS=false` to opt out).
 - `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
+- `reasoning.effort`: thinking effort for the session (`low|medium|high|xhigh|max`, Claude backend).
+  Baked at session creation — a continuation keeps what its first turn set. The gateway also sets
+  `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` for that subprocess, because the CLI otherwise skips the
+  field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id. **Whether it changes
+  anything is the upstream's business**: on the wire it is Anthropic's `output_config.effort`; the
+  sanitizer translates that to OpenAI `reasoning_effort` (`xhigh`/`max` clamp to `high`) for
+  LiteLLM, and a model that does not take the field simply ignores it (LiteLLM's `drop_params`
+  discards it, and the CLI retries without effort if the upstream 400s on it).
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key.

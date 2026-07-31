@@ -1041,6 +1041,10 @@ async def _ensure_response_session_client(
     # accepts neither, so gate to avoid an unknown-kwarg TypeError.
     if resolved.backend == "claude":
         create_kwargs["user"] = body.user
+        # Session-level effort (OpenAI-shaped ``reasoning.effort``). Only the
+        # claude backend accepts the kwarg, so gate it like ``user``.
+        if body.reasoning and body.reasoning.effort:
+            create_kwargs["effort"] = body.reasoning.effort
     if resolved.backend in {"claude", "codex"} and forward_headers:
         create_kwargs["forward_headers"] = forward_headers
     try:

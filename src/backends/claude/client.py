@@ -1120,6 +1120,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
         include_partial_messages: Optional[bool] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
@@ -1161,6 +1162,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             forward_headers=forward_headers,
             include_partial_messages=include_partial_messages,
         )
+        # 세션 단위 effort — SDK가 생성 시점에 굽는다(중간 변경 API 없음).
+        # 그래서 '다음 새 대화부터 적용'이 이 값의 정직한 의미다.
+        #
+        # CLI는 "이 모델이 effort를 지원하는가"를 자기 모델 레지스트리와 **base URL이
+        # 1st-party인가**로 판단한다. 커스텀 ANTHROPIC_BASE_URL(sanitizer/LiteLLM)에
+        # 낯선 모델 id면 그 판단이 false가 되어 요청에 effort를 아예 싣지 않는다.
+        # CLAUDE_CODE_ALWAYS_ENABLE_EFFORT가 그 게이트를 연다. (업스트림이 400으로
+        # 거절하면 CLI가 스스로 effort를 빼고 재시도하므로 켜도 안전하다.)
+        if effort:
+            options.effort = effort
+            options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
         await self._apply_hidden_skills(options)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the

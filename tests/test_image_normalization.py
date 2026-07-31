@@ -146,3 +146,45 @@ class TestSavePathNormalization:
     def test_max_image_size_constant_unchanged(self):
         # Guard the documented contract (5 MB, under the 10 MB body limit).
         assert MAX_IMAGE_SIZE == 5 * 1024 * 1024
+
+
+class TestEffortBridge:
+    """``output_config.effort`` → OpenAI ``reasoning_effort`` (sanitizer path).
+
+    The chat UI's "생각 강도" only means something if the value survives
+    gateway → sanitizer → LiteLLM. The sanitizer's Anthropic→OpenAI converter is
+    an allowlist, so effort needs an explicit translation or it is dropped.
+    """
+
+    def _convert(self, body):
+        from src.sanitizer.openai_bridge import anthropic_request_to_openai_body
+
+        return anthropic_request_to_openai_body({"model": "m", "messages": [], **body})
+
+    def test_string_levels_map_through(self):
+        for level, expected in [("low", "low"), ("medium", "medium"), ("high", "high")]:
+            out = self._convert({"output_config": {"effort": level}})
+            assert out["reasoning_effort"] == expected
+
+    def test_anthropic_only_levels_clamp_to_high(self):
+        """OpenAI has nothing above "high" — clamp instead of inventing a level."""
+        for level in ("xhigh", "max"):
+            assert self._convert({"output_config": {"effort": level}})["reasoning_effort"] == "high"
+
+    def test_integer_effort_buckets(self):
+        assert self._convert({"output_config": {"effort": 10}})["reasoning_effort"] == "low"
+        assert self._convert({"output_config": {"effort": 50}})["reasoning_effort"] == "medium"
+        assert self._convert({"output_config": {"effort": 90}})["reasoning_effort"] == "high"
+
+    def test_absent_output_config_adds_nothing(self):
+        assert "reasoning_effort" not in self._convert({})
+
+    def test_unknown_level_is_ignored(self):
+        assert "reasoning_effort" not in self._convert({"output_config": {"effort": "turbo"}})
+
+    def test_bool_is_not_an_integer_effort(self):
+        assert "reasoning_effort" not in self._convert({"output_config": {"effort": True}})
+
+    def test_other_fields_still_forwarded(self):
+        out = self._convert({"max_tokens": 100, "output_config": {"effort": "high"}})
+        assert out["max_tokens"] == 100 and out["reasoning_effort"] == "high"

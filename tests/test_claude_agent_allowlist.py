@@ -164,3 +164,28 @@ class TestHookWiring:
     def test_sandbox_hook_skipped_without_cwd(self, cli, monkeypatch):
         monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
         assert [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])] == ["Skill", "Task"]
+
+
+class TestSessionEffort:
+    """``reasoning.effort`` is a session-level knob (the SDK bakes it at create)."""
+
+    def test_request_model_accepts_effort(self):
+        from src.response_models import ResponseCreateRequest
+
+        body = ResponseCreateRequest(input="hi", reasoning={"effort": "high"})
+        assert body.reasoning is not None
+        assert body.reasoning.effort == "high"
+
+    def test_request_model_rejects_unknown_level(self):
+        import pytest as _pytest
+        from pydantic import ValidationError
+
+        from src.response_models import ResponseCreateRequest
+
+        with _pytest.raises(ValidationError):
+            ResponseCreateRequest(input="hi", reasoning={"effort": "turbo"})
+
+    def test_absent_reasoning_stays_none(self):
+        from src.response_models import ResponseCreateRequest
+
+        assert ResponseCreateRequest(input="hi").reasoning is None
