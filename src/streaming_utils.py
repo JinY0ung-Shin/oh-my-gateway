@@ -33,9 +33,11 @@ from src.sse_builders import (  # noqa: F401
     _build_progress_event,
     _build_task_event,
     _normalize_tool_result,
+    is_teammate_message_text,
     make_function_call_response_sse,
     make_response_sse,
     make_task_response_sse,
+    make_teammate_message_response_sse,
     make_tool_result_response_sse,
     make_tool_use_response_sse,
     make_tool_use_started_response_sse,
@@ -655,6 +657,59 @@ def _user_tool_result_events(
             parent_tool_use_id=parent_id,
         )
         for tr_block in visible_results
+    ]
+
+
+def _user_chunk_texts(chunk: Dict[str, Any]) -> list[str]:
+    """Text carried by a user chunk, as a list of block texts.
+
+    Resolves ``content`` exactly the way :func:`extract_user_tool_results`
+    does — chunk-level ``content`` first, then the ``message.content``
+    fallback — and additionally accepts a plain-string content.
+    """
+    content = chunk.get("content")
+    if not isinstance(content, (list, str)):
+        msg = chunk.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        return [content]
+    if not isinstance(content, list):
+        return []
+    texts = []
+    for block in content:
+        # An SDK TextBlock carries no ``type`` field (only ``text``), so accept
+        # both the dict form and any untyped block that has string text.
+        block_type = _block_field(block, "type")
+        if block_type is not None and block_type != "text":
+            continue
+        text = _block_field(block, "text")
+        if isinstance(text, str) and text:
+            texts.append(text)
+    return texts
+
+
+def _teammate_message_events(
+    chunk: Dict[str, Any],
+    next_seq: Callable[[], int],
+) -> list[str]:
+    """Surface an agent-team teammate's message to the leader as SSE.
+
+    The CLI injects a teammate's ``SendMessage`` into the leader's transcript as
+    a plain ``user`` message, so this text arrives on the same chunks the loop
+    otherwise only mines for tool_result blocks. Restricted to leader-level
+    chunks: a chunk with a ``parent_tool_use_id`` belongs to a subagent's own
+    transcript, not to a message addressed at the leader session.
+    """
+    if chunk.get("parent_tool_use_id") is not None:
+        return []
+    return [
+        make_teammate_message_response_sse(
+            text,
+            session_id=chunk.get("session_id"),
+            sequence_number=next_seq(),
+        )
+        for text in _user_chunk_texts(chunk)
+        if is_teammate_message_text(text)
     ]
 
 
@@ -1278,6 +1333,10 @@ async def stream_response_chunks(
                 for event in _user_tool_result_events(
                     chunk, tool_stats, _next_seq, tool_names_by_id, request_context
                 ):
+                    yield event
+                # An agent-team teammate's message to the leader arrives as
+                # injected user text, which the tool_result path above drops.
+                for event in _teammate_message_events(chunk, _next_seq):
                     yield event
                 chunks_buffer.append(chunk)
                 continue

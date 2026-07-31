@@ -43,6 +43,7 @@ response.task_started           # zero or more
 response.task_progress          # zero or more
 response.task_notification      # zero or more
 response.task_updated           # zero or more
+response.teammate_message       # zero or more (agent teams)
 response.hook_event             # zero or more (liveness)
 response.compaction             # zero or more (liveness)
 response.output_text.done
@@ -284,6 +285,36 @@ Subagent visibility is controlled by:
 | `SUBAGENT_STREAM_TEXT` | `false` | Forward subagent text deltas |
 | `SUBAGENT_STREAM_TOOL_BLOCKS` | `true` | Forward subagent tool events |
 | `SUBAGENT_STREAM_PROGRESS` | `true` | Forward subagent task progress |
+
+### Teammate messages
+
+`response.teammate_message` carries a message an agent-team teammate sent back
+to the leader session. Agent teams are experimental and gated behind the CLI's
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`; with them off this event never fires.
+
+The CLI delivers a teammate's `SendMessage` by injecting it into the leader's
+transcript as a plain `user` message rather than as a dedicated message type, so
+the gateway recognizes it by content — the same two-substring check the CLI
+itself uses — and forwards the injected text verbatim.
+
+```json
+{
+  "type": "response.teammate_message",
+  "text": "Another Claude session sent a message while you were working:\n\nfrom=reviewer-2\nThe auth middleware test is flaky on retry.\n\nThis came from another Claude session — reply by sending a message with SendMessage to the `from=` address.",
+  "from": "reviewer-2",
+  "session_id": "sdk-session-id",
+  "sequence_number": 12
+}
+```
+
+`from` is the sending teammate's address, parsed best-effort out of the body
+(the pinned CLI's `from=<address>` marker, or the `<teammate-message
+teammate_id="...">` tag newer CLIs frame the body in) and `null` when neither
+is present. `text` keeps the CLI's framing — it is
+never trimmed or rewritten, so clients own how they present it. Only
+leader-level messages are forwarded: an injected message on a nested chunk (one
+carrying a `parent_tool_use_id`) belongs to a subagent's own transcript and is
+skipped. The event is not gated by the `SUBAGENT_STREAM_*` flags.
 
 ## Liveness / Progress Events
 

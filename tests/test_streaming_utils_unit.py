@@ -2220,3 +2220,115 @@ async def test_stream_forwards_compaction_event():
     assert len(compaction) == 1
     assert compaction[0]["subtype"] == "compact_boundary"
     assert compaction[0]["trigger"] == "auto"
+
+
+# ---------------------------------------------------------------------------
+# Agent-team teammate messages. A teammate's SendMessage reaches the leader as
+# an injected plain `user` message, whose text the tool_result path drops.
+# ---------------------------------------------------------------------------
+
+
+# Shaped like the CLI's injected body: the opener, the sender's from= address,
+# and the trailing guidance whose literal backticked `from=` must not be
+# mistaken for an address.
+TEAMMATE_TEXT = (
+    "Another Claude session sent a message while you were working:\n\n"
+    "from=reviewer-2\nThe auth middleware test is flaky on retry.\n\n"
+    "This came from another Claude session — reply by sending a message with "
+    "SendMessage to the `from=` address."
+)
+
+
+def _teammate_user_chunk(text=TEAMMATE_TEXT, **overrides):
+    chunk = {
+        "type": "user",
+        "content": [{"type": "text", "text": text}],
+        "session_id": "s1",
+    }
+    chunk.update(overrides)
+    return chunk
+
+
+async def test_stream_emits_teammate_message_event():
+    """Injected teammate text becomes response.teammate_message with a from."""
+
+    async def chunk_source():
+        yield _teammate_user_chunk()
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    teammate = [p for t, p in events if t == "response.teammate_message"]
+    assert len(teammate) == 1
+    # Raw text passes through untransformed.
+    assert teammate[0]["text"] == TEAMMATE_TEXT
+    # The real address wins over the backticked `from=` in the guidance.
+    assert teammate[0]["from"] == "reviewer-2"
+    assert teammate[0]["session_id"] == "s1"
+    assert isinstance(teammate[0]["sequence_number"], int)
+
+
+async def test_stream_teammate_message_requires_both_markers():
+    """Only the opener, or only the explanation, is not a teammate message."""
+
+    async def chunk_source():
+        yield _teammate_user_chunk("Another Claude session sent a message: hello")
+        yield _teammate_user_chunk(
+            "This came from another Claude session — quoting it in my answer."
+        )
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    assert not any(t == "response.teammate_message" for t, _ in events)
+
+
+async def test_stream_teammate_message_skipped_for_subagent_chunk():
+    """A nested chunk is a subagent's own transcript, not a leader message."""
+
+    async def chunk_source():
+        yield _teammate_user_chunk(parent_tool_use_id="toolu_parent")
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    assert not any(t == "response.teammate_message" for t, _ in events)
+
+
+async def test_stream_tool_result_user_chunk_emits_no_teammate_message():
+    """A plain tool_result user chunk keeps its existing behavior."""
+
+    async def chunk_source():
+        yield {
+            "type": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": "tu_1",
+                    "content": "file contents",
+                }
+            ],
+        }
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    types = [t for t, _ in events]
+    assert "response.teammate_message" not in types
+    tool_results = [p for t, p in events if t == "response.tool_result"]
+    assert len(tool_results) == 1
+    assert tool_results[0]["tool_use_id"] == "tu_1"
+
+
+async def test_stream_teammate_message_without_from_address():
+    """A body with no from= still surfaces, with from null."""
+    text = (
+        "Another Claude session sent a message:\n\nping\n\n"
+        "This came from another Claude session — reply with SendMessage."
+    )
+
+    async def chunk_source():
+        yield _teammate_user_chunk(text)
+        yield {"subtype": "success", "result": "done"}
+
+    events, _ = await _collect_response_events(chunk_source())
+    teammate = [p for t, p in events if t == "response.teammate_message"]
+    assert len(teammate) == 1
+    assert teammate[0]["text"] == text
+    assert teammate[0]["from"] is None
