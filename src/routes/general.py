@@ -51,7 +51,8 @@ async def list_slash_commands(
 ):
     """List slash commands the Claude backend will accept on /v1/responses.
 
-    Clients (e.g. the ChatDRAGON composer) use this for `/` autocompletion.
+    Clients (e.g. the ChatDRAGON composer) use this for CLI-style `/`
+    completion, so each entry carries the SDK's description/argument hint.
     Blocked names are excluded — sending one returns 400 blocked_command, so
     they must never be offered for completion.
     """
@@ -60,10 +61,18 @@ async def list_slash_commands(
     from src.backends.claude import slash_commands
 
     try:
-        names = await slash_commands.get_available_commands()
+        details = await slash_commands.get_command_details()
     except Exception:  # noqa: BLE001 — SDK 조회 실패는 빈 목록으로 응답
-        names = set()
-    allowed = sorted(names - slash_commands.BLOCKED_COMMANDS)
+        details = {}
+    allowed = [
+        {
+            "name": name,
+            "description": meta.get("description", ""),
+            "argument_hint": meta.get("argument_hint", ""),
+        }
+        for name, meta in sorted(details.items())
+        if name not in slash_commands.BLOCKED_COMMANDS
+    ]
     return {"commands": allowed, "total": len(allowed)}
 
 

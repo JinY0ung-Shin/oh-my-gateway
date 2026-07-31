@@ -3048,20 +3048,26 @@ async def test_responses_truly_concurrent_lock_serialization(isolated_session_ma
 
 
 def test_slash_commands_endpoint_lists_allowed_only():
-    """/v1/slash-commands는 차단 명령을 제외한 사용 가능 목록을 준다."""
+    """/v1/slash-commands는 차단 명령을 제외하고 설명 포함 목록을 준다."""
     from src.backends.claude import slash_commands as sc_module
 
-    async def fake_commands(cwd=None, force=False):
-        return {"context", "usage", "compact", "init"}
+    async def fake_details(cwd=None, force=False):
+        return {
+            "usage": {"description": "Show usage", "argument_hint": ""},
+            "context": {"description": "Context info", "argument_hint": ""},
+            "compact": {"description": "blocked builtin", "argument_hint": ""},
+            "init": {"description": "blocked builtin", "argument_hint": ""},
+        }
 
     with (
         client_context() as (client, _mock_cli),
-        patch.object(sc_module, "get_available_commands", side_effect=fake_commands),
+        patch.object(sc_module, "get_command_details", side_effect=fake_details),
     ):
         response = client.get("/v1/slash-commands")
         assert response.status_code == 200
         body = response.json()
-        assert body["commands"] == ["context", "usage"]  # blocked 제외, 정렬
+        assert [c["name"] for c in body["commands"]] == ["context", "usage"]
+        assert body["commands"][0]["description"] == "Context info"
         assert body["total"] == 2
 
 
@@ -3074,7 +3080,7 @@ def test_slash_commands_endpoint_degrades_to_empty():
 
     with (
         client_context() as (client, _mock_cli),
-        patch.object(sc_module, "get_available_commands", side_effect=boom),
+        patch.object(sc_module, "get_command_details", side_effect=boom),
     ):
         response = client.get("/v1/slash-commands")
         assert response.status_code == 200
