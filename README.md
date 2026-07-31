@@ -386,6 +386,11 @@ Effective `/v1/responses` request fields:
 - `background`: return a `queued` response immediately and run the turn server-side (see below).
 - `metadata`: stored on responses; allowlisted keys can be forwarded to Claude with `METADATA_ENV_ALLOWLIST`.
 - `allowed_tools`: explicit tool allowlist for backends that support tool policy enforcement.
+  Two entry forms select *inside* a tool: `Skill(<name>)` narrows the skill catalog to
+  the named skills, and `Task(<agent>)` narrows which subagents may run (enforced by a
+  gateway PreToolUse hook — an unlisted `subagent_type` is denied with a reason the model
+  reads back). A bare `Skill`/`Task` keeps its allow-everything meaning and wins over the
+  granular entries.
 - `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.

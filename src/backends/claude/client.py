@@ -80,6 +80,39 @@ SKILL_ALLOW_ALL_RULE = "Skill(:*)"
 # least one non-``:`` character so the ``Skill(:*)`` catch-all never matches.
 _GRANULAR_SKILL_RULE_RE = re.compile(r"^Skill\((?P<name>[^:)]+)(?::\*)?\)$")
 
+# Granular per-subagent rule: ``Task(<agent>)`` / ``Agent(<agent>)`` (the CLI
+# has used both names for this tool; DISALLOWED_SUBAGENT_TYPES denies with the
+# ``Agent(...)`` spelling). Unlike skills there is no SDK allowlist that hides a
+# plugin/filesystem subagent from the model, so the gateway enforces the
+# selection itself with a PreToolUse hook that denies ``Task`` calls whose
+# ``subagent_type`` is not listed. A bare ``Task`` entry keeps its
+# allow-every-subagent meaning and wins over granular entries.
+_GRANULAR_AGENT_RULE_RE = re.compile(r"^(?:Task|Agent)\((?P<name>[^:)]+)\)$")
+
+
+def _has_granular_agent_rule(tools: List[str]) -> bool:
+    return any(_GRANULAR_AGENT_RULE_RE.match(t) is not None for t in tools)
+
+
+def agent_allowlist(tools: Optional[List[str]]) -> Optional[set]:
+    """Subagents selected via ``Task(<agent>)`` entries, or None for "all".
+
+    Returns None when the caller passed a bare ``Task`` (allow every subagent)
+    or no granular entry at all, so the hook is only installed when the client
+    actually narrowed the set. Race-free by construction: derived from the
+    request's own ``allowed_tools`` rather than stored on the shared client.
+    """
+    if not tools:
+        return None
+    if "Task" in tools:
+        return None
+    names = {
+        match.group("name")
+        for t in tools
+        if (match := _GRANULAR_AGENT_RULE_RE.match(t)) is not None
+    }
+    return names or None
+
 
 def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
     """Return Claude config sources for SDK calls.
@@ -263,6 +296,14 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         """
         blocked = set(DISALLOWED_TOOLS) | set(BLOCKED_DEFERRED_TOOLS)
         filtered = [t for t in tools if t not in blocked]
+        # Subagent selection: ``Task(<agent>)`` entries are the gateway's own
+        # allowlist (enforced by a PreToolUse hook), not CLI rules — strip them
+        # and expose the bare tool so the model can still call it.
+        if _has_granular_agent_rule(filtered) and "Task" not in filtered:
+            filtered = [t for t in filtered if _GRANULAR_AGENT_RULE_RE.match(t) is None]
+            filtered.append("Task")
+        else:
+            filtered = [t for t in filtered if _GRANULAR_AGENT_RULE_RE.match(t) is None]
         if "Skill" in filtered:
             filtered = [
                 t
@@ -858,6 +899,38 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
+    def _make_agent_allowlist_hook(self, allowed: set):
+        """PreToolUse hook denying ``Task`` calls outside the selected subagents.
+
+        The SDK's ``agents`` option only *defines* programmatic subagents; it
+        cannot hide plugin/filesystem ones, and the CLI's rule matcher is not a
+        reliable gate for ``Task(<agent>)`` across builds. So the gateway
+        enforces the client's selection here: an unlisted ``subagent_type`` is
+        denied with a reason the model reads as a tool result, and every other
+        tool passes through untouched.
+        """
+
+        async def hook(input_data, _tool_use_id, _context):
+            if not isinstance(input_data, dict) or input_data.get("tool_name") != "Task":
+                return {}
+            tool_input = input_data.get("tool_input") or {}
+            agent = tool_input.get("subagent_type", "") if isinstance(tool_input, dict) else ""
+            if not agent or agent in allowed:
+                return {}
+            logger.info("Denying Task subagent outside allowlist: %s", agent)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"Subagent '{agent}' is not enabled for this session. "
+                        f"Enabled subagents: {', '.join(sorted(allowed)) or 'none'}."
+                    ),
+                }
+            }
+
+        return hook
+
     def _make_ask_user_can_use_tool(self, session):
         """Create a ``can_use_tool`` callback that intercepts AskUserQuestion.
 
@@ -1049,6 +1122,14 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 hooks=[self._make_skill_allow_hook()],
             ),
         ]
+        selected_agents = agent_allowlist(allowed_tools)
+        if selected_agents:
+            pre_tool_use.append(
+                HookMatcher(
+                    matcher="Task",
+                    hooks=[self._make_agent_allowlist_hook(selected_agents)],
+                )
+            )
         if cwd and sandbox_enabled():
             pre_tool_use.append(
                 HookMatcher(

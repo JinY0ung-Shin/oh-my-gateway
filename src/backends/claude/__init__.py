@@ -56,9 +56,15 @@ def _claude_model_meta(model: str) -> dict:
     alias = aliases.get(model)
     if alias is not None:
         return {"alias_of": alias}
-    for name, bare in aliases.items():
-        if bare == model:
-            return {"configured_as": name}
+    if model in CLAUDE_MODELS:
+        # Bare tier alias. Clients that want to show only real deployment model
+        # names filter on ``alias`` alone; ``configured_as`` says which name
+        # supersedes this one when an override is set.
+        meta: dict = {"alias": True}
+        for name, bare in aliases.items():
+            if bare == model:
+                meta["configured_as"] = name
+        return meta
     return {}
 
 

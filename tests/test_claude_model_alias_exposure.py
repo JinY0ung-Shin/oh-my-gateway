@@ -143,8 +143,10 @@ class TestClaudeResolve:
 class TestModelMeta:
     """``/v1/models`` alias bookkeeping — clients offer the configured names."""
 
-    def test_no_extra_fields_without_overrides(self, no_alias_env):
-        assert _claude_model_meta("sonnet") == {}
+    def test_bare_alias_is_marked_even_without_overrides(self, no_alias_env):
+        # Clients that only want real model names filter on ``alias``.
+        assert _claude_model_meta("sonnet") == {"alias": True}
+        assert _claude_model_meta("claude/some-model") == {}
 
     def test_configured_name_declares_its_alias(self, no_alias_env):
         no_alias_env.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-5-20250929")
@@ -153,12 +155,16 @@ class TestModelMeta:
     def test_superseded_bare_alias_points_at_configured_name(self, no_alias_env):
         no_alias_env.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-5-20250929")
         assert _claude_model_meta("sonnet") == {
-            "configured_as": "claude-sonnet-4-5-20250929"
+            "alias": True,
+            "configured_as": "claude-sonnet-4-5-20250929",
         }
-        # Aliases without an override stay untouched.
-        assert _claude_model_meta("opus") == {}
+        # Aliases without an override are still marked as aliases.
+        assert _claude_model_meta("opus") == {"alias": True}
 
     def test_descriptor_is_wired(self, no_alias_env):
         no_alias_env.setenv("ANTHROPIC_DEFAULT_HAIKU_MODEL", "haiku-real")
         assert CLAUDE_DESCRIPTOR.model_meta_fn is not None
-        assert CLAUDE_DESCRIPTOR.model_meta_fn("haiku") == {"configured_as": "haiku-real"}
+        assert CLAUDE_DESCRIPTOR.model_meta_fn("haiku") == {
+            "alias": True,
+            "configured_as": "haiku-real",
+        }
