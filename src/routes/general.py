@@ -43,6 +43,30 @@ async def list_models(
     }
 
 
+@router.get("/v1/slash-commands")
+@rate_limit_endpoint("general")
+async def list_slash_commands(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """List slash commands the Claude backend will accept on /v1/responses.
+
+    Clients (e.g. the ChatDRAGON composer) use this for `/` autocompletion.
+    Blocked names are excluded — sending one returns 400 blocked_command, so
+    they must never be offered for completion.
+    """
+    await verify_api_key(request, credentials)
+
+    from src.backends.claude import slash_commands
+
+    try:
+        names = await slash_commands.get_available_commands()
+    except Exception:  # noqa: BLE001 — SDK 조회 실패는 빈 목록으로 응답
+        names = set()
+    allowed = sorted(names - slash_commands.BLOCKED_COMMANDS)
+    return {"commands": allowed, "total": len(allowed)}
+
+
 @router.get("/v1/mcp/servers")
 @rate_limit_endpoint("general")
 async def list_mcp_servers(
