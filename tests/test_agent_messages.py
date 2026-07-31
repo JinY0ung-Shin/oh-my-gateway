@@ -124,6 +124,15 @@ def test_stateless_stream_projects_sdk_messages_for_noah(monkeypatch, tmp_path):
                     {"name": "review", "status": "loaded", "path": "/private/plugin"},
                     "/private/plugins/design-helper",
                 ],
+                # CLI 2.1.219+ startup diagnostics: gateway-log-only, must
+                # never reach the Noah wire (not in _SYSTEM_DATA_FIELDS).
+                "mcp_server_errors": [
+                    {
+                        "name": "brokensrv",
+                        "type": "invalid_config",
+                        "message": "Skipped — invalid MCP server config",
+                    }
+                ],
             },
         },
         {
@@ -263,6 +272,7 @@ def test_stateless_stream_projects_sdk_messages_for_noah(monkeypatch, tmp_path):
         "design-helper",
     ]
     assert "cwd" not in init["data"]
+    assert "brokensrv" not in response.text  # startup diagnostics stay log-only
     task = sdk[1]
     assert task["task_id"] == "task-1"
     assert task["task_type"] == "subagent"

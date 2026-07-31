@@ -65,6 +65,6 @@ uv run pytest --cov=src                            # with coverage
   default run reports only ~130 deselected — the dedicated stale files never collect at all).
   `RUN_STALE_BACKEND_TESTS=1` restores them. When a shared-code change breaks stale backend code or
   its tests, do not fix the backend — leave it frozen.
-- `claude-agent-sdk` is pinned exactly (`==0.2.108`); upgrades are deliberate, gap-analyzed events — do not bump casually.
+- `claude-agent-sdk` is pinned exactly (`==0.2.128`); upgrades are deliberate, gap-analyzed events — do not bump casually.
 - Changes to the stateless mapper must pass `uv run pytest tests/test_agent_messages.py -q` and the full
   gateway suite. If the schema/event shape changes, also run Noah's `tests/external-agent.test.ts`.

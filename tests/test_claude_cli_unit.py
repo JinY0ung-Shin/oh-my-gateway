@@ -33,6 +33,9 @@ def _make_cli(cli_class):
     cli = MagicMock()
     cli._convert_message = cli_class._convert_message.__get__(cli, cli_class)
     cli._TYPE_CHECKS = cli_class._TYPE_CHECKS
+    # Bind the real static helper so init-message conversions exercise the
+    # mcp_server_errors logging instead of a MagicMock auto-attribute.
+    cli._log_init_mcp_server_errors = cli_class._log_init_mcp_server_errors
     return cli
 
 
@@ -819,6 +822,85 @@ class TestConvertMessageTypeMap:
         assert result["uuid"] == "rl-1"
         # rate_limit_info should be the real dataclass, not a dict
         assert hasattr(result["rate_limit_info"], "status")
+
+
+class TestInitMcpServerErrorsLogging:
+    """_convert_message logs init.mcp_server_errors (CLI 2.1.219+) as warnings."""
+
+    def test_skipped_servers_are_logged(self, cli_class, caplog):
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        # Field shape observed live on the bundled CLI 2.1.220.
+        message = SystemMessage(
+            subtype="init",
+            data={
+                "model": "sonnet",
+                "mcp_server_errors": [
+                    {
+                        "name": "badcmd",
+                        "type": "invalid_config",
+                        "message": (
+                            'Skipped — invalid MCP server config for "badcmd": '
+                            "command: expected string, received number"
+                        ),
+                    },
+                    # No message: the log falls back to the entry type.
+                    {"name": "nourl", "type": "invalid_config"},
+                ],
+            },
+        )
+
+        with caplog.at_level("WARNING"):
+            converted = cli._convert_message(message)
+
+        assert converted["type"] == "system"
+        assert converted["data"]["mcp_server_errors"]  # conversion untouched
+        assert "'badcmd'" in caplog.text
+        assert "command: expected string" in caplog.text
+        assert "'nourl'" in caplog.text
+        assert "invalid_config" in caplog.text
+
+    def test_clean_init_logs_nothing(self, cli_class, caplog):
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        message = SystemMessage(
+            subtype="init", data={"model": "sonnet", "mcp_servers": [{"name": "ok"}]}
+        )
+
+        with caplog.at_level("WARNING"):
+            cli._convert_message(message)
+
+        assert "skipped MCP server" not in caplog.text
+
+    def test_non_init_subtype_logs_nothing(self, cli_class, caplog):
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        message = SystemMessage(
+            subtype="status", data={"mcp_server_errors": [{"name": "x"}]}
+        )
+
+        with caplog.at_level("WARNING"):
+            cli._convert_message(message)
+
+        assert "skipped MCP server" not in caplog.text
+
+    def test_dict_passthrough_also_logs(self, cli_class, caplog):
+        """Chunks arriving as plain dicts get the same startup diagnostics."""
+        cli = _make_cli(cli_class)
+        chunk = {
+            "type": "system",
+            "subtype": "init",
+            "data": {"mcp_server_errors": [{"name": "ghost", "message": "Skipped"}]},
+        }
+
+        with caplog.at_level("WARNING"):
+            assert cli._convert_message(chunk) is chunk
+
+        assert "'ghost'" in caplog.text
+        assert "Skipped" in caplog.text
 
 
 class TestConvertMessageEdgeCases:

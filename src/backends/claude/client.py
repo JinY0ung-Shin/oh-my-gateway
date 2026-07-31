@@ -10,6 +10,7 @@ import tempfile
 import atexit
 import shutil
 import contextlib
+import warnings
 from typing import AsyncGenerator, Dict, Any, Literal, Optional, List, Union, cast
 from pathlib import Path
 import logging
@@ -17,6 +18,7 @@ import logging
 from claude_agent_sdk import query, ClaudeAgentOptions, ClaudeSDKClient
 from src.constants import DEFAULT_MAX_TURNS
 from claude_agent_sdk.types import (
+    CanUseToolShadowedWarning,
     StreamEvent,
     AssistantMessage,
     ResultMessage,
@@ -61,6 +63,16 @@ from src.backends.claude.workspace_sandbox import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The SDK (0.2.126+) warns that ``can_use_tool`` is shadowed whenever it is
+# registered alongside ``bypassPermissions`` or whole-tool ``allowed_tools``
+# entries. For every gateway client that shadowing is deliberate — ordinary
+# tools are *meant* to auto-approve — and the one tool the callback exists for,
+# AskUserQuestion, still reaches it regardless (CLI exception; re-verified live
+# on SDK 0.2.128 / CLI 2.1.220 by tests/test_ask_user_question_live.py). The
+# warning's "can_use_tool will not be invoked" would be a false alarm in every
+# worker's log, so it is filtered out for this process.
+warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
 
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
@@ -658,6 +670,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     def _convert_message(self, message) -> Dict[str, Any]:
         """Convert SDK message object to dict if needed."""
         if isinstance(message, dict):
+            self._log_init_mcp_server_errors(message)
             return message
         if hasattr(message, "__dict__"):
             result = {
@@ -676,8 +689,37 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     error_msg = "; ".join(result["errors"])
                 if error_msg:
                     result["error_message"] = error_msg
+            self._log_init_mcp_server_errors(result)
             return result
         return message
+
+    @staticmethod
+    def _log_init_mcp_server_errors(converted: Dict[str, Any]) -> None:
+        """Surface MCP servers the CLI skipped at startup in the gateway log.
+
+        Since CLI 2.1.219 the stream-json ``init`` event carries
+        ``mcp_server_errors`` — the ``--mcp-config`` entries dropped by config
+        validation (``[{"name", "type", "message"}]``, observed live on the
+        bundled CLI 2.1.220). Under ``strict_mcp_config`` + materialize-all
+        this is the only trace of a broken gateway- or plugin-materialized
+        server, so without this log an invalid config vanishes silently.
+        Log-only: both endpoints' whitelists keep the field off the wire.
+        """
+        if converted.get("subtype") != "init":
+            return
+        data = converted.get("data")
+        errors = data.get("mcp_server_errors") if isinstance(data, dict) else None
+        if not errors:
+            return
+        for entry in errors if isinstance(errors, list) else [errors]:
+            if isinstance(entry, dict):
+                logger.warning(
+                    "CLI skipped MCP server %r at startup: %s",
+                    entry.get("name"),
+                    entry.get("message") or entry.get("type") or entry,
+                )
+            else:
+                logger.warning("CLI skipped MCP server at startup: %s", entry)
 
     @staticmethod
     def _mark_gateway_interrupt(converted: Dict[str, Any], session) -> Dict[str, Any]:
@@ -820,7 +862,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         model literally reports it has no such tool otherwise; see issue #131.)
         AskUserQuestion always falls through to this callback, even under
         ``permission_mode=bypassPermissions`` where ordinary tools are
-        auto-approved without it — verified against claude-agent-sdk==0.2.108.
+        auto-approved without it — verified against claude-agent-sdk==0.2.108,
+        re-verified live on 0.2.128 (CLI 2.1.220). The SDK's
+        ``CanUseToolShadowedWarning`` about this combination is a false
+        positive for AskUserQuestion and is filtered at module import.
 
         For AskUserQuestion we park the session and wait for the client's
         answer, then deny with the answer as the message — the CLI turns the
