@@ -140,6 +140,12 @@ MCP_TEST_TIMEOUT_SECONDS = parse_float_env("MCP_TEST_TIMEOUT_SECONDS", 5.0)
 # supplied commands is an RCE surface; gate any actual spawn behind this flag.
 MCP_TEST_ALLOW_SPAWN = parse_bool_env("MCP_TEST_ALLOW_SPAWN", "false")
 
+# MCP health snapshot (GET /v1/mcp/health) — a poll-safe view for clients that
+# gate MCP selection on reachability. Probes run at most once per TTL, bounded,
+# and readers get the last snapshot immediately (see src/mcp_health.py).
+MCP_HEALTH_TTL_SECONDS = parse_float_env("MCP_HEALTH_TTL_SECONDS", 60.0)
+MCP_HEALTH_MAX_CONCURRENCY = parse_int_env("MCP_HEALTH_MAX_CONCURRENCY", 4)
+
 # SSE keepalive interval (seconds).  During long SDK operations (tool
 # execution, context compaction) no events flow to the client.  Emitting
 # an SSE comment (`: keepalive\n\n`) on this interval prevents HTTP

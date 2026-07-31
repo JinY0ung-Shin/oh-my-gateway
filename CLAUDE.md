@@ -29,6 +29,10 @@ uv run pytest --cov=src                            # with coverage
   `/v1/agents/messages`.
 - `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` implements them. `codex/` (JSON-RPC to a local `codex app-server`) and `opencode/` (managed subprocess / external HTTP modes) are frozen stale code — do not extend them.
 - `src/sanitizer/` — stream sanitization + OpenAI-format bridge.
+- `src/agent_catalog.py` / `src/mcp_health.py` — client-facing read models behind
+  `GET /v1/agent-resources` (skills/subagents across plugin + workspace + user scope, described
+  from frontmatter) and `GET /v1/mcp/health` (cached, poll-safe reachability snapshot). Both are
+  read-only and never raise; do not turn them into enforcement paths.
 - `src/session_manager.py` / `src/workspace_manager.py` — `/v1/responses` continuation state and
   workspace isolation. Stateless agent-message runs use request-scoped temporary workspaces and never
   enter the session manager.

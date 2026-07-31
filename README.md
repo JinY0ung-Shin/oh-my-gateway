@@ -328,6 +328,8 @@ Primary endpoints:
 - `GET /v1/sessions/{session_id}/pending-events?after=<seq>&user=<name>` (between-turn outbox: background task lifecycle + assistant messages captured by the session's idle reader; cursor-paged, polling refreshes the session TTL)
 - `GET /v1/auth/status`
 - `GET /v1/mcp/servers`
+- `GET /v1/mcp/health` (reachability snapshot for every configured MCP server; poll-safe)
+- `GET /v1/agent-resources` (skills + subagents the caller's next session would see)
 - `GET /health`
 - `GET /version`
 
@@ -390,7 +392,10 @@ Effective `/v1/responses` request fields:
   the named skills, and `Task(<agent>)` narrows which subagents may run (enforced by a
   gateway PreToolUse hook — an unlisted `subagent_type` is denied with a reason the model
   reads back). A bare `Skill`/`Task` keeps its allow-everything meaning and wins over the
-  granular entries.
+  granular entries. Names for both forms come from `GET /v1/agent-resources`, which lists
+  plugin, workspace (`<cwd>/.claude/{skills,agents}`) and user-scope definitions alike —
+  the plugin admin API sees only the first of the three, so a picker built on it alone
+  omits skills the session can still run.
   Subagents always run **in the foreground**: the CLI's background default promises the
   model a completion notification that would land after the HTTP turn closed, so the
   gateway rewrites `Task` calls to `run_in_background: false`
