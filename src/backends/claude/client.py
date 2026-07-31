@@ -905,6 +905,40 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
+    def _make_deferred_deny_hook(self):
+        """Deny post-turn scheduling tools with a reason the model can act on.
+
+        ``BLOCKED_DEFERRED_TOOLS`` (ScheduleWakeup/CronCreate) are also in
+        ``disallowed_tools``, but the CLI's own refusal reads
+        "CronCreate isn't available in this context" — which tells the model
+        (and the user watching) nothing about *why*, so the model shrugs and
+        ends the turn. A PreToolUse deny carries our reason instead: the payoff
+        would land after the HTTP stream closed, so the work has to happen now.
+        """
+
+        async def hook(input_data, _tool_use_id, _context):
+            if not isinstance(input_data, dict):
+                return {}
+            name = input_data.get("tool_name")
+            if name not in BLOCKED_DEFERRED_TOOLS:
+                return {}
+            logger.info("Denying deferred-delivery tool: %s", name)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"{name} is blocked on this gateway: its payoff fires after the "
+                        "HTTP turn closes, so nothing it schedules can ever be delivered "
+                        "to the user. Do the work inside this turn instead — if the user "
+                        "asked for something recurring, say plainly that scheduled or "
+                        "repeating runs are not supported here."
+                    ),
+                }
+            }
+
+        return hook
+
     def _make_task_hook(self, allowed: Optional[set]):
         """PreToolUse hook governing the subagent tool (``Agent``/``Task``).
 
@@ -994,6 +1028,14 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         matchers.extend(
             HookMatcher(matcher=name, hooks=[task_hook]) for name in SUBAGENT_TOOL_NAMES
         )
+        # Post-turn schedulers: deny with a reason instead of leaving the model
+        # with the CLI's opaque "isn't available in this context".
+        if BLOCKED_DEFERRED_TOOLS:
+            deferred_hook = self._make_deferred_deny_hook()
+            matchers.extend(
+                HookMatcher(matcher=name, hooks=[deferred_hook])
+                for name in BLOCKED_DEFERRED_TOOLS
+            )
         if cwd and sandbox_enabled():
             matchers.append(
                 HookMatcher(matcher="", hooks=[make_workspace_sandbox_hook(Path(cwd))])

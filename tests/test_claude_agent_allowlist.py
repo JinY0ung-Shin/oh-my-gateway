@@ -181,10 +181,24 @@ class TestHookWiring:
     """Which tools the gateway governs on every session."""
 
     def test_skill_and_subagent_tools_are_always_governed(self, cli):
-        matchers = cli._pre_tool_use_hooks(None, ["Read"])
+        matchers = [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])]
         # Both subagent spellings: hook matchers fire on the tool's real name and
         # current CLI builds renamed Task -> Agent.
-        assert [m.matcher for m in matchers] == ["Skill", "Task", "Agent"]
+        assert matchers[:3] == ["Skill", "Task", "Agent"]
+
+    def test_deferred_tools_are_denied_with_a_reason(self, cli):
+        """The CLI's own refusal explains nothing; ours has to."""
+        matchers = {m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])}
+        assert {"ScheduleWakeup", "CronCreate"} <= matchers
+
+    async def test_deferred_deny_reason_names_the_constraint(self, cli):
+        hook = cli._make_deferred_deny_hook()
+        out = await hook({"tool_name": "CronCreate", "tool_input": {}}, None, None)
+        decision = out["hookSpecificOutput"]
+        assert decision["permissionDecision"] == "deny"
+        assert "after the" in decision["permissionDecisionReason"]
+        # Other tools are untouched
+        assert await hook({"tool_name": "Bash", "tool_input": {}}, None, None) == {}
 
     def test_task_hook_present_without_any_allowlist(self, cli):
         """Foreground forcing must not depend on subagent selection."""
@@ -194,16 +208,14 @@ class TestHookWiring:
 
     def test_sandbox_hook_added_when_enabled(self, cli, monkeypatch):
         monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
-        matchers = cli._pre_tool_use_hooks("/tmp/ws", ["Read"])
-        assert [m.matcher for m in matchers] == ["Skill", "Task", "Agent", ""]
+        matchers = [m.matcher for m in cli._pre_tool_use_hooks("/tmp/ws", ["Read"])]
+        # The catch-all sandbox matcher goes last
+        assert matchers[0] == "Skill" and matchers[-1] == ""
 
     def test_sandbox_hook_skipped_without_cwd(self, cli, monkeypatch):
         monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
-        assert [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])] == [
-            "Skill",
-            "Task",
-            "Agent",
-        ]
+        matchers = [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])]
+        assert "" not in matchers
 
 
 class TestSessionEffort:

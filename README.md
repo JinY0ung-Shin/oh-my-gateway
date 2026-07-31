@@ -130,6 +130,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `MCP_CONFIG` | Shared MCP server config |
 | `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
+| `BLOCKED_DEFERRED_TOOLS` | Post-turn schedulers to deny; default `ScheduleWakeup,CronCreate` (see below) |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode (stale backend) |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models (stale backend) |
 | `CODEX_BIN` | Codex CLI binary name/path; default `codex` (stale backend) |
@@ -140,6 +141,21 @@ Most settings are environment variables. Start with `.env.example`.
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
 | `USAGE_LOG_DB_URL` | Optional SQLAlchemy URL for usage logging |
+
+### No post-turn scheduling
+
+`/v1/responses` is a single synchronous turn: when the stream closes, nothing the
+model scheduled can still reach the caller. So the CLI's post-turn schedulers
+(`ScheduleWakeup`, `CronCreate` — and skills built on them, e.g. `/loop`) are
+denied by default (`BLOCKED_DEFERRED_TOOLS`). The denial carries a reason the model
+reads back — "do the work inside this turn; recurring runs are not supported here" —
+instead of the CLI's opaque *"CronCreate isn't available in this context"*, which
+left the model ending the turn with nothing.
+
+Supporting recurring runs is a feature, not a config flip: it needs a server-owned
+run loop, per-user quotas and expiry, and a delivery channel the client can read
+after the turn. Clear `BLOCKED_DEFERRED_TOOLS` only when the surface embedding the
+gateway has all three.
 
 ## Capacity
 
