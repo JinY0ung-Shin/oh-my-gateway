@@ -55,6 +55,10 @@ class BackendDescriptor:
 
     ``capabilities`` carries feature flags surfaced in ``/v1/models``
     (e.g. ``{"image_input": True}``).
+
+    ``model_meta_fn`` optionally adds per-model fields to the ``/v1/models``
+    entry (e.g. alias bookkeeping so clients can tell a bare ``sonnet`` from
+    the concrete id configured via ``ANTHROPIC_DEFAULT_SONNET_MODEL``).
     """
 
     name: str
@@ -62,6 +66,7 @@ class BackendDescriptor:
     models: List[str]
     resolve_fn: Callable[[str], Optional[ResolvedModel]]
     capabilities: Dict[str, bool] = field(default_factory=dict)
+    model_meta_fn: Optional[Callable[[str], Dict[str, Any]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -234,21 +239,23 @@ class BackendRegistry:
 
         Keeps the original ``id``/``object``/``owned_by`` fields for
         compatibility and adds ``backend`` plus a ``capabilities`` map
-        (``image_input`` is always present).
+        (``image_input`` is always present). A descriptor's ``model_meta_fn``
+        may contribute extra per-model fields (alias bookkeeping).
         """
         data: List[Dict[str, Any]] = []
 
         for desc in cls._descriptors.values():
             if cls.is_registered(desc.name):
                 for model_id in desc.models:
-                    data.append(
-                        {
-                            "id": model_id,
-                            "object": "model",
-                            "owned_by": desc.owned_by,
-                            "backend": desc.name,
-                            "capabilities": {"image_input": False, **desc.capabilities},
-                        }
-                    )
+                    entry = {
+                        "id": model_id,
+                        "object": "model",
+                        "owned_by": desc.owned_by,
+                        "backend": desc.name,
+                        "capabilities": {"image_input": False, **desc.capabilities},
+                    }
+                    if desc.model_meta_fn is not None:
+                        entry.update(desc.model_meta_fn(model_id))
+                    data.append(entry)
 
         return data
