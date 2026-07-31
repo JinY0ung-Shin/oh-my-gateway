@@ -1054,6 +1054,25 @@ class TestConfigureHelpers:
         assert "WebFetch" in opts.disallowed_tools
         assert "WebSearch" in opts.disallowed_tools
 
+    def test_configure_tools_blocks_deferred_wakeup_tools_by_default(self, cli_instance):
+        """ScheduleWakeup/CronCreate fire after the turn's HTTP stream closes,
+        so their follow-up output is undeliverable — blocked by default."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        cli_instance._configure_tools(opts, None, None)
+        assert "ScheduleWakeup" in opts.disallowed_tools
+        assert "CronCreate" in opts.disallowed_tools
+
+    def test_configure_tools_deferred_block_env_override(self, cli_instance):
+        """BLOCKED_DEFERRED_TOOLS is a separate knob from DISALLOWED_TOOLS."""
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        opts = ClaudeAgentOptions(max_turns=1, cwd=cli_instance.cwd)
+        with patch("src.backends.claude.client.BLOCKED_DEFERRED_TOOLS", []):
+            cli_instance._configure_tools(opts, None, None)
+        assert not opts.disallowed_tools or "ScheduleWakeup" not in opts.disallowed_tools
+
     def test_configure_tools_strips_disallowed_from_allowed(self, cli_instance):
         """Request-supplied allowed_tools cannot re-enable a globally blocked tool."""
         from claude_agent_sdk import ClaudeAgentOptions

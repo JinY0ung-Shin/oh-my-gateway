@@ -141,6 +141,20 @@ DISALLOWED_SUBAGENT_TYPES = [f"Agent({t.strip()})" for t in _raw_disallowed.spli
 _raw_disallowed_tools = os.getenv("DISALLOWED_TOOLS", "")
 DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.strip()]
 
+# Deferred-Delivery Tools
+# CLI harness tools whose payoff fires only AFTER the current turn ends:
+# ScheduleWakeup re-invokes the agent later, CronCreate schedules future runs.
+# In the standalone CLI that works — the terminal is still attached when the
+# wakeup fires. On /v1/responses the HTTP stream closes at turn end, so the
+# follow-up runs invisibly inside the CLI subprocess and its output is never
+# delivered ("I'll report back when it's done" — and nothing ever arrives).
+# Blocked by default so the model keeps the turn open and polls async jobs to
+# completion instead. Operators embedding the gateway behind a surface that
+# CAN deliver post-turn output may override with BLOCKED_DEFERRED_TOOLS
+# (comma-separated; empty string disables the block).
+_raw_blocked_deferred = os.getenv("BLOCKED_DEFERRED_TOOLS", "ScheduleWakeup,CronCreate")
+BLOCKED_DEFERRED_TOOLS = [t.strip() for t in _raw_blocked_deferred.split(",") if t.strip()]
+
 # Hidden Skills
 # Comma-separated skill names removed from the model's skill catalog. A
 # ``Skill(<name>)`` deny in DISALLOWED_TOOLS blocks execution but leaves the

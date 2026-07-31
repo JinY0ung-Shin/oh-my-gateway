@@ -39,6 +39,7 @@ from src.backends.claude.constants import (
     THINKING_BUDGET_TOKENS,
     DISALLOWED_SUBAGENT_TYPES,
     DISALLOWED_TOOLS,
+    BLOCKED_DEFERRED_TOOLS,
     HIDDEN_SKILLS,
     CLAUDE_SANDBOX_ENABLED,
     CLAUDE_SANDBOX_AUTO_ALLOW_BASH,
@@ -223,7 +224,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         """
         if allowed_tools:
             self._set_allowed_tools(options, allowed_tools)
-        base_disallowed = list(DISALLOWED_SUBAGENT_TYPES) + list(DISALLOWED_TOOLS)
+        # BLOCKED_DEFERRED_TOOLS: wakeup/cron payoffs fire after the HTTP turn
+        # has closed, so their promised follow-up is undeliverable here.
+        base_disallowed = (
+            list(DISALLOWED_SUBAGENT_TYPES)
+            + list(DISALLOWED_TOOLS)
+            + list(BLOCKED_DEFERRED_TOOLS)
+        )
         if disallowed_tools:
             base_disallowed.extend(disallowed_tools)
         if base_disallowed:
@@ -254,7 +261,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         ``Skill`` entry keeps its existing allow-everything meaning and wins
         over granular entries if both are present.
         """
-        filtered = [t for t in tools if t not in DISALLOWED_TOOLS]
+        blocked = set(DISALLOWED_TOOLS) | set(BLOCKED_DEFERRED_TOOLS)
+        filtered = [t for t in tools if t not in blocked]
         if "Skill" in filtered:
             filtered = [
                 t
