@@ -9,6 +9,7 @@ gateway enforces the client's selection with a PreToolUse hook that denies any
 
 import pytest
 
+from src.backends.claude import client as client_mod
 from src.backends.claude.client import ClaudeCodeCLI, agent_allowlist
 
 
@@ -71,16 +72,26 @@ class TestAllowedToolsTranslation:
         assert "Task" in options.allowed_tools
 
 
-class TestAgentAllowlistHook:
+class TestTaskHook:
+    """Selection (deny unlisted) + foreground forcing, in one Task hook."""
+
     async def _decide(self, cli, allowed, tool_name, tool_input):
-        hook = cli._make_agent_allowlist_hook(allowed)
+        hook = cli._make_task_hook(allowed)
         return await hook({"tool_name": tool_name, "tool_input": tool_input}, None, None)
 
     async def test_listed_subagent_passes(self, cli):
-        assert await self._decide(cli, {"Explore"}, "Task", {"subagent_type": "Explore"}) == {}
+        out = await self._decide(
+            cli, {"Explore"}, "Task", {"subagent_type": "Explore", "run_in_background": False}
+        )
+        assert out == {}
 
     async def test_unlisted_subagent_denied(self, cli):
-        out = await self._decide(cli, {"Explore"}, "Task", {"subagent_type": "general-purpose"})
+        out = await self._decide(
+            cli,
+            {"Explore"},
+            "Task",
+            {"subagent_type": "general-purpose", "run_in_background": False},
+        )
         decision = out["hookSpecificOutput"]
         assert decision["permissionDecision"] == "deny"
         assert "general-purpose" in decision["permissionDecisionReason"]
@@ -90,6 +101,66 @@ class TestAgentAllowlistHook:
     async def test_other_tools_pass_through(self, cli):
         assert await self._decide(cli, {"Explore"}, "Bash", {"command": "ls"}) == {}
 
-    async def test_missing_subagent_type_passes(self, cli):
-        # Nothing to check against — leave the CLI's own handling in charge.
-        assert await self._decide(cli, {"Explore"}, "Task", {}) == {}
+    async def test_no_allowlist_allows_any_subagent(self, cli):
+        out = await self._decide(
+            cli, None, "Task", {"subagent_type": "anything", "run_in_background": False}
+        )
+        assert out == {}
+
+
+class TestForegroundForcing:
+    """A background subagent's payoff lands after the HTTP turn closes."""
+
+    async def _run(self, cli, tool_input, allowed=None):
+        hook = cli._make_task_hook(allowed)
+        return await hook({"tool_name": "Task", "tool_input": tool_input}, None, None)
+
+    async def test_explicit_background_is_rewritten(self, cli):
+        out = await self._run(cli, {"subagent_type": "Explore", "run_in_background": True})
+        updated = out["hookSpecificOutput"]["updatedInput"]
+        assert updated["run_in_background"] is False
+        # Everything else about the call survives.
+        assert updated["subagent_type"] == "Explore"
+
+    async def test_omitted_flag_is_normalized(self, cli):
+        """Background is the CLI default — 'not present' is the broken case."""
+        out = await self._run(cli, {"subagent_type": "Explore", "prompt": "go"})
+        updated = out["hookSpecificOutput"]["updatedInput"]
+        assert updated["run_in_background"] is False
+        assert updated["prompt"] == "go"
+
+    async def test_explicit_foreground_untouched(self, cli):
+        out = await self._run(cli, {"subagent_type": "Explore", "run_in_background": False})
+        assert out == {}
+
+    async def test_denial_wins_over_rewrite(self, cli):
+        """An unlisted subagent is denied, not quietly made synchronous."""
+        out = await self._run(cli, {"subagent_type": "nope"}, allowed={"Explore"})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_disabled_by_env(self, cli, monkeypatch):
+        monkeypatch.setattr(client_mod, "FORCE_FOREGROUND_SUBAGENTS", False)
+        out = await self._run(cli, {"subagent_type": "Explore", "run_in_background": True})
+        assert out == {}
+
+
+class TestHookWiring:
+    """Which tools the gateway governs on every session."""
+
+    def test_skill_and_task_are_always_governed(self, cli):
+        matchers = cli._pre_tool_use_hooks(None, ["Read"])
+        assert [m.matcher for m in matchers] == ["Skill", "Task"]
+
+    def test_task_hook_present_without_any_allowlist(self, cli):
+        """Foreground forcing must not depend on subagent selection."""
+        matchers = cli._pre_tool_use_hooks(None, None)
+        assert any(m.matcher == "Task" and m.hooks for m in matchers)
+
+    def test_sandbox_hook_added_when_enabled(self, cli, monkeypatch):
+        monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
+        matchers = cli._pre_tool_use_hooks("/tmp/ws", ["Read"])
+        assert [m.matcher for m in matchers] == ["Skill", "Task", ""]
+
+    def test_sandbox_hook_skipped_without_cwd(self, cli, monkeypatch):
+        monkeypatch.setattr(client_mod, "sandbox_enabled", lambda: True)
+        assert [m.matcher for m in cli._pre_tool_use_hooks(None, ["Read"])] == ["Skill", "Task"]

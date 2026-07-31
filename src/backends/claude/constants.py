@@ -152,6 +152,16 @@ DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.str
 # completion instead. Operators embedding the gateway behind a surface that
 # CAN deliver post-turn output may override with BLOCKED_DEFERRED_TOOLS
 # (comma-separated; empty string disables the block).
+# Subagent delivery mode
+# The CLI's Task tool runs subagents in the BACKGROUND by default and tells the
+# model it will be "notified when one completes". In a headless HTTP turn that
+# notification lands after the response stream has closed, so the model says
+# "I'll report back" and the turn ends with no result ever arriving — the same
+# undeliverable-payoff shape as BLOCKED_DEFERRED_TOOLS. Forcing
+# ``run_in_background: false`` keeps the subagent inside the turn that asked for
+# it. Set to false only for a client that can poll a session across turns.
+FORCE_FOREGROUND_SUBAGENTS = parse_bool_env("FORCE_FOREGROUND_SUBAGENTS", "true")
+
 _raw_blocked_deferred = os.getenv("BLOCKED_DEFERRED_TOOLS", "ScheduleWakeup,CronCreate")
 BLOCKED_DEFERRED_TOOLS = [t.strip() for t in _raw_blocked_deferred.split(",") if t.strip()]
 

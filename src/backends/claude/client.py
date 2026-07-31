@@ -47,6 +47,7 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_ALLOW_UNSANDBOXED,
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
+    FORCE_FOREGROUND_SUBAGENTS,
 )
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
@@ -899,37 +900,94 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
-    def _make_agent_allowlist_hook(self, allowed: set):
-        """PreToolUse hook denying ``Task`` calls outside the selected subagents.
+    def _make_task_hook(self, allowed: Optional[set]):
+        """PreToolUse hook governing the ``Task`` tool (subagents).
 
-        The SDK's ``agents`` option only *defines* programmatic subagents; it
-        cannot hide plugin/filesystem ones, and the CLI's rule matcher is not a
-        reliable gate for ``Task(<agent>)`` across builds. So the gateway
-        enforces the client's selection here: an unlisted ``subagent_type`` is
-        denied with a reason the model reads as a tool result, and every other
-        tool passes through untouched.
+        Two jobs, both about the gateway's headless single-turn shape:
+
+        1. **Selection** — when the client narrowed subagents via
+           ``Task(<agent>)`` entries, an unlisted ``subagent_type`` is denied
+           with a reason the model reads back as a tool result. The SDK's
+           ``agents`` option only *defines* programmatic subagents (it cannot
+           hide plugin/filesystem ones) and the CLI's rule matcher is not a
+           dependable gate across builds, so the gateway enforces it here.
+        2. **Foreground** — the CLI runs subagents in the background by default
+           and promises the model a completion notification. That notification
+           fires after the HTTP turn has closed, so the model answers "I'll
+           report back" and the turn ends with nothing (issue: subagent turns
+           going silent). ``updatedInput`` rewrites the call to
+           ``run_in_background: false`` so the work happens inside this turn.
+
+        Non-Task tools pass through untouched.
         """
 
         async def hook(input_data, _tool_use_id, _context):
             if not isinstance(input_data, dict) or input_data.get("tool_name") != "Task":
                 return {}
             tool_input = input_data.get("tool_input") or {}
-            agent = tool_input.get("subagent_type", "") if isinstance(tool_input, dict) else ""
-            if not agent or agent in allowed:
+            if not isinstance(tool_input, dict):
                 return {}
-            logger.info("Denying Task subagent outside allowlist: %s", agent)
-            return {
-                "hookSpecificOutput": {
-                    "hookEventName": "PreToolUse",
-                    "permissionDecision": "deny",
-                    "permissionDecisionReason": (
-                        f"Subagent '{agent}' is not enabled for this session. "
-                        f"Enabled subagents: {', '.join(sorted(allowed)) or 'none'}."
-                    ),
+
+            agent = tool_input.get("subagent_type", "")
+            if allowed and agent and agent not in allowed:
+                logger.info("Denying Task subagent outside allowlist: %s", agent)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Subagent '{agent}' is not enabled for this session. "
+                            f"Enabled subagents: {', '.join(sorted(allowed)) or 'none'}."
+                        ),
+                    }
                 }
-            }
+
+            # Background subagents cannot deliver here — pull them into the turn.
+            # The flag is normalized even when omitted: background is the CLI's
+            # DEFAULT, so "not present" is exactly the broken case.
+            if FORCE_FOREGROUND_SUBAGENTS and tool_input.get("run_in_background") is not False:
+                logger.info(
+                    "Forcing foreground subagent run (background payoff is undeliverable): %s",
+                    agent or "unknown",
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": {**tool_input, "run_in_background": False},
+                    }
+                }
+            return {}
 
         return hook
+
+    def _pre_tool_use_hooks(self, cwd: Optional[str], allowed_tools: Optional[List[str]]):
+        """Assemble the PreToolUse hook matchers for a session.
+
+        Order is meaningful only in that every matcher runs; each hook is
+        independent. Kept separate from ``create_client`` so the wiring itself
+        is testable (which tools are governed, and when).
+        """
+        matchers = [
+            # Force-approve the Skill tool. The gateway runs headless (no
+            # interactive approver), so the CLI's per-skill permission "ask"
+            # (surfaced to the client as an "Execute skill: <name>" error)
+            # becomes a hard denial. A PreToolUse "allow" decision pre-empts the
+            # rule matcher entirely, which is more robust than the Skill(:*)
+            # allow-rule across CLI builds. The skill's own downstream tool
+            # calls remain governed by their permissions and the sandbox hook.
+            HookMatcher(matcher="Skill", hooks=[self._make_skill_allow_hook()]),
+            # Task is governed on every session, not just when the client
+            # narrowed subagents: forcing foreground delivery is needed on its own.
+            HookMatcher(
+                matcher="Task",
+                hooks=[self._make_task_hook(agent_allowlist(allowed_tools))],
+            ),
+        ]
+        if cwd and sandbox_enabled():
+            matchers.append(
+                HookMatcher(matcher="", hooks=[make_workspace_sandbox_hook(Path(cwd))])
+            )
+        return matchers
 
     def _make_ask_user_can_use_tool(self, session):
         """Create a ``can_use_tool`` callback that intercepts AskUserQuestion.
@@ -1109,35 +1167,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # model as a callable tool when a permission callback is present.
         options.can_use_tool = self._make_ask_user_can_use_tool(session)
 
-        pre_tool_use = [
-            # Force-approve the Skill tool. The gateway runs headless (no
-            # interactive approver), so the CLI's per-skill permission "ask"
-            # (surfaced to the client as an "Execute skill: <name>" error)
-            # becomes a hard denial. A PreToolUse "allow" decision pre-empts the
-            # rule matcher entirely, which is more robust than the Skill(:*)
-            # allow-rule across CLI builds. The skill's own downstream tool
-            # calls remain governed by their permissions and the sandbox hook.
-            HookMatcher(
-                matcher="Skill",
-                hooks=[self._make_skill_allow_hook()],
-            ),
-        ]
-        selected_agents = agent_allowlist(allowed_tools)
-        if selected_agents:
-            pre_tool_use.append(
-                HookMatcher(
-                    matcher="Task",
-                    hooks=[self._make_agent_allowlist_hook(selected_agents)],
-                )
-            )
-        if cwd and sandbox_enabled():
-            pre_tool_use.append(
-                HookMatcher(
-                    matcher="",
-                    hooks=[make_workspace_sandbox_hook(Path(cwd))],
-                )
-            )
-        options.hooks = {"PreToolUse": pre_tool_use}
+        options.hooks = {"PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools)}
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)

@@ -391,6 +391,10 @@ Effective `/v1/responses` request fields:
   gateway PreToolUse hook — an unlisted `subagent_type` is denied with a reason the model
   reads back). A bare `Skill`/`Task` keeps its allow-everything meaning and wins over the
   granular entries.
+  Subagents always run **in the foreground**: the CLI's background default promises the
+  model a completion notification that would land after the HTTP turn closed, so the
+  gateway rewrites `Task` calls to `run_in_background: false`
+  (`FORCE_FOREGROUND_SUBAGENTS=false` to opt out).
 - `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
