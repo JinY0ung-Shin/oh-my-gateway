@@ -44,7 +44,10 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "label": "Thinking Mode",
         "type": "string",
         "options": ["disabled", "adaptive", "enabled"],
-        "description": "Claude thinking mode. enabled = fixed budget (THINKING_BUDGET_TOKENS)",
+        "description": (
+            "Claude thinking mode. enabled = fixed budget (THINKING_BUDGET_TOKENS). "
+            "Requests that send reasoning.effort / effort override this."
+        ),
     },
     "token_streaming": {
         "label": "Token Streaming",

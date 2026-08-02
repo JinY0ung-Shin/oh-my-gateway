@@ -43,6 +43,14 @@ class AgentMessagesRequest(BaseModel):
     system: Optional[Union[str, List[AgentTextBlock]]] = None
     messages: List[AgentMessage] = Field(min_length=1)
     stream: bool = True
+    effort: Optional[Literal["none", "low", "medium", "high", "xhigh", "max"]] = Field(
+        default=None,
+        description=(
+            "Per-request reasoning control: 'none' disables extended "
+            "thinking, the five SDK levels select adaptive-thinking effort. "
+            "Omitted = the gateway's global THINKING_MODE default."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_final_user_turn(self):

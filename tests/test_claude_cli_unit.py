@@ -578,6 +578,30 @@ class TestBuildSdkOptions:
                 assert "bogus" in mock_logger.warning.call_args[0][0]
                 assert getattr(opts, "thinking", None) is None
 
+    def test_effort_level_sets_adaptive_thinking_and_effort(self, cli_instance):
+        """A request-scoped effort level rides adaptive thinking + options.effort."""
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            opts = cli_instance._build_sdk_options(effort=level)
+            assert opts.thinking == {"type": "adaptive"}
+            assert opts.effort == level
+
+    def test_effort_none_disables_thinking_explicitly(self, cli_instance):
+        """effort='none' sends an explicit thinking=disabled, no effort flag."""
+        opts = cli_instance._build_sdk_options(effort="none")
+        assert opts.thinking == {"type": "disabled"}
+        assert getattr(opts, "effort", None) is None
+
+    def test_effort_overrides_global_thinking_mode(self, cli_instance):
+        """Request effort wins over the global THINKING_MODE runtime setting."""
+        with patch("src.runtime_config.runtime_config.get", return_value="enabled"):
+            opts = cli_instance._build_sdk_options(effort="low")
+        assert opts.thinking == {"type": "adaptive"}
+        assert opts.effort == "low"
+
+        with patch("src.runtime_config.runtime_config.get", return_value="adaptive"):
+            opts = cli_instance._build_sdk_options(effort="none")
+        assert opts.thinking == {"type": "disabled"}
+
     def test_include_partial_messages_when_token_streaming(self, cli_instance):
         """TOKEN_STREAMING=True sets include_partial_messages."""
         with patch("src.runtime_config.runtime_config.get", return_value=True):

@@ -9,6 +9,10 @@ from src.runtime_config import get_default_model
 
 PermissionMode = Literal["default", "acceptEdits", "bypassPermissions", "plan"]
 
+# "none" disables extended thinking; the rest are the Claude SDK EffortLevel
+# values, applied on top of adaptive thinking.
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+
 
 class ResponseInputTextPart(BaseModel):
     """A text content part within a Responses API input item."""
@@ -106,6 +110,16 @@ class ResponseTextConfig(BaseModel):
     ] = None
 
 
+class ReasoningConfig(BaseModel):
+    """OpenAI-style ``reasoning`` request block (Claude backend only).
+
+    Only ``effort`` is honored; other OpenAI keys (e.g. ``summary``) are
+    accepted and ignored so stock OpenAI clients don't break.
+    """
+
+    effort: Optional[ReasoningEffort] = None
+
+
 class ResponseCreateRequest(BaseModel):
     """POST /v1/responses request body."""
 
@@ -163,6 +177,17 @@ class ResponseCreateRequest(BaseModel):
         description=(
             "Text response configuration. format.type 'json_schema' enables "
             "Structured Outputs (Claude backend only); 'text' is the default."
+        ),
+    )
+    reasoning: Optional[ReasoningConfig] = Field(
+        default=None,
+        description=(
+            "Reasoning configuration (Claude backend only). effort is one of "
+            "none|low|medium|high|xhigh|max: 'none' disables extended "
+            "thinking, the rest select adaptive-thinking effort. Omitted = "
+            "the gateway's global THINKING_MODE default. Fixed when the "
+            "session is created; continuations may only re-send the same "
+            "value."
         ),
     )
 

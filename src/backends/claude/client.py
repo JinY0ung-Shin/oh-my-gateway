@@ -205,8 +205,26 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     # SDK option helpers
     # ------------------------------------------------------------------
 
-    def _configure_thinking(self, options: ClaudeAgentOptions) -> None:
-        """Apply thinking-mode configuration to *options*."""
+    def _configure_thinking(
+        self, options: ClaudeAgentOptions, effort: Optional[str] = None
+    ) -> None:
+        """Apply thinking/effort configuration to *options*.
+
+        A request-scoped *effort* overrides the global THINKING_MODE setting:
+        ``"none"`` disables extended thinking explicitly (some models reject
+        this — the SDK error passes through); the five SDK levels
+        (low/medium/high/xhigh/max) enable adaptive thinking at that effort.
+        """
+        if effort is not None:
+            if effort == "none":
+                options.thinking = {"type": "disabled"}
+            else:
+                options.thinking = {"type": "adaptive"}
+                # SDK narrows to the EffortLevel Literal; the value is
+                # validated upstream by the request schema.
+                options.effort = cast(Any, effort)
+            return
+
         from src.runtime_config import get_thinking_mode
 
         mode = get_thinking_mode()
@@ -592,6 +610,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
         include_partial_messages: Optional[bool] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
@@ -601,7 +620,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             setting_sources=_get_setting_sources(),
         )
 
-        self._configure_thinking(options)
+        self._configure_thinking(options, effort)
         self._configure_sandbox(options)
         self._configure_add_dirs(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
@@ -987,8 +1006,14 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
         include_partial_messages: Optional[bool] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
+
+        ``effort`` (``none`` | ``low`` | ``medium`` | ``high`` | ``xhigh`` |
+        ``max``) rides the CLI ``--effort`` flag / thinking config, so like
+        ``output_format`` it is baked in at create time and cannot change on
+        later turns of the same client.
 
         The client is connected with ``prompt=None`` (interactive mode)
         so subsequent turns can be sent via ``client.query()``.
@@ -1027,6 +1052,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             user=user,
             forward_headers=forward_headers,
             include_partial_messages=include_partial_messages,
+            effort=effort,
         )
         await self._apply_hidden_skills(options)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
