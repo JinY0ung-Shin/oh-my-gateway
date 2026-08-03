@@ -6,6 +6,7 @@ implementation registered as the ``claude`` backend.
 
 import asyncio
 import os
+import re
 import tempfile
 import atexit
 import shutil
@@ -85,6 +86,28 @@ _VALID_SETTING_SOURCES = {"user", "project", "local"}
 # ``Skill`` rule does NOT work — the matcher discards content-less rules. See
 # :meth:`ClaudeCodeCLI._set_allowed_tools`.
 SKILL_ALLOW_ALL_RULE = "Skill(:*)"
+
+# Granular skill rule: ``Skill(<name>)`` / ``Skill(<name>:*)``. The captured
+# content (minus a trailing ``:*``) is the requested skill name — bare
+# (``summarize``) or plugin-qualified (``docs-helper:summarize``). The
+# catch-all ``Skill(:*)`` yields an empty name and is not a request for a
+# specific skill.
+_SKILL_RULE_RE = re.compile(r"^Skill\((.+)\)$")
+
+
+def _granular_skill_names(tools: List[str]) -> List[str]:
+    """Extract requested skill names from granular ``Skill(...)`` rules."""
+    names: set[str] = set()
+    for entry in tools:
+        match = _SKILL_RULE_RE.match(entry)
+        if not match:
+            continue
+        content = match.group(1)
+        if content.endswith(":*"):
+            content = content[:-2]
+        if content:
+            names.add(content)
+    return sorted(names)
 
 
 def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
@@ -255,7 +278,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.disallowed_tools = list(dict.fromkeys(base_disallowed))
 
     def _set_allowed_tools(self, options: ClaudeAgentOptions, tools: List[str]) -> None:
-        """Set allowed_tools while translating deprecated Skill access.
+        """Set allowed_tools while translating Skill access into ``options.skills``.
 
         ``skills="all"`` enables and lists every discovered skill, and makes the
         SDK add a bare ``Skill`` rule to ``--allowedTools``. That bare rule is
@@ -270,33 +293,95 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         name against the empty string, so it approves every skill while still
         leaving the skill's own downstream tool calls (Bash/Read/Write) subject
         to ``allowed_tools``, ``disallowed_tools`` and the workspace sandbox.
+
+        A caller that sends only granular ``Skill(<name>)`` rules (no bare
+        ``Skill``) is requesting a *subset* of skills. Permission allow rules
+        alone cannot enforce that subset — they are auto-approve hints, and the
+        gateway's headless Skill hook force-approves every invocation — so the
+        requested names seed ``options.skills``, the one surface that actually
+        removes unlisted skills from the model's catalog and makes the Skill
+        tool reject them. The names are resolved against the discovered command
+        set in :meth:`_apply_skills_allowlist`. An operator ``Skill`` entry in
+        ``DISALLOWED_TOOLS`` disables every skill path, granular included.
         """
         filtered = [t for t in tools if t not in DISALLOWED_TOOLS]
-        if "Skill" in filtered:
+        if "Skill" in DISALLOWED_TOOLS:
+            # Operator kill-switch: strip granular rules too so no Skill
+            # surface survives (the deny list already hard-blocks execution).
+            filtered = [t for t in filtered if not t.startswith("Skill(")]
+        elif "Skill" in filtered:
             filtered = [t for t in filtered if t != "Skill"]
             options.skills = "all"
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
+        else:
+            granular = _granular_skill_names(filtered)
+            if granular:
+                options.skills = granular
         options.allowed_tools = filtered
 
-    async def _apply_hidden_skills(self, options: ClaudeAgentOptions) -> None:
-        """Convert ``options.skills`` into an allowlist excluding HIDDEN_SKILLS.
+    async def _apply_skills_allowlist(self, options: ClaudeAgentOptions) -> None:
+        """Resolve ``options.skills`` into the session's effective allowlist.
 
         The SDK ``skills`` allowlist is the only surface that removes a skill
         from the model's catalog (deny rules block execution but keep the
-        listing). The allowlist is the discovered command set minus hidden and
-        slash-blocked names; builtin command names left in the remainder are
-        inert — their ``Skill(<name>)`` allow rules match no skill.
+        listing, and the gateway's headless Skill hook force-approves every
+        invocation that stays listed). Two callers land here:
+
+        * Granular callers (``Skill(<name>)`` rules) left the requested names
+          in ``options.skills``. Each name is resolved against the discovered
+          command set so a bare name also matches its plugin-qualified
+          ``plugin:skill`` form; the raw names are kept alongside (an entry
+          matching no skill is inert). Discovery failure falls back to the raw
+          requested names — still an allowlist, never wide-open.
+        * ``skills="all"``/unset with HIDDEN_SKILLS configured keeps the
+          previous behavior: discovered set minus hidden/blocked names.
+
+        Hidden/blocked subtraction matches the full name and the bare tail
+        after the last ``:``, so a hidden skill stays hidden in its
+        plugin-qualified form too. Builtin command names left in the remainder
+        are inert — their ``Skill(<name>)`` allow rules match no skill.
         """
-        if not HIDDEN_SKILLS:
+        granular = isinstance(options.skills, list)
+        if not granular and not HIDDEN_SKILLS:
             return
         from src.backends.claude import slash_commands
 
         cwd = Path(options.cwd) if options.cwd else None
+        dropped = HIDDEN_SKILLS | slash_commands.BLOCKED_COMMANDS
+
+        def keep(name: str) -> bool:
+            return name not in dropped and name.rsplit(":", 1)[-1] not in dropped
+
+        if granular:
+            requested = set(options.skills or [])
+            resolved = set(requested)
+            try:
+                names = await slash_commands.get_available_commands(cwd)
+                if any(
+                    not any(d == r or d.endswith(":" + r) for d in names)
+                    for r in requested
+                ):
+                    # A requested skill may have been installed after the
+                    # 60s discovery cache was populated — refresh once.
+                    names = await slash_commands.get_available_commands(
+                        cwd, force=True
+                    )
+                resolved |= {
+                    d
+                    for d in names
+                    if any(d == r or d.endswith(":" + r) for r in requested)
+                }
+            except Exception:  # noqa: BLE001 — keep the raw request, fail closed
+                logger.warning(
+                    "Skill discovery failed; using raw requested skill names",
+                    exc_info=True,
+                )
+            options.skills = sorted(n for n in resolved if keep(n))
+            return
+
         names = await slash_commands.get_available_commands(cwd)
-        options.skills = sorted(
-            names - HIDDEN_SKILLS - slash_commands.BLOCKED_COMMANDS
-        )
+        options.skills = sorted(n for n in names if keep(n))
 
     def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
         """Grant the CLI extra working directories (``--add-dir``).
@@ -1063,7 +1148,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             include_partial_messages=include_partial_messages,
             effort=effort,
         )
-        await self._apply_hidden_skills(options)
+        await self._apply_skills_allowlist(options)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
         # model as a callable tool when a permission callback is present.
