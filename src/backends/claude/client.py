@@ -588,6 +588,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 "Claude SDK sanitizer requested but inactive: ANTHROPIC_BASE_URL is not set"
             )
 
+        # Experimental agent teams: only an explicit admin override touches the
+        # child env — on stamps the CLI gate, off masks an inherited export
+        # (options.env wins over the inherited process environment). With no
+        # override the process env passes through untouched.
+        if runtime_config.is_overridden("agent_teams_enabled"):
+            sdk_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = (
+                "1" if runtime_config.get("agent_teams_enabled") else ""
+            )
+
         if sdk_env:
             options.env.update(sdk_env)
 

@@ -602,6 +602,40 @@ class TestBuildSdkOptions:
             opts = cli_instance._build_sdk_options(effort="none")
         assert opts.thinking == {"type": "disabled"}
 
+    def test_agent_teams_not_injected_without_override(self, cli_instance, monkeypatch):
+        """No admin override → the CLI gate env passes through untouched."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        runtime_config.reset("agent_teams_enabled")
+        opts = cli_instance._build_sdk_options()
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in (opts.env or {})
+
+    def test_agent_teams_override_on_stamps_gate(self, cli_instance):
+        """Admin override ON injects CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."""
+        from src.runtime_config import runtime_config
+
+        runtime_config.set("agent_teams_enabled", True)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert opts.env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
+        finally:
+            runtime_config.reset("agent_teams_enabled")
+
+    def test_agent_teams_override_off_masks_inherited_export(
+        self, cli_instance, monkeypatch
+    ):
+        """Admin override OFF masks an operator export with an empty value."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        runtime_config.set("agent_teams_enabled", False)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert opts.env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == ""
+        finally:
+            runtime_config.reset("agent_teams_enabled")
+
     def test_include_partial_messages_when_token_streaming(self, cli_instance):
         """TOKEN_STREAMING=True sets include_partial_messages."""
         with patch("src.runtime_config.runtime_config.get", return_value=True):

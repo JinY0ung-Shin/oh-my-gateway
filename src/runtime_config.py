@@ -14,6 +14,7 @@ timeout at init time.  Changing those requires a server restart.
 """
 
 import logging
+import os
 from threading import Lock
 from typing import Any, Dict
 
@@ -58,6 +59,15 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "label": "Sanitizer (/v1/messages)",
         "type": "bool",
         "description": "Anthropic SSE sanitizer; effective only when ANTHROPIC_BASE_URL is set",
+    },
+    "agent_teams_enabled": {
+        "label": "Agent Teams",
+        "type": "bool",
+        "description": (
+            "Experimental CLI agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) "
+            "for NEW Claude sessions; an override wins over the gateway process "
+            "env, and team tools also need the CLI's account-side feature gate"
+        ),
     },
 }
 
@@ -157,6 +167,11 @@ class RuntimeConfig:
             "thinking_mode": THINKING_MODE,
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
+            # Mirrors the CLI's own truthiness on the raw env string: any
+            # non-empty value activates the gate, including "0".
+            "agent_teams_enabled": bool(
+                os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+            ),
         }
         return _map.get(key)
 
