@@ -390,6 +390,61 @@ class TestSkillsOptionMigration:
 
         assert options.skills == "all"
 
+    def test_granular_skill_rules_set_catalog_allowlist(self):
+        """Skill(<name>) entries without bare Skill select exactly those skills."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill(summarize)", "Skill(translate:*)", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) == ["summarize", "translate"]
+        allowed = options.allowed_tools or []
+        # normalized to prefix-matching granular rules; no bare/catch-all rule
+        assert "Skill(summarize:*)" in allowed and "Skill(translate:*)" in allowed
+        assert "Skill" not in allowed and "Skill(:*)" not in allowed
+
+    def test_bare_skill_wins_over_granular(self):
+        """Bare Skill keeps its allow-everything meaning even with granular entries."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Skill", "Skill(summarize)"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) == "all"
+        assert options.allowed_tools == ["Skill(:*)"]
+
+    async def test_hidden_skills_narrows_granular_allowlist(self, monkeypatch):
+        """A granular skills list is narrowed by HIDDEN_SKILLS, not replaced."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude import slash_commands
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        async def _fake_available(cwd=None, force=False):
+            return {"summarize", "translate"}
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"translate"}))
+        monkeypatch.setattr(slash_commands, "get_available_commands", _fake_available)
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = ["summarize", "translate"]
+        await backend._apply_skills_allowlist(options)
+
+        assert options.skills == ["summarize"]
+
     def test_no_skill_keeps_skills_unset(self):
         from claude_agent_sdk import ClaudeAgentOptions
         from src.backends.claude.client import ClaudeCodeCLI
@@ -448,40 +503,6 @@ class TestSkillsOptionMigration:
         assert getattr(options, "skills", None) == "all"
         assert "Skill(:*)" in (options.allowed_tools or [])
 
-    def test_granular_skill_rules_seed_skills_allowlist(self):
-        """``Skill(<name>)`` rules without bare Skill request a skills subset."""
-        from claude_agent_sdk import ClaudeAgentOptions
-        from src.backends.claude.client import ClaudeCodeCLI
-
-        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
-        options = ClaudeAgentOptions(max_turns=1)
-        backend._configure_tools(
-            options,
-            allowed_tools=["Read", "Skill(summarize)", "Skill(translate:*)"],
-            disallowed_tools=None,
-        )
-
-        assert options.skills == ["summarize", "translate"]
-        # Granular rules stay as auto-approve hints; no catch-all injected.
-        assert "Skill(summarize)" in (options.allowed_tools or [])
-        assert "Skill(:*)" not in (options.allowed_tools or [])
-
-    def test_bare_skill_wins_over_granular_rules(self):
-        """Bare Skill = full access; granular rules must not narrow it."""
-        from claude_agent_sdk import ClaudeAgentOptions
-        from src.backends.claude.client import ClaudeCodeCLI
-
-        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
-        options = ClaudeAgentOptions(max_turns=1)
-        backend._configure_tools(
-            options,
-            allowed_tools=["Skill", "Skill(summarize)"],
-            disallowed_tools=None,
-        )
-
-        assert options.skills == "all"
-        assert "Skill(:*)" in (options.allowed_tools or [])
-
     def test_skill_catch_all_alone_does_not_seed_allowlist(self):
         """``Skill(:*)`` carries no name — not a subset request."""
         from claude_agent_sdk import ClaudeAgentOptions
@@ -496,6 +517,43 @@ class TestSkillsOptionMigration:
         )
 
         assert getattr(options, "skills", None) is None
+
+    def test_qualified_granular_skill_rule_is_recognized(self):
+        """A plugin-qualified ``Skill(plugin:name)`` entry is a subset request.
+
+        The CLI registers a plugin skill as ``plugin:skill``, so that is the
+        spelling a client naming one has to use. Failing to recognize it would
+        leave ``options.skills`` unset — i.e. every skill exposed.
+        """
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill(docs-helper:summarize)"],
+            disallowed_tools=None,
+        )
+
+        assert options.skills == ["docs-helper:summarize"]
+        assert "Skill(docs-helper:summarize:*)" in (options.allowed_tools or [])
+        assert "Skill(:*)" not in (options.allowed_tools or [])
+
+    def test_qualified_granular_agent_rule_is_recognized(self):
+        """``Task(plugin:agent)`` narrows the subagent allowlist.
+
+        Same shape as skills: a plugin subagent's ``subagent_type`` is
+        ``plugin:agent``, and an unrecognized rule would fall back to
+        allow-every-subagent.
+        """
+        from src.backends.claude.client import agent_allowlist
+
+        assert agent_allowlist(["Read", "Task(testplugin:reporter)"]) == {
+            "testplugin:reporter"
+        }
+        # A bare Task still means "every subagent".
+        assert agent_allowlist(["Task", "Task(testplugin:reporter)"]) is None
 
     def test_disallowed_skill_strips_granular_rules(self, monkeypatch):
         """Operator Skill deny disables the granular path too."""

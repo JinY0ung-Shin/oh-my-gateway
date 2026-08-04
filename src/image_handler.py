@@ -66,6 +66,10 @@ class ImageHandler:
                 f"Image size {len(image_bytes)} bytes exceeds {MAX_IMAGE_SIZE} byte limit"
             )
 
+        # Same normalization as the inline path — a Read-tool image ends up at the
+        # same vision backend, so a palette PNG would fail there too (issue #143).
+        image_bytes, media_type = self.normalize_image_bytes(image_bytes, media_type)
+
         content_hash = hashlib.sha256(image_bytes).hexdigest()[:16]
         ext = EXTENSION_MAP[media_type]
         filepath = self.image_dir / f"img_{content_hash}{ext}"
@@ -109,6 +113,66 @@ class ImageHandler:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def normalize_image_bytes(image_bytes: bytes, media_type: str) -> Tuple[bytes, str]:
+        """Return pixel data a strict vision decoder will accept (issue #143).
+
+        Palette/indexed-color PNGs (Pillow mode ``P``) — the encoding screenshot
+        and icon tools emit constantly — make some vLLM vision backends fail
+        with ``unrecognized data stream contents when reading image file``. The
+        500 gets wrapped upstream and surfaces as the model hallucinating an
+        image or claiming there is none, so the fix belongs here, at the point
+        the bytes are handed over.
+
+        Only non-truecolor modes are re-encoded (``P``/``L``/``LA``/``1``/``I``/
+        ``F``/``CMYK``); RGB/RGBA payloads and animated GIFs are returned
+        untouched, so the common path stays a decode-and-check. PNG is the
+        re-encode target: converting to JPEG would drop the alpha channel that
+        icons rely on. Any decode failure returns the original bytes — this is a
+        compatibility nudge, not a new validation gate (malformed payloads keep
+        failing where they already did).
+        """
+        try:
+            from PIL import Image  # noqa: PLC0415 — optional-ish, keep import local
+        except ImportError:  # pragma: no cover - Pillow is a declared dependency
+            logger.warning("Pillow unavailable — sending image bytes without normalization")
+            return image_bytes, media_type
+
+        import io
+
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as img:
+                # Animated GIFs must keep their frames — normalizing would flatten
+                # them to a single frame, which loses information the model may need.
+                if getattr(img, "is_animated", False):
+                    return image_bytes, media_type
+                if img.mode in ("RGB", "RGBA"):
+                    return image_bytes, media_type
+                mode = img.mode
+                # Keep transparency when the source has it (palette PNGs often do).
+                target = "RGBA" if mode in ("LA", "PA") or "transparency" in img.info else "RGB"
+                buffer = io.BytesIO()
+                img.convert(target).save(buffer, format="PNG")
+        except Exception as exc:  # noqa: BLE001 — never turn a nudge into a failure
+            logger.warning("Image normalization skipped (%s): %s", media_type, exc)
+            return image_bytes, media_type
+
+        normalized = buffer.getvalue()
+        if len(normalized) > MAX_IMAGE_SIZE:
+            # Re-encoding can grow a payload; the caller's limit still governs.
+            raise ValueError(
+                f"Image size after normalization {len(normalized)} bytes exceeds "
+                f"{MAX_IMAGE_SIZE} byte limit"
+            )
+        logger.debug(
+            "Normalized image mode %s → %s (%d → %d bytes)",
+            mode,
+            target,
+            len(image_bytes),
+            len(normalized),
+        )
+        return normalized, "image/png"
+
+    @staticmethod
     def data_url_to_image_block(image_url: str) -> dict:
         """Convert a ``data:`` URL into a native Anthropic image content block.
 
@@ -134,6 +198,12 @@ class ImageHandler:
             raise ValueError(
                 f"Image size {len(image_bytes)} bytes exceeds {MAX_IMAGE_SIZE} byte limit"
             )
+
+        # Normalize palette/greyscale payloads some vision backends cannot decode
+        # (issue #143). Re-encoded bytes need a fresh base64 and media type.
+        normalized, media_type = ImageHandler.normalize_image_bytes(image_bytes, media_type)
+        if normalized is not image_bytes:
+            b64data = base64.b64encode(normalized).decode("ascii")
 
         return {
             "type": "image",

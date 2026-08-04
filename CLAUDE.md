@@ -29,6 +29,10 @@ uv run pytest --cov=src                            # with coverage
   `/v1/agents/messages`.
 - `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` implements them. `codex/` (JSON-RPC to a local `codex app-server`) and `opencode/` (managed subprocess / external HTTP modes) are frozen stale code — do not extend them.
 - `src/sanitizer/` — stream sanitization + OpenAI-format bridge.
+- `src/agent_catalog.py` / `src/mcp_health.py` — client-facing read models behind
+  `GET /v1/agent-resources` (skills/subagents across plugin + workspace + user scope, described
+  from frontmatter) and `GET /v1/mcp/health` (cached, poll-safe reachability snapshot). Both are
+  read-only and never raise; do not turn them into enforcement paths.
 - `src/session_manager.py` / `src/workspace_manager.py` — `/v1/responses` continuation state and
   workspace isolation. Stateless agent-message runs use request-scoped temporary workspaces and never
   enter the session manager.
@@ -41,6 +45,16 @@ uv run pytest --cov=src                            # with coverage
   deliberate adapter is the versioned, endpoint-local mapper in `src/routes/agent_messages.py`, because
   the Python SDK objects are not wire-compatible with Noah's JavaScript SDK handlers. Never move that
   mapper into the shared Responses conversion path.
+
+## Gotchas
+
+- The CLI renames tools across builds (`Task` → `Agent`, `KillShell` → `TaskStop`, …).
+  Permission *rules* pass through that rename map, but **PreToolUse hook matchers fire on
+  the tool's real name** — bind hooks to every spelling (`SUBAGENT_TOOL_NAMES`) or they
+  become silent no-ops on a new CLI.
+- A turn cut off by the agentic limit is reported as `response.incomplete` with
+  `incomplete_details.reason = "max_turns"`, not `response.failed`: the partial text is
+  real work. `DEFAULT_MAX_TURNS` (40) has to accommodate subagent orchestration.
 
 ## API Compatibility Boundaries
 

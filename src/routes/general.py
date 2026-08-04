@@ -3,7 +3,6 @@
 import os
 import asyncio
 import logging
-import re
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request, Response, Depends
@@ -44,6 +43,39 @@ async def list_models(
     }
 
 
+@router.get("/v1/slash-commands")
+@rate_limit_endpoint("general")
+async def list_slash_commands(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """List slash commands the Claude backend will accept on /v1/responses.
+
+    Clients (e.g. the ChatDRAGON composer) use this for CLI-style `/`
+    completion, so each entry carries the SDK's description/argument hint.
+    Blocked names are excluded — sending one returns 400 blocked_command, so
+    they must never be offered for completion.
+    """
+    await verify_api_key(request, credentials)
+
+    from src.backends.claude import slash_commands
+
+    try:
+        details = await slash_commands.get_command_details()
+    except Exception:  # noqa: BLE001 — SDK 조회 실패는 빈 목록으로 응답
+        details = {}
+    allowed = [
+        {
+            "name": name,
+            "description": meta.get("description", ""),
+            "argument_hint": meta.get("argument_hint", ""),
+        }
+        for name, meta in sorted(details.items())
+        if name not in slash_commands.BLOCKED_COMMANDS
+    ]
+    return {"commands": allowed, "total": len(allowed)}
+
+
 @router.get("/v1/mcp/servers")
 @rate_limit_endpoint("general")
 async def list_mcp_servers(
@@ -68,53 +100,65 @@ async def list_mcp_servers(
     return {"servers": servers, "total": len(servers)}
 
 
-_AGENT_DENY_RULE_RE = re.compile(r"^Agent\((.+)\)$")
-
-
-@router.get("/v1/agents")
+@router.get("/v1/mcp/health")
 @rate_limit_endpoint("general")
-async def list_agents(
+async def mcp_health(
     request: Request,
+    refresh: bool = False,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """List subagent types the Claude CLI discovers for a session.
+    """Reachability of every configured MCP server — cached, poll-safe.
 
-    Covers builtin, plugin (plugin-qualified names), and workspace
-    ``.claude/agents`` definitions. When the caller identifies a user
-    (``X-User`` header or ``user`` query param), discovery runs in that
-    user's workspace so per-workspace agents are included. Names are the
-    exact registered agent types, usable verbatim in ``Agent(<name>)``
-    allow/deny rules. Gateway-env-disallowed types are filtered out.
-    Returns an empty catalog when the Claude backend is unavailable.
+    Clients that let a user pick MCP servers need to know which ones are
+    actually up; probing per selection would spawn a process per click. Results
+    come from a shared snapshot refreshed at most once per
+    ``MCP_HEALTH_TTL_SECONDS``: a stale read returns the previous answer and
+    refreshes in the background, so polling never blocks. ``refresh=true``
+    forces a sweep and waits for it.
+
+    Each entry is ``{name, status: up|down|unknown, detail, latency_ms,
+    transport, checked_at}``. Details are the probe's own message — never
+    credentials.
     """
     await verify_api_key(request, credentials)
 
-    user = request.headers.get("X-User") or request.query_params.get("user")
-    cwd = None
-    if user:
-        try:
-            from src.workspace_manager import workspace_manager
+    from src import mcp_health as mcp_health_service
 
-            cwd = workspace_manager.resolve(user, backend="claude")
-        except Exception:
-            logger.debug("workspace resolve failed for /v1/agents", exc_info=True)
+    return await mcp_health_service.get_health(refresh=refresh)
 
-    try:
-        from src.backends.claude import slash_commands
-        from src.backends.claude.constants import DISALLOWED_SUBAGENT_TYPES
 
-        agents = await slash_commands.get_available_agents(cwd)
-        denied = {
-            m.group(1)
-            for rule in DISALLOWED_SUBAGENT_TYPES
-            if (m := _AGENT_DENY_RULE_RE.match(rule))
-        }
-        agents = [a for a in agents if a["name"] not in denied]
-    except Exception:
-        logger.warning("agent catalog discovery failed", exc_info=True)
-        agents = []
+@router.get("/v1/agent-resources")
+@rate_limit_endpoint("general")
+async def list_agent_resources(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Skills and subagents this user's next session would see.
 
-    return {"agents": agents, "total": len(agents)}
+    The plugin admin API only knows about *installed plugins*; the CLI also
+    reads the workspace's own ``.claude/skills`` and ``.claude/agents`` (and
+    ``~/.claude`` when user scope is enabled). A picker built from plugins alone
+    is therefore missing entries the model can still use — this endpoint is the
+    honest catalog, each entry tagged with the scope it came from and described
+    from its own frontmatter.
+
+    The workspace is keyed off the same identity header the file browser uses
+    (``WORKSPACE_USER_HEADER``); without it, only plugin and user scope are
+    reported.
+    """
+    await verify_api_key(request, credentials)
+
+    from src import agent_catalog
+    from src.routes.terminal_files import resolve_workspace_for_request
+
+    workspace = resolve_workspace_for_request(request)
+    resources = agent_catalog.list_agent_resources(workspace)
+    return {
+        **resources,
+        "workspace_scoped": workspace is not None,
+        "total_skills": len(resources["skills"]),
+        "total_agents": len(resources["agents"]),
+    }
 
 
 @router.get("/health")

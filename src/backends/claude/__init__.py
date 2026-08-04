@@ -40,6 +40,34 @@ def _claude_resolve(model: str) -> Optional[ResolvedModel]:
     return None
 
 
+def _claude_model_meta(model: str) -> dict:
+    """Alias bookkeeping for ``/v1/models`` entries.
+
+    Clients need to tell the bare ``opus``/``sonnet``/``haiku`` aliases apart
+    from the concrete ids configured via ``ANTHROPIC_DEFAULT_*_MODEL``, so they
+    can offer the deployment's actual model names instead of both:
+
+    - configured name → ``{"alias_of": "sonnet"}``
+    - bare alias with an override set → ``{"configured_as": "<name>"}``
+
+    No override configured means no extra fields (unchanged default surface).
+    """
+    aliases = configured_model_aliases()  # configured name -> bare alias
+    alias = aliases.get(model)
+    if alias is not None:
+        return {"alias_of": alias}
+    if model in CLAUDE_MODELS:
+        # Bare tier alias. Clients that want to show only real deployment model
+        # names filter on ``alias`` alone; ``configured_as`` says which name
+        # supersedes this one when an override is set.
+        meta: dict = {"alias": True}
+        for name, bare in aliases.items():
+            if bare == model:
+                meta["configured_as"] = name
+        return meta
+    return {}
+
+
 CLAUDE_DESCRIPTOR = BackendDescriptor(
     name="claude",
     owned_by="anthropic",
@@ -48,6 +76,7 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     # Image input is supported via the client's image_handler (see
     # validate_image_request in src/routes/deps.py).
     capabilities={"image_input": True},
+    model_meta_fn=_claude_model_meta,
 )
 
 

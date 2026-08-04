@@ -130,6 +130,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `MCP_CONFIG` | Shared MCP server config |
 | `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
+| `BLOCKED_DEFERRED_TOOLS` | Post-turn schedulers to deny; default `ScheduleWakeup,CronCreate` (see below) |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode (stale backend) |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models (stale backend) |
 | `CODEX_BIN` | Codex CLI binary name/path; default `codex` (stale backend) |
@@ -140,6 +141,21 @@ Most settings are environment variables. Start with `.env.example`.
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
 | `USAGE_LOG_DB_URL` | Optional SQLAlchemy URL for usage logging |
+
+### No post-turn scheduling
+
+`/v1/responses` is a single synchronous turn: when the stream closes, nothing the
+model scheduled can still reach the caller. So the CLI's post-turn schedulers
+(`ScheduleWakeup`, `CronCreate` — and skills built on them, e.g. `/loop`) are
+denied by default (`BLOCKED_DEFERRED_TOOLS`). The denial carries a reason the model
+reads back — "do the work inside this turn; recurring runs are not supported here" —
+instead of the CLI's opaque *"CronCreate isn't available in this context"*, which
+left the model ending the turn with nothing.
+
+Supporting recurring runs is a feature, not a config flip: it needs a server-owned
+run loop, per-user quotas and expiry, and a delivery channel the client can read
+after the turn. Clear `BLOCKED_DEFERRED_TOOLS` only when the surface embedding the
+gateway has all three.
 
 ## Capacity
 
@@ -328,6 +344,8 @@ Primary endpoints:
 - `GET /v1/sessions/{session_id}/pending-events?after=<seq>&user=<name>` (between-turn outbox: background task lifecycle + assistant messages captured by the session's idle reader; cursor-paged, polling refreshes the session TTL)
 - `GET /v1/auth/status`
 - `GET /v1/mcp/servers`
+- `GET /v1/mcp/health` (reachability snapshot for every configured MCP server; poll-safe)
+- `GET /v1/agent-resources` (skills + subagents the caller's next session would see)
 - `GET /health`
 - `GET /version`
 
@@ -386,7 +404,30 @@ Effective `/v1/responses` request fields:
 - `background`: return a `queued` response immediately and run the turn server-side (see below).
 - `metadata`: stored on responses; allowlisted keys can be forwarded to Claude with `METADATA_ENV_ALLOWLIST`.
 - `allowed_tools`: explicit tool allowlist for backends that support tool policy enforcement.
+  Two entry forms select *inside* a tool: `Skill(<name>)` narrows the skill catalog to
+  the named skills, and `Task(<agent>)` narrows which subagents may run (enforced by a
+  gateway PreToolUse hook — an unlisted `subagent_type` is denied with a reason the model
+  reads back). A bare `Skill`/`Task` keeps its allow-everything meaning and wins over the
+  granular entries. Names for both forms come from `GET /v1/agent-resources`, which lists
+  plugin, workspace (`<cwd>/.claude/{skills,agents}`) and user-scope definitions alike —
+  the plugin admin API sees only the first of the three, so a picker built on it alone
+  omits skills the session can still run.
+  Subagents always run **in the foreground**: the CLI's background default promises the
+  model a completion notification that would land after the HTTP turn closed, so the
+  gateway rewrites subagent calls to `run_in_background: false`
+  (`FORCE_FOREGROUND_SUBAGENTS=false` to opt out). Both tool spellings are governed —
+  current CLI builds renamed `Task` to `Agent`, and a hook bound to the old name alone
+  is a silent no-op that lets subagents drift back into the background *and* stops
+  enforcing the selection allowlist.
 - `disallowed_tools`: explicit tool blocklist; merged with the global `DISALLOWED_TOOLS` setting where supported.
+- `reasoning.effort`: thinking effort for the session (`low|medium|high|xhigh|max`, Claude backend).
+  Baked at session creation — a continuation keeps what its first turn set. The gateway also sets
+  `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` for that subprocess, because the CLI otherwise skips the
+  field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id. **Whether it changes
+  anything is the upstream's business**: on the wire it is Anthropic's `output_config.effort`; the
+  sanitizer translates that to OpenAI `reasoning_effort` (`xhigh`/`max` clamp to `high`) for
+  LiteLLM, and a model that does not take the field simply ignores it (LiteLLM's `drop_params`
+  discards it, and the CLI retries without effort if the upstream 400s on it).
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key.

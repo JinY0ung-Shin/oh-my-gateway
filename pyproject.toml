@@ -19,6 +19,8 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.0",
     "aiomysql>=0.2.0",
     "prometheus-client>=0.25.0",
+    # 이미지 모드 정규화 (issue #143) — palette PNG를 못 읽는 비전 백엔드 대응
+    "pillow>=10.0.0",
 ]
 
 [dependency-groups]

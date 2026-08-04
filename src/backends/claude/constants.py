@@ -136,6 +136,16 @@ TOKEN_STREAMING = parse_bool_env("TOKEN_STREAMING", "true")
 # session creation so a typo cannot take sessions down.
 CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH") or None
 
+# Subagent Tool Names
+# The CLI renamed the subagent tool: recent builds ship it as ``Agent`` and keep
+# ``Task`` only as a legacy alias (the binary carries the rename map
+# ``{Task:"Agent", KillShell:"TaskStop", AgentOutputTool:"TaskOutput", …}``).
+# Permission *rules* are translated through that map, but PreToolUse hook
+# matchers fire on the tool's real name — so a hook registered for "Task" alone
+# silently never runs on a build that calls it "Agent", taking the gateway's
+# subagent allowlist and foreground forcing down with it. Govern both names.
+SUBAGENT_TOOL_NAMES = ("Task", "Agent")
+
 # Disallowed Subagent Types
 # Comma-separated list of subagent types to block via Agent(type) syntax
 # Example: "statusline-setup,Plan"
@@ -150,6 +160,30 @@ DISALLOWED_SUBAGENT_TYPES = [f"Agent({t.strip()})" for t in _raw_disallowed.spli
 # blocking); set explicitly to enforce a deny-list, e.g. ``WebFetch,WebSearch``.
 _raw_disallowed_tools = os.getenv("DISALLOWED_TOOLS", "")
 DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.strip()]
+
+# Deferred-Delivery Tools
+# CLI harness tools whose payoff fires only AFTER the current turn ends:
+# ScheduleWakeup re-invokes the agent later, CronCreate schedules future runs.
+# In the standalone CLI that works — the terminal is still attached when the
+# wakeup fires. On /v1/responses the HTTP stream closes at turn end, so the
+# follow-up runs invisibly inside the CLI subprocess and its output is never
+# delivered ("I'll report back when it's done" — and nothing ever arrives).
+# Blocked by default so the model keeps the turn open and polls async jobs to
+# completion instead. Operators embedding the gateway behind a surface that
+# CAN deliver post-turn output may override with BLOCKED_DEFERRED_TOOLS
+# (comma-separated; empty string disables the block).
+# Subagent delivery mode
+# The CLI's Task tool runs subagents in the BACKGROUND by default and tells the
+# model it will be "notified when one completes". In a headless HTTP turn that
+# notification lands after the response stream has closed, so the model says
+# "I'll report back" and the turn ends with no result ever arriving — the same
+# undeliverable-payoff shape as BLOCKED_DEFERRED_TOOLS. Forcing
+# ``run_in_background: false`` keeps the subagent inside the turn that asked for
+# it. Set to false only for a client that can poll a session across turns.
+FORCE_FOREGROUND_SUBAGENTS = parse_bool_env("FORCE_FOREGROUND_SUBAGENTS", "true")
+
+_raw_blocked_deferred = os.getenv("BLOCKED_DEFERRED_TOOLS", "ScheduleWakeup,CronCreate")
+BLOCKED_DEFERRED_TOOLS = [t.strip() for t in _raw_blocked_deferred.split(",") if t.strip()]
 
 # Hidden Skills
 # Comma-separated skill names removed from the model's skill catalog. A

@@ -195,6 +195,34 @@ def _convert_tool_choice(tc: Any) -> Any:
     return None
 
 
+# Anthropic effort levels → OpenAI ``reasoning_effort``. The OpenAI field has no
+# level above "high", so the two Anthropic extremes clamp onto it rather than
+# being invented upstream.
+_EFFORT_TO_REASONING_EFFORT = {
+    "low": "low",
+    "medium": "medium",
+    "high": "high",
+    "xhigh": "high",
+    "max": "high",
+}
+
+
+def _reasoning_effort(body: Dict[str, Any]) -> Optional[str]:
+    """Read ``output_config.effort`` and map it to an OpenAI reasoning effort."""
+    output_config = body.get("output_config")
+    if not isinstance(output_config, dict):
+        return None
+    effort = output_config.get("effort")
+    if isinstance(effort, str):
+        return _EFFORT_TO_REASONING_EFFORT.get(effort.lower())
+    # Anthropic also accepts an integer effort; bucket it onto the three levels.
+    if isinstance(effort, bool) or not isinstance(effort, int):
+        return None
+    if effort <= 33:
+        return "low"
+    return "medium" if effort <= 66 else "high"
+
+
 def anthropic_request_to_openai_body(body: Dict[str, Any]) -> Dict[str, Any]:
     """Translate an Anthropic ``/v1/messages`` body to an OpenAI one.
 
@@ -203,6 +231,13 @@ def anthropic_request_to_openai_body(body: Dict[str, Any]) -> Dict[str, Any]:
     reasoning via its chat template, not via a request flag. Fields with
     a 1:1 analogue (``max_tokens``, ``temperature``, ``top_p``, ``stop``)
     are forwarded as-is.
+
+    One deliberate translation: Anthropic's ``output_config.effort`` (what the
+    CLI sends for a requested thinking effort) becomes OpenAI's
+    ``reasoning_effort``, which LiteLLM understands and forwards. Anthropic's
+    ``xhigh``/``max`` have no OpenAI counterpart and clamp to ``high``. Whether
+    it changes anything is the served model's business — LiteLLM's
+    ``drop_params`` will discard it for a model that does not take it.
     """
     out: Dict[str, Any] = {}
 
@@ -220,6 +255,10 @@ def anthropic_request_to_openai_body(body: Dict[str, Any]) -> Dict[str, Any]:
         out["stream"] = bool(body["stream"])
     if "stop_sequences" in body:
         out["stop"] = body["stop_sequences"]
+
+    effort = _reasoning_effort(body)
+    if effort:
+        out["reasoning_effort"] = effort
 
     messages: List[Dict[str, Any]] = []
 
