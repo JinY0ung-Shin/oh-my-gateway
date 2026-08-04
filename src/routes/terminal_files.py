@@ -130,6 +130,24 @@ def _workspace_root(user: str) -> Path:
         raise HTTPException(status_code=400, detail="invalid user identity")
 
 
+def resolve_workspace_for_request(request: Request) -> Optional[Path]:
+    """The caller's workspace directory, or ``None`` when it can't be keyed.
+
+    Same identity header and workspace mapping as the file browser, but soft:
+    endpoints that merely *describe* a workspace (e.g. the agent-resource
+    catalog) should degrade to "no project scope" rather than 400 when the
+    header is absent. Never creates the directory.
+    """
+    identity = (request.headers.get(_user_header()) or "").strip()
+    user = identity.split("@")[0]
+    if not user:
+        return None
+    try:
+        return workspace_manager.resolve(user, backend=_BACKEND)
+    except ValueError:
+        return None
+
+
 def _is_under(path: Path, base: Path) -> bool:
     """True when *path* is *base* or nested inside it."""
     try:

@@ -135,6 +135,58 @@ async def get_available_commands(
         return _cache.commands
 
 
+class _DetailsCache:
+    def __init__(self) -> None:
+        self.details: Optional[dict[str, dict[str, str]]] = None
+        self.fetched_at: float = 0.0
+        self.lock = asyncio.Lock()
+
+    def is_fresh(self) -> bool:
+        return (
+            self.details is not None
+            and (time.monotonic() - self.fetched_at) < CACHE_TTL_SECONDS
+        )
+
+
+_details_cache = _DetailsCache()
+
+
+async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str]]:
+    """Names plus SDK metadata (description, argumentHint) for completion UIs."""
+    from src.backends.claude.client import _get_setting_sources
+
+    opts = ClaudeAgentOptions(cwd=cwd, setting_sources=_get_setting_sources())
+    details: dict[str, dict[str, str]] = {}
+    async with ClaudeSDKClient(options=opts) as client:
+        info = await client.get_server_info()
+    if info:
+        for c in info.get("commands") or []:
+            if not isinstance(c, dict):
+                continue
+            name = c.get("name")
+            if isinstance(name, str) and name:
+                details[name] = {
+                    "description": str(c.get("description") or ""),
+                    "argument_hint": str(
+                        c.get("argumentHint") or c.get("argument_hint") or ""
+                    ),
+                }
+    return details
+
+
+async def get_command_details(
+    cwd: Optional[Path] = None, force: bool = False
+) -> dict[str, dict[str, str]]:
+    """Like :func:`get_available_commands` but with per-command metadata."""
+    async with _details_cache.lock:
+        if not force and _details_cache.is_fresh():
+            assert _details_cache.details is not None
+            return _details_cache.details
+        _details_cache.details = await _fetch_command_details(cwd)
+        _details_cache.fetched_at = time.monotonic()
+        return _details_cache.details
+
+
 def extract_command_name(prompt: str) -> Optional[str]:
     """Return the slash-command name (without the leading ``/``) or ``None``.
 

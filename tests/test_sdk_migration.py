@@ -361,6 +361,56 @@ class TestSkillsOptionMigration:
 
         assert options.skills == "all"
 
+    def test_granular_skill_rules_set_catalog_allowlist(self):
+        """Skill(<name>) entries without bare Skill select exactly those skills."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill(summarize)", "Skill(translate:*)", "Bash"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) == ["summarize", "translate"]
+        allowed = options.allowed_tools or []
+        # normalized to prefix-matching granular rules; no bare/catch-all rule
+        assert "Skill(summarize:*)" in allowed and "Skill(translate:*)" in allowed
+        assert "Skill" not in allowed and "Skill(:*)" not in allowed
+
+    def test_bare_skill_wins_over_granular(self):
+        """Bare Skill keeps its allow-everything meaning even with granular entries."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Skill", "Skill(summarize)"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) == "all"
+        assert options.allowed_tools == ["Skill(:*)"]
+
+    async def test_hidden_skills_narrows_granular_allowlist(self, monkeypatch):
+        """A granular skills list is narrowed by HIDDEN_SKILLS, not replaced."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"translate"}))
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = ["summarize", "translate"]
+        await backend._apply_hidden_skills(options)
+
+        assert options.skills == ["summarize"]
+
     def test_no_skill_keeps_skills_unset(self):
         from claude_agent_sdk import ClaudeAgentOptions
         from src.backends.claude.client import ClaudeCodeCLI

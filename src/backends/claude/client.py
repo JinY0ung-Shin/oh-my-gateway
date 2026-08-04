@@ -6,6 +6,7 @@ implementation registered as the ``claude`` backend.
 
 import asyncio
 import os
+import re
 import tempfile
 import atexit
 import shutil
@@ -40,6 +41,7 @@ from src.backends.claude.constants import (
     THINKING_BUDGET_TOKENS,
     DISALLOWED_SUBAGENT_TYPES,
     DISALLOWED_TOOLS,
+    BLOCKED_DEFERRED_TOOLS,
     HIDDEN_SKILLS,
     CLAUDE_SANDBOX_ENABLED,
     CLAUDE_SANDBOX_AUTO_ALLOW_BASH,
@@ -47,6 +49,8 @@ from src.backends.claude.constants import (
     CLAUDE_SANDBOX_ALLOW_UNSANDBOXED,
     CLAUDE_SANDBOX_NETWORK_ALLOW_LOCAL,
     CLAUDE_SANDBOX_WEAKER_NESTED,
+    FORCE_FOREGROUND_SUBAGENTS,
+    SUBAGENT_TOOL_NAMES,
 )
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
@@ -85,6 +89,43 @@ _VALID_SETTING_SOURCES = {"user", "project", "local"}
 # ``Skill`` rule does NOT work — the matcher discards content-less rules. See
 # :meth:`ClaudeCodeCLI._set_allowed_tools`.
 SKILL_ALLOW_ALL_RULE = "Skill(:*)"
+
+# Granular per-skill rule: ``Skill(<name>)`` / ``Skill(<name>:*)``. Requires at
+# least one non-``:`` character so the ``Skill(:*)`` catch-all never matches.
+_GRANULAR_SKILL_RULE_RE = re.compile(r"^Skill\((?P<name>[^:)]+)(?::\*)?\)$")
+
+# Granular per-subagent rule: ``Task(<agent>)`` / ``Agent(<agent>)`` (the CLI
+# has used both names for this tool; DISALLOWED_SUBAGENT_TYPES denies with the
+# ``Agent(...)`` spelling). Unlike skills there is no SDK allowlist that hides a
+# plugin/filesystem subagent from the model, so the gateway enforces the
+# selection itself with a PreToolUse hook that denies ``Task`` calls whose
+# ``subagent_type`` is not listed. A bare ``Task`` entry keeps its
+# allow-every-subagent meaning and wins over granular entries.
+_GRANULAR_AGENT_RULE_RE = re.compile(r"^(?:Task|Agent)\((?P<name>[^:)]+)\)$")
+
+
+def _has_granular_agent_rule(tools: List[str]) -> bool:
+    return any(_GRANULAR_AGENT_RULE_RE.match(t) is not None for t in tools)
+
+
+def agent_allowlist(tools: Optional[List[str]]) -> Optional[set]:
+    """Subagents selected via ``Task(<agent>)`` entries, or None for "all".
+
+    Returns None when the caller passed a bare ``Task`` (allow every subagent)
+    or no granular entry at all, so the hook is only installed when the client
+    actually narrowed the set. Race-free by construction: derived from the
+    request's own ``allowed_tools`` rather than stored on the shared client.
+    """
+    if not tools:
+        return None
+    if "Task" in tools:
+        return None
+    names = {
+        match.group("name")
+        for t in tools
+        if (match := _GRANULAR_AGENT_RULE_RE.match(t)) is not None
+    }
+    return names or None
 
 
 def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
@@ -248,7 +289,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         """
         if allowed_tools:
             self._set_allowed_tools(options, allowed_tools)
-        base_disallowed = list(DISALLOWED_SUBAGENT_TYPES) + list(DISALLOWED_TOOLS)
+        # BLOCKED_DEFERRED_TOOLS: wakeup/cron payoffs fire after the HTTP turn
+        # has closed, so their promised follow-up is undeliverable here.
+        base_disallowed = (
+            list(DISALLOWED_SUBAGENT_TYPES)
+            + list(DISALLOWED_TOOLS)
+            + list(BLOCKED_DEFERRED_TOOLS)
+        )
         if disallowed_tools:
             base_disallowed.extend(disallowed_tools)
         if base_disallowed:
@@ -270,13 +317,52 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         name against the empty string, so it approves every skill while still
         leaving the skill's own downstream tool calls (Bash/Read/Write) subject
         to ``allowed_tools``, ``disallowed_tools`` and the workspace sandbox.
+
+        Granular selection: ``Skill(<name>)`` / ``Skill(<name>:*)`` entries
+        *without* a bare ``Skill`` set ``options.skills`` to exactly those
+        names. The catalog allowlist is the real enforcement point — a skill
+        not in the list is invisible to the model (the gateway's PreToolUse
+        force-approve hook then only ever sees listed skills). A bare
+        ``Skill`` entry keeps its existing allow-everything meaning and wins
+        over granular entries if both are present.
         """
-        filtered = [t for t in tools if t not in DISALLOWED_TOOLS]
+        blocked = set(DISALLOWED_TOOLS) | set(BLOCKED_DEFERRED_TOOLS)
+        filtered = [t for t in tools if t not in blocked]
+        # Subagent selection: ``Task(<agent>)`` entries are the gateway's own
+        # allowlist (enforced by a PreToolUse hook), not CLI rules — strip them
+        # and expose the bare tool so the model can still call it.
+        if _has_granular_agent_rule(filtered) and not any(
+            name in filtered for name in SUBAGENT_TOOL_NAMES
+        ):
+            filtered = [t for t in filtered if _GRANULAR_AGENT_RULE_RE.match(t) is None]
+            # Both spellings: the rule name that reaches the CLI depends on the
+            # build's rename map, and an unknown name is inert rather than fatal.
+            filtered.extend(SUBAGENT_TOOL_NAMES)
+        else:
+            filtered = [t for t in filtered if _GRANULAR_AGENT_RULE_RE.match(t) is None]
         if "Skill" in filtered:
-            filtered = [t for t in filtered if t != "Skill"]
+            filtered = [
+                t
+                for t in filtered
+                if t != "Skill" and _GRANULAR_SKILL_RULE_RE.match(t) is None
+            ]
             options.skills = "all"
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
+        else:
+            granular = sorted(
+                {
+                    match.group("name")
+                    for t in filtered
+                    if (match := _GRANULAR_SKILL_RULE_RE.match(t)) is not None
+                }
+            )
+            if granular:
+                options.skills = granular
+                filtered = [
+                    t for t in filtered if _GRANULAR_SKILL_RULE_RE.match(t) is None
+                ]
+                filtered.extend(f"Skill({name}:*)" for name in granular)
         options.allowed_tools = filtered
 
     async def _apply_hidden_skills(self, options: ClaudeAgentOptions) -> None:
@@ -287,13 +373,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         listing). The allowlist is the discovered command set minus hidden and
         slash-blocked names; builtin command names left in the remainder are
         inert — their ``Skill(<name>)`` allow rules match no skill.
+
+        An options.skills that is already a granular allowlist (set from
+        ``Skill(<name>)`` allowed_tools entries) is narrowed in place rather
+        than replaced — hidden skills must not resurrect, and non-selected
+        skills must not appear.
         """
         if not HIDDEN_SKILLS:
             return
         from src.backends.claude import slash_commands
 
-        cwd = Path(options.cwd) if options.cwd else None
-        names = await slash_commands.get_available_commands(cwd)
+        if isinstance(options.skills, list):
+            names = set(options.skills)
+        else:
+            cwd = Path(options.cwd) if options.cwd else None
+            names = await slash_commands.get_available_commands(cwd)
         options.skills = sorted(
             names - HIDDEN_SKILLS - slash_commands.BLOCKED_COMMANDS
         )
@@ -881,6 +975,143 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
+    def _make_deferred_deny_hook(self):
+        """Deny post-turn scheduling tools with a reason the model can act on.
+
+        ``BLOCKED_DEFERRED_TOOLS`` (ScheduleWakeup/CronCreate) are also in
+        ``disallowed_tools``, but the CLI's own refusal reads
+        "CronCreate isn't available in this context" — which tells the model
+        (and the user watching) nothing about *why*, so the model shrugs and
+        ends the turn. A PreToolUse deny carries our reason instead: the payoff
+        would land after the HTTP stream closed, so the work has to happen now.
+        """
+
+        async def hook(input_data, _tool_use_id, _context):
+            if not isinstance(input_data, dict):
+                return {}
+            name = input_data.get("tool_name")
+            if name not in BLOCKED_DEFERRED_TOOLS:
+                return {}
+            logger.info("Denying deferred-delivery tool: %s", name)
+            return {
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": (
+                        f"{name} is blocked on this gateway: its payoff fires after the "
+                        "HTTP turn closes, so nothing it schedules can ever be delivered "
+                        "to the user. Do the work inside this turn instead — if the user "
+                        "asked for something recurring, say plainly that scheduled or "
+                        "repeating runs are not supported here."
+                    ),
+                }
+            }
+
+        return hook
+
+    def _make_task_hook(self, allowed: Optional[set]):
+        """PreToolUse hook governing the subagent tool (``Agent``/``Task``).
+
+        Two jobs, both about the gateway's headless single-turn shape:
+
+        1. **Selection** — when the client narrowed subagents via
+           ``Task(<agent>)`` entries, an unlisted ``subagent_type`` is denied
+           with a reason the model reads back as a tool result. The SDK's
+           ``agents`` option only *defines* programmatic subagents (it cannot
+           hide plugin/filesystem ones) and the CLI's rule matcher is not a
+           dependable gate across builds, so the gateway enforces it here.
+        2. **Foreground** — the CLI runs subagents in the background by default
+           and promises the model a completion notification. That notification
+           fires after the HTTP turn has closed, so the model answers "I'll
+           report back" and the turn ends with nothing (issue: subagent turns
+           going silent). ``updatedInput`` rewrites the call to
+           ``run_in_background: false`` so the work happens inside this turn.
+
+        Both tool names are handled: the CLI renamed ``Task`` to ``Agent`` and a
+        hook that checks only the old name is a no-op on current builds
+        (``SUBAGENT_TOOL_NAMES``). Other tools pass through untouched.
+        """
+
+        async def hook(input_data, _tool_use_id, _context):
+            if not isinstance(input_data, dict):
+                return {}
+            if input_data.get("tool_name") not in SUBAGENT_TOOL_NAMES:
+                return {}
+            tool_input = input_data.get("tool_input") or {}
+            if not isinstance(tool_input, dict):
+                return {}
+
+            agent = tool_input.get("subagent_type", "")
+            if allowed and agent and agent not in allowed:
+                logger.info("Denying subagent outside allowlist: %s", agent)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            f"Subagent '{agent}' is not enabled for this session. "
+                            f"Enabled subagents: {', '.join(sorted(allowed)) or 'none'}."
+                        ),
+                    }
+                }
+
+            # Background subagents cannot deliver here — pull them into the turn.
+            # The flag is normalized even when omitted: background is the CLI's
+            # DEFAULT, so "not present" is exactly the broken case.
+            if FORCE_FOREGROUND_SUBAGENTS and tool_input.get("run_in_background") is not False:
+                logger.info(
+                    "Forcing foreground subagent run (background payoff is undeliverable): %s",
+                    agent or "unknown",
+                )
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "updatedInput": {**tool_input, "run_in_background": False},
+                    }
+                }
+            return {}
+
+        return hook
+
+    def _pre_tool_use_hooks(self, cwd: Optional[str], allowed_tools: Optional[List[str]]):
+        """Assemble the PreToolUse hook matchers for a session.
+
+        Order is meaningful only in that every matcher runs; each hook is
+        independent. Kept separate from ``create_client`` so the wiring itself
+        is testable (which tools are governed, and when).
+        """
+        matchers = [
+            # Force-approve the Skill tool. The gateway runs headless (no
+            # interactive approver), so the CLI's per-skill permission "ask"
+            # (surfaced to the client as an "Execute skill: <name>" error)
+            # becomes a hard denial. A PreToolUse "allow" decision pre-empts the
+            # rule matcher entirely, which is more robust than the Skill(:*)
+            # allow-rule across CLI builds. The skill's own downstream tool
+            # calls remain governed by their permissions and the sandbox hook.
+            HookMatcher(matcher="Skill", hooks=[self._make_skill_allow_hook()]),
+        ]
+        # The subagent tool is governed on every session, not just when the
+        # client narrowed subagents: forcing foreground delivery is needed on
+        # its own. One matcher per name — matcher strings are compared against
+        # the tool's real name, and current CLI builds call it "Agent".
+        task_hook = self._make_task_hook(agent_allowlist(allowed_tools))
+        matchers.extend(
+            HookMatcher(matcher=name, hooks=[task_hook]) for name in SUBAGENT_TOOL_NAMES
+        )
+        # Post-turn schedulers: deny with a reason instead of leaving the model
+        # with the CLI's opaque "isn't available in this context".
+        if BLOCKED_DEFERRED_TOOLS:
+            deferred_hook = self._make_deferred_deny_hook()
+            matchers.extend(
+                HookMatcher(matcher=name, hooks=[deferred_hook])
+                for name in BLOCKED_DEFERRED_TOOLS
+            )
+        if cwd and sandbox_enabled():
+            matchers.append(
+                HookMatcher(matcher="", hooks=[make_workspace_sandbox_hook(Path(cwd))])
+            )
+        return matchers
+
     def _make_ask_user_can_use_tool(self, session):
         """Create a ``can_use_tool`` callback that intercepts AskUserQuestion.
 
@@ -1063,33 +1294,26 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             include_partial_messages=include_partial_messages,
             effort=effort,
         )
+        # 세션 단위 effort — SDK가 생성 시점에 굽는다(중간 변경 API 없음).
+        # 그래서 '다음 새 대화부터 적용'이 이 값의 정직한 의미다.
+        #
+        # CLI는 "이 모델이 effort를 지원하는가"를 자기 모델 레지스트리와 **base URL이
+        # 1st-party인가**로 판단한다. 커스텀 ANTHROPIC_BASE_URL(sanitizer/LiteLLM)에
+        # 낯선 모델 id면 그 판단이 false가 되어 요청에 effort를 아예 싣지 않는다.
+        # CLAUDE_CODE_ALWAYS_ENABLE_EFFORT가 그 게이트를 연다. (업스트림이 400으로
+        # 거절하면 CLI가 스스로 effort를 빼고 재시도하므로 켜도 안전하다.)
+        # "none"은 effort 레벨이 아니라 thinking 비활성화라 _configure_thinking이
+        # 처리한다 — options.effort에 실으면 안 된다.
+        if effort and effort != "none":
+            options.effort = effort
+            options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
         await self._apply_hidden_skills(options)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
         # model as a callable tool when a permission callback is present.
         options.can_use_tool = self._make_ask_user_can_use_tool(session)
 
-        pre_tool_use = [
-            # Force-approve the Skill tool. The gateway runs headless (no
-            # interactive approver), so the CLI's per-skill permission "ask"
-            # (surfaced to the client as an "Execute skill: <name>" error)
-            # becomes a hard denial. A PreToolUse "allow" decision pre-empts the
-            # rule matcher entirely, which is more robust than the Skill(:*)
-            # allow-rule across CLI builds. The skill's own downstream tool
-            # calls remain governed by their permissions and the sandbox hook.
-            HookMatcher(
-                matcher="Skill",
-                hooks=[self._make_skill_allow_hook()],
-            ),
-        ]
-        if cwd and sandbox_enabled():
-            pre_tool_use.append(
-                HookMatcher(
-                    matcher="",
-                    hooks=[make_workspace_sandbox_hook(Path(cwd))],
-                )
-            )
-        options.hooks = {"PreToolUse": pre_tool_use}
+        options.hooks = {"PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools)}
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
