@@ -11,6 +11,7 @@ import tempfile
 import atexit
 import shutil
 import contextlib
+import warnings
 from typing import AsyncGenerator, Dict, Any, Literal, Optional, List, Union, cast
 from pathlib import Path
 import logging
@@ -18,6 +19,7 @@ import logging
 from claude_agent_sdk import query, ClaudeAgentOptions, ClaudeSDKClient
 from src.constants import DEFAULT_MAX_TURNS
 from claude_agent_sdk.types import (
+    CanUseToolShadowedWarning,
     StreamEvent,
     AssistantMessage,
     ResultMessage,
@@ -65,6 +67,16 @@ from src.backends.claude.workspace_sandbox import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The SDK (0.2.126+) warns that ``can_use_tool`` is shadowed whenever it is
+# registered alongside ``bypassPermissions`` or whole-tool ``allowed_tools``
+# entries. For every gateway client that shadowing is deliberate — ordinary
+# tools are *meant* to auto-approve — and the one tool the callback exists for,
+# AskUserQuestion, still reaches it regardless (CLI exception; re-verified live
+# on SDK 0.2.128 / CLI 2.1.220 by tests/test_ask_user_question_live.py). The
+# warning's "can_use_tool will not be invoked" would be a false alarm in every
+# worker's log, so it is filtered out for this process.
+warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
 
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
@@ -234,8 +246,26 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     # SDK option helpers
     # ------------------------------------------------------------------
 
-    def _configure_thinking(self, options: ClaudeAgentOptions) -> None:
-        """Apply thinking-mode configuration to *options*."""
+    def _configure_thinking(
+        self, options: ClaudeAgentOptions, effort: Optional[str] = None
+    ) -> None:
+        """Apply thinking/effort configuration to *options*.
+
+        A request-scoped *effort* overrides the global THINKING_MODE setting:
+        ``"none"`` disables extended thinking explicitly (some models reject
+        this — the SDK error passes through); the five SDK levels
+        (low/medium/high/xhigh/max) enable adaptive thinking at that effort.
+        """
+        if effort is not None:
+            if effort == "none":
+                options.thinking = {"type": "disabled"}
+            else:
+                options.thinking = {"type": "adaptive"}
+                # SDK narrows to the EffortLevel Literal; the value is
+                # validated upstream by the request schema.
+                options.effort = cast(Any, effort)
+            return
+
         from src.runtime_config import get_thinking_mode
 
         mode = get_thinking_mode()
@@ -652,6 +682,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 "Claude SDK sanitizer requested but inactive: ANTHROPIC_BASE_URL is not set"
             )
 
+        # Experimental agent teams: only an explicit admin override touches the
+        # child env — on stamps the CLI gate, off masks an inherited export
+        # (options.env wins over the inherited process environment). With no
+        # override the process env passes through untouched.
+        if runtime_config.is_overridden("agent_teams_enabled"):
+            sdk_env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] = (
+                "1" if runtime_config.get("agent_teams_enabled") else ""
+            )
+
         if sdk_env:
             options.env.update(sdk_env)
 
@@ -674,6 +713,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         user: Optional[str] = None,
         forward_headers: Optional[Dict[str, str]] = None,
         include_partial_messages: Optional[bool] = None,
+        effort: Optional[str] = None,
     ) -> ClaudeAgentOptions:
         """Build ClaudeAgentOptions with common parameters."""
         effective_cwd = cwd or self.cwd
@@ -683,7 +723,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             setting_sources=_get_setting_sources(),
         )
 
-        self._configure_thinking(options)
+        self._configure_thinking(options, effort)
         self._configure_sandbox(options)
         self._configure_add_dirs(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
@@ -752,6 +792,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     def _convert_message(self, message) -> Dict[str, Any]:
         """Convert SDK message object to dict if needed."""
         if isinstance(message, dict):
+            self._log_init_mcp_server_errors(message)
             return message
         if hasattr(message, "__dict__"):
             result = {
@@ -770,8 +811,37 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     error_msg = "; ".join(result["errors"])
                 if error_msg:
                     result["error_message"] = error_msg
+            self._log_init_mcp_server_errors(result)
             return result
         return message
+
+    @staticmethod
+    def _log_init_mcp_server_errors(converted: Dict[str, Any]) -> None:
+        """Surface MCP servers the CLI skipped at startup in the gateway log.
+
+        Since CLI 2.1.219 the stream-json ``init`` event carries
+        ``mcp_server_errors`` — the ``--mcp-config`` entries dropped by config
+        validation (``[{"name", "type", "message"}]``, observed live on the
+        bundled CLI 2.1.220). Under ``strict_mcp_config`` + materialize-all
+        this is the only trace of a broken gateway- or plugin-materialized
+        server, so without this log an invalid config vanishes silently.
+        Log-only: both endpoints' whitelists keep the field off the wire.
+        """
+        if converted.get("subtype") != "init":
+            return
+        data = converted.get("data")
+        errors = data.get("mcp_server_errors") if isinstance(data, dict) else None
+        if not errors:
+            return
+        for entry in errors if isinstance(errors, list) else [errors]:
+            if isinstance(entry, dict):
+                logger.warning(
+                    "CLI skipped MCP server %r at startup: %s",
+                    entry.get("name"),
+                    entry.get("message") or entry.get("type") or entry,
+                )
+            else:
+                logger.warning("CLI skipped MCP server at startup: %s", entry)
 
     @staticmethod
     def _mark_gateway_interrupt(converted: Dict[str, Any], session) -> Dict[str, Any]:
@@ -1051,7 +1121,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         model literally reports it has no such tool otherwise; see issue #131.)
         AskUserQuestion always falls through to this callback, even under
         ``permission_mode=bypassPermissions`` where ordinary tools are
-        auto-approved without it — verified against claude-agent-sdk==0.2.108.
+        auto-approved without it — verified against claude-agent-sdk==0.2.108,
+        re-verified live on 0.2.128 (CLI 2.1.220). The SDK's
+        ``CanUseToolShadowedWarning`` about this combination is a false
+        positive for AskUserQuestion and is filtered at module import.
 
         For AskUserQuestion we park the session and wait for the client's
         answer, then deny with the answer as the message — the CLI turns the
@@ -1177,6 +1250,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     ) -> ClaudeSDKClient:
         """Create and connect a :class:`ClaudeSDKClient` for *session*.
 
+        ``effort`` (``none`` | ``low`` | ``medium`` | ``high`` | ``xhigh`` |
+        ``max``) rides the CLI ``--effort`` flag / thinking config, so like
+        ``output_format`` it is baked in at create time and cannot change on
+        later turns of the same client.
+
         The client is connected with ``prompt=None`` (interactive mode)
         so subsequent turns can be sent via ``client.query()``.
 
@@ -1214,6 +1292,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             user=user,
             forward_headers=forward_headers,
             include_partial_messages=include_partial_messages,
+            effort=effort,
         )
         # 세션 단위 effort — SDK가 생성 시점에 굽는다(중간 변경 API 없음).
         # 그래서 '다음 새 대화부터 적용'이 이 값의 정직한 의미다.
@@ -1223,7 +1302,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # 낯선 모델 id면 그 판단이 false가 되어 요청에 effort를 아예 싣지 않는다.
         # CLAUDE_CODE_ALWAYS_ENABLE_EFFORT가 그 게이트를 연다. (업스트림이 400으로
         # 거절하면 CLI가 스스로 effort를 빼고 재시도하므로 켜도 안전하다.)
-        if effort:
+        # "none"은 effort 레벨이 아니라 thinking 비활성화라 _configure_thinking이
+        # 처리한다 — options.effort에 실으면 안 된다.
+        if effort and effort != "none":
             options.effort = effort
             options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
         await self._apply_hidden_skills(options)

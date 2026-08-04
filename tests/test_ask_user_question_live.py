@@ -9,7 +9,11 @@ NOTE (issue #131): the CLI surfaces AskUserQuestion to the model *only* when a
 ``can_use_tool`` permission callback is registered. A PreToolUse hook alone does
 NOT expose the tool — the model reports it has no AskUserQuestion tool and the
 hook never fires. (An earlier revision claimed the opposite; it was true of an
-older CLI. Verified against claude-agent-sdk==0.2.108 + Claude CLI 2.1.x.)
+older CLI. Verified against claude-agent-sdk==0.2.108 + Claude CLI 2.1.x;
+re-verified 2026-07-28 on 0.2.128 + bundled CLI 2.1.220. These tests import the
+SDK directly, so the CanUseToolShadowedWarning the SDK now emits for this
+combination is expected in the output — the passing tests are the proof it is
+a false positive for AskUserQuestion.)
 
 Requires: Claude Code CLI authenticated locally (claude auth status) and a
 reachable model endpoint, so these are marked ``e2e`` and excluded from the

@@ -1,6 +1,7 @@
 """SSE event builders for the OpenAI Responses API wire format."""
 
 import json
+import re
 from typing import Any, Dict, Optional
 
 from src.constants import STREAM_COMPACTION_EVENTS, STREAM_HOOK_EVENTS
@@ -121,6 +122,72 @@ def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int =
     """Build an SSE line for Responses API with a custom task event type."""
     event_type = f"response.{task_event['type']}"
     data = {**task_event, "type": event_type, "sequence_number": sequence_number}
+    return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
+
+
+# Detection markers for a teammate's message injected as a user message.
+_TEAMMATE_MESSAGE_MARKERS = (
+    "Another Claude session sent a message",
+    "This came from another Claude session",
+)
+
+# The sending teammate's address as it appears in the injected body. On the
+# pinned CLI (2.1.220) the body carries a ``from=<address>`` marker; newer CLIs
+# frame the body in a ``<teammate-message teammate_id="...">`` tag instead, so
+# both are tried. At least one address character is required so the literal
+# ``from=`` in the trailing reply guidance — immediately followed by a
+# backtick — is not read as an address, and ``:`` is excluded so a
+# ``from=name: message`` framing yields ``name``.
+_TEAMMATE_FROM_RE = re.compile(r"\bfrom=([A-Za-z0-9._-]+)")
+_TEAMMATE_TAG_ID_RE = re.compile(r'<teammate-message\b[^>]*\bteammate_id="([^"]+)"')
+
+
+def is_teammate_message_text(text: Any) -> bool:
+    """True when a user-message text is an agent-team teammate's message.
+
+    Agent teams (experimental, gated behind the CLI's
+    ``CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS``) deliver a teammate's
+    ``SendMessage`` to the leader by injecting it into the leader's transcript
+    as a plain ``user`` message — there is no dedicated SDK message type, so
+    detection is by content. This is the CLI's own check: the opener (which has
+    a ``while you were working`` variant, hence the shorter prefix) plus the
+    explanation sentence must both be present.
+    """
+    if not isinstance(text, str):
+        return False
+    return all(marker in text for marker in _TEAMMATE_MESSAGE_MARKERS)
+
+
+def parse_teammate_message_from(text: str) -> Optional[str]:
+    """Best-effort address of the sending teammate, else None.
+
+    The exact body framing is the CLI's and not fully pinned down, so a missing
+    address is expected rather than an error.
+    """
+    match = _TEAMMATE_TAG_ID_RE.search(text) or _TEAMMATE_FROM_RE.search(text)
+    return match.group(1) if match else None
+
+
+def make_teammate_message_response_sse(
+    text: str,
+    *,
+    session_id: Optional[str] = None,
+    sequence_number: int = 0,
+) -> str:
+    """Build an SSE line for a teammate's message to the leader session.
+
+    ``text`` is the injected user-message text passed through verbatim,
+    CLI framing and all: the gateway does not re-word or trim what the SDK
+    produced, and a client that renders it owns that presentation choice.
+    """
+    event_type = "response.teammate_message"
+    data = {
+        "type": event_type,
+        "text": text,
+        "from": parse_teammate_message_from(text),
+        "session_id": session_id,
+        "sequence_number": sequence_number,
+    }
     return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 

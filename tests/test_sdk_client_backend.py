@@ -282,6 +282,55 @@ def _ctx(tool_use_id):
     return SimpleNamespace(tool_use_id=tool_use_id)
 
 
+def test_can_use_tool_shadowed_warning_is_filtered():
+    """Importing the Claude backend registers an ignore filter for the SDK's
+    CanUseToolShadowedWarning.
+
+    The gateway registers can_use_tool alongside bypassPermissions /
+    whole-tool allowed_tools on purpose: the shadowing is intended for
+    ordinary tools, and AskUserQuestion still reaches the callback (live
+    coverage in test_ask_user_question_live.py). Without the filter every
+    worker logs a false "can_use_tool will not be invoked" line.
+
+    Runs in a subprocess because pytest's warnings plugin swaps out the
+    global filter list per test, hiding module-registered filters.
+    """
+    import os
+    import subprocess
+    import sys
+
+    probe = (
+        "import warnings\n"
+        "import src.backends.claude.client\n"
+        "from claude_agent_sdk.types import (\n"
+        "    CanUseToolShadowedWarning,\n"
+        "    ClaudeAgentOptions,\n"
+        "    _warn_if_can_use_tool_shadowed,\n"
+        ")\n"
+        "assert any(\n"
+        "    entry[0] == 'ignore' and entry[2] is CanUseToolShadowedWarning\n"
+        "    for entry in warnings.filters\n"
+        ")\n"
+        "async def cb(tool, tool_input, context): ...\n"
+        "with warnings.catch_warnings(record=True) as caught:\n"
+        "    _warn_if_can_use_tool_shadowed(\n"
+        "        ClaudeAgentOptions(\n"
+        "            can_use_tool=cb, permission_mode='bypassPermissions'\n"
+        "        )\n"
+        "    )\n"
+        "assert not caught, caught\n"
+    )
+    env = {**os.environ, "GATEWAY_SKIP_DOTENV": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+
+
 async def test_can_use_tool_allows_other_tools():
     """Non-AskUserQuestion tools are approved (PermissionResultAllow)."""
     cli = _make_cli()

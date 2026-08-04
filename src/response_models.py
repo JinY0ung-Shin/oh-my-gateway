@@ -9,6 +9,10 @@ from src.runtime_config import get_default_model
 
 PermissionMode = Literal["default", "acceptEdits", "bypassPermissions", "plan"]
 
+# "none" disables extended thinking; the rest are the Claude SDK EffortLevel
+# values, applied on top of adaptive thinking.
+ReasoningEffort = Literal["none", "low", "medium", "high", "xhigh", "max"]
+
 
 class ResponseInputTextPart(BaseModel):
     """A text content part within a Responses API input item."""
@@ -107,22 +111,13 @@ class ResponseTextConfig(BaseModel):
 
 
 class ReasoningConfig(BaseModel):
-    """OpenAI Responses-shaped reasoning control.
+    """OpenAI-style ``reasoning`` request block (Claude backend only).
 
-    Only ``effort`` is honored, mapped to the SDK's session-level ``effort``
-    option ("how much effort Claude puts into its response", which guides
-    adaptive thinking depth). Applied when the session is created, so a
-    continuation keeps the effort its first turn set.
+    Only ``effort`` is honored; other OpenAI keys (e.g. ``summary``) are
+    accepted and ignored so stock OpenAI clients don't break.
     """
 
-    effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = Field(
-        default=None,
-        description=(
-            "Thinking/response effort for this session: low | medium | high | "
-            "xhigh | max. Applied at session creation (the first turn of a "
-            "conversation); continuations keep it."
-        ),
-    )
+    effort: Optional[ReasoningEffort] = None
 
 
 class ResponseCreateRequest(BaseModel):
@@ -186,7 +181,14 @@ class ResponseCreateRequest(BaseModel):
     )
     reasoning: Optional[ReasoningConfig] = Field(
         default=None,
-        description="Reasoning controls. Only 'effort' is honored (Claude backend).",
+        description=(
+            "Reasoning configuration (Claude backend only). effort is one of "
+            "none|low|medium|high|xhigh|max: 'none' disables extended "
+            "thinking, the rest select adaptive-thinking effort. Omitted = "
+            "the gateway's global THINKING_MODE default. Fixed when the "
+            "session is created; continuations may only re-send the same "
+            "value."
+        ),
     )
 
 

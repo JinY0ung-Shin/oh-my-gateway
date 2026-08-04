@@ -124,6 +124,15 @@ def test_stateless_stream_projects_sdk_messages_for_noah(monkeypatch, tmp_path):
                     {"name": "review", "status": "loaded", "path": "/private/plugin"},
                     "/private/plugins/design-helper",
                 ],
+                # CLI 2.1.219+ startup diagnostics: gateway-log-only, must
+                # never reach the Noah wire (not in _SYSTEM_DATA_FIELDS).
+                "mcp_server_errors": [
+                    {
+                        "name": "brokensrv",
+                        "type": "invalid_config",
+                        "message": "Skipped — invalid MCP server config",
+                    }
+                ],
             },
         },
         {
@@ -263,6 +272,7 @@ def test_stateless_stream_projects_sdk_messages_for_noah(monkeypatch, tmp_path):
         "design-helper",
     ]
     assert "cwd" not in init["data"]
+    assert "brokensrv" not in response.text  # startup diagnostics stay log-only
     task = sdk[1]
     assert task["task_id"] == "task-1"
     assert task["task_type"] == "subagent"
@@ -407,6 +417,42 @@ def test_v1_rejects_unsupported_agent_and_non_stream(monkeypatch, tmp_path):
     assert non_stream.status_code == 400
     assert "requires stream=true" in non_stream.json()["error"]["message"]
     assert backend.create_kwargs is None
+
+
+def test_effort_is_forwarded_to_create_client(monkeypatch, tmp_path):
+    backend = _FakeBackend(
+        [{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}]
+    )
+    _install_endpoint_fakes(monkeypatch, tmp_path, backend)
+
+    response = TestClient(main.app).post(
+        "/v1/agents/messages",
+        json={"effort": "max", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    assert response.status_code == 200
+    assert backend.create_kwargs["effort"] == "max"
+
+
+def test_effort_defaults_to_none_and_unknown_level_is_rejected(monkeypatch, tmp_path):
+    backend = _FakeBackend(
+        [{"type": "result", "subtype": "success", "is_error": False, "result": "ok"}]
+    )
+    _install_endpoint_fakes(monkeypatch, tmp_path, backend)
+    client = TestClient(main.app)
+
+    ok = client.post(
+        "/v1/agents/messages",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+    bad = client.post(
+        "/v1/agents/messages",
+        json={"effort": "minimal", "messages": [{"role": "user", "content": "hi"}]},
+    )
+
+    assert ok.status_code == 200
+    assert backend.create_kwargs["effort"] is None
+    assert bad.status_code == 422
 
 
 def test_partial_message_override_does_not_change_default_responses_behavior():

@@ -819,6 +819,50 @@ def _validate_continuation_output_format(
     )
 
 
+def _response_reasoning_effort(body: ResponseCreateRequest) -> Optional[str]:
+    """Extract the requested ``reasoning.effort`` value, or ``None``."""
+    return body.reasoning.effort if body.reasoning is not None else None
+
+
+def _validate_reasoning_backend(effort: Optional[str], backend_name: str) -> None:
+    """Reject reasoning.effort requests for backends that can't honor them."""
+    if effort is not None and backend_name != "claude":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"reasoning.effort is not supported by the '{backend_name}' "
+                f"backend; only the claude backend supports reasoning control"
+            ),
+        )
+
+
+def _validate_continuation_reasoning(client: Any, effort: Optional[str]) -> None:
+    """Fail closed when a continuation asks for a different reasoning effort.
+
+    Thinking/effort ride CLI flags baked into the SDK client at create time;
+    there is no runtime API to change them. Re-sending the value the session
+    already runs with is a no-op (OpenAI clients typically resend the full
+    request config every turn); asking for a different one is rejected
+    instead of silently ignored.
+    """
+    if effort is None:
+        return
+    opts = getattr(client, "options", None)
+    if effort == "none":
+        if getattr(opts, "thinking", None) == {"type": "disabled"}:
+            return
+    elif getattr(opts, "effort", None) == effort:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            "reasoning.effort cannot be changed on a continuation turn; it "
+            "is fixed when the session is created. Start a new session to "
+            "apply a different effort."
+        ),
+    )
+
+
 def _response_prompt_and_system(
     body: ResponseCreateRequest,
     workspace: Path,
@@ -1015,6 +1059,7 @@ async def _ensure_response_session_client(
     output_format = _response_output_format(body)
     if session.client is not None:
         _validate_continuation_output_format(session.client, output_format)
+        _validate_continuation_reasoning(session.client, _response_reasoning_effort(body))
         await _refresh_existing_client_policy(body, backend, session.client)
         return
 
@@ -1035,6 +1080,13 @@ async def _ensure_response_session_client(
     create_kwargs: Dict[str, Any] = {}
     if output_format is not None:
         create_kwargs["output_format"] = output_format
+    # Like output_format, ``effort`` is claude-only and only passed when set:
+    # the route preflight already rejected reasoning.effort for other
+    # backends, so this keyword never reaches a create_client() that doesn't
+    # accept it.
+    reasoning_effort = _response_reasoning_effort(body)
+    if reasoning_effort is not None:
+        create_kwargs["effort"] = reasoning_effort
     # Per-request MCP header injection (persistent session path). ``user`` is
     # consumed by the claude backend only (system-prompt identity); the resolved
     # context header goes to both claude and codex. opencode's create_client
@@ -1897,6 +1949,7 @@ async def create_response(
     validate_image_request(body, backend)
     validate_model_vision_support(body, resolved)
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
+    _validate_reasoning_backend(_response_reasoning_effort(body), resolved.backend)
 
     # Per-request MCP context header (identity + caller-owned credentials).
     # Only the claude and codex backends consume it, so skip the env-read + JSON
@@ -2436,6 +2489,9 @@ async def _handle_function_call_output(
     if session.client is not None:
         try:
             _validate_continuation_output_format(session.client, _response_output_format(body))
+            _validate_continuation_reasoning(
+                session.client, _response_reasoning_effort(body)
+            )
             await _refresh_existing_client_policy(body, backend, session.client)
         except Exception:
             if session.lock.locked():

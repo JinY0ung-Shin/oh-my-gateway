@@ -649,6 +649,7 @@ async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):
             mcp_servers=get_mcp_servers(),
             cwd=str(workspace),
             include_partial_messages=True,
+            effort=body.effort,
         )
         session.client = client
 

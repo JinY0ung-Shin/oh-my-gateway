@@ -115,6 +115,28 @@ class TestTypeCoercion:
         assert runtime_config.get("default_model") == "123"
 
 
+class TestAgentTeamsOriginal:
+    """agent_teams_enabled derives its original from the CLI gate env var."""
+
+    def test_original_false_when_env_absent(self, monkeypatch):
+        monkeypatch.delenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", raising=False)
+        assert runtime_config.get("agent_teams_enabled") is False
+
+    def test_original_true_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        assert runtime_config.get("agent_teams_enabled") is True
+
+    def test_original_mirrors_cli_truthiness_for_zero(self, monkeypatch):
+        """The CLI gate is raw string truthiness — "0" still activates it."""
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "0")
+        assert runtime_config.get("agent_teams_enabled") is True
+
+    def test_override_beats_env(self, monkeypatch):
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        runtime_config.set("agent_teams_enabled", False)
+        assert runtime_config.get("agent_teams_enabled") is False
+
+
 class TestConvenienceGetters:
     def test_get_default_model(self):
         from src.constants import DEFAULT_MODEL

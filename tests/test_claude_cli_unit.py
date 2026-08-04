@@ -33,6 +33,9 @@ def _make_cli(cli_class):
     cli = MagicMock()
     cli._convert_message = cli_class._convert_message.__get__(cli, cli_class)
     cli._TYPE_CHECKS = cli_class._TYPE_CHECKS
+    # Bind the real static helper so init-message conversions exercise the
+    # mcp_server_errors logging instead of a MagicMock auto-attribute.
+    cli._log_init_mcp_server_errors = cli_class._log_init_mcp_server_errors
     return cli
 
 
@@ -575,6 +578,64 @@ class TestBuildSdkOptions:
                 assert "bogus" in mock_logger.warning.call_args[0][0]
                 assert getattr(opts, "thinking", None) is None
 
+    def test_effort_level_sets_adaptive_thinking_and_effort(self, cli_instance):
+        """A request-scoped effort level rides adaptive thinking + options.effort."""
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            opts = cli_instance._build_sdk_options(effort=level)
+            assert opts.thinking == {"type": "adaptive"}
+            assert opts.effort == level
+
+    def test_effort_none_disables_thinking_explicitly(self, cli_instance):
+        """effort='none' sends an explicit thinking=disabled, no effort flag."""
+        opts = cli_instance._build_sdk_options(effort="none")
+        assert opts.thinking == {"type": "disabled"}
+        assert getattr(opts, "effort", None) is None
+
+    def test_effort_overrides_global_thinking_mode(self, cli_instance):
+        """Request effort wins over the global THINKING_MODE runtime setting."""
+        with patch("src.runtime_config.runtime_config.get", return_value="enabled"):
+            opts = cli_instance._build_sdk_options(effort="low")
+        assert opts.thinking == {"type": "adaptive"}
+        assert opts.effort == "low"
+
+        with patch("src.runtime_config.runtime_config.get", return_value="adaptive"):
+            opts = cli_instance._build_sdk_options(effort="none")
+        assert opts.thinking == {"type": "disabled"}
+
+    def test_agent_teams_not_injected_without_override(self, cli_instance, monkeypatch):
+        """No admin override → the CLI gate env passes through untouched."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        runtime_config.reset("agent_teams_enabled")
+        opts = cli_instance._build_sdk_options()
+        assert "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS" not in (opts.env or {})
+
+    def test_agent_teams_override_on_stamps_gate(self, cli_instance):
+        """Admin override ON injects CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1."""
+        from src.runtime_config import runtime_config
+
+        runtime_config.set("agent_teams_enabled", True)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert opts.env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
+        finally:
+            runtime_config.reset("agent_teams_enabled")
+
+    def test_agent_teams_override_off_masks_inherited_export(
+        self, cli_instance, monkeypatch
+    ):
+        """Admin override OFF masks an operator export with an empty value."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
+        runtime_config.set("agent_teams_enabled", False)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert opts.env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == ""
+        finally:
+            runtime_config.reset("agent_teams_enabled")
+
     def test_include_partial_messages_when_token_streaming(self, cli_instance):
         """TOKEN_STREAMING=True sets include_partial_messages."""
         with patch("src.runtime_config.runtime_config.get", return_value=True):
@@ -819,6 +880,85 @@ class TestConvertMessageTypeMap:
         assert result["uuid"] == "rl-1"
         # rate_limit_info should be the real dataclass, not a dict
         assert hasattr(result["rate_limit_info"], "status")
+
+
+class TestInitMcpServerErrorsLogging:
+    """_convert_message logs init.mcp_server_errors (CLI 2.1.219+) as warnings."""
+
+    def test_skipped_servers_are_logged(self, cli_class, caplog):
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        # Field shape observed live on the bundled CLI 2.1.220.
+        message = SystemMessage(
+            subtype="init",
+            data={
+                "model": "sonnet",
+                "mcp_server_errors": [
+                    {
+                        "name": "badcmd",
+                        "type": "invalid_config",
+                        "message": (
+                            'Skipped — invalid MCP server config for "badcmd": '
+                            "command: expected string, received number"
+                        ),
+                    },
+                    # No message: the log falls back to the entry type.
+                    {"name": "nourl", "type": "invalid_config"},
+                ],
+            },
+        )
+
+        with caplog.at_level("WARNING"):
+            converted = cli._convert_message(message)
+
+        assert converted["type"] == "system"
+        assert converted["data"]["mcp_server_errors"]  # conversion untouched
+        assert "'badcmd'" in caplog.text
+        assert "command: expected string" in caplog.text
+        assert "'nourl'" in caplog.text
+        assert "invalid_config" in caplog.text
+
+    def test_clean_init_logs_nothing(self, cli_class, caplog):
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        message = SystemMessage(
+            subtype="init", data={"model": "sonnet", "mcp_servers": [{"name": "ok"}]}
+        )
+
+        with caplog.at_level("WARNING"):
+            cli._convert_message(message)
+
+        assert "skipped MCP server" not in caplog.text
+
+    def test_non_init_subtype_logs_nothing(self, cli_class, caplog):
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        message = SystemMessage(
+            subtype="status", data={"mcp_server_errors": [{"name": "x"}]}
+        )
+
+        with caplog.at_level("WARNING"):
+            cli._convert_message(message)
+
+        assert "skipped MCP server" not in caplog.text
+
+    def test_dict_passthrough_also_logs(self, cli_class, caplog):
+        """Chunks arriving as plain dicts get the same startup diagnostics."""
+        cli = _make_cli(cli_class)
+        chunk = {
+            "type": "system",
+            "subtype": "init",
+            "data": {"mcp_server_errors": [{"name": "ghost", "message": "Skipped"}]},
+        }
+
+        with caplog.at_level("WARNING"):
+            assert cli._convert_message(chunk) is chunk
+
+        assert "'ghost'" in caplog.text
+        assert "Skipped" in caplog.text
 
 
 class TestConvertMessageEdgeCases:

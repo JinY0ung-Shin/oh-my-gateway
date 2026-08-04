@@ -1172,3 +1172,121 @@ class TestTaskEventSerializationResilience:
         assert payload["status"] == "completed"
         # The callable is coerced to a string rather than crashing serialization.
         assert isinstance(payload["patch"]["on_done"], str)
+
+
+class TestTeammateMessageTextExtraction:
+    """A teammate's message is detected across the content shapes a user chunk
+    can arrive in: dict text blocks, an SDK TextBlock (which carries no ``type``
+    field), the ``message.content`` fallback, and plain-string content."""
+
+    TEXT = (
+        "Another Claude session sent a message:\n\nfrom=builder\nDone with the "
+        "migration.\n\nThis came from another Claude session — reply with "
+        "SendMessage to the `from=` address."
+    )
+
+    def test_dict_text_block(self):
+        from src.streaming_utils import _user_chunk_texts
+
+        chunk = {"type": "user", "content": [{"type": "text", "text": self.TEXT}]}
+        assert _user_chunk_texts(chunk) == [self.TEXT]
+
+    def test_sdk_text_block_without_type_field(self):
+        from claude_agent_sdk.types import TextBlock
+        from src.streaming_utils import _user_chunk_texts
+
+        chunk = {"type": "user", "content": [TextBlock(text=self.TEXT)]}
+        assert _user_chunk_texts(chunk) == [self.TEXT]
+
+    def test_message_content_fallback(self):
+        from src.streaming_utils import _user_chunk_texts
+
+        chunk = {
+            "type": "user",
+            "message": {"content": [{"type": "text", "text": self.TEXT}]},
+        }
+        assert _user_chunk_texts(chunk) == [self.TEXT]
+
+    def test_plain_string_content(self):
+        from src.streaming_utils import _user_chunk_texts
+
+        assert _user_chunk_texts({"type": "user", "content": self.TEXT}) == [self.TEXT]
+
+    def test_non_text_blocks_are_skipped(self):
+        from src.streaming_utils import _user_chunk_texts
+
+        chunk = {
+            "type": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "tu_1", "content": "out"},
+                ToolResultBlock(tool_use_id="tu_2", content="out", is_error=False),
+                {"type": "thinking", "thinking": "hmm"},
+            ],
+        }
+        assert _user_chunk_texts(chunk) == []
+
+    def test_unusable_content_returns_empty(self):
+        from src.streaming_utils import _user_chunk_texts
+
+        assert _user_chunk_texts({"type": "user"}) == []
+        assert _user_chunk_texts({"type": "user", "content": 42}) == []
+
+    def test_teammate_event_built_from_each_shape(self):
+        from src.streaming_utils import _teammate_message_events
+
+        seq = iter(range(1, 100))
+        for content in (
+            [{"type": "text", "text": self.TEXT}],
+            self.TEXT,
+        ):
+            events = _teammate_message_events(
+                {"type": "user", "content": content, "session_id": "s9"},
+                lambda: next(seq),
+            )
+            assert len(events) == 1
+            event_line, data_line = events[0].strip().splitlines()
+            assert event_line == "event: response.teammate_message"
+            payload = json.loads(data_line[len("data: ") :])
+            assert payload["type"] == "response.teammate_message"
+            assert payload["text"] == self.TEXT
+            assert payload["from"] == "builder"
+            assert payload["session_id"] == "s9"
+
+
+class TestTeammateMessageFromParsing:
+    """Address parsing covers both CLI body framings and never reads the
+    literal ``from=`` inside the trailing reply guidance as an address."""
+
+    GUIDANCE = (
+        "This came from another Claude session — reply via SendMessage to "
+        "the `from=` address."
+    )
+
+    def test_colon_framed_address_excludes_colon(self):
+        from src.sse_builders import parse_teammate_message_from
+
+        text = (
+            "Another Claude session sent a message:\n\n"
+            f"from=reviewer-2: the auth test is flaky.\n\n{self.GUIDANCE}"
+        )
+        assert parse_teammate_message_from(text) == "reviewer-2"
+
+    def test_teammate_tag_frame_from_newer_clis(self):
+        from src.sse_builders import parse_teammate_message_from
+
+        text = (
+            "Another Claude session sent a message:\n"
+            '<teammate-message teammate_id="gateway-lane" color="blue" '
+            'summary="suite green">\nDone.\n</teammate-message>\n'
+            "This came from another Claude session — not typed by your user."
+        )
+        assert parse_teammate_message_from(text) == "gateway-lane"
+
+    def test_guidance_literal_alone_yields_none(self):
+        from src.sse_builders import parse_teammate_message_from
+
+        text = (
+            "Another Claude session sent a message:\n\n"
+            f"no address in this body\n\n{self.GUIDANCE}"
+        )
+        assert parse_teammate_message_from(text) is None

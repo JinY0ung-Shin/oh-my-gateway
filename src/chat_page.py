@@ -462,6 +462,7 @@ body {
 .tool-status.error   { color: var(--red); }
 /* Per-tool-type badge colors */
 .tool-badge.cat-agent   { color: var(--magenta); border-color: var(--magenta); }
+.tool-badge.cat-team    { color: var(--magenta); border-color: var(--magenta); }
 .tool-badge.cat-bash    { color: var(--green); border-color: var(--green-dim); }
 .tool-badge.cat-read    { color: var(--cyan); border-color: var(--cyan-dim); }
 .tool-badge.cat-write,
@@ -534,6 +535,33 @@ body {
 .task-status-line[data-state="error"]   { border-left-color: var(--red-dim); color: var(--red); }
 .task-status-line .task-status-glyph { flex: 0 0 auto; font-weight: 700; }
 .task-status-line .task-status-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Agent-team teammate message: an inbound bubble from another session */
+.message.teammate .role { color: var(--magenta); }
+.message.teammate .role .teammate-from { text-transform: none; letter-spacing: 0; }
+.message.teammate .bubble {
+  border-color: var(--magenta);
+  background: var(--magenta-subtle);
+}
+.teammate-raw { margin-top: 0.25rem; }
+.teammate-raw summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: var(--fs-xs);
+  list-style: none;
+}
+.teammate-raw summary::-webkit-details-marker { display: none; }
+.teammate-raw pre {
+  margin: 0.25rem 0 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
 
 /* === Input area === */
 .input-area {
@@ -1050,6 +1078,7 @@ function toolMeta(name) {
   const raw = name || 'tool';
   const n = raw.toLowerCase();
   if (n === 'task' || n === 'agent') return { cls: 'cat-agent', glyph: '✦', label: raw };
+  if (n === 'teamcreate' || n === 'teamdelete' || n === 'sendmessage') return { cls: 'cat-team', glyph: '⇄', label: raw };
   if (n.indexOf('mcp__') === 0) return { cls: 'cat-mcp', glyph: '⚙', label: raw };
   if (n === 'bash' || n === 'bashoutput' || n === 'killshell' || n === 'killbash') return { cls: 'cat-bash', glyph: '$', label: raw };
   if (n === 'read' || n === 'notebookread') return { cls: 'cat-read', glyph: '▤', label: raw };
@@ -1058,6 +1087,7 @@ function toolMeta(name) {
   if (n === 'grep' || n === 'glob' || n === 'ls') return { cls: 'cat-search', glyph: '⌕', label: raw };
   if (n === 'webfetch' || n === 'websearch') return { cls: 'cat-web', glyph: '◎', label: raw };
   if (n === 'todowrite' || n === 'todoread') return { cls: 'cat-todo', glyph: '☑', label: raw };
+  if (n === 'taskcreate' || n === 'taskupdate' || n === 'tasklist' || n === 'taskget') return { cls: 'cat-todo', glyph: '☑', label: raw };
   if (n === 'askuserquestion') return { cls: 'cat-ask', glyph: '?', label: raw };
   return { cls: 'cat-default', glyph: '▸', label: raw };
 }
@@ -1159,6 +1189,12 @@ function renderToolUse(evt) {
   if (isAgent) {
     const who = input.subagent_type ? '@' + input.subagent_type : '';
     title = [who, input.description || summarizeInput(input)].filter(Boolean).join('  ');
+  } else if (meta.cls === 'cat-team') {
+    // SendMessage → "→ @recipient  body", Team* → "team_name  description".
+    const target = input.to ? '→ @' + input.to : (input.team_name || input.name || '');
+    const body = input.summary || input.content || input.message || input.description || '';
+    title = ([target, body].filter(Boolean).join('  ') || summarizeInput(input))
+      .replace(/\s+/g, ' ').trim().slice(0, 140);
   } else {
     title = summarizeInput(input);
   }
@@ -1193,6 +1229,49 @@ function attachToolResult(card, content, isError) {
   const pill = details && details.querySelector(':scope > summary > .tool-status');
   if (pill) { pill.className = 'tool-status ' + status; pill.textContent = statusGlyph(status); }
   scrollToBottom();
+}
+
+// --- Agent-team teammate messages ---
+
+// Best-effort body extraction from the CLI's injected framing. The gateway
+// passes the injected user-message text through verbatim (framing and all)
+// and leaves presentation to the client — this is that presentation choice.
+// Unknown framings fall through to the raw text, never to an empty bubble.
+function extractTeammateBody(text) {
+  const s = String(text || '');
+  // Newer CLIs frame the body in a <teammate-message> tag.
+  const tag = s.match(/<teammate-message\b[^>]*>([\s\S]*?)<\/teammate-message>/);
+  if (tag && tag[1].trim()) return tag[1].trim();
+  // Pinned-CLI framing: opener line, an optional from= address line, the
+  // body, then trailing "This came from another Claude session…" guidance.
+  const body = s
+    .replace(/^Another Claude session sent a message[^\n]*\n+/, '')
+    .replace(/\n+This came from another Claude session[\s\S]*$/, '')
+    .replace(/^from=[A-Za-z0-9._-]+\n/, '')
+    .trim();
+  return body || s;
+}
+
+// Render a response.teammate_message event as its own inbound bubble, with
+// the raw injected text kept one click away.
+function renderTeammateMessage(evt) {
+  welcomeEl.style.display = 'none';
+  const raw = String(evt.text || '');
+  const body = extractTeammateBody(raw);
+  const from = evt.from ? String(evt.from) : '';
+  const div = document.createElement('div');
+  div.className = 'message teammate';
+  let html = '<div class="role">⇄ teammate' +
+    (from ? ' · <span class="teammate-from">' + escapeHtml(from) + '</span>' : '') +
+    '</div><div class="bubble">' + escapeHtml(body) + '</div>';
+  if (body !== raw) {
+    html += '<details class="teammate-raw"><summary>RAW MESSAGE</summary><pre>' +
+      escapeHtml(raw) + '</pre></details>';
+  }
+  div.innerHTML = html;
+  chatEl.appendChild(div);
+  scrollToBottom();
+  return div;
 }
 
 // Maintain ONE live status line per subagent, nested under the spawning agent,
@@ -1621,6 +1700,13 @@ async function streamRequest(body) {
           upsertTaskStatus(evt);
           const label = type.slice('response.'.length).replace('task_', '');
           setStatus('streaming', 'agent: ' + label);
+        }
+
+        // --- Agent-team teammate message to the leader ---
+        if (type === 'response.teammate_message') {
+          finalizeActiveBubble();
+          renderTeammateMessage(evt);
+          setStatus('streaming', '⇄ teammate' + (evt.from ? ' · ' + evt.from : ''));
         }
 
         // --- Liveness: tool call starting (before its arguments finish) ---
