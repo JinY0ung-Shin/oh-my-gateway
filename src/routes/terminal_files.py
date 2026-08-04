@@ -29,8 +29,10 @@ name so the two agree (no code coupling to the caller's product).
 
 Config:
 - ``WORKSPACE_USER_HEADER`` — inbound identity header name (default ``X-User-Email``).
-- ``WORKSPACE_HIDE_DOTFILES`` — when true (default), dot-prefixed entries are
-  neither listed nor accessible.
+- ``WORKSPACE_HIDE_DOTFILES`` — when true, dot-prefixed entries are neither
+  listed nor accessible. Default **false**: hiding is a presentation choice that
+  belongs to the client rendering the tree, and hiding them here also blocks
+  writes to the workspace's agent-resource directories.
 
 Concurrency:
 - Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
@@ -100,8 +102,19 @@ def _user_header() -> str:
 
 
 def _hide_dotfiles() -> bool:
-    """When true (default), dot-prefixed entries are neither listed nor accessible."""
-    return os.getenv("WORKSPACE_HIDE_DOTFILES", "true").strip().lower() == "true"
+    """When true, dot-prefixed entries are neither listed nor accessible.
+
+    Defaults to **false**: hiding dotfiles protects nothing here — the agent
+    itself reads and writes them freely through Bash/Read within the same
+    workspace, and the real guards are ``API_KEY`` plus root confinement. What it
+    *did* do was make the workspace's agent-resource directories unreachable over
+    ``/files/*`` (a 404 on any dot-prefixed component, including writes), which
+    silently breaks clients that install skills/subagents through this API. Hiding
+    is presentation, so it belongs to the client that renders the tree — see the
+    Finder-style "show hidden items" toggle in ChatDRAGON's files panel. Set this
+    to ``true`` to restore server-side hiding for a deployment that wants it.
+    """
+    return os.getenv("WORKSPACE_HIDE_DOTFILES", "false").strip().lower() == "true"
 
 
 def _ensure_api_key() -> None:
