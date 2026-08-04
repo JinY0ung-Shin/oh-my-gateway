@@ -1854,6 +1854,51 @@ def test_list_mcp_servers_filters_safe_fields():
     assert "token" not in body["servers"][1]["config"]
 
 
+def test_list_agents_returns_discovered_catalog_minus_env_denied():
+    discovered = [
+        {"name": "general-purpose", "description": "General agent"},
+        {"name": "statusline-setup", "description": "Denied by env default"},
+        {"name": "testplugin:reporter", "description": "Plugin agent"},
+        {"name": "workspace-agent", "description": "From .claude/agents"},
+    ]
+
+    async def _fake_agents(cwd=None, force=False):
+        return discovered
+
+    with (
+        client_context() as (client, _mock_cli),
+        patch(
+            "src.backends.claude.slash_commands.get_available_agents",
+            side_effect=_fake_agents,
+        ),
+    ):
+        response = client.get("/v1/agents", headers={"X-User": "dev"})
+
+    body = response.json()
+    assert response.status_code == 200
+    names = [a["name"] for a in body["agents"]]
+    # Default DISALLOWED_SUBAGENT_TYPES ("statusline-setup") is filtered out.
+    assert names == ["general-purpose", "testplugin:reporter", "workspace-agent"]
+    assert body["total"] == 3
+
+
+def test_list_agents_empty_on_discovery_failure():
+    async def _boom(cwd=None, force=False):
+        raise RuntimeError("no CLI")
+
+    with (
+        client_context() as (client, _mock_cli),
+        patch(
+            "src.backends.claude.slash_commands.get_available_agents",
+            side_effect=_boom,
+        ),
+    ):
+        response = client.get("/v1/agents")
+
+    assert response.status_code == 200
+    assert response.json() == {"agents": [], "total": 0}
+
+
 def test_auth_status_endpoint_uses_runtime_key_source():
     original_main_key = getattr(main, "runtime_api_key", None)
     main.runtime_api_key = "runtime-key"

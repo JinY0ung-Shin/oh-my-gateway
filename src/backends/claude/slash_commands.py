@@ -102,8 +102,8 @@ class _Cache:
 _cache = _Cache()
 
 
-async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
-    """Pull the registered slash-command names from the SDK.
+async def _fetch_server_info(cwd: Optional[Path]) -> dict:
+    """Run a CLI preflight and return its ``get_server_info()`` payload.
 
     Uses the same setting sources as the backend's SDK calls so user-scope
     plugin skills installed by the admin panel are visible to the preflight.
@@ -111,15 +111,20 @@ async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
     from src.backends.claude.client import _get_setting_sources
 
     opts = ClaudeAgentOptions(cwd=cwd, setting_sources=_get_setting_sources())
-    names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
-    if info:
-        for c in info.get("commands") or []:
-            if isinstance(c, dict):
-                name = c.get("name")
-                if isinstance(name, str) and name:
-                    names.add(name)
+    return info or {}
+
+
+async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
+    """Pull the registered slash-command names from the SDK."""
+    info = await _fetch_server_info(cwd)
+    names: set[str] = set()
+    for c in info.get("commands") or []:
+        if isinstance(c, dict):
+            name = c.get("name")
+            if isinstance(name, str) and name:
+                names.add(name)
     return names
 
 
@@ -133,6 +138,42 @@ async def get_available_commands(
         _cache.commands = await _fetch_commands(cwd)
         _cache.fetched_at = time.monotonic()
         return _cache.commands
+
+
+# -- Discovered subagent catalog -------------------------------------------
+#
+# The same preflight also reports the agent definitions the CLI discovered
+# (builtin + plugin + workspace ``.claude/agents``). Unlike commands this is
+# cached PER cwd: sessions run in per-user workspaces, and workspace agents
+# differ between users.
+
+_agents_cache: dict[str, tuple[float, list[dict[str, str]]]] = {}
+_agents_lock = asyncio.Lock()
+
+
+async def get_available_agents(
+    cwd: Optional[Path] = None, force: bool = False
+) -> list[dict[str, str]]:
+    """Return the CLI-discovered agent catalog ``[{name, description}]``.
+
+    Names are the exact registered agent types — plugin agents come back
+    plugin-qualified (``plugin:agent``) — so they can be used verbatim in
+    ``Agent(<name>)`` permission rules.
+    """
+    key = str(cwd) if cwd else ""
+    async with _agents_lock:
+        hit = _agents_cache.get(key)
+        if not force and hit and (time.monotonic() - hit[0]) < CACHE_TTL_SECONDS:
+            return hit[1]
+        info = await _fetch_server_info(cwd)
+        agents: list[dict[str, str]] = []
+        for a in info.get("agents") or []:
+            if isinstance(a, dict) and isinstance(a.get("name"), str) and a["name"]:
+                agents.append(
+                    {"name": a["name"], "description": str(a.get("description") or "")}
+                )
+        _agents_cache[key] = (time.monotonic(), agents)
+        return agents
 
 
 def extract_command_name(prompt: str) -> Optional[str]:

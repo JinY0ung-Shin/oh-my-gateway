@@ -3,6 +3,7 @@
 import os
 import asyncio
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Request, Response, Depends
@@ -65,6 +66,55 @@ async def list_mcp_servers(
         servers.append({"name": name, "config": safe_config})
 
     return {"servers": servers, "total": len(servers)}
+
+
+_AGENT_DENY_RULE_RE = re.compile(r"^Agent\((.+)\)$")
+
+
+@router.get("/v1/agents")
+@rate_limit_endpoint("general")
+async def list_agents(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """List subagent types the Claude CLI discovers for a session.
+
+    Covers builtin, plugin (plugin-qualified names), and workspace
+    ``.claude/agents`` definitions. When the caller identifies a user
+    (``X-User`` header or ``user`` query param), discovery runs in that
+    user's workspace so per-workspace agents are included. Names are the
+    exact registered agent types, usable verbatim in ``Agent(<name>)``
+    allow/deny rules. Gateway-env-disallowed types are filtered out.
+    Returns an empty catalog when the Claude backend is unavailable.
+    """
+    await verify_api_key(request, credentials)
+
+    user = request.headers.get("X-User") or request.query_params.get("user")
+    cwd = None
+    if user:
+        try:
+            from src.workspace_manager import workspace_manager
+
+            cwd = workspace_manager.resolve(user, backend="claude")
+        except Exception:
+            logger.debug("workspace resolve failed for /v1/agents", exc_info=True)
+
+    try:
+        from src.backends.claude import slash_commands
+        from src.backends.claude.constants import DISALLOWED_SUBAGENT_TYPES
+
+        agents = await slash_commands.get_available_agents(cwd)
+        denied = {
+            m.group(1)
+            for rule in DISALLOWED_SUBAGENT_TYPES
+            if (m := _AGENT_DENY_RULE_RE.match(rule))
+        }
+        agents = [a for a in agents if a["name"] not in denied]
+    except Exception:
+        logger.warning("agent catalog discovery failed", exc_info=True)
+        agents = []
+
+    return {"agents": agents, "total": len(agents)}
 
 
 @router.get("/health")
