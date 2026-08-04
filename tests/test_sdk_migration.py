@@ -304,6 +304,35 @@ class TestTaskToolCatalog:
         assert "TodoWrite" in CLAUDE_TOOLS
 
 
+class TestCliPathOverride:
+    """CLAUDE_CLI_PATH overrides the SDK's bundled CLI, failing safe."""
+
+    def test_unset_returns_none(self, monkeypatch):
+        from src.backends.claude import client as client_module
+
+        monkeypatch.setattr(client_module, "CLAUDE_CLI_PATH", None)
+        assert client_module._get_cli_path() is None
+
+    def test_executable_path_is_used(self, monkeypatch, tmp_path):
+        from src.backends.claude import client as client_module
+
+        cli = tmp_path / "claude"
+        cli.write_text("#!/bin/sh\n")
+        cli.chmod(0o755)
+        monkeypatch.setattr(client_module, "CLAUDE_CLI_PATH", str(cli))
+        assert client_module._get_cli_path() == str(cli)
+
+    def test_bogus_path_ignored_with_warning(self, monkeypatch, caplog):
+        from src.backends.claude import client as client_module
+
+        monkeypatch.setattr(
+            client_module, "CLAUDE_CLI_PATH", "/nonexistent/claude-bin"
+        )
+        with caplog.at_level("WARNING"):
+            assert client_module._get_cli_path() is None
+        assert any("CLAUDE_CLI_PATH" in r.message for r in caplog.records)
+
+
 class TestSkillsOptionMigration:
     """`Skill` allowed_tools entry should be transformed into `skills="all"`."""
 

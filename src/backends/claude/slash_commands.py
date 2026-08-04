@@ -108,9 +108,11 @@ async def _fetch_server_info(cwd: Optional[Path]) -> dict:
     Uses the same setting sources as the backend's SDK calls so user-scope
     plugin skills installed by the admin panel are visible to the preflight.
     """
-    from src.backends.claude.client import _get_setting_sources
+    from src.backends.claude.client import _get_cli_path, _get_setting_sources
 
-    opts = ClaudeAgentOptions(cwd=cwd, setting_sources=_get_setting_sources())
+    opts = ClaudeAgentOptions(
+        cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
+    )
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
     return info or {}

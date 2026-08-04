@@ -36,6 +36,7 @@ from claude_agent_sdk.types import (
 )
 from src.backends.claude.constants import (
     configured_public_models,
+    CLAUDE_CLI_PATH,
     DEFAULT_ALLOWED_TOOLS,
     DEFAULT_TASK_BUDGET,
     THINKING_BUDGET_TOKENS,
@@ -108,6 +109,27 @@ def _granular_skill_names(tools: List[str]) -> List[str]:
         if content:
             names.add(content)
     return sorted(names)
+
+
+def _get_cli_path() -> Optional[str]:
+    """Resolve the operator CLI override, or ``None`` for the SDK's bundled CLI.
+
+    The SDK prefers its bundled binary over PATH, so pointing sessions at a
+    different CLI (e.g. one whose MCP client speaks a newer protocol revision)
+    requires an explicit ``cli_path``. Fail safe: a CLAUDE_CLI_PATH that is not
+    an executable file is ignored with a warning rather than breaking session
+    creation.
+    """
+    if not CLAUDE_CLI_PATH:
+        return None
+    path = Path(CLAUDE_CLI_PATH)
+    if path.is_file() and os.access(path, os.X_OK):
+        return str(path)
+    logger.warning(
+        "CLAUDE_CLI_PATH=%r is not an executable file; using the SDK's bundled CLI",
+        CLAUDE_CLI_PATH,
+    )
+    return None
 
 
 def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
@@ -712,6 +734,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             max_turns=max_turns,
             cwd=effective_cwd,
             setting_sources=_get_setting_sources(),
+            cli_path=_get_cli_path(),
         )
 
         self._configure_thinking(options, effort)
