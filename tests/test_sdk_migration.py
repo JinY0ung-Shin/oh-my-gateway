@@ -304,6 +304,35 @@ class TestTaskToolCatalog:
         assert "TodoWrite" in CLAUDE_TOOLS
 
 
+class TestCliPathOverride:
+    """CLAUDE_CLI_PATH overrides the SDK's bundled CLI, failing safe."""
+
+    def test_unset_returns_none(self, monkeypatch):
+        from src.backends.claude import client as client_module
+
+        monkeypatch.setattr(client_module, "CLAUDE_CLI_PATH", None)
+        assert client_module._get_cli_path() is None
+
+    def test_executable_path_is_used(self, monkeypatch, tmp_path):
+        from src.backends.claude import client as client_module
+
+        cli = tmp_path / "claude"
+        cli.write_text("#!/bin/sh\n")
+        cli.chmod(0o755)
+        monkeypatch.setattr(client_module, "CLAUDE_CLI_PATH", str(cli))
+        assert client_module._get_cli_path() == str(cli)
+
+    def test_bogus_path_ignored_with_warning(self, monkeypatch, caplog):
+        from src.backends.claude import client as client_module
+
+        monkeypatch.setattr(
+            client_module, "CLAUDE_CLI_PATH", "/nonexistent/claude-bin"
+        )
+        with caplog.at_level("WARNING"):
+            assert client_module._get_cli_path() is None
+        assert any("CLAUDE_CLI_PATH" in r.message for r in caplog.records)
+
+
 class TestSkillsOptionMigration:
     """`Skill` allowed_tools entry should be transformed into `skills="all"`."""
 
@@ -341,7 +370,7 @@ class TestSkillsOptionMigration:
         backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
         options = ClaudeAgentOptions(max_turns=1)
         options.skills = "all"
-        await backend._apply_hidden_skills(options)
+        await backend._apply_skills_allowlist(options)
 
         # "verify" hidden, "compact" dropped as an always-blocked builtin.
         assert options.skills == ["review", "simplify"]
@@ -357,7 +386,7 @@ class TestSkillsOptionMigration:
         backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
         options = ClaudeAgentOptions(max_turns=1)
         options.skills = "all"
-        await backend._apply_hidden_skills(options)
+        await backend._apply_skills_allowlist(options)
 
         assert options.skills == "all"
 
@@ -400,14 +429,19 @@ class TestSkillsOptionMigration:
         """A granular skills list is narrowed by HIDDEN_SKILLS, not replaced."""
         from claude_agent_sdk import ClaudeAgentOptions
         from src.backends.claude import client as client_module
+        from src.backends.claude import slash_commands
         from src.backends.claude.client import ClaudeCodeCLI
 
+        async def _fake_available(cwd=None, force=False):
+            return {"summarize", "translate"}
+
         monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"translate"}))
+        monkeypatch.setattr(slash_commands, "get_available_commands", _fake_available)
 
         backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
         options = ClaudeAgentOptions(max_turns=1)
         options.skills = ["summarize", "translate"]
-        await backend._apply_hidden_skills(options)
+        await backend._apply_skills_allowlist(options)
 
         assert options.skills == ["summarize"]
 
@@ -468,6 +502,141 @@ class TestSkillsOptionMigration:
         assert "mcp__*" in (options.allowed_tools or [])
         assert getattr(options, "skills", None) == "all"
         assert "Skill(:*)" in (options.allowed_tools or [])
+
+    def test_skill_catch_all_alone_does_not_seed_allowlist(self):
+        """``Skill(:*)`` carries no name — not a subset request."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill(:*)"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) is None
+
+    def test_qualified_granular_skill_rule_is_recognized(self):
+        """A plugin-qualified ``Skill(plugin:name)`` entry is a subset request.
+
+        The CLI registers a plugin skill as ``plugin:skill``, so that is the
+        spelling a client naming one has to use. Failing to recognize it would
+        leave ``options.skills`` unset — i.e. every skill exposed.
+        """
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill(docs-helper:summarize)"],
+            disallowed_tools=None,
+        )
+
+        assert options.skills == ["docs-helper:summarize"]
+        assert "Skill(docs-helper:summarize:*)" in (options.allowed_tools or [])
+        assert "Skill(:*)" not in (options.allowed_tools or [])
+
+    def test_qualified_granular_agent_rule_is_recognized(self):
+        """``Task(plugin:agent)`` narrows the subagent allowlist.
+
+        Same shape as skills: a plugin subagent's ``subagent_type`` is
+        ``plugin:agent``, and an unrecognized rule would fall back to
+        allow-every-subagent.
+        """
+        from src.backends.claude.client import agent_allowlist
+
+        assert agent_allowlist(["Read", "Task(testplugin:reporter)"]) == {
+            "testplugin:reporter"
+        }
+        # A bare Task still means "every subagent".
+        assert agent_allowlist(["Task", "Task(testplugin:reporter)"]) is None
+
+    def test_disallowed_skill_strips_granular_rules(self, monkeypatch):
+        """Operator Skill deny disables the granular path too."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        monkeypatch.setattr("src.backends.claude.client.DISALLOWED_TOOLS", ["Skill"])
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        backend._configure_tools(
+            options,
+            allowed_tools=["Read", "Skill(summarize)", "Skill(:*)"],
+            disallowed_tools=None,
+        )
+
+        assert getattr(options, "skills", None) is None
+        assert options.allowed_tools == ["Read"]
+
+    async def test_granular_allowlist_resolves_plugin_qualified(self, monkeypatch):
+        """Requested bare names resolve to their plugin-qualified forms."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude import slash_commands
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        async def _fake_available(cwd=None, force=False):
+            return {"docs-helper:summarize", "translate", "review"}
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset())
+        monkeypatch.setattr(slash_commands, "get_available_commands", _fake_available)
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = ["summarize", "translate"]
+        await backend._apply_skills_allowlist(options)
+
+        # Qualified match joins the allowlist; unselected "review" stays out.
+        assert options.skills == [
+            "docs-helper:summarize",
+            "summarize",
+            "translate",
+        ]
+
+    async def test_granular_allowlist_subtracts_hidden_by_tail(self, monkeypatch):
+        """HIDDEN_SKILLS hides a skill in bare and plugin-qualified form."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude import slash_commands
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        async def _fake_available(cwd=None, force=False):
+            return {"docs-helper:verify", "translate"}
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"verify"}))
+        monkeypatch.setattr(slash_commands, "get_available_commands", _fake_available)
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = ["verify", "translate"]
+        await backend._apply_skills_allowlist(options)
+
+        assert options.skills == ["translate"]
+
+    async def test_granular_allowlist_survives_discovery_failure(self, monkeypatch):
+        """Discovery failure keeps the raw requested names (fail closed)."""
+        from claude_agent_sdk import ClaudeAgentOptions
+        from src.backends.claude import client as client_module
+        from src.backends.claude import slash_commands
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        async def _boom(cwd=None, force=False):
+            raise RuntimeError("no CLI")
+
+        monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset())
+        monkeypatch.setattr(slash_commands, "get_available_commands", _boom)
+
+        backend = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+        options = ClaudeAgentOptions(max_turns=1)
+        options.skills = ["summarize"]
+        await backend._apply_skills_allowlist(options)
+
+        assert options.skills == ["summarize"]
 
     def test_skill_catch_all_rule_not_duplicated(self):
         """A caller that already passes ``Skill(:*)`` must not get it twice."""

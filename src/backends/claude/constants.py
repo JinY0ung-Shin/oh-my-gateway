@@ -126,6 +126,16 @@ else:
 # instead of waiting for complete messages
 TOKEN_STREAMING = parse_bool_env("TOKEN_STREAMING", "true")
 
+# Claude CLI binary override
+# The SDK spawns its own bundled CLI by default (claude-agent-sdk==0.2.128
+# bundles CLI 2.1.220). Set CLAUDE_CLI_PATH to an executable to spawn that
+# binary instead — e.g. a newer CLI whose MCP client speaks a protocol
+# revision the bundled one predates (2.1.220 negotiates up to 2025-11-25;
+# the 2026-07-28 stateless revision needs >= 2.1.221) — without bumping the
+# deliberately pinned SDK. Invalid paths are ignored with a warning at
+# session creation so a typo cannot take sessions down.
+CLAUDE_CLI_PATH = os.getenv("CLAUDE_CLI_PATH") or None
+
 # Subagent Tool Names
 # The CLI renamed the subagent tool: recent builds ship it as ``Agent`` and keep
 # ``Task`` only as a legacy alias (the binary carries the rename map
