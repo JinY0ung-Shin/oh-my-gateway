@@ -528,21 +528,38 @@ class SessionManager:
                     del self.sessions[sid]
                     logger.info(f"Cleaned up expired session: {sid}")
                     doomed.append((sid, session))
-        for sid, session in doomed:
-            _cancel_idle_reader(session)
-            if session.client is not None:
-                try:
-                    # Capped like every other awaited disconnect here (see
-                    # async_shutdown): disconnect() can hang on a dead anyio
-                    # channel, and a wedged sweep would block all future
-                    # out-of-band sweeps AND the periodic cleanup loop —
-                    # session expiry would stop for the process lifetime.
-                    await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
-                except Exception:
-                    logger.debug("Client disconnect failed for session %s", sid, exc_info=True)
-                session.client = None
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+        async def _teardown(sid: str, session: "Session") -> None:
+            # Never raises (mirrors _teardown_evicted): under the gather's
+            # return_exceptions a raise would otherwise vanish unlogged.
+            try:
+                _cancel_idle_reader(session)
+                if session.client is not None:
+                    try:
+                        # Capped like every other awaited disconnect here (see
+                        # async_shutdown): disconnect() can hang on a dead
+                        # anyio channel, and a wedged sweep would block all
+                        # future out-of-band sweeps AND the periodic cleanup
+                        # loop — session expiry would stop for the process
+                        # lifetime.
+                        await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                    except Exception:
+                        logger.debug(
+                            "Client disconnect failed for session %s", sid, exc_info=True
+                        )
+                    session.client = None
+                if session.workspace:
+                    self._cleanup_workspace(session.workspace)
+            except Exception:
+                logger.exception("Expiry teardown failed for session %s", sid)
+
+        if doomed:
+            # Concurrent teardown, mirroring async_shutdown's snapshot pass.
+            # The doomed list is by now the ONLY reference to these sessions,
+            # so async_shutdown must be able to await an in-flight sweep at a
+            # ~2s bound rather than MAX_LIVE_SESSIONS x 2s serial.
+            await asyncio.gather(
+                *(_teardown(sid, s) for sid, s in doomed), return_exceptions=True
+            )
         return len(doomed)
 
     def _purge_all_expired_sync(self) -> int:
@@ -639,13 +656,16 @@ class SessionManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cleanup_task
 
-        # A wedged out-of-band sweep must not be awaited (its disconnects run
-        # serially) — cancel it; the snapshot pass below re-covers whatever
-        # it had not reached yet.
+        # Settle — never cancel — an in-flight out-of-band sweep:
+        # _purge_all_expired deletes every doomed session from self.sessions
+        # BEFORE disconnecting it, so a parked sweep is the only reference to
+        # those clients, and cancelling it would orphan each one it had not
+        # reached — invisibly to the snapshot pass below. Awaiting is
+        # bounded: the sweep's teardowns run concurrently, each disconnect
+        # capped at 2s.
         sweep = self._sweep_task
         if sweep is not None and not sweep.done():
-            sweep.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            with contextlib.suppress(Exception):
                 await sweep
 
         # Evicted sessions are already out of self.sessions, so the snapshot

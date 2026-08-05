@@ -857,24 +857,41 @@ class TestLruEviction:
         assert removed == 1
         assert "stale" not in manager.sessions
 
-    async def test_shutdown_cancels_an_inflight_sweep(self):
-        """async_shutdown must not return with a live sweep task parked in a
-        hung disconnect — the loop then closes over a pending task and the
-        session it was tearing down never finishes."""
+    async def test_shutdown_settles_an_inflight_sweep_without_orphans(self):
+        """_purge_all_expired deletes every doomed session from the dict
+        BEFORE disconnecting it, so a parked sweep is the only reference to
+        those clients — cancelling it would orphan each one it had not
+        reached, invisibly to shutdown's snapshot pass. Shutdown must await
+        the (2s-capped) sweep instead."""
 
         class WedgedClient:
             async def disconnect(self):
-                await asyncio.Event().wait()
+                await asyncio.Event().wait()  # never resolves
+
+        class TrackedClient:
+            def __init__(self):
+                self.disconnected = False
+
+            async def disconnect(self):
+                self.disconnected = True
 
         manager = SessionManager()
-        stale = manager.get_or_create_session("stale")
-        stale.client = WedgedClient()
-        stale.expires_at = stale.created_at
+        wedged = manager.get_or_create_session("wedged")
+        wedged.client = WedgedClient()
+        wedged.expires_at = wedged.created_at
+        tracked_client = TrackedClient()
+        tracked = manager.get_or_create_session("tracked")
+        tracked.client = tracked_client
+        tracked.expires_at = tracked.created_at
+
         manager._schedule_expired_sweep()
-        await asyncio.sleep(0)  # let the sweep reach the hung disconnect
+        await asyncio.sleep(0)  # sweep dequeues both and parks in a disconnect
         await manager.async_shutdown()
+
         assert manager._sweep_task is not None
         assert manager._sweep_task.done()
+        assert tracked_client.disconnected is True
+        assert wedged.client is None  # timed out at the 2s cap, then released
 
     async def test_finishing_a_turn_touches_the_session_whatever_the_outcome(self):
         """Only the success paths touch via add_messages; the failure path
