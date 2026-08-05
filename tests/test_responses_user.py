@@ -327,8 +327,8 @@ class TestUserSessionBinding:
             call("alice"),
         ]
         assert mock_get_session.call_args_list == [
-            call(existing_session_id, user="alice", cwd="/tmp/ws/alice/claude"),
-            call(existing_session_id, user="alice", cwd="/tmp/ws/alice"),
+            call(existing_session_id, user="alice", cwd="/tmp/ws/alice/claude", max_turn=1),
+            call(existing_session_id, user="alice", cwd="/tmp/ws/alice", max_turn=1),
             call(existing_session_id),
         ]
         assert create_calls[0]["cwd"] == "/tmp/ws/alice"

@@ -547,6 +547,12 @@ async def _finish_active_response(session, response_id: str, terminal_state: str
         session.active_response_id = None
         session.active_response_turn = None
         session.active_response_client = None
+        # Refresh in the same critical section that unpins: only the success
+        # paths touch via add_messages, so without this a *failed* long turn
+        # leaves last_accessed at the turn's start — reading as idle for the
+        # whole turn duration and (under SESSION_EVICTION_POLICY=lru)
+        # instantly evictable under a queued follow-up.
+        session.touch()
         session.active_response_done.set()
     # Turn over — hand the client's message stream back to the between-turn
     # idle reader so background task events keep flowing into the outbox.
@@ -688,14 +694,21 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             _early_cwd = str(workspace_manager.resolve(body.user, backend=backend))
         except (ValueError, OSError):
             pass
-    session = session_manager.get_session(session_id, user=body.user, cwd=_early_cwd)
+    # max_turn: a transcript that cannot serve the requested turn must be
+    # discarded before admission — at the cap, admitting it can evict a live
+    # session (SESSION_EVICTION_POLICY=lru) only for this request to 404.
+    session = session_manager.get_session(
+        session_id, user=body.user, cwd=_early_cwd, max_turn=turn
+    )
     if session is None and backend == "claude" and body.user:
         try:
             legacy_cwd = str(workspace_manager.resolve(body.user))
         except (ValueError, OSError):
             legacy_cwd = None
         if legacy_cwd and legacy_cwd != _early_cwd:
-            session = session_manager.get_session(session_id, user=body.user, cwd=legacy_cwd)
+            session = session_manager.get_session(
+                session_id, user=body.user, cwd=legacy_cwd, max_turn=turn
+            )
     if not session:
         raise HTTPException(
             status_code=404,

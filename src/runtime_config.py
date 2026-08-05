@@ -41,6 +41,17 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "type": "int",
         "description": "TTL for new sessions (existing sessions keep their original TTL)",
     },
+    "session_eviction_policy": {
+        "label": "Session Eviction",
+        "type": "string",
+        "options": ["reject", "lru"],
+        "description": (
+            "At the MAX_LIVE_SESSIONS cap: reject new sessions with 503, or evict "
+            "the least-recently-used idle session (erases its in-memory "
+            "conversation; resuming via previous_response_id restores only the "
+            "turn counter and workspace)"
+        ),
+    },
     "thinking_mode": {
         "label": "Thinking Mode",
         "type": "string",
@@ -149,6 +160,7 @@ class RuntimeConfig:
         from src.constants import (
             DEFAULT_MODEL,
             DEFAULT_MAX_TURNS,
+            SESSION_EVICTION_POLICY,
             SESSION_MAX_AGE_MINUTES,
         )
         from src.backends.claude.constants import (
@@ -164,6 +176,7 @@ class RuntimeConfig:
             "default_model": DEFAULT_MODEL,
             "default_max_turns": DEFAULT_MAX_TURNS,
             "session_max_age_minutes": SESSION_MAX_AGE_MINUTES,
+            "session_eviction_policy": SESSION_EVICTION_POLICY,
             "thinking_mode": THINKING_MODE,
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),

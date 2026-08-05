@@ -55,6 +55,21 @@ MAX_LIVE_SESSIONS = parse_int_env("MAX_LIVE_SESSIONS", 12)
 MAX_CONCURRENT_TURNS = parse_int_env("MAX_CONCURRENT_TURNS", 8)
 MAX_CONCURRENT_TURNS_PER_USER = parse_int_env("MAX_CONCURRENT_TURNS_PER_USER", 3)
 
+# What happens when a brand-new session is requested at the MAX_LIVE_SESSIONS
+# cap and no expired session can be reclaimed. "reject" (default) refuses with
+# 503; "lru" evicts the least-recently-accessed idle session to make room.
+# Eviction erases someone else's in-memory conversation (rehydration from the
+# on-disk transcript restores only the turn counter and workspace), so it is
+# strictly opt-in. Any unrecognized value behaves as "reject".
+SESSION_EVICTION_POLICY = os.getenv("SESSION_EVICTION_POLICY", "reject").strip().lower()
+# Sessions accessed within this many seconds are never evicted. Without the
+# floor, a burst of cap+1 new sessions would each evict the previous newcomer
+# and nobody would make progress — hence the clamp: 0 would silently disable
+# the guard entirely.
+SESSION_EVICTION_MIN_IDLE_SECONDS = max(
+    1, parse_int_env("SESSION_EVICTION_MIN_IDLE_SECONDS", 60)
+)
+
 # Per-user workspace isolation
 # Base directory for user workspaces. Empty means a per-process system temp dir.
 USER_WORKSPACES_DIR = os.getenv("USER_WORKSPACES_DIR", "")
