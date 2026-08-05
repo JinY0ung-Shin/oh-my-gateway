@@ -187,6 +187,31 @@ def _get_setting_sources() -> List[Literal["user", "project", "local"]]:
     return deduped
 
 
+def _get_max_buffer_size() -> Optional[int]:
+    """Return the operator override for the SDK's stdout buffer limit.
+
+    ``CLAUDE_MAX_BUFFER_SIZE`` (bytes) overrides the Claude SDK's framing
+    limit for a single JSON message on CLI stdout (SDK default: 1MB).
+    Oversized tool results abort the stream with
+    ``JSON message exceeded maximum buffer size``; raising this is the
+    escape hatch. Unset or invalid values return ``None`` so the SDK
+    default applies.
+    """
+    raw = os.getenv("CLAUDE_MAX_BUFFER_SIZE")
+    if raw is None or not raw.strip():
+        return None
+    try:
+        value = int(raw.strip())
+    except ValueError:
+        value = 0
+    if value <= 0:
+        logger.warning(
+            "Invalid CLAUDE_MAX_BUFFER_SIZE=%r; using the SDK default", raw
+        )
+        return None
+    return value
+
+
 class UnsupportedContinuationPolicy(ValueError):
     """Raised when a continuation request asks for a policy change the SDK can't apply mid-session.
 
@@ -799,6 +824,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             setting_sources=_get_setting_sources(),
             cli_path=_get_cli_path(),
         )
+
+        max_buffer_size = _get_max_buffer_size()
+        if max_buffer_size is not None:
+            options.max_buffer_size = max_buffer_size
 
         self._configure_thinking(options, effort)
         self._configure_sandbox(options)
