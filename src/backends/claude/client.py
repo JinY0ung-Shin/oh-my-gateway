@@ -55,7 +55,7 @@ from src.backends.claude.constants import (
 )
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
-from src.constants import ASK_USER_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
+from src.constants import ASK_USER_TIMEOUT_SECONDS
 from src.message_adapter import MessageAdapter
 from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns, resolve_mcp_servers
@@ -234,10 +234,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     in-memory client is missing.
     """
 
-    def __init__(self, timeout: Optional[int] = None, cwd: Optional[str] = None):
-        if timeout is None:
-            timeout = DEFAULT_TIMEOUT_MS
-        self.timeout = timeout / 1000  # Convert ms to seconds
+    def __init__(self, cwd: Optional[str] = None):
         self.temp_dir = None
 
         # If an explicit cwd is provided, use it. Otherwise create an isolated

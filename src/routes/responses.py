@@ -63,7 +63,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
-NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_MS / 1000
+# Wall-clock budget (MAX_TIMEOUT) for one non-streaming /v1/responses turn,
+# fresh and continuation alike. A non-streaming request emits nothing while
+# the backend runs — no SSE keepalive — so without this bound a wedged SDK
+# call would hold the HTTP request, the session lock, and the CLI subprocess
+# indefinitely. Streaming turns are deliberately unbounded: the client
+# connection (disconnect == cancel) and DEFAULT_MAX_TURNS bound them, and a
+# wall clock would truncate legitimate long agentic turns.
+NON_STREAM_TURN_TIMEOUT_SECONDS = DEFAULT_TIMEOUT_MS / 1000
 
 
 def _background_response_timeout_s() -> float:
@@ -1510,7 +1517,7 @@ async def _capture_pending_tool_questions(chunk_source, resolved: ResolvedModel,
         yield chunk
 
 
-async def _collect_non_stream_continuation_chunks(chunk_source):
+async def _collect_non_stream_chunks(chunk_source):
     chunks = []
 
     async def _consume():
@@ -1520,7 +1527,7 @@ async def _collect_non_stream_continuation_chunks(chunk_source):
     try:
         await asyncio.wait_for(
             _consume(),
-            timeout=NON_STREAM_CONTINUATION_TIMEOUT_SECONDS,
+            timeout=NON_STREAM_TURN_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError as exc:
         close = getattr(chunk_source, "aclose", None)
@@ -1529,7 +1536,10 @@ async def _collect_non_stream_continuation_chunks(chunk_source):
                 await close()
         raise HTTPException(
             status_code=504,
-            detail=(f"Continuation timed out after {NON_STREAM_CONTINUATION_TIMEOUT_SECONDS:.3g}s"),
+            detail=(
+                "Non-streaming turn timed out after "
+                f"{NON_STREAM_TURN_TIMEOUT_SECONDS:.3g}s"
+            ),
         ) from exc
     return chunks
 
@@ -2332,12 +2342,12 @@ async def create_response(
                 forward_headers=forward_headers,
             )
             # Execute backend through the persistent client.
-            chunks = []
             active_client = session.client
             _configure_client_streaming(active_client, False)
             backend_source = backend.run_completion_with_client(active_client, prompt, session)
-            async for chunk in _capture_pending_tool_questions(backend_source, resolved, session):
-                chunks.append(chunk)
+            chunks = await _collect_non_stream_chunks(
+                _capture_pending_tool_questions(backend_source, resolved, session)
+            )
 
             # Check for backend errors — SDK in-band error chunks plus
             # AssistantMessage errors and rejected rate limits, mirroring
@@ -2712,7 +2722,7 @@ async def _handle_function_call_output(
             fc_output,
             opencode_resume_kind,
         )
-        chunks = await _collect_non_stream_continuation_chunks(
+        chunks = await _collect_non_stream_chunks(
             _capture_pending_tool_questions(backend_source, resolved, session)
         )
 

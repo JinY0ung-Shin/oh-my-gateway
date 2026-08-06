@@ -118,7 +118,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `BACKENDS` | Backend allowlist; `claude` is the only maintained backend (`opencode`/`codex` are stale) |
 | `DEFAULT_MODEL` | Default model for requests without `model` |
 | `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
-| `MAX_TIMEOUT` | Backend timeout in milliseconds |
+| `MAX_TIMEOUT` | Wall-clock budget per **non-streaming** `/v1/responses` turn in milliseconds (504 on breach); streaming turns are unbounded by design |
 | `BACKGROUND_RESPONSE_TIMEOUT_S` | Wall-clock cap for one `background: true` turn in seconds; default `3600` |
 | `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
 | `MAX_LIVE_SESSIONS` | Sessions held in memory before new ones get `503`; default `12` (see Capacity) |

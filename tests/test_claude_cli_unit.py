@@ -372,7 +372,6 @@ class TestClaudeCodeCLIInit:
 
                     assert cli.cwd == Path(temp_dir)
                     assert cli.temp_dir is None
-                    assert cli.timeout == 600.0  # 600000ms / 1000
 
     def test_init_with_invalid_cwd_raises(self):
         """ClaudeCodeCLI raises ValueError for non-existent cwd."""
@@ -407,20 +406,6 @@ class TestClaudeCodeCLIInit:
                         import shutil
 
                         shutil.rmtree(cli.temp_dir)
-
-    def test_init_with_custom_timeout(self):
-        """ClaudeCodeCLI uses custom timeout."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("src.auth.validate_claude_code_auth") as mock_validate:
-                with patch("src.auth.auth_manager") as mock_auth:
-                    mock_validate.return_value = (True, {"method": "anthropic"})
-                    mock_auth.get_claude_code_env_vars.return_value = {}
-
-                    from src.claude_cli import ClaudeCodeCLI
-
-                    cli = ClaudeCodeCLI(timeout=120000, cwd=temp_dir)
-
-                    assert cli.timeout == 120.0
 
     def test_init_auth_validation_failure(self):
         """ClaudeCodeCLI handles auth validation failure gracefully."""

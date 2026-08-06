@@ -813,9 +813,8 @@ class TestContinuationNonStreaming:
         backend.parse_message = MagicMock(return_value=None)
         monkeypatch.setattr(
             responses_module,
-            "NON_STREAM_CONTINUATION_TIMEOUT_SECONDS",
+            "NON_STREAM_TURN_TIMEOUT_SECONDS",
             0.01,
-            raising=False,
         )
 
         with patch.object(responses_module, "session_manager") as mock_sm:
