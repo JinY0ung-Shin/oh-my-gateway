@@ -38,10 +38,11 @@ def get_config_html() -> str:
                         </select>
                       </template>
                       <template x-if="meta.type === 'int'">
-                        <input type="number" :value="meta.value" min="1"
+                        <input type="number" :value="meta.value" :min="meta.min || 1"
+                          :step="(meta.min || 1) >= 1000 ? 10000 : 1"
                           :aria-label="'Set ' + meta.label"
                           @change="updateRuntimeConfig(key, parseInt($event.target.value))"
-                          style="padding:4px 8px; font-size:0.75rem; width:100px">
+                          style="padding:4px 8px; font-size:0.75rem; width:120px">
                       </template>
                       <template x-if="meta.type === 'string' && Array.isArray(meta.options)">
                         <select :value="meta.value"

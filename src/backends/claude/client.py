@@ -767,6 +767,14 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 "1" if runtime_config.get("agent_teams_enabled") else ""
             )
 
+        # Auto-compact window: same shape as agent teams — only an explicit
+        # admin override touches the child env, so with no override the process
+        # env (or the CLI's own default) passes through untouched. The CLI reads
+        # this env var ahead of its `autoCompactWindow` setting.
+        if runtime_config.is_overridden("auto_compact_window"):
+            window = runtime_config.get("auto_compact_window")
+            sdk_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window) if window else ""
+
         if sdk_env:
             options.env.update(sdk_env)
 

@@ -20,6 +20,14 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
+
+def _int_env(name: str) -> int:
+    """Read an int env var, treating unset/junk as 0 ("not configured")."""
+    try:
+        return int(os.environ.get(name, "") or 0)
+    except ValueError:
+        return 0
+
 # ---------------------------------------------------------------------------
 # Editable key definitions
 # ---------------------------------------------------------------------------
@@ -59,6 +67,18 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "label": "Sanitizer (/v1/messages)",
         "type": "bool",
         "description": "Anthropic SSE sanitizer; effective only when ANTHROPIC_BASE_URL is set",
+    },
+    "auto_compact_window": {
+        "label": "Auto-compact window (tokens)",
+        "type": "int",
+        "min": 20000,
+        "description": (
+            "Context size at which the CLI auto-compacts a session "
+            "(CLAUDE_CODE_AUTO_COMPACT_WINDOW). Lower = compacts sooner, so long "
+            "agentic turns stay under a small upstream window at the cost of "
+            "losing older detail. 0 = leave the CLI default alone. Applies to NEW "
+            "sessions; an override wins over the gateway process env."
+        ),
     },
     "agent_teams_enabled": {
         "label": "Agent Teams",
@@ -172,6 +192,10 @@ class RuntimeConfig:
             "agent_teams_enabled": bool(
                 os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
             ),
+            # 0 = not set — the CLI picks its own window from the model.
+            # A junk value reads as 0 rather than crashing the config read;
+            # the CLI ignores junk the same way.
+            "auto_compact_window": _int_env("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
         }
         return _map.get(key)
 
@@ -182,8 +206,11 @@ class RuntimeConfig:
         expected = meta["type"]
         if expected == "int":
             v = int(value)
-            if v < 1:
-                raise ValueError(f"{key} must be >= 1, got {v}")
+            # A per-key floor where 1 is meaningless — a 1-token compaction
+            # window would compact on every turn and lose the conversation.
+            low = meta.get("min", 1)
+            if v < low:
+                raise ValueError(f"{key} must be >= {low}, got {v}")
             return v
         if expected == "bool":
             if isinstance(value, bool):
