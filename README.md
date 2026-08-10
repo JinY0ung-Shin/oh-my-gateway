@@ -37,7 +37,7 @@ curl http://localhost:8000/v1/responses \
 - **Stateless agent API**: `/v1/agents/messages` with caller-owned history and Claude SDK events.
 - **Backends**: Claude (`sonnet`, `opus`, `haiku`) is the maintained backend. OpenCode (`opencode/<provider>/<model>`) and Codex (`codex/<model>`) are stale — kept frozen, unmaintained.
 - **Session continuity**: `previous_response_id` and server-side session tracking.
-- **Workspace isolation**: temporary sessions by default, or per-user directories with `USER_WORKSPACES_DIR`.
+- **Workspace isolation**: session-scoped temp directories for anonymous requests, persistent per-user directories when `user` is set (see [Workspaces](#workspaces)).
 - **MCP support**: shared gateway `MCP_CONFIG`, with optional OpenCode managed-mode config generation.
 - **Admin tools**: `/admin` dashboard, `/admin/chat`, runtime config, sessions, logs, prompts, plugin & marketplace management (install/remove + periodic auto-refresh), and diagnostics.
 - **Docker support**: Dockerfile and Compose setup with optional usage-log MySQL sidecar.
@@ -128,7 +128,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `MAX_CONCURRENT_TURNS_PER_USER` | Per-caller fairness hint keyed on `user` — not a security control; default `3` |
 | `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
 | `GATEWAY_HOST` | Host bind address; falls back to legacy `CLAUDE_WRAPPER_HOST` |
-| `USER_WORKSPACES_DIR` | Per-user workspace root (per-session temp dir if unset) |
+| `USER_WORKSPACES_DIR` | Workspace base directory (system temp dir if unset; see Workspaces) |
 | `MCP_CONFIG` | Shared MCP server config |
 | `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
 | `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
@@ -239,6 +239,49 @@ They bound resource use; they are not an authorization boundary. Deploy behind
   `gateway_turns_rejected_total` `scope` label reveals which limit binds —
   information the `503` bodies deliberately withhold. Restrict `/metrics` at
   the reverse proxy on any deployment where that matters.
+
+## Workspaces
+
+Every `/v1/responses` session runs its SDK subprocess inside a workspace
+directory that becomes the agent's working directory. The path is resolved
+from the request's `user` field (`src/workspace_manager.py`):
+
+| Request | Workspace |
+|---|---|
+| `user` set | `{base}/{user}/{backend}` — persistent, shared by all of that user's sessions on that backend |
+| `user` omitted | `{base}/_tmp_{uuid}` — private to the session, removed with it |
+
+`{base}` is `USER_WORKSPACES_DIR`, or `<system tmp>/oh-my-gateway-workspaces`
+when unset — a stable location rather than a per-process temp dir, so the
+startup sweep can reclaim `_tmp_` directories a previous run left behind.
+
+- `user` must match `^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$`, which is what keeps a
+  caller-supplied identifier from escaping the base directory; a failing value
+  is rejected with `400`.
+- Isolation is **per user, not per session**: two sessions sending the same
+  `user` share one directory, and files written there outlive the session and
+  gateway restarts. Only anonymous sessions are session-scoped.
+- Workspaces are created **empty** and nothing is seeded into them — Claude
+  configuration (settings, plugins, skills) is loaded from global sources such
+  as `~/.claude`, never from the workspace.
+- The resolved path is stored on the session at creation; continuations reuse
+  the stored path without re-resolving. When a restarted gateway rehydrates a
+  session from disk, it recomputes `{user}/{backend}` and falls back once to
+  the legacy `{user}` layout (pre backend-suffix, Claude only) to locate the
+  transcript.
+- Cleanup only ever touches `_tmp_*` names: each anonymous workspace is
+  removed when its session is deleted (expiry, eviction, or admin delete), and
+  startup sweeps orphans older than the session TTL. Named-user workspaces are
+  never deleted by the gateway.
+
+As with the per-user turn limit, `user` is caller-supplied and tied to no
+credential: anyone who can reach the gateway can claim any workspace by
+sending its `user` value. Workspace resolution separates tenants' files; it
+does not authenticate them — front the gateway with real identity (`API_KEY`,
+trusted network) when that matters.
+
+`/v1/agents/messages` never enters this path: each stateless call gets a
+request-scoped temporary workspace that is removed when its stream ends.
 
 ## Docker
 
@@ -437,7 +480,9 @@ Effective `/v1/responses` request fields:
   discards it, and the CLI retries without effort if the upstream 400s on it).
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
-- `user`: per-user workspace key.
+- `user`: per-user workspace key (see [Workspaces](#workspaces)); also injected
+  into the session's system prompt as `Current user: {user}` on the Claude
+  backend, and enforced as the session owner on continuation requests.
 
 The request model also accepts `store` for client compatibility.
 
