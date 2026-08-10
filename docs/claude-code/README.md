@@ -243,7 +243,7 @@ End-to-end examples live in `examples/`:
 | `TASK_BUDGET` | unset | Global tool-use token budget |
 | `DEFAULT_MAX_TURNS` | `10` | Max agent turns per request |
 | `TOKEN_STREAMING` | `true` | Per-token vs per-message streaming |
-| `MAX_TIMEOUT` | `600000` | Request timeout (ms) |
+| `MAX_TIMEOUT` | `600000` | Non-streaming turn budget (ms); streaming unbounded |
 | `CLAUDE_SANDBOX_ENABLED` | unset | Tri-state Bash sandbox |
 | `SYSTEM_PROMPT_FILE` | unset | Custom system prompt path |
 | `DISALLOWED_SUBAGENT_TYPES` | `statusline-setup` | Blocked subagent types |

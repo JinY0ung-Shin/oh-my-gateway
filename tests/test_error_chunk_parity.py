@@ -238,6 +238,45 @@ class TestNonStreamPathFailureSemantics:
         assert log_kwargs["error_code"] == code
 
 
+class TestNonStreamTurnTimeout:
+    """MAX_TIMEOUT bounds a fresh non-streaming turn.
+
+    A hung backend must 504 and disconnect the session's SDK client instead
+    of pinning the HTTP request, the session lock, and the CLI subprocess.
+    Continuation turns share the same collector; their timeout is covered in
+    test_ask_user_question.py.
+    """
+
+    def test_hung_backend_times_out_504_and_disconnects(
+        self, isolated_session_manager, monkeypatch
+    ):
+        monkeypatch.setattr(responses_module, "NON_STREAM_TURN_TIMEOUT_SECONDS", 0.05)
+
+        async def hung_run_completion(client, prompt, session, **kwargs):
+            await asyncio.Event().wait()
+            yield {"subtype": "success", "result": "unreachable"}
+
+        sdk_client = MagicMock(name="mock_sdk_client")
+        sdk_client.disconnect = AsyncMock()
+
+        async def _create_client(**kwargs):
+            return sdk_client
+
+        with _client_context() as (client, mock_cli):
+            mock_cli.create_client = _create_client
+            mock_cli.run_completion_with_client = hung_run_completion
+
+            response = client.post(
+                "/v1/responses",
+                json={"model": DEFAULT_MODEL, "input": "Hello"},
+                headers={"Authorization": "Bearer test"},
+            )
+
+        assert response.status_code == 504
+        assert "timed out" in response.json()["error"]["message"]
+        sdk_client.disconnect.assert_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Path 3: non-streaming continuation (_handle_function_call_output)
 # ---------------------------------------------------------------------------

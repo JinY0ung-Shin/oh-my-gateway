@@ -1200,11 +1200,11 @@ class TestUnblockPendingToolCall:
         assert "no pending input event" in exc_info.value.detail
 
 
-class TestCollectNonStreamContinuationChunks:
-    """Lines 1048 — _collect_non_stream_continuation_chunks timeout path."""
+class TestCollectNonStreamChunks:
+    """_collect_non_stream_chunks timeout path (fresh + continuation turns)."""
 
     def test_timeout_raises_504(self):
-        from src.routes.responses import _collect_non_stream_continuation_chunks
+        from src.routes.responses import _collect_non_stream_chunks
 
         async def slow_source():
             await asyncio.sleep(999)
@@ -1213,12 +1213,12 @@ class TestCollectNonStreamContinuationChunks:
         async def run():
             import src.routes.responses as rm
 
-            original = rm.NON_STREAM_CONTINUATION_TIMEOUT_SECONDS
-            rm.NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = 0.01
+            original = rm.NON_STREAM_TURN_TIMEOUT_SECONDS
+            rm.NON_STREAM_TURN_TIMEOUT_SECONDS = 0.01
             try:
-                await _collect_non_stream_continuation_chunks(slow_source())
+                await _collect_non_stream_chunks(slow_source())
             finally:
-                rm.NON_STREAM_CONTINUATION_TIMEOUT_SECONDS = original
+                rm.NON_STREAM_TURN_TIMEOUT_SECONDS = original
 
         with pytest.raises(HTTPException) as exc_info:
             asyncio.get_event_loop().run_until_complete(run())

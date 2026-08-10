@@ -7,8 +7,11 @@ sessions pin a Claude CLI subprocess for their whole TTL — so its tests
 assert that continuations are *never* refused.
 """
 
+import asyncio
+import contextlib
 import time
-from unittest.mock import patch
+from datetime import timedelta
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -23,7 +26,7 @@ from src.concurrency import (
 )
 from src.concurrency_middleware import logger as concurrency_middleware_logger
 from src.constants import DEFAULT_MODEL
-from src.session_manager import SessionManager
+from src.session_manager import SessionManager, _utcnow
 from tests.test_main_api_unit import client_context
 
 
@@ -552,6 +555,384 @@ class TestLiveSessionLimit:
                     main.session_manager.sessions.clear()
         assert resp.status_code == 503
         assert "7" not in resp.json()["error"]["message"]
+
+
+@contextlib.contextmanager
+def _lru_policy(cap, min_idle=60):
+    """MAX_LIVE_SESSIONS at *cap* with SESSION_EVICTION_POLICY=lru opted in."""
+    with patch("src.constants.MAX_LIVE_SESSIONS", cap):
+        with patch("src.constants.SESSION_EVICTION_POLICY", "lru"):
+            with patch("src.constants.SESSION_EVICTION_MIN_IDLE_SECONDS", min_idle):
+                yield
+
+
+def _age(session, seconds):
+    """Make *session* look idle for *seconds* without expiring it."""
+    session.last_accessed = _utcnow() - timedelta(seconds=seconds)
+
+
+class TestLruEviction:
+    """Opt-in ``SESSION_EVICTION_POLICY=lru`` at the MAX_LIVE_SESSIONS cap.
+
+    The default policy stays ``reject``: every test in TestLiveSessionLimit
+    above runs unmodified as the regression guard for that.
+    """
+
+    def test_default_policy_still_rejects(self):
+        """Without the opt-in, a cap full of unexpired sessions refuses even
+        when a perfectly evictable idle session is available."""
+        manager = SessionManager()
+        with patch("src.constants.MAX_LIVE_SESSIONS", 1):
+            victim = manager.get_or_create_session("idle")
+            _age(victim, seconds=600)
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("fresh")
+        assert "idle" in manager.sessions
+
+    def test_lru_evicts_the_least_recently_accessed_session(self):
+        manager = SessionManager()
+        with _lru_policy(cap=2):
+            older = manager.get_or_create_session("older")
+            newer = manager.get_or_create_session("newer")
+            _age(older, seconds=300)
+            _age(newer, seconds=120)
+            admitted = manager.get_or_create_session("fresh")
+        assert admitted.session_id == "fresh"
+        assert "older" not in manager.sessions
+        assert "newer" in manager.sessions
+
+    def test_never_evicts_a_session_with_an_active_response(self):
+        """An in-flight turn pins the session; when it is the only candidate
+        the gateway must 503 rather than orphan the running client."""
+        manager = SessionManager()
+        with _lru_policy(cap=1):
+            busy = manager.get_or_create_session("busy")
+            _age(busy, seconds=600)
+            busy.active_response_id = "resp_1"
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("fresh")
+        assert "busy" in manager.sessions
+
+    def test_recently_touched_sessions_are_never_evicted(self):
+        """The min-idle floor prevents cap+1 newcomers from cascade-evicting
+        each other: a cap full of just-created sessions still refuses."""
+        manager = SessionManager()
+        with _lru_policy(cap=2, min_idle=60):
+            manager.get_or_create_session("s1")
+            manager.get_or_create_session("s2")
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("s3")
+        assert set(manager.sessions) == {"s1", "s2"}
+
+    async def test_evicting_a_client_holding_session_disconnects_it(self):
+        """The slot frees synchronously; the disconnect — and with it the
+        actual memory return — happens in the scheduled teardown task."""
+        manager = SessionManager()
+        client = AsyncMock()
+        with _lru_policy(cap=1):
+            victim = manager.get_or_create_session("victim")
+            victim.client = client
+            _age(victim, seconds=600)
+
+            admitted = manager.get_or_create_session("fresh")
+            assert admitted.session_id == "fresh"
+            assert "victim" not in manager.sessions
+
+            await asyncio.gather(*list(manager._evict_tasks))
+        client.disconnect.assert_awaited_once()
+
+    def test_evicted_session_workspace_is_cleaned(self, tmp_path):
+        manager = SessionManager()
+        workspace = tmp_path / "_tmp_victim"
+        workspace.mkdir()
+        with _lru_policy(cap=1):
+            victim = manager.get_or_create_session("victim")
+            victim.workspace = str(workspace)
+            _age(victim, seconds=600)
+            manager.get_or_create_session("fresh")
+        assert not workspace.exists()
+
+    def test_unlimited_cap_never_evicts(self):
+        manager = SessionManager()
+        with _lru_policy(cap=0):
+            for i in range(30):
+                _age(manager.get_or_create_session(f"s{i}"), seconds=600)
+        assert len(manager.sessions) == 30
+
+    def test_eviction_increments_the_metric(self):
+        from prometheus_client import REGISTRY
+
+        def evicted_total():
+            return REGISTRY.get_sample_value("gateway_sessions_evicted_total") or 0
+
+        manager = SessionManager()
+        before = evicted_total()
+        with _lru_policy(cap=1):
+            _age(manager.get_or_create_session("victim"), seconds=600)
+            manager.get_or_create_session("fresh")
+        assert evicted_total() == before + 1
+
+    def test_touching_a_session_moves_it_off_the_eviction_frontline(self):
+        manager = SessionManager()
+        with _lru_policy(cap=2):
+            frontline = manager.get_or_create_session("frontline")
+            second = manager.get_or_create_session("second")
+            _age(frontline, seconds=300)
+            _age(second, seconds=120)
+            # Reaching an existing session touches it: no longer the LRU.
+            manager.get_or_create_session("frontline")
+            manager.get_or_create_session("fresh")
+        assert "frontline" in manager.sessions
+        assert "second" not in manager.sessions
+
+    def test_without_a_loop_client_holding_candidates_are_not_orphaned(self):
+        """Sync context (no running loop): the disconnect cannot be scheduled,
+        so a client-holding candidate is skipped — rejecting beats orphaning
+        a live subprocess."""
+        manager = SessionManager()
+        with _lru_policy(cap=1):
+            victim = manager.get_or_create_session("victim")
+            victim.client = object()
+            _age(victim, seconds=600)
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("fresh")
+        assert "victim" in manager.sessions
+
+    def test_without_a_loop_falls_past_client_holders_to_a_clientless_one(self):
+        """A skipped client-holder does not end the scan: a younger
+        client-less session behind it is still evicted inline."""
+        manager = SessionManager()
+        with _lru_policy(cap=2):
+            holder = manager.get_or_create_session("holder")
+            holder.client = object()
+            _age(holder, seconds=600)  # oldest: visited first, then skipped
+            clientless = manager.get_or_create_session("clientless")
+            _age(clientless, seconds=300)
+            admitted = manager.get_or_create_session("fresh")
+        assert admitted.session_id == "fresh"
+        assert "clientless" not in manager.sessions
+        assert "holder" in manager.sessions
+
+    def test_admin_runtime_toggle_enables_eviction_without_restart(self):
+        """The env default stays reject; flipping the runtime key opts in."""
+        from src.runtime_config import runtime_config
+
+        manager = SessionManager()
+        try:
+            with patch("src.constants.MAX_LIVE_SESSIONS", 1):
+                _age(manager.get_or_create_session("victim"), seconds=600)
+                with pytest.raises(SessionLimitExceeded):
+                    manager.get_or_create_session("fresh")
+
+                runtime_config.set("session_eviction_policy", "lru")
+                admitted = manager.get_or_create_session("fresh")
+                assert admitted.session_id == "fresh"
+                assert "victim" not in manager.sessions
+        finally:
+            runtime_config.reset("session_eviction_policy")
+
+    def test_never_evicts_a_session_paused_on_ask_user_question(self):
+        """A paused AskUserQuestion turn clears active_response_id but leaves
+        pending_tool_call / input_event set — its continuation is coming back
+        for this exact session, so it is pinned like an in-flight turn."""
+        manager = SessionManager()
+        with _lru_policy(cap=2):
+            paused = manager.get_or_create_session("paused")
+            _age(paused, seconds=600)
+            paused.pending_tool_call = {"call_id": "call_1"}
+            waiting = manager.get_or_create_session("waiting")
+            _age(waiting, seconds=600)
+            waiting.input_event = asyncio.Event()
+            with pytest.raises(SessionLimitExceeded):
+                manager.get_or_create_session("fresh")
+        assert set(manager.sessions) == {"paused", "waiting"}
+
+    async def test_prefers_an_expired_client_holder_over_a_live_session(self):
+        """Per-session TTLs can diverge (admin edits), making an expired
+        session the *younger*-accessed one; it must still be chosen over
+        someone's live conversation."""
+        manager = SessionManager()
+        dead_client = AsyncMock()
+        with _lru_policy(cap=2):
+            live = manager.get_or_create_session("live")
+            _age(live, seconds=300)
+            dead = manager.get_or_create_session("dead")
+            dead.client = dead_client
+            _age(dead, seconds=120)  # younger access than "live"...
+            dead.expires_at = _utcnow() - timedelta(seconds=1)  # ...but expired
+
+            admitted = manager.get_or_create_session("fresh")
+            assert admitted.session_id == "fresh"
+            assert "dead" not in manager.sessions
+            assert "live" in manager.sessions
+            await asyncio.gather(*list(manager._evict_tasks))
+        dead_client.disconnect.assert_awaited_once()
+
+    async def test_eviction_still_schedules_the_sweep_for_leftover_expired(self):
+        """Admission via eviction must not starve the out-of-band sweep that
+        reclaims expired-but-client-holding sessions."""
+        manager = SessionManager()
+        with _lru_policy(cap=2):
+            first = manager.get_or_create_session("expired-evicted")
+            first.client = AsyncMock()
+            _age(first, seconds=600)
+            first.expires_at = _utcnow() - timedelta(seconds=1)
+            leftover = manager.get_or_create_session("expired-leftover")
+            leftover.client = AsyncMock()
+            _age(leftover, seconds=300)
+            leftover.expires_at = _utcnow() - timedelta(seconds=1)
+
+            admitted = manager.get_or_create_session("fresh")
+            assert admitted.session_id == "fresh"
+
+            sweep = manager._sweep_task
+            assert sweep is not None
+            await asyncio.gather(*list(manager._evict_tasks))
+            await sweep
+        assert "expired-leftover" not in manager.sessions
+
+    async def test_shutdown_settles_inflight_eviction_teardowns(self):
+        """async_shutdown snapshots self.sessions, which no longer contains
+        an evicted session — its teardown must be awaited explicitly or the
+        subprocess outlives the gateway. The victim's disconnect genuinely
+        suspends: an AsyncMock would resolve incidentally at shutdown's next
+        await point and pass even without the explicit settle."""
+
+        class SlowClient:
+            def __init__(self):
+                self.disconnected = False
+
+            async def disconnect(self):
+                await asyncio.sleep(0.05)
+                self.disconnected = True
+
+        manager = SessionManager()
+        client = SlowClient()
+        with _lru_policy(cap=1):
+            victim = manager.get_or_create_session("victim")
+            victim.client = client
+            _age(victim, seconds=600)
+            manager.get_or_create_session("fresh")
+            await manager.async_shutdown()
+        assert client.disconnected is True
+
+    async def test_expired_candidates_ignore_the_min_idle_floor(self):
+        """The floor protects fresh *live* newcomers from cascade eviction; a
+        dead-but-client-holding session must not shield itself with it while
+        someone's live conversation gets destroyed instead."""
+        manager = SessionManager()
+        dead_client = AsyncMock()
+        with _lru_policy(cap=2, min_idle=200):
+            dead = manager.get_or_create_session("dead")
+            dead.client = dead_client
+            _age(dead, seconds=90)  # under the 200s floor...
+            dead.expires_at = _utcnow() - timedelta(seconds=1)  # ...but expired
+            live = manager.get_or_create_session("live")
+            _age(live, seconds=400)
+
+            admitted = manager.get_or_create_session("fresh")
+            assert admitted.session_id == "fresh"
+            assert "dead" not in manager.sessions
+            assert "live" in manager.sessions
+            await asyncio.gather(*list(manager._evict_tasks))
+        dead_client.disconnect.assert_awaited_once()
+
+    async def test_expiry_sweep_survives_a_hung_disconnect(self):
+        """A dead anyio channel must not wedge the sweep: a wedged sweep
+        blocks every future out-of-band sweep and the periodic cleanup loop
+        awaits the same coroutine, so session expiry would stop for the
+        process lifetime."""
+
+        class WedgedClient:
+            async def disconnect(self):
+                await asyncio.Event().wait()  # never resolves
+
+        manager = SessionManager()
+        stale = manager.get_or_create_session("stale")
+        stale.client = WedgedClient()
+        stale.expires_at = stale.created_at
+        removed = await asyncio.wait_for(
+            manager.cleanup_expired_sessions(), timeout=5.0
+        )
+        assert removed == 1
+        assert "stale" not in manager.sessions
+
+    async def test_shutdown_settles_an_inflight_sweep_without_orphans(self):
+        """_purge_all_expired deletes every doomed session from the dict
+        BEFORE disconnecting it, so a parked sweep is the only reference to
+        those clients — cancelling it would orphan each one it had not
+        reached, invisibly to shutdown's snapshot pass. Shutdown must await
+        the (2s-capped) sweep instead."""
+
+        class WedgedClient:
+            async def disconnect(self):
+                await asyncio.Event().wait()  # never resolves
+
+        class TrackedClient:
+            def __init__(self):
+                self.disconnected = False
+
+            async def disconnect(self):
+                self.disconnected = True
+
+        manager = SessionManager()
+        wedged = manager.get_or_create_session("wedged")
+        wedged.client = WedgedClient()
+        wedged.expires_at = wedged.created_at
+        tracked_client = TrackedClient()
+        tracked = manager.get_or_create_session("tracked")
+        tracked.client = tracked_client
+        tracked.expires_at = tracked.created_at
+
+        manager._schedule_expired_sweep()
+        await asyncio.sleep(0)  # sweep dequeues both and parks in a disconnect
+        await manager.async_shutdown()
+
+        assert manager._sweep_task is not None
+        assert manager._sweep_task.done()
+        assert tracked_client.disconnected is True
+        assert wedged.client is None  # timed out at the 2s cap, then released
+
+    async def test_finishing_a_turn_touches_the_session_whatever_the_outcome(self):
+        """Only the success paths touch via add_messages; the failure path
+        must refresh last_accessed too, or a long failed turn reads as idle
+        for its whole duration and is instantly evictable under a queued
+        follow-up."""
+        from src.routes.responses import _finish_active_response
+
+        manager = SessionManager()
+        session = manager.get_or_create_session("s")
+        session.active_response_id = "resp_1"
+        _age(session, seconds=600)
+
+        await _finish_active_response(session, "resp_1", "failed")
+        assert (_utcnow() - session.last_accessed).total_seconds() < 5
+
+    def test_rehydration_for_a_future_turn_does_not_evict(self):
+        """A previous_response_id pointing past the transcript's turn count
+        would be 404ed by the route right after admission — it must be
+        discarded before it can evict anyone (or burn a slot)."""
+        from src.session_manager import Session
+
+        manager = SessionManager()
+        with _lru_policy(cap=1):
+            with patch(
+                "src.session_manager._try_rehydrate_from_jsonl",
+                lambda sid, *, user, cwd: Session(
+                    session_id=sid, user=user, turn_counter=3
+                ),
+            ):
+                victim = manager.get_or_create_session("victim")
+                _age(victim, seconds=600)
+
+                miss = manager.get_session("other", user="u", cwd="/w", max_turn=9)
+                assert miss is None
+                assert "victim" in manager.sessions
+
+                # A servable turn still admits (and may evict) as before.
+                hit = manager.get_session("other", user="u", cwd="/w", max_turn=3)
+                assert hit is not None
+                assert "victim" not in manager.sessions
 
 
 class TestMemorySizingCheck:

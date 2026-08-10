@@ -372,7 +372,6 @@ class TestClaudeCodeCLIInit:
 
                     assert cli.cwd == Path(temp_dir)
                     assert cli.temp_dir is None
-                    assert cli.timeout == 600.0  # 600000ms / 1000
 
     def test_init_with_invalid_cwd_raises(self):
         """ClaudeCodeCLI raises ValueError for non-existent cwd."""
@@ -407,20 +406,6 @@ class TestClaudeCodeCLIInit:
                         import shutil
 
                         shutil.rmtree(cli.temp_dir)
-
-    def test_init_with_custom_timeout(self):
-        """ClaudeCodeCLI uses custom timeout."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("src.auth.validate_claude_code_auth") as mock_validate:
-                with patch("src.auth.auth_manager") as mock_auth:
-                    mock_validate.return_value = (True, {"method": "anthropic"})
-                    mock_auth.get_claude_code_env_vars.return_value = {}
-
-                    from src.claude_cli import ClaudeCodeCLI
-
-                    cli = ClaudeCodeCLI(timeout=120000, cwd=temp_dir)
-
-                    assert cli.timeout == 120.0
 
     def test_init_auth_validation_failure(self):
         """ClaudeCodeCLI handles auth validation failure gracefully."""
@@ -667,6 +652,45 @@ class TestBuildSdkOptions:
             assert opts.env["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == ""
         finally:
             runtime_config.reset("agent_teams_enabled")
+
+    def test_max_buffer_size_unset_leaves_sdk_default(
+        self, cli_instance, monkeypatch
+    ):
+        """Without CLAUDE_MAX_BUFFER_SIZE the option stays None (SDK default)."""
+        monkeypatch.delenv("CLAUDE_MAX_BUFFER_SIZE", raising=False)
+        opts = cli_instance._build_sdk_options()
+        assert opts.max_buffer_size is None
+
+    def test_max_buffer_size_env_override_applied(self, cli_instance, monkeypatch):
+        """CLAUDE_MAX_BUFFER_SIZE sets options.max_buffer_size in bytes."""
+        monkeypatch.setenv("CLAUDE_MAX_BUFFER_SIZE", "10485760")
+        opts = cli_instance._build_sdk_options()
+        assert opts.max_buffer_size == 10485760
+
+    def test_max_buffer_size_empty_value_ignored(self, cli_instance, monkeypatch):
+        """An empty CLAUDE_MAX_BUFFER_SIZE behaves like unset, no warning."""
+        monkeypatch.setenv("CLAUDE_MAX_BUFFER_SIZE", "   ")
+        with patch("src.backends.claude.client.logger") as mock_logger:
+            opts = cli_instance._build_sdk_options()
+        assert opts.max_buffer_size is None
+        assert not any(
+            "CLAUDE_MAX_BUFFER_SIZE" in str(call)
+            for call in mock_logger.warning.call_args_list
+        )
+
+    def test_max_buffer_size_invalid_values_warn_and_fall_back(
+        self, cli_instance, monkeypatch
+    ):
+        """Non-numeric or non-positive values log a warning and keep the default."""
+        for bad in ("not-a-number", "0", "-1"):
+            monkeypatch.setenv("CLAUDE_MAX_BUFFER_SIZE", bad)
+            with patch("src.backends.claude.client.logger") as mock_logger:
+                opts = cli_instance._build_sdk_options()
+            assert opts.max_buffer_size is None
+            assert any(
+                "CLAUDE_MAX_BUFFER_SIZE" in str(call)
+                for call in mock_logger.warning.call_args_list
+            )
 
     def test_include_partial_messages_when_token_streaming(self, cli_instance):
         """TOKEN_STREAMING=True sets include_partial_messages."""

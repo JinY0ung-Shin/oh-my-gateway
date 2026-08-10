@@ -108,6 +108,12 @@ SESSIONS_REJECTED_TOTAL = Counter(
     "Session creations refused because MAX_LIVE_SESSIONS was reached.",
 )
 
+SESSIONS_EVICTED_TOTAL = Counter(
+    "gateway_sessions_evicted_total",
+    "Idle sessions evicted at the MAX_LIVE_SESSIONS cap to admit new ones "
+    "(SESSION_EVICTION_POLICY=lru).",
+)
+
 STREAM_DURATION = Histogram(
     "gateway_stream_duration_seconds",
     "Wall-clock duration of a streaming agent response, first byte to last. "
@@ -202,6 +208,11 @@ def bind_live_sessions_source(source: Callable[[], float]) -> None:
 def record_session_rejected() -> None:
     """Record one session creation refused by ``MAX_LIVE_SESSIONS``."""
     SESSIONS_REJECTED_TOTAL.inc()
+
+
+def record_session_evicted() -> None:
+    """Record one idle session evicted at the cap (``SESSION_EVICTION_POLICY=lru``)."""
+    SESSIONS_EVICTED_TOTAL.inc()
 
 
 def record_stream_duration(*, path: str, duration_seconds: float) -> None:

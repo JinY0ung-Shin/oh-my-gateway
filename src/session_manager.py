@@ -168,6 +168,20 @@ def _max_live_sessions() -> int:
     return MAX_LIVE_SESSIONS
 
 
+def _eviction_policy() -> str:
+    """Effective ``SESSION_EVICTION_POLICY``: admin runtime override, then env."""
+    from src.runtime_config import runtime_config
+
+    return runtime_config.get("session_eviction_policy")
+
+
+def _eviction_min_idle_seconds() -> int:
+    """Read ``SESSION_EVICTION_MIN_IDLE_SECONDS`` fresh so tests can patch it."""
+    from src.constants import SESSION_EVICTION_MIN_IDLE_SECONDS
+
+    return SESSION_EVICTION_MIN_IDLE_SECONDS
+
+
 def _utcnow() -> datetime:
     """Return a timezone-aware UTC timestamp."""
     return datetime.now(timezone.utc)
@@ -308,6 +322,10 @@ class SessionManager:
         # Out-of-band sweep kicked when the live-session cap is hit; see
         # _schedule_expired_sweep.
         self._sweep_task: Optional[asyncio.Task[int]] = None
+        # Strong refs to in-flight eviction teardowns (the loop only keeps
+        # weak ones, and several evictions can overlap — a single slot like
+        # _sweep_task would let earlier tasks be GC-cancelled mid-disconnect).
+        self._evict_tasks: set = set()
         self._rehydrate_hits: int = 0
         self._rehydrate_misses: int = 0
 
@@ -328,6 +346,11 @@ class SessionManager:
         expired-but-client-holding sessions are what's filling the cap, kick
         the async cleanup instead: this request still fails, but the slot is
         freed in about a second rather than up to five minutes.
+
+        When the cap is full of *unexpired* sessions there is nothing to
+        sweep; ``SESSION_EVICTION_POLICY=lru`` opts into evicting the
+        least-recently-used idle session instead of refusing (see
+        ``_try_evict_lru_locked``). The default remains refusal.
         """
         limit = _max_live_sessions()
         if limit <= 0:
@@ -339,9 +362,15 @@ class SessionManager:
         if len(self.sessions) < limit:
             return True
 
+        admitted = _eviction_policy() == "lru" and self._try_evict_lru_locked()
+
+        # Kick the async sweep whether or not eviction made room: under
+        # sustained eviction pressure the reject path would otherwise never
+        # run, leaving expired-but-client-holding sessions to the (much
+        # slower) periodic cleanup.
         if any(s.is_expired() for s in self.sessions.values()):
             self._schedule_expired_sweep()
-        return False
+        return admitted
 
     def _schedule_expired_sweep(self) -> None:
         """Kick an out-of-band async cleanup, at most one at a time.
@@ -358,6 +387,113 @@ class SessionManager:
         except RuntimeError:
             return
         self._sweep_task = loop.create_task(self.cleanup_expired_sessions())
+
+    def _try_evict_lru_locked(self) -> bool:
+        """Evict the least-recently-accessed idle session to free one slot.
+
+        Caller must hold the lock.  Returns ``True`` when a slot was freed.
+
+        Skips sessions that are mid-turn in either sense: pinned by an
+        in-flight response (``active_response_id``, the same guard
+        ``is_expired`` uses — evicting one would orphan the running SDK
+        client and strand a response id the caller may still poll or cancel)
+        or paused on an ``AskUserQuestion`` (``pending_tool_call`` /
+        ``input_event``, the same pair ``resume_idle_reader`` and
+        ``_clear_stale_pending_tool_call`` gate on — the turn's continuation
+        is coming back for this exact session). Also skips sessions accessed
+        within ``SESSION_EVICTION_MIN_IDLE_SECONDS`` (without that floor, a
+        burst of cap+1 newcomers would cascade-evict each other). When
+        nothing qualifies the caller falls through to the normal reject
+        path: a gateway full of busy sessions should 503 rather than break a
+        live conversation.
+
+        Expired sessions are preferred over live ones regardless of access
+        order — an expired-but-client-holding session (which the sync purge
+        cannot drop) is always a better victim than someone's live
+        conversation, and per-session TTLs can diverge after admin edits, so
+        plain LRU order does not guarantee that on its own.
+
+        The slot itself is freed synchronously — the dict entry is gone when
+        this returns — but a session holding an SDK client needs its
+        disconnect awaited, so the real teardown runs in a fire-and-forget
+        task and the subprocess memory is only returned once it completes.
+        Without a running loop that task cannot be scheduled, so
+        client-holding candidates are skipped rather than orphaned.
+        """
+        now = _utcnow()
+        min_idle = timedelta(seconds=_eviction_min_idle_seconds())
+        candidates = sorted(
+            self.sessions.values(),
+            key=lambda s: (not s.is_expired(), s.last_accessed),
+        )
+        for session in candidates:
+            if session.active_response_id is not None:
+                continue
+            if session.pending_tool_call is not None or session.input_event is not None:
+                continue
+            idle = now - session.last_accessed
+            if not session.is_expired() and idle < min_idle:
+                # The floor only protects *live* sessions (its purpose is to
+                # stop cap+1 newcomers from cascade-evicting each other); an
+                # expired candidate is already condemned and must not shield
+                # itself with it. Expired sessions sort first, so the first
+                # live session under the floor ends the scan — everyone after
+                # it is live and younger.
+                break
+            if session.client is not None:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    continue
+                del self.sessions[session.session_id]
+                task = loop.create_task(self._teardown_evicted(session))
+                self._evict_tasks.add(task)
+                task.add_done_callback(self._evict_tasks.discard)
+            else:
+                del self.sessions[session.session_id]
+                if session.workspace:
+                    self._cleanup_workspace(session.workspace)
+            metrics.record_session_evicted()
+            logger.info(
+                "Evicted LRU session %s (idle %.0fs) to admit a new session; "
+                "%d live sessions remain",
+                session.session_id,
+                idle.total_seconds(),
+                len(self.sessions),
+            )
+            return True
+        return False
+
+    async def _teardown_evicted(self, session: "Session") -> None:
+        """Disconnect and clean up an evicted session outside the lock.
+
+        Mirrors the expiry sweep's sequence in ``_purge_all_expired``, with
+        the same 2s disconnect cap as ``async_shutdown`` — disconnect() can
+        hang on a dead anyio channel, and a hung fire-and-forget task would
+        pin the subprocess and the Session (via ``_evict_tasks``) forever.
+        The session is already out of ``self.sessions``; this only releases
+        the resources it still owns. Never raises: nothing awaits this task,
+        so an escaped exception would only surface as an unretrieved-task
+        warning at GC time.
+        """
+        try:
+            _cancel_idle_reader(session)
+            if session.client is not None:
+                try:
+                    await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                except Exception:
+                    logger.debug(
+                        "Client disconnect timed out or failed for evicted session %s",
+                        session.session_id,
+                        exc_info=True,
+                    )
+                session.client = None
+            if session.workspace:
+                self._cleanup_workspace(session.workspace)
+        except Exception:
+            logger.exception(
+                "Eviction teardown failed for session %s", session.session_id
+            )
 
     def _remove_if_expired(self, session_id: str) -> bool:
         """Remove *session_id* if present and expired.
@@ -392,16 +528,38 @@ class SessionManager:
                     del self.sessions[sid]
                     logger.info(f"Cleaned up expired session: {sid}")
                     doomed.append((sid, session))
-        for sid, session in doomed:
-            _cancel_idle_reader(session)
-            if session.client is not None:
-                try:
-                    await session.client.disconnect()
-                except Exception:
-                    logger.debug("Client disconnect failed for session %s", sid, exc_info=True)
-                session.client = None
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+        async def _teardown(sid: str, session: "Session") -> None:
+            # Never raises (mirrors _teardown_evicted): under the gather's
+            # return_exceptions a raise would otherwise vanish unlogged.
+            try:
+                _cancel_idle_reader(session)
+                if session.client is not None:
+                    try:
+                        # Capped like every other awaited disconnect here (see
+                        # async_shutdown): disconnect() can hang on a dead
+                        # anyio channel, and a wedged sweep would block all
+                        # future out-of-band sweeps AND the periodic cleanup
+                        # loop — session expiry would stop for the process
+                        # lifetime.
+                        await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                    except Exception:
+                        logger.debug(
+                            "Client disconnect failed for session %s", sid, exc_info=True
+                        )
+                    session.client = None
+                if session.workspace:
+                    self._cleanup_workspace(session.workspace)
+            except Exception:
+                logger.exception("Expiry teardown failed for session %s", sid)
+
+        if doomed:
+            # Concurrent teardown, mirroring async_shutdown's snapshot pass.
+            # The doomed list is by now the ONLY reference to these sessions,
+            # so async_shutdown must be able to await an in-flight sweep at a
+            # ~2s bound rather than MAX_LIVE_SESSIONS x 2s serial.
+            await asyncio.gather(
+                *(_teardown(sid, s) for sid, s in doomed), return_exceptions=True
+            )
         return len(doomed)
 
     def _purge_all_expired_sync(self) -> int:
@@ -498,6 +656,30 @@ class SessionManager:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._cleanup_task
 
+        # Settle — never cancel — an in-flight out-of-band sweep:
+        # _purge_all_expired deletes every doomed session from self.sessions
+        # BEFORE disconnecting it, so a parked sweep is the only reference to
+        # those clients, and cancelling it would orphan each one it had not
+        # reached — invisibly to the snapshot pass below. Awaiting is
+        # bounded: the sweep's teardowns run concurrently, each disconnect
+        # capped at 2s.
+        sweep = self._sweep_task
+        if sweep is not None and not sweep.done():
+            with contextlib.suppress(Exception):
+                await sweep
+
+        # Evicted sessions are already out of self.sessions, so the snapshot
+        # below cannot see them — settle their in-flight teardowns first or
+        # their CLI subprocesses outlive the gateway. Loop: a concurrent
+        # admission can evict (scheduling another teardown) while we await.
+        # Bounded: each teardown caps its disconnect at 2s and never raises,
+        # and the loop ends the first round no new eviction lands in.
+        while True:
+            evict_tasks = list(self._evict_tasks)
+            if not evict_tasks:
+                break
+            await asyncio.gather(*evict_tasks, return_exceptions=True)
+
         with self.lock:
             sessions_snapshot = list(self.sessions.values())
 
@@ -588,11 +770,20 @@ class SessionManager:
         *,
         user: Optional[str] = None,
         cwd: Optional[str] = None,
+        max_turn: Optional[int] = None,
     ) -> Optional[Session]:
         """Return a session by id; rehydrate from jsonl on cache miss when context permits.
 
         Returns ``None`` when the session does not exist, is expired, and
         cannot be rehydrated from disk.
+
+        ``max_turn`` is the highest turn the caller is about to reference
+        (from ``previous_response_id``). A rehydrated session that cannot
+        serve it is discarded *before* admission — admission is not free
+        (at the cap it can reject, or under ``SESSION_EVICTION_POLICY=lru``
+        evict someone else's live session), and the route would 404 the
+        request right after anyway. Live cache hits are returned regardless;
+        the route's own turn validation owns that case.
         """
         with self.lock:
             self._remove_if_expired(session_id)
@@ -607,6 +798,9 @@ class SessionManager:
             if not user or not cwd:
                 return None
             session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
+            if session is not None and max_turn is not None and max_turn > session.turn_counter:
+                self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
+                return None
             if session is not None:
                 # Rehydration materializes a session that will pin its own
                 # Claude CLI subprocess, so it has to respect the same cap as

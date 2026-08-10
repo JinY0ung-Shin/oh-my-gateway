@@ -222,7 +222,7 @@ class TestClaudeRegister:
 
             from src.backends.claude import register
 
-            register(cwd=str(tmp_path), timeout=5000)
+            register(cwd=str(tmp_path))
 
             assert "claude" in BackendRegistry.all_descriptors()
             assert BackendRegistry.is_registered("claude")
@@ -236,7 +236,7 @@ class TestClaudeRegister:
             side_effect=RuntimeError("auth failure"),
         ):
             with pytest.raises(RuntimeError, match="auth failure"):
-                register(cwd="/tmp", timeout=1000)
+                register(cwd="/tmp")
 
         # Descriptor should still be registered even though client creation failed
         assert "claude" in BackendRegistry.all_descriptors()
@@ -254,7 +254,7 @@ class TestClaudeRegister:
             caplog.at_level("ERROR", logger="src.backends.claude"),
         ):
             with pytest.raises(RuntimeError):
-                register(cwd="/tmp", timeout=1000)
+                register(cwd="/tmp")
 
         assert any("Claude backend client creation failed" in r.message for r in caplog.records)
 

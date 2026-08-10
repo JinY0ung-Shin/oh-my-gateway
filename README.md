@@ -118,10 +118,12 @@ Most settings are environment variables. Start with `.env.example`.
 | `BACKENDS` | Backend allowlist; `claude` is the only maintained backend (`opencode`/`codex` are stale) |
 | `DEFAULT_MODEL` | Default model for requests without `model` |
 | `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
-| `MAX_TIMEOUT` | Backend timeout in milliseconds |
+| `MAX_TIMEOUT` | Wall-clock budget per **non-streaming** `/v1/responses` turn in milliseconds (504 on breach); streaming turns are unbounded by design |
 | `BACKGROUND_RESPONSE_TIMEOUT_S` | Wall-clock cap for one `background: true` turn in seconds; default `3600` |
 | `MAX_REQUEST_SIZE` | Maximum request body size in bytes |
 | `MAX_LIVE_SESSIONS` | Sessions held in memory before new ones get `503`; default `12` (see Capacity) |
+| `SESSION_EVICTION_POLICY` | At the session cap: `reject` (default, 503) or `lru` — evict the least-recently-used idle session to admit the newcomer |
+| `SESSION_EVICTION_MIN_IDLE_SECONDS` | Sessions accessed within this window are never evicted (thrash guard); default `60`, clamped to ≥1 |
 | `MAX_CONCURRENT_TURNS` | Agent turns allowed to run simultaneously; default `8` |
 | `MAX_CONCURRENT_TURNS_PER_USER` | Per-caller fairness hint keyed on `user` — not a security control; default `3` |
 | `SSE_KEEPALIVE_INTERVAL` | SSE keepalive comment interval; `0` disables it |
@@ -203,8 +205,9 @@ limit to `0` to disable it.
 
 The gateway logs a startup warning when `MAX_LIVE_SESSIONS` exceeds what the
 detected cgroup (or host) memory can hold. Watch `gateway_live_sessions`,
-`gateway_turns_in_flight`, `gateway_turns_rejected_total`, and
-`gateway_sessions_rejected_total` on `/metrics` to tune it.
+`gateway_turns_in_flight`, `gateway_turns_rejected_total`,
+`gateway_sessions_rejected_total`, and (with `SESSION_EVICTION_POLICY=lru`)
+`gateway_sessions_evicted_total` on `/metrics` to tune it.
 
 > Single process only. Sessions, the rate limiter, and the Prometheus registry
 > are all in-memory, so these limits are per-process and running multiple
@@ -221,11 +224,15 @@ They bound resource use; they are not an authorization boundary. Deploy behind
   Opting out entirely is also trivial: omit `user`, or send the body with
   `Transfer-Encoding: chunked` so there is no content-length to peek at. Only
   `MAX_CONCURRENT_TURNS` is load-bearing against a hostile caller.
-- **Session slots have no eviction or fairness.** `touch()` refreshes the TTL
-  on every access, so a caller that keeps `MAX_LIVE_SESSIONS` conversations
-  warm holds them indefinitely and everyone else gets `503`. With the defaults
-  that is 12 cheap requests per hour. Recovering needs an admin session
-  delete.
+- **Session slots have no eviction or fairness by default.** `touch()`
+  refreshes the TTL on every access, so a caller that keeps
+  `MAX_LIVE_SESSIONS` conversations warm holds them indefinitely and everyone
+  else gets `503`. With the defaults that is 12 cheap requests per hour.
+  Recovering needs an admin session delete — or opt in to
+  `SESSION_EVICTION_POLICY=lru`, which evicts the least-recently-used idle
+  session instead of refusing. Note eviction is still not *fairness*: a
+  keep-warm caller whose sessions are always fresher than the
+  `SESSION_EVICTION_MIN_IDLE_SECONDS` floor continues to hold its slots.
 - **`/metrics` is unauthenticated and now publishes capacity.**
   `gateway_turns_in_flight` and `gateway_live_sessions` let anyone who can
   reach the endpoint read the exact number of free slots, and the

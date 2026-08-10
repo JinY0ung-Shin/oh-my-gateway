@@ -38,7 +38,7 @@ def mock_claude_cli():
             import tempfile
 
             with tempfile.TemporaryDirectory() as tmpdir:
-                cli = ClaudeCodeCLI(timeout=1000, cwd=tmpdir)
+                cli = ClaudeCodeCLI(cwd=tmpdir)
                 yield cli
 
 

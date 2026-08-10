@@ -109,11 +109,18 @@ async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
     so user-scope plugin skills installed by the admin panel are visible to the
     preflight and the answer describes the CLI that will actually run the turn.
     """
-    from src.backends.claude.client import _get_cli_path, _get_setting_sources
+    from src.backends.claude.client import (
+        _get_cli_path,
+        _get_max_buffer_size,
+        _get_setting_sources,
+    )
 
     opts = ClaudeAgentOptions(
         cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
     )
+    max_buffer_size = _get_max_buffer_size()
+    if max_buffer_size is not None:
+        opts.max_buffer_size = max_buffer_size
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -156,11 +163,18 @@ _details_cache = _DetailsCache()
 
 async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str]]:
     """Names plus SDK metadata (description, argumentHint) for completion UIs."""
-    from src.backends.claude.client import _get_cli_path, _get_setting_sources
+    from src.backends.claude.client import (
+        _get_cli_path,
+        _get_max_buffer_size,
+        _get_setting_sources,
+    )
 
     opts = ClaudeAgentOptions(
         cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
     )
+    max_buffer_size = _get_max_buffer_size()
+    if max_buffer_size is not None:
+        opts.max_buffer_size = max_buffer_size
     details: dict[str, dict[str, str]] = {}
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
