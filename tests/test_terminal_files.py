@@ -100,7 +100,9 @@ def test_list_root_sorts_dirs_first(client):
     assert r.status_code == 200
     entries = r.json()["entries"]
     names = [e["name"] for e in entries]
-    assert names == ["sub", "blob.bin", "notes.txt"]  # dir first, then files a-z
+    # dirs first, then files, each a-z — dot-prefixed entries sort with the rest
+    # now that the server no longer hides them.
+    assert names == [".secret_dir", "sub", ".env", "blob.bin", "notes.txt"]
     sub = next(e for e in entries if e["name"] == "sub")
     assert sub["type"] == "directory"
     notes = next(e for e in entries if e["name"] == "notes.txt")
@@ -202,16 +204,56 @@ def test_missing_file_is_404(client):
 
 
 # --- dotfile hiding -----------------------------------------------------------
+#
+# Off by default (2026-08). Server-side hiding blocked WRITES to dot-prefixed
+# paths too, so clients installing agent resources into the workspace got a 404
+# from a flag that was only ever meant to tidy a listing. Hiding is presentation
+# and now belongs to the client rendering the tree; the flag stays for
+# deployments that want the old behavior.
 
 
-def test_dotfiles_hidden_by_default(client):
+def test_dotfiles_visible_by_default(client):
     r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
     names = [e["name"] for e in r.json()["entries"]]
-    assert ".env" not in names and ".secret_dir" not in names
+    assert ".env" in names and ".secret_dir" in names
+
+
+def test_hidden_path_accessible_by_default(client):
+    # Reading and listing inside a dot-prefixed path is allowed...
+    rr = client.get("/files/read?path=/.env", headers={**_AUTH, **_USER})
+    assert rr.status_code == 200 and rr.json()["content"] == "TOKEN=abc"
+    assert (
+        client.get("/files/list?directory=/.secret_dir", headers={**_AUTH, **_USER}).status_code
+        == 200
+    )
+
+
+def test_dot_prefixed_write_path_is_allowed_by_default(client, workspace):
+    """The regression this default exists for: installing into a dot-prefixed
+    directory must not 404. mkdir + upload is how a client writes agent
+    resources (skills, subagents) into the workspace."""
+    r = client.post(
+        "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/.agent/skills/demo"}
+    )
+    assert r.status_code == 200
+    up = client.post(
+        "/files/upload?directory=/.agent/skills/demo",
+        headers={**_AUTH, **_USER},
+        files={"file": ("SKILL.md", b"# demo", "text/markdown")},
+    )
+    assert up.status_code == 200
+    assert (workspace / ".agent" / "skills" / "demo" / "SKILL.md").read_text() == "# demo"
+
+
+def test_dotfiles_hidden_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "true")
+    r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
+    names = [e["name"] for e in r.json()["entries"]]
     assert names == ["sub", "blob.bin", "notes.txt"]
 
 
-def test_hidden_path_not_accessible_by_default(client):
+def test_hidden_path_not_accessible_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "true")
     # Even typing the path directly is blocked (list/read/inside-dir).
     assert client.get("/files/read?path=/.env", headers={**_AUTH, **_USER}).status_code == 404
     assert (
@@ -222,16 +264,6 @@ def test_hidden_path_not_accessible_by_default(client):
         client.get("/files/read?path=/.secret_dir/k.txt", headers={**_AUTH, **_USER}).status_code
         == 404
     )
-
-
-def test_dotfiles_shown_when_disabled(client, monkeypatch):
-    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "false")
-    r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
-    names = [e["name"] for e in r.json()["entries"]]
-    assert ".env" in names and ".secret_dir" in names
-    # ...and now readable.
-    rr = client.get("/files/read?path=/.env", headers={**_AUTH, **_USER})
-    assert rr.status_code == 200 and rr.json()["content"] == "TOKEN=abc"
 
 
 # --- write operations ---------------------------------------------------------
@@ -341,9 +373,10 @@ def test_archive_zips_selection(client):
     assert "notes.txt" in names and "sub/inner.md" in names
 
 
-def test_archive_excludes_hidden_entries(client):
-    """Directory downloads must not sweep in dotfiles (e.g. .claude) that the
-    browser hides — the zip mirrors the visible listing."""
+def test_archive_excludes_hidden_entries_when_enabled(client, monkeypatch):
+    """The zip mirrors the visible listing — when the server hides dotfiles, a
+    directory download must not sweep them back in."""
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "true")
     r = client.post(
         "/files/archive",
         headers={**_AUTH, **_USER},
@@ -359,8 +392,7 @@ def test_archive_excludes_hidden_entries(client):
     assert not any(n.startswith(".secret_dir/") for n in names)
 
 
-def test_archive_includes_hidden_when_disabled(client, monkeypatch):
-    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "false")
+def test_archive_includes_hidden_by_default(client):
     r = client.post(
         "/files/archive",
         headers={**_AUTH, **_USER},
@@ -372,6 +404,7 @@ def test_archive_includes_hidden_when_disabled(client, monkeypatch):
 
     names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
     assert ".env" in names and ".secret_dir/k.txt" in names
+    assert "notes.txt" in names
 
 
 def test_search_finds_nested_files(client):
@@ -393,15 +426,14 @@ def test_search_is_case_insensitive_and_matches_dirs(client):
     assert any(e["name"] == "sub" and e["type"] == "directory" for e in results)
 
 
-def test_search_excludes_hidden_entries(client):
+def test_search_excludes_hidden_entries_when_enabled(client, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "true")
     r = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
     assert r.status_code == 200
     assert r.json()["results"] == []
-    # ...but finds them when hiding is disabled.
 
 
-def test_search_includes_hidden_when_disabled(client, monkeypatch):
-    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "false")
+def test_search_includes_hidden_by_default(client):
     r = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
     names = [e["name"] for e in r.json()["results"]]
     assert ".secret_dir" in names
@@ -467,7 +499,8 @@ def test_serve_outside_root_never_leaks(client, workspace):
     assert "SECRET" not in r.text
 
 
-def test_serve_hidden_file_is_404(client, workspace):
+def test_serve_hidden_file_is_404_when_enabled(client, workspace, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "true")
     d = str(workspace.resolve())
     r = client.get(f"/files/serve{d}/.env", headers={**_AUTH, **_USER})
     assert r.status_code == 404

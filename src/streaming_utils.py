@@ -1461,6 +1461,38 @@ async def stream_response_chunks(
 
     # --- Finalization ---
 
+    # **파킹된 턴은 완료된 턴이 아니다.**
+    #
+    # AskUserQuestion은 `can_use_tool` 콜백이 세션을 세워 두고 사용자의 답을
+    # 기다린다. 그 사이 SDK 메시지 반복자는 끝나 버릴 수 있고(실측: 모델이
+    # thinking만 내고 질문한 턴), 그러면 위쪽 `stream_break_event` 레이스에서
+    # `get_next`가 먼저 이겨 루프가 "정상 종료"로 빠져나온다. 그대로 두면 여기서
+    # `status="completed"`를 먼저 쏘고, 라우트가 뒤이어 `requires_action`을
+    # **한 번 더** 쏜다 — 클라이언트는 첫 완료를 보고 턴을 닫으므로 질문 카드가
+    # 영영 안 뜨고, 게이트웨이는 300초 뒤 타임아웃으로 끝난다 (issue #13).
+    #
+    # 아래 "내용이 없으면 라우트에 맡긴다" 가드가 이 경우를 잡아 주기를 기대했지만
+    # 그건 **내용의 유무**를 물을 뿐이다. 물어야 할 것은 파킹 여부다.
+    _paused_session = (
+        (request_context or {}).get("session") if isinstance(request_context, dict) else None
+    )
+    if getattr(_paused_session, "pending_tool_call", None) is not None:
+        logger.info("Responses stream paused on a pending tool call — deferring completion")
+        # 열려 있는 항목은 닫아 준다. 완료 이벤트는 라우트가 requires_action으로
+        # 쏘므로 여기서 쏘지 않는다.
+        _close_thinking_capture()
+        if reasoning_open:
+            for line in _close_reasoning():
+                yield line
+        if message_item_opened:
+            for line in _close_message_item():
+                yield line
+        stream_result["success"] = False
+        stream_result["paused"] = True
+        stream_result["assistant_text"] = "".join(all_visible_text)
+        stream_result["thinking_texts"] = thinking_texts
+        return
+
     # No content received AND no reasoning emitted.  Don't yield a failed event
     # here: the caller may still need to emit function_call + requires_action
     # (AskUserQuestion hook path).  Signal "empty" via stream_result and let

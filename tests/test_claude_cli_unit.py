@@ -587,6 +587,38 @@ class TestBuildSdkOptions:
             opts = cli_instance._build_sdk_options(effort="none")
         assert opts.thinking == {"type": "disabled"}
 
+    def test_auto_compact_window_not_injected_without_override(
+        self, cli_instance, monkeypatch
+    ):
+        """No admin override → the operator's env (or the CLI default) stands."""
+        from src.runtime_config import runtime_config
+
+        monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "150000")
+        runtime_config.reset("auto_compact_window")
+        opts = cli_instance._build_sdk_options()
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in (opts.env or {})
+
+    def test_auto_compact_window_override_reaches_the_cli(self, cli_instance):
+        """The admin value lands on the env var the CLI actually reads."""
+        from src.runtime_config import runtime_config
+
+        runtime_config.set("auto_compact_window", 120000)
+        try:
+            opts = cli_instance._build_sdk_options()
+            assert opts.env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
+        finally:
+            runtime_config.reset("auto_compact_window")
+
+    def test_auto_compact_window_rejects_a_useless_floor(self):
+        """A 1-token window would compact every turn — the floor refuses it."""
+        import pytest as _pytest
+
+        from src.runtime_config import runtime_config
+
+        with _pytest.raises(ValueError):
+            runtime_config.set("auto_compact_window", 500)
+        assert not runtime_config.is_overridden("auto_compact_window")
+
     def test_agent_teams_not_injected_without_override(self, cli_instance, monkeypatch):
         """No admin override → the CLI gate env passes through untouched."""
         from src.runtime_config import runtime_config

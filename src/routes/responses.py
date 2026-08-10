@@ -2144,6 +2144,10 @@ async def create_response(
                         "previous_response_id": body.previous_response_id,
                         "turn": next_turn,
                         "use_sdk_client": True,
+                        # 파킹(AskUserQuestion) 여부를 종료 직전에 물어보기 위해
+                        # 세션 자체를 넘긴다 — 아래에서 pending_tool_call을 보고
+                        # requires_action을 쏘는 것과 **같은 근거**여야 한다.
+                        "session": session,
                     },
                 )
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
