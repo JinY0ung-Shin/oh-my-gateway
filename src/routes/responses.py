@@ -314,6 +314,7 @@ def _build_completed_response(
     input_tokens: int,
     output_tokens: int,
     usage_details: Optional[InputTokensDetails] = None,
+    context_tokens: Optional[int] = None,
     thinking_texts: Optional[List[str]] = None,
     structured_output: Any = None,
 ) -> ResponseObject:
@@ -341,6 +342,7 @@ def _build_completed_response(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             input_tokens_details=usage_details or InputTokensDetails(),
+            context_tokens=context_tokens,
         ),
         metadata=metadata or {},
         structured_output=structured_output,
@@ -398,6 +400,7 @@ def _record_stream_turn_response(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         usage_details=streaming_utils.resolve_usage_details(chunks_buffer),
+        context_tokens=streaming_utils.extract_sdk_context_tokens(chunks_buffer),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks_buffer),
     )
@@ -1807,6 +1810,7 @@ async def _run_background_response(
                     input_tokens=prompt_tokens,
                     output_tokens=completion_tokens,
                     input_tokens_details=streaming_utils.resolve_usage_details(chunks),
+                    context_tokens=streaming_utils.extract_sdk_context_tokens(chunks),
                 ),
                 metadata=body.metadata or {},
                 incomplete_details=ResponseIncompleteDetails(reason="user_cancelled"),
@@ -1898,6 +1902,7 @@ async def _run_background_response(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
             usage_details=streaming_utils.resolve_usage_details(chunks),
+            context_tokens=streaming_utils.extract_sdk_context_tokens(chunks),
             thinking_texts=thinking_texts,
             structured_output=streaming_utils.extract_structured_output(chunks),
         )
@@ -2440,6 +2445,7 @@ async def create_response(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
         usage_details=streaming_utils.resolve_usage_details(chunks),
+        context_tokens=streaming_utils.extract_sdk_context_tokens(chunks),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks),
     )
@@ -2798,6 +2804,7 @@ async def _handle_function_call_output(
         input_tokens=prompt_tokens,
         output_tokens=completion_tokens,
         usage_details=streaming_utils.resolve_usage_details(chunks),
+        context_tokens=streaming_utils.extract_sdk_context_tokens(chunks),
         thinking_texts=thinking_texts,
         structured_output=streaming_utils.extract_structured_output(chunks),
     )

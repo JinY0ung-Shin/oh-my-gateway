@@ -353,6 +353,40 @@ def resolve_token_usage(
     return MessageAdapter.estimate_tokens(prompt), MessageAdapter.estimate_tokens(completion_text)
 
 
+def extract_sdk_context_tokens(chunks: list) -> Optional[int]:
+    """Context-window occupancy after the turn (Claude extension).
+
+    The Claude Code status line and ``/context`` report the LAST main-loop
+    API call's ``input + cache_creation + cache_read`` — a snapshot of what
+    the next turn will carry, verified against the bundled CLI binary
+    (``GHo``: ``e.input_tokens+e.cache_creation_input_tokens+
+    e.cache_read_input_tokens`` over the context window).
+
+    This deliberately differs from :func:`extract_sdk_usage`, whose
+    ``prompt_tokens`` is the ResultMessage's CUMULATIVE billing total — an
+    agentic turn re-reads the whole context from cache on every API call, so
+    that total routinely exceeds the context window several times over and
+    must not be shown on a context gauge.
+
+    Subagent assistant messages (``parent_tool_use_id`` set) are skipped —
+    their usage describes the subagent's own context, not the main loop's.
+    """
+    for msg in reversed(chunks):
+        if (
+            isinstance(msg, dict)
+            and msg.get("type") == "assistant"
+            and msg.get("usage")
+            and not msg.get("parent_tool_use_id")
+        ):
+            u = msg["usage"]
+            return (
+                int(u.get("input_tokens", 0) or 0)
+                + int(u.get("cache_creation_input_tokens", 0) or 0)
+                + int(u.get("cache_read_input_tokens", 0) or 0)
+            )
+    return None
+
+
 def resolve_usage_details(chunks: list) -> InputTokensDetails:
     """Return the ``input_tokens`` cache breakdown for a Responses payload.
 
@@ -1540,6 +1574,7 @@ async def stream_response_chunks(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
             input_tokens_details=resolve_usage_details(chunks_buffer),
+            context_tokens=extract_sdk_context_tokens(chunks_buffer),
         ),
         metadata=_metadata,
         structured_output=extract_structured_output(chunks_buffer),

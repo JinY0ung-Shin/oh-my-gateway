@@ -276,6 +276,14 @@ class ResponseUsage(BaseModel):
     output_tokens: int = 0
     total_tokens: int = 0
     input_tokens_details: InputTokensDetails = Field(default_factory=InputTokensDetails)
+    # Claude extension: context-window occupancy after the turn — the last
+    # main-loop API call's ``input + cache_creation + cache_read`` (the same
+    # number the Claude Code status line and ``/context`` report). This is a
+    # SNAPSHOT; ``input_tokens`` above is the turn's cumulative billing total,
+    # which for agentic turns (many API calls, each re-reading the whole
+    # context from cache) can exceed the context window several times over.
+    # ``None`` when the turn carried no per-call SDK usage.
+    context_tokens: Optional[int] = None
 
     @model_validator(mode="after")
     def _derive_total(self) -> "ResponseUsage":
