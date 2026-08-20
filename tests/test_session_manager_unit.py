@@ -619,3 +619,62 @@ class TestPerSessionLock:
         assert order[1].endswith("-end")
         assert order[0][0] == order[1][0]  # Same label for start/end pair
         assert len(session.messages) == 2
+
+
+class TestDisconnectCap:
+    """Issue #147 — the disconnect cap must not cancel the SDK's close().
+
+    subprocess_cli.close() escalates stdin-EOF → SIGTERM → SIGKILL with
+    bounded waits (~20s worst case) inside a shielded scope, but the shield
+    does not survive a raw asyncio cancellation: a too-short asyncio.wait_for
+    cancels close() mid-wait, the escalation is skipped, and the `claude`
+    child survives. Leaked workers then pile up until MAX_LIVE_SESSIONS
+    returns 503 — while the session bookkeeping says everything was cleaned.
+    """
+
+    def test_cap_covers_the_sdk_close_escalation(self):
+        """stdin-lock 5s + graceful 5s + SIGTERM 5s + SIGKILL 5s = 20s."""
+        from src.constants import CLIENT_DISCONNECT_TIMEOUT_SECONDS
+
+        assert CLIENT_DISCONNECT_TIMEOUT_SECONDS > 20.0
+
+    async def test_slow_disconnect_is_awaited_to_completion(
+        self, fresh_session_manager
+    ):
+        """A disconnect slower than the old 2s cap must still finish.
+
+        With the old cap this fake (2.3s) was cancelled mid-flight — exactly
+        how real CLI children that outlive the 5s graceful window escaped
+        their SIGTERM/SIGKILL.
+        """
+        manager = fresh_session_manager
+        session = manager.get_or_create_session("slow-disconnect")
+        finished = asyncio.Event()
+
+        async def slow_disconnect():
+            await asyncio.sleep(2.3)
+            finished.set()
+
+        client = AsyncMock()
+        client.disconnect = slow_disconnect
+        session.client = client
+
+        assert await manager.delete_session_async("slow-disconnect") is True
+        assert finished.is_set(), "disconnect was cancelled before completing"
+
+    def test_every_disconnect_wait_uses_the_shared_cap(self):
+        """No site may reintroduce a private (too-short) disconnect timeout."""
+        import re
+        from pathlib import Path
+
+        import src.session_manager as sm
+        import src.routes.responses as resp
+
+        src_text = Path(sm.__file__).read_text() + Path(resp.__file__).read_text()
+        calls = re.findall(
+            r"asyncio\.wait_for\((?:[^()]|\([^()]*\))*\)", src_text
+        )
+        disconnect_calls = [c for c in calls if "disconnect" in c]
+        assert disconnect_calls, "expected wait_for(...disconnect...) sites"
+        for call in disconnect_calls:
+            assert "CLIENT_DISCONNECT_TIMEOUT_SECONDS" in call, call

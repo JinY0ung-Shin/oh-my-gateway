@@ -46,6 +46,24 @@ PERMISSION_MODE_BYPASS = "bypassPermissions"
 SESSION_CLEANUP_INTERVAL_MINUTES = parse_int_env("SESSION_CLEANUP_INTERVAL_MINUTES", 5)
 SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 
+# Cap on every awaited ClaudeSDKClient.disconnect(). Must sit ABOVE the SDK
+# transport's own worst-case close() sequence, not below it: close()
+# (claude-agent-sdk 0.2.128, subprocess_cli.py) bounds each of its awaits —
+# stdin-lock 5s, graceful-exit wait 5s, SIGTERM + 5s, SIGKILL + 5s ≈ 20s —
+# inside a shielded scope whose shield does NOT survive a raw asyncio
+# cancellation. An asyncio.wait_for firing mid-close cancels the coroutine at
+# its next await and the SIGTERM→SIGKILL escalation is silently skipped (the
+# SDK docstring states this). The previous 2s cap did exactly that whenever
+# the CLI outlived the graceful window: the `claude` child survived, the
+# session bookkeeping said "cleaned", and leaked workers piled up until
+# MAX_LIVE_SESSIONS returned 503 — recoverable only by `docker compose down`
+# (issue #147). At 30s the wait_for fires only when close() is truly wedged
+# (dead anyio channel); the child is unreachable then and the atexit reaper is
+# the remaining line of defense. Shutdown stays bounded: disconnects run under
+# gather, so wall clock is ~one cap, and docker-compose grants a matching
+# stop_grace_period.
+CLIENT_DISCONNECT_TIMEOUT_SECONDS = 30.0
+
 # Concurrency admission control (see src/concurrency.py for the rationale).
 # Every live session pins a Claude CLI subprocess (~400 MB measured) for its
 # whole TTL, so MAX_LIVE_SESSIONS — not the in-flight turn cap — is what keeps

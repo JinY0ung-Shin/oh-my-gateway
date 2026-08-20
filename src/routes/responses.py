@@ -46,7 +46,7 @@ from src.concurrency_middleware import take_turn_slot
 from src.rate_limiter import rate_limit_endpoint
 from src import session_outbox
 from src.chunk_processing import classify_error_chunk
-from src.constants import DEFAULT_TIMEOUT_MS
+from src.constants import CLIENT_DISCONNECT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
 from src.usage_logger import usage_logger
@@ -525,7 +525,7 @@ async def _disconnect_session_client(session, reason: str, client=None) -> None:
     if disconnect is None:
         return
     try:
-        await asyncio.wait_for(disconnect(), timeout=2.0)
+        await asyncio.wait_for(disconnect(), timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS)
     except Exception:
         logger.debug("SDK client disconnect failed after %s", reason, exc_info=True)
 

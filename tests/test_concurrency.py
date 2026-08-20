@@ -837,16 +837,24 @@ class TestLruEviction:
             await asyncio.gather(*list(manager._evict_tasks))
         dead_client.disconnect.assert_awaited_once()
 
-    async def test_expiry_sweep_survives_a_hung_disconnect(self):
+    async def test_expiry_sweep_survives_a_hung_disconnect(self, monkeypatch):
         """A dead anyio channel must not wedge the sweep: a wedged sweep
         blocks every future out-of-band sweep and the periodic cleanup loop
         awaits the same coroutine, so session expiry would stop for the
-        process lifetime."""
+        process lifetime.
+
+        The cap under test is the MECHANISM, not its production value: the
+        real CLIENT_DISCONNECT_TIMEOUT_SECONDS is 30s (sized for the SDK's
+        SIGTERM→SIGKILL escalation, issue #147), so it is shrunk here to keep
+        the test fast."""
 
         class WedgedClient:
             async def disconnect(self):
                 await asyncio.Event().wait()  # never resolves
 
+        import src.session_manager as sm_module
+
+        monkeypatch.setattr(sm_module, "CLIENT_DISCONNECT_TIMEOUT_SECONDS", 0.2)
         manager = SessionManager()
         stale = manager.get_or_create_session("stale")
         stale.client = WedgedClient()
@@ -857,12 +865,15 @@ class TestLruEviction:
         assert removed == 1
         assert "stale" not in manager.sessions
 
-    async def test_shutdown_settles_an_inflight_sweep_without_orphans(self):
+    async def test_shutdown_settles_an_inflight_sweep_without_orphans(
+        self, monkeypatch
+    ):
         """_purge_all_expired deletes every doomed session from the dict
         BEFORE disconnecting it, so a parked sweep is the only reference to
         those clients — cancelling it would orphan each one it had not
         reached, invisibly to shutdown's snapshot pass. Shutdown must await
-        the (2s-capped) sweep instead."""
+        the (disconnect-capped) sweep instead. The cap is shrunk here — its
+        production value is 30s (issue #147)."""
 
         class WedgedClient:
             async def disconnect(self):
@@ -875,6 +886,9 @@ class TestLruEviction:
             async def disconnect(self):
                 self.disconnected = True
 
+        import src.session_manager as sm_module
+
+        monkeypatch.setattr(sm_module, "CLIENT_DISCONNECT_TIMEOUT_SECONDS", 0.2)
         manager = SessionManager()
         wedged = manager.get_or_create_session("wedged")
         wedged.client = WedgedClient()
@@ -891,7 +905,7 @@ class TestLruEviction:
         assert manager._sweep_task is not None
         assert manager._sweep_task.done()
         assert tracked_client.disconnected is True
-        assert wedged.client is None  # timed out at the 2s cap, then released
+        assert wedged.client is None  # timed out at the disconnect cap, then released
 
     async def test_finishing_a_turn_touches_the_session_whatever_the_outcome(self):
         """Only the success paths touch via add_messages; the failure path

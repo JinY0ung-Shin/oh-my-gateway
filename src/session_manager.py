@@ -30,7 +30,11 @@ from threading import Lock
 from src import metrics
 from src.concurrency import SessionLimitExceeded
 from src.models import Message, SessionInfo
-from src.constants import SESSION_CLEANUP_INTERVAL_MINUTES, SESSION_MAX_AGE_MINUTES
+from src.constants import (
+    CLIENT_DISCONNECT_TIMEOUT_SECONDS,
+    SESSION_CLEANUP_INTERVAL_MINUTES,
+    SESSION_MAX_AGE_MINUTES,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -468,7 +472,9 @@ class SessionManager:
         """Disconnect and clean up an evicted session outside the lock.
 
         Mirrors the expiry sweep's sequence in ``_purge_all_expired``, with
-        the same 2s disconnect cap as ``async_shutdown`` — disconnect() can
+        the same disconnect cap as ``async_shutdown``
+        (``CLIENT_DISCONNECT_TIMEOUT_SECONDS`` — sized so the SDK's own
+        SIGTERM→SIGKILL escalation finishes, see constants.py) — disconnect() can
         hang on a dead anyio channel, and a hung fire-and-forget task would
         pin the subprocess and the Session (via ``_evict_tasks``) forever.
         The session is already out of ``self.sessions``; this only releases
@@ -480,7 +486,10 @@ class SessionManager:
             _cancel_idle_reader(session)
             if session.client is not None:
                 try:
-                    await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                    await asyncio.wait_for(
+                        session.client.disconnect(),
+                        timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
+                    )
                 except Exception:
                     logger.debug(
                         "Client disconnect timed out or failed for evicted session %s",
@@ -541,7 +550,10 @@ class SessionManager:
                         # future out-of-band sweeps AND the periodic cleanup
                         # loop — session expiry would stop for the process
                         # lifetime.
-                        await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                        await asyncio.wait_for(
+                            session.client.disconnect(),
+                            timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
+                        )
                     except Exception:
                         logger.debug(
                             "Client disconnect failed for session %s", sid, exc_info=True
@@ -556,7 +568,7 @@ class SessionManager:
             # Concurrent teardown, mirroring async_shutdown's snapshot pass.
             # The doomed list is by now the ONLY reference to these sessions,
             # so async_shutdown must be able to await an in-flight sweep at a
-            # ~2s bound rather than MAX_LIVE_SESSIONS x 2s serial.
+            # one disconnect-cap bound rather than MAX_LIVE_SESSIONS x cap serial.
             await asyncio.gather(
                 *(_teardown(sid, s) for sid, s in doomed), return_exceptions=True
             )
@@ -662,7 +674,7 @@ class SessionManager:
         # those clients, and cancelling it would orphan each one it had not
         # reached — invisibly to the snapshot pass below. Awaiting is
         # bounded: the sweep's teardowns run concurrently, each disconnect
-        # capped at 2s.
+        # capped at CLIENT_DISCONNECT_TIMEOUT_SECONDS.
         sweep = self._sweep_task
         if sweep is not None and not sweep.done():
             with contextlib.suppress(Exception):
@@ -672,7 +684,7 @@ class SessionManager:
         # below cannot see them — settle their in-flight teardowns first or
         # their CLI subprocesses outlive the gateway. Loop: a concurrent
         # admission can evict (scheduling another teardown) while we await.
-        # Bounded: each teardown caps its disconnect at 2s and never raises,
+        # Bounded: each teardown caps its disconnect and never raises,
         # and the loop ends the first round no new eviction lands in.
         while True:
             evict_tasks = list(self._evict_tasks)
@@ -691,7 +703,10 @@ class SessionManager:
             if session.client is None:
                 return
             try:
-                await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                await asyncio.wait_for(
+                    session.client.disconnect(),
+                    timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
+                )
             except Exception:
                 logger.debug("Client disconnect timed out or failed", exc_info=True)
             session.client = None
@@ -866,7 +881,10 @@ class SessionManager:
         _cancel_idle_reader(session)
         if session.client is not None:
             try:
-                await asyncio.wait_for(session.client.disconnect(), timeout=2.0)
+                await asyncio.wait_for(
+                    session.client.disconnect(),
+                    timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
+                )
             except Exception:
                 logger.debug("Client disconnect timed out or failed", exc_info=True)
             session.client = None
