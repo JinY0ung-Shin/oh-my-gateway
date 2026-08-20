@@ -254,10 +254,21 @@ class InputTokensDetails(BaseModel):
     equivalent, broken out because cache writes bill at a premium. Clients
     that only know the OpenAI shape ignore the extra key and still read a
     correct ``input_tokens`` total.
+
+    ``context_tokens`` is a second gateway extension: the prompt size of the
+    turn's LAST main-agent model request (its ``input_tokens`` + cache reads +
+    cache creation), i.e. a snapshot of live context-window occupancy at the
+    end of the turn. It is NOT a subset of ``input_tokens`` in the breakdown
+    sense — ``input_tokens`` is CUMULATIVE across every model request the
+    agentic turn made (one per tool round, each re-sending the transcript), so
+    dividing it by the context window overstates fill and runs past 100% on
+    tool-heavy turns. UIs that render "context used" must use this field;
+    ``input_tokens`` remains the billing total. 0 = no snapshot available.
     """
 
     cached_tokens: int = 0
     cache_creation_tokens: int = 0
+    context_tokens: int = 0
 
 
 class ResponseUsage(BaseModel):

@@ -109,6 +109,80 @@ class TestResolveUsageDetails:
         ]
         assert resolve_usage_details(chunks).cached_tokens == 17
 
+    def test_context_tokens_snapshot_last_main_agent_assistant(self):
+        """context_tokens = the LAST main-agent request's prompt size, not the
+        cumulative result total — the whole point of the field (a tool-heavy
+        turn's cumulative input runs past the context window)."""
+        chunks = [
+            {
+                "type": "assistant",
+                "usage": {"input_tokens": 5, "cache_read_input_tokens": 100},
+            },
+            {
+                "type": "assistant",
+                "usage": {
+                    "input_tokens": 5,
+                    "cache_read_input_tokens": 140,
+                    "cache_creation_input_tokens": 15,
+                },
+            },
+            {
+                "type": "result",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 50,
+                    "cache_read_input_tokens": 240,
+                    "cache_creation_input_tokens": 15,
+                },
+            },
+        ]
+        details = resolve_usage_details(chunks)
+        assert details.context_tokens == 160  # 5 + 140 + 15, NOT 265
+
+    def test_context_tokens_ignore_subagent_chunks(self):
+        """A subagent's context is a separate window — its (often larger or
+        smaller) prompt must not masquerade as the main conversation's fill."""
+        chunks = [
+            {"type": "assistant", "usage": {"input_tokens": 70}},
+            {
+                "type": "assistant",
+                "parent_tool_use_id": "toolu_1",
+                "usage": {"input_tokens": 9000},
+            },
+        ]
+        assert resolve_usage_details(chunks).context_tokens == 70
+
+    def test_context_tokens_from_message_start_in_token_streaming(self):
+        """Token-streaming turns: the assembled assistant message carries only
+        the message_delta output counts (input_tokens null), so the snapshot
+        rides the ``message_start`` stream event instead."""
+        chunks = [
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {"input_tokens": 4, "cache_read_input_tokens": 80}
+                    },
+                },
+            },
+            {"type": "assistant", "usage": {"input_tokens": None, "output_tokens": 30}},
+            {
+                "type": "stream_event",
+                "event": {
+                    "type": "message_start",
+                    "message": {
+                        "usage": {"input_tokens": 4, "cache_read_input_tokens": 120}
+                    },
+                },
+            },
+            {"type": "result", "usage": {"input_tokens": 8, "output_tokens": 60}},
+        ]
+        assert resolve_usage_details(chunks).context_tokens == 124
+
+    def test_context_tokens_zero_without_any_snapshot(self):
+        assert resolve_usage_details([{"type": "assistant"}]).context_tokens == 0
+
     def test_agrees_with_the_usage_log_row_for_the_same_turn(self):
         """The API payload and the usage-log row must never disagree."""
         from src.usage_logger import extract_sdk_usage_detail

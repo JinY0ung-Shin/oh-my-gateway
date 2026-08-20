@@ -234,6 +234,67 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     return None
 
 
+def _prompt_size(usage: Dict[str, Any]) -> int:
+    """Prompt-token size of one model request's usage record.
+
+    ``input_tokens`` + cache reads + cache creation = the size of the prompt
+    actually sent on that request (the cache counters are how most of a
+    resumed transcript is billed, so ``input_tokens`` alone is misleadingly
+    tiny on cached turns).
+    """
+    return (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+    )
+
+
+def context_snapshot_from_chunk(chunk: Any) -> int:
+    """Context-occupancy snapshot carried by one SDK chunk, 0 if none.
+
+    Two shapes carry it, mirroring Noah's dual path:
+
+    - a MAIN-agent ``assistant`` message's ``usage`` (non-token-streaming:
+      the assembled message reports the request's full prompt counts);
+    - a MAIN-agent ``stream_event``/``message_start`` event's
+      ``message.usage`` (token-streaming: the assembled assistant message
+      only carries the ``message_delta`` output counts, so the prompt size
+      rides the start event instead).
+
+    Subagent chunks (``parent_tool_use_id`` set) are never snapshots — their
+    context is a separate window.
+    """
+    if not isinstance(chunk, dict) or chunk.get("parent_tool_use_id"):
+        return 0
+    ctype = chunk.get("type")
+    if ctype == "assistant":
+        usage = chunk.get("usage")
+        return _prompt_size(usage) if isinstance(usage, dict) else 0
+    if ctype == "stream_event":
+        event = chunk.get("event")
+        if isinstance(event, dict) and event.get("type") == "message_start":
+            message = event.get("message")
+            usage = message.get("usage") if isinstance(message, dict) else None
+            return _prompt_size(usage) if isinstance(usage, dict) else 0
+    return 0
+
+
+def extract_context_tokens(chunks: list) -> int:
+    """Live context-window occupancy at the end of the turn, 0 if unknown.
+
+    The LAST main-agent model request of a turn was prompted with the full
+    transcript so far, so its prompt size ≈ live context occupancy — a true
+    snapshot, unlike the CUMULATIVE ``result``/summed usage that
+    :func:`extract_sdk_usage` reports (which grows by one whole prompt per
+    tool round and overstates context fill).
+    """
+    for chunk in reversed(chunks):
+        snapshot = context_snapshot_from_chunk(chunk)
+        if snapshot > 0:
+            return snapshot
+    return 0
+
+
 def extract_structured_output(chunks: list) -> Any:
     """Return ``ResultMessage.structured_output`` from SDK chunks, if present.
 
@@ -368,6 +429,7 @@ def resolve_usage_details(chunks: list) -> InputTokensDetails:
     return InputTokensDetails(
         cached_tokens=detail["cache_read_tokens"],
         cache_creation_tokens=detail["cache_creation_tokens"],
+        context_tokens=extract_context_tokens(chunks),
     )
 
 
@@ -1405,6 +1467,13 @@ async def stream_response_chunks(
             # Tool blocks were already extracted above, so only text is suppressed.
             if token_streaming:
                 if chunk.get("type") == "stream_event":
+                    # Keep main-agent ``message_start`` markers in the buffer:
+                    # their usage is the prompt-size snapshot of that model
+                    # request (→ ``context_tokens``), which the assembled
+                    # assistant message no longer carries in token-streaming
+                    # mode. One chunk per model request — bounded.
+                    if context_snapshot_from_chunk(chunk) > 0:
+                        chunks_buffer.append(chunk)
                     continue
                 if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
                     if chunk.get("type") == "assistant" and chunk.get("usage"):
