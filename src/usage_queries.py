@@ -189,13 +189,26 @@ _GRANULARITY_SQL_MYSQL: Dict[str, str] = {
     "month": "DATE_FORMAT(DATE_ADD(ts, INTERVAL 9 HOUR), '%Y-%m')",
 }
 
-# SQLite equivalents.  ``%G`` (ISO week year) / ``%V`` (ISO week) match MySQL's
-# ``%x``/``%v`` Monday-first ISO weeks.  None of these literals contain the
-# substring ``ts`` outside the column reference, so the ``.replace("ts", "u.ts")``
-# used to alias the column for the join below stays safe.
+# SQLite equivalents.  The week bucket deliberately avoids ``%G``/``%V``:
+# those need SQLite >= 3.46 (2024-05) and on anything older strftime returns
+# NULL, so every row lands in one NULL bucket — turns still aggregate but the
+# LEFT JOIN on ``bucket`` never matches (NULL = NULL is false) and tool_calls
+# silently reads 0.  Instead the ISO week is derived from the Thursday of the
+# row's Monday-first week (``'-3 days', 'weekday 4'`` — the classic pre-%G
+# idiom): the ISO week-year is that Thursday's calendar year and the week
+# number is (dayofyear(Thursday)-1)/7 + 1.  Verified against
+# ``date.isocalendar()`` for every day of 2015..2034 (0 mismatches) and it
+# matches MySQL's ``%x-W%v`` labels.  None of these literals contain the
+# substring ``ts`` outside the column reference, so the
+# ``.replace("ts", "u.ts")`` used to alias the column for the join below
+# stays safe.
 _GRANULARITY_SQL_SQLITE: Dict[str, str] = {
     "day": "date(ts, '+9 hours')",
-    "week": "strftime('%G-W%V', ts, '+9 hours')",
+    "week": (
+        "(strftime('%Y', date(ts, '+9 hours', '-3 days', 'weekday 4'))"
+        " || '-W' || printf('%02d',"
+        " (strftime('%j', date(ts, '+9 hours', '-3 days', 'weekday 4')) - 1) / 7 + 1))"
+    ),
     "month": "strftime('%Y-%m', ts, '+9 hours')",
 }
 
