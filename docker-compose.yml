@@ -1,6 +1,13 @@
 services:
   gateway:
     restart: unless-stopped
+    # Shutdown must outlive the SDK's SIGTERM→SIGKILL escalation (~20s worst
+    # case per claude subprocess; disconnects run concurrently, see
+    # CLIENT_DISCONNECT_TIMEOUT_SECONDS in src/constants.py). Docker's default
+    # 10s grace would SIGKILL the gateway mid-escalation and strand `claude`
+    # grandchildren in the cgroup — the reason `docker restart` used to leak
+    # workers while only `compose down && up` recovered (issue #147).
+    stop_grace_period: 35s
     build:
       context: .
       # Inherit proxy settings from the host shell at build time.
