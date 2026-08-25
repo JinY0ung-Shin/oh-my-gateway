@@ -209,13 +209,19 @@ SSE_KEEPALIVE_INTERVAL = parse_int_env("SSE_KEEPALIVE_INTERVAL", 15)
 STREAM_STALL_TIMEOUT_SECONDS = parse_int_env("STREAM_STALL_TIMEOUT", 600)
 
 # Safety net behind the stall guard, enforced by the expiry sweep: a session
-# whose active turn is older than this stops pinning itself and is reclaimed
+# whose active turn has made NO PROGRESS (no real SDK chunk, stamped by the
+# route's chunk wrapper) for this long stops pinning itself and is reclaimed
 # (client disconnect → SIGTERM→SIGKILL escalation) even though in-flight
-# turns normally exempt a session from expiry. Catches wedges the in-stream
-# guard cannot see (a path that never enters stream_response_chunks, or
-# keepalives disabled). Must sit above every legitimate turn budget —
-# MAX_TIMEOUT (10 min), the background cap, and the stall cap — so it only
-# ever fires on true zombies. Set to 0 to disable.
+# turns normally exempt a session from expiry. Deliberately measures silence,
+# not absolute turn age: streaming turns are intentionally unbounded and
+# background turns may legitimately run to their whole
+# BACKGROUND_RESPONSE_TIMEOUT_S (3600s) budget while producing chunks the
+# whole way — an absolute cap would reclaim healthy work. Catches wedges the
+# in-stream guard cannot see (a path that never enters
+# stream_response_chunks, or keepalives disabled). Must sit above the
+# longest legitimate silent stretch (the stall cap above bounds streaming
+# silence at 600s), so it only ever fires on true zombies. Set to 0 to
+# disable.
 ACTIVE_TURN_MAX_AGE_SECONDS = parse_int_env("ACTIVE_TURN_MAX_AGE", 1800)
 
 # ---------------------------------------------------------------------------

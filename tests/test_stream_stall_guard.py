@@ -100,10 +100,35 @@ class TestActiveTurnPinAge:
         assert session.is_expired() is False
 
     def test_zombie_active_turn_stops_pinning(self, monkeypatch):
+        """No progress since begin, past the cap → reclaimed."""
         monkeypatch.setattr("src.constants.ACTIVE_TURN_MAX_AGE_SECONDS", 50)
         session = Session(session_id="pin-2", ttl_minutes=0)
         session.active_response_id = "resp_x"
         session.active_response_started_at = time.monotonic() - 100
+        assert session.is_expired() is True
+
+    def test_old_turn_with_recent_progress_keeps_pin(self, monkeypatch):
+        """The valve measures NO-PROGRESS time, never absolute turn age.
+
+        A background job deep into its 3600s budget, or an intentionally
+        unbounded streaming turn, keeps producing chunks — each stamp resets
+        the valve, so a turn far older than the cap must stay pinned while
+        it is alive (review: absolute age would reclaim healthy work).
+        """
+        monkeypatch.setattr("src.constants.ACTIVE_TURN_MAX_AGE_SECONDS", 50)
+        session = Session(session_id="pin-progress", ttl_minutes=0)
+        session.active_response_id = "resp_x"
+        session.active_response_started_at = time.monotonic() - 5000
+        session.active_response_last_progress_at = time.monotonic() - 5
+        assert session.is_expired() is False
+
+    def test_progress_gone_silent_stops_pinning(self, monkeypatch):
+        """Progress that stopped past the cap → reclaimed, however young the turn."""
+        monkeypatch.setattr("src.constants.ACTIVE_TURN_MAX_AGE_SECONDS", 50)
+        session = Session(session_id="pin-silent", ttl_minutes=0)
+        session.active_response_id = "resp_x"
+        session.active_response_started_at = time.monotonic() - 200
+        session.active_response_last_progress_at = time.monotonic() - 100
         assert session.is_expired() is True
 
     def test_valve_disabled_preserves_unconditional_pin(self, monkeypatch):
@@ -138,10 +163,39 @@ class TestBeginFinishStamping:
         session = Session(session_id="stamp-1")
         await _begin_active_response(session, "resp_1", 1, object())
         assert isinstance(session.active_response_started_at, float)
+        # Progress is seeded to the start stamp so a turn that wedges before
+        # its first chunk is still measured from begin, not left None.
+        assert (
+            session.active_response_last_progress_at
+            == session.active_response_started_at
+        )
 
         await _finish_active_response(session, "resp_1", "completed")
         assert session.active_response_started_at is None
+        assert session.active_response_last_progress_at is None
         assert session.active_response_id is None
+
+    async def test_chunk_wrapper_stamps_progress(self):
+        """Every real chunk through the shared turn-path wrapper is progress."""
+        from types import SimpleNamespace
+
+        from src.routes.responses import _capture_pending_tool_questions
+
+        session = Session(session_id="stamp-2")
+        session.active_response_id = "resp_1"
+        resolved = SimpleNamespace(backend="claude")
+
+        async def chunks():
+            yield {"type": "stream_event", "event": {}}
+
+        before = time.monotonic()
+        out = [
+            c
+            async for c in _capture_pending_tool_questions(chunks(), resolved, session)
+        ]
+        assert len(out) == 1
+        assert session.active_response_last_progress_at is not None
+        assert session.active_response_last_progress_at >= before
 
 
 class TestOldestActiveTurnGauge:

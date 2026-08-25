@@ -254,6 +254,13 @@ class Session:
     # a rehydrated session starts unpinned, which is correct — its turn
     # died with the old process.
     active_response_started_at: Optional[float] = None
+    # ``time.monotonic()`` of the turn's most recent real SDK chunk
+    # (stamped by the route's chunk wrapper, seeded to started_at at begin).
+    # The pin-age valve measures NO-PROGRESS time from here — not absolute
+    # turn age — so a long-running turn that keeps producing chunks
+    # (a 30min+ background job inside its 3600s budget, an unbounded
+    # streaming agentic turn) is never reclaimed while it is alive.
+    active_response_last_progress_at: Optional[float] = None
     active_response_client: Optional[Any] = field(default=None, repr=False, compare=False)
     active_response_done: asyncio.Event = field(
         default_factory=asyncio.Event, repr=False, compare=False
@@ -309,18 +316,24 @@ class Session:
             # response id a client may still poll or cancel. The turn's
             # teardown always clears the slot and touches the session.
             #
-            # ...unless the "turn" is a zombie. Every legitimate turn is
-            # bounded (MAX_TIMEOUT, the background cap, the stream stall
-            # guard), so an active turn older than ACTIVE_TURN_MAX_AGE is a
-            # wedge none of those guards reached — left pinned it holds a
-            # live CLI worker, a session slot, and a turn slot until the
-            # container is recreated. Letting the expiry sweep reclaim it
-            # disconnects the client; that kills the CLI, which errors the
-            # wedged stream and lets its own teardown release everything.
+            # ...unless the "turn" is a zombie. The valve measures
+            # NO-PROGRESS time (last real SDK chunk), never absolute turn
+            # age: streaming turns are intentionally unbounded and background
+            # turns may run to their 3600s budget, so a long turn that keeps
+            # producing chunks must keep its pin. A turn silent past
+            # ACTIVE_TURN_MAX_AGE is a wedge none of the per-path guards
+            # reached — left pinned it holds a live CLI worker, a session
+            # slot, and a turn slot until the container is recreated.
+            # Letting the expiry sweep reclaim it disconnects the client;
+            # that kills the CLI, which errors the wedged stream and lets
+            # its own teardown release everything.
             age_cap = _active_turn_max_age()
-            started = self.active_response_started_at
-            if age_cap > 0 and started is not None:
-                return time.monotonic() - started > age_cap
+            progressed = (
+                self.active_response_last_progress_at
+                or self.active_response_started_at
+            )
+            if age_cap > 0 and progressed is not None:
+                return time.monotonic() - progressed > age_cap
             return False
         return _utcnow() > self.expires_at
 

@@ -543,6 +543,7 @@ async def _begin_active_response(session, response_id: str, turn: int, client: A
         session.active_response_turn = turn
         session.active_response_state = "running"
         session.active_response_started_at = time.monotonic()
+        session.active_response_last_progress_at = session.active_response_started_at
         session.active_response_client = client
         session.active_response_done.clear()
 
@@ -556,6 +557,7 @@ async def _finish_active_response(session, response_id: str, terminal_state: str
         session.active_response_id = None
         session.active_response_turn = None
         session.active_response_started_at = None
+        session.active_response_last_progress_at = None
         session.active_response_client = None
         # Refresh in the same critical section that unpins: only the success
         # paths touch via add_messages, so without this a *failed* long turn
@@ -1495,6 +1497,13 @@ def _is_codex_pending_approval_chunk(
 
 async def _capture_pending_tool_questions(chunk_source, resolved: ResolvedModel, session):
     async for chunk in chunk_source:
+        # Every real SDK chunk is turn progress. Stamped here because this
+        # wrapper sits on ALL turn paths (streaming, non-stream, background,
+        # continuations) and is the one place that has both the chunk stream
+        # and the session. ``is_expired``'s pin-age valve measures NO-PROGRESS
+        # time from this stamp, so a legitimately long turn that keeps
+        # producing chunks is never reclaimed — only a silent wedge is.
+        session.active_response_last_progress_at = time.monotonic()
         # Keep the outbox's active-task registry aware of tasks started
         # mid-turn (they outlive the turn while the idle reader is off).
         session_outbox.apply_turn_task_chunk(session, chunk)
@@ -1934,6 +1943,7 @@ async def _run_background_response(
                     session.active_response_id = None
                     session.active_response_turn = None
                     session.active_response_started_at = None
+                    session.active_response_last_progress_at = None
                     session.active_response_client = None
                     session.active_response_done.set()
                 raise
