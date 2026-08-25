@@ -320,7 +320,9 @@ async def lifespan(app: FastAPI):
         MAX_CONCURRENT_TURNS_PER_USER or "unlimited",
     )
     metrics.bind_live_sessions_source(lambda: len(session_manager.sessions))
-    metrics.bind_oldest_active_turn_source(session_manager.oldest_active_turn_age)
+    metrics.bind_oldest_active_turn_silence_source(
+        session_manager.oldest_active_turn_silence
+    )
 
     # Start session cleanup task
     session_manager.start_cleanup_task()

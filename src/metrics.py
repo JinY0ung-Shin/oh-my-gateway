@@ -121,11 +121,15 @@ STREAM_STALLS_TOTAL = Counter(
     "permanently leaked CLI worker pinning a session and a turn slot.",
 )
 
-OLDEST_ACTIVE_TURN = Gauge(
-    "gateway_oldest_active_turn_seconds",
-    "Age of the oldest in-flight Responses turn, 0 when idle. A value stuck "
-    "far above every turn budget means a wedged turn is pinning its session "
-    "(exempt from TTL expiry) and holding a MAX_CONCURRENT_TURNS slot.",
+OLDEST_ACTIVE_TURN_SILENCE = Gauge(
+    "gateway_oldest_active_turn_silence_seconds",
+    "Longest current no-progress stretch (seconds since the last real SDK "
+    "chunk) across in-flight Responses turns, 0 when idle. Absolute turn age "
+    "is deliberately NOT measured: healthy streaming turns are unbounded and "
+    "a progressing hours-long turn is normal — only sustained silence marks "
+    "a wedged turn pinning its session (exempt from TTL expiry) and holding "
+    "a MAX_CONCURRENT_TURNS slot. Alert when this exceeds the stall/pin-age "
+    "budgets.",
 )
 
 STREAM_DURATION = Histogram(
@@ -223,14 +227,15 @@ def record_stream_stall() -> None:
     STREAM_STALLS_TOTAL.inc()
 
 
-def bind_oldest_active_turn_source(source: Callable[[], float]) -> None:
-    """Have ``gateway_oldest_active_turn_seconds`` read *source* at scrape time.
+def bind_oldest_active_turn_silence_source(source: Callable[[], float]) -> None:
+    """Have ``gateway_oldest_active_turn_silence_seconds`` read *source* at
+    scrape time.
 
     Pull-based for the same reason as ``gateway_live_sessions``: turns start
     and finish on several paths and a missed push would publish a stale age
     indefinitely — the exact failure this gauge exists to expose.
     """
-    OLDEST_ACTIVE_TURN.set_function(source)
+    OLDEST_ACTIVE_TURN_SILENCE.set_function(source)
 
 
 def record_session_rejected() -> None:

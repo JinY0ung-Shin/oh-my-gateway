@@ -198,24 +198,36 @@ class TestBeginFinishStamping:
         assert session.active_response_last_progress_at >= before
 
 
-class TestOldestActiveTurnGauge:
-    def test_reports_oldest_and_zero_when_idle(self):
+class TestOldestActiveTurnSilenceGauge:
+    def test_measures_silence_not_absolute_age(self):
+        """A long-running turn with recent progress must read SMALL — absolute
+        age would flag healthy unbounded turns and produce false alarms; only
+        a long-silent turn may dominate the gauge."""
         from src.session_manager import SessionManager
 
         manager = SessionManager()
-        assert manager.oldest_active_turn_age() == 0.0
+        assert manager.oldest_active_turn_silence() == 0.0
 
-        young = Session(session_id="g-young")
-        young.active_response_id = "r1"
-        young.active_response_started_at = time.monotonic() - 5
-        old = Session(session_id="g-old")
-        old.active_response_id = "r2"
-        old.active_response_started_at = time.monotonic() - 500
+        # Very old turn, but progressing 5s ago — must not dominate.
+        long_but_alive = Session(session_id="g-alive")
+        long_but_alive.active_response_id = "r1"
+        long_but_alive.active_response_started_at = time.monotonic() - 9000
+        long_but_alive.active_response_last_progress_at = time.monotonic() - 5
+        # Young turn that went silent 500s ago — this is the wedge signal.
+        silent = Session(session_id="g-silent")
+        silent.active_response_id = "r2"
+        silent.active_response_started_at = time.monotonic() - 600
+        silent.active_response_last_progress_at = time.monotonic() - 500
+        # No progress stamp at all (legacy/rehydrated) — falls back to start.
+        unstamped = Session(session_id="g-unstamped")
+        unstamped.active_response_id = "r3"
+        unstamped.active_response_started_at = time.monotonic() - 50
         idle = Session(session_id="g-idle")
         with manager.lock:
-            manager.sessions["g-young"] = young
-            manager.sessions["g-old"] = old
+            manager.sessions["g-alive"] = long_but_alive
+            manager.sessions["g-silent"] = silent
+            manager.sessions["g-unstamped"] = unstamped
             manager.sessions["g-idle"] = idle
 
-        age = manager.oldest_active_turn_age()
-        assert 499 < age < 510
+        silence = manager.oldest_active_turn_silence()
+        assert 499 < silence < 510, "the silent turn must set the gauge"

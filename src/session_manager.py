@@ -935,23 +935,26 @@ class SessionManager:
         logger.info(f"Deleted session: {session_id}")
         return True
 
-    def oldest_active_turn_age(self) -> float:
-        """Age in seconds of the oldest in-flight turn, 0.0 when none.
+    def oldest_active_turn_silence(self) -> float:
+        """Longest current no-progress stretch across in-flight turns, 0.0 when none.
 
-        Read at metrics scrape time (``gateway_oldest_active_turn_seconds``).
-        A value stuck far above every turn budget is the visible symptom of a
-        wedged turn pinning its session — the failure mode that previously
-        accumulated silently until the slot caps were exhausted.
+        Read at metrics scrape time
+        (``gateway_oldest_active_turn_silence_seconds``). Measures seconds
+        since each turn's last real SDK chunk — NOT absolute turn age, which
+        is meaningless as a wedge signal now that healthy turns are unbounded
+        while progressing. A value stuck above the stall/pin-age budgets is
+        the visible symptom of a wedged turn pinning its session — the
+        failure mode that previously accumulated silently until the slot
+        caps were exhausted.
         """
         now = time.monotonic()
         with self.lock:
-            starts = [
-                s.active_response_started_at
+            marks = [
+                s.active_response_last_progress_at or s.active_response_started_at
                 for s in self.sessions.values()
                 if s.active_response_id is not None
-                and s.active_response_started_at is not None
             ]
-        return max((now - started for started in starts), default=0.0)
+        return max((now - mark for mark in marks if mark is not None), default=0.0)
 
     def list_sessions(self) -> List[SessionInfo]:
         """List all active (non-expired) sessions."""
