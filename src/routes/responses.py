@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import secrets
+import time
 import uuid
 from pathlib import Path
 from typing import Optional, Dict, Any, List, cast
@@ -541,6 +542,7 @@ async def _begin_active_response(session, response_id: str, turn: int, client: A
         session.active_response_id = response_id
         session.active_response_turn = turn
         session.active_response_state = "running"
+        session.active_response_started_at = time.monotonic()
         session.active_response_client = client
         session.active_response_done.clear()
 
@@ -553,6 +555,7 @@ async def _finish_active_response(session, response_id: str, terminal_state: str
         session.active_response_state = terminal_state
         session.active_response_id = None
         session.active_response_turn = None
+        session.active_response_started_at = None
         session.active_response_client = None
         # Refresh in the same critical section that unpins: only the success
         # paths touch via add_messages, so without this a *failed* long turn
@@ -1930,6 +1933,7 @@ async def _run_background_response(
                     session.active_response_state = terminal_state
                     session.active_response_id = None
                     session.active_response_turn = None
+                    session.active_response_started_at = None
                     session.active_response_client = None
                     session.active_response_done.set()
                 raise

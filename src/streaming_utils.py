@@ -3,8 +3,10 @@ import logging
 import time
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
 
+from src import metrics
 from src.constants import (
     SSE_KEEPALIVE_INTERVAL,
+    STREAM_STALL_TIMEOUT_SECONDS,
     STREAM_TOOL_PROGRESS,
     SUBAGENT_STREAM_PROGRESS,
     SUBAGENT_STREAM_TEXT,
@@ -430,6 +432,18 @@ async def bridge_sse_stream(
 # SSE comment line — compliant clients silently ignore these.
 _SSE_KEEPALIVE = ": keepalive\n\n"
 
+
+class StreamStallError(Exception):
+    """The SDK produced no chunk for STREAM_STALL_TIMEOUT_SECONDS.
+
+    Raised from inside the keepalive wrapper so the turn fails loudly
+    instead of streaming keepalives forever: a wedged CLI turn pins its
+    session (exempt from TTL expiry and LRU eviction) and holds a
+    MAX_CONCURRENT_TURNS slot, and the keepalives keep every intermediary
+    and per-read client timeout from ever cutting the connection — so
+    without this, nothing on either side reclaims the worker.
+    """
+
 logger = logging.getLogger(__name__)
 
 # Strong references to reader tasks that outlive their wrapper. On client
@@ -453,6 +467,7 @@ def _reap_background_reader(task) -> None:
 async def _keepalive_wrapper(
     source: AsyncGenerator,
     interval: int,
+    stall_after: float = 0,
 ) -> AsyncGenerator:
     """Wrap *source* to yield ``_SSE_KEEPALIVE`` during idle periods.
 
@@ -463,6 +478,12 @@ async def _keepalive_wrapper(
 
     If *interval* is ``<= 0`` keepalives are disabled and the source is
     yielded through unchanged.
+
+    *stall_after* > 0 bounds the silence itself: when the source produces
+    no item for that many seconds, :class:`StreamStallError` is raised
+    instead of another keepalive. Any real item resets the clock, so only
+    a wedged source — not a slow one — trips it. The check rides the
+    keepalive timer, so it needs *interval* > 0 to fire mid-silence.
 
     The source generator is iterated inside a **single dedicated task** so
     that anyio cancel scopes within the SDK never cross task boundaries.
@@ -492,11 +513,17 @@ async def _keepalive_wrapper(
             await queue.put(_SENTINEL)
 
     task = asyncio.create_task(_reader())
+    last_item_at = time.monotonic()
     try:
         while True:
             try:
                 item = await asyncio.wait_for(queue.get(), timeout=interval)
             except asyncio.TimeoutError:
+                if stall_after > 0 and time.monotonic() - last_item_at > stall_after:
+                    raise StreamStallError(
+                        f"no SDK output for {stall_after:.0f}s — "
+                        "turn is wedged, failing it so the worker is reclaimed"
+                    )
                 yield _SSE_KEEPALIVE
                 continue
 
@@ -504,6 +531,7 @@ async def _keepalive_wrapper(
                 break
             if isinstance(item, Exception):
                 raise item
+            last_item_at = time.monotonic()
             yield item
     finally:
         task.cancel()
@@ -1069,7 +1097,11 @@ async def stream_response_chunks(
     # --- Main streaming loop ---
 
     try:
-        async for chunk in _keepalive_wrapper(chunk_source, SSE_KEEPALIVE_INTERVAL):
+        async for chunk in _keepalive_wrapper(
+            chunk_source,
+            SSE_KEEPALIVE_INTERVAL,
+            stall_after=STREAM_STALL_TIMEOUT_SECONDS,
+        ):
             # Keepalive SSE comments — forward directly to the client
             if chunk is _SSE_KEEPALIVE:
                 yield _SSE_KEEPALIVE
@@ -1432,6 +1464,23 @@ async def stream_response_chunks(
                 all_visible_text.append(text)
                 content_sent = True
 
+    except StreamStallError as e:
+        # A wedged turn, not a failed one: the SDK went silent past the stall
+        # budget while keepalives kept the connection alive. Fail the response
+        # so the route's teardown disconnects the client — that disconnect is
+        # what actually reclaims the CLI worker (SIGTERM→SIGKILL escalation)
+        # and unpins the session/turn slot.
+        logger.error(
+            "Responses stream: stalled: %s | prior_chunks=%r | %s",
+            e,
+            _buffer_summary(chunks_buffer),
+            _error_context(),
+        )
+        metrics.record_stream_stall()
+        stream_result["success"] = False
+        yield _make_failed_event("server_error", f"Turn stalled: {e}")
+        await _log_usage("failed", "stream_stall")
+        return
     except Exception as e:
         logger.error(
             "Responses stream: unexpected error: %s | prior_chunks=%r | %s",
