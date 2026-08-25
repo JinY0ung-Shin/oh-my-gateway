@@ -1733,7 +1733,7 @@ class TestKeepaliveForwardedInMainLoop:
         # Wrap the normal source so we inject a keepalive before the real item
         real_keepalive = su._SSE_KEEPALIVE
 
-        async def patched_wrapper(src, interval):
+        async def patched_wrapper(src, interval, stall_after=0):
             yield real_keepalive  # inject keepalive — triggers lines 969-970
             async for item in src:
                 yield item

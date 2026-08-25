@@ -21,6 +21,7 @@ import contextlib
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -172,6 +173,13 @@ def _max_live_sessions() -> int:
     return MAX_LIVE_SESSIONS
 
 
+def _active_turn_max_age() -> int:
+    """Read ``ACTIVE_TURN_MAX_AGE_SECONDS`` fresh so tests can patch it."""
+    from src.constants import ACTIVE_TURN_MAX_AGE_SECONDS
+
+    return ACTIVE_TURN_MAX_AGE_SECONDS
+
+
 def _eviction_policy() -> str:
     """Effective ``SESSION_EVICTION_POLICY``: admin runtime override, then env."""
     from src.runtime_config import runtime_config
@@ -240,6 +248,19 @@ class Session:
     active_response_id: Optional[str] = None
     active_response_turn: Optional[int] = None
     active_response_state: Optional[str] = None
+    # ``time.monotonic()`` at _begin_active_response, None between turns.
+    # Monotonic (not wall clock) so the pin-age safety valve in
+    # ``is_expired`` can't misfire on a host clock jump. Never persisted:
+    # a rehydrated session starts unpinned, which is correct — its turn
+    # died with the old process.
+    active_response_started_at: Optional[float] = None
+    # ``time.monotonic()`` of the turn's most recent real SDK chunk
+    # (stamped by the route's chunk wrapper, seeded to started_at at begin).
+    # The pin-age valve measures NO-PROGRESS time from here — not absolute
+    # turn age — so a long-running turn that keeps producing chunks
+    # (a 30min+ background job inside its 3600s budget, an unbounded
+    # streaming agentic turn) is never reclaimed while it is alive.
+    active_response_last_progress_at: Optional[float] = None
     active_response_client: Optional[Any] = field(default=None, repr=False, compare=False)
     active_response_done: asyncio.Event = field(
         default_factory=asyncio.Event, repr=False, compare=False
@@ -294,6 +315,25 @@ class Session:
             # expiring it would orphan the running SDK client and strand the
             # response id a client may still poll or cancel. The turn's
             # teardown always clears the slot and touches the session.
+            #
+            # ...unless the "turn" is a zombie. The valve measures
+            # NO-PROGRESS time (last real SDK chunk), never absolute turn
+            # age: streaming turns are intentionally unbounded and background
+            # turns may run to their 3600s budget, so a long turn that keeps
+            # producing chunks must keep its pin. A turn silent past
+            # ACTIVE_TURN_MAX_AGE is a wedge none of the per-path guards
+            # reached — left pinned it holds a live CLI worker, a session
+            # slot, and a turn slot until the container is recreated.
+            # Letting the expiry sweep reclaim it disconnects the client;
+            # that kills the CLI, which errors the wedged stream and lets
+            # its own teardown release everything.
+            age_cap = _active_turn_max_age()
+            progressed = (
+                self.active_response_last_progress_at
+                or self.active_response_started_at
+            )
+            if age_cap > 0 and progressed is not None:
+                return time.monotonic() - progressed > age_cap
             return False
         return _utcnow() > self.expires_at
 
@@ -894,6 +934,27 @@ class SessionManager:
 
         logger.info(f"Deleted session: {session_id}")
         return True
+
+    def oldest_active_turn_silence(self) -> float:
+        """Longest current no-progress stretch across in-flight turns, 0.0 when none.
+
+        Read at metrics scrape time
+        (``gateway_oldest_active_turn_silence_seconds``). Measures seconds
+        since each turn's last real SDK chunk — NOT absolute turn age, which
+        is meaningless as a wedge signal now that healthy turns are unbounded
+        while progressing. A value stuck above the stall/pin-age budgets is
+        the visible symptom of a wedged turn pinning its session — the
+        failure mode that previously accumulated silently until the slot
+        caps were exhausted.
+        """
+        now = time.monotonic()
+        with self.lock:
+            marks = [
+                s.active_response_last_progress_at or s.active_response_started_at
+                for s in self.sessions.values()
+                if s.active_response_id is not None
+            ]
+        return max((now - mark for mark in marks if mark is not None), default=0.0)
 
     def list_sessions(self) -> List[SessionInfo]:
         """List all active (non-expired) sessions."""

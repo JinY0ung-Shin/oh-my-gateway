@@ -58,8 +58,11 @@ SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 # session bookkeeping said "cleaned", and leaked workers piled up until
 # MAX_LIVE_SESSIONS returned 503 — recoverable only by `docker compose down`
 # (issue #147). At 30s the wait_for fires only when close() is truly wedged
-# (dead anyio channel); the child is unreachable then and the atexit reaper is
-# the remaining line of defense. Shutdown stays bounded: disconnects run under
+# (dead anyio channel); the child is unreachable then, and the only remaining
+# backstops are weak ones — the SDK's atexit reaper sends a single SIGTERM
+# without waiting (useless against a child that already ignored SIGTERM, and
+# only at process exit), and ACTIVE_TURN_MAX_AGE below reclaims the session
+# side. Shutdown stays bounded: disconnects run under
 # gather, so wall clock is ~one cap, and docker-compose grants a matching
 # stop_grace_period.
 CLIENT_DISCONNECT_TIMEOUT_SECONDS = 30.0
@@ -189,6 +192,37 @@ MCP_HEALTH_MAX_CONCURRENCY = parse_int_env("MCP_HEALTH_MAX_CONCURRENCY", 4)
 # proxies, load balancers, and client-side timeouts from closing the
 # connection.  Set to 0 to disable.
 SSE_KEEPALIVE_INTERVAL = parse_int_env("SSE_KEEPALIVE_INTERVAL", 15)
+
+# Wall-clock cap on SDK *silence* inside a streaming turn. Non-streaming and
+# background turns are bounded (MAX_TIMEOUT / BACKGROUND_RESPONSE_TIMEOUT_S),
+# but a streaming turn had no guard at all — and the keepalive above actively
+# keeps a wedged one alive: a CLI stalled upstream emits nothing, the wrapper
+# fills the silence every 15s, so intermediaries and per-read client timeouts
+# never disconnect. Because an in-flight turn also pins its session against
+# TTL expiry and LRU eviction (Session.is_expired) and holds a
+# MAX_CONCURRENT_TURNS slot, each wedged turn permanently leaked one live
+# `claude` worker plus one session and one turn slot, recoverable only by
+# recreating the container. This cap bounds the silence, not the turn:
+# any real SDK chunk resets it, so long agentic turns that keep producing
+# events are unaffected. Detection ticks on the keepalive timer, so it
+# requires SSE_KEEPALIVE_INTERVAL > 0. Set to 0 to disable.
+STREAM_STALL_TIMEOUT_SECONDS = parse_int_env("STREAM_STALL_TIMEOUT", 600)
+
+# Safety net behind the stall guard, enforced by the expiry sweep: a session
+# whose active turn has made NO PROGRESS (no real SDK chunk, stamped by the
+# route's chunk wrapper) for this long stops pinning itself and is reclaimed
+# (client disconnect → SIGTERM→SIGKILL escalation) even though in-flight
+# turns normally exempt a session from expiry. Deliberately measures silence,
+# not absolute turn age: streaming turns are intentionally unbounded and
+# background turns may legitimately run to their whole
+# BACKGROUND_RESPONSE_TIMEOUT_S (3600s) budget while producing chunks the
+# whole way — an absolute cap would reclaim healthy work. Catches wedges the
+# in-stream guard cannot see (a path that never enters
+# stream_response_chunks, or keepalives disabled). Must sit above the
+# longest legitimate silent stretch (the stall cap above bounds streaming
+# silence at 600s), so it only ever fires on true zombies. Set to 0 to
+# disable.
+ACTIVE_TURN_MAX_AGE_SECONDS = parse_int_env("ACTIVE_TURN_MAX_AGE", 1800)
 
 # ---------------------------------------------------------------------------
 # Subagent Streaming Visibility
