@@ -151,24 +151,40 @@ def is_assistant_content_chunk(chunk: Dict[str, Any]) -> bool:
 
 
 def extract_embedded_tool_blocks(chunk: Dict[str, Any]) -> list:
-    """Extract tool_use/tool_result blocks embedded in assistant content.
+    """Extract tool blocks embedded in assistant content with subagent attribution.
 
-    Extract tool_use/tool_result blocks embedded in assistant content arrays.
-    This function lets the streaming loop emit them as structured SSE events.
+    Claude Agent SDK completed ``AssistantMessage`` chunks carry the spawning
+    Agent/Task id on ``parent_tool_use_id`` at the message level, while the
+    individual content blocks do not necessarily repeat it. Inherit that
+    parent onto normalized tool blocks so buffered/non-token-streaming paths
+    preserve the same nesting as token-level ``StreamEvent`` tool calls.
 
-    Returns a (possibly empty) list of tool block dicts.
+    Returns a (possibly empty) list of plain tool block dicts.
     """
     if not is_assistant_content_chunk(chunk):
         return []
+
+    parent_id = chunk.get("parent_tool_use_id")
     content = chunk.get("content")
     if content is None:
         msg = chunk.get("message")
-        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(msg, dict):
+            content = msg.get("content")
+            parent_id = parent_id or msg.get("parent_tool_use_id")
     if not isinstance(content, list):
         return []
+
     tool_blocks, _ = _extract_tool_blocks(content)
-    # Normalize SDK objects to plain dicts so callers can safely use .get().
-    return [normalize_embedded_tool_block(tb) for tb in tool_blocks]
+    normalized = []
+    for tool_block in tool_blocks:
+        block = normalize_embedded_tool_block(tool_block)
+        if not isinstance(block, dict):
+            continue
+        block = dict(block)
+        if parent_id and not block.get("parent_tool_use_id"):
+            block["parent_tool_use_id"] = parent_id
+        normalized.append(block)
+    return normalized
 
 
 class ToolUseAccumulator:
