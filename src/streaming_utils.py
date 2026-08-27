@@ -188,31 +188,34 @@ def _buffer_summary(buf: list, limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _prompt_tokens_from_usage(usage: Any) -> int:
-    """Prompt size for one SDK model request, including cache read/write tokens."""
+def _context_tokens_from_usage(usage: Any) -> int:
+    """Live context footprint for one SDK model request, including its output."""
     if not isinstance(usage, dict):
         return 0
     return (
         int(usage.get("input_tokens", 0) or 0)
         + int(usage.get("cache_creation_input_tokens", 0) or 0)
         + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("output_tokens", 0) or 0)
     )
 
 
 def extract_context_tokens(chunks: list) -> Optional[int]:
-    """Return the latest main-agent prompt snapshot, never cumulative turn usage.
+    """Return the latest main-agent context footprint, never cumulative turn usage.
 
     ``ResultMessage.usage`` is cumulative across every model request in an
     agentic turn, so it can exceed the context window many times. Per-request
-    ``AssistantMessage.usage`` is the honest occupancy source. Subagent
-    messages own separate context windows and are intentionally excluded.
+    ``AssistantMessage.usage`` is the honest occupancy source. Matching Claude
+    Code's context accounting, the footprint includes input, cache read/write,
+    and the request's generated output. Subagent messages own separate context
+    windows and are intentionally excluded.
     """
     for msg in reversed(chunks):
         if not isinstance(msg, dict) or msg.get("type") != "assistant":
             continue
         if msg.get("parent_tool_use_id"):
             continue
-        tokens = _prompt_tokens_from_usage(msg.get("usage"))
+        tokens = _context_tokens_from_usage(msg.get("usage"))
         if tokens > 0:
             return tokens
     return None
@@ -390,7 +393,7 @@ def resolve_usage_details(chunks: list) -> InputTokensDetails:
 
     Cache counters remain turn-cumulative billing fields. ``context_tokens``
     instead comes from the latest main-agent ``AssistantMessage.usage`` because
-    that is a single-request context-window snapshot. If no such snapshot is
+    that is a single-request context-window footprint. If no such snapshot is
     available it remains ``None``; cumulative input is never relabelled as
     context occupancy.
     """
