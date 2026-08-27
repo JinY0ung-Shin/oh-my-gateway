@@ -255,13 +255,24 @@ class InputTokensDetails(BaseModel):
     equivalent, broken out because cache writes bill at a premium.
 
     ``context_tokens`` is a different kind of extension: it is the prompt size
-    of the *last main-agent model request* in the turn (input + cache read +
-    cache creation for that request), i.e. a snapshot of the conversation's
-    live context occupancy. It is deliberately not added to ``input_tokens`` or
-    ``total_tokens``. Agentic turns re-send the transcript on every tool round,
-    so cumulative ``input_tokens`` can exceed the model window many times while
+    of the *last main-agent model request* in the turn — that request's
+    ``input_tokens`` plus its cache reads and cache writes, i.e. the whole
+    prompt it carried and therefore a snapshot of the conversation's live
+    context occupancy. The request's own output is excluded, so a streamed turn
+    (where the counters arrive on ``message_start``, before any output exists)
+    and a non-streamed one report the same number for the same conversation.
+
+    It is deliberately not added to ``input_tokens`` or ``total_tokens``.
+    Agentic turns re-send the transcript on every tool round, so cumulative
+    ``input_tokens`` can exceed the model window many times while
     ``context_tokens`` remains bounded by the live window. After compaction the
-    next main-agent request naturally reports the smaller post-compact snapshot.
+    next main-agent request naturally reports the smaller post-compact
+    snapshot; a turn that ends *at* the compaction boundary keeps reporting the
+    pre-compact request until the next turn's first request lands.
+
+    ``None`` means the turn carried no per-request snapshot (an error-only or
+    subagent-only turn): the gateway reports nothing rather than relabelling
+    cumulative input as occupancy.
     """
 
     cached_tokens: int = 0

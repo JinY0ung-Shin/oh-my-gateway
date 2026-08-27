@@ -188,34 +188,90 @@ def _buffer_summary(buf: list, limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
-def _context_tokens_from_usage(usage: Any) -> int:
-    """Live context footprint for one SDK model request, including its output."""
+def _prompt_tokens_from_usage(usage: Any) -> int:
+    """Prompt size of one SDK model request: input + cache read + cache creation.
+
+    This is the whole prompt the request carried, cached or not, and therefore
+    the context window that request occupied. ``output_tokens`` is deliberately
+    excluded: the same accounting has to work off a ``message_start`` event,
+    which is emitted before a single output token exists, so counting output
+    would make a streamed turn and a non-streamed one report different
+    occupancy for the identical conversation.
+    """
     if not isinstance(usage, dict):
         return 0
     return (
         int(usage.get("input_tokens", 0) or 0)
         + int(usage.get("cache_creation_input_tokens", 0) or 0)
         + int(usage.get("cache_read_input_tokens", 0) or 0)
-        + int(usage.get("output_tokens", 0) or 0)
+    )
+
+
+def _main_agent_prompt_tokens(msg: Any) -> int:
+    """Prompt size of one main-agent request, from either message shape.
+
+    Two shapes carry the same number depending on streaming mode:
+
+    * ``assistant`` — the assembled message's ``usage`` (non-streaming turns).
+    * ``stream_event`` / ``message_start`` — the per-request prompt counters
+      under ``include_partial_messages``. There the assembled assistant
+      message's ``usage`` carries only the ``message_delta`` output counts
+      (``input_tokens`` arrives ``null``), so ``message_start`` is the only
+      place a streamed turn's prompt size appears at all.
+
+    Returns 0 for subagent messages: a subagent runs its own context window,
+    so its prompt size says nothing about the main conversation's occupancy.
+    """
+    if not isinstance(msg, dict):
+        return 0
+    if msg.get("parent_tool_use_id"):
+        return 0
+    msg_type = msg.get("type")
+    if msg_type == "assistant":
+        return _prompt_tokens_from_usage(msg.get("usage"))
+    if msg_type == "stream_event":
+        event = msg.get("event")
+        if not isinstance(event, dict) or event.get("type") != "message_start":
+            return 0
+        inner = event.get("message")
+        if not isinstance(inner, dict):
+            return 0
+        return _prompt_tokens_from_usage(inner.get("usage"))
+    return 0
+
+
+def _is_context_snapshot_chunk(chunk: Any) -> bool:
+    """True for a ``message_start`` event that carries a usable prompt size.
+
+    The streaming path drops ``stream_event`` chunks once the text deltas have
+    been emitted; this marks the few that must survive in the chunk buffer
+    (one per model request) so :func:`extract_context_tokens` can still find a
+    snapshot on a token-streamed turn.
+    """
+    return (
+        isinstance(chunk, dict)
+        and chunk.get("type") == "stream_event"
+        and _main_agent_prompt_tokens(chunk) > 0
     )
 
 
 def extract_context_tokens(chunks: list) -> Optional[int]:
-    """Return the latest main-agent context footprint, never cumulative turn usage.
+    """Return the latest main-agent prompt size, never cumulative turn usage.
 
     ``ResultMessage.usage`` is cumulative across every model request in an
-    agentic turn, so it can exceed the context window many times. Per-request
-    ``AssistantMessage.usage`` is the honest occupancy source. Matching Claude
-    Code's context accounting, the footprint includes input, cache read/write,
-    and the request's generated output. Subagent messages own separate context
-    windows and are intentionally excluded.
+    agentic turn, so it can exceed the context window many times. The prompt
+    size of a single request is the honest occupancy source, and the last
+    main-agent request of the turn is the live one.
+
+    The scan walks backwards and takes the first positive prompt size, so an
+    assembled ``assistant`` message wins when it carries real prompt counters
+    and its preceding ``message_start`` answers when it does not (the
+    token-streaming shape). Returns ``None`` when the turn produced no
+    per-request snapshot at all — cumulative input is never relabelled as
+    context occupancy.
     """
     for msg in reversed(chunks):
-        if not isinstance(msg, dict) or msg.get("type") != "assistant":
-            continue
-        if msg.get("parent_tool_use_id"):
-            continue
-        tokens = _context_tokens_from_usage(msg.get("usage"))
+        tokens = _main_agent_prompt_tokens(msg)
         if tokens > 0:
             return tokens
     return None
@@ -392,7 +448,7 @@ def resolve_usage_details(chunks: list) -> InputTokensDetails:
     """Return cache accounting plus an honest live-context snapshot.
 
     Cache counters remain turn-cumulative billing fields. ``context_tokens``
-    instead comes from the latest main-agent ``AssistantMessage.usage`` because
+    instead comes from the latest main-agent per-request prompt size, because
     that is a single-request context-window footprint. If no such snapshot is
     available it remains ``None``; cumulative input is never relabelled as
     context occupancy.
@@ -1469,6 +1525,18 @@ async def stream_response_chunks(
             # Tool blocks were already extracted above, so only text is suppressed.
             if token_streaming:
                 if chunk.get("type") == "stream_event":
+                    # Context-occupancy snapshot. Under
+                    # ``include_partial_messages`` the per-request prompt
+                    # counters ride on ``message_start`` and the assembled
+                    # assistant message's usage carries only the
+                    # ``message_delta`` output counts. Dropping every
+                    # stream_event here left the buffer holding only the FIRST
+                    # request's start event (buffered below before this flag
+                    # flipped), so a multi-round turn reported a stale snapshot
+                    # from before its tool rounds. Buffered, never emitted —
+                    # one entry per model request, not per token.
+                    if _is_context_snapshot_chunk(chunk):
+                        chunks_buffer.append(chunk)
                     continue
                 if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
                     if chunk.get("type") == "assistant" and chunk.get("usage"):
