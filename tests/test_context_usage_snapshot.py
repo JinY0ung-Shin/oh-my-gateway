@@ -6,6 +6,7 @@ def _assistant(
     input_tokens: int,
     cache_creation: int = 0,
     cache_read: int = 0,
+    output_tokens: int = 7,
     parent_tool_use_id: str | None = None,
 ) -> dict:
     return {
@@ -15,7 +16,7 @@ def _assistant(
             "input_tokens": input_tokens,
             "cache_creation_input_tokens": cache_creation,
             "cache_read_input_tokens": cache_read,
-            "output_tokens": 7,
+            "output_tokens": output_tokens,
         },
     }
 
@@ -41,11 +42,12 @@ def test_context_snapshot_uses_latest_main_agent_request_not_turn_total() -> Non
         },
     ]
 
-    # 150 + 40 + 50 from the final top-level AssistantMessage. The much larger
-    # ResultMessage and subagent request are intentionally irrelevant here.
-    assert extract_context_tokens(chunks) == 240
+    # Claude Code context accounting includes input + cache creation + cache
+    # reads + output for the final top-level AssistantMessage: 150+40+50+7.
+    # The much larger ResultMessage and subagent request are irrelevant here.
+    assert extract_context_tokens(chunks) == 247
     details = resolve_usage_details(chunks)
-    assert details.context_tokens == 240
+    assert details.context_tokens == 247
 
     # Billing/cache fields keep their existing turn-cumulative ResultMessage semantics.
     assert details.cached_tokens == 70_000
@@ -77,5 +79,5 @@ def test_context_snapshot_tracks_post_compaction_request() -> None:
     ]
 
     # The latest main-agent request is the post-compaction window, so the
-    # snapshot falls instead of accumulating both requests.
-    assert extract_context_tokens(chunks) == 25_000
+    # snapshot falls instead of accumulating both requests (3000+22000+7).
+    assert extract_context_tokens(chunks) == 25_007
