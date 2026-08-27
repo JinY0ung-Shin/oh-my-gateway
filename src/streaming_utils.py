@@ -188,6 +188,39 @@ def _buffer_summary(buf: list, limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _context_tokens_from_usage(usage: Any) -> int:
+    """Live context footprint for one SDK model request, including its output."""
+    if not isinstance(usage, dict):
+        return 0
+    return (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("output_tokens", 0) or 0)
+    )
+
+
+def extract_context_tokens(chunks: list) -> Optional[int]:
+    """Return the latest main-agent context footprint, never cumulative turn usage.
+
+    ``ResultMessage.usage`` is cumulative across every model request in an
+    agentic turn, so it can exceed the context window many times. Per-request
+    ``AssistantMessage.usage`` is the honest occupancy source. Matching Claude
+    Code's context accounting, the footprint includes input, cache read/write,
+    and the request's generated output. Subagent messages own separate context
+    windows and are intentionally excluded.
+    """
+    for msg in reversed(chunks):
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        if msg.get("parent_tool_use_id"):
+            continue
+        tokens = _context_tokens_from_usage(msg.get("usage"))
+        if tokens > 0:
+            return tokens
+    return None
+
+
 def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     """Extract real token usage from SDK messages if available.
 
@@ -356,20 +389,19 @@ def resolve_token_usage(
 
 
 def resolve_usage_details(chunks: list) -> InputTokensDetails:
-    """Return the ``input_tokens`` cache breakdown for a Responses payload.
+    """Return cache accounting plus an honest live-context snapshot.
 
-    Reuses :func:`src.usage_logger.extract_sdk_usage_detail` rather than
-    re-walking the chunk list, so the usage-log rows and the API response can
-    never disagree about the same turn.
-
-    Returns all-zero details when the turn carried no SDK usage (the
-    estimation fallback in :func:`resolve_token_usage`) — the gateway has no
-    cache information to report in that case.
+    Cache counters remain turn-cumulative billing fields. ``context_tokens``
+    instead comes from the latest main-agent ``AssistantMessage.usage`` because
+    that is a single-request context-window footprint. If no such snapshot is
+    available it remains ``None``; cumulative input is never relabelled as
+    context occupancy.
     """
     detail = extract_sdk_usage_detail(chunks)
     return InputTokensDetails(
         cached_tokens=detail["cache_read_tokens"],
         cache_creation_tokens=detail["cache_creation_tokens"],
+        context_tokens=extract_context_tokens(chunks),
     )
 
 
