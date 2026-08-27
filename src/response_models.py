@@ -235,11 +235,12 @@ class ReasoningOutputItem(BaseModel):
 
 
 class InputTokensDetails(BaseModel):
-    """Breakdown of ``input_tokens`` (OpenAI shape plus a Claude extension).
+    """Breakdown of ``input_tokens`` plus live context occupancy metadata.
 
-    Both fields are *subsets* of ``input_tokens``, never additions to it.
-    ``extract_sdk_usage`` folds every cache counter into the reported prompt
-    total, so the decomposition is::
+    ``cached_tokens`` and ``cache_creation_tokens`` are *subsets* of
+    ``input_tokens``, never additions to it. ``extract_sdk_usage`` folds every
+    cache counter into the reported prompt total, so the billing decomposition
+    is::
 
         input_tokens = uncached + cache_creation_tokens + cached_tokens
 
@@ -251,13 +252,21 @@ class InputTokensDetails(BaseModel):
     SDK's ``cache_read_input_tokens``.
 
     ``cache_creation_tokens`` is a gateway extension with no OpenAI
-    equivalent, broken out because cache writes bill at a premium. Clients
-    that only know the OpenAI shape ignore the extra key and still read a
-    correct ``input_tokens`` total.
+    equivalent, broken out because cache writes bill at a premium.
+
+    ``context_tokens`` is a different kind of extension: it is the prompt size
+    of the *last main-agent model request* in the turn (input + cache read +
+    cache creation for that request), i.e. a snapshot of the conversation's
+    live context occupancy. It is deliberately not added to ``input_tokens`` or
+    ``total_tokens``. Agentic turns re-send the transcript on every tool round,
+    so cumulative ``input_tokens`` can exceed the model window many times while
+    ``context_tokens`` remains bounded by the live window. After compaction the
+    next main-agent request naturally reports the smaller post-compact snapshot.
     """
 
     cached_tokens: int = 0
     cache_creation_tokens: int = 0
+    context_tokens: Optional[int] = None
 
 
 class ResponseUsage(BaseModel):
