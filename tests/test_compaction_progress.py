@@ -416,3 +416,92 @@ async def test_another_streams_output_does_not_close_a_held_terminal():
     # The boundary still got to merge, so the numbers survived.
     assert leader[-1]["result"] == "success"
     assert leader[-1]["post_tokens"] == 1585
+
+
+# ---------------------------------------------------------------------------
+# The subagent gate. SUBAGENT_STREAM_PROGRESS decides whether a subagent's
+# liveness reaches the client at all — it has to see the same stream identity
+# the event builder does.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_subagents_compaction_is_held_by_the_subagent_gate(monkeypatch):
+    """``SUBAGENT_STREAM_PROGRESS=false`` must actually hold a subagent's compaction.
+
+    The gate read ``parent_tool_use_id`` off the top level, where the generic
+    ``SystemMessage`` never has it — so a deployment that had switched subagent
+    progress off still saw subagent compactions on the wire, while the event
+    built right below it read the parent out of ``data`` and labelled them.
+    """
+    monkeypatch.setattr("src.streaming_utils.SUBAGENT_STREAM_PROGRESS", False)
+    sub = dict(session_id="sess-sub", parent_tool_use_id="toolu_sub")
+    events = await _events(
+        [
+            _in_stream(_status_chunk("compacting"), **sub),
+            _in_stream(_status_chunk(None, compact_result="success"), **sub),
+            _in_stream(_boundary_chunk(trigger="auto"), **sub),
+            _TEXT,
+            _RESULT,
+        ]
+    )
+    assert _compaction(events) == []
+
+
+async def test_the_leaders_compaction_still_passes_that_gate(monkeypatch):
+    """The gate holds subagents, not the run the user is actually watching."""
+    monkeypatch.setattr("src.streaming_utils.SUBAGENT_STREAM_PROGRESS", False)
+    events = await _events(
+        [
+            _in_stream(_status_chunk("compacting"), session_id="sess-leader"),
+            _in_stream(
+                _status_chunk(None, compact_result="success"), session_id="sess-leader"
+            ),
+            _in_stream(_boundary_chunk(trigger="auto"), session_id="sess-leader"),
+            _RESULT,
+        ]
+    )
+    assert [e["phase"] for e in _compaction(events)] == ["start", "end"]
+
+
+async def test_a_subagents_hook_event_is_held_by_the_same_gate(monkeypatch):
+    """Hook liveness shares the gate, and ``HookEventMessage`` models no parent.
+
+    So a subagent's hook can only name its parent from inside ``data`` — the
+    same blind spot, on the same line, for the other kind of progress event.
+    """
+    monkeypatch.setattr("src.streaming_utils.SUBAGENT_STREAM_PROGRESS", False)
+    hook = {
+        "type": "system",
+        "subtype": "hook_started",
+        "hook_event_name": "PreToolUse",
+        "data": {
+            "hook_event": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "tu_child",
+            "parent_tool_use_id": "toolu_sub",
+            "session_id": "sess-sub",
+        },
+    }
+    events = await _events([hook, _TEXT, _RESULT])
+    assert [e for e in events if e.get("type") == "response.hook_event"] == []
+
+
+async def test_a_forwarded_subagent_hook_names_its_parent():
+    """With the gate open the event still has to say whose hook it was."""
+    hook = {
+        "type": "system",
+        "subtype": "hook_started",
+        "hook_event_name": "PreToolUse",
+        "data": {
+            "hook_event": "PreToolUse",
+            "tool_name": "Bash",
+            "tool_use_id": "tu_child",
+            "parent_tool_use_id": "toolu_sub",
+            "session_id": "sess-sub",
+        },
+    }
+    events = await _events([hook, _RESULT])
+    forwarded = [e for e in events if e.get("type") == "response.hook_event"]
+    assert len(forwarded) == 1
+    assert forwarded[0]["parent_tool_use_id"] == "toolu_sub"
+    assert forwarded[0]["session_id"] == "sess-sub"

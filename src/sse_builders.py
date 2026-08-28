@@ -346,6 +346,10 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             or ""
         )
         tool_use_id = data.get("tool_use_id") or chunk.get("tool_use_id")
+        # Same stream question, same answer as the gate that let this chunk
+        # through: ``HookEventMessage`` models no parent at all, so a subagent's
+        # hook can only name its parent from inside ``data``.
+        parent, session = _stream_identity(chunk)
         event = {
             "type": "hook_event",
             "phase": subtype,  # "hook_started" | "hook_response"
@@ -353,10 +357,10 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "tool_name": data.get("tool_name") or data.get("tool"),
             "tool_use_id": tool_use_id,
             "outcome": data.get("outcome"),  # present on hook_response
-            "session_id": chunk.get("session_id"),
+            "session_id": session,
         }
-        if chunk.get("parent_tool_use_id") is not None:
-            event["parent_tool_use_id"] = chunk.get("parent_tool_use_id")
+        if parent is not None:
+            event["parent_tool_use_id"] = parent
         return event
     if subtype in ("compact_boundary", "compaction"):
         if not STREAM_COMPACTION_EVENTS:

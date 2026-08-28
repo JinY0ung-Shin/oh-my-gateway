@@ -36,6 +36,7 @@ from src.sse_builders import (  # noqa: F401
     _build_progress_event,
     _build_task_event,
     _normalize_tool_result,
+    _stream_identity,
     is_teammate_message_text,
     make_function_call_response_sse,
     make_response_sse,
@@ -1340,7 +1341,13 @@ async def stream_response_chunks(
                     # Other liveness signals: hook lifecycle + compaction.
                     # For these, only an explicit parent_tool_use_id marks
                     # subagent origin. A plain tool_use_id is the target tool.
-                    is_subagent_progress = chunk.get("parent_tool_use_id") is not None
+                    # These arrive as the SDK's generic SystemMessage, whose only
+                    # fields are subtype and data — so the parent lives inside
+                    # ``data``, and reading the top level alone let a subagent's
+                    # compaction through a gate that was meant to hold it. One
+                    # helper answers "which stream" for the gate and the event
+                    # builder alike; two answers is how they drifted apart.
+                    is_subagent_progress = _stream_identity(chunk)[0] is not None
                     if not is_subagent_progress or SUBAGENT_STREAM_PROGRESS:
                         progress_event = _build_progress_event(chunk)
                         if progress_event:
