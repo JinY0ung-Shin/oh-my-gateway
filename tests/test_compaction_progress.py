@@ -121,7 +121,14 @@ async def test_client_is_told_when_the_pause_starts_not_only_when_it_ended():
 
 
 def _boundary_chunk(trigger="manual", **metadata):
-    meta = {"trigger": trigger, "pre_tokens": 36157, "post_tokens": 1585, **metadata}
+    # Numbers as measured on claude-code 2.1.220.
+    meta = {
+        "trigger": trigger,
+        "pre_tokens": 36157,
+        "post_tokens": 1585,
+        "duration_ms": 12426,
+        **metadata,
+    }
     return {
         "type": "system",
         "subtype": "compact_boundary",
@@ -250,3 +257,72 @@ async def test_a_turn_ending_on_a_held_terminal_still_closes_it():
         ]
     )
     assert [e["phase"] for e in _compaction(events)] == ["start", "end"]
+
+
+async def test_terminal_carries_what_the_compaction_actually_did():
+    """A client should be able to say 36k → 1.6k in 12s, not just "it happened"."""
+    events = await _events(
+        [
+            _status_chunk("compacting"),
+            _status_chunk(None, compact_result="success"),
+            _boundary_chunk(trigger="auto"),
+            _RESULT,
+        ]
+    )
+    end = _compaction(events)[-1]
+    assert end["phase"] == "end"
+    assert (end["pre_tokens"], end["post_tokens"]) == (36157, 1585)
+    assert end["duration_ms"] == 12426
+    assert end["trigger"] == "auto"
+    assert end["result"] == "success"
+
+
+async def test_a_compaction_without_a_boundary_reports_no_numbers():
+    """The failed path never reaches a boundary, so it has nothing to report."""
+    events = await _events(
+        [
+            _status_chunk("compacting"),
+            _status_chunk(None, compact_result="failed", compact_error="too short"),
+            _RESULT,
+        ]
+    )
+    end = _compaction(events)[-1]
+    assert end["result"] == "failed"
+    assert end["pre_tokens"] is None
+    assert end["post_tokens"] is None
+    assert end["duration_ms"] is None
+
+
+def test_bookkeeping_metadata_stays_off_the_wire():
+    """``compact_metadata`` also carries transcript uuids — those are not ours."""
+    event = _build_progress_event(
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "data": {
+                "compact_metadata": {
+                    "trigger": "auto",
+                    "pre_tokens": 36157,
+                    "post_tokens": 1585,
+                    "duration_ms": 12426,
+                    "preserved_messages": {"anchor_uuid": "…", "uuids": ["…"]},
+                    "preserved_segment": {"head_uuid": "…"},
+                }
+            },
+        }
+    )
+    assert event is not None
+    assert "preserved_messages" not in event
+    assert "preserved_segment" not in event
+    assert event["pre_tokens"] == 36157
+
+
+def test_a_non_numeric_token_count_is_reported_as_unknown():
+    event = _build_progress_event(
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "data": {"compact_metadata": {"trigger": "auto", "pre_tokens": "n/a"}},
+        }
+    )
+    assert event is not None and event["pre_tokens"] is None

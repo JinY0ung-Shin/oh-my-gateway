@@ -118,6 +118,13 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _as_int(value: Any) -> Optional[int]:
+    """Numbers the CLI reports, kept off the wire when they are not real numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
 class CompactionTracker:
     """Canonicalise a compaction's raw markers into one start and one terminal.
 
@@ -301,9 +308,11 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not STREAM_COMPACTION_EVENTS:
             return None
         data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
+        meta = data.get("compact_metadata")
+        meta = meta if isinstance(meta, dict) else {}
         trigger = data.get("trigger")
-        if trigger is None and isinstance(data.get("compact_metadata"), dict):
-            trigger = data["compact_metadata"].get("trigger")
+        if trigger is None:
+            trigger = meta.get("trigger")
         return {
             "type": "compaction",
             "subtype": subtype,
@@ -311,6 +320,15 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             # compacted"), so it always closes a compaction rather than opening one.
             "phase": "end",
             "trigger": trigger,
+            # What the compaction actually did. Without these a client can only say
+            # that it happened; with them it can say the conversation went from
+            # 36k to 1.6k tokens in 12 seconds, which is the thing a user waiting
+            # through the pause wants to know. The rest of ``compact_metadata`` is
+            # transcript bookkeeping (preserved segment/message uuids) and stays off
+            # the wire.
+            "pre_tokens": _as_int(meta.get("pre_tokens")),
+            "post_tokens": _as_int(meta.get("post_tokens")),
+            "duration_ms": _as_int(meta.get("duration_ms")),
             "session_id": chunk.get("session_id"),
         }
     if subtype == "status":
@@ -341,6 +359,11 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "phase": "end",
                 "trigger": None,
                 "result": data.get("compact_result"),
+                # A compaction that never reached a boundary has no numbers to
+                # report; the keys stay so the terminal has one shape.
+                "pre_tokens": None,
+                "post_tokens": None,
+                "duration_ms": None,
                 "session_id": chunk.get("session_id"),
             }
         return None
