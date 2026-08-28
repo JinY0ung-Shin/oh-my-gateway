@@ -118,6 +118,20 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _stream_identity(chunk: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
+    """Which stream a chunk belongs to: ``(parent_tool_use_id, session_id)``.
+
+    The SDK's generic ``SystemMessage`` carries only ``subtype`` and ``data``, so
+    for these chunks the routing fields live inside ``data`` — reading them off the
+    top level alone reports every compaction as the same anonymous stream, which is
+    also why the events used to go out with ``session_id: null``.
+    """
+    data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
+    parent = chunk.get("parent_tool_use_id") or data.get("parent_tool_use_id")
+    session = chunk.get("session_id") or data.get("session_id")
+    return parent, session
+
+
 def _as_int(value: Any) -> Optional[int]:
     """Numbers the CLI reports, kept off the wire when they are not real numbers."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -146,46 +160,86 @@ class CompactionTracker:
     held, the boundary merges into it, and anything else in the stream flushes
     what is held. A failed compaction sends no boundary, so that flush is what
     closes it — promptly, on the turn's next chunk, not at the end of the turn.
+
+    **One turn carries several streams**, and they interleave: a leader session
+    and every subagent it spawns compact independently, on their own schedule.
+    Holding one state for all of them would let a subagent's start be swallowed
+    as the leader's duplicate, and let one stream's ``compact_result`` merge onto
+    another's boundary — the client would then be told the wrong stream's verdict.
+    So state is per :func:`_stream_identity`, and a flush only closes the stream
+    the chunk that triggered it belongs to.
     """
 
     def __init__(self) -> None:
-        self._open = False
-        self._pending: Optional[Dict[str, Any]] = None
+        self._streams: Dict[tuple[Optional[str], Optional[str]], Dict[str, Any]] = {}
 
     def feed(self, event: Dict[str, Any]) -> list[Dict[str, Any]]:
         """Take one compaction event; return what the client should actually see."""
         if event.get("type") != "compaction":
             return [event]
+        key = _stream_identity(event)
+        state = self._streams.setdefault(key, {"open": False, "pending": None})
         if event.get("phase") == "start":
-            if self._open:
+            if state["open"]:
                 return []  # already announced — the CLI is just still working
-            self._open = True
+            state["open"] = True
             return [event]
 
         if event.get("subtype") == "compact_boundary":
             merged = dict(event)
-            if self._pending is not None:
+            pending = state["pending"]
+            if pending is not None:
                 # The status knows how it ended; the boundary knows what it did.
-                merged["result"] = self._pending.get("result")
-            self._reset()
+                merged["result"] = pending.get("result")
+            del self._streams[key]
             return [merged]
 
         # A closing status. Hold it: the boundary that usually follows carries the
         # trigger, and emitting now would spend the terminal before that is known.
-        self._pending = event
+        state["pending"] = event
         return []
 
-    def flush(self) -> list[Dict[str, Any]]:
-        """Emit a held terminal — no boundary is coming, or the turn moved on."""
-        if self._pending is None:
-            return []
-        event = self._pending
-        self._reset()
-        return [event]
+    def flush(self, chunk: Optional[Dict[str, Any]] = None) -> list[Dict[str, Any]]:
+        """Emit held terminals — no boundary is coming, or the turn moved on.
 
-    def _reset(self) -> None:
-        self._open = False
-        self._pending = None
+        With a chunk, only the stream that chunk belongs to is closed: a subagent
+        writing text says nothing about whether the leader's compaction has
+        finished. Without one (end of turn) every stream still holding a terminal
+        is closed, so no client is left showing a compaction that never ended.
+        """
+        identity = _stream_identity(chunk) if chunk is not None else None
+        closed = []
+        for key, state in list(self._streams.items()):
+            if identity is not None and not _same_stream(key, identity):
+                continue
+            if state["pending"] is None:
+                # Still mid-compaction: keep ``open`` so a repeated "compacting"
+                # status stays deduplicated.
+                continue
+            closed.append(state["pending"])
+            del self._streams[key]
+        return closed
+
+
+def _same_stream(
+    key: tuple[Optional[str], Optional[str]],
+    identity: tuple[Optional[str], Optional[str]],
+) -> bool:
+    """Do a tracked stream and a chunk belong together?
+
+    ``parent_tool_use_id`` is the field content chunks reliably carry, and it is
+    what separates a subagent from its leader, so it must match exactly. The
+    session id is decisive when both sides know it (two leader sessions in one
+    turn), and is simply not consulted when either side is anonymous — a chunk
+    that omits it must still be able to close its own stream.
+    """
+    parent_key, session_key = key
+    parent, session = identity
+    if parent_key != parent:
+        return False
+    if session_key is not None and session is not None:
+        return session_key == session
+    return True
 
 
 def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int = 0) -> str:
@@ -313,6 +367,7 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         trigger = data.get("trigger")
         if trigger is None:
             trigger = meta.get("trigger")
+        parent, session = _stream_identity(chunk)
         return {
             "type": "compaction",
             "subtype": subtype,
@@ -320,6 +375,7 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             # compacted"), so it always closes a compaction rather than opening one.
             "phase": "end",
             "trigger": trigger,
+            **({"parent_tool_use_id": parent} if parent else {}),
             # What the compaction actually did. Without these a client can only say
             # that it happened; with them it can say the conversation went from
             # 36k to 1.6k tokens in 12 seconds, which is the thing a user waiting
@@ -329,7 +385,7 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "pre_tokens": _as_int(meta.get("pre_tokens")),
             "post_tokens": _as_int(meta.get("post_tokens")),
             "duration_ms": _as_int(meta.get("duration_ms")),
-            "session_id": chunk.get("session_id"),
+            "session_id": session,
         }
     if subtype == "status":
         # The CLI reports its own run phase here, and compaction is the one phase a
@@ -341,13 +397,15 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             return None
         data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
         status = data.get("status")
+        parent, session = _stream_identity(chunk)
         if status == "compacting":
             return {
                 "type": "compaction",
                 "subtype": subtype,
                 "phase": "start",
                 "trigger": None,
-                "session_id": chunk.get("session_id"),
+                **({"parent_tool_use_id": parent} if parent else {}),
+                "session_id": session,
             }
         # Any other status ends a compaction we announced; a client that never saw
         # the start simply has nothing to close. ``compact_result`` is the CLI's own
@@ -364,7 +422,8 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "pre_tokens": None,
                 "post_tokens": None,
                 "duration_ms": None,
-                "session_id": chunk.get("session_id"),
+                **({"parent_tool_use_id": parent} if parent else {}),
+                "session_id": session,
             }
         return None
     return None

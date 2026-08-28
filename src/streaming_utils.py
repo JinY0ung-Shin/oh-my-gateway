@@ -1352,8 +1352,9 @@ async def stream_response_chunks(
 
             # The turn moved on past the compaction markers. A failed compaction
             # sends no boundary, so this is what closes it — on the next chunk of
-            # the turn rather than at its end.
-            for event in compaction.flush():
+            # the turn rather than at its end. Only for the stream this chunk
+            # belongs to: a subagent's output says nothing about the leader.
+            for event in compaction.flush(chunk):
                 yield make_task_response_sse(event, sequence_number=_next_seq())
 
             # Token-level streaming (text/thinking deltas)

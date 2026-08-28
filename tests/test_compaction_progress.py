@@ -326,3 +326,93 @@ def test_a_non_numeric_token_count_is_reported_as_unknown():
         }
     )
     assert event is not None and event["pre_tokens"] is None
+
+
+# ---------------------------------------------------------------------------
+# One turn, several streams. A leader and its subagents compact independently.
+# ---------------------------------------------------------------------------
+
+
+def _in_stream(chunk, *, session_id, parent_tool_use_id=None):
+    """Tag a system chunk with the stream it came from, where the CLI puts it.
+
+    The SDK's generic ``SystemMessage`` carries only ``subtype`` and ``data``, so
+    the routing fields ride inside ``data`` — not at the top level, where the
+    typed messages keep them.
+    """
+    data = {**chunk["data"], "session_id": session_id}
+    if parent_tool_use_id is not None:
+        data["parent_tool_use_id"] = parent_tool_use_id
+    return {**chunk, "data": data}
+
+
+async def test_interleaved_streams_each_get_their_own_start_and_end():
+    """A subagent compacting while the leader does must not share its state.
+
+    With one state for the whole turn the subagent's start is swallowed as the
+    leader's duplicate, and whichever verdict is held last merges onto whichever
+    boundary lands first — telling the client the wrong stream's outcome.
+    """
+    sub = dict(session_id="sess-sub", parent_tool_use_id="toolu_sub")
+    events = await _events(
+        [
+            _in_stream(_status_chunk("compacting"), session_id="sess-leader"),
+            _in_stream(_status_chunk("compacting"), **sub),
+            _in_stream(
+                _status_chunk(None, compact_result="success"),
+                session_id="sess-leader",
+            ),
+            # The subagent's compaction fails, so it never reaches a boundary.
+            _in_stream(
+                _status_chunk(None, compact_result="failed", compact_error="short"),
+                **sub,
+            ),
+            _in_stream(_boundary_chunk(trigger="auto"), session_id="sess-leader"),
+            {**_TEXT, "parent_tool_use_id": "toolu_sub", "session_id": "sess-sub"},
+            _TEXT,
+            _RESULT,
+        ]
+    )
+
+    by_stream = {}
+    for event in _compaction(events):
+        key = (event.get("parent_tool_use_id"), event.get("session_id"))
+        by_stream.setdefault(key, []).append(event)
+
+    leader = by_stream[(None, "sess-leader")]
+    subagent = by_stream[("toolu_sub", "sess-sub")]
+    assert [e["phase"] for e in leader] == ["start", "end"]
+    assert [e["phase"] for e in subagent] == ["start", "end"]
+
+    # Each terminal reports its own stream's outcome, not the other's.
+    assert leader[-1]["result"] == "success"
+    assert (leader[-1]["trigger"], leader[-1]["pre_tokens"]) == ("auto", 36157)
+    assert subagent[-1]["result"] == "failed"
+    assert subagent[-1]["pre_tokens"] is None
+
+
+async def test_another_streams_output_does_not_close_a_held_terminal():
+    """Only the compacting stream's own chunks may decide it is over.
+
+    The held terminal waits for a boundary that may still be coming; a chunk from
+    a different stream is no evidence either way, and closing on it would spend
+    the terminal before the trigger and token counts are known.
+    """
+    events = await _events(
+        [
+            _in_stream(_status_chunk("compacting"), session_id="sess-leader"),
+            _in_stream(
+                _status_chunk(None, compact_result="success"),
+                session_id="sess-leader",
+            ),
+            # A subagent writes while the leader's boundary is still in flight.
+            {**_TEXT, "parent_tool_use_id": "toolu_sub", "session_id": "sess-sub"},
+            _in_stream(_boundary_chunk(trigger="auto"), session_id="sess-leader"),
+            _RESULT,
+        ]
+    )
+    leader = _compaction(events)
+    assert [e["phase"] for e in leader] == ["start", "end"]
+    # The boundary still got to merge, so the numbers survived.
+    assert leader[-1]["result"] == "success"
+    assert leader[-1]["post_tokens"] == 1585
