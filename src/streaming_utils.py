@@ -32,9 +32,11 @@ from src.usage_logger import extract_sdk_usage_detail, usage_logger
 # External callers continue to use `from src.streaming_utils import X`.
 from src.collab_filter import CollabJsonStreamFilter, strip_collab_json  # noqa: F401
 from src.sse_builders import (  # noqa: F401
+    CompactionTracker,
     _build_progress_event,
     _build_task_event,
     _normalize_tool_result,
+    _stream_identity,
     is_teammate_message_text,
     make_function_call_response_sse,
     make_response_sse,
@@ -951,6 +953,9 @@ async def stream_response_chunks(
     usage_start = time.monotonic()
     tool_stats = ToolStatsCollector()
     tool_names_by_id: Dict[str, str] = {}
+    # A compaction's raw markers repeat and close twice; this keeps the wire at
+    # one start and one terminal per compaction.
+    compaction = CompactionTracker()
 
     def _next_seq() -> int:
         nonlocal seq
@@ -1336,14 +1341,28 @@ async def stream_response_chunks(
                     # Other liveness signals: hook lifecycle + compaction.
                     # For these, only an explicit parent_tool_use_id marks
                     # subagent origin. A plain tool_use_id is the target tool.
-                    is_subagent_progress = chunk.get("parent_tool_use_id") is not None
+                    # These arrive as the SDK's generic SystemMessage, whose only
+                    # fields are subtype and data — so the parent lives inside
+                    # ``data``, and reading the top level alone let a subagent's
+                    # compaction through a gate that was meant to hold it. One
+                    # helper answers "which stream" for the gate and the event
+                    # builder alike; two answers is how they drifted apart.
+                    is_subagent_progress = _stream_identity(chunk)[0] is not None
                     if not is_subagent_progress or SUBAGENT_STREAM_PROGRESS:
                         progress_event = _build_progress_event(chunk)
                         if progress_event:
-                            yield make_task_response_sse(
-                                progress_event, sequence_number=_next_seq()
-                            )
+                            for event in compaction.feed(progress_event):
+                                yield make_task_response_sse(
+                                    event, sequence_number=_next_seq()
+                                )
                 continue
+
+            # The turn moved on past the compaction markers. A failed compaction
+            # sends no boundary, so this is what closes it — on the next chunk of
+            # the turn rather than at its end. Only for the stream this chunk
+            # belongs to: a subagent's output says nothing about the leader.
+            for event in compaction.flush(chunk):
+                yield make_task_response_sse(event, sequence_number=_next_seq())
 
             # Token-level streaming (text/thinking deltas)
             was_thinking = in_thinking
@@ -1609,6 +1628,12 @@ async def stream_response_chunks(
         logger.warning("Incomplete tool_use blocks at stream end: %s", tool_acc.incomplete_keys)
 
     # --- Finalization ---
+
+    # A turn that ended while a compaction terminal was held still has to close it,
+    # and this runs before the early exits below (paused, empty) — a client must not
+    # be left showing a compaction that never finished.
+    for event in compaction.flush():
+        yield make_task_response_sse(event, sequence_number=_next_seq())
 
     # **파킹된 턴은 완료된 턴이 아니다.**
     #
