@@ -118,6 +118,69 @@ def _build_task_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     return None
 
 
+class CompactionTracker:
+    """Canonicalise a compaction's raw markers into one start and one terminal.
+
+    The CLI does not speak in pairs. Measured against claude-code 2.1.220, one
+    successful compaction closes **twice** — the status first, then the boundary::
+
+        system/status          status="compacting"
+        system/status          status=null, compact_result="success"
+        system/compact_boundary compact_metadata={trigger, pre_tokens, post_tokens, …}
+
+    and ``status="compacting"`` may repeat while the work is in flight. Passing
+    those through one-for-one would hand a client ``start, start, …, end, end``,
+    so a client tracking a single progress state would open or close it twice and
+    would see the verdict (``compact_result``) and the trigger arrive on different
+    events.
+
+    The two closing markers carry different halves of the same fact, so the
+    terminal waits for the boundary rather than racing it: a closing status is
+    held, the boundary merges into it, and anything else in the stream flushes
+    what is held. A failed compaction sends no boundary, so that flush is what
+    closes it — promptly, on the turn's next chunk, not at the end of the turn.
+    """
+
+    def __init__(self) -> None:
+        self._open = False
+        self._pending: Optional[Dict[str, Any]] = None
+
+    def feed(self, event: Dict[str, Any]) -> list[Dict[str, Any]]:
+        """Take one compaction event; return what the client should actually see."""
+        if event.get("type") != "compaction":
+            return [event]
+        if event.get("phase") == "start":
+            if self._open:
+                return []  # already announced — the CLI is just still working
+            self._open = True
+            return [event]
+
+        if event.get("subtype") == "compact_boundary":
+            merged = dict(event)
+            if self._pending is not None:
+                # The status knows how it ended; the boundary knows what it did.
+                merged["result"] = self._pending.get("result")
+            self._reset()
+            return [merged]
+
+        # A closing status. Hold it: the boundary that usually follows carries the
+        # trigger, and emitting now would spend the terminal before that is known.
+        self._pending = event
+        return []
+
+    def flush(self) -> list[Dict[str, Any]]:
+        """Emit a held terminal — no boundary is coming, or the turn moved on."""
+        if self._pending is None:
+            return []
+        event = self._pending
+        self._reset()
+        return [event]
+
+    def _reset(self) -> None:
+        self._open = False
+        self._pending = None
+
+
 def make_task_response_sse(task_event: Dict[str, Any], *, sequence_number: int = 0) -> str:
     """Build an SSE line for Responses API with a custom task event type."""
     event_type = f"response.{task_event['type']}"
