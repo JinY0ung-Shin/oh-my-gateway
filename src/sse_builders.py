@@ -244,9 +244,43 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return {
             "type": "compaction",
             "subtype": subtype,
+            # The boundary is the CLI's own past-tense marker ("Conversation
+            # compacted"), so it always closes a compaction rather than opening one.
+            "phase": "end",
             "trigger": trigger,
             "session_id": chunk.get("session_id"),
         }
+    if subtype == "status":
+        # The CLI reports its own run phase here, and compaction is the one phase a
+        # client cannot otherwise see coming: ``compact_boundary`` only arrives once
+        # the summarisation has already finished, so a client that waits for it shows
+        # nothing during the very pause it is meant to explain. ``status: compacting``
+        # opens that pause and the next status closes it, carrying the outcome.
+        if not STREAM_COMPACTION_EVENTS:
+            return None
+        data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
+        status = data.get("status")
+        if status == "compacting":
+            return {
+                "type": "compaction",
+                "subtype": subtype,
+                "phase": "start",
+                "trigger": None,
+                "session_id": chunk.get("session_id"),
+            }
+        # Any other status ends a compaction we announced; a client that never saw
+        # the start simply has nothing to close. ``compact_result`` is the CLI's own
+        # verdict, so a failed compaction stops claiming the context was reduced.
+        if status is None and data.get("compact_result") is not None:
+            return {
+                "type": "compaction",
+                "subtype": subtype,
+                "phase": "end",
+                "trigger": None,
+                "result": data.get("compact_result"),
+                "session_id": chunk.get("session_id"),
+            }
+        return None
     return None
 
 
