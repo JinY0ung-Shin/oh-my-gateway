@@ -26,20 +26,17 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.tool_stats import ToolStatsCollector
-from src.usage_logger import (
-    context_snapshot_tokens,
-    extract_context_tokens,
-    extract_sdk_usage_detail,
-    usage_logger,
-)
+from src.usage_logger import extract_sdk_usage_detail, usage_logger
 
 # Backward-compat re-exports from split modules.
 # External callers continue to use `from src.streaming_utils import X`.
 from src.collab_filter import CollabJsonStreamFilter, strip_collab_json  # noqa: F401
 from src.sse_builders import (  # noqa: F401
+    CompactionTracker,
     _build_progress_event,
     _build_task_event,
     _normalize_tool_result,
+    _stream_identity,
     is_teammate_message_text,
     make_function_call_response_sse,
     make_response_sse,
@@ -193,6 +190,108 @@ def _buffer_summary(buf: list, limit: int = 5) -> list:
 # ---------------------------------------------------------------------------
 
 
+def _prompt_tokens_from_usage(usage: Any) -> int:
+    """Prompt size of one SDK model request: input + cache read + cache creation.
+
+    This is the whole prompt the request carried, cached or not, and therefore
+    the context window that request occupied. ``output_tokens`` is deliberately
+    excluded: the same accounting has to work off a ``message_start`` event,
+    which is emitted before a single output token exists, so counting output
+    would make a streamed turn and a non-streamed one report different
+    occupancy for the identical conversation.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    return (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+    )
+
+
+def _main_agent_prompt_tokens(msg: Any) -> int:
+    """Prompt size of one main-agent request, from either message shape.
+
+    Two shapes carry the same number depending on streaming mode:
+
+    * ``assistant`` — the assembled message's ``usage`` (non-streaming turns).
+    * ``stream_event`` / ``message_start`` — the per-request prompt counters
+      under ``include_partial_messages``. There the assembled assistant
+      message's ``usage`` carries only the ``message_delta`` output counts
+      (``input_tokens`` arrives ``null``), so ``message_start`` is the only
+      place a streamed turn's prompt size appears at all.
+
+    Returns 0 for subagent messages: a subagent runs its own context window,
+    so its prompt size says nothing about the main conversation's occupancy.
+
+    ``session_id`` is deliberately NOT part of this gate, unlike the compaction
+    lifecycle's stream key. Compaction needs per-stream *state* (an open start
+    waiting for its end), so two parent-less leader sessions in one turn — a
+    session handoff — must not close each other's markers. Occupancy needs one
+    *number*: what the next request will carry. Across a handoff that is the
+    NEWEST parent-less request, so "latest parent-less wins" already picks the
+    right session without naming it. The invariant this leans on is that every
+    stream that is not the current leader lineage arrives with
+    ``parent_tool_use_id`` set (subagents do today); a future stream shape
+    that is parent-less yet not the leader would need a session-aware pick —
+    ``test_context_snapshot_spans_leader_session_handoff`` pins the current
+    contract so such a change fails loudly instead of silently clobbering.
+    """
+    if not isinstance(msg, dict):
+        return 0
+    if msg.get("parent_tool_use_id"):
+        return 0
+    msg_type = msg.get("type")
+    if msg_type == "assistant":
+        return _prompt_tokens_from_usage(msg.get("usage"))
+    if msg_type == "stream_event":
+        event = msg.get("event")
+        if not isinstance(event, dict) or event.get("type") != "message_start":
+            return 0
+        inner = event.get("message")
+        if not isinstance(inner, dict):
+            return 0
+        return _prompt_tokens_from_usage(inner.get("usage"))
+    return 0
+
+
+def _is_context_snapshot_chunk(chunk: Any) -> bool:
+    """True for a ``message_start`` event that carries a usable prompt size.
+
+    The streaming path drops ``stream_event`` chunks once the text deltas have
+    been emitted; this marks the few that must survive in the chunk buffer
+    (one per model request) so :func:`extract_context_tokens` can still find a
+    snapshot on a token-streamed turn.
+    """
+    return (
+        isinstance(chunk, dict)
+        and chunk.get("type") == "stream_event"
+        and _main_agent_prompt_tokens(chunk) > 0
+    )
+
+
+def extract_context_tokens(chunks: list) -> Optional[int]:
+    """Return the latest main-agent prompt size, never cumulative turn usage.
+
+    ``ResultMessage.usage`` is cumulative across every model request in an
+    agentic turn, so it can exceed the context window many times. The prompt
+    size of a single request is the honest occupancy source, and the last
+    main-agent request of the turn is the live one.
+
+    The scan walks backwards and takes the first positive prompt size, so an
+    assembled ``assistant`` message wins when it carries real prompt counters
+    and its preceding ``message_start`` answers when it does not (the
+    token-streaming shape). Returns ``None`` when the turn produced no
+    per-request snapshot at all — cumulative input is never relabelled as
+    context occupancy.
+    """
+    for msg in reversed(chunks):
+        tokens = _main_agent_prompt_tokens(msg)
+        if tokens > 0:
+            return tokens
+    return None
+
+
 def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     """Extract real token usage from SDK messages if available.
 
@@ -201,14 +300,14 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
 
     Returns dict with prompt_tokens, completion_tokens, total_tokens or None.
 
-    Every counter is read through ``or 0``: the CLI sends JSON ``null`` for
-    counters that do not apply to a message, and a streaming ``assistant``
+    Every counter is read through ``int(... or 0)``: the CLI sends JSON ``null``
+    for counters that do not apply to a message, and a streaming ``assistant``
     message assembled from ``message_delta`` carries exactly that
     (``input_tokens: null``, output only). ``.get(key, 0)`` returns that
-    ``None`` — the default only covers a *missing* key — so the bare sums here
+    ``None`` — the default only covers a *missing* key — so bare sums here
     raised ``TypeError: unsupported operand type(s) for +: 'NoneType' and
     'int'`` and took the whole turn's payload down with them. Matches the
-    ``int(... or 0)`` idiom ``extract_sdk_usage_detail`` already uses.
+    idiom ``_prompt_tokens_from_usage`` already uses.
     """
     # Primary: ResultMessage usage (cumulative totals)
     for msg in reversed(chunks):
@@ -370,22 +469,13 @@ def resolve_token_usage(
 
 
 def resolve_usage_details(chunks: list) -> InputTokensDetails:
-    """Return the ``input_tokens`` cache breakdown for a Responses payload.
+    """Return cache accounting plus an honest live-context snapshot.
 
-    Reuses :func:`src.usage_logger.extract_sdk_usage_detail` rather than
-    re-walking the chunk list, so the usage-log rows and the API response can
-    never disagree about the same turn.
-
-    Returns all-zero details when the turn carried no SDK usage (the
-    estimation fallback in :func:`resolve_token_usage`) — the gateway has no
-    cache information to report in that case.
-
-    ``context_tokens`` rides along here because every Responses payload already
-    builds its details through this one helper, so the window-occupancy
-    snapshot cannot go missing on one of the five ``ResponseUsage`` sites
-    (completed, cancelled, max-turns, background, non-streaming) while the
-    others have it. It stays ``None`` when the turn has no main-agent usage to
-    snapshot — see :func:`~src.usage_logger.extract_context_tokens`.
+    Cache counters remain turn-cumulative billing fields. ``context_tokens``
+    instead comes from the latest main-agent per-request prompt size, because
+    that is a single-request context-window footprint. If no such snapshot is
+    available it remains ``None``; cumulative input is never relabelled as
+    context occupancy.
     """
     detail = extract_sdk_usage_detail(chunks)
     return InputTokensDetails(
@@ -885,6 +975,9 @@ async def stream_response_chunks(
     usage_start = time.monotonic()
     tool_stats = ToolStatsCollector()
     tool_names_by_id: Dict[str, str] = {}
+    # A compaction's raw markers repeat and close twice; this keeps the wire at
+    # one start and one terminal per compaction.
+    compaction = CompactionTracker()
 
     def _next_seq() -> int:
         nonlocal seq
@@ -1270,14 +1363,28 @@ async def stream_response_chunks(
                     # Other liveness signals: hook lifecycle + compaction.
                     # For these, only an explicit parent_tool_use_id marks
                     # subagent origin. A plain tool_use_id is the target tool.
-                    is_subagent_progress = chunk.get("parent_tool_use_id") is not None
+                    # These arrive as the SDK's generic SystemMessage, whose only
+                    # fields are subtype and data — so the parent lives inside
+                    # ``data``, and reading the top level alone let a subagent's
+                    # compaction through a gate that was meant to hold it. One
+                    # helper answers "which stream" for the gate and the event
+                    # builder alike; two answers is how they drifted apart.
+                    is_subagent_progress = _stream_identity(chunk)[0] is not None
                     if not is_subagent_progress or SUBAGENT_STREAM_PROGRESS:
                         progress_event = _build_progress_event(chunk)
                         if progress_event:
-                            yield make_task_response_sse(
-                                progress_event, sequence_number=_next_seq()
-                            )
+                            for event in compaction.feed(progress_event):
+                                yield make_task_response_sse(
+                                    event, sequence_number=_next_seq()
+                                )
                 continue
+
+            # The turn moved on past the compaction markers. A failed compaction
+            # sends no boundary, so this is what closes it — on the next chunk of
+            # the turn rather than at its end. Only for the stream this chunk
+            # belongs to: a subagent's output says nothing about the leader.
+            for event in compaction.flush(chunk):
+                yield make_task_response_sse(event, sequence_number=_next_seq())
 
             # Token-level streaming (text/thinking deltas)
             was_thinking = in_thinking
@@ -1459,18 +1566,17 @@ async def stream_response_chunks(
             # Tool blocks were already extracted above, so only text is suppressed.
             if token_streaming:
                 if chunk.get("type") == "stream_event":
-                    # ...except the one that carries this round's prompt size.
-                    # With ``include_partial_messages`` the window-occupancy
-                    # counts ride on ``message_start``, while the assembled
-                    # ``assistant`` message may report only the
-                    # ``message_delta`` counts (output, ``input_tokens`` null).
-                    # Dropping every stream event here is what left
-                    # ``context_tokens`` unmeasurable in the gateway's DEFAULT
-                    # configuration (``TOKEN_STREAMING=true``) — the client's
-                    # context indicator then reads "—" forever. Only the
-                    # snapshot-bearing start is kept; its text and deltas are
-                    # still suppressed as duplicates above.
-                    if context_snapshot_tokens(chunk) is not None:
+                    # Context-occupancy snapshot. Under
+                    # ``include_partial_messages`` the per-request prompt
+                    # counters ride on ``message_start`` and the assembled
+                    # assistant message's usage carries only the
+                    # ``message_delta`` output counts. Dropping every
+                    # stream_event here left the buffer holding only the FIRST
+                    # request's start event (buffered below before this flag
+                    # flipped), so a multi-round turn reported a stale snapshot
+                    # from before its tool rounds. Buffered, never emitted —
+                    # one entry per model request, not per token.
+                    if _is_context_snapshot_chunk(chunk):
                         chunks_buffer.append(chunk)
                     continue
                 if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
@@ -1544,6 +1650,12 @@ async def stream_response_chunks(
         logger.warning("Incomplete tool_use blocks at stream end: %s", tool_acc.incomplete_keys)
 
     # --- Finalization ---
+
+    # A turn that ended while a compaction terminal was held still has to close it,
+    # and this runs before the early exits below (paused, empty) — a client must not
+    # be left showing a compaction that never finished.
+    for event in compaction.flush():
+        yield make_task_response_sse(event, sequence_number=_next_seq())
 
     # **파킹된 턴은 완료된 턴이 아니다.**
     #
