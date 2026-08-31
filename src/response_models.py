@@ -254,10 +254,23 @@ class InputTokensDetails(BaseModel):
     equivalent, broken out because cache writes bill at a premium. Clients
     that only know the OpenAI shape ignore the extra key and still read a
     correct ``input_tokens`` total.
+
+    ``context_tokens`` is a different kind of number and the reason it lives
+    here: it is NOT a subset of ``input_tokens``. ``input_tokens`` is the
+    turn's cumulative prompt cost — an agentic turn re-sends the transcript on
+    every tool round, so it sums many overlapping prompts and runs past the
+    context window several times over. ``context_tokens`` is a *snapshot*: the
+    prompt size of the final main-agent request, which is what actually
+    occupies the window right now (the CLI's ``/context``). A client that wants
+    to draw "how full is this conversation" must use this field; dividing
+    ``input_tokens`` by the window is what drew 263k/250k. ``None`` means the
+    turn carried no main-agent usage to snapshot — clients say "unmeasured"
+    rather than estimating, so a wrong number never masquerades as a real one.
     """
 
     cached_tokens: int = 0
     cache_creation_tokens: int = 0
+    context_tokens: Optional[int] = None
 
 
 class ResponseUsage(BaseModel):

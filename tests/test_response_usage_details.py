@@ -123,3 +123,72 @@ class TestResolveUsageDetails:
         details = resolve_usage_details(chunks)
         assert details.cached_tokens == row["cache_read_tokens"]
         assert details.cache_creation_tokens == row["cache_creation_tokens"]
+
+
+def _assistant(prompt, *, cache_read=0, cache_creation=0, parent=None, output=7):
+    """One main-agent (or subagent) model request with the given prompt size."""
+    chunk = {
+        "type": "assistant",
+        "usage": {
+            "input_tokens": prompt,
+            "output_tokens": output,
+            "cache_read_input_tokens": cache_read,
+            "cache_creation_input_tokens": cache_creation,
+        },
+    }
+    if parent:
+        chunk["parent_tool_use_id"] = parent
+    return chunk
+
+
+class TestContextTokensSnapshot:
+    """``context_tokens`` is a window-occupancy SNAPSHOT, not a turn total.
+
+    The bug this pins: ChatDRAGON's context chip refuses to estimate and reads
+    this field only, so while the gateway omitted it the chip fell to "—" on
+    every conversation that had seen a single turn. And it must never be the
+    cumulative prompt total — an agentic turn re-sends the transcript per tool
+    round, which is what once drew 263k/250k.
+    """
+
+    def test_snapshot_is_the_last_request_not_the_sum_of_all_rounds(self):
+        # Three tool rounds, each re-sending a longer transcript.
+        chunks = [_assistant(1000), _assistant(1800), _assistant(2500)]
+        details = resolve_usage_details(chunks)
+        assert details.context_tokens == 2500, "must be the final prompt, not 5300"
+
+    def test_cache_reads_still_occupy_the_window(self):
+        """A cached prompt is cheaper, not smaller — it holds the same space."""
+        chunks = [_assistant(200, cache_read=9000, cache_creation=800)]
+        assert resolve_usage_details(chunks).context_tokens == 10000
+
+    def test_subagent_prompt_never_stands_in_for_the_conversation(self):
+        """Subagents run their own context; the last MAIN request is the answer."""
+        chunks = [
+            _assistant(4000),
+            _assistant(120, parent="toolu_sub"),
+            _assistant(90, parent="toolu_sub"),
+        ]
+        assert resolve_usage_details(chunks).context_tokens == 4000
+
+    def test_result_totals_alone_are_not_a_snapshot(self):
+        """``ResultMessage.usage`` carries the same cumulative totals, so a turn
+        with no assistant usage yields None — the client says "unmeasured"."""
+        details = resolve_usage_details(
+            _result_chunk(input_tokens=99000, output_tokens=400)
+        )
+        assert details.context_tokens is None
+        assert details.cached_tokens == 0
+
+    def test_no_usage_at_all_is_unmeasured_not_zero(self):
+        assert resolve_usage_details([]).context_tokens is None
+
+    def test_field_is_published_on_the_wire(self):
+        """The frontend reads ``input_tokens_details.context_tokens``; the key
+        has to survive serialization or the chip is back to "—"."""
+        payload = ResponseUsage(
+            input_tokens=5300,
+            output_tokens=21,
+            input_tokens_details=InputTokensDetails(context_tokens=2500),
+        ).model_dump()
+        assert payload["input_tokens_details"]["context_tokens"] == 2500

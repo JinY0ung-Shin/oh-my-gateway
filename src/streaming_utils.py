@@ -26,7 +26,11 @@ from src.response_models import (
     ResponseUsage,
 )
 from src.tool_stats import ToolStatsCollector
-from src.usage_logger import extract_sdk_usage_detail, usage_logger
+from src.usage_logger import (
+    extract_context_tokens,
+    extract_sdk_usage_detail,
+    usage_logger,
+)
 
 # Backward-compat re-exports from split modules.
 # External callers continue to use `from src.streaming_utils import X`.
@@ -365,11 +369,19 @@ def resolve_usage_details(chunks: list) -> InputTokensDetails:
     Returns all-zero details when the turn carried no SDK usage (the
     estimation fallback in :func:`resolve_token_usage`) — the gateway has no
     cache information to report in that case.
+
+    ``context_tokens`` rides along here because every Responses payload already
+    builds its details through this one helper, so the window-occupancy
+    snapshot cannot go missing on one of the five ``ResponseUsage`` sites
+    (completed, cancelled, max-turns, background, non-streaming) while the
+    others have it. It stays ``None`` when the turn has no main-agent usage to
+    snapshot — see :func:`~src.usage_logger.extract_context_tokens`.
     """
     detail = extract_sdk_usage_detail(chunks)
     return InputTokensDetails(
         cached_tokens=detail["cache_read_tokens"],
         cache_creation_tokens=detail["cache_creation_tokens"],
+        context_tokens=extract_context_tokens(chunks),
     )
 
 

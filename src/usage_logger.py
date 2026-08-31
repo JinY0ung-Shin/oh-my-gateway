@@ -129,6 +129,48 @@ def extract_sdk_usage_detail(chunks: list) -> Dict[str, int]:
     return total
 
 
+def extract_context_tokens(chunks: list) -> Optional[int]:
+    """Return the window-occupancy snapshot for this turn, or ``None``.
+
+    This is deliberately NOT the turn's cumulative prompt total that
+    :func:`extract_sdk_usage_detail` reports. An agentic turn re-sends the whole
+    transcript on every tool round, so the cumulative ``input_tokens`` sums many
+    overlapping prompts and sails past the context window on tool-heavy turns
+    (a client dividing it by the window drew 263k/250k). What a "how full is
+    this conversation" indicator needs is a *snapshot*: the prompt size of the
+    LAST request, which is exactly what occupies the window going forward.
+
+    Prompt size is ``input_tokens`` + both cache counters — a cache read still
+    occupies the window, it is only cheaper. Subagent chunks
+    (``parent_tool_use_id`` set) are skipped for the same reason
+    :func:`extract_model_id` skips them: a subagent runs its own separate
+    context, so its prompt size says nothing about the main conversation.
+
+    ``ResultMessage.usage`` is useless here (it carries the same cumulative
+    totals), so this walks assistant chunks from the end and takes the first
+    main-agent one with a non-zero prompt. Returns ``None`` for turns with no
+    main-agent usage at all — error-only turns, non-Claude backends, or the
+    character-estimation fallback — so callers can report "unmeasured" instead
+    of publishing a guess.
+    """
+    for msg in reversed(chunks):
+        if not isinstance(msg, dict) or msg.get("type") != "assistant":
+            continue
+        if msg.get("parent_tool_use_id"):
+            continue
+        usage = msg.get("usage")
+        if not isinstance(usage, dict):
+            continue
+        tokens = (
+            int(usage.get("input_tokens", 0) or 0)
+            + int(usage.get("cache_read_input_tokens", 0) or 0)
+            + int(usage.get("cache_creation_input_tokens", 0) or 0)
+        )
+        if tokens > 0:
+            return tokens
+    return None
+
+
 def extract_model_id(chunks: list) -> Optional[str]:
     """Return the concrete model id the backend actually used, if reported.
 

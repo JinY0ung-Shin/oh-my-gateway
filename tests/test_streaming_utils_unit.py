@@ -2332,3 +2332,75 @@ async def test_stream_teammate_message_without_from_address():
     assert len(teammate) == 1
     assert teammate[0]["text"] == text
     assert teammate[0]["from"] is None
+
+
+@pytest.mark.asyncio
+async def test_response_completed_carries_the_context_window_snapshot():
+    """The context indicator's only data source is this field.
+
+    ChatDRAGON's composer chip reads ``input_tokens_details.context_tokens`` and
+    refuses to estimate from anything else, so while the gateway omitted the key
+    the chip read "—" on every conversation past its first turn. This walks a
+    realistic agentic turn — two main-agent rounds with a subagent in between —
+    and pins that the published snapshot is the LAST main-agent prompt, not the
+    cumulative ``input_tokens`` the same payload reports for billing.
+    """
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {
+            "type": "assistant",
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 40,
+                "cache_read_input_tokens": 11_000,
+                "cache_creation_input_tokens": 0,
+            },
+        }
+        # A subagent's own (much smaller) context must not be mistaken for ours.
+        yield {
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_sub",
+            "usage": {"input_tokens": 300, "output_tokens": 12},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "done"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        # Final main-agent round: the transcript grew, so the window is fuller.
+        yield {
+            "type": "assistant",
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 60,
+                "cache_read_input_tokens": 13_500,
+                "cache_creation_input_tokens": 100,
+            },
+        }
+        yield {"subtype": "success", "result": "done"}
+
+    completed = None
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_ctx",
+        output_item_id="msg_ctx",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        t, p = _parse_response_sse(line)
+        if t == "response.completed":
+            completed = p
+
+    assert completed is not None
+    usage = completed["response"]["usage"]
+    # 900 + 13500 + 100 — the final main-agent prompt.
+    assert usage["input_tokens_details"]["context_tokens"] == 14_500
+    # Cumulative billing total is a different, larger number and stays intact.
+    assert usage["input_tokens"] > usage["input_tokens_details"]["context_tokens"]
