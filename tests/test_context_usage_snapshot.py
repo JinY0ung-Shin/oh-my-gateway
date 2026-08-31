@@ -33,9 +33,11 @@ def _assistant(
 def _streamed_assistant(*, output_tokens: int = 7) -> dict:
     """Assembled assistant message as it arrives under token streaming.
 
-    ``include_partial_messages`` splits the usage: prompt counters ride on
-    ``message_start`` and only the ``message_delta`` output counts survive on
-    the assembled message, with ``input_tokens`` null.
+    ``include_partial_messages`` splits the usage: prompt counters usually ride
+    on ``message_start`` and only ``message_delta`` output counts survive on
+    the assembled message, with ``input_tokens`` null. LiteLLM is a notable
+    proxy shape where ``message_start`` is zero and the real prompt counters
+    arrive on the raw ``message_delta`` stream event instead.
     """
     return {
         "type": "assistant",
@@ -68,6 +70,31 @@ def _message_start(
                     "cache_read_input_tokens": cache_read,
                     "output_tokens": 1,
                 }
+            },
+        },
+    }
+
+
+def _message_delta(
+    *,
+    input_tokens: int,
+    cache_creation: int = 0,
+    cache_read: int = 0,
+    output_tokens: int = 7,
+    parent_tool_use_id: str | None = None,
+) -> dict:
+    """Anthropic message_delta carrying usage in the LiteLLM proxy shape."""
+    return {
+        "type": "stream_event",
+        "parent_tool_use_id": parent_tool_use_id,
+        "event": {
+            "type": "message_delta",
+            "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+            "usage": {
+                "input_tokens": input_tokens,
+                "cache_creation_input_tokens": cache_creation,
+                "cache_read_input_tokens": cache_read,
+                "output_tokens": output_tokens,
             },
         },
     }
@@ -146,6 +173,34 @@ def test_context_snapshot_reads_message_start_under_token_streaming() -> None:
     assert resolve_usage_details(chunks).context_tokens == 122_000
 
 
+def test_context_snapshot_reads_litellm_message_delta_when_start_is_zero() -> None:
+    """LiteLLM initializes message_start usage to zero, then reports real usage at the end."""
+    chunks = [
+        _message_start(input_tokens=0),
+        _message_delta(input_tokens=2_000, cache_read=90_000, output_tokens=143),
+        _streamed_assistant(output_tokens=143),
+    ]
+
+    assert extract_context_tokens(chunks) == 92_000
+    assert resolve_usage_details(chunks).context_tokens == 92_000
+
+
+def test_context_snapshot_uses_latest_litellm_message_delta_round() -> None:
+    chunks = [
+        _message_start(input_tokens=0),
+        _message_delta(input_tokens=1_200, cache_read=20_000, output_tokens=32),
+        _streamed_assistant(output_tokens=32),
+        _message_start(input_tokens=0),
+        _message_delta(
+            input_tokens=1_500, cache_creation=500, cache_read=90_000, output_tokens=640
+        ),
+        _streamed_assistant(output_tokens=640),
+    ]
+
+    # Same rule as message_start snapshots: newest top-level request wins.
+    assert extract_context_tokens(chunks) == 92_000
+
+
 def test_context_snapshot_ignores_subagent_message_start() -> None:
     chunks = [
         _message_start(input_tokens=1_000, cache_read=20_000),
@@ -159,6 +214,20 @@ def test_context_snapshot_ignores_subagent_message_start() -> None:
 
     # A subagent owns a separate context window; the main-agent request stands.
     assert extract_context_tokens(chunks) == 21_000
+
+
+def test_context_snapshot_ignores_subagent_litellm_message_delta() -> None:
+    chunks = [
+        _message_start(input_tokens=0),
+        _message_delta(input_tokens=1_000, cache_read=57_000),
+        _message_delta(
+            input_tokens=90_000,
+            cache_read=300_000,
+            parent_tool_use_id="toolu_subagent",
+        ),
+    ]
+
+    assert extract_context_tokens(chunks) == 58_000
 
 
 def test_context_snapshot_prefers_assistant_usage_over_message_start() -> None:
@@ -219,9 +288,10 @@ async def test_streamed_turn_reports_the_latest_round_not_the_first() -> None:
 
     ``stream_response_chunks`` drops ``stream_event`` chunks once text deltas
     start flowing, and the prompt counters only exist on ``message_start`` in
-    that mode. The first round's start event slipped into the buffer before the
-    token-streaming flag flipped, so every later round's growth was invisible
-    and the completed response reported the turn's SMALLEST prompt.
+    the first-party shape. The first round's start event slipped into the
+    buffer before the token-streaming flag flipped, so every later round's
+    growth was invisible and the completed response reported the turn's
+    SMALLEST prompt.
     """
 
     async def source():
@@ -262,6 +332,54 @@ async def test_streamed_turn_reports_the_latest_round_not_the_first() -> None:
     # Billing totals stay on the cumulative ResultMessage.
     assert usage["input_tokens"] == 640_000
 
+
+@pytest.mark.asyncio
+async def test_streamed_turn_keeps_litellm_message_delta_snapshot() -> None:
+    """LiteLLM's useful final usage event must survive token-stream duplicate suppression."""
+
+    async def source():
+        yield _message_start(input_tokens=0)
+        yield _text_delta("looking")
+        yield _message_delta(input_tokens=1_200, cache_read=20_000, output_tokens=32)
+        yield _streamed_assistant(output_tokens=32)
+
+        yield _message_start(input_tokens=0)
+        yield _text_delta("done")
+        yield _message_delta(
+            input_tokens=1_500,
+            cache_creation=500,
+            cache_read=90_000,
+            output_tokens=640,
+        )
+        yield _streamed_assistant(output_tokens=640)
+        yield {
+            "type": "result",
+            "usage": {
+                "input_tokens": 400_000,
+                "cache_creation_input_tokens": 30_000,
+                "cache_read_input_tokens": 210_000,
+                "output_tokens": 1_200,
+            },
+        }
+
+    chunks_buffer: list = []
+    lines = [
+        line
+        async for line in stream_response_chunks(
+            chunk_source=source(),
+            model="claude-test",
+            response_id="resp-litellm-ctx",
+            output_item_id="msg-litellm-ctx",
+            chunks_buffer=chunks_buffer,
+            logger=logging.getLogger("test-resp-litellm-ctx"),
+        )
+    ]
+
+    usage = _parse_completed_usage(lines)
+    assert usage["input_tokens_details"]["context_tokens"] == 92_000
+    assert usage["input_tokens"] == 640_000
+
+
 def test_context_snapshot_spans_leader_session_handoff() -> None:
     """Two parent-less leader sessions in one turn: the newest one wins.
 
@@ -282,4 +400,3 @@ def test_context_snapshot_spans_leader_session_handoff() -> None:
     assert extract_context_tokens([old_leader, new_leader]) == 3_000
     # Order, not session identity, decides — reversed input picks the other one.
     assert extract_context_tokens([new_leader, old_leader]) == 9_000
-

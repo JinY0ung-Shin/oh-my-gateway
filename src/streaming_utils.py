@@ -195,10 +195,9 @@ def _prompt_tokens_from_usage(usage: Any) -> int:
 
     This is the whole prompt the request carried, cached or not, and therefore
     the context window that request occupied. ``output_tokens`` is deliberately
-    excluded: the same accounting has to work off a ``message_start`` event,
-    which is emitted before a single output token exists, so counting output
-    would make a streamed turn and a non-streamed one report different
-    occupancy for the identical conversation.
+    excluded so an end-of-stream ``message_delta`` snapshot and an opening
+    ``message_start`` snapshot report the same occupancy for the identical
+    request.
     """
     if not isinstance(usage, dict):
         return 0
@@ -210,16 +209,24 @@ def _prompt_tokens_from_usage(usage: Any) -> int:
 
 
 def _main_agent_prompt_tokens(msg: Any) -> int:
-    """Prompt size of one main-agent request, from either message shape.
+    """Prompt size of one main-agent request, from supported SDK message shapes.
 
-    Two shapes carry the same number depending on streaming mode:
+    The same per-request number can arrive in three places depending on the
+    client/proxy path:
 
     * ``assistant`` — the assembled message's ``usage`` (non-streaming turns).
-    * ``stream_event`` / ``message_start`` — the per-request prompt counters
-      under ``include_partial_messages``. There the assembled assistant
-      message's ``usage`` carries only the ``message_delta`` output counts
-      (``input_tokens`` arrives ``null``), so ``message_start`` is the only
-      place a streamed turn's prompt size appears at all.
+    * ``stream_event`` / ``message_start`` — Anthropic-native partial-message
+      streams put prompt counters under ``event.message.usage``.
+    * ``stream_event`` / ``message_delta`` — LiteLLM's Anthropic adapter emits
+      ``message_start`` immediately with placeholder zeros because its
+      OpenAI-compatible upstream does not report usage until the final chunk;
+      the real per-request prompt counters therefore arrive in the terminal
+      ``event.usage`` instead.
+
+    Native Anthropic ``message_delta`` events normally carry output-only usage;
+    :func:`_prompt_tokens_from_usage` returns 0 for those, so accepting this
+    shape is backward-compatible rather than a new estimate or cumulative
+    fallback.
 
     Returns 0 for subagent messages: a subagent runs its own context window,
     so its prompt size says nothing about the main conversation's occupancy.
@@ -246,22 +253,28 @@ def _main_agent_prompt_tokens(msg: Any) -> int:
         return _prompt_tokens_from_usage(msg.get("usage"))
     if msg_type == "stream_event":
         event = msg.get("event")
-        if not isinstance(event, dict) or event.get("type") != "message_start":
+        if not isinstance(event, dict):
             return 0
-        inner = event.get("message")
-        if not isinstance(inner, dict):
-            return 0
-        return _prompt_tokens_from_usage(inner.get("usage"))
+        event_type = event.get("type")
+        if event_type == "message_start":
+            inner = event.get("message")
+            if not isinstance(inner, dict):
+                return 0
+            return _prompt_tokens_from_usage(inner.get("usage"))
+        if event_type == "message_delta":
+            return _prompt_tokens_from_usage(event.get("usage"))
     return 0
 
 
 def _is_context_snapshot_chunk(chunk: Any) -> bool:
-    """True for a ``message_start`` event that carries a usable prompt size.
+    """True for a stream event that carries a usable per-request prompt size.
 
-    The streaming path drops ``stream_event`` chunks once the text deltas have
-    been emitted; this marks the few that must survive in the chunk buffer
-    (one per model request) so :func:`extract_context_tokens` can still find a
-    snapshot on a token-streamed turn.
+    The streaming path drops ``stream_event`` chunks once text deltas have
+    been emitted; this marks the few ``message_start``/``message_delta`` usage
+    events that must survive in the chunk buffer so
+    :func:`extract_context_tokens` can still find a snapshot on a token-streamed
+    turn. Zero/output-only events are rejected by
+    :func:`_main_agent_prompt_tokens`.
     """
     return (
         isinstance(chunk, dict)
@@ -279,11 +292,11 @@ def extract_context_tokens(chunks: list) -> Optional[int]:
     main-agent request of the turn is the live one.
 
     The scan walks backwards and takes the first positive prompt size, so an
-    assembled ``assistant`` message wins when it carries real prompt counters
-    and its preceding ``message_start`` answers when it does not (the
-    token-streaming shape). Returns ``None`` when the turn produced no
-    per-request snapshot at all — cumulative input is never relabelled as
-    context occupancy.
+    assembled ``assistant`` message wins when it carries real prompt counters;
+    otherwise the nearest usable ``message_start`` or LiteLLM
+    ``message_delta`` stream event answers. Returns ``None`` when the turn
+    produced no per-request snapshot at all — cumulative input is never
+    relabelled as context occupancy.
     """
     for msg in reversed(chunks):
         tokens = _main_agent_prompt_tokens(msg)
@@ -555,6 +568,7 @@ class StreamStallError(Exception):
     and per-read client timeout from ever cutting the connection — so
     without this, nothing on either side reclaims the worker.
     """
+
 
 logger = logging.getLogger(__name__)
 
@@ -1566,16 +1580,15 @@ async def stream_response_chunks(
             # Tool blocks were already extracted above, so only text is suppressed.
             if token_streaming:
                 if chunk.get("type") == "stream_event":
-                    # Context-occupancy snapshot. Under
-                    # ``include_partial_messages`` the per-request prompt
-                    # counters ride on ``message_start`` and the assembled
-                    # assistant message's usage carries only the
-                    # ``message_delta`` output counts. Dropping every
-                    # stream_event here left the buffer holding only the FIRST
-                    # request's start event (buffered below before this flag
-                    # flipped), so a multi-round turn reported a stale snapshot
-                    # from before its tool rounds. Buffered, never emitted —
-                    # one entry per model request, not per token.
+                    # Context-occupancy snapshot. Anthropic-native partial
+                    # streams put prompt counters on ``message_start``;
+                    # LiteLLM must start streaming before its OpenAI-compatible
+                    # upstream reports usage, so its opening event is zero and
+                    # the real counters arrive on the terminal
+                    # ``message_delta``. Keep either positive per-request
+                    # snapshot before dropping duplicate stream events.
+                    # Buffered, never emitted — at most the usage-bearing
+                    # events for each model request, not per-token deltas.
                     if _is_context_snapshot_chunk(chunk):
                         chunks_buffer.append(chunk)
                     continue
