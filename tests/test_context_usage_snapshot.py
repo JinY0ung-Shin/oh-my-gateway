@@ -261,3 +261,25 @@ async def test_streamed_turn_reports_the_latest_round_not_the_first() -> None:
     assert usage["input_tokens_details"]["context_tokens"] == 122_000
     # Billing totals stay on the cumulative ResultMessage.
     assert usage["input_tokens"] == 640_000
+
+def test_context_snapshot_spans_leader_session_handoff() -> None:
+    """Two parent-less leader sessions in one turn: the newest one wins.
+
+    The compaction lifecycle keys its stream state by ``(parent_tool_use_id,
+    session_id)`` because it pairs starts with ends. The occupancy snapshot
+    deliberately ignores ``session_id``: across a leader handoff the window the
+    NEXT request will carry is described by the newest parent-less request, so
+    "latest parent-less wins" already lands on the live session without naming
+    it. This pins that contract — a future parent-less stream shape that is NOT
+    the leader (today every non-leader stream carries ``parent_tool_use_id``)
+    must show up here as a loud failure, not silently clobber the main number.
+    """
+    old_leader = _message_start(input_tokens=9_000)
+    old_leader["session_id"] = "sess-old"
+    new_leader = _message_start(input_tokens=2_500, cache_read=500)
+    new_leader["session_id"] = "sess-new"
+
+    assert extract_context_tokens([old_leader, new_leader]) == 3_000
+    # Order, not session identity, decides — reversed input picks the other one.
+    assert extract_context_tokens([new_leader, old_leader]) == 9_000
+

@@ -223,6 +223,19 @@ def _main_agent_prompt_tokens(msg: Any) -> int:
 
     Returns 0 for subagent messages: a subagent runs its own context window,
     so its prompt size says nothing about the main conversation's occupancy.
+
+    ``session_id`` is deliberately NOT part of this gate, unlike the compaction
+    lifecycle's stream key. Compaction needs per-stream *state* (an open start
+    waiting for its end), so two parent-less leader sessions in one turn — a
+    session handoff — must not close each other's markers. Occupancy needs one
+    *number*: what the next request will carry. Across a handoff that is the
+    NEWEST parent-less request, so "latest parent-less wins" already picks the
+    right session without naming it. The invariant this leans on is that every
+    stream that is not the current leader lineage arrives with
+    ``parent_tool_use_id`` set (subagents do today); a future stream shape
+    that is parent-less yet not the leader would need a session-aware pick —
+    ``test_context_snapshot_spans_leader_session_handoff`` pins the current
+    contract so such a change fails loudly instead of silently clobbering.
     """
     if not isinstance(msg, dict):
         return 0
@@ -286,17 +299,26 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     per-turn AssistantMessage.usage (available since SDK 0.1.49).
 
     Returns dict with prompt_tokens, completion_tokens, total_tokens or None.
+
+    Every counter is read through ``int(... or 0)``: the CLI sends JSON ``null``
+    for counters that do not apply to a message, and a streaming ``assistant``
+    message assembled from ``message_delta`` carries exactly that
+    (``input_tokens: null``, output only). ``.get(key, 0)`` returns that
+    ``None`` — the default only covers a *missing* key — so bare sums here
+    raised ``TypeError: unsupported operand type(s) for +: 'NoneType' and
+    'int'`` and took the whole turn's payload down with them. Matches the
+    idiom ``_prompt_tokens_from_usage`` already uses.
     """
     # Primary: ResultMessage usage (cumulative totals)
     for msg in reversed(chunks):
         if isinstance(msg, dict) and msg.get("type") == "result" and msg.get("usage"):
             usage = msg["usage"]
             input_tokens = (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
             )
-            output_tokens = usage.get("output_tokens", 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
             return {
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
@@ -312,11 +334,11 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
             found_any = True
             usage = msg["usage"]
             total_input += (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
             )
-            total_output += usage.get("output_tokens", 0)
+            total_output += int(usage.get("output_tokens") or 0)
     if found_any:
         return {
             "prompt_tokens": total_input,

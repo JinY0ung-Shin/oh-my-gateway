@@ -2332,3 +2332,166 @@ async def test_stream_teammate_message_without_from_address():
     assert len(teammate) == 1
     assert teammate[0]["text"] == text
     assert teammate[0]["from"] is None
+
+
+@pytest.mark.asyncio
+async def test_response_completed_carries_the_context_window_snapshot():
+    """The context indicator's only data source is this field.
+
+    ChatDRAGON's composer chip reads ``input_tokens_details.context_tokens`` and
+    refuses to estimate from anything else, so while the gateway omitted the key
+    the chip read "—" on every conversation past its first turn. This walks a
+    realistic agentic turn — two main-agent rounds with a subagent in between —
+    and pins that the published snapshot is the LAST main-agent prompt, not the
+    cumulative ``input_tokens`` the same payload reports for billing.
+    """
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {
+            "type": "assistant",
+            "usage": {
+                "input_tokens": 500,
+                "output_tokens": 40,
+                "cache_read_input_tokens": 11_000,
+                "cache_creation_input_tokens": 0,
+            },
+        }
+        # A subagent's own (much smaller) context must not be mistaken for ours.
+        yield {
+            "type": "assistant",
+            "parent_tool_use_id": "toolu_sub",
+            "usage": {"input_tokens": 300, "output_tokens": 12},
+        }
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "done"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        # Final main-agent round: the transcript grew, so the window is fuller.
+        yield {
+            "type": "assistant",
+            "usage": {
+                "input_tokens": 900,
+                "output_tokens": 60,
+                "cache_read_input_tokens": 13_500,
+                "cache_creation_input_tokens": 100,
+            },
+        }
+        yield {"subtype": "success", "result": "done"}
+
+    completed = None
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_ctx",
+        output_item_id="msg_ctx",
+        chunks_buffer=[],
+        logger=logging.getLogger("test"),
+    ):
+        t, p = _parse_response_sse(line)
+        if t == "response.completed":
+            completed = p
+
+    assert completed is not None
+    usage = completed["response"]["usage"]
+    # 900 + 13500 + 100 — the final main-agent prompt.
+    assert usage["input_tokens_details"]["context_tokens"] == 14_500
+    # Cumulative billing total is a different, larger number and stays intact.
+    assert usage["input_tokens"] > usage["input_tokens_details"]["context_tokens"]
+
+@pytest.mark.asyncio
+async def test_context_snapshot_survives_token_streaming_mode():
+    """The DEFAULT configuration (``TOKEN_STREAMING=true``) must measure too.
+
+    With ``include_partial_messages`` the prompt-size counts ride on the raw
+    ``message_start`` event and the assembled ``assistant`` message can report
+    only the ``message_delta`` counts (output, ``input_tokens`` null). The
+    ``token_streaming`` is a local flag the loop flips on its first text delta,
+    so the FIRST ``message_start`` was buffered incidentally (nothing had
+    streamed yet) while every LATER one — including the last, the only one that
+    describes the window going forward — was dropped. This turn therefore puts
+    text deltas between the two main rounds, which is what a real tool round
+    looks like and what makes the final start land on the dropping path.
+    """
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 400,
+                "cache_read_input_tokens": 9_000,
+                "cache_creation_input_tokens": 0,
+            }},
+        }}
+        # A subagent round: its own smaller context must not be adopted as ours.
+        yield {"type": "stream_event", "parent_tool_use_id": "toolu_sub", "event": {
+            "type": "message_start",
+            "message": {"usage": {"input_tokens": 250, "cache_read_input_tokens": 0}},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "text", "text": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        # Second main-agent round — the transcript grew.
+        yield {"type": "stream_event", "event": {
+            "type": "message_start",
+            "message": {"usage": {
+                "input_tokens": 600,
+                "cache_read_input_tokens": 11_000,
+                "cache_creation_input_tokens": 200,
+            }},
+        }}
+        # The assembled assistant message in this mode: delta counts only.
+        yield {
+            "type": "assistant",
+            "usage": {"input_tokens": None, "output_tokens": 55},
+        }
+        yield {"subtype": "success", "result": "hi"}
+
+    chunks_buffer: list = []
+    completed = None
+    async for line in stream_response_chunks(
+        chunk_source(),
+        model="m",
+        response_id="resp_ts",
+        output_item_id="msg_ts",
+        chunks_buffer=chunks_buffer,
+        logger=logging.getLogger("test"),
+    ):
+        t, p = _parse_response_sse(line)
+        if t == "response.completed":
+            completed = p
+
+    assert completed is not None
+    details = completed["response"]["usage"]["input_tokens_details"]
+    # 600 + 11000 + 200 — the last MAIN-agent message_start.
+    assert details["context_tokens"] == 11_800
+    # Only the snapshot-bearing starts were kept; text/delta events stay dropped.
+    # The event this change owns: the LAST main-agent start, which arrives after
+    # streaming began and so travels the dropping path. Earlier events reach the
+    # buffer incidentally (nothing had streamed yet), which is pre-existing and
+    # not what is asserted here.
+    starts = [
+        c
+        for c in chunks_buffer
+        if c.get("type") == "stream_event"
+        and c.get("event", {}).get("type") == "message_start"
+        and not c.get("parent_tool_use_id")
+    ]
+    assert starts, "the snapshot-bearing start must survive the duplicate-text skip"
+    assert (
+        starts[-1]["event"]["message"]["usage"]["input_tokens"] == 600
+    ), "the final round's start is the one that describes the window from here on"
