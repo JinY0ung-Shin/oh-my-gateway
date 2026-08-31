@@ -191,7 +191,9 @@ def test_context_snapshot_uses_latest_litellm_message_delta_round() -> None:
         _message_delta(input_tokens=1_200, cache_read=20_000, output_tokens=32),
         _streamed_assistant(output_tokens=32),
         _message_start(input_tokens=0),
-        _message_delta(input_tokens=1_500, cache_creation=500, cache_read=90_000, output_tokens=640),
+        _message_delta(
+            input_tokens=1_500, cache_creation=500, cache_read=90_000, output_tokens=640
+        ),
         _streamed_assistant(output_tokens=640),
     ]
 
