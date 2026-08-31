@@ -129,6 +129,62 @@ def extract_sdk_usage_detail(chunks: list) -> Dict[str, int]:
     return total
 
 
+def _prompt_size(usage: Any) -> Optional[int]:
+    """Prompt tokens of one model request: ``input_tokens`` + both cache counters.
+
+    A cache read still occupies the context window — it is only cheaper — so all
+    three counters belong in the size. Returns ``None`` for a usage-less or
+    zero-prompt record (streaming ``message_delta`` usage reports output only).
+    """
+    if not isinstance(usage, dict):
+        return None
+    tokens = (
+        int(usage.get("input_tokens", 0) or 0)
+        + int(usage.get("cache_read_input_tokens", 0) or 0)
+        + int(usage.get("cache_creation_input_tokens", 0) or 0)
+    )
+    return tokens if tokens > 0 else None
+
+
+def context_snapshot_tokens(chunk: Any) -> Optional[int]:
+    """Window-occupancy snapshot carried by ONE chunk, or ``None``.
+
+    Two chunk shapes carry it, because which one appears depends on
+    ``TOKEN_STREAMING``:
+
+    * ``assistant`` — prompt counts on the message's own ``usage``. This is the
+      shape in non-streaming mode.
+    * ``stream_event`` / ``message_start`` — the raw Anthropic stream event. With
+      ``include_partial_messages`` the prompt counts ride here, while the
+      assembled ``assistant`` message may report only the ``message_delta``
+      counts (output, ``input_tokens`` null). Reading assistant chunks alone
+      would therefore go blind in the gateway's DEFAULT configuration.
+
+    Subagent chunks (``parent_tool_use_id`` set) return ``None`` for the same
+    reason :func:`extract_model_id` skips them: a subagent runs its own separate
+    context, so its prompt size says nothing about the main conversation.
+
+    This predicate is the single place that knows those shapes — the streaming
+    loop uses it to decide which chunks are worth buffering, and
+    :func:`extract_context_tokens` uses it to read them back. Splitting that
+    knowledge is how one side starts dropping what the other needs.
+    """
+    if not isinstance(chunk, dict):
+        return None
+    if chunk.get("parent_tool_use_id"):
+        return None
+    kind = chunk.get("type")
+    if kind == "assistant":
+        return _prompt_size(chunk.get("usage"))
+    if kind == "stream_event":
+        event = chunk.get("event")
+        if not isinstance(event, dict) or event.get("type") != "message_start":
+            return None
+        message = event.get("message")
+        return _prompt_size(message.get("usage") if isinstance(message, dict) else None)
+    return None
+
+
 def extract_context_tokens(chunks: list) -> Optional[int]:
     """Return the window-occupancy snapshot for this turn, or ``None``.
 
@@ -138,37 +194,24 @@ def extract_context_tokens(chunks: list) -> Optional[int]:
     overlapping prompts and sails past the context window on tool-heavy turns
     (a client dividing it by the window drew 263k/250k). What a "how full is
     this conversation" indicator needs is a *snapshot*: the prompt size of the
-    LAST request, which is exactly what occupies the window going forward.
+    LAST main-agent request, which is exactly what occupies the window going
+    forward.
 
-    Prompt size is ``input_tokens`` + both cache counters — a cache read still
-    occupies the window, it is only cheaper. Subagent chunks
-    (``parent_tool_use_id`` set) are skipped for the same reason
-    :func:`extract_model_id` skips them: a subagent runs its own separate
-    context, so its prompt size says nothing about the main conversation.
+    Walks forward and keeps the latest snapshot rather than scanning backwards,
+    because both shapes :func:`context_snapshot_tokens` accepts can appear in one
+    turn and only chunk order says which request came last.
 
     ``ResultMessage.usage`` is useless here (it carries the same cumulative
-    totals), so this walks assistant chunks from the end and takes the first
-    main-agent one with a non-zero prompt. Returns ``None`` for turns with no
-    main-agent usage at all — error-only turns, non-Claude backends, or the
-    character-estimation fallback — so callers can report "unmeasured" instead
-    of publishing a guess.
+    totals). Returns ``None`` for turns with no main-agent prompt at all — error
+    -only turns, non-Claude backends, or the character-estimation fallback — so
+    callers can report "unmeasured" instead of publishing a guess.
     """
-    for msg in reversed(chunks):
-        if not isinstance(msg, dict) or msg.get("type") != "assistant":
-            continue
-        if msg.get("parent_tool_use_id"):
-            continue
-        usage = msg.get("usage")
-        if not isinstance(usage, dict):
-            continue
-        tokens = (
-            int(usage.get("input_tokens", 0) or 0)
-            + int(usage.get("cache_read_input_tokens", 0) or 0)
-            + int(usage.get("cache_creation_input_tokens", 0) or 0)
-        )
-        if tokens > 0:
-            return tokens
-    return None
+    snapshot: Optional[int] = None
+    for chunk in chunks:
+        tokens = context_snapshot_tokens(chunk)
+        if tokens is not None:
+            snapshot = tokens
+    return snapshot
 
 
 def extract_model_id(chunks: list) -> Optional[str]:

@@ -27,6 +27,7 @@ from src.response_models import (
 )
 from src.tool_stats import ToolStatsCollector
 from src.usage_logger import (
+    context_snapshot_tokens,
     extract_context_tokens,
     extract_sdk_usage_detail,
     usage_logger,
@@ -199,17 +200,26 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
     per-turn AssistantMessage.usage (available since SDK 0.1.49).
 
     Returns dict with prompt_tokens, completion_tokens, total_tokens or None.
+
+    Every counter is read through ``or 0``: the CLI sends JSON ``null`` for
+    counters that do not apply to a message, and a streaming ``assistant``
+    message assembled from ``message_delta`` carries exactly that
+    (``input_tokens: null``, output only). ``.get(key, 0)`` returns that
+    ``None`` — the default only covers a *missing* key — so the bare sums here
+    raised ``TypeError: unsupported operand type(s) for +: 'NoneType' and
+    'int'`` and took the whole turn's payload down with them. Matches the
+    ``int(... or 0)`` idiom ``extract_sdk_usage_detail`` already uses.
     """
     # Primary: ResultMessage usage (cumulative totals)
     for msg in reversed(chunks):
         if isinstance(msg, dict) and msg.get("type") == "result" and msg.get("usage"):
             usage = msg["usage"]
             input_tokens = (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
             )
-            output_tokens = usage.get("output_tokens", 0)
+            output_tokens = int(usage.get("output_tokens") or 0)
             return {
                 "prompt_tokens": input_tokens,
                 "completion_tokens": output_tokens,
@@ -225,11 +235,11 @@ def extract_sdk_usage(chunks: list) -> Optional[Dict[str, int]]:
             found_any = True
             usage = msg["usage"]
             total_input += (
-                usage.get("input_tokens", 0)
-                + usage.get("cache_creation_input_tokens", 0)
-                + usage.get("cache_read_input_tokens", 0)
+                int(usage.get("input_tokens") or 0)
+                + int(usage.get("cache_creation_input_tokens") or 0)
+                + int(usage.get("cache_read_input_tokens") or 0)
             )
-            total_output += usage.get("output_tokens", 0)
+            total_output += int(usage.get("output_tokens") or 0)
     if found_any:
         return {
             "prompt_tokens": total_input,
@@ -1449,6 +1459,19 @@ async def stream_response_chunks(
             # Tool blocks were already extracted above, so only text is suppressed.
             if token_streaming:
                 if chunk.get("type") == "stream_event":
+                    # ...except the one that carries this round's prompt size.
+                    # With ``include_partial_messages`` the window-occupancy
+                    # counts ride on ``message_start``, while the assembled
+                    # ``assistant`` message may report only the
+                    # ``message_delta`` counts (output, ``input_tokens`` null).
+                    # Dropping every stream event here is what left
+                    # ``context_tokens`` unmeasurable in the gateway's DEFAULT
+                    # configuration (``TOKEN_STREAMING=true``) — the client's
+                    # context indicator then reads "—" forever. Only the
+                    # snapshot-bearing start is kept; its text and deltas are
+                    # still suppressed as duplicates above.
+                    if context_snapshot_tokens(chunk) is not None:
+                        chunks_buffer.append(chunk)
                     continue
                 if chunk.get("type") != "user" and is_assistant_content_chunk(chunk):
                     if chunk.get("type") == "assistant" and chunk.get("usage"):
