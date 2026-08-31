@@ -1374,9 +1374,11 @@ async def stream_response_chunks(
                     if not is_subagent_task or SUBAGENT_STREAM_PROGRESS:
                         yield make_task_response_sse(task_event, sequence_number=_next_seq())
                 else:
-                    # Other liveness signals: hook lifecycle + compaction.
-                    # For these, only an explicit parent_tool_use_id marks
-                    # subagent origin. A plain tool_use_id is the target tool.
+                    # Everything else a ``system`` chunk can carry for the
+                    # client: hook lifecycle, compaction, and local slash-command
+                    # output. For these, only an explicit parent_tool_use_id
+                    # marks subagent origin. A plain tool_use_id is the target
+                    # tool.
                     # These arrive as the SDK's generic SystemMessage, whose only
                     # fields are subtype and data — so the parent lives inside
                     # ``data``, and reading the top level alone let a subagent's

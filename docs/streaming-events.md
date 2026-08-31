@@ -46,6 +46,7 @@ response.task_updated           # zero or more
 response.teammate_message       # zero or more (agent teams)
 response.hook_event             # zero or more (liveness)
 response.compaction             # zero or more (liveness)
+response.local_command_output   # zero or more (slash-command answer)
 response.output_text.done
 response.content_part.done
 response.output_item.done
@@ -363,18 +364,66 @@ otherwise-silent pause). `trigger` is `auto` or `manual` when the SDK reports it
   "type": "response.compaction",
   "subtype": "compact_boundary",
   "trigger": "auto",
+  "pre_tokens": 67200,
+  "post_tokens": 2700,
+  "duration_ms": 12000,
   "session_id": "sdk-session-id",
   "sequence_number": 8
 }
 ```
 
-Liveness events are controlled by:
+**`pre_tokens` and `post_tokens` do not measure the same thing, and a client
+must not render them as one before/after pair.** Both are passed through from
+the CLI's own `compact_metadata`, where (measured against claude-code 2.1.251):
+
+* `pre_tokens` is the *whole API request* that tripped the threshold —
+  `input + cache_creation + cache_read + output` of the last assistant request,
+  plus an estimate of the messages after it. It therefore includes the system
+  prompt, every tool schema, and memory files.
+* `post_tokens` counts only the **conversation messages that remain** (the
+  boundary marker, the summary, attachments, hook results), as a local
+  character-based estimate. The system prompt, tool schemas, and memory are not
+  in it — and they are not removed by compaction either; they are re-sent on
+  every subsequent request.
+
+So `67200 → 2700` means "the request was 67.2k; 2.7k of conversation survives",
+not "the context is now 2.7k". The next request is `2.7k + the fixed prefix`,
+which is what `usage.input_tokens_details.context_tokens` reports. A client that
+shows the pair as a drop will contradict its own context indicator. Render
+`post_tokens` as "conversation kept", or show the next turn's `context_tokens`.
+
+This also explains a compaction that fires repeatedly: the CLI's auto-compact
+trigger is `window − min(CLAUDE_CODE_MAX_OUTPUT_TOKENS, 20_000) − 13_000`, so a
+100k `auto_compact_window` compacts at 67k, and whatever the fixed prefix costs
+comes out of that 67k before any conversation fits.
+
+`response.local_command_output` carries the output of a built-in slash command
+(`/context`, `/usage`, `/cost`, …). These run inside the CLI and never reach the
+model, so this event is the turn's entire answer — a client that drops it shows
+an empty turn. `content` is the CLI's own rendering, passed through verbatim;
+it is column-aligned text, so render it preformatted.
+
+```json
+{
+  "type": "response.local_command_output",
+  "content": "Context Usage\n  System prompt   3.2k tokens (3%)\n  …",
+  "session_id": "sdk-session-id",
+  "sequence_number": 9
+}
+```
+
+`/context` is the only surface that breaks the window down by category (system
+prompt, tools, MCP tools, memory files, messages, free, compaction buffer), so
+it is the way to find out why `context_tokens` sits where it does.
+
+These events are controlled by:
 
 | Env var | Default | Effect |
 |---------|---------|--------|
 | `STREAM_TOOL_PROGRESS` | `true` | Emit `response.tool_use_started` |
 | `STREAM_HOOK_EVENTS` | `true` | Enable SDK `include_hook_events`; forward `response.hook_event` |
 | `STREAM_COMPACTION_EVENTS` | `true` | Forward `response.compaction` |
+| `STREAM_LOCAL_COMMAND_OUTPUT` | `true` | Forward `response.local_command_output` |
 
 Subagent-originated liveness events (with `parent_tool_use_id`) follow the same
 subagent gates as their block type: `response.tool_use_started` respects

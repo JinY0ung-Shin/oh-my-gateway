@@ -563,6 +563,23 @@ body {
   word-break: break-word;
 }
 
+/* Local slash-command output: the CLI's own answer, not the model's. Rendered
+   preformatted because /context and /usage are column-aligned tables that lose
+   their meaning when reflowed. */
+.message.local-command .role { color: var(--cyan); }
+.message.local-command pre {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-raised);
+  font-size: var(--fs-xs);
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-x: auto;
+}
+
 /* === Input area === */
 .input-area {
   padding: 0.75rem 1rem;
@@ -1274,6 +1291,17 @@ function renderTeammateMessage(evt) {
   return div;
 }
 
+function renderLocalCommandOutput(evt) {
+  welcomeEl.style.display = 'none';
+  const div = document.createElement('div');
+  div.className = 'message local-command';
+  div.innerHTML = '<div class="role">/ command</div><pre>' +
+    escapeHtml(String(evt.content || '')) + '</pre>';
+  chatEl.appendChild(div);
+  scrollToBottom();
+  return div;
+}
+
 // Maintain ONE live status line per subagent, nested under the spawning agent,
 // updated in place across task_started / task_progress / task_notification /
 // task_updated.
@@ -1726,6 +1754,15 @@ async function streamRequest(body) {
         // --- Liveness: context compaction in progress ---
         if (type === 'response.compaction') {
           setStatus('streaming', '🗜️ 컨텍스트 압축 중…');
+        }
+
+        // --- Local slash-command output (/context, /usage, …) ---
+        // The CLI answers these itself, so this event is the whole turn: without
+        // rendering it the command runs and the page shows nothing.
+        if (type === 'response.local_command_output') {
+          finalizeActiveBubble();
+          renderLocalCommandOutput(evt);
+          setStatus('streaming', '/ 명령 출력');
         }
 
         // --- function_call (AskUserQuestion) ---

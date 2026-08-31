@@ -260,9 +260,17 @@ SUBAGENT_STREAM_PROGRESS = parse_bool_env("SUBAGENT_STREAM_PROGRESS", "true")
 # STREAM_COMPACTION_EVENTS: Forward context-compaction system messages
 #   (compact_boundary/compaction) as `response.compaction`, so the client can
 #   show "compacting context…" during the pause. Default true.
+# STREAM_LOCAL_COMMAND_OUTPUT: Forward the `local_command_output` system message
+#   as `response.local_command_output`. Unlike the signals above this is not
+#   liveness — it is the whole answer to a slash command the user typed. A
+#   built-in like `/context` or `/usage` runs entirely inside the CLI and
+#   returns nothing through the assistant channel, so without this the command
+#   completes and the client shows an empty turn. Default true: dropping the
+#   only reply to an explicit request is never the safer default.
 STREAM_TOOL_PROGRESS = parse_bool_env("STREAM_TOOL_PROGRESS", "true")
 STREAM_HOOK_EVENTS = parse_bool_env("STREAM_HOOK_EVENTS", "true")
 STREAM_COMPACTION_EVENTS = parse_bool_env("STREAM_COMPACTION_EVENTS", "true")
+STREAM_LOCAL_COMMAND_OUTPUT = parse_bool_env("STREAM_LOCAL_COMMAND_OUTPUT", "true")
 
 # Rate Limiting defaults (requests per minute)
 # These are used by rate_limiter.py as the single source of truth

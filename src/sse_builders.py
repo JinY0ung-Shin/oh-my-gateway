@@ -4,7 +4,11 @@ import json
 import re
 from typing import Any, Dict, Optional
 
-from src.constants import STREAM_COMPACTION_EVENTS, STREAM_HOOK_EVENTS
+from src.constants import (
+    STREAM_COMPACTION_EVENTS,
+    STREAM_HOOK_EVENTS,
+    STREAM_LOCAL_COMMAND_OUTPUT,
+)
 from src.content_blocks import normalize_tool_result_for_sse
 
 
@@ -316,11 +320,11 @@ def make_teammate_message_response_sse(
 
 
 def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Build a liveness ("still working") event dict from a system chunk, or None.
+    """Build a client-visible event dict from a ``system`` chunk, or None.
 
     Complements :func:`_build_task_event` (which only handles subagent task
-    messages). Surfaces two more classes of progress that the SDK reports as
-    ``system`` messages but the gateway previously dropped:
+    messages). Surfaces three more classes of ``system`` message the gateway
+    previously dropped:
 
     * Hook lifecycle (``hook_started`` / ``hook_response``) — emitted when
       ``include_hook_events`` is on. Becomes ``response.hook_event`` carrying
@@ -329,6 +333,10 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     * Context compaction (``compact_boundary`` / ``compaction``) — becomes
       ``response.compaction`` so a UI can show "compacting context…" during the
       otherwise-silent pause.
+    * Local slash-command output (``local_command_output``) — becomes
+      ``response.local_command_output``. The first two are liveness; this one
+      is the turn's entire answer, because a built-in command runs inside the
+      CLI and never reaches the model.
 
     Returns ``None`` for any other subtype (caller leaves it dropped) and when
     the corresponding feature flag is disabled.
@@ -430,6 +438,33 @@ def _build_progress_event(chunk: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "session_id": session,
             }
         return None
+    if subtype == "local_command_output":
+        # A built-in slash command (`/context`, `/usage`, `/cost`, …) is answered
+        # by the CLI itself, not by the model: the turn produces this system
+        # message and no assistant text at all. Dropping it left the client with
+        # a turn that ran and said nothing — the reason `/context`, the only
+        # honest breakdown of what actually occupies the window, was unreachable
+        # through the gateway.
+        #
+        # Content is passed through verbatim, framing and all. It is the CLI's
+        # own rendering (already a display string, not data to re-derive), and a
+        # client that shows it owns that presentation choice — the same contract
+        # as :func:`make_teammate_message_sse`.
+        if not STREAM_LOCAL_COMMAND_OUTPUT:
+            return None
+        data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
+        content = data.get("content")
+        if not isinstance(content, str) or not content:
+            # Nothing to show. An empty body is not a signal a client can render,
+            # and an event with no content would only open a blank bubble.
+            return None
+        parent, session = _stream_identity(chunk)
+        return {
+            "type": "local_command_output",
+            "content": content,
+            **({"parent_tool_use_id": parent} if parent else {}),
+            "session_id": session,
+        }
     return None
 
 
