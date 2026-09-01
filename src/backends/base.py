@@ -6,10 +6,12 @@ so endpoint code dispatches by interface rather than concrete backend type.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import (
     Any,
     AsyncIterator,
+    Awaitable,
     Callable,
     Dict,
     List,
@@ -18,6 +20,7 @@ from typing import (
     Union,
 )
 
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -48,7 +51,7 @@ class ResolvedModel:
 
 @dataclass(frozen=True)
 class BackendDescriptor:
-    """Static metadata for a known backend.
+    """Metadata and optional discovery hooks for a known backend.
 
     Separates "known backends" from "live clients" so that model resolution
     and auth status work even if a backend failed to start.
@@ -59,6 +62,11 @@ class BackendDescriptor:
     ``model_meta_fn`` optionally adds per-model fields to the ``/v1/models``
     entry (e.g. alias bookkeeping so clients can tell a bare ``sonnet`` from
     the concrete id configured via ``ANTHROPIC_DEFAULT_SONNET_MODEL``).
+
+    ``model_discovery_fn`` optionally returns additional model IDs from a live
+    upstream. Discovery is best-effort: the registry preserves the static
+    model list if a hook fails, so ``/v1/models`` never depends on upstream
+    availability.
     """
 
     name: str
@@ -67,6 +75,7 @@ class BackendDescriptor:
     resolve_fn: Callable[[str], Optional[ResolvedModel]]
     capabilities: Dict[str, bool] = field(default_factory=dict)
     model_meta_fn: Optional[Callable[[str], Dict[str, Any]]] = None
+    model_discovery_fn: Optional[Callable[[], Awaitable[List[str]]]] = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +191,7 @@ class BackendRegistry:
 
     @classmethod
     def register_descriptor(cls, descriptor: BackendDescriptor) -> None:
-        """Register a static backend descriptor (model metadata)."""
+        """Register a backend descriptor (model metadata/discovery)."""
         cls._descriptors[descriptor.name] = descriptor
 
     @classmethod
@@ -227,15 +236,28 @@ class BackendRegistry:
 
     @classmethod
     def all_model_ids(cls) -> set[str]:
-        """Return a set of all model IDs across all descriptors."""
+        """Return a set of all statically declared model IDs."""
         ids: set[str] = set()
         for desc in cls._descriptors.values():
             ids.update(desc.models)
         return ids
 
+    @staticmethod
+    def _model_entry(desc: BackendDescriptor, model_id: str) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {
+            "id": model_id,
+            "object": "model",
+            "owned_by": desc.owned_by,
+            "backend": desc.name,
+            "capabilities": {"image_input": False, **desc.capabilities},
+        }
+        if desc.model_meta_fn is not None:
+            entry.update(desc.model_meta_fn(model_id))
+        return entry
+
     @classmethod
     def available_models(cls) -> List[Dict[str, Any]]:
-        """Build the ``/v1/models`` data list from registered backends.
+        """Build the static ``/v1/models`` data list from registered backends.
 
         Keeps the original ``id``/``object``/``owned_by`` fields for
         compatibility and adds ``backend`` plus a ``capabilities`` map
@@ -246,16 +268,63 @@ class BackendRegistry:
 
         for desc in cls._descriptors.values():
             if cls.is_registered(desc.name):
-                for model_id in desc.models:
-                    entry = {
-                        "id": model_id,
-                        "object": "model",
-                        "owned_by": desc.owned_by,
-                        "backend": desc.name,
-                        "capabilities": {"image_input": False, **desc.capabilities},
-                    }
-                    if desc.model_meta_fn is not None:
-                        entry.update(desc.model_meta_fn(model_id))
-                    data.append(entry)
+                data.extend(cls._model_entry(desc, model_id) for model_id in desc.models)
+
+        return data
+
+    @classmethod
+    async def warm_model_discovery(cls) -> None:
+        """Prime every registered backend's discovery cache before serving.
+
+        Model resolution is synchronous, so dynamic IDs can only resolve after
+        their backend's discovery hook has populated its cache. Startup calls
+        this method before readiness, removing any dependency on a client first
+        calling ``GET /v1/models``. Failures remain isolated per backend.
+        """
+        for name, desc in cls._descriptors.items():
+            if desc.model_discovery_fn is None or not cls.is_registered(name):
+                continue
+            try:
+                await desc.model_discovery_fn()
+            except Exception:
+                logger.warning(
+                    "model discovery warm-up failed for backend %s",
+                    name,
+                    exc_info=True,
+                )
+
+    @classmethod
+    async def available_models_async(cls) -> List[Dict[str, Any]]:
+        """Build ``/v1/models`` including best-effort live discovery.
+
+        Static descriptor models are always returned first. Dynamic IDs are
+        appended per backend, preserving upstream order and skipping duplicates.
+        A broken/slow discovery hook is isolated to that backend and never makes
+        the model-list endpoint fail.
+        """
+        data: List[Dict[str, Any]] = []
+
+        for desc in cls._descriptors.values():
+            if not cls.is_registered(desc.name):
+                continue
+
+            model_ids = list(desc.models)
+            if desc.model_discovery_fn is not None:
+                try:
+                    discovered = await desc.model_discovery_fn()
+                except Exception:
+                    logger.warning(
+                        "model discovery failed for backend %s; using static models",
+                        desc.name,
+                        exc_info=True,
+                    )
+                    discovered = []
+                seen = set(model_ids)
+                for model_id in discovered:
+                    if isinstance(model_id, str) and model_id and model_id not in seen:
+                        seen.add(model_id)
+                        model_ids.append(model_id)
+
+            data.extend(cls._model_entry(desc, model_id) for model_id in model_ids)
 
         return data

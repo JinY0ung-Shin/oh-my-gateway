@@ -16,6 +16,7 @@ from src.backends.claude.constants import (
     configured_model_aliases,
     configured_public_models,
 )
+from src.backends.claude.model_discovery import discover_models, discovered_model_ids
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,14 @@ def _claude_resolve(model: str) -> Optional[ResolvedModel]:
     alias = configured_model_aliases().get(model)
     if alias is not None:
         return ResolvedModel(public_model=model, backend="claude", provider_model=alias)
+
+    # A bare/provider-qualified ID learned from the upstream /v1/models endpoint
+    # is safe to pass through exactly. Do not accept every unknown bare string:
+    # discovery acts as the allowlist so typos and another backend's IDs are not
+    # silently claimed by Claude.
+    if model in discovered_model_ids():
+        return ResolvedModel(public_model=model, backend="claude", provider_model=model)
+
     if "/" in model:
         prefix, sub_model = model.split("/", 1)
         if prefix == "claude":
@@ -77,6 +86,7 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     # validate_image_request in src/routes/deps.py).
     capabilities={"image_input": True},
     model_meta_fn=_claude_model_meta,
+    model_discovery_fn=discover_models,
 )
 
 

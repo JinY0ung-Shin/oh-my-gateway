@@ -262,6 +262,10 @@ async def lifespan(app: FastAPI):
     # Verify all registered backends
     await _verify_backends()
 
+    # Prime optional backend model discovery before readiness. Resolution is
+    # synchronous, so the first request must see an already-populated cache.
+    await BackendRegistry.warm_model_discovery()
+
     # Warm up slash-command allowlist so the first /v1/responses request
     # doesn't pay the round-trip, and surface the list in startup logs.
     await _log_slash_commands()
