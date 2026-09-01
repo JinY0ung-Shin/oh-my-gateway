@@ -253,6 +253,34 @@ async def test_discovered_bare_and_provider_qualified_ids_resolve(monkeypatch):
     assert _claude_resolve("typo-model") is None
 
 
+async def test_reserved_claude_prefix_survives_discovery(monkeypatch):
+    """Discovery must never reinterpret the explicit ``claude/<model>`` contract."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
+    client = StubClient(
+        [response(200, {"data": [{"id": "claude/foo"}, {"id": "openai/gpt-5.5"}]})]
+    )
+    monkeypatch.setattr(model_discovery, "_make_client", lambda: client)
+
+    await model_discovery.discover_models()
+
+    # Even though upstream advertises a literal "claude/foo", the reserved
+    # namespace still means "route foo to the claude backend".
+    reserved = _claude_resolve("claude/foo")
+    assert reserved is not None and reserved.provider_model == "foo"
+    # Unchanged for ids that were never discovered at all.
+    assert _claude_resolve("claude/opus").provider_model == "opus"
+    # Other namespaces still resolve only via the discovery allowlist.
+    assert _claude_resolve("openai/gpt-5.5").provider_model == "openai/gpt-5.5"
+    assert _claude_resolve("codex/whatever") is None
+
+
+@pytest.mark.parametrize("raw", ["nan", "inf", "-inf", "0", "-5"])
+async def test_non_finite_or_non_positive_ttl_falls_back_to_default(monkeypatch, raw):
+    """A NaN TTL would defeat both the cache and the failure backoff."""
+    monkeypatch.setenv("MODEL_DISCOVERY_TTL_SECONDS", raw)
+    assert model_discovery._positive_float_env("MODEL_DISCOVERY_TTL_SECONDS", 60.0) == 60.0
+
+
 async def test_registry_discovery_hook_is_generic(clean_registry):
     async def discover():
         return ["static-model", "dynamic-a", "dynamic-b", "dynamic-a"]

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass
@@ -66,7 +67,10 @@ def discovery_enabled() -> bool:
 def _positive_float_env(name: str, default: float) -> float:
     """Read a positive float using the repository-wide env parser."""
     value = parse_float_env(name, default)
-    if value <= 0:
+    # ``float()`` accepts "nan"/"inf", and neither compares <= 0. A NaN TTL makes
+    # every ``now < expires_at`` check false, defeating the cache *and* the
+    # failure backoff; an infinite one never expires. Reject both.
+    if not math.isfinite(value) or value <= 0:
         logger.warning("Invalid %s=%r; using %.1f", name, os.getenv(name), default)
         return default
     return value
