@@ -41,10 +41,14 @@ def reset_discovery(monkeypatch):
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_CUSTOM_HEADERS",
+        "MODEL_DISCOVERY_ENABLED",
         "MODEL_DISCOVERY_TTL_SECONDS",
         "MODEL_DISCOVERY_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
+    # Discovery is opt-in, so every test that exercises it turns it on. The
+    # unset default is covered by test_discovery_is_off_by_default.
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "true")
     yield
     model_discovery._reset_cache_for_tests()
 
@@ -170,6 +174,62 @@ async def test_registry_warm_model_discovery_primes_registered_hooks(clean_regis
     await BackendRegistry.warm_model_discovery()
 
     assert calls == ["active"]
+
+
+async def test_discovery_is_off_by_default(monkeypatch):
+    """Configuring an upstream alone must not widen the advertised models."""
+    monkeypatch.delenv("MODEL_DISCOVERY_ENABLED", raising=False)
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
+    client = StubClient([response(200, {"data": [{"id": "GLM-5.3-Flash"}]})])
+    monkeypatch.setattr(model_discovery, "_make_client", lambda: client)
+
+    assert await model_discovery.discover_models() == []
+    assert client.calls == []
+    assert _claude_resolve("GLM-5.3-Flash") is None
+
+
+async def test_discovery_disabled_skips_upstream_entirely(monkeypatch):
+    """The kill switch stops the fetch and the /v1/models merge."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
+    client = StubClient([response(200, {"data": [{"id": "GLM-5.3-Flash"}]})])
+    monkeypatch.setattr(model_discovery, "_make_client", lambda: client)
+
+    assert await model_discovery.discover_models() == []
+    assert client.calls == []
+
+
+async def test_disabling_discovery_revokes_cached_ids_from_resolution(monkeypatch):
+    """A snapshot cached before the switch flipped must stop routing traffic."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
+    client = StubClient([response(200, {"data": [{"id": "GLM-5.3-Flash"}]})])
+    monkeypatch.setattr(model_discovery, "_make_client", lambda: client)
+
+    await model_discovery.discover_models()
+    assert _claude_resolve("GLM-5.3-Flash") is not None
+
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
+    assert model_discovery.discovered_model_ids() == frozenset()
+    assert _claude_resolve("GLM-5.3-Flash") is None
+    # Static aliases are unaffected by the switch.
+    assert _claude_resolve("sonnet") is not None
+
+
+async def test_disabled_discovery_leaves_static_models_on_v1_models(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
+    client = StubClient([response(200, {"data": [{"id": "GLM-5.3-Flash"}]})])
+    monkeypatch.setattr(model_discovery, "_make_client", lambda: client)
+
+    with client_context() as (api, _mock_cli):
+        result = api.get("/v1/models")
+
+    assert result.status_code == 200
+    claude_ids = [
+        entry["id"] for entry in result.json()["data"] if entry["backend"] == "claude"
+    ]
+    assert claude_ids == ["opus", "sonnet", "haiku"]
+    assert client.calls == []
 
 
 async def test_discovered_bare_and_provider_qualified_ids_resolve(monkeypatch):

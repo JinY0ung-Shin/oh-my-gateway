@@ -5,6 +5,10 @@ Anthropic-compatible upstream such as LiteLLM without making model listing depen
 on upstream availability. A short TTL cache limits traffic; refresh failures use
 the last successful snapshot and otherwise fall back to the descriptor's static
 aliases.
+
+Discovery is opt-in: it stays off until an operator sets
+``MODEL_DISCOVERY_ENABLED=true``, so merely configuring an upstream never
+changes which models a deployment advertises.
 """
 
 from __future__ import annotations
@@ -18,7 +22,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
-from src.env_utils import parse_float_env
+from src.env_utils import parse_bool_env, parse_float_env
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +47,20 @@ _cache_lock: Optional[asyncio.Lock] = None
 
 def _upstream_base_url() -> str:
     return (os.getenv("ANTHROPIC_BASE_URL") or "").strip().rstrip("/")
+
+
+def discovery_enabled() -> bool:
+    """Whether upstream model discovery may run at all.
+
+    Off by default: configuring ``ANTHROPIC_BASE_URL`` alone must not widen
+    the advertised model list, so an operator opts in explicitly. Read per
+    call, never cached, so flipping the switch takes effect on the next
+    request rather than requiring the module to be re-imported. Both public
+    entry points below check it, so turning discovery off stops the upstream
+    fetch *and* revokes already-discovered IDs from resolution — a snapshot
+    cached before the switch flipped must not keep routing traffic.
+    """
+    return parse_bool_env("MODEL_DISCOVERY_ENABLED", "false")
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -117,6 +135,8 @@ def _parse_model_ids(payload: object) -> List[str]:
 
 def discovered_model_ids() -> frozenset[str]:
     """Return the cached IDs for the currently configured upstream only."""
+    if not discovery_enabled():
+        return frozenset()
     source = _upstream_base_url()
     if not source or _cache.source != source:
         return frozenset()
@@ -138,6 +158,9 @@ def _failure_backoff_seconds() -> float:
 async def discover_models() -> List[str]:
     """Return cached/live upstream model IDs without propagating fetch errors."""
     global _cache
+
+    if not discovery_enabled():
+        return []
 
     source = _upstream_base_url()
     if not source:
