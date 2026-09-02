@@ -17,8 +17,10 @@ nothing else:
 - EOF / parse error / process death -> bounded fanout: every waiter fails
   exactly once, every pending interaction is invalidated, every subscriber
   receives one ``TerminalEvent``
-- late or wrong-generation interaction answers are rejected (``StaleAnswer``)
-  and never reach the process
+- late, wrong-generation, or wrong-OCCURRENCE interaction answers are
+  rejected (``StaleAnswer``) and never reach the process: every answer carries
+  the immutable token of the occurrence it answers, so a stale decision can
+  never authorize a new server request that reused a settled JSON-RPC id
 - interrupt routing
 - process-group teardown (EOF -> SIGTERM -> SIGKILL) with descendant reap and
   an idempotent, deterministic ``close()`` report
@@ -234,6 +236,11 @@ class PendingInteraction:
     method: str
     params: Any
     generation: int
+    # Immutable occurrence identity. Upstream may reuse a JSON-RPC server
+    # request id after the previous occurrence settled, so `(generation, id)`
+    # is NOT unique; every answer must present the token of the occurrence it
+    # is answering and it is checked against the registry's current entry.
+    token: str = field(default_factory=lambda: uuid.uuid4().hex)
     created_at: float = field(default_factory=time.monotonic)
     state: str = "pending"  # pending | resolving | answered | failed | resolved | invalidated
     invalidation_reason: Optional[str] = None  # RUNTIME_LOST | SERVER_RESOLVED
@@ -702,19 +709,33 @@ class AppServerTransport:
     def interaction(self, interaction_id: Any) -> Optional[PendingInteraction]:
         return self._interactions.get(interaction_id)
 
-    async def answer(self, interaction_id: Any, result: Dict[str, Any], *, generation: int) -> None:
+    async def answer(
+        self, interaction_id: Any, result: Dict[str, Any], *, generation: int, token: str
+    ) -> None:
         """Deliver a human/app decision for a server request.
 
-        Fenced three ways: the interaction must still be open, its generation
-        must match the caller's, and the runtime must still be alive.
-        Otherwise ``StaleAnswer`` -- and nothing is written.
+        Fenced four ways: the transport must not be closing, the occurrence
+        identified by ``(interaction_id, token)`` must be the registry's
+        current entry and still open, its generation must match the caller's,
+        and the runtime must still be alive. Otherwise ``StaleAnswer`` -- and
+        nothing is written. The token is what makes a stale card or a late
+        handler for an OLD occurrence unable to authorize a NEW server request
+        that reused the same JSON-RPC id.
         """
-        interaction = self._fence(interaction_id, generation)
+        interaction = self._fence(interaction_id, generation, token)
         await self._commit(interaction, {"id": interaction.id, "result": result}, "answered")
 
-    async def fail_interaction(self, interaction_id: Any, *, generation: int, code: int = JSONRPC_INTERNAL_ERROR, message: str = "interaction failed") -> None:
+    async def fail_interaction(
+        self,
+        interaction_id: Any,
+        *,
+        generation: int,
+        token: str,
+        code: int = JSONRPC_INTERNAL_ERROR,
+        message: str = "interaction failed",
+    ) -> None:
         """Answer a server request with a JSON-RPC error (the fail-closed path)."""
-        interaction = self._fence(interaction_id, generation)
+        interaction = self._fence(interaction_id, generation, token)
         await self._commit(
             interaction, {"id": interaction.id, "error": {"code": code, "message": message}}, "failed"
         )
@@ -765,7 +786,7 @@ class AppServerTransport:
             )
         interaction.state = final_state
 
-    def _fence(self, interaction_id: Any, generation: int) -> PendingInteraction:
+    def _fence(self, interaction_id: Any, generation: int, token: str) -> PendingInteraction:
         if self._closing and self._terminal is None:
             raise StaleAnswer(
                 f"owner close in progress; answer for {interaction_id!r} not admitted"
@@ -773,6 +794,14 @@ class AppServerTransport:
         interaction = self._interactions.get(interaction_id)
         if interaction is None:
             raise StaleAnswer(f"unknown interaction {interaction_id!r}")
+        if interaction.token != token:
+            # The registry's current occurrence of this id is not the one the
+            # caller is answering: upstream reused the id after the caller's
+            # occurrence settled. A stale decision must never authorize it.
+            raise StaleAnswer(
+                f"answer for a previous occurrence of interaction {interaction_id!r} rejected; "
+                f"the id now belongs to a different server request"
+            )
         if generation != self.generation or generation != interaction.generation:
             raise StaleAnswer(
                 f"answer for generation {generation} rejected; interaction {interaction_id!r} "
@@ -1275,11 +1304,16 @@ class AppServerTransport:
             logger.warning("interaction handler failed for %s: %r", interaction.method, exc)
             with contextlib.suppress(StaleAnswer):
                 await self.fail_interaction(
-                    interaction.id, generation=interaction.generation, message=f"handler error: {type(exc).__name__}"
+                    interaction.id,
+                    generation=interaction.generation,
+                    token=interaction.token,
+                    message=f"handler error: {type(exc).__name__}",
                 )
             return
         try:
-            await self.answer(interaction.id, result, generation=interaction.generation)
+            await self.answer(
+                interaction.id, result, generation=interaction.generation, token=interaction.token
+            )
         except StaleAnswer as exc:
             logger.info("dropping late interaction answer: %s", exc)
 

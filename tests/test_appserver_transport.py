@@ -301,7 +301,7 @@ async def test_death_while_parked_invalidates_interaction_and_rejects_late_answe
     assert interaction.invalidation_reason == RUNTIME_LOST
     assert transport.pending_interactions == []
     with pytest.raises(StaleAnswer):
-        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
     with pytest.raises(RuntimeLost):
         await probe
     await transport.close()
@@ -323,14 +323,14 @@ async def test_wrong_generation_answer_is_rejected_before_reaching_runtime(tmp_p
         assert interaction.generation == 2
         # An answer minted against the previous process generation.
         with pytest.raises(StaleAnswer):
-            await transport.answer(interaction.id, {"decision": "accept"}, generation=1)
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=1, token=interaction.token)
         assert interaction.open
         # The correct generation goes through, exactly once.
-        await transport.answer(interaction.id, {"decision": "decline"}, generation=2)
+        await transport.answer(interaction.id, {"decision": "decline"}, generation=2, token=interaction.token)
         ack = await _next_of(events, Notification)
         assert ack.method == "probe/answered"
         with pytest.raises(StaleAnswer):
-            await transport.answer(interaction.id, {"decision": "decline"}, generation=2)
+            await transport.answer(interaction.id, {"decision": "decline"}, generation=2, token=interaction.token)
     finally:
         probe.cancel()
         await transport.close()
@@ -346,7 +346,7 @@ async def test_answer_after_close_is_stale(tmp_path):
     assert report["pending_interactions"] == 0
     assert interaction.state == "invalidated"
     with pytest.raises(StaleAnswer):
-        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
 
 
 # ---------------------------------------------------------------------------
@@ -515,9 +515,9 @@ async def test_server_resolved_after_interrupt_retires_interaction(tmp_path):
         assert transport.pending_interactions == []
         assert await asyncio.wait_for(cancelled, CONTROL_S) == "approval-1"
         with pytest.raises(StaleAnswer):
-            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
         with pytest.raises(StaleAnswer):
-            await transport.fail_interaction(interaction.id, generation=transport.generation)
+            await transport.fail_interaction(interaction.id, generation=transport.generation, token=interaction.token)
         assert await transport.request("probe", timeout=HEALTHY_S) == "no-stray-write"
         assert transport.alive
     finally:
@@ -541,7 +541,7 @@ async def test_server_driven_resolution_without_interrupt_or_death(tmp_path):
         assert resolved.method == "serverRequest/resolved"
         assert interaction.state == "resolved"
         with pytest.raises(StaleAnswer):
-            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
         assert await transport.request("probe", timeout=HEALTHY_S) == "no-stray-write"
     finally:
         probe.cancel()
@@ -730,7 +730,7 @@ async def test_cancelled_answer_caller_never_leaves_answered_without_bytes(tmp_p
         # Hold the writer so the answer parks before any byte is written...
         await transport._write_lock.acquire()
         caller = asyncio.create_task(
-            transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+            transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation, token=interaction.token)
         )
         await asyncio.sleep(0.1)
         assert interaction.state == "resolving"
@@ -741,7 +741,7 @@ async def test_cancelled_answer_caller_never_leaves_answered_without_bytes(tmp_p
         # The transport owns the commit: it is neither abandoned nor duplicated.
         assert interaction.state == "resolving"
         with pytest.raises(StaleAnswer):
-            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
         transport._write_lock.release()
         await asyncio.wait_for(interaction.commit, CONTROL_S)
         assert interaction.state == "answered"
@@ -763,7 +763,7 @@ async def test_answer_commit_records_runtime_loss(tmp_path):
     interaction = await _next_of(events, PendingInteraction)
     await transport._write_lock.acquire()
     caller = asyncio.create_task(
-        transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+        transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation, token=interaction.token)
     )
     await _next_of(events, TerminalEvent)
     transport._write_lock.release()
@@ -1065,7 +1065,7 @@ async def test_server_resolved_beats_resolving_answer_before_wire_commit(tmp_pat
         interaction = await _next_of(events, PendingInteraction)
         await transport._write_lock.acquire()  # the writer is busy elsewhere
         caller = asyncio.create_task(
-            transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+            transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
         )
         await asyncio.sleep(0.1)
         assert interaction.state == "resolving"
@@ -1098,7 +1098,7 @@ async def test_server_resolved_after_wire_commit_is_recorded_not_unsent(tmp_path
     probe = asyncio.create_task(transport.request("probe"))
     try:
         interaction = await _next_of(events, PendingInteraction)
-        await transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+        await transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation, token=interaction.token)
         assert interaction.state == "answered" and interaction.wire_committed
         resolved = await _next_of(events, Notification, timeout=CONTROL_S)
         assert resolved.method == "serverRequest/resolved"
@@ -1251,7 +1251,7 @@ async def test_resolved_arriving_before_committed_task_runs_writes_nothing(tmp_p
     interaction = await _next_of(events, PendingInteraction)
     hold.clear()  # from here on committed tasks are scheduled but do not run
     caller = asyncio.create_task(
-        transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
     )
     await asyncio.sleep(0.05)
     assert interaction.state == "resolving"
@@ -1366,7 +1366,7 @@ async def test_close_retires_queued_unsent_answer_and_owns_its_commit(tmp_path):
     await transport._write_lock.acquire()  # "A" owns the writer
     transport._writer_since = asyncio.get_running_loop().time()
     caller = asyncio.create_task(
-        transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
     )
     await asyncio.sleep(0.1)
     assert interaction.state == "resolving"
@@ -1412,7 +1412,7 @@ async def test_close_lets_accepted_answer_bytes_settle_before_shutdown(tmp_path)
     probe = asyncio.create_task(transport.request("probe"))
     interaction = await _next_of(events, PendingInteraction)
     caller = asyncio.create_task(
-        transport.answer(interaction.id, {"decision": "accept", "note": "x" * 4_000_000}, generation=transport.generation)
+        transport.answer(interaction.id, {"decision": "accept", "note": "x" * 4_000_000}, generation=transport.generation, token=interaction.token)
     )
     await asyncio.sleep(0.1)
     assert interaction.state == "resolving" and interaction.wire_committed
@@ -1437,7 +1437,7 @@ async def test_runtime_loss_retires_unsent_accepted_answer(tmp_path):
     interaction = await _next_of(events, PendingInteraction)
     await transport._write_lock.acquire()
     caller = asyncio.create_task(
-        transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+        transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation, token=interaction.token)
     )
     await _next_of(events, TerminalEvent)
     assert interaction.state == "invalidated"
@@ -1482,7 +1482,7 @@ async def test_close_admits_no_new_work_once_started(tmp_path):
     assert transport._closing and not closing.done() and transport.terminal is None
     # --- concurrent admissions while close is in progress ---
     with pytest.raises(StaleAnswer):
-        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation, token=interaction.token)
     started = asyncio.get_running_loop().time()
     with pytest.raises(RuntimeLost) as info:
         await transport.request("probe")
@@ -1788,6 +1788,114 @@ async def test_reused_settled_server_request_id_is_handled_and_retired(tmp_path)
         assert resolved.method == "serverRequest/resolved"
         assert second.state == "resolved"
         assert (await asyncio.wait_for(cancelled, CONTROL_S)) is second
+        assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# occurrence identity: a settled id reused by upstream cannot be answered
+# with a previous occurrence's credentials -- by a stale card or a late handler
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_occurrence_credentials_cannot_answer_reused_id(tmp_path):
+    """old X -> resolved(X) -> new X (same generation). Answering with the OLD
+    occurrence's token must be StaleAnswer and the adversary must see no
+    response for new X; the NEW token succeeds exactly once."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST, RESOLVED_APPROVAL, APPROVAL_REQUEST]},
+            # exactly one response for X is expected here; a second would desync
+            {"expect_id": "approval-1", "actions": [{"type": "message", "message": {"method": "probe/answered", "params": {}}}]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "ok"}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        old = await _next_of(events, PendingInteraction)
+        resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert resolved.method == "serverRequest/resolved" and old.state == "resolved"
+        new = await _next_of(events, PendingInteraction)
+        assert new is not old and new.id == old.id and new.generation == old.generation
+        assert new.token != old.token and new.open
+        # The stale card is clicked.
+        with pytest.raises(StaleAnswer):
+            await transport.answer(old.id, {"decision": "accept"}, generation=old.generation, token=old.token)
+        with pytest.raises(StaleAnswer):
+            await transport.fail_interaction(old.id, generation=old.generation, token=old.token)
+        assert new.open  # untouched
+        # The right occurrence answers, exactly once.
+        await transport.answer(new.id, {"decision": "decline"}, generation=new.generation, token=new.token)
+        assert new.state == "answered"
+        ack = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert ack.method == "probe/answered"
+        with pytest.raises(StaleAnswer):
+            await transport.answer(new.id, {"decision": "decline"}, generation=new.generation, token=new.token)
+        assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+async def test_late_old_handler_result_cannot_answer_reused_id(tmp_path):
+    """Same ordering through the interaction_handler: the OLD occurrence's
+    handler is a misbehaving one that survives cancellation and returns late,
+    after new X exists. Its result must be dropped (StaleAnswer inside the
+    transport), new X stays pending, and only new X's own handler answers."""
+    release_old: asyncio.Future = asyncio.get_running_loop().create_future()
+    new_seen: asyncio.Future = asyncio.get_running_loop().create_future()
+    calls: list = []
+
+    async def handler(interaction: PendingInteraction):
+        calls.append(interaction)
+        if len(calls) == 1:
+            try:
+                await release_old
+            except asyncio.CancelledError:
+                pass  # misbehaving: swallows the retirement and still answers
+            return {"decision": "accept", "who": "old"}
+        new_seen.set_result(interaction)
+        await asyncio.sleep(0.3)  # arrives after the old result
+        return {"decision": "decline", "who": "new"}
+
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                # The old handler must already be RUNNING (parked) when the
+                # retirement arrives, otherwise its task is cancelled before it
+                # starts and there is no late result to test.
+                "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.2}, RESOLVED_APPROVAL, APPROVAL_REQUEST],
+            },
+            {"expect_id": "approval-1", "actions": [{"type": "message", "message": {"method": "probe/answered", "params": {}}}]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "ok"}]},
+        ],
+        interaction_handler=handler,
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        new = await asyncio.wait_for(new_seen, HEALTHY_S)
+        assert len(calls) == 2 and calls[0].token != new.token and calls[0].state == "resolved"
+        await asyncio.sleep(0.05)
+        # The old handler has been cancelled by resolved(X) and swallowed it; it
+        # returns its stale "accept" now, while new X is pending.
+        if not release_old.done():
+            release_old.set_result(None)
+        await asyncio.sleep(0.05)
+        assert new.open  # the stale old result did not land on the new occurrence
+        while True:  # skip the earlier serverRequest/resolved notification
+            ack = await _next_of(events, Notification, timeout=CONTROL_S)
+            if ack.method == "probe/answered":
+                break
+            assert ack.method == "serverRequest/resolved"
+        # the ONE response came from new X's own handler
+        assert new.state == "answered"
         assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
     finally:
         probe.cancel()
