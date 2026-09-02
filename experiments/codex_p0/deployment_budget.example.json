@@ -1,0 +1,14 @@
+{
+  "expected_concurrent_live_sessions": null,
+  "expected_concurrent_active_turns": null,
+  "expected_parked_human_interactions": null,
+  "container_memory_budget_mib": null,
+  "process_pid_budget": null,
+  "fd_budget": null,
+  "acceptable_cold_start_p95_s": null,
+  "acceptable_resume_p95_s": null,
+  "acceptable_teardown_p95_s": null,
+  "acceptable_idle_cpu_percent": null,
+  "maximum_orphan_descendants_after_hard_kill": 0,
+  "process_per_session_counts": []
+}
