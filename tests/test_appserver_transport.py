@@ -1623,3 +1623,46 @@ async def test_orphan_that_does_get_its_response_is_not_also_ambiguous(tmp_path)
     kinds = [type(i).__name__ for i in items]
     assert kinds.count("OrphanedResponse") == 1 and kinds.count("AmbiguousRequest") == 0, kinds
     await transport.close()
+
+
+async def test_delivered_orphan_is_not_also_ambiguous_when_generation_ends_before_caller_unwinds(tmp_path):
+    """Forced ordering: turn/start committed -> Task.cancel(caller) (the
+    awaited future is cancelled synchronously) -> response injected before the
+    caller's handler runs (tombstone + OrphanedResponse) -> the generation
+    ends, still before the caller's handler runs -> caller unwinds. Exactly one
+    OrphanedResponse(X), zero AmbiguousRequest(X), no leftover tombstone."""
+    transport = await _transport(tmp_path, [{"expect_method": "turn/start", "actions": []}])
+    events = transport.subscribe()
+    task = asyncio.create_task(transport.request("turn/start", {"threadId": "thread-1"}))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if transport._waiters and not transport._write_lock.locked():
+            break
+    (request_id,) = transport._waiters.keys()
+    task.cancel()
+    # Same tick: the reader delivers the response (definitive outcome)...
+    transport._dispatch({"id": request_id, "result": {"turn": {"id": "turn-1"}}})
+    assert request_id in transport._orphan_delivered
+    # ...and the generation ends, all before the cancelled caller resumes.
+    transport._terminalize("exit", exit_code=9, detail="forced")
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    items = []
+    while True:
+        item = await _next(events)
+        items.append(item)
+        if isinstance(item, TerminalEvent):
+            break
+    orphaned = [i for i in items if isinstance(i, OrphanedResponse) and i.request_id == request_id]
+    ambiguous = [i for i in items if isinstance(i, AmbiguousRequest) and i.request_id == request_id]
+    assert len(orphaned) == 1 and orphaned[0].result == {"turn": {"id": "turn-1"}}
+    assert ambiguous == []
+    await asyncio.sleep(0.1)
+    late = []
+    while not events.empty():
+        late.append(events.get_nowait())
+    assert not any(isinstance(i, (AmbiguousRequest, OrphanedResponse)) for i in late), late
+    assert transport._orphan_delivered == set()
+    assert transport._orphaned_requests == {}
+    report = await transport.close()
+    assert report["unresolved_orphans"] == 0 and report["unconsumed_orphan_tombstones"] == 0

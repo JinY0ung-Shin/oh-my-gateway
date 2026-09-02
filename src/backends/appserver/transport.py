@@ -836,6 +836,9 @@ class AppServerTransport:
             # Committed-but-unanswered requests still unaccounted for; every one
             # was surfaced as AmbiguousRequest at terminalization, so this is 0.
             "unresolved_orphans": len(self._orphaned_requests),
+            # Definitive outcomes already delivered whose departed caller has
+            # not yet consumed the tombstone (it will, on its next step).
+            "unconsumed_orphan_tombstones": len(self._orphan_delivered),
             "running_descendants": len(running),
             "running_descendant_pids": running,
         }
@@ -1338,7 +1341,12 @@ class AppServerTransport:
                 )
             )
         self._orphaned_requests.clear()
-        self._orphan_delivered.clear()
+        # `_orphan_delivered` is deliberately NOT cleared here: it is the
+        # tombstone proving a definitive OrphanedResponse was already fanned
+        # out for a request whose cancelled caller has not yet run its
+        # ownership-transfer handler. That handler consumes it; erasing it at
+        # terminalization would let the same request also be reported as
+        # AmbiguousRequest -- two terminal outcomes for one request.
         self._fanout(event)
         if reason != "closed" and self._reap_task is None:
             # Unexpected loss: once stdout/stdin is unusable the gateway can no
