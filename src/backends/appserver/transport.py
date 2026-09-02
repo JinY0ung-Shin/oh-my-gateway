@@ -43,26 +43,38 @@ import uuid
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
-# Server requests the gateway knows how to surface as interactions. Anything
-# else is answered with a JSON-RPC "method not found" error: an unknown
-# request must never be satisfied by accident.
-SUPPORTED_SERVER_REQUESTS = frozenset(
+# Server requests the gateway knows how to surface as interactions -- the
+# certified subset for the C0 rich-interaction surface. The set is injectable
+# per transport (``supported_server_requests=``) so a product layer can widen
+# or narrow it; anything outside the active set is answered with a JSON-RPC
+# "method not found" error. An unknown request must never be satisfied by
+# accident.
+DEFAULT_SUPPORTED_SERVER_REQUESTS = frozenset(
     {
         "item/commandExecution/requestApproval",
         "item/fileChange/requestApproval",
         "item/permissions/requestApproval",
         "item/tool/requestUserInput",
+        "item/tool/call",  # dynamic tool call
+        "mcpServer/elicitation/request",
     }
 )
+SUPPORTED_SERVER_REQUESTS = DEFAULT_SUPPORTED_SERVER_REQUESTS  # backwards-compatible alias
+
+# Upstream retires a pending server request (turn interrupted, turn finished,
+# request cleared) with this notification; the matching interaction must
+# become non-actionable at that moment, independent of any human TTL.
+SERVER_REQUEST_RESOLVED = "serverRequest/resolved"
 
 JSONRPC_METHOD_NOT_FOUND = -32601
 JSONRPC_INTERNAL_ERROR = -32603
 
 RUNTIME_LOST = "RUNTIME_LOST"
+SERVER_RESOLVED = "SERVER_RESOLVED"
 
 DEFAULT_CLIENT_INFO = {
     "name": "oh_my_gateway",
@@ -148,8 +160,8 @@ class PendingInteraction:
     params: Any
     generation: int
     created_at: float = field(default_factory=time.monotonic)
-    state: str = "pending"  # "pending" | "answered" | "failed" | "invalidated"
-    invalidation_reason: Optional[str] = None
+    state: str = "pending"  # "pending" | "answered" | "failed" | "resolved" | "invalidated"
+    invalidation_reason: Optional[str] = None  # RUNTIME_LOST | SERVER_RESOLVED
 
     @property
     def open(self) -> bool:
@@ -178,10 +190,18 @@ class AppServerTransport:
         interaction_handler: Optional[InteractionHandler] = None,
         client_info: Optional[Dict[str, Any]] = None,
         capabilities: Optional[Dict[str, Any]] = None,
+        supported_server_requests: Optional[Iterable[str]] = None,
         stderr_tail_lines: int = 400,
+        exit_drain_grace_s: float = 2.0,
     ) -> None:
         self.argv = list(argv)
         self.generation = generation
+        self.supported_server_requests = frozenset(
+            DEFAULT_SUPPORTED_SERVER_REQUESTS
+            if supported_server_requests is None
+            else supported_server_requests
+        )
+        self.exit_drain_grace_s = exit_drain_grace_s
         self.cwd = str(cwd) if cwd is not None else None
         self.env = dict(env) if env is not None else None
         self.client_info = client_info or dict(DEFAULT_CLIENT_INFO)
@@ -197,6 +217,8 @@ class AppServerTransport:
         self._subscribers: List[asyncio.Queue] = []
         self._tasks: List[asyncio.Task] = []
         self._handler_tasks: set[asyncio.Task] = set()
+        self._interaction_tasks: Dict[Any, asyncio.Task] = {}
+        self._stdout_eof: Optional[asyncio.Event] = None
         self._stderr_tail: deque[str] = deque(maxlen=stderr_tail_lines)
         self._terminal: Optional[TerminalEvent] = None
         self._terminal_waiter: Optional[asyncio.Future] = None
@@ -212,6 +234,7 @@ class AppServerTransport:
             raise TransportError("transport already started")
         loop = asyncio.get_running_loop()
         self._terminal_waiter = loop.create_future()
+        self._stdout_eof = asyncio.Event()
         proc_env = os.environ.copy()
         if self.env:
             proc_env.update(self.env)
@@ -459,12 +482,14 @@ class AppServerTransport:
                 self._signal_group(signal.SIGKILL)
                 return
             if not raw:
-                # EOF almost always means the process is exiting; give the exit
-                # status a bounded moment to land so every RuntimeLost and the
-                # TerminalEvent carry it. A process that closed stdout but
-                # lives on is reported as "eof" with exit_code None.
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(proc.wait(), 2.0)
+                # Every buffered message has now been routed: the reader owns
+                # terminalization. Give the exit status a bounded moment to
+                # land so every RuntimeLost and the TerminalEvent carry it. A
+                # process that closed stdout but lives on is reported as "eof"
+                # with exit_code None.
+                assert self._stdout_eof is not None
+                self._stdout_eof.set()
+                await self._exit_status(proc, self.exit_drain_grace_s)
                 reason = "exit" if proc.returncode is not None else "eof"
                 self._terminalize(reason, exit_code=proc.returncode, detail=self._stderr_excerpt())
                 return
@@ -490,7 +515,12 @@ class AppServerTransport:
             self._on_server_request(message["id"], method, message.get("params"))
             return
         if isinstance(method, str):
-            self._fanout(Notification(method, message.get("params")))
+            params = message.get("params")
+            if method == SERVER_REQUEST_RESOLVED:
+                # Retire the interaction BEFORE anyone hears about it, so no
+                # subscriber can race a late answer past the fence.
+                self._resolve_interaction(params)
+            self._fanout(Notification(method, params))
             return
         if has_id:
             self._on_response(message)
@@ -499,6 +529,20 @@ class AppServerTransport:
         # speaking JSON-RPC any more.
         self._terminalize("protocol_error", exit_code=self._proc.returncode if self._proc else None, detail=f"unroutable message: {str(message)[:200]!r}")
         self._signal_group(signal.SIGKILL)
+
+    def _resolve_interaction(self, params: Any) -> None:
+        """Upstream cleared a server request: the interaction is no longer
+        actionable. A later ``answer()`` raises ``StaleAnswer`` and writes
+        nothing; a handler still parked on it is cancelled."""
+        request_id = params.get("requestId") if isinstance(params, dict) else None
+        interaction = self._interactions.get(request_id)
+        if interaction is None or not interaction.open:
+            return
+        interaction.state = "resolved"
+        interaction.invalidation_reason = SERVER_RESOLVED
+        task = self._interaction_tasks.pop(request_id, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     def _on_response(self, message: Dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -512,7 +556,7 @@ class AppServerTransport:
             future.set_result(message.get("result"))
 
     def _on_server_request(self, request_id: Any, method: str, params: Any) -> None:
-        if method not in SUPPORTED_SERVER_REQUESTS:
+        if method not in self.supported_server_requests:
             # Fail closed: answer with a protocol error right away, record it,
             # and keep reading. Never a permissive result, never an interaction.
             self.rejected_server_requests.append({"id": request_id, "method": method})
@@ -535,7 +579,9 @@ class AppServerTransport:
         if self._interaction_handler is not None:
             # Off the reader: a handler that parks on a human must not stop
             # responses, notifications, or death detection.
-            self._spawn_handler_task(self._run_handler(interaction))
+            task = self._spawn_handler_task(self._run_handler(interaction))
+            self._interaction_tasks[request_id] = task
+            task.add_done_callback(lambda _t, rid=request_id: self._interaction_tasks.pop(rid, None))
 
     async def _run_handler(self, interaction: PendingInteraction) -> None:
         assert self._interaction_handler is not None
@@ -555,10 +601,11 @@ class AppServerTransport:
         except StaleAnswer as exc:
             logger.info("dropping late interaction answer: %s", exc)
 
-    def _spawn_handler_task(self, coro: Awaitable[Any]) -> None:
+    def _spawn_handler_task(self, coro: Awaitable[Any]) -> asyncio.Task:
         task = asyncio.ensure_future(coro)
         self._handler_tasks.add(task)
         task.add_done_callback(self._handler_tasks.discard)
+        return task
 
     def _fanout(self, item: SubscriberItem) -> None:
         for queue in list(self._subscribers):
@@ -577,12 +624,44 @@ class AppServerTransport:
             self._stderr_tail.append(raw.decode("utf-8", "replace").rstrip("\n"))
 
     async def _watch_exit(self) -> None:
+        """Process exit never terminalizes ahead of the stdout drain.
+
+        A child can flush its final response and exit while those bytes are
+        still in the pipe; ``proc.wait()`` returning says nothing about
+        whether the reader has consumed them. So after exit the watcher waits
+        for the reader's EOF (bounded by ``exit_drain_grace_s``) and lets the
+        reader terminalize after routing everything. Only when EOF cannot
+        arrive -- a descendant inherited stdout and keeps it open -- does the
+        watcher terminalize itself, after the grace.
+        """
         proc = self._proc
-        assert proc is not None
-        code = await proc.wait()
-        # EOF normally arrives first and carries the same information; this
-        # covers a process that dies with stdout held open by a descendant.
-        self._terminalize("exit", exit_code=code, detail=self._stderr_excerpt())
+        assert proc is not None and self._stdout_eof is not None
+        code = await self._exit_status(proc, None)
+        try:
+            await asyncio.wait_for(self._stdout_eof.wait(), self.exit_drain_grace_s)
+        except asyncio.TimeoutError:
+            self._terminalize(
+                "exit",
+                exit_code=code,
+                detail=f"stdout held open {self.exit_drain_grace_s}s past exit; {self._stderr_excerpt()}",
+            )
+
+    @staticmethod
+    async def _exit_status(proc: asyncio.subprocess.Process, timeout: Optional[float]) -> Optional[int]:
+        """Exit status as soon as the child is reaped, pipes notwithstanding.
+
+        ``Process.wait()`` only resolves once every inherited pipe has also
+        closed, so a descendant holding stdout would hide the parent's exit
+        from a watcher built on it. ``returncode`` is set the moment the child
+        watcher reaps the process, so poll that (50 ms) instead.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        while proc.returncode is None:
+            if deadline is not None and loop.time() >= deadline:
+                break
+            await asyncio.sleep(0.05)
+        return proc.returncode
 
     def _stderr_excerpt(self) -> str:
         tail = list(self._stderr_tail)[-5:]
@@ -613,6 +692,10 @@ class AppServerTransport:
             if interaction.open:
                 interaction.state = "invalidated"
                 interaction.invalidation_reason = RUNTIME_LOST
+        for task in list(self._interaction_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._interaction_tasks.clear()
         self._fanout(event)
 
     # -- internals: process group --------------------------------------------
@@ -632,8 +715,7 @@ class AppServerTransport:
             logger.debug("signal %s to app-server group failed: %r", sig, exc)
 
     async def _wait_exit(self, proc: asyncio.subprocess.Process, timeout: float) -> None:
-        with contextlib.suppress(asyncio.TimeoutError):
-            await asyncio.wait_for(proc.wait(), timeout)
+        await self._exit_status(proc, timeout)
 
     def _running_group_members(self) -> List[int]:
         """PIDs still running (not zombies) in this transport's process group.

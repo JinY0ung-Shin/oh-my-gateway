@@ -18,6 +18,7 @@ import pytest
 
 from src.backends.appserver import (
     RUNTIME_LOST,
+    SERVER_RESOLVED,
     AppServerTransport,
     Notification,
     PendingInteraction,
@@ -449,3 +450,181 @@ async def test_close_reaps_the_whole_process_group(tmp_path):
     assert isinstance(await _next_of(events, TerminalEvent, timeout=CONTROL_S), TerminalEvent)
     # Idempotent: the second close returns the identical report and does no work.
     assert await transport.close() == report
+
+
+# ---------------------------------------------------------------------------
+# upstream-retired interactions are non-actionable at once (serverRequest/resolved)
+# ---------------------------------------------------------------------------
+
+RESOLVED_APPROVAL = {
+    "type": "message",
+    "message": {
+        "method": "serverRequest/resolved",
+        "params": {"threadId": "thread-1", "requestId": "approval-1"},
+    },
+}
+
+
+async def test_server_resolved_after_interrupt_retires_interaction(tmp_path):
+    """Mirrors upstream's turn_interrupt ordering: approval request ->
+    turn/interrupt -> serverRequest/resolved for that id -> the turn ends.
+    A late UI answer must be rejected and the fixture must never see a
+    response for the retired id (it would desync the scenario)."""
+    human: asyncio.Future = asyncio.get_running_loop().create_future()
+    cancelled: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    async def handler(interaction: PendingInteraction):
+        try:
+            return await human
+        except asyncio.CancelledError:
+            cancelled.set_result(interaction.id)
+            raise
+
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST]},
+            {
+                "expect_method": "turn/interrupt",
+                "actions": [RESOLVED_APPROVAL, {"type": "response", "result": {"turnId": "turn-1"}}],
+            },
+            # Any stray response for approval-1 would land here instead and
+            # desync the adversary (exit 64) -> the follow-up probe would fail.
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "no-stray-write"}]},
+        ],
+        interaction_handler=handler,
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        interaction = await _next_of(events, PendingInteraction)
+        assert interaction.open
+        await transport.interrupt("thread-1", "turn-1", timeout=CONTROL_S)
+        resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert resolved.method == "serverRequest/resolved"
+        # Retired at the moment upstream said so, not when the human answers.
+        assert interaction.state == "resolved"
+        assert interaction.invalidation_reason == SERVER_RESOLVED
+        assert transport.pending_interactions == []
+        assert await asyncio.wait_for(cancelled, CONTROL_S) == "approval-1"
+        with pytest.raises(StaleAnswer):
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        with pytest.raises(StaleAnswer):
+            await transport.fail_interaction(interaction.id, generation=transport.generation)
+        assert await transport.request("probe", timeout=HEALTHY_S) == "no-stray-write"
+        assert transport.alive
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+async def test_server_driven_resolution_without_interrupt_or_death(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST, RESOLVED_APPROVAL]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "no-stray-write"}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        interaction = await _next_of(events, PendingInteraction)
+        resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert resolved.method == "serverRequest/resolved"
+        assert interaction.state == "resolved"
+        with pytest.raises(StaleAnswer):
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        assert await transport.request("probe", timeout=HEALTHY_S) == "no-stray-write"
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+async def test_resolution_for_unknown_request_id_is_harmless(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                "actions": [
+                    {
+                        "type": "message",
+                        "message": {
+                            "method": "serverRequest/resolved",
+                            "params": {"threadId": "thread-1", "requestId": "never-seen"},
+                        },
+                    },
+                    {"type": "response", "result": "ok"},
+                ],
+            }
+        ],
+    )
+    try:
+        assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
+    finally:
+        await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# process exit never beats the stdout drain: a flushed final response and a
+# terminal notification are routed before the runtime is reported lost
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("attempt", range(12))
+async def test_final_response_and_event_before_exit_are_never_lost(tmp_path, attempt):
+    # A payload large enough to sit in the pipe when the child exits.
+    payload = "x" * 300_000
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                "actions": [
+                    {"type": "response", "result": {"payload": payload, "attempt": attempt}},
+                    TURN_COMPLETED,
+                    {"type": "exit", "code": 0},
+                ],
+            }
+        ],
+    )
+    events = transport.subscribe()
+    result = await transport.request("probe", timeout=HEALTHY_S)
+    assert result == {"payload": payload, "attempt": attempt}
+    note = await _next_of(events, Notification)
+    assert note.method == "turn/completed"
+    terminal = await _next_of(events, TerminalEvent)
+    assert terminal.reason == "exit"
+    assert terminal.exit_code == 0
+    await transport.close()
+
+
+async def test_exit_with_stdout_held_open_by_descendant_still_terminalizes(tmp_path):
+    """The one case where the watcher must act: the child exits but a
+    descendant inherited stdout, so EOF never comes. Terminal state must
+    still arrive within the bounded drain grace."""
+    scenario = _scenario(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                "actions": [
+                    {"type": "response", "result": "before-exit"},
+                    {"type": "spawn", "seconds": 120, "inherit_stdout": True},
+                    {"type": "exit", "code": 5},
+                ],
+            }
+        ],
+    )
+    transport = AppServerTransport(
+        [sys.executable, str(FIXTURE), str(scenario)], exit_drain_grace_s=1.0
+    )
+    await transport.start()
+    events = transport.subscribe()
+    assert await transport.request("probe", timeout=HEALTHY_S) == "before-exit"
+    terminal = await _next_of(events, TerminalEvent, timeout=HEALTHY_S)
+    assert terminal.reason == "exit"
+    assert terminal.exit_code == 5
+    report = await transport.close()
+    assert report["running_descendants"] == 0

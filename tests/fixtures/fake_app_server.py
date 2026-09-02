@@ -71,10 +71,12 @@ def _run_action(action: dict[str, Any], request: dict[str, Any]) -> None:
     if kind == "spawn":
         # A long-lived descendant in the same process group, to prove that a
         # transport's teardown reaches the whole group and not just the root.
+        # With ``inherit_stdout`` the descendant keeps the transport's stdout
+        # pipe open after this process exits, so EOF cannot be the signal.
         subprocess.Popen(  # noqa: S603 - fixture-owned interpreter
             [sys.executable, "-c", f"import time; time.sleep({float(action.get('seconds', 60))})"],
             stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
+            stdout=None if action.get("inherit_stdout") else subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
         return
