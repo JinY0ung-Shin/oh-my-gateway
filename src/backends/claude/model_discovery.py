@@ -55,11 +55,21 @@ def discovery_enabled() -> bool:
 
     Off by default: configuring ``ANTHROPIC_BASE_URL`` alone must not widen
     the advertised model list, so an operator opts in explicitly. Read per
-    call, never cached, so flipping the switch takes effect on the next
-    request rather than requiring the module to be re-imported. Both public
-    entry points below check it, so turning discovery off stops the upstream
-    fetch *and* revokes already-discovered IDs from resolution — a snapshot
-    cached before the switch flipped must not keep routing traffic.
+    call, never cached, rather than frozen at import time.
+
+    The two directions are NOT symmetric, because model resolution is
+    synchronous and cannot fetch:
+
+    - **Disabling** takes effect on the very next request. Both public entry
+      points check this, so a snapshot cached while the switch was on stops
+      routing traffic immediately.
+    - **Enabling** only unblocks the fetch. Resolution stays dark until a
+      discovery refresh actually populates the cache — the next
+      ``GET /v1/models``, or the startup warm-up after a restart.
+
+    In practice the switch lives in ``.env`` and a change implies a restart,
+    which runs the warm-up; a deployment that flips it in-process must drive
+    ``BackendRegistry.warm_model_discovery()`` itself.
     """
     return parse_bool_env("MODEL_DISCOVERY_ENABLED", "false")
 

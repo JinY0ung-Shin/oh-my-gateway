@@ -215,6 +215,35 @@ async def test_disabling_discovery_revokes_cached_ids_from_resolution(monkeypatc
     assert _claude_resolve("sonnet") is not None
 
 
+async def test_enabling_discovery_needs_a_refresh_before_resolution(monkeypatch):
+    """The switch is asymmetric: disable is instant, enable waits for a fetch.
+
+    Resolution is synchronous and cannot fetch, so flipping the switch on only
+    unblocks discovery — the cache stays empty until a refresh populates it.
+    """
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
+    client = StubClient([response(200, {"data": [{"id": "GLM-5.3-Flash"}]})])
+    monkeypatch.setattr(model_discovery, "_make_client", lambda: client)
+
+    # Started with discovery off: the startup warm-up is a no-op.
+    assert await model_discovery.discover_models() == []
+    assert _claude_resolve("GLM-5.3-Flash") is None
+
+    # Flipping it on does NOT retroactively make the id resolvable...
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "true")
+    assert _claude_resolve("GLM-5.3-Flash") is None
+    assert client.calls == []
+
+    # ...only a refresh (GET /v1/models, or warm-up after a restart) does.
+    await model_discovery.discover_models()
+    assert _claude_resolve("GLM-5.3-Flash") is not None
+
+    # Disabling, by contrast, is effective on the very next call.
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
+    assert _claude_resolve("GLM-5.3-Flash") is None
+
+
 async def test_disabled_discovery_leaves_static_models_on_v1_models(monkeypatch):
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://upstream.example")
     monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
