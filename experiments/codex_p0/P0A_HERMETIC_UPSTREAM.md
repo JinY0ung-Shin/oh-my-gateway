@@ -82,6 +82,55 @@ uv run python experiments/codex_p0/real_path_conformance.py \
   --artifact-dir /tmp/codex-p0a2
 ```
 
+## Payload replay: `replay_codex_contract.py`
+
+`real_path_conformance.py` (#168) drives the pinned Codex binary. `replay_codex_contract.py`
+replays the **captured contract directly over HTTP** — no Codex binary, no agent loop — which makes
+it the cheapest way to ask one narrow question of a model server:
+
+> does this upstream accept Codex 0.147.0's exact Responses payload and produce the stream shape
+> Codex needs, including the tool continuation?
+
+Structural fields (`tools`, `include`, `reasoning`, `store`, `tool_choice`, `parallel_tool_calls`)
+are sent verbatim from the fixture because those are what is under test; `instructions` and `input`
+are synthetic and short, since Codex's prose is not the contract. It always attempts **turn 2** when
+turn 1 yields a `function_call`, because two checks in vLLM's Responses path live on the
+continuation rather than the first turn: the `Encrypted content is not supported.` rejection for an
+input reasoning item carrying `encrypted_content`, and the `last_message.type != "function_call"`
+guard in the continuation builder. A single-turn smoke test cannot reach either.
+
+```bash
+# self-test against the hermetic upstream first — proves payload and script
+python3 experiments/codex_p0/mock_responses_upstream.py --port 8099 &
+python3 experiments/codex_p0/replay_codex_contract.py \
+    --base-url http://127.0.0.1:8099/v1 --model replica-model
+
+# then the real model server
+python3 experiments/codex_p0/replay_codex_contract.py \
+    --base-url http://<host>:8000/v1 --model <alias> \
+    --api-key-env P0_API_KEY --report /tmp/p0a-replay.json
+```
+
+Secret boundary matches the rest of P0: the API key is referenced by environment-variable name, the
+base URL is reported as a SHA-256 digest, and no header values are recorded.
+
+### Verified signatures
+
+Each outcome was produced against a controlled upstream, so the classification is exercised rather
+than asserted:
+
+| Upstream behavior | Result | Meaning |
+|---|---|---|
+| conformant | `pass` | payload accepted, stream completed, tool cycle and continuation worked |
+| HTTP 429 | `fail` | `HTTPError 429` recorded, no hang |
+| connection dropped mid-stream | `fail` | accepted but never reached `response.completed` |
+| clean stream, **no** `function_call` | `incomplete` | the parser-mismatch signature — a `200` with a dead tool cycle, deliberately not a pass |
+
+That last row is the one worth emphasizing: with `--enable-auto-tool-choice` set but a
+`--tool-call-parser` a generation behind the model, the request is accepted and the stream completes
+normally while the parser extracts nothing, so Codex never receives a tool call. Treating that as a
+pass is the easiest way to certify a broken path.
+
 ## Fault modes
 
 | `--fault` | Behavior |
