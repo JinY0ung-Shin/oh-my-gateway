@@ -80,6 +80,13 @@ def _run_action(action: dict[str, Any], request: dict[str, Any]) -> None:
             stderr=subprocess.DEVNULL,
         )
         return
+    if kind == "close_stdout":
+        # The root stays alive but its stdout is gone: EOF from a live runtime.
+        sys.stdout.flush()
+        import os
+
+        os.close(1)
+        return
     if kind == "exit":
         raise SystemExit(int(action.get("code", 0)))
     _fail(f"unknown action type: {kind!r}")

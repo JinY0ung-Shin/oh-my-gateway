@@ -628,6 +628,9 @@ async def test_exit_with_stdout_held_open_by_descendant_still_terminalizes(tmp_p
     terminal = await _next_of(events, TerminalEvent, timeout=HEALTHY_S)
     assert terminal.reason == "exit"
     assert terminal.exit_code == 5
+    # Transport-owned teardown, without close(): the 120 s descendant is gone.
+    await transport.wait_reaped(timeout=HEALTHY_S)
+    assert transport.running_group_members() == []
     report = await transport.close()
     assert report["running_descendants"] == 0
 
@@ -841,3 +844,110 @@ async def test_subscriber_far_behind_on_lossless_items_is_disconnected_not_grown
         assert stalled.empty()
     finally:
         await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# bounded writes: a live runtime that stops reading stdin cannot pin a caller
+# ---------------------------------------------------------------------------
+
+
+async def test_write_blocked_by_stalled_reader_is_bounded_and_reaps(tmp_path):
+    """Child completes the handshake, reads one request, then stops reading
+    stdin for 30 s (a SIGSTOP / wedged-runtime stand-in). A payload larger
+    than the pipe + stream buffer cannot drain; the request must fail within
+    its deadline, the generation must terminalize, and the group must be
+    reaped without close()."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [{"type": "spawn", "seconds": 120}, {"type": "sleep", "seconds": 30}]},
+        ],
+        write_timeout_s=0.5,
+    )
+    events = transport.subscribe()
+    stalled = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.3)  # the child has read the line and is now asleep
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(RuntimeLost) as info:
+        await transport.request("probe", {"blob": "x" * 4_000_000}, timeout=HEALTHY_S)
+    assert asyncio.get_running_loop().time() - started < CONTROL_S
+    assert info.value.reason == "write_timeout"
+    # Every other waiter and later control call sees the same bounded state.
+    with pytest.raises(RuntimeLost):
+        await stalled
+    with pytest.raises(RuntimeLost):
+        await transport.interrupt("thread-1", "turn-1", timeout=CONTROL_S)
+    terminal = await _next_of(events, TerminalEvent, timeout=CONTROL_S)
+    assert terminal.reason == "write_timeout"
+    await transport.wait_reaped(timeout=HEALTHY_S)
+    assert transport.running_group_members() == []
+    report = await transport.close()
+    assert report["running_descendants"] == 0
+    assert await transport.close() == report
+
+
+async def test_interrupt_deadline_covers_write_and_response(tmp_path):
+    """Small interrupt while the child is asleep: the write lands in the
+    buffer, no response comes; the caller's deadline still bounds the whole
+    operation and the transport stays alive for the runtime to recover."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [{"type": "sleep", "seconds": 1.0}]},
+            {"expect_method": "turn/interrupt", "actions": [{"type": "response", "result": {"turnId": "turn-1"}}]},
+        ],
+    )
+    stalled = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.2)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(asyncio.TimeoutError):
+        await transport.interrupt("thread-1", "turn-1", timeout=0.3)
+    assert asyncio.get_running_loop().time() - started < 1.0
+    assert transport.alive
+    stalled.cancel()
+    await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# unexpected loss reaps the owned group without waiting for close()
+# ---------------------------------------------------------------------------
+
+
+async def test_eof_from_live_root_reaps_group_without_close(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                "actions": [
+                    {"type": "response", "result": "last-words"},
+                    {"type": "spawn", "seconds": 120},
+                    {"type": "close_stdout"},
+                ],
+            }
+        ],
+        exit_drain_grace_s=0.5,
+    )
+    assert await transport.request("probe", timeout=HEALTHY_S) == "last-words"
+    terminal = await transport.wait_terminal(timeout=HEALTHY_S)
+    assert terminal.reason == "eof"
+    assert terminal.exit_code is None  # the root was alive when stdout went away
+    await transport.wait_reaped(timeout=HEALTHY_S)
+    assert transport.running_group_members() == []
+    assert transport.exit_code is not None
+    report = await transport.close()
+    assert report["running_descendants"] == 0
+    assert await transport.close() == report
+
+
+async def test_close_after_owner_initiated_shutdown_does_not_double_reap(tmp_path):
+    transport = await _transport(tmp_path, [{"expect_method": "probe", "actions": [{"type": "spawn", "seconds": 120}]}])
+    probe = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.2)
+    report = await transport.close()
+    assert report["reason"] == "closed"
+    assert report["running_descendants"] == 0
+    assert transport._reap_task is None  # owner-initiated close never schedules loss teardown
+    with pytest.raises(RuntimeLost):
+        await probe
+    await transport.wait_reaped(timeout=CONTROL_S)  # resolved by close(); must not hang

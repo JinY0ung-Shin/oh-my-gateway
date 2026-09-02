@@ -24,6 +24,11 @@ nothing else:
   an idempotent, deterministic ``close()`` report
 - a bounded handshake: ``start()`` fails within ``initialize_timeout_s`` and
   tears the runtime down on any handshake failure before re-raising
+- bounded writes: one absolute deadline covers write + response, and a
+  runtime that stops reading stdin is terminalized (``write_timeout``) and
+  torn down instead of pinning the caller
+- transport-owned teardown on ANY unexpected loss: the process group is
+  reaped (SIGTERM -> SIGKILL, bounded) without waiting for ``close()``
 - transport-owned, exactly-once commit of interaction answers: a cancelled
   caller never leaves an interaction "answered" with nothing on the wire
 - bounded subscribers: streaming deltas are droppable for a slow consumer,
@@ -160,7 +165,7 @@ class Notification:
 class TerminalEvent:
     """Delivered once to every subscriber when the runtime is lost."""
 
-    reason: str  # "eof" | "exit" | "protocol_error" | "write_failed" | "closed"
+    reason: str  # eof | exit | protocol_error | write_failed | write_timeout | closed
     generation: int
     exit_code: Optional[int]
     detail: str = ""
@@ -285,6 +290,8 @@ class AppServerTransport:
         stderr_tail_lines: int = 400,
         exit_drain_grace_s: float = 2.0,
         initialize_timeout_s: float = 10.0,
+        write_timeout_s: float = 10.0,
+        loss_teardown_grace_s: float = 2.0,
     ) -> None:
         self.argv = list(argv)
         self.generation = generation
@@ -295,6 +302,10 @@ class AppServerTransport:
         )
         self.exit_drain_grace_s = exit_drain_grace_s
         self.initialize_timeout_s = initialize_timeout_s
+        self.write_timeout_s = write_timeout_s
+        self.loss_teardown_grace_s = loss_teardown_grace_s
+        self._reap_task: Optional[asyncio.Task] = None
+        self._reaped: Optional[asyncio.Future] = None
         self.cwd = str(cwd) if cwd is not None else None
         self.env = dict(env) if env is not None else None
         self.client_info = client_info or dict(DEFAULT_CLIENT_INFO)
@@ -335,6 +346,7 @@ class AppServerTransport:
             raise TransportError("transport already started")
         loop = asyncio.get_running_loop()
         self._terminal_waiter = loop.create_future()
+        self._reaped = loop.create_future()
         self._stdout_eof = asyncio.Event()
         proc_env = os.environ.copy()
         if self.env:
@@ -413,16 +425,28 @@ class AppServerTransport:
         """
         self._raise_if_lost()
         loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
         request_id = str(uuid.uuid4())
         future: asyncio.Future = loop.create_future()
         self._waiters[request_id] = future
         self._waiter_methods[request_id] = method
         try:
-            await self._write({"id": request_id, "method": method, "params": params or {}})
-            return await asyncio.wait_for(future, timeout)
+            # One absolute deadline covers the write AND the response: a live
+            # runtime that stopped reading stdin cannot pin the caller before
+            # its timeout even starts.
+            await self._write(
+                {"id": request_id, "method": method, "params": params or {}},
+                deadline=deadline,
+            )
+            remaining = None if deadline is None else max(0.0, deadline - loop.time())
+            return await asyncio.wait_for(future, remaining)
         finally:
             self._waiters.pop(request_id, None)
             self._waiter_methods.pop(request_id, None)
+            if future.done() and not future.cancelled():
+                # Terminalization may have failed this waiter while the write
+                # itself was raising; mark that exception retrieved.
+                future.exception()
 
     async def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         self._raise_if_lost()
@@ -549,6 +573,11 @@ class AppServerTransport:
         self._closing = True
         proc = self._proc
         exit_code: Optional[int] = None
+        if self._reap_task is not None:
+            # An unexpected loss already started transport-owned teardown; let
+            # it finish rather than racing two signal sequences.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(asyncio.shield(self._reap_task), 2 * self.loss_teardown_grace_s + 1.0)
         if proc is not None:
             if proc.returncode is None and proc.stdin is not None:
                 with contextlib.suppress(Exception):
@@ -573,6 +602,8 @@ class AppServerTransport:
             self._signal_group(signal.SIGKILL)
             await asyncio.sleep(0.1)
             running = self._running_group_members()
+        if self._reaped is not None and not self._reaped.done():
+            self._reaped.set_result(None)
         self._close_report = {
             "generation": self.generation,
             "exit_code": exit_code,
@@ -586,19 +617,48 @@ class AppServerTransport:
 
     # -- internals: writing ----------------------------------------------------
 
-    async def _write(self, payload: Dict[str, Any]) -> None:
+    async def _write(self, payload: Dict[str, Any], *, deadline: Optional[float] = None) -> None:
+        """Bounded write. The bound is ``write_timeout_s`` (or the caller's
+        earlier absolute ``deadline``), covering the wait for the writer lock
+        AND the drain. A write that cannot complete in that time means the
+        runtime is alive but no longer consuming stdin (stopped, wedged, or
+        back-pressured with a partial line in the pipe): the transport is
+        unusable and its bytes are ambiguous, so the generation is
+        terminalized (``write_timeout``) and the group is torn down rather
+        than the write being silently abandoned.
+        """
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise TransportError("transport not started")
+        loop = asyncio.get_running_loop()
+        write_deadline = loop.time() + self.write_timeout_s
+        if deadline is not None:
+            write_deadline = min(write_deadline, deadline)
         line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
-        async with self._write_lock:
+        try:
+            await asyncio.wait_for(self._write_lock.acquire(), max(0.0, write_deadline - loop.time()))
+        except asyncio.TimeoutError:
+            self._terminalize(
+                "write_timeout", exit_code=proc.returncode, detail="writer lock not acquired in time"
+            )
+            self._raise_if_lost()
+        try:
             self._raise_if_lost()
             try:
                 proc.stdin.write(line)
-                await proc.stdin.drain()
+                await asyncio.wait_for(proc.stdin.drain(), max(0.0, write_deadline - loop.time()))
+            except asyncio.TimeoutError:
+                self._terminalize(
+                    "write_timeout",
+                    exit_code=proc.returncode,
+                    detail=f"stdin not drained within bound; {len(line)} bytes pending",
+                )
+                self._raise_if_lost()
             except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError) as exc:
                 self._terminalize("write_failed", exit_code=proc.returncode, detail=repr(exc))
                 self._raise_if_lost()
+        finally:
+            self._write_lock.release()
 
     def _raise_if_lost(self) -> None:
         if self._terminal is not None:
@@ -840,6 +900,42 @@ class AppServerTransport:
                 task.cancel()
         self._interaction_tasks.clear()
         self._fanout(event)
+        if reason != "closed" and self._reap_task is None:
+            # Unexpected loss: once stdout/stdin is unusable the gateway can no
+            # longer supervise approvals, tool events or completion, so the
+            # owned process group must not keep running until some caller
+            # remembers close(). Teardown is transport-owned and bounded.
+            self._reap_task = asyncio.ensure_future(self._reap_after_loss())
+
+    async def _reap_after_loss(self) -> None:
+        try:
+            if self._running_group_members():
+                self._signal_group(signal.SIGTERM)
+                await self._wait_group_empty(self.loss_teardown_grace_s)
+            if self._running_group_members():
+                self._signal_group(signal.SIGKILL)
+                await self._wait_group_empty(self.loss_teardown_grace_s)
+        finally:
+            if self._reaped is not None and not self._reaped.done():
+                self._reaped.set_result(None)
+
+    async def _wait_group_empty(self, timeout: float) -> None:
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        while self._running_group_members() and loop.time() < deadline:
+            await asyncio.sleep(0.05)
+
+    async def wait_reaped(self, timeout: Optional[float] = None) -> None:
+        """Wait until the transport-owned teardown after an unexpected loss has
+        run (no-op once ``close()`` has completed)."""
+        if self._close_report is not None:
+            return
+        assert self._reaped is not None, "transport not started"
+        await asyncio.wait_for(asyncio.shield(self._reaped), timeout)
+
+    def running_group_members(self) -> List[int]:
+        """PIDs still running in this transport's process group (Linux /proc)."""
+        return self._running_group_members()
 
     # -- internals: process group --------------------------------------------
 
