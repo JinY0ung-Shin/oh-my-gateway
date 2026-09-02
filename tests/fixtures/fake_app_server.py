@@ -14,7 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, NoReturn
 
 
 def _write_json(payload: Any) -> None:
@@ -22,7 +22,7 @@ def _write_json(payload: Any) -> None:
     sys.stdout.flush()
 
 
-def _fail(message: str, code: int = 64) -> "None":
+def _fail(message: str, code: int = 64) -> NoReturn:
     sys.stderr.write(message + "\n")
     sys.stderr.flush()
     raise SystemExit(code)
@@ -95,7 +95,8 @@ def main() -> int:
         if not _matches(step, message):
             _fail(
                 f"unexpected input at step {index}: "
-                f"expected method={step.get('expect_method')!r} id={step.get('expect_id')!r}, "
+                f"expected method={step.get('expect_method')!r} "
+                f"id={step.get('expect_id')!r}, "
                 f"got {message!r}"
             )
         actions = step.get("actions", [])
