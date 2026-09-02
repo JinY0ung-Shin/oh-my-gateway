@@ -341,12 +341,14 @@ async def proxy(request: Request, path: str):
             observation.error = str(exc)
             raise
         except asyncio.CancelledError:
-            # The downstream client (Codex) went away first -- e.g. its stream
-            # idle timeout fired during an injected delay. A cancellation that
-            # lands after the whole stream was relayed (Codex closes the
-            # connection once it has read [DONE]) is not a disconnect.
+            # The downstream client (Codex) closed the connection. That is
+            # normal after it has read the final frame (the cancellation lands
+            # at the last yield, so `stream_completed` cannot distinguish the
+            # two), and abnormal when it happens mid-stream -- e.g. its idle
+            # timeout fired during an injected delay. Record the fact, not a
+            # guess: how many frames it had received when it left.
             if not observation.stream_completed:
-                observation.error = "client_disconnected"
+                observation.error = f"client_closed_after_{observation.frames_forwarded}_frames"
             raise
         finally:
             await client.aclose()
