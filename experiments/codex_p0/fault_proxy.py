@@ -33,6 +33,8 @@ HOP_BY_HOP = {
     "accept-encoding",
 }
 
+# httpx aiter_bytes()/aread() returns decoded content, so do not advertise the
+# upstream content-encoding to the downstream Codex client.
 RESPONSE_HOP_BY_HOP = HOP_BY_HOP | {"content-encoding"}
 
 
@@ -82,7 +84,7 @@ def _find_sse_delimiter(buffer: bytes) -> tuple[int, int] | None:
 
 async def _iter_sse_frames(response: httpx.Response) -> AsyncIterator[bytes]:
     buffer = b""
-    async for chunk in response.aiter_raw():
+    async for chunk in response.aiter_bytes():
         if not chunk:
             continue
         buffer += chunk
@@ -100,7 +102,7 @@ async def _iter_sse_frames(response: httpx.Response) -> AsyncIterator[bytes]:
 
 async def _raw_passthrough(response: httpx.Response) -> AsyncIterator[bytes]:
     try:
-        async for chunk in response.aiter_raw():
+        async for chunk in response.aiter_bytes():
             if chunk:
                 yield chunk
     finally:
@@ -227,6 +229,7 @@ async def proxy(request: Request, path: str):
     content_type = upstream.headers.get("content-type", "")
 
     if config.mode == "drop_before_body":
+
         async def _drop() -> AsyncIterator[bytes]:
             try:
                 raise ConnectionResetError("P0 injected drop before first response body byte")
