@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from src.backends.appserver import (
+    OWNER_CLOSED,
     RUNTIME_LOST,
     SERVER_RESOLVED,
     AppServerTransport,
@@ -1334,3 +1335,114 @@ async def test_rpc_error_for_orphaned_request_is_surfaced_as_error(tmp_path):
     orphan = await _next_of(events, OrphanedResponse)
     assert orphan.result is None and orphan.error["code"] == -32000
     await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# owner close owns accepted answers: unsent ones lose (policy B), accepted
+# bytes settle first; the report counts unsettled interactions
+# ---------------------------------------------------------------------------
+
+
+async def test_close_retires_queued_unsent_answer_and_owns_its_commit(tmp_path):
+    """A owns the writer; answer(X) is accepted (resolving, zero bytes) and its
+    commit queues for the lock; close() starts while A still holds the writer.
+    Policy B: X is invalidated OWNER_CLOSED, its commit settles with nothing
+    written, no owned task remains, and the adversary never sees a response
+    for X -- it exits 64 ("stdin closed before step") rather than 77, which the
+    scenario reserves for "a response for X arrived"."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST]},
+            {"expect_id": "approval-1", "actions": [{"type": "exit", "code": 77}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    interaction = await _next_of(events, PendingInteraction)
+    await transport._write_lock.acquire()  # "A" owns the writer
+    transport._writer_since = asyncio.get_running_loop().time()
+    caller = asyncio.create_task(
+        transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+    )
+    await asyncio.sleep(0.1)
+    assert interaction.state == "resolving"
+    assert not interaction.wire_committed
+    assert interaction.commit is not None and not interaction.commit.done()
+    closing = asyncio.create_task(transport.close(grace_s=1.0))
+    await asyncio.sleep(0.1)
+    assert not closing.done()  # close is waiting on the owned commit
+    transport._writer_since = None
+    transport._write_lock.release()  # A finishes
+    report = await asyncio.wait_for(closing, HEALTHY_S)
+    with pytest.raises(StaleAnswer):
+        await caller
+    assert interaction.state == "invalidated"
+    assert interaction.invalidation_reason == OWNER_CLOSED
+    assert not interaction.wire_committed
+    assert interaction.commit.done()
+    assert transport._interaction_commits == set()
+    assert report["pending_waiters"] == 0
+    assert report["pending_interactions"] == 0
+    assert report["unsettled_interaction_commits"] == 0
+    assert report["running_descendants"] == 0
+    assert report["exit_code"] == 64  # stdin EOF reached the adversary; no response for X ever did
+    with pytest.raises(RuntimeLost):
+        await probe
+    assert await transport.close() == report
+
+
+async def test_close_lets_accepted_answer_bytes_settle_before_shutdown(tmp_path):
+    """The other branch: the answer's bytes are accepted (child paused reading,
+    large payload mid-drain) when close() starts. The commit settles first and
+    the adversary observes exactly that response (exit 77) before the runtime
+    is shut down."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.5}]},
+            {"expect_id": "approval-1", "actions": [{"type": "exit", "code": 77}]},
+        ],
+        write_timeout_s=10.0,
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    interaction = await _next_of(events, PendingInteraction)
+    caller = asyncio.create_task(
+        transport.answer(interaction.id, {"decision": "accept", "note": "x" * 4_000_000}, generation=transport.generation)
+    )
+    await asyncio.sleep(0.1)
+    assert interaction.state == "resolving" and interaction.wire_committed
+    assert transport._write_lock.locked()  # committed write mid-drain
+    report = await asyncio.wait_for(transport.close(grace_s=1.0), HEALTHY_S)
+    await caller
+    assert interaction.state == "answered"
+    assert report["pending_interactions"] == 0
+    assert report["unsettled_interaction_commits"] == 0
+    assert report["exit_code"] == 77  # the adversary read the answer before shutdown
+    with pytest.raises(RuntimeLost):
+        await probe
+
+
+async def test_runtime_loss_retires_unsent_accepted_answer(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "probe", "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.3}, {"type": "exit", "code": 9}]}],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    interaction = await _next_of(events, PendingInteraction)
+    await transport._write_lock.acquire()
+    caller = asyncio.create_task(
+        transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+    )
+    await _next_of(events, TerminalEvent)
+    assert interaction.state == "invalidated"
+    assert interaction.invalidation_reason == RUNTIME_LOST
+    transport._write_lock.release()
+    with pytest.raises(StaleAnswer):
+        await caller
+    with pytest.raises(RuntimeLost):
+        await probe
+    report = await transport.close()
+    assert report["pending_interactions"] == 0 and report["unsettled_interaction_commits"] == 0

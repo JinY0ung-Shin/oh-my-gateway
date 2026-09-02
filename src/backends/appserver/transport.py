@@ -42,6 +42,10 @@ nothing else:
 - bounded subscribers: streaming deltas are droppable for a slow consumer,
   lossless items are not, and a consumer that falls too far behind on
   lossless items is disconnected instead of growing the process
+- owner close owns every accepted answer: one whose bytes were not yet
+  accepted is invalidated (``OWNER_CLOSED``) and writes nothing; one whose
+  bytes were accepted settles before shutdown; ``close()`` awaits all of them
+  (bounded) and reports unsettled interactions, not just pending ones
 
 Deliberately NOT here (supervisor policy, gated on #165's production-mount and
 budget evidence): session<->process placement, pooling or sharding, capacity,
@@ -96,6 +100,7 @@ JSONRPC_INTERNAL_ERROR = -32603
 
 RUNTIME_LOST = "RUNTIME_LOST"
 SERVER_RESOLVED = "SERVER_RESOLVED"
+OWNER_CLOSED = "OWNER_CLOSED"
 
 DEFAULT_CLIENT_INFO = {
     "name": "oh_my_gateway",
@@ -208,7 +213,15 @@ class PendingInteraction:
 
     @property
     def open(self) -> bool:
+        """Answerable: exactly ``pending``. A ``resolving`` interaction already
+        has an accepted answer and rejects a second one."""
         return self.state == "pending"
+
+    @property
+    def settled(self) -> bool:
+        """No transport-owned work remains: neither awaiting an answer nor
+        carrying an accepted answer that has not finished committing."""
+        return self.state not in ("pending", "resolving")
 
 
 @dataclass(frozen=True)
@@ -347,6 +360,7 @@ class AppServerTransport:
         self._writer_since: Optional[float] = None  # when the current lock holder took the writer
         self._orphaned_requests: Dict[str, str] = {}  # request id -> method, caller gone after bytes began
         self._orphan_delivered: set[str] = set()  # ids whose orphan the reader already fanned out
+        self._interaction_commits: set[asyncio.Task] = set()  # accepted answers not yet settled
         self._committed_writes: set[asyncio.Task] = set()
         self._waiters: Dict[str, asyncio.Future] = {}
         self._waiter_methods: Dict[str, str] = {}
@@ -584,7 +598,15 @@ class AppServerTransport:
 
     @property
     def pending_interactions(self) -> List[PendingInteraction]:
+        """Interactions still awaiting an answer."""
         return [i for i in self._interactions.values() if i.open]
+
+    @property
+    def unsettled_interactions(self) -> List[PendingInteraction]:
+        """Interactions with transport-owned work outstanding: awaiting an
+        answer, or carrying an accepted answer whose commit has not settled.
+        This is what teardown must drive to zero."""
+        return [i for i in self._interactions.values() if not i.settled]
 
     @property
     def pending_waiters(self) -> int:
@@ -623,8 +645,13 @@ class AppServerTransport:
         (RUNTIME_LOST) if the runtime was lost before they could be.
         """
         interaction.state = "resolving"
-        interaction.commit = asyncio.ensure_future(self._commit_task(interaction, payload, final_state))
-        await asyncio.shield(interaction.commit)
+        commit = asyncio.ensure_future(self._commit_task(interaction, payload, final_state))
+        interaction.commit = commit
+        # Owned by the transport from this instant: close() drives it to a
+        # settled state before shutting the runtime down.
+        self._interaction_commits.add(commit)
+        commit.add_done_callback(self._interaction_commits.discard)
+        await asyncio.shield(commit)
 
     async def _commit_task(self, interaction: PendingInteraction, payload: Dict[str, Any], final_state: str) -> None:
         def _gate() -> None:
@@ -679,6 +706,23 @@ class AppServerTransport:
         self._closing = True
         proc = self._proc
         exit_code: Optional[int] = None
+        # Policy for accepted answers at owner close (explicit, tested):
+        #   * an answer whose bytes have NOT been accepted yet loses to the
+        #     close -- it is invalidated (OWNER_CLOSED) and its commit task,
+        #     which is still queued for the writer, finds the gate shut and
+        #     writes nothing;
+        #   * an answer whose bytes HAVE been accepted settles (drain completes
+        #     or terminalizes) before the runtime is shut down.
+        # Either way every accepted commit is awaited here, bounded, so no
+        # interaction-owned task outlives close() and no late write can race
+        # the closed runtime.
+        self._retire_unsent_answers(OWNER_CLOSED)
+        if self._interaction_commits:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*self._interaction_commits, return_exceptions=True),
+                    self.write_timeout_s + 1.0,
+                )
         if self._committed_writes:
             # A write that has begun finishes (or terminalizes) before teardown
             # starts pulling the process out from under it. Bounded: a committed
@@ -724,7 +768,10 @@ class AppServerTransport:
             "exit_code": exit_code,
             "reason": self._terminal.reason if self._terminal else "closed",
             "pending_waiters": len(self._waiters),
-            "pending_interactions": len(self.pending_interactions),
+            # Counts unsettled interactions: awaiting an answer OR carrying an
+            # accepted answer that never settled. Must be 0 after close().
+            "pending_interactions": len(self.unsettled_interactions),
+            "unsettled_interaction_commits": len(self._interaction_commits),
             "running_descendants": len(running),
             "running_descendant_pids": running,
         }
@@ -1164,6 +1211,9 @@ class AppServerTransport:
             if interaction.open:
                 interaction.state = "invalidated"
                 interaction.invalidation_reason = RUNTIME_LOST
+        # An accepted answer whose bytes were never accepted by the runtime can
+        # no longer be delivered either; its commit task's gate finds it shut.
+        self._retire_unsent_answers(RUNTIME_LOST)
         for task in list(self._interaction_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -1175,6 +1225,12 @@ class AppServerTransport:
             # owned process group must not keep running until some caller
             # remembers close(). Teardown is transport-owned and bounded.
             self._reap_task = asyncio.ensure_future(self._reap_after_loss())
+
+    def _retire_unsent_answers(self, reason: str) -> None:
+        for interaction in self._interactions.values():
+            if interaction.state == "resolving" and not interaction.wire_committed:
+                interaction.state = "invalidated"
+                interaction.invalidation_reason = reason
 
     async def _reap_after_loss(self) -> None:
         try:
