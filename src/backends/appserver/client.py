@@ -43,6 +43,8 @@ from src.backends.appserver.interactions import (
     answer_result_from_output,
     interaction_arguments,
 )
+from src.backends.appserver.isolation import ISOLATION_ENV_REMOVE, build_isolated_env
+from src.backends.appserver.policy import resolve_runtime_policy
 from src.backends.appserver.transport import (
     AppServerTransport,
     Notification,
@@ -142,6 +144,8 @@ class AppServerSessionClient(SessionHandle):
         model: Optional[str],
         cwd: Optional[str],
         permission_mode: Optional[str],
+        approval_policy: str,
+        sandbox: str,
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]],
         model_params: Optional[Dict[str, Any]],
@@ -153,6 +157,10 @@ class AppServerSessionClient(SessionHandle):
         self.model = model
         self.cwd = cwd
         self.permission_mode = permission_mode
+        # Resolved once at create time (issue §7): the turn reuses the same
+        # approval/sandbox policy the thread was started under.
+        self.approval_policy = approval_policy
+        self.sandbox = sandbox
         self.allowed_tools = allowed_tools
         self.disallowed_tools = disallowed_tools
         self.model_params = model_params
@@ -177,9 +185,7 @@ class AppServerSessionClient(SessionHandle):
 
     def turn_params(self) -> Dict[str, Any]:
         """``turn/start`` params (minus ``threadId``/``input``) for this handle."""
-        params: Dict[str, Any] = {
-            "approvalPolicy": _resolve_approval_policy(self.permission_mode)
-        }
+        params: Dict[str, Any] = {"approvalPolicy": self.approval_policy}
         if self.model:
             params["model"] = self.model
         if self.cwd:
@@ -245,12 +251,36 @@ class AppServerCodexClient(TokenEstimateMixin):
         resumes; otherwise a fresh thread is started.
         """
         generation = getattr(session, "turn_counter", 0) + 1
-        env = self._build_subprocess_env(extra_env)
+
+        # Resolve the canonical capability policy BEFORE spawning: a requested
+        # deny that no Codex setting can enforce (e.g. shell.execute) raises
+        # CapabilityError here, so session creation fails closed (HTTP 503)
+        # rather than running with the denied capability silently available.
+        runtime_policy = resolve_runtime_policy(
+            default_sandbox=sandbox_mode(),
+            default_approval=_resolve_approval_policy(permission_mode),
+            disallowed_tools=disallowed_tools,
+        )
+
+        # Per-user isolation (issue §6): a dedicated process (C0), a per-user
+        # workspace (cwd), a per-user CODEX_HOME, and sibling-backend secrets
+        # stripped from the child environment.
+        env = build_isolated_env(
+            auth_env=self._auth_provider.build_env(),
+            extra_env=extra_env,
+            user=getattr(session, "user", None),
+            session_id=getattr(session, "session_id", None),
+            metadata_allowlist=self._metadata_allowlist(),
+        )
+        env_remove = ISOLATION_ENV_REMOVE | frozenset(
+            self._auth_provider.get_isolation_vars()
+        )
         transport = AppServerTransport(
             app_server_argv(),
             generation=generation,
             cwd=cwd,
             env=env or None,
+            env_remove=env_remove,
         )
         try:
             await transport.start()
@@ -258,7 +288,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 model=model,
                 cwd=cwd,
                 system_prompt=combine_system_prompt(_custom_base, system_prompt),
-                permission_mode=permission_mode,
+                runtime_policy=runtime_policy,
                 mcp_servers=mcp_servers,
             )
             durable_thread_id = getattr(session, "codex_thread_id", None)
@@ -287,6 +317,8 @@ class AppServerCodexClient(TokenEstimateMixin):
             model=model,
             cwd=cwd,
             permission_mode=permission_mode,
+            approval_policy=runtime_policy["approvalPolicy"],
+            sandbox=runtime_policy["sandbox"],
             allowed_tools=list(allowed_tools) if allowed_tools is not None else None,
             disallowed_tools=(
                 list(disallowed_tools) if disallowed_tools is not None else None
@@ -590,17 +622,10 @@ class AppServerCodexClient(TokenEstimateMixin):
 
     # -- helpers -----------------------------------------------------------
 
-    def _build_subprocess_env(
-        self, extra_env: Optional[Dict[str, str]]
-    ) -> Dict[str, str]:
-        env = dict(self._auth_provider.build_env())
-        if extra_env:
-            from src.constants import METADATA_ENV_ALLOWLIST
+    def _metadata_allowlist(self) -> frozenset:
+        from src.constants import METADATA_ENV_ALLOWLIST
 
-            for key, value in extra_env.items():
-                if key in METADATA_ENV_ALLOWLIST and isinstance(value, str):
-                    env[key] = value
-        return env
+        return frozenset(METADATA_ENV_ALLOWLIST)
 
     def _thread_params(
         self,
@@ -608,12 +633,12 @@ class AppServerCodexClient(TokenEstimateMixin):
         model: Optional[str],
         cwd: Optional[str],
         system_prompt: Optional[str],
-        permission_mode: Optional[str],
+        runtime_policy: Dict[str, Any],
         mcp_servers: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
         params: Dict[str, Any] = {
-            "approvalPolicy": _resolve_approval_policy(permission_mode),
-            "sandbox": sandbox_mode(),
+            "approvalPolicy": runtime_policy["approvalPolicy"],
+            "sandbox": runtime_policy["sandbox"],
         }
         if model:
             params["model"] = model
