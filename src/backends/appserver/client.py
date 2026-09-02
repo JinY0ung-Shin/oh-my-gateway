@@ -431,6 +431,10 @@ class AppServerCodexClient(TokenEstimateMixin):
                     subscription.get(), timeout=request_timeout_s()
                 )
             except (TimeoutError, asyncio.TimeoutError):
+                for chunk in mapper.drain_open_subagents(
+                    "killed" if cancelling else "failed"
+                ):
+                    yield chunk
                 self._end_turn(client)
                 if cancelling:
                     yield _gateway_interrupt_chunk("Codex turn interrupted")
@@ -442,6 +446,8 @@ class AppServerCodexClient(TokenEstimateMixin):
                 # A terminal turn/completed while cancelling becomes an
                 # incomplete (user_cancelled) instead of a normal completion.
                 if cancelling and self._is_turn_completed(item, turn_id):
+                    for chunk in mapper.drain_open_subagents("killed"):
+                        yield chunk
                     self._end_turn(client)
                     yield _gateway_interrupt_chunk("Codex turn interrupted")
                     return
@@ -472,6 +478,11 @@ class AppServerCodexClient(TokenEstimateMixin):
                 continue
 
             if isinstance(item, TerminalEvent):
+                # Parent runtime loss terminalizes every open child row.
+                for chunk in mapper.drain_open_subagents(
+                    "killed" if cancelling else "failed"
+                ):
+                    yield chunk
                 self._end_turn(client)
                 if cancelling:
                     yield _gateway_interrupt_chunk("Codex turn interrupted")
@@ -480,6 +491,8 @@ class AppServerCodexClient(TokenEstimateMixin):
                 return
 
             if isinstance(item, SubscriberOverflow):
+                for chunk in mapper.drain_open_subagents("failed"):
+                    yield chunk
                 self._end_turn(client)
                 yield error_chunk("Codex event stream overflowed")
                 return

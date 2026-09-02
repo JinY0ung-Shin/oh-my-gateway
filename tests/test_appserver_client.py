@@ -669,3 +669,135 @@ async def test_route_aclose_after_park_keeps_turn_live_for_resume(
         assert resumed[-1]["result"] == "ok"
     finally:
         await handle.disconnect()
+
+
+# -- subagents (PR C) --------------------------------------------------------
+
+
+async def test_subagent_spawn_and_completion_stream_as_task_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "child-1",
+                            "parentThreadId": "thread-1",
+                            "role": "explorer",
+                        }
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "type": "subAgentActivity",
+                            "threadId": "child-1",
+                            "state": "completed",
+                        }
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "done",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "spawn", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    started = next(c for c in chunks if c.get("subtype") == "task_started")
+    assert started["task_id"] == "child-1"
+    assert started["parent_tool_use_id"] == "thread-1"
+    assert started["subagent_type"] == "explorer"
+    notified = next(c for c in chunks if c.get("subtype") == "task_notification")
+    assert notified["task_id"] == "child-1"
+    assert notified["status"] == "completed"
+    assert chunks[-1]["result"] == "done"
+
+
+async def test_runtime_loss_terminalizes_open_child_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {"id": "child-1", "parentThreadId": "thread-1"}
+                    },
+                }
+            ),
+            {"type": "exit", "code": 1},
+        ],
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "spawn", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # The open child was terminalized before the turn's error terminal, so no
+    # forever-running row is left behind.
+    task_updates = [c for c in chunks if c.get("subtype") == "task_updated"]
+    assert any(
+        c["task_id"] == "child-1" and c["status"] == "failed" for c in task_updates
+    )
+    assert chunks[-1]["type"] == "error"

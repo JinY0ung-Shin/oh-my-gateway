@@ -25,6 +25,7 @@ import json
 from typing import Any, Dict, Iterator, List, Optional
 
 from src.backends.common import completion_chunks, error_chunk
+from src.backends.appserver.subagents import SubAgentEvent, normalize_subagent_event
 
 # Native item types the adapter surfaces as tool activity. Everything else is
 # either visible text (``agentMessage``), reasoning, or accumulation-only.
@@ -99,6 +100,10 @@ class TurnMapper:
         self._in_reasoning = False
         self._finished = False
         self._errored = False
+        # Live child subagents (child thread id -> parent thread id), so a turn
+        # that terminalizes with children still open never leaves a
+        # forever-running task row in the UI (issue §5).
+        self._open_subagents: Dict[str, Optional[str]] = {}
 
     # -- public API --------------------------------------------------------
 
@@ -125,6 +130,14 @@ class TurnMapper:
         notification_turn_id = params.get("turnId")
         if turn is not None:
             notification_turn_id = turn.get("id") or notification_turn_id
+
+        # Subagent lifecycle is handled BEFORE the turn-id gate: child threads
+        # run their own turns, so their notifications carry a different turnId
+        # and would otherwise be dropped as sibling-turn traffic.
+        subagent = normalize_subagent_event(method, params)
+        if subagent is not None:
+            yield from self._map_subagent(subagent)
+            return
 
         # Thread-idle is a terminal fallback for a turn that never emitted an
         # explicit ``turn/completed`` (matches the frozen backend's safety net).
@@ -183,6 +196,7 @@ class TurnMapper:
         if method == "turn/completed":
             if isinstance(turn, dict) and turn.get("status") == "failed":
                 yield from self._close_reasoning()
+                yield from self.drain_open_subagents("failed")
                 self._finished = True
                 self._errored = True
                 yield error_chunk(self._turn_error_message(turn))
@@ -195,9 +209,83 @@ class TurnMapper:
         if self._finished:
             return
         yield from self._close_reasoning()
+        # A clean turn end with children still open is anomalous; retire them as
+        # ``stopped`` so no task row is left running forever.
+        yield from self.drain_open_subagents("stopped")
         self._finished = True
         final_text = self._final_response_from_items() or ""
         yield from completion_chunks(final_text, self._usage)
+
+    # -- subagent mapping -------------------------------------------------
+
+    def _map_subagent(self, event: SubAgentEvent) -> Iterator[Dict[str, Any]]:
+        """Map a normalized subagent event into canonical ``task_*`` chunks.
+
+        Child identity (``task_id``) and the parent thread id are preserved so
+        nested agents render under the correct parent; absent fields stay absent.
+        """
+        if event.kind == "spawned":
+            if event.child_id in self._open_subagents:
+                yield self._task_chunk("task_progress", event)
+                return
+            self._open_subagents[event.child_id] = event.parent_id
+            yield self._task_chunk("task_started", event)
+            return
+        if event.kind == "progress":
+            yield self._task_chunk("task_progress", event)
+            return
+        # terminal
+        self._open_subagents.pop(event.child_id, None)
+        status = event.status or "stopped"
+        if status == "completed":
+            yield self._task_chunk("task_notification", event, status=status)
+        else:
+            yield self._task_chunk("task_updated", event, status=status)
+
+    def drain_open_subagents(self, status: str) -> Iterator[Dict[str, Any]]:
+        """Terminalize every still-open child (turn ended / interrupted / lost).
+
+        Emits one ``task_updated`` per open child so the UI never shows a
+        forever-running descendant row. Idempotent: the open set is cleared.
+        """
+        if not self._open_subagents:
+            return
+        open_children = list(self._open_subagents.items())
+        self._open_subagents.clear()
+        for child_id, parent_id in open_children:
+            yield self._task_chunk(
+                "task_updated",
+                SubAgentEvent(kind="terminal", child_id=child_id, parent_id=parent_id),
+                status=status,
+            )
+
+    def _task_chunk(
+        self,
+        subtype: str,
+        event: SubAgentEvent,
+        *,
+        status: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        chunk: Dict[str, Any] = {
+            "type": "system",
+            "subtype": subtype,
+            "task_id": event.child_id,
+            "task_type": "local_agent",
+            # Nest under the parent thread: the route surfaces
+            # ``parent_tool_use_id`` as the attribution node, and Codex nests by
+            # thread tree, so the parent thread id is the correct node id.
+            "parent_tool_use_id": event.parent_id,
+        }
+        if event.description is not None:
+            chunk["description"] = event.description
+        if event.role is not None:
+            chunk["subagent_type"] = event.role
+        if subtype == "task_notification":
+            chunk["status"] = status or "completed"
+        elif subtype == "task_updated":
+            chunk["status"] = status
+            chunk["patch"] = {"status": status}
+        return chunk
 
     # -- reasoning block bookkeeping --------------------------------------
 
