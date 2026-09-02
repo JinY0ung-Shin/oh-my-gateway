@@ -18,6 +18,7 @@ Contract (what FileNav calls):
 - ``POST /files/mkdir``  {path}       -> ``{path}``
 - ``DELETE /files/delete?path=<p>``   -> ``{path,type}``
 - ``POST /files/move``  {source,destination} -> ``{source,destination}``
+- ``POST /files/copy``  {source,destination,overwrite?} -> ``{source,destination,type}``
 - ``POST /files/archive`` {paths}     -> zip stream
 
 Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
@@ -78,6 +79,15 @@ class _PathBody(BaseModel):
 class _MoveBody(BaseModel):
     source: str
     destination: str
+
+
+class _CopyBody(BaseModel):
+    source: str
+    destination: str
+    # Copying is the one write that a client routinely issues speculatively (a
+    # paste into a folder that may already hold that name), so refusing an
+    # existing destination is the default and clobbering must be asked for.
+    overwrite: bool = False
 
 
 class _ArchiveBody(BaseModel):
@@ -580,6 +590,76 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="destination directory not found")
     await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
+
+
+@router.post("/files/copy")
+async def copy_entry(
+    request: Request,
+    body: _CopyBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Copy a file or directory within the workspace.
+
+    Deliberately stricter than ``/files/move`` in three ways, because a copy can
+    do damage a move cannot:
+
+    - **Existing destination is refused** (409) unless ``overwrite`` is set. A
+      paste is issued speculatively, so silently clobbering is the wrong default.
+    - **A directory cannot be copied into itself or a descendant** (400).
+      ``copytree`` would otherwise recurse into the copy it is writing and fill
+      the disk.
+    - **Symlinks inside a copied tree are preserved as links, never followed**
+      (``symlinks=True``). Following them would materialize content from outside
+      the workspace *inside* it, where it becomes readable through
+      ``/files/read`` — an escape by copy. ``_resolve_or_403`` already resolves
+      the source itself, so only the tree's interior needs this.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    src = _resolve_or_403(root, body.source)
+    dst = _resolve_or_403(root, body.destination)
+    if src == root.resolve() or dst == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source not found")
+    if src == dst:
+        raise HTTPException(
+            status_code=400, detail="source and destination are the same"
+        )
+    if not dst.parent.is_dir():
+        raise HTTPException(status_code=404, detail="destination directory not found")
+
+    is_dir = src.is_dir()
+    if is_dir and _is_under(dst, src):
+        raise HTTPException(
+            status_code=400, detail="cannot copy a directory into itself"
+        )
+    if dst.exists():
+        if not body.overwrite:
+            raise HTTPException(status_code=409, detail="destination already exists")
+        # A tree can only replace a tree and a file only a file; letting a
+        # directory land on a file (or the reverse) makes the result depend on
+        # rmtree/unlink ordering rather than on what the caller asked for.
+        if dst.is_dir() != is_dir:
+            raise HTTPException(
+                status_code=409, detail="destination is a different kind of entry"
+            )
+        if dst.is_dir():
+            await run_in_threadpool(shutil.rmtree, dst)
+
+    # Deflating/walking a large tree takes seconds — keep it off the event loop.
+    if is_dir:
+        await run_in_threadpool(
+            lambda: shutil.copytree(src, dst, symlinks=True, dirs_exist_ok=False)
+        )
+    else:
+        await run_in_threadpool(shutil.copy2, src, dst)
+    return {
+        "source": body.source,
+        "destination": body.destination,
+        "type": "directory" if is_dir else "file",
+    }
 
 
 @router.post("/files/archive")

@@ -1,5 +1,6 @@
 """Tests for the Open Terminal-compatible read-only workspace file server."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -504,3 +505,140 @@ def test_serve_hidden_file_is_404_when_enabled(client, workspace, monkeypatch):
     d = str(workspace.resolve())
     r = client.get(f"/files/serve{d}/.env", headers={**_AUTH, **_USER})
     assert r.status_code == 404
+
+
+def test_copy_file(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/notes copy.txt"},
+    )
+    assert r.status_code == 200
+    assert r.json()["type"] == "file"
+    # The original survives — that is the whole difference from /files/move.
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"
+    assert (workspace / "notes copy.txt").read_text() == "hello\nworld\n"
+
+
+def test_copy_preserves_binary_bytes(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/blob.bin", "destination": "/sub/blob.bin"},
+    )
+    assert r.status_code == 200
+    assert (workspace / "sub" / "blob.bin").read_bytes() == b"\xff\xfe\x00\x01binary"
+
+
+def test_copy_directory_recursive(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub-copy"},
+    )
+    assert r.status_code == 200
+    assert r.json()["type"] == "directory"
+    assert (workspace / "sub-copy" / "inner.md").read_text() == "# inner"
+    assert (workspace / "sub" / "inner.md").exists()
+
+
+def test_copy_refuses_existing_destination(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin"},
+    )
+    assert r.status_code == 409
+    # Untouched: a speculative paste must not clobber on its own.
+    assert (workspace / "blob.bin").read_bytes() == b"\xff\xfe\x00\x01binary"
+
+
+def test_copy_overwrites_only_when_asked(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={
+            "source": "/notes.txt",
+            "destination": "/blob.bin",
+            "overwrite": True,
+        },
+    )
+    assert r.status_code == 200
+    assert (workspace / "blob.bin").read_text() == "hello\nworld\n"
+
+
+def test_copy_refuses_crossing_file_and_directory(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/sub", "overwrite": True},
+    )
+    assert r.status_code == 409
+    assert (workspace / "sub").is_dir()
+    assert (workspace / "sub" / "inner.md").exists()
+
+
+def test_copy_directory_into_own_descendant_blocked(client, workspace):
+    """copytree would recurse into the copy it is writing and fill the disk."""
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub/nested"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "sub" / "nested").exists()
+
+
+def test_copy_onto_itself_blocked(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/notes.txt", "overwrite": True},
+    )
+    assert r.status_code == 400
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"
+
+
+def test_copy_traversal_blocked(client, workspace, tmp_path):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/../secret.txt", "destination": "/stolen.txt"},
+    )
+    assert r.status_code in (400, 403, 404)
+    assert not (workspace / "stolen.txt").exists()
+
+
+def test_copy_destination_traversal_blocked(client, workspace, tmp_path):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/../leaked.txt"},
+    )
+    assert r.status_code in (400, 403)
+    assert not (tmp_path / "leaked.txt").exists()
+
+
+def test_copy_tree_does_not_follow_symlinks_out_of_workspace(client, workspace, tmp_path):
+    """A followed symlink would pull outside content in, where /files/read sees it."""
+    (workspace / "sub" / "escape").symlink_to(tmp_path / "secret.txt")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub-copy"},
+    )
+    assert r.status_code == 200
+    copied = workspace / "sub-copy" / "escape"
+    # Copied AS a link. A followed symlink would arrive as a regular file
+    # holding the outside bytes, which /files/read would then hand out.
+    assert copied.is_symlink()
+    assert os.readlink(copied) == str(tmp_path / "secret.txt")
+
+
+def test_copy_requires_auth(client):
+    r = client.post(
+        "/files/copy",
+        headers=_USER,
+        json={"source": "/notes.txt", "destination": "/x.txt"},
+    )
+    assert r.status_code in (401, 403)
