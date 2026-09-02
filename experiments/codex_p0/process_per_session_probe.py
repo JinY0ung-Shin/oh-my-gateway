@@ -58,6 +58,22 @@ def load_budget(path: Path) -> dict[str, Any]:
         raise ValueError("process_per_session_counts must be a non-empty list of positive integers")
     if budget["maximum_orphan_descendants_after_hard_kill"] != 0:
         raise ValueError("#163 requires maximum_orphan_descendants_after_hard_kill to be exactly 0")
+
+    live = int(budget["expected_concurrent_live_sessions"])
+    parked = int(budget["expected_parked_human_interactions"])
+    if live <= 0:
+        raise ValueError("expected_concurrent_live_sessions must be > 0")
+    if parked < 0:
+        raise ValueError("expected_parked_human_interactions must be >= 0")
+    if max(counts) < live:
+        raise ValueError(
+            "process_per_session_counts must include a count at least as large as "
+            "expected_concurrent_live_sessions"
+        )
+    if parked > 0 and max(counts) < parked:
+        raise ValueError(
+            "process_per_session_counts must cover expected_parked_human_interactions"
+        )
     return budget
 
 
@@ -131,7 +147,12 @@ def measure_idle_cpu(servers: list[AppServer], seconds: float) -> dict[str, Any]
     try:
         ticks_per_second = float(os.sysconf(os.sysconf_names["SC_CLK_TCK"]))
     except (AttributeError, KeyError, OSError, ValueError):
-        return {"elapsed_s": elapsed, "aggregate_cpu_percent": None, "reason": "CLK_TCK unavailable"}
+        return {
+            "elapsed_s": round(elapsed, 6),
+            "aggregate_cpu_percent": None,
+            "complete": False,
+            "reason": "CLK_TCK unavailable",
+        }
 
     delta = 0
     complete = True
@@ -151,7 +172,7 @@ def measure_idle_cpu(servers: list[AppServer], seconds: float) -> dict[str, Any]
 
 
 def stderr_tail_stats(server: AppServer) -> dict[str, Any]:
-    lines = list(server._stderr)  # experiment-owned class; this is not an upstream/private SDK access
+    lines = list(server._stderr)  # experiment-owned class; not an upstream/private SDK access
     return {
         "retained_lines": len(lines),
         "retained_bytes": sum(len(line.encode("utf-8")) + 1 for line in lines),
@@ -187,15 +208,24 @@ def evaluate(case: dict[str, Any], budget: dict[str, Any]) -> dict[str, Any]:
         ),
     }
     checks: dict[str, Any] = {}
-    overall = True
+    any_failed = False
+    any_unknown = bool(case.get("exception"))
     for name, (actual, maximum) in limits.items():
         if actual is None:
             checks[name] = {"actual": None, "maximum": maximum, "pass": None}
+            any_unknown = True
             continue
         passed = actual <= maximum
         checks[name] = {"actual": actual, "maximum": maximum, "pass": passed}
-        overall = overall and passed
-    return {"checks": checks, "pass": overall}
+        any_failed = any_failed or not passed
+
+    if any_failed:
+        status = "fail"
+    elif any_unknown:
+        status = "inconclusive"
+    else:
+        status = "pass"
+    return {"checks": checks, "status": status, "pass": status == "pass"}
 
 
 def run_case(
@@ -221,10 +251,12 @@ def run_case(
             workspace.mkdir(parents=True, exist_ok=True)
             server = AppServer(codex_bin, shared_home, cwd=workspace, timeout_s=timeout_s)
             startup_times.append(server.start())
+            # Register immediately after process start so a later thread/start
+            # failure cannot leak a live runtime past this probe's cleanup path.
+            servers.append(server)
             thread_started = time.monotonic()
             _thread_id(server.start_thread(model=model))
             thread_start_times.append(time.monotonic() - thread_started)
-            servers.append(server)
 
         runtime_pids = all_runtime_pids(servers)
         result["resource"] = aggregate_process_sample(runtime_pids)
