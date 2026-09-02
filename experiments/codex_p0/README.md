@@ -1,8 +1,18 @@
 # Codex P0 experiments
 
-This directory contains **evidence-gathering probes for issue #164**. It is intentionally outside `src/backends/codex`: the existing Codex backend is frozen/stale and must not be extended before the P0 production gate selects a replacement architecture.
+This directory contains **evidence-gathering probes for canonical issue #163**. It is intentionally outside `src/backends/codex`: the existing Codex backend is frozen/stale and must not be extended before the P0 production gate selects a replacement architecture.
 
 Parent architecture discussion: #162
+
+## P0b-0: declare deployment budgets first
+
+#163 requires resource thresholds to be fixed before measurements are interpreted. Copy and fill:
+
+```bash
+cp experiments/codex_p0/deployment_budget.example.json /tmp/codex-p0-budget.json
+```
+
+Do not leave `null` values. `process_per_session_probe.py` refuses to run with an incomplete budget. The required fields cover expected live/active/parked concurrency, memory/PID/FD limits, cold-start/resume/teardown p95 limits, idle CPU, zero tolerated orphan descendants, and the process-per-session counts to measure.
 
 ## Ownership/resource probe
 
@@ -31,11 +41,9 @@ uv run python experiments/codex_p0/ownership_probe.py \
 CODEX_P0_MODEL=<model-id> uv run python experiments/codex_p0/ownership_probe.py
 ```
 
-## What it measures
+### What it measures
 
-### Writer ownership cases
-
-Each case gets an isolated `CODEX_HOME` and durable thread:
+Each ownership case gets an isolated `CODEX_HOME` and durable thread:
 
 - `healthy_conflict`: process B attempts `thread/resume` while process A remains alive.
 - `sigstop`: A is frozen, B attempts resume, then A is continued. POSIX only.
@@ -43,18 +51,11 @@ Each case gets an isolated `CODEX_HOME` and durable thread:
 - `sigterm`: A's process group is terminated before B resumes.
 - `sigkill`: A's process group is killed before B resumes.
 
-The output records:
-
-- `thread/resume` success/error payloads
-- `thread-writer-locks` snapshots
-- app-server startup/teardown latency
-- Linux `/proc` RSS and FD counts when available
-- descendant PIDs discovered through `ps`
-- stderr tails on failure
+The output records `thread/resume` success/error payloads, `thread-writer-locks` snapshots, app-server startup/teardown latency, Linux `/proc` RSS and FD counts when available, descendant PIDs, surviving descendants after teardown, and stderr tails on failure.
 
 The probe deliberately records evidence rather than encoding expectations such as “SIGKILL must make resume succeed”. Those expectations are exactly what P0b is supposed to establish for the pinned Codex version.
 
-### Density cases
+### Thread-density cases
 
 One app-server process starts durable threads at densities `1,10,50,100` by default and records RSS/FD/descendant counts. Override with:
 
@@ -64,28 +65,57 @@ One app-server process starts durable threads at densities `1,10,50,100` by defa
 
 This is **not** a throughput benchmark: no model turns are executed. It answers only the low-level question “what does the idle runtime/thread-store footprint look like at this density?”
 
+## Process-per-session budget probe
+
+`process_per_session_probe.py` measures the B0-required topology independently from transport correctness: one app-server process per live session/thread, all using the same intended local `CODEX_HOME` store.
+
+It requires the predeclared budget file:
+
+```bash
+uv run python experiments/codex_p0/process_per_session_probe.py \
+  --codex-bin /path/to/codex \
+  --budget /tmp/codex-p0-budget.json \
+  --output artifacts/codex-p0-process-per-session.json
+```
+
+For each count in `process_per_session_counts` it records:
+
+- aggregate direct + descendant PID count
+- aggregate RSS and FD count where `/proc` is available
+- per-process cold-start timings and p95
+- idle CPU over a bounded sample window
+- retained stderr line/byte volume with truncation flag
+- teardown timings and p95
+- surviving descendant PIDs
+- mechanical pass/fail against the predeclared budget
+
+This keeps the B0-vs-C0 transport decision separate from the later C1 multiplexing question.
+
 ## Safety / interpretation
 
 Do not infer a fencing protocol merely because a second writer is rejected. The current upstream local store uses an OS file lock as a single-writer guard. P0b must separately establish what happens during `SIGSTOP/SIGCONT`, unclean death, and takeover.
 
-Until P0b proves stronger semantics, the v1 safety invariant from #164 stands:
+Until P0b proves stronger semantics, the v1 safety invariant from #163 stands:
 
 > Never move a live Codex thread to another runtime merely because the old runtime looks unhealthy. Takeover requires positive proof that the old owner is dead or has successfully relinquished its writer. If that proof is unavailable, fail availability rather than risk concurrent side effects.
 
 ## Platform notes
 
 - `SIGSTOP/SIGCONT` is skipped outside POSIX.
-- `/proc` RSS/FD sampling is Linux-specific and degrades to partial output elsewhere.
+- `/proc` RSS/FD/CPU sampling is Linux-specific and degrades to partial output elsewhere.
 - Descendant discovery uses `ps` when available.
-- Runtime cleanup signals the app-server **process group** on POSIX so descendants are included in the experiment. The report still records any descendants observed after parent exit.
+- Runtime cleanup signals the app-server **process group** on POSIX so descendants are included in the experiment.
+- Descendant PIDs are captured before parent death and checked afterward so reparenting cannot hide leaked workers.
 
-## Not covered by this probe
+## Not covered by these probes
 
-This file is only P0b support. It does not decide:
+These files are P0b support only. They do not decide:
 
-- enterprise Responses/LiteLLM compatibility (P0a)
-- Python SDK B0 parked-reader death detection (P0c)
-- direct-client C transport correctness (P0c)
-- ambiguous-turn history reconciliation (P0e)
+- P0a-1 real internal Responses/LiteLLM compatibility
+- P0a-2 isolated model-gateway fault corpus
+- Python SDK B0 correctness gates B0-1 through B0-9
+- direct-client C0 transport correctness
+- C1 shared-shard topology
+- ambiguous-turn recovery/reconciliation
 
-Those must use their own executable fixtures and must not be replaced by architectural inference from this probe.
+Those require their own executable fixtures under #163 and must not be replaced by architectural inference from these probes.
