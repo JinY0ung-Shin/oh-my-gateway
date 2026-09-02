@@ -23,6 +23,16 @@ def percentile95(values: list[float]) -> float | None:
     return ordered[max(0, math.ceil(0.95 * len(ordered)) - 1)]
 
 
+def stop_is_clean(stop: object) -> bool:
+    if not isinstance(stop, dict):
+        return False
+    return (
+        stop.get("returncode") is not None
+        and stop.get("error") is None
+        and not (stop.get("surviving_descendants") or [])
+    )
+
+
 def run_iteration(
     *,
     codex_bin: str,
@@ -61,6 +71,12 @@ def run_iteration(
         if replacement is not None:
             result["replacement_cleanup"] = replacement.stop("stdin_eof", timeout_s=timeout_s)
         result.setdefault("owner_cleanup", owner.stop("stdin_eof", timeout_s=timeout_s))
+        result["iteration_ok"] = bool(
+            result.get("resume_ok")
+            and not result.get("exception")
+            and stop_is_clean(result.get("owner_stop"))
+            and stop_is_clean(result.get("replacement_cleanup"))
+        )
     return result
 
 
@@ -116,7 +132,8 @@ def main() -> int:
             latencies = [
                 float(case["resume_latency_s"])
                 for case in cases
-                if case.get("resume_ok") and isinstance(case.get("resume_latency_s"), (int, float))
+                if case.get("iteration_ok")
+                and isinstance(case.get("resume_latency_s"), (int, float))
             ]
             p95 = percentile95(latencies)
             all_ok = len(latencies) == args.iterations
@@ -130,7 +147,7 @@ def main() -> int:
                 status = "fail"
             report["modes"][mode] = {
                 "cases": cases,
-                "successful_resumes": len(latencies),
+                "successful_clean_resumes": len(latencies),
                 "resume_p95_s": p95,
                 "status": status,
             }
