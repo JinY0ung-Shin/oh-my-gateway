@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from ownership_probe import AppServer, _thread_id, runtime_identity
-from process_per_session_probe import load_budget
+from process_per_session_probe import budget_provenance, load_budget
 
 
 def percentile95(values: list[float]) -> float | None:
@@ -168,6 +168,7 @@ def main() -> int:
         "model": args.model,
         "iterations": args.iterations,
         "budget_resume_p95_s": float(budget["acceptable_resume_p95_s"]),
+        "budget_provenance": budget_provenance(args.budget, budget),
         "prepopulated_threads_per_store": args.prepopulate_threads,
         "materialization_enabled": bool(args.materialize_upstream),
         "store_note": (

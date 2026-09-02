@@ -156,6 +156,17 @@ reaped inside the window is therefore still counted, in its parent. The sample i
 only when no consistent snapshot could be taken, a server root died, or the tree lost members to
 reparenting — never a partial sum presented as a number.
 
+### Budget provenance: a pass is only as good as the budget it was judged against
+
+Every budget-judged artifact records `budget_provenance` — the budget file path, its SHA-256,
+`deployment_budget_name` (an optional budget key; `"unlabeled"` when absent) and `finalized` (the
+optional budget key `budget_finalized`, default `false`). Per case the process-per-session evaluation
+distinguishes `passes_supplied_c0_budget` (materialized, every session completed a turn, budget
+checks pass) from `certifies_c0_topology`, which additionally requires the budget to be finalized. A
+placeholder budget can therefore make every check pass mechanically and still never produce a
+certification; the production statement belongs in #163/#170 after the real deployment budget and
+production-mount run.
+
 ### Provenance in every artifact
 
 Each of the three probes records `runtime` — `codex_bin`, `resolved_path`, `sha256`, `size_bytes`,

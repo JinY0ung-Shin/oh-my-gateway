@@ -9,6 +9,7 @@ modify or depend on the frozen production Codex backend.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -42,6 +43,25 @@ _REQUIRED_BUDGET_FIELDS = (
     "maximum_orphan_descendants_after_hard_kill",
     "process_per_session_counts",
 )
+
+
+def budget_provenance(path: Path, budget: dict[str, Any]) -> dict[str, Any]:
+    """Identity of the budget every verdict in the artifact was judged against.
+
+    A locally filled placeholder budget can make every check pass mechanically,
+    so the JSON must be impossible to quote out of context: it names the budget
+    file, its SHA-256, the deployment it claims to describe
+    (`deployment_budget_name`, default "unlabeled") and whether the budget is
+    `budget_finalized`. Topology certification is asserted only when the budget
+    itself is finalized; otherwise a pass is `passes_supplied_c0_budget` and no
+    more.
+    """
+    return {
+        "path": str(path),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        "deployment_budget_name": budget.get("deployment_budget_name") or "unlabeled",
+        "finalized": bool(budget.get("budget_finalized", False)),
+    }
 
 
 def load_budget(path: Path) -> dict[str, Any]:
@@ -397,6 +417,7 @@ def run_case(
     budget: dict[str, Any],
     teardown_mode: str = "sigkill",
     materialize_upstream: str | None = None,
+    budget_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     case_root = root / f"process-per-session-{count}"
     shared_home = case_root / "codex-home"
@@ -479,10 +500,18 @@ def run_case(
         materialized_ok = mode == "materialized" and result["materialized_count"] == count
         evaluation["materialized_all_sessions"] = materialized_ok
         # Only a materialized run in which every session completed a turn can
-        # certify the 1 process : 1 live durable session topology. An
+        # satisfy the 1 process : 1 live durable session budget. An
         # unmaterialized pass is a lower bound and must not satisfy the budget.
-        evaluation["certifies_c0_topology"] = bool(
+        evaluation["passes_supplied_c0_budget"] = bool(
             materialized_ok and evaluation.get("status") == "pass"
+        )
+        # ...and even that only becomes a topology certification when the budget
+        # it was judged against is the finalized deployment budget, not a
+        # placeholder. The budget identity rides along so neither can be quoted
+        # without the other.
+        evaluation["budget"] = budget_meta or {"finalized": False, "deployment_budget_name": "unlabeled"}
+        evaluation["certifies_c0_topology"] = bool(
+            evaluation["passes_supplied_c0_budget"] and evaluation["budget"]["finalized"]
         )
         result["evaluation"] = evaluation
     return result
@@ -531,8 +560,10 @@ def main() -> int:
         root = Path(cleanup.name)
 
     runtime = runtime_identity(args.codex_bin)
+    budget_meta = budget_provenance(args.budget, budget)
     report = {
         "budget": budget,
+        "budget_provenance": budget_meta,
         "codex_bin": args.codex_bin,
         "codex_version": runtime["codex_version"],
         "runtime": runtime,
@@ -558,6 +589,7 @@ def main() -> int:
                     budget=budget,
                     teardown_mode=args.teardown_mode,
                     materialize_upstream=args.materialize_upstream,
+                    budget_meta=budget_meta,
                 )
             )
     finally:
