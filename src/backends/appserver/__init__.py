@@ -10,6 +10,7 @@ from src.backends.appserver.transport import (
     SERVER_REQUEST_RESOLVED,
     SERVER_RESOLVED,
     SUPPORTED_SERVER_REQUESTS,
+    AmbiguousRequest,
     AppServerTransport,
     HandshakeError,
     Notification,
@@ -26,6 +27,7 @@ from src.backends.appserver.transport import (
 )
 
 __all__ = [
+    "AmbiguousRequest",
     "AppServerTransport",
     "DEFAULT_SUPPORTED_SERVER_REQUESTS",
     "HandshakeError",

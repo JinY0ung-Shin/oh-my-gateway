@@ -19,6 +19,7 @@ import pytest
 
 from src.backends.appserver import (
     OWNER_CLOSED,
+    AmbiguousRequest,
     RUNTIME_LOST,
     SERVER_RESOLVED,
     AppServerTransport,
@@ -1557,3 +1558,68 @@ async def test_concurrent_closers_share_one_teardown(tmp_path):
     assert signals.count(signal.SIGTERM) <= 1 and signals.count(signal.SIGKILL) <= 1
     with pytest.raises(RuntimeLost):
         await probe
+
+
+# ---------------------------------------------------------------------------
+# an orphaned (committed, unanswered) request reaches one terminal outcome
+# when the generation ends -- runtime loss or owner close alike
+# ---------------------------------------------------------------------------
+
+
+async def test_orphan_without_response_is_surfaced_as_ambiguous_on_runtime_loss(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "turn/start", "actions": [{"type": "sleep", "seconds": 0.5}, {"type": "exit", "code": 9}]}],
+    )
+    events = transport.subscribe()
+    with pytest.raises(asyncio.TimeoutError):
+        await transport.request("turn/start", {"threadId": "thread-1"}, timeout=0.15)
+    assert list(transport._orphaned_requests.values()) == ["turn/start"]
+    # The server dies before ever answering.
+    first = await _next(events)
+    assert isinstance(first, AmbiguousRequest), first  # BEFORE the terminal event
+    assert first.method == "turn/start" and first.terminal_reason in {"exit", "eof"}
+    terminal = await _next(events)
+    assert isinstance(terminal, TerminalEvent) and terminal.exit_code == 9
+    assert transport._orphaned_requests == {}
+    await asyncio.sleep(0.1)
+    assert not any(isinstance(events.get_nowait(), AmbiguousRequest) for _ in range(events.qsize()))
+    report = await transport.close()
+    assert report["unresolved_orphans"] == 0 and report["pending_waiters"] == 0
+
+
+async def test_orphan_without_response_is_surfaced_as_ambiguous_on_owner_close(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "turn/start", "actions": [{"type": "sleep", "seconds": 30}]}],
+    )
+    events = transport.subscribe()
+    with pytest.raises(asyncio.TimeoutError):
+        await transport.request("turn/start", {"threadId": "thread-1"}, timeout=0.15)
+    assert list(transport._orphaned_requests.values()) == ["turn/start"]
+    report = await asyncio.wait_for(transport.close(grace_s=0.5), HEALTHY_S)
+    first = await _next(events)
+    assert isinstance(first, AmbiguousRequest) and first.method == "turn/start"
+    assert first.terminal_reason == "closed"
+    assert isinstance(await _next(events), TerminalEvent)
+    assert report["unresolved_orphans"] == 0
+    assert transport._orphaned_requests == {}
+
+
+async def test_orphan_that_does_get_its_response_is_not_also_ambiguous(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "turn/start", "actions": [{"type": "sleep", "seconds": 0.4}, TURN_START_RESPONSE, {"type": "exit", "code": 0}]}],
+    )
+    events = transport.subscribe()
+    with pytest.raises(asyncio.TimeoutError):
+        await transport.request("turn/start", {"threadId": "thread-1"}, timeout=0.15)
+    items = []
+    while True:
+        item = await _next(events)
+        items.append(item)
+        if isinstance(item, TerminalEvent):
+            break
+    kinds = [type(i).__name__ for i in items]
+    assert kinds.count("OrphanedResponse") == 1 and kinds.count("AmbiguousRequest") == 0, kinds
+    await transport.close()

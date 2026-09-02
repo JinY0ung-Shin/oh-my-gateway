@@ -38,7 +38,10 @@ nothing else:
   writer mid-drain and does not lose the outcome: the transport finishes the
   write and fans the response out as ``OrphanedResponse`` -- whether it had
   already landed on the abandoned waiter or arrives later -- so the owner
-  layer can reconcile a stateful call such as ``turn/start``
+  layer can reconcile a stateful call such as ``turn/start``; if the
+  generation ends first, that request is surfaced ONCE as
+  ``AmbiguousRequest`` (before the ``TerminalEvent``) -- accepted work with
+  no observed outcome, to be reconciled against durable state, never replayed
 - bounded subscribers: streaming deltas are droppable for a slow consumer,
   lossless items are not, and a consumer that falls too far behind on
   lossless items is disconnected instead of growing the process
@@ -243,6 +246,21 @@ class OrphanedResponse:
 
 
 @dataclass(frozen=True)
+class AmbiguousRequest:
+    """A request whose bytes were accepted by the runtime and whose caller had
+    already left (cancelled, or response deadline expired) received NO JSON-RPC
+    response before the generation ended. The work may or may not have
+    happened. This is not an ordinary RPC failure: the owner must reconcile
+    against durable state (read the thread, resume) and never blindly replay.
+    Delivered exactly once, before the ``TerminalEvent``."""
+
+    request_id: str
+    method: str
+    generation: int
+    terminal_reason: str
+
+
+@dataclass(frozen=True)
 class SubscriberOverflow:
     """Delivered once to a subscriber that fell too far behind on lossless
     items; the subscription is disconnected and receives nothing further."""
@@ -252,7 +270,9 @@ class SubscriberOverflow:
     generation: int
 
 
-SubscriberItem = Union[Notification, PendingInteraction, TerminalEvent, SubscriberOverflow, OrphanedResponse]
+SubscriberItem = Union[
+    Notification, PendingInteraction, TerminalEvent, SubscriberOverflow, OrphanedResponse, AmbiguousRequest
+]
 InteractionHandler = Callable[[PendingInteraction], Awaitable[Dict[str, Any]]]
 
 
@@ -550,12 +570,29 @@ class AppServerTransport:
             elif isinstance(exc, RpcError):
                 error = {"code": exc.code, "message": exc.rpc_message, "data": exc.data}
             else:
-                # RuntimeLost: the generation is gone; the TerminalEvent already
-                # told every subscriber, nothing further to reconcile.
+                # RuntimeLost while the caller was leaving: the request was
+                # committed and the generation is gone -- ambiguous accepted
+                # work, surfaced as such (the caller itself sees RuntimeLost).
+                self._fanout(
+                    AmbiguousRequest(
+                        request_id=request_id,
+                        method=method,
+                        generation=self.generation,
+                        terminal_reason=self._terminal.reason if self._terminal else "lost",
+                    )
+                )
                 return
             self._fanout(
                 OrphanedResponse(
                     request_id=request_id, method=method, result=result, error=error, generation=self.generation
+                )
+            )
+            return
+        if self._terminal is not None:
+            # No response can arrive any more: terminal outcome right now.
+            self._fanout(
+                AmbiguousRequest(
+                    request_id=request_id, method=method, generation=self.generation, terminal_reason=self._terminal.reason
                 )
             )
             return
@@ -796,6 +833,9 @@ class AppServerTransport:
             # accepted answer that never settled. Must be 0 after close().
             "pending_interactions": len(self.unsettled_interactions),
             "unsettled_interaction_commits": len(self._interaction_commits),
+            # Committed-but-unanswered requests still unaccounted for; every one
+            # was surfaced as AmbiguousRequest at terminalization, so this is 0.
+            "unresolved_orphans": len(self._orphaned_requests),
             "running_descendants": len(running),
             "running_descendant_pids": running,
         }
@@ -1287,6 +1327,18 @@ class AppServerTransport:
             if not task.done():
                 task.cancel()
         self._interaction_tasks.clear()
+        # Every committed request whose caller left and that never got its
+        # response reaches ONE terminal outcome, delivered before the terminal
+        # event (a subscriber may stop consuming after it): ambiguous accepted
+        # work for the owner to reconcile, never silently dropped.
+        for request_id, method in list(self._orphaned_requests.items()):
+            self._fanout(
+                AmbiguousRequest(
+                    request_id=request_id, method=method, generation=self.generation, terminal_reason=reason
+                )
+            )
+        self._orphaned_requests.clear()
+        self._orphan_delivered.clear()
         self._fanout(event)
         if reason != "closed" and self._reap_task is None:
             # Unexpected loss: once stdout/stdin is unusable the gateway can no
