@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ownership_probe import AppServer, _thread_id
+from ownership_probe import AppServer, _thread_id, runtime_identity
 from process_per_session_probe import load_budget
 
 
@@ -59,9 +59,25 @@ def run_iteration(
         # holding a realistic number of threads, not a single one. Store-size
         # effects (thread index scan, first-acquire stale-lock cleanup) are
         # invisible on a one-thread store.
+        # Each prepopulated thread must be MATERIALIZED, not merely started:
+        # thread/start persists no rollout, so N unmaterialized starts leave the
+        # durable store at one thread and the store-size variant measures
+        # nothing. Requested and materialized counts are both recorded and a
+        # mismatch fails the iteration rather than quietly shrinking the store.
+        materialized_threads: list[str] = []
         for _ in range(prepopulate_threads):
-            _thread_id(owner.start_thread(model=model))
-        result["prepopulated_threads"] = prepopulate_threads
+            filler = _thread_id(owner.start_thread(model=model))
+            filled = owner.run_text_turn(filler)
+            if not filled.get("ok"):
+                raise RuntimeError(
+                    f"prepopulation materialization failed after {len(materialized_threads)} "
+                    f"of {prepopulate_threads}: {filled}"
+                )
+            materialized_threads.append(filler)
+        result["prepopulate_requested"] = prepopulate_threads
+        result["prepopulate_materialized"] = len(materialized_threads)
+        if len(materialized_threads) != prepopulate_threads:
+            raise RuntimeError("prepopulated store smaller than requested")
         thread_id = _thread_id(owner.start_thread(model=model))
         result["thread_id"] = thread_id
         if materialize_upstream:
@@ -122,6 +138,11 @@ def main() -> int:
 
     if args.prepopulate_threads < 0:
         parser.error("--prepopulate-threads must be >= 0")
+    if args.prepopulate_threads > 0 and not args.materialize_upstream:
+        parser.error(
+            "--prepopulate-threads requires --materialize-upstream: thread/start alone "
+            "persists no rollout, so unmaterialized prepopulation does not enlarge the store"
+        )
     if args.iterations <= 0:
         parser.error("--iterations must be > 0")
     budget = load_budget(args.budget)
@@ -139,8 +160,11 @@ def main() -> int:
         cleanup = tempfile.TemporaryDirectory(prefix="codex-p0-resume-")
         root = Path(cleanup.name)
 
+    runtime = runtime_identity(args.codex_bin)
     report: dict[str, Any] = {
         "codex_bin": args.codex_bin,
+        "codex_version": runtime["codex_version"],
+        "runtime": runtime,
         "model": args.model,
         "iterations": args.iterations,
         "budget_resume_p95_s": float(budget["acceptable_resume_p95_s"]),
@@ -148,7 +172,9 @@ def main() -> int:
         "materialization_enabled": bool(args.materialize_upstream),
         "store_note": (
             "resume timed against a store holding prepopulated_threads_per_store + 1 "
-            "threads; 0 means a one-thread store, an optimistic floor"
+            "MATERIALIZED threads (each ran one turn); 0 means a one-thread store, an "
+            "optimistic floor. Per case, prepopulate_requested must equal "
+            "prepopulate_materialized or the case fails"
         ),
         "modes": {},
     }
@@ -174,7 +200,10 @@ def main() -> int:
                 and isinstance(case.get("resume_latency_s"), (int, float))
             ]
             p95 = percentile95(latencies)
-            all_ok = len(latencies) == args.iterations
+            store_ok = all(
+                case.get("prepopulate_materialized") == args.prepopulate_threads for case in cases
+            )
+            all_ok = len(latencies) == args.iterations and store_ok
             if not all_ok:
                 status = "fail"
             elif p95 is None:
@@ -186,6 +215,7 @@ def main() -> int:
             report["modes"][mode] = {
                 "cases": cases,
                 "successful_clean_resumes": len(latencies),
+                "store_prepopulated_as_requested": store_ok,
                 "resume_p95_s": p95,
                 "status": status,
             }

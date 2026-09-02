@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import hashlib
 import json
 import os
 import platform
@@ -647,6 +648,40 @@ def codex_version(codex_bin: str) -> str | None:
     return value or None
 
 
+def runtime_identity(codex_bin: str) -> dict[str, Any]:
+    """Exact identity of the runtime under test, for every standalone artifact.
+
+    A path is not a pin: the file behind ``/opt/codex/codex`` can change between
+    runs. Every probe report therefore carries the resolved path, the binary's
+    SHA-256 and size, and ``codex --version`` together, so a JSON artifact can
+    be interpreted on its own without trusting the path it names.
+    """
+    identity: dict[str, Any] = {
+        "codex_bin": str(codex_bin),
+        "resolved_path": None,
+        "sha256": None,
+        "size_bytes": None,
+        "codex_version": codex_version(codex_bin),
+    }
+    candidate = shutil.which(codex_bin) or codex_bin
+    try:
+        path = Path(candidate).resolve(strict=True)
+    except OSError:
+        return identity
+    identity["resolved_path"] = str(path)
+    if path.is_file():
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    digest.update(chunk)
+            identity["sha256"] = digest.hexdigest()
+            identity["size_bytes"] = path.stat().st_size
+        except OSError as exc:
+            identity["sha256_error"] = type(exc).__name__
+    return identity
+
+
 def parse_densities(raw: str) -> list[int]:
     values: list[int] = []
     for part in raw.split(","):
@@ -692,13 +727,15 @@ def main() -> int:
         root = Path(temp_context.name)
 
     try:
+        runtime = runtime_identity(args.codex_bin)
         report: dict[str, Any] = {
             "probe": "codex-p0-ownership-resource",
             "created_at_unix": time.time(),
             "platform": platform.platform(),
             "python": sys.version,
             "codex_bin": str(args.codex_bin),
-            "codex_version": codex_version(args.codex_bin),
+            "codex_version": runtime["codex_version"],
+            "runtime": runtime,
             "root": str(root),
             "materialization": {
                 "enabled": bool(args.materialize_upstream),

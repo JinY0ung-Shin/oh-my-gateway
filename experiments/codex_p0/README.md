@@ -128,9 +128,39 @@ For each count in `process_per_session_counts` it records:
 
 Teardown defaults to **SIGKILL** so `surviving_descendants_after_hard_kill` is judged against the
 hard-kill orphan budget it is named for. `--teardown-mode sigterm` measures graceful shutdown instead
-and leaves that check unknown rather than certifying process-group ownership it never exercised. An
-incomplete idle-CPU sample (some PIDs' ticks unreadable) is likewise reported as unknown, not as a
-pass: under-counted CPU always looks better than reality.
+and leaves that check unknown rather than certifying process-group ownership it never exercised.
+
+### Two modes: unmaterialized lower bound vs materialized certification
+
+```text
+unmaterialized (default)          cold/idle lower bound: thread/start only, no rollout exists
+materialized (--materialize-upstream)   C0 1 process : 1 live durable session certification case
+```
+
+`thread/start` alone persists nothing (see the ownership probe), so a process holding an
+unmaterialized thread is not a live durable session. With `--materialize-upstream BASE_URL` every
+process runs one text turn against the hermetic upstream before sampling; the report records
+`mode`, `materialized_count`, and per case `certifies_c0_topology`, which is true **only** for a
+materialized run in which every session completed its turn and the budget passed. An unmaterialized
+pass never certifies the topology — it is the floor under it.
+
+### Idle CPU is tree-wide and complete under PID churn
+
+app-server shells out to `git` on every `thread/start`, so short-lived children come and go during
+the sample window. Per-PID tick deltas cannot be complete under that churn (a PID present at one
+edge and absent at the other has no delta), which left the previous sampler permanently
+`inconclusive`. The sampler now waits for the set of running tree PIDs to be stable for 1 s (bounded
+at 15 s; recorded as `idle_cpu.settle`), then measures the **process tree** total: each live or zombie
+process's own `utime+stime` plus each process's reaped-children `cutime+cstime`. A child born and
+reaped inside the window is therefore still counted, in its parent. The sample is `complete: False`
+only when no consistent snapshot could be taken, a server root died, or the tree lost members to
+reparenting — never a partial sum presented as a number.
+
+### Provenance in every artifact
+
+Each of the three probes records `runtime` — `codex_bin`, `resolved_path`, `sha256`, `size_bytes`,
+`codex --version` — so a JSON file attached on its own still names the exact runtime it measured. A
+path is not a pin.
 
 This keeps the B0-vs-C0 transport decision separate from the later C1 multiplexing question.
 
@@ -153,6 +183,12 @@ Each iteration uses a fresh `CODEX_HOME`, so by default the p95 is measured agai
 store** — an optimistic floor. Store-size effects (thread index scan, first-acquire stale-lock cleanup)
 are invisible there. Pass `--prepopulate-threads N` to fill the store to a realistic count before the
 timed resume, and judge the budget against that run.
+
+Prepopulation **materializes** every filler thread (one text turn each against
+`--materialize-upstream`, which the flag therefore requires): `thread/start` alone leaves no rollout,
+so N unmaterialized starts would not enlarge the durable store at all. Each case records
+`prepopulate_requested` and `prepopulate_materialized`; a mismatch fails the case, and a mode is only
+`pass` when `store_prepopulated_as_requested` holds for every iteration.
 
 ## Safety / interpretation
 
