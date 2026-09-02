@@ -315,6 +315,7 @@ class AppServerTransport:
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._pgid: Optional[int] = None
         self._write_lock = asyncio.Lock()
+        self._writer_since: Optional[float] = None  # when the current lock holder took the writer
         self._waiters: Dict[str, asyncio.Future] = {}
         self._waiter_methods: Dict[str, str] = {}
         self._interactions: Dict[Any, PendingInteraction] = {}
@@ -618,46 +619,75 @@ class AppServerTransport:
     # -- internals: writing ----------------------------------------------------
 
     async def _write(self, payload: Dict[str, Any], *, deadline: Optional[float] = None) -> None:
-        """Bounded write. The bound is ``write_timeout_s`` (or the caller's
-        earlier absolute ``deadline``), covering the wait for the writer lock
-        AND the drain. A write that cannot complete in that time means the
-        runtime is alive but no longer consuming stdin (stopped, wedged, or
-        back-pressured with a partial line in the pipe): the transport is
-        unusable and its bytes are ambiguous, so the generation is
-        terminalized (``write_timeout``) and the group is torn down rather
-        than the write being silently abandoned.
+        """Bounded write with two separate clocks.
+
+        - The **caller's** ``deadline`` expiring while this request is still
+          queued for the writer is local: zero bytes of it were written, so it
+          raises ``asyncio.TimeoutError`` for this request only and the
+          transport stays alive. Being queued behind another, healthy write is
+          not evidence about the runtime.
+        - The **transport health** bound ``write_timeout_s`` is judged against
+          the *current lock holder*: if the writer that owns the lock has held
+          it that long, the runtime has stopped consuming stdin and the
+          generation is terminalized (``write_timeout``). Contention between
+          several fast writes never trips it.
+        - Once this request has written bytes, the caller's deadline expiring
+          during ``drain()`` leaves a partial, ambiguous line in the pipe, so
+          that too terminalizes the generation rather than being abandoned.
         """
         proc = self._proc
         if proc is None or proc.stdin is None:
             raise TransportError("transport not started")
         loop = asyncio.get_running_loop()
-        write_deadline = loop.time() + self.write_timeout_s
-        if deadline is not None:
-            write_deadline = min(write_deadline, deadline)
         line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
+
+        # --- acquire the writer -------------------------------------------
+        while True:
+            now = loop.time()
+            holder_since = self._writer_since if self._writer_since is not None else now
+            health_deadline = holder_since + self.write_timeout_s
+            wait_until = health_deadline if deadline is None else min(health_deadline, deadline)
+            try:
+                await asyncio.wait_for(self._write_lock.acquire(), max(0.0, wait_until - now))
+                break
+            except asyncio.TimeoutError:
+                now = loop.time()
+                if deadline is not None and now >= deadline:
+                    raise asyncio.TimeoutError(
+                        "request deadline expired while queued for the writer; nothing was written"
+                    )
+                if self._writer_since is not None and now - self._writer_since >= self.write_timeout_s:
+                    self._terminalize(
+                        "write_timeout",
+                        exit_code=proc.returncode,
+                        detail=f"writer held the transport for {now - self._writer_since:.2f}s; runtime not consuming stdin",
+                    )
+                    self._raise_if_lost()
+                # The holder changed under us before either clock ran out: re-arm.
+
+        # --- own the writer -------------------------------------------------
+        self._writer_since = loop.time()
         try:
-            await asyncio.wait_for(self._write_lock.acquire(), max(0.0, write_deadline - loop.time()))
-        except asyncio.TimeoutError:
-            self._terminalize(
-                "write_timeout", exit_code=proc.returncode, detail="writer lock not acquired in time"
-            )
             self._raise_if_lost()
-        try:
-            self._raise_if_lost()
+            drain_deadline = self._writer_since + self.write_timeout_s
+            if deadline is not None:
+                drain_deadline = min(drain_deadline, deadline)
             try:
                 proc.stdin.write(line)
-                await asyncio.wait_for(proc.stdin.drain(), max(0.0, write_deadline - loop.time()))
+                await asyncio.wait_for(proc.stdin.drain(), max(0.0, drain_deadline - loop.time()))
             except asyncio.TimeoutError:
+                which = "caller deadline" if deadline is not None and drain_deadline == deadline else "write_timeout_s"
                 self._terminalize(
                     "write_timeout",
                     exit_code=proc.returncode,
-                    detail=f"stdin not drained within bound; {len(line)} bytes pending",
+                    detail=f"{which} expired mid-write with {len(line)} bytes not drained; pipe contents ambiguous",
                 )
                 self._raise_if_lost()
             except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError) as exc:
                 self._terminalize("write_failed", exit_code=proc.returncode, detail=repr(exc))
                 self._raise_if_lost()
         finally:
+            self._writer_since = None
             self._write_lock.release()
 
     def _raise_if_lost(self) -> None:

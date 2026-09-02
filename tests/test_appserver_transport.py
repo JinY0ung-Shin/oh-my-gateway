@@ -951,3 +951,82 @@ async def test_close_after_owner_initiated_shutdown_does_not_double_reap(tmp_pat
     with pytest.raises(RuntimeLost):
         await probe
     await transport.wait_reaped(timeout=CONTROL_S)  # resolved by close(); must not hang
+
+
+# ---------------------------------------------------------------------------
+# two clocks: a caller's deadline queued behind a healthy writer is local;
+# the transport health bound is judged against the writer that holds the lock
+# ---------------------------------------------------------------------------
+
+
+async def test_caller_deadline_behind_healthy_writer_is_local_not_a_kill(tmp_path):
+    """A owns the writer for ~0.4 s (the child pauses reading), well under
+    write_timeout_s. B arrives with a 50 ms deadline and cannot get the lock.
+    B must time out locally with nothing written; A must complete; the same
+    generation must keep serving."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [{"type": "sleep", "seconds": 0.4}, {"type": "response", "result": "warm"}]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "A"}]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "after"}]},
+        ],
+        write_timeout_s=5.0,
+    )
+    events = transport.subscribe()
+    try:
+        warm = asyncio.create_task(transport.request("probe"))
+        await asyncio.sleep(0.1)  # the child has read "warm" and is asleep: nobody reads stdin
+        a = asyncio.create_task(transport.request("probe", {"blob": "x" * 4_000_000}))
+        await asyncio.sleep(0.05)  # A now owns the writer, blocked in drain()
+        started = asyncio.get_running_loop().time()
+        with pytest.raises(asyncio.TimeoutError):
+            await transport.request("probe", timeout=0.05)
+        assert asyncio.get_running_loop().time() - started < 0.5
+        # Local: the transport is alive, A finishes, the generation keeps serving.
+        assert transport.alive
+        assert await asyncio.wait_for(warm, HEALTHY_S) == "warm"
+        assert await asyncio.wait_for(a, HEALTHY_S) == "A"
+        assert await transport.request("probe", timeout=HEALTHY_S) == "after"
+        assert transport.terminal is None
+        assert not any(isinstance(events.get_nowait(), TerminalEvent) for _ in range(events.qsize()))
+    finally:
+        await transport.close()
+
+
+async def test_caller_deadline_expiring_mid_drain_terminalizes(tmp_path):
+    """Once bytes are in flight, a caller deadline during drain() leaves an
+    ambiguous partial line: that is a generation-level loss, not a local one."""
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "probe", "actions": [{"type": "sleep", "seconds": 30}]}],
+        write_timeout_s=10.0,
+    )
+    warm = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.2)
+    with pytest.raises(RuntimeLost) as info:
+        await transport.request("probe", {"blob": "x" * 4_000_000}, timeout=0.3)
+    assert info.value.reason == "write_timeout"
+    assert "caller deadline" in info.value.detail
+    with pytest.raises(RuntimeLost):
+        await warm
+    await transport.wait_reaped(timeout=HEALTHY_S)
+    assert transport.running_group_members() == []
+    await transport.close()
+
+
+async def test_contention_between_fast_writes_never_trips_health_bound(tmp_path):
+    """Many small concurrent writes queue on the lock for longer in total than
+    write_timeout_s, but no single holder is slow: no terminalization."""
+    n = 40
+    steps = [{"expect_method": "probe", "actions": [{"type": "response", "result": i}]} for i in range(n)]
+    transport = await _transport(tmp_path, steps, write_timeout_s=0.05)
+    try:
+        results = await asyncio.wait_for(
+            asyncio.gather(*(transport.request("probe", {"blob": "y" * 20_000, "i": i}) for i in range(n))),
+            HEALTHY_S,
+        )
+        assert sorted(results) == list(range(n))
+        assert transport.alive and transport.terminal is None
+    finally:
+        await transport.close()
