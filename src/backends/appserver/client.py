@@ -46,6 +46,7 @@ from src.backends.appserver.interactions import (
 from src.backends.appserver.isolation import ISOLATION_ENV_REMOVE, build_isolated_env
 from src.backends.appserver.policy import resolve_runtime_policy
 from src.backends.appserver.transport import (
+    AmbiguousRequest,
     AppServerTransport,
     Notification,
     OrphanedResponse,
@@ -182,6 +183,10 @@ class AppServerSessionClient(SessionHandle):
         self.pending_interaction_id: Any = None
         self.pending_interaction_method: Optional[str] = None
         self.pending_interaction_params: Optional[Dict[str, Any]] = None
+        # The occurrence token of the parked interaction (transport requires it
+        # to answer): a stale card or a late answer for an OLD occurrence can
+        # never authorize a NEW server request that reused the id.
+        self.pending_interaction_token: Optional[str] = None
 
     def turn_params(self) -> Dict[str, Any]:
         """``turn/start`` params (minus ``threadId``/``input``) for this handle."""
@@ -400,6 +405,7 @@ class AppServerCodexClient(TokenEstimateMixin):
         interaction_id = client.pending_interaction_id
         method = client.pending_interaction_method or ""
         params = client.pending_interaction_params or {}
+        token = client.pending_interaction_token
         self._clear_pending_interaction(client)
 
         if interaction_id is None:
@@ -422,7 +428,10 @@ class AppServerCodexClient(TokenEstimateMixin):
         result = answer_result_from_output(method, output, params)
         try:
             await client.transport.answer(
-                interaction_id, result, generation=client.generation
+                interaction_id,
+                result,
+                generation=client.generation,
+                token=token,
             )
         except StaleAnswer:
             # Retired upstream (serverRequest/resolved), wrong generation, or a
@@ -511,6 +520,21 @@ class AppServerCodexClient(TokenEstimateMixin):
                 logger.debug("appserver codex orphaned response: %s", item.method)
                 continue
 
+            if isinstance(item, AmbiguousRequest):
+                # A request whose bytes were accepted but never answered before
+                # the generation ended. The work may or may not have happened;
+                # never blindly replay -- surface a terminal error so the turn
+                # ends deterministically (the transport also fans a TerminalEvent
+                # right after, which is handled below/next).
+                for chunk in mapper.drain_open_subagents("failed"):
+                    yield chunk
+                self._end_turn(client)
+                yield error_chunk(
+                    f"Codex request outcome is ambiguous ({item.method}); "
+                    f"not replayed ({item.terminal_reason})"
+                )
+                return
+
             if isinstance(item, TerminalEvent):
                 # Parent runtime loss terminalizes every open child row.
                 for chunk in mapper.drain_open_subagents(
@@ -551,6 +575,7 @@ class AppServerCodexClient(TokenEstimateMixin):
         client.pending_interaction_id = interaction.id
         client.pending_interaction_method = interaction.method
         client.pending_interaction_params = params
+        client.pending_interaction_token = interaction.token
         session.pending_tool_call = {
             "call_id": request_id,
             "name": ASK_USER_QUESTION_TOOL_NAME,
@@ -576,6 +601,7 @@ class AppServerCodexClient(TokenEstimateMixin):
         client.pending_interaction_id = None
         client.pending_interaction_method = None
         client.pending_interaction_params = None
+        client.pending_interaction_token = None
 
     def _end_turn(self, client: AppServerSessionClient) -> None:
         """Tear down the per-turn transport view (only at a true terminal)."""

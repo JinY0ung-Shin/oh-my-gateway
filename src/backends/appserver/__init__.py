@@ -10,11 +10,13 @@ from src.backends.appserver.transport import (
     SERVER_REQUEST_RESOLVED,
     SERVER_RESOLVED,
     SUPPORTED_SERVER_REQUESTS,
+    AmbiguousRequest,
     AppServerTransport,
     HandshakeError,
     Notification,
     OrphanedResponse,
     PendingInteraction,
+    RequestOutcomeUnknown,
     RpcError,
     RuntimeLost,
     StaleAnswer,
@@ -26,6 +28,7 @@ from src.backends.appserver.transport import (
 )
 
 __all__ = [
+    "AmbiguousRequest",
     "AppServerTransport",
     "DEFAULT_SUPPORTED_SERVER_REQUESTS",
     "HandshakeError",
@@ -36,6 +39,7 @@ __all__ = [
     "OWNER_CLOSED",
     "OrphanedResponse",
     "PendingInteraction",
+    "RequestOutcomeUnknown",
     "RUNTIME_LOST",
     "SERVER_REQUEST_RESOLVED",
     "SERVER_RESOLVED",
