@@ -140,6 +140,14 @@ replaced with a deterministic placeholder, environment-specific absolute paths a
 `/workspace`, and `instructions` is truncated. Only field/schema/value semantics are under test;
 identity and path values are not. Keep a raw capture local if an audit trail is needed.
 
+The file carries a `contract_assertions` block holding **only the stable semantics**: required
+top-level fields, required tool names, and the load-bearing values (`stream`, `store`, `include`,
+`tool_choice`, `parallel_tool_calls`, `reasoning` keys). Any future regression test must assert
+against that block, never byte-exact equality of the whole capture — tool descriptions, the model
+catalog and `instructions` prose churn with every Codex release, and promoting volatile prose into
+the contract would turn routine upgrades into test noise. `prompt_cache_key` and `client_metadata`
+are listed as identity fields explicitly *not* under test.
+
 It is the requirement list any Responses upstream must accept:
 
 - top-level `instructions, input, model, stream, store, reasoning, tools, tool_choice,

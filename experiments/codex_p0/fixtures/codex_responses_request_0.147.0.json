@@ -568,5 +568,50 @@
   "_sanitized": {
     "identity_uuids_replaced": 6,
     "path_roots_replaced_with": "/workspace"
+  },
+  "contract_assertions": {
+    "_note": "Assert against THIS block, never byte/exact equality of the whole file. Tool descriptions, instructions prose and model catalogs are volatile across Codex releases; the required field/tool/schema semantics below are what an upstream is certified against.",
+    "required_top_level_fields": [
+      "client_metadata",
+      "include",
+      "input",
+      "instructions",
+      "model",
+      "parallel_tool_calls",
+      "prompt_cache_key",
+      "reasoning",
+      "store",
+      "stream",
+      "tool_choice",
+      "tools"
+    ],
+    "required_tool_names": [
+      "exec_command",
+      "write_stdin",
+      "update_plan",
+      "request_user_input",
+      "view_image",
+      "multi_agent_v1",
+      "get_goal",
+      "create_goal",
+      "update_goal",
+      "<builtin:web_search>"
+    ],
+    "required_values": {
+      "stream": true,
+      "store": false,
+      "include": [
+        "reasoning.encrypted_content"
+      ],
+      "tool_choice": "auto",
+      "parallel_tool_calls": false,
+      "reasoning_keys": [
+        "summary"
+      ]
+    },
+    "identity_fields_not_under_test": [
+      "prompt_cache_key",
+      "client_metadata"
+    ]
   }
 }
