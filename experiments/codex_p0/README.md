@@ -87,9 +87,23 @@ For each count in `process_per_session_counts` it records:
 - retained stderr line/byte volume with truncation flag
 - teardown timings and p95
 - surviving descendant PIDs
-- mechanical pass/fail against the predeclared budget
+- mechanical `pass` / `fail` / `inconclusive` against the predeclared budget
 
 This keeps the B0-vs-C0 transport decision separate from the later C1 multiplexing question.
+
+## Resume latency probe
+
+`resume_latency_probe.py` repeatedly creates a durable thread in process A, releases the writer through a declared shutdown mode, starts process B on the same `CODEX_HOME`, and measures only the `thread/resume` RPC latency. This isolates resume p95 from app-server cold-start time.
+
+```bash
+uv run python experiments/codex_p0/resume_latency_probe.py \
+  --codex-bin /path/to/codex \
+  --budget /tmp/codex-p0-budget.json \
+  --iterations 20 \
+  --output artifacts/codex-p0-resume.json
+```
+
+By default it measures `stdin_eof`, `SIGTERM`, and `SIGKILL` release paths separately. A mode fails if any iteration cannot resume successfully or if its measured p95 exceeds `acceptable_resume_p95_s`.
 
 ## Safety / interpretation
 
