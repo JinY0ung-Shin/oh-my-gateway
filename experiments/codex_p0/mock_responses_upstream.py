@@ -53,6 +53,17 @@ MARKER_RE = re.compile(r"CHATDRAGON_P0_[A-Z_]*OK")
 # The P0a-1 corpus asks for `printf <token>` inside a shell tool call.
 SHELL_RE = re.compile(r"`([^`]*printf[^`]*)`")
 
+# Deliberately non-conformant *shapes* (as opposed to transport FAULTS). These
+# exist so the replay's classification can be exercised against a controlled
+# upstream: each must produce a FAIL, never a pass.
+SHAPES = (
+    "conformant",
+    "wrong_tool",      # emits update_plan instead of exec_command
+    "bad_arguments",   # exec_command with arguments that are not JSON
+    "no_reasoning",    # never emits a reasoning item even when requested
+    "turn2_error",     # continuation stream carries an explicit error event
+)
+
 FAULTS = (
     "none",
     "http_429",
@@ -69,6 +80,7 @@ class Config:
     """Process-wide replica behavior, set once from the command line."""
 
     fault = "none"
+    shape = "conformant"
     fault_after = 2
     idle_stall_s = 30.0
     log_path: str | None = None
@@ -148,12 +160,23 @@ def plan_reply(body: dict[str, Any]) -> dict[str, Any]:
     # additionally sets a detailed summary; emit a reasoning item when asked.
     reasoning = isinstance(body.get("reasoning"), dict)
 
+    if Config.shape == "no_reasoning":
+        reasoning = False
     if shell_match and not already_ran_tool and "exec_command" in tool_names:
-        return {
+        plan = {
             "kind": "tool_call",
             "cmd": shell_match.group(1).strip(),
             "tool": "exec_command",
+            "arguments": None,
+            "reasoning": reasoning,
         }
+        if Config.shape == "wrong_tool":
+            plan["tool"] = "update_plan"
+        elif Config.shape == "bad_arguments":
+            plan["arguments"] = "{not json"
+        return plan
+    if already_ran_tool and Config.shape == "turn2_error":
+        return {"kind": "error", "reasoning": reasoning}
     if has_image and not marker_match:
         # The P0a-1 image case generates a solid red PNG and asks for one word.
         return {"kind": "text", "text": "red", "reasoning": reasoning}
@@ -254,18 +277,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _items(self, plan: dict[str, Any]) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        if plan["kind"] == "tool_call":
-            items.append(
-                {
-                    "type": "function_call",
-                    "id": "fc_replica_1",
-                    "call_id": "call_replica_1",
-                    "name": plan["tool"],
-                    "arguments": json.dumps({"cmd": plan["cmd"]}),
-                    "status": "completed",
-                }
-            )
+        if plan["kind"] == "error":
             return items
+        # A reasoning item precedes whatever the turn produces — a tool call or a
+        # message — the same way a real reasoning-parser-backed server emits it.
         if plan.get("reasoning"):
             items.append(
                 {
@@ -277,6 +292,18 @@ class Handler(BaseHTTPRequestHandler):
                     "content": [],
                 }
             )
+        if plan["kind"] == "tool_call":
+            items.append(
+                {
+                    "type": "function_call",
+                    "id": "fc_replica_1",
+                    "call_id": "call_replica_1",
+                    "name": plan["tool"],
+                    "arguments": plan.get("arguments") or json.dumps({"cmd": plan["cmd"]}),
+                    "status": "completed",
+                }
+            )
+            return items
         items.append(
             {
                 "type": "message",
@@ -378,6 +405,16 @@ class Handler(BaseHTTPRequestHandler):
         frames.append({"type": "response.completed", "response": final})
 
         self._begin_sse()
+        if plan["kind"] == "error":
+            # Shape knob: a continuation that reports an error event and then
+            # still emits response.completed. Must classify as FAIL.
+            frames.insert(
+                max(1, len(frames) - 1),
+                {
+                    "type": "error",
+                    "error": {"type": "server_error", "message": "replica shape turn2_error"},
+                },
+            )
         for position, frame in enumerate(frames):
             if position == Config.fault_after:
                 if Config.fault == "drop_mid_stream":
@@ -417,6 +454,12 @@ def main() -> int:
     parser.add_argument("--model", default="replica-model")
     parser.add_argument("--fault", choices=FAULTS, default="none")
     parser.add_argument(
+        "--shape",
+        choices=SHAPES,
+        default="conformant",
+        help="deliberately non-conformant response shape, for exercising replay classification",
+    )
+    parser.add_argument(
         "--fault-after",
         type=int,
         default=2,
@@ -436,6 +479,7 @@ def main() -> int:
         parser.error("--fault-after must be >= 0")
 
     Config.fault = args.fault
+    Config.shape = args.shape
     Config.fault_after = args.fault_after
     Config.idle_stall_s = args.idle_stall_s
     Config.log_path = args.log
@@ -444,7 +488,7 @@ def main() -> int:
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(
         f"P0a hermetic upstream listening on http://{args.host}:{args.port}/v1 "
-        f"(model={args.model}, fault={args.fault})",
+        f"(model={args.model}, fault={args.fault}, shape={args.shape})",
         file=sys.stderr,
         flush=True,
     )

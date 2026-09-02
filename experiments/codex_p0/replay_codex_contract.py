@@ -191,6 +191,51 @@ def completed(turn: dict[str, Any]) -> bool:
     return turn["event_types"].get("response.completed", 0) >= 1
 
 
+def clean_stream(turn: dict[str, Any]) -> bool:
+    """A stream is clean only if it was accepted, carried no error event, had no
+    malformed frame, and reached ``response.completed``. Applied identically to
+    turn 1 and turn 2: a continuation that limps to a completed frame past an
+    explicit error is not a pass."""
+    return (
+        turn["http_status"] == 200
+        and not turn["transport_error"]
+        and not turn["errors"]
+        and turn["malformed_frames"] == 0
+        and completed(turn)
+    )
+
+
+def validate_tool_call(call: dict[str, Any]) -> list[str]:
+    """Reasons the emitted tool call does NOT match what this prompt requires.
+
+    "A function call happened" is too weak: with ten tools in the contract, a
+    parser/model mismatch can emit the wrong tool, unparsable arguments, or a
+    missing call_id and still complete a continuation. Any of those must fail
+    tool-parser compatibility rather than certify it.
+    """
+    reasons: list[str] = []
+    if call.get("name") != "exec_command":
+        reasons.append(f"tool name {call.get('name')!r} != 'exec_command'")
+    call_id = call.get("call_id")
+    if not isinstance(call_id, str) or not call_id:
+        reasons.append("call_id missing or empty")
+    raw = call.get("arguments")
+    try:
+        args = json.loads(raw) if isinstance(raw, str) else None
+    except json.JSONDecodeError:
+        args = None
+        reasons.append("arguments is not valid JSON")
+    if args is None and not reasons:
+        reasons.append("arguments missing")
+    if isinstance(args, dict):
+        cmd = args.get("cmd")
+        if not isinstance(cmd, str) or TOOL_TOKEN not in cmd:
+            reasons.append(f"arguments.cmd does not contain {TOOL_TOKEN}")
+    elif args is not None:
+        reasons.append("arguments is not a JSON object")
+    return reasons
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base-url", required=True)
@@ -233,6 +278,7 @@ def main() -> int:
     )
 
     call = first_function_call(turn1["output_items"])
+    tool_reasons = validate_tool_call(call) if call is not None else []
     turn2: dict[str, Any] | None = None
     if call is not None:
         # The continuation Codex itself would send: original input, the emitted
@@ -263,8 +309,10 @@ def main() -> int:
             args.timeout_s,
         )
 
+    reasoning_requested = bool(contract.get("reasoning"))
     checks: dict[str, Any] = {
         "accepts_payload": turn1["http_status"] == 200 and not turn1["transport_error"],
+        "no_error_events": not turn1["errors"],
         "stream_completed": completed(turn1),
         "usage_present": isinstance(turn1["usage"], dict),
         "no_malformed_frames": turn1["malformed_frames"] == 0,
@@ -273,12 +321,26 @@ def main() -> int:
         "reasoning_item": has_item_type(turn1["output_items"], "reasoning")
         or bool(turn2 and has_item_type(turn2["output_items"], "reasoning")),
         "tool_call_emitted": call is not None,
-        "continuation_accepted": bool(turn2 and turn2["http_status"] == 200 and completed(turn2)),
+        "tool_call_correct": call is not None and not tool_reasons,
+        # Turn 2 is held to the same stream-integrity bar as turn 1, plus usage.
+        "continuation_accepted": bool(
+            turn2 and clean_stream(turn2) and isinstance(turn2["usage"], dict)
+        ),
     }
 
-    blocking = ["accepts_payload", "stream_completed", "usage_present", "no_malformed_frames"]
+    blocking = [
+        "accepts_payload",
+        "no_error_events",
+        "stream_completed",
+        "usage_present",
+        "no_malformed_frames",
+    ]
+    if reasoning_requested:
+        # The contract asks for reasoning; a real --reasoning-parser that emits
+        # no reasoning item is a P0a failure, not a cosmetic gap.
+        blocking.append("reasoning_item")
     if checks["tool_call_emitted"]:
-        blocking.append("continuation_accepted")
+        blocking.extend(["tool_call_correct", "continuation_accepted"])
     overall = "pass" if all(checks[name] for name in blocking) else "fail"
     if overall == "pass" and not checks["tool_call_emitted"]:
         # A clean stream with no tool call is the parser-mismatch signature, not
@@ -307,6 +369,9 @@ def main() -> int:
         "turn2": None if turn2 is None else {k: v for k, v in turn2.items() if k != "output_items"},
         "turn2_item_types": None if turn2 is None else [i.get("type") for i in turn2["output_items"]],
         "checks": checks,
+        "blocking_checks": blocking,
+        "tool_call_reasons": tool_reasons,
+        "reasoning_requested": reasoning_requested,
         "overall_status": overall,
         "interpretation": {
             "clean_stream_without_tool_call": (
@@ -317,6 +382,15 @@ def main() -> int:
                 "last_message type guard in the upstream Responses path"
             ),
             "missing_reasoning_item": "suspect --reasoning-parser vs model",
+            "wrong_tool_call": (
+                "a function_call was emitted but not the one this prompt requires "
+                "(see tool_call_reasons): parser/model mismatch on tool selection, "
+                "argument encoding, or call_id propagation"
+            ),
+            "turn2_unclean": (
+                "continuation reached the server but the stream carried an error "
+                "event, a malformed frame, or no usage"
+            ),
         },
     }
 

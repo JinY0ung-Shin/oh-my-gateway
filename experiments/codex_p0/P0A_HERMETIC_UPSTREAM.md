@@ -125,11 +125,24 @@ than asserted:
 | HTTP 429 | `fail` | `HTTPError 429` recorded, no hang |
 | connection dropped mid-stream | `fail` | accepted but never reached `response.completed` |
 | clean stream, **no** `function_call` | `incomplete` | the parser-mismatch signature — a `200` with a dead tool cycle, deliberately not a pass |
+| `--shape wrong_tool` (emits `update_plan`) | `fail` | a function call happened, but not the one the prompt requires |
+| `--shape bad_arguments` (non-JSON args) | `fail` | tool name right, arguments unparsable |
+| `--shape no_reasoning` | `fail` | contract requests reasoning; none returned — blocking, not cosmetic |
+| `--shape turn2_error` (error event, then completed) | `fail` | continuation held to the same integrity bar as turn 1 |
 
-That last row is the one worth emphasizing: with `--enable-auto-tool-choice` set but a
+The `incomplete` row is the one worth emphasizing: with `--enable-auto-tool-choice` set but a
 `--tool-call-parser` a generation behind the model, the request is accepted and the stream completes
 normally while the parser extracts nothing, so Codex never receives a tool call. Treating that as a
 pass is the easiest way to certify a broken path.
+
+The `--shape` rows close the false-pass paths a weaker gate would leave open. "A function call
+happened" is not the contract: the emitted call must be `exec_command`, its `arguments` must parse
+as JSON with a `cmd` containing the marker, and a non-empty `call_id` must round-trip into the
+`function_call_output`. Reasoning is **blocking** whenever the contract requests it (this fixture
+does). Turn 2 is gated on the same stream integrity as turn 1 — no error event, no malformed frame,
+`response.completed`, usage present — so a continuation that limps to a completed frame past an
+explicit error is not a pass. Every row in the table was produced against the controlled upstream,
+not asserted.
 
 ## Fault modes
 
