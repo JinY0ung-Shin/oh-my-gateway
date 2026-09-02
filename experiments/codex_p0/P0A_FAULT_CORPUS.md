@@ -118,3 +118,42 @@ isolated LiteLLM/model-gateway behavior differs from the assumed Responses strea
 ```
 
 Classify ownership from raw artifacts and corresponding isolated gateway logs. Do not compensate in oh-my-gateway's future Codex transport until the model-path behavior itself is understood.
+
+## Causality: a fault case passes only if the proxy proves the fault fired
+
+A bounded client failure looks the same whether the injected 429 fired or a config/auth/model error
+killed the run. So the proxy writes one secret-free **observation** per request to
+`<case>/proxy.observations.jsonl` (`--observation-log`), and the matrix requires it in every verdict:
+
+```text
+mode                 the proxy mode this process ran
+method, path         the request (no query string, no headers, no body)
+request_seen         the proxy handled the request
+upstream_status      status returned by the isolated upstream (null for synthetic responses)
+fault_triggered      the selected injection actually executed
+trigger_point        synthetic_response | before_first_body_byte | after_event_N |
+                     swap_events_N_M | before_event_1 | each_event
+frames_forwarded     SSE frames passed downstream before/around the injection
+stream_completed     the upstream stream was fully relayed (passthrough / non-truncating modes)
+error                proxy-side error, if any
+```
+
+Verdict rules (`evaluate_fault`):
+
+- no observation for the Responses request, or a mode mismatch → `harness_error`
+- injecting mode with `fault_triggered = false` (the stream ended before the target boundary) →
+  `inconclusive`, with the frames forwarded and upstream status in `failure_reasons`
+- only then is the client outcome compared with the expected class → `pass` / `fail`
+
+For the delay modes the trigger is recorded when the delay *begins*: a client whose stream idle
+timeout is shorter than the delay disconnects mid-sleep, and the proxy must still prove the delay was
+the cause (`error: client_disconnected` accompanies it).
+
+`malformed_after_first_event` is an observation-only case (`bounded_terminal`), like duplicate and
+reorder: the hermetic self-test showed `codex-cli 0.147.0` skips a single non-JSON `data:` frame and
+completes the turn. That is recorded, not penalised — a synthetic-invalid frame must not kill a
+candidate for tolerating it.
+
+Overall status is `fail` if any case failed, `incomplete` if any case is `inconclusive` or
+`harness_error`, and `pass` only when every case passed **with** its injection proven. The exit
+code is 0 only for `pass`.

@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from dataclasses import dataclass
+import json
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import AsyncIterator
 
 import httpx
@@ -45,6 +48,40 @@ class FaultConfig:
     after_events: int
     delay_s: float
     upstream_connect_timeout_s: float
+    observation_log: Path | None = None
+
+
+@dataclass(slots=True)
+class Observation:
+    """Machine-readable proof of what this proxy did to ONE request.
+
+    The matrix requires it in every verdict: a bounded client failure without
+    ``fault_triggered`` for the selected mode is a harness error, not a PASS.
+    Never contains header values or body bytes -- only the path, the method,
+    upstream status and the injection facts.
+    """
+
+    ts: float
+    mode: str
+    method: str
+    path: str
+    request_seen: bool = True
+    upstream_status: int | None = None
+    upstream_content_type: str | None = None
+    fault_triggered: bool = False
+    trigger_point: str | None = None
+    frames_forwarded: int = 0
+    error: str | None = None
+    stream_completed: bool = False
+
+
+def _record(observation: Observation) -> None:
+    config = _config()
+    if config.observation_log is None:
+        return
+    with config.observation_log.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(asdict(observation), sort_keys=True) + "\n")
+        fh.flush()
 
 
 CONFIG: FaultConfig | None = None
@@ -100,70 +137,101 @@ async def _iter_sse_frames(response: httpx.Response) -> AsyncIterator[bytes]:
         yield buffer
 
 
-async def _raw_passthrough(response: httpx.Response) -> AsyncIterator[bytes]:
+async def _raw_passthrough(response: httpx.Response, observation: Observation) -> AsyncIterator[bytes]:
     try:
-        async for chunk in response.aiter_bytes():
-            if chunk:
-                yield chunk
+        async for frame in _iter_sse_frames(response):
+            observation.frames_forwarded += 1
+            yield frame
+        observation.stream_completed = True
     finally:
         await response.aclose()
 
 
-async def _faulted_sse(response: httpx.Response, config: FaultConfig) -> AsyncIterator[bytes]:
+def _trigger(observation: Observation, point: str) -> None:
+    if not observation.fault_triggered:
+        observation.fault_triggered = True
+        observation.trigger_point = point
+
+
+async def _faulted_sse(
+    response: httpx.Response, config: FaultConfig, observation: Observation
+) -> AsyncIterator[bytes]:
     index = 0
     held: bytes | None = None
     try:
         async for frame in _iter_sse_frames(response):
             index += 1
 
+            # The delay IS the injection: mark it when it begins, because a
+            # client whose idle timeout is shorter than the delay disconnects
+            # mid-sleep and this generator is cancelled before the sleep ends.
             if config.mode == "delay_first_event" and index == 1:
+                _trigger(observation, "before_event_1")
                 await asyncio.sleep(config.delay_s)
             elif config.mode == "delay_each_event":
+                _trigger(observation, "each_event")
                 await asyncio.sleep(config.delay_s)
 
             if config.mode == "truncate_after_events":
                 if index > config.after_events:
+                    _trigger(observation, f"after_event_{config.after_events}")
                     return
+                observation.frames_forwarded += 1
                 yield frame
                 continue
 
             if config.mode == "abort_after_events":
                 if index > config.after_events:
+                    _trigger(observation, f"after_event_{config.after_events}")
                     raise ConnectionResetError("P0 injected stream abort")
+                observation.frames_forwarded += 1
                 yield frame
                 continue
 
             if config.mode == "malformed_event_after":
+                observation.frames_forwarded += 1
                 yield frame
                 if index == config.after_events:
+                    _trigger(observation, f"after_event_{config.after_events}")
                     yield b"data: {P0_MALFORMED_JSON\n\n"
                 continue
 
             if config.mode == "duplicate_event":
+                observation.frames_forwarded += 1
                 yield frame
                 if index == config.after_events:
+                    _trigger(observation, f"after_event_{config.after_events}")
                     yield frame
                 continue
 
             if config.mode == "reorder_adjacent":
                 if index < config.after_events:
+                    observation.frames_forwarded += 1
                     yield frame
                     continue
                 if index == config.after_events:
                     held = frame
                     continue
                 if index == config.after_events + 1 and held is not None:
+                    _trigger(observation, f"swap_events_{config.after_events}_{config.after_events + 1}")
+                    observation.frames_forwarded += 2
                     yield frame
                     yield held
                     held = None
                     continue
+                observation.frames_forwarded += 1
                 yield frame
                 continue
 
+            observation.frames_forwarded += 1
             yield frame
 
         if held is not None:
+            # The stream ended on the held frame: nothing to swap with, so the
+            # reorder never happened; forward it untouched and say so.
+            observation.frames_forwarded += 1
             yield held
+        observation.stream_completed = True
     finally:
         await response.aclose()
 
@@ -176,8 +244,11 @@ async def health() -> dict[str, str]:
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
 async def proxy(request: Request, path: str):
     config = _config()
+    observation = Observation(ts=time.time(), mode=config.mode, method=request.method, path=f"/{path}")
 
     if config.mode == "http_429":
+        _trigger(observation, "synthetic_response")
+        _record(observation)
         return JSONResponse(
             status_code=429,
             headers={"Retry-After": "1"},
@@ -190,6 +261,8 @@ async def proxy(request: Request, path: str):
             },
         )
     if config.mode == "http_500":
+        _trigger(observation, "synthetic_response")
+        _record(observation)
         return JSONResponse(
             status_code=500,
             content={
@@ -221,22 +294,28 @@ async def proxy(request: Request, path: str):
             content=body,
         )
         upstream = await client.send(upstream_request, stream=True)
-    except Exception:
+    except Exception as exc:
         await client.aclose()
+        observation.error = f"upstream_unreachable: {type(exc).__name__}"
+        _record(observation)
         raise
 
     headers = _response_headers(upstream)
     content_type = upstream.headers.get("content-type", "")
+    observation.upstream_status = upstream.status_code
+    observation.upstream_content_type = content_type or None
 
     if config.mode == "drop_before_body":
 
         async def _drop() -> AsyncIterator[bytes]:
             try:
+                _trigger(observation, "before_first_body_byte")
                 raise ConnectionResetError("P0 injected drop before first response body byte")
                 yield b""  # pragma: no cover - keeps this an async generator
             finally:
                 await upstream.aclose()
                 await client.aclose()
+                _record(observation)
 
         return StreamingResponse(_drop(), status_code=upstream.status_code, headers=headers)
 
@@ -246,18 +325,32 @@ async def proxy(request: Request, path: str):
         finally:
             await upstream.aclose()
             await client.aclose()
+        observation.error = None if upstream.status_code < 400 else f"upstream_http_{upstream.status_code}"
+        _record(observation)
         return Response(content=content, status_code=upstream.status_code, headers=headers)
 
     async def _stream() -> AsyncIterator[bytes]:
         try:
             if config.mode == "passthrough":
-                async for chunk in _raw_passthrough(upstream):
+                async for chunk in _raw_passthrough(upstream, observation):
                     yield chunk
             else:
-                async for chunk in _faulted_sse(upstream, config):
+                async for chunk in _faulted_sse(upstream, config, observation):
                     yield chunk
+        except ConnectionResetError as exc:
+            observation.error = str(exc)
+            raise
+        except asyncio.CancelledError:
+            # The downstream client (Codex) went away first -- e.g. its stream
+            # idle timeout fired during an injected delay. A cancellation that
+            # lands after the whole stream was relayed (Codex closes the
+            # connection once it has read [DONE]) is not a disconnect.
+            if not observation.stream_completed:
+                observation.error = "client_disconnected"
+            raise
         finally:
             await client.aclose()
+            _record(observation)
 
     return StreamingResponse(_stream(), status_code=upstream.status_code, headers=headers)
 
@@ -288,6 +381,12 @@ def main() -> int:
     parser.add_argument("--delay-s", type=float, default=2.0)
     parser.add_argument("--upstream-connect-timeout-s", type=float, default=10.0)
     parser.add_argument(
+        "--observation-log",
+        type=Path,
+        help="JSONL file receiving one secret-free Observation per request (mode, path, "
+        "upstream status, fault_triggered, trigger_point); the matrix requires it",
+    )
+    parser.add_argument(
         "--i-understand-isolated-test-only",
         action="store_true",
         help="required acknowledgement that this is not pointed at shared production",
@@ -308,6 +407,7 @@ def main() -> int:
         after_events=args.after_events,
         delay_s=args.delay_s,
         upstream_connect_timeout_s=args.upstream_connect_timeout_s,
+        observation_log=args.observation_log,
     )
     uvicorn.run(
         app,

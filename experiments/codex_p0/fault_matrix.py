@@ -20,7 +20,6 @@ from pathlib import Path
 from typing import Any
 
 from real_path_conformance import (
-    PROVIDER_ID,
     build_config,
     codex_version,
     parse_header_env,
@@ -112,8 +111,63 @@ def classify_observation(case: dict[str, Any]) -> str:
     return "terminal_failure"
 
 
-def evaluate_fault(expected: str, case: dict[str, Any]) -> tuple[str, str]:
+def load_observations(path: Path) -> list[dict[str, Any]]:
+    """Secret-free per-request observations the proxy wrote for this case."""
+    if not path.is_file():
+        return []
+    observations: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            observations.append(json.loads(line))
+        except json.JSONDecodeError:
+            observations.append({"unparsable": line[:200]})
+    return observations
+
+
+def responses_observation(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The observation for the Codex Responses request this case exercised.
+
+    Retries are disabled, so there is exactly one such request per case; the
+    last matching POST wins if a client ever sends more.
+    """
+    matches = [
+        o
+        for o in observations
+        if o.get("method") == "POST" and str(o.get("path", "")).rstrip("/").endswith("/responses")
+    ]
+    return matches[-1] if matches else None
+
+
+def evaluate_fault(
+    expected: str, mode: str, case: dict[str, Any], observation: dict[str, Any] | None
+) -> tuple[str, str, list[str]]:
+    """Verdict = client outcome AND proof that the selected fault actually fired.
+
+    A terminal client failure without the proxy's ``fault_triggered`` marker for
+    this mode is ``inconclusive`` (or ``harness_error`` when the proxy never saw
+    the request at all), never a PASS: an unrelated config/auth/model error
+    produces the same client-side outcome as a real injected fault.
+    """
     observed = classify_observation(case)
+    reasons: list[str] = []
+    if observation is None:
+        return "harness_error", observed, ["proxy recorded no Responses request for this case"]
+    if observation.get("mode") != mode:
+        return "harness_error", observed, [f"proxy ran mode {observation.get('mode')!r}, case expected {mode!r}"]
+    if not observation.get("request_seen"):
+        return "harness_error", observed, ["proxy did not see the request"]
+
+    injecting = mode != "passthrough"
+    if injecting and not observation.get("fault_triggered"):
+        reasons.append(
+            f"fault {mode!r} was never triggered (stream ended before the target boundary; "
+            f"frames_forwarded={observation.get('frames_forwarded')}, upstream_status={observation.get('upstream_status')})"
+        )
+        return "inconclusive", observed, reasons
+
     if expected == "success":
         passed = case.get("status") == "pass" and observed == "success"
     elif expected == "terminal_failure":
@@ -122,7 +176,9 @@ def evaluate_fault(expected: str, case: dict[str, Any]) -> tuple[str, str]:
         passed = observed in {"success", "terminal_failure"}
     else:
         raise ValueError(expected)
-    return ("pass" if passed else "fail"), observed
+    if not passed:
+        reasons.append(f"expected {expected}, observed {observed}")
+    return ("pass" if passed else "fail"), observed, reasons
 
 
 def proxy_command(
@@ -133,6 +189,7 @@ def proxy_command(
     mode: str,
     after_events: int,
     delay_s: float,
+    observation_log: Path,
 ) -> list[str]:
     return [
         sys.executable,
@@ -147,6 +204,8 @@ def proxy_command(
         str(after_events),
         "--delay-s",
         str(delay_s),
+        "--observation-log",
+        str(observation_log),
         "--i-understand-isolated-test-only",
     ]
 
@@ -173,6 +232,7 @@ def run_fault(
     case_dir.mkdir(parents=True, exist_ok=True)
     proxy_stdout_path = case_dir / "proxy.stdout.txt"
     proxy_stderr_path = case_dir / "proxy.stderr.txt"
+    observation_path = case_dir / "proxy.observations.jsonl"
 
     with proxy_stdout_path.open("wb") as proxy_stdout, proxy_stderr_path.open("wb") as proxy_stderr:
         kwargs: dict[str, Any] = {}
@@ -186,6 +246,7 @@ def run_fault(
                 mode=mode,
                 after_events=int(spec.get("after_events", 1)),
                 delay_s=float(spec.get("delay_s", 0.0)),
+                observation_log=observation_path,
             ),
             stdout=proxy_stdout,
             stderr=proxy_stderr,
@@ -220,18 +281,25 @@ def run_fault(
                     timeout_s=timeout_s,
                     expected={"marker": FAULT_MARKER, "usage": True},
                 )
-                verdict, observed = evaluate_fault(str(spec["expected"]), case)
+                observations = load_observations(observation_path)
+                observation = responses_observation(observations)
+                verdict, observed, reasons = evaluate_fault(str(spec["expected"]), mode, case, observation)
                 return {
                     "name": name,
                     "fault_mode": mode,
                     "expected": spec["expected"],
                     "observed": observed,
                     "status": verdict,
+                    "failure_reasons": reasons,
+                    # Causality: what the proxy proves it did to the request.
+                    "proxy_observation": observation,
+                    "proxy_request_count": len(observations),
                     "codex_case": case,
                     "local_proxy_base_path": upstream_prefix or "/",
                     "proxy_artifacts": {
                         "stdout": str(proxy_stdout_path.relative_to(artifact_dir)),
                         "stderr": str(proxy_stderr_path.relative_to(artifact_dir)),
+                        "observations": str(observation_path.relative_to(artifact_dir)),
                     },
                 }
         except Exception as exc:
@@ -240,8 +308,9 @@ def run_fault(
                 "fault_mode": mode,
                 "expected": spec["expected"],
                 "observed": "harness_error",
-                "status": "fail",
+                "status": "harness_error",
                 "harness_error": f"{type(exc).__name__}: {exc}",
+                "proxy_observation": responses_observation(load_observations(observation_path)),
             }
         finally:
             proxy_stop = stop_process(proxy)
@@ -318,10 +387,15 @@ def main() -> int:
             "expected": "terminal_failure",
         },
         {
+            # Observation-only, like duplicate/reorder: a single non-JSON
+            # `data:` frame is a synthetic-invalid input, and the hermetic run
+            # showed codex-cli 0.147.0 skips it and completes the turn. Killing
+            # a candidate for tolerating it would be judging the wrong thing;
+            # the raw artifact records what it did with the frame.
             "name": "malformed_after_first_event",
             "mode": "malformed_event_after",
             "after_events": 1,
-            "expected": "terminal_failure",
+            "expected": "bounded_terminal",
         },
         {
             "name": "delay_within_idle",
@@ -371,7 +445,8 @@ def main() -> int:
         "cases": [],
         "notes": [
             "Run only against an isolated LiteLLM/model-gateway route or replica.",
-            "duplicate/reorder cases only require bounded terminal behavior; inspect raw artifacts for semantic corruption.",
+            "duplicate/reorder/malformed-frame cases only require bounded terminal behavior; inspect raw artifacts for semantic corruption.",
+            "every injecting case additionally requires the proxy's fault_triggered observation; without it the case is inconclusive, never pass.",
             "side-effect-after-drop requires a separate deterministic tool-call fixture and is not claimed by this matrix.",
         ],
     }
@@ -393,13 +468,24 @@ def main() -> int:
             )
         )
 
-    failed = [case["name"] for case in report["cases"] if case.get("status") != "pass"]
-    report["overall_status"] = "pass" if not failed else "fail"
+    failed = [case["name"] for case in report["cases"] if case.get("status") == "fail"]
+    undecided = [
+        case["name"] for case in report["cases"] if case.get("status") in {"inconclusive", "harness_error"}
+    ]
+    # A case whose fault was never proven to fire cannot count as evidence in
+    # either direction: the matrix is incomplete, not passed.
+    if failed:
+        report["overall_status"] = "fail"
+    elif undecided:
+        report["overall_status"] = "incomplete"
+    else:
+        report["overall_status"] = "pass"
     report["failed_cases"] = failed
+    report["undecided_cases"] = undecided
     report_path = args.artifact_dir / "p0a-fault-matrix-summary.json"
     report_path.write_text(json.dumps(report, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(report_path)
-    return 0 if not failed else 2
+    return 0 if report["overall_status"] == "pass" else 2
 
 
 if __name__ == "__main__":
