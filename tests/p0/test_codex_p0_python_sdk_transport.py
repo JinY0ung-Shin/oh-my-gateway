@@ -79,6 +79,22 @@ def _client(tmp_path: Path, payload: dict, *, approval_handler=None) -> CodexCli
     return client
 
 
+def _close_quietly(client: CodexClient) -> None:
+    """Tear a client down without letting teardown noise fail a probe.
+
+    ``CodexClient.close()`` closes the child's stdin, which flushes any write
+    still buffered there. After the adversary has exited (the death scenarios)
+    that flush raises ``BrokenPipeError`` -- a teardown fact about the SDK,
+    not the property under test, and every assertion precedes the ``finally``
+    that calls this. Swallowing it keeps a control from failing for a reason
+    unrelated to what it controls for.
+    """
+    try:
+        client.close()
+    except BrokenPipeError:
+        pass
+
+
 def _start_daemon_call(fn: Callable[[], T]) -> queue.Queue[tuple[str, object]]:
     """Run a potentially blocking SDK call off the main thread.
 
@@ -215,7 +231,7 @@ def test_sdk_turn_start_control_safe_ordering(tmp_path):
         )
         assert _await_call(pending).method == "turn/completed"
     finally:
-        client.close()
+        _close_quietly(client)
 
 
 @pytest.mark.integration
@@ -247,7 +263,7 @@ def test_sdk_turn_start_loses_terminal_notification_written_right_after_response
         )
         assert _await_call(pending).method == "turn/completed"
     finally:
-        client.close()
+        _close_quietly(client)
 
 
 @pytest.mark.integration
@@ -276,7 +292,7 @@ def test_sdk_turn_start_retains_terminal_notification_emitted_before_response(tm
         )
         assert _await_call(pending).method == "turn/completed"
     finally:
-        client.close()
+        _close_quietly(client)
 
 
 @pytest.mark.integration
@@ -303,7 +319,7 @@ def test_sdk_raw_request_retains_terminal_notification_emitted_before_response(t
         pending = _start_daemon_call(lambda: client.next_turn_notification("turn-1"))
         assert _await_call(pending).method == "turn/completed"
     finally:
-        client.close()
+        _close_quietly(client)
 
 
 # ---------------------------------------------------------------------------
@@ -343,7 +359,7 @@ def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
         with pytest.raises(TransportClosedError):
             _await_call(third)
     finally:
-        client.close()
+        _close_quietly(client)
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +394,7 @@ def test_sdk_control_runtime_death_detected_when_handler_does_not_park(tmp_path)
         with pytest.raises(TransportClosedError):
             _await_call(request)
     finally:
-        client.close()
+        _close_quietly(client)
 
 
 @pytest.mark.integration
@@ -415,7 +431,7 @@ def test_sdk_detects_runtime_death_while_approval_handler_is_parked(tmp_path):
     finally:
         if not human_decision.done():
             human_decision.set_result({"decision": "decline"})
-        client.close()
+        _close_quietly(client)
 
 
 @pytest.mark.integration
@@ -480,10 +496,88 @@ def test_sdk_parked_approval_does_not_block_unrelated_session(tmp_path):
     finally:
         if not human_decision.done():
             human_decision.set_result({"decision": "decline"})
-        client_a.close()
-        client_b.close()
+        _close_quietly(client_a)
+        _close_quietly(client_b)
         try:
             _await_call(request_a, timeout=0.5)
+        except BaseException:
+            pass
+
+
+INTERRUPT_APPROVAL_REQUEST = {
+    "type": "message",
+    "message": {
+        "id": "approval-1",
+        "method": "item/commandExecution/requestApproval",
+        "params": {"threadId": "thread-1", "turnId": "turn-1"},
+    },
+}
+
+
+@pytest.mark.integration
+def test_sdk_control_interrupt_progresses_when_handler_does_not_park(tmp_path):
+    """Control for the parked-interrupt probe: same approval request, handler
+    answers at once.
+
+    Must pass. The fixture acknowledges the handler's decision with a
+    notification (no turnId, so it lands on the global queue) and the test
+    sends ``turn/interrupt`` only after reading it, which makes the stdin order
+    deterministic for the step-sequential adversary. A routed interrupt here
+    plus a lost one in the parked variant is the causal proof that the park,
+    not interrupt handling in general, is what blocks control progress.
+    """
+    approval_seen: Future[None] = Future()
+
+    def approval_handler(_method, _params):
+        if not approval_seen.done():
+            approval_seen.set_result(None)
+        return {"decision": "decline"}
+
+    client = _client(
+        tmp_path,
+        {
+            "steps": [
+                {"expect_method": "probe", "actions": [INTERRUPT_APPROVAL_REQUEST]},
+                {
+                    # the handler's decision arrives as a JSON-RPC response
+                    "expect_id": "approval-1",
+                    "actions": [
+                        {
+                            "type": "message",
+                            "message": {"method": "probe/approvalConsumed", "params": {}},
+                        }
+                    ],
+                },
+                {
+                    "expect_method": "turn/interrupt",
+                    "actions": [{"type": "response", "result": {"turnId": "turn-1"}}],
+                },
+            ],
+            "linger": True,
+        },
+        approval_handler=approval_handler,
+    )
+    request = _start_daemon_call(
+        lambda: client.request("probe", {}, response_model=ProbeResponse)
+    )
+    try:
+        approval_seen.result(timeout=HEALTHY_DEADLINE_S)
+        consumed = _start_daemon_call(client.next_notification)
+        assert _await_call(consumed).method == "probe/approvalConsumed"
+        interrupt = _start_daemon_call(
+            lambda: client.request(
+                "turn/interrupt",
+                {"threadId": "thread-1", "turnId": "turn-1"},
+                response_model=ProbeResponse,
+            )
+        )
+        # Same runtime-health bound as the parked probe.
+        result = _await_call(interrupt, timeout=2.0)
+        assert result.turnId == "turn-1"
+    finally:
+        _close_quietly(client)
+        try:
+            _await_call(request, timeout=0.5)
         except BaseException:
             pass
 
@@ -510,19 +604,7 @@ def test_sdk_interrupt_progresses_while_approval_handler_is_parked(tmp_path):
         tmp_path,
         {
             "steps": [
-                {
-                    "expect_method": "probe",
-                    "actions": [
-                        {
-                            "type": "message",
-                            "message": {
-                                "id": "approval-1",
-                                "method": "item/commandExecution/requestApproval",
-                                "params": {"threadId": "thread-1", "turnId": "turn-1"},
-                            },
-                        }
-                    ],
-                },
+                {"expect_method": "probe", "actions": [INTERRUPT_APPROVAL_REQUEST]},
                 {
                     "expect_method": "turn/interrupt",
                     "actions": [{"type": "response", "result": {"turnId": "turn-1"}}],
@@ -550,7 +632,7 @@ def test_sdk_interrupt_progresses_while_approval_handler_is_parked(tmp_path):
     finally:
         if not human_decision.done():
             human_decision.set_result({"decision": "decline"})
-        client.close()
+        _close_quietly(client)
         try:
             _await_call(request, timeout=0.5)
         except BaseException:

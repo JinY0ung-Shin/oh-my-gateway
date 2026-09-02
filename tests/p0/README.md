@@ -55,9 +55,13 @@ Initial fixtures cover:
 - a second global read after terminal transport failure (`openai/codex#40399`)
 - child-process death while a synchronous human-approval handler owns the SDK reader, paired with a
   non-parking control that proves the park — not the SDK in general — is what delays detection
+- `turn/interrupt` routing while the handler is parked, paired with a non-parking control in which the
+  same interrupt is routed within the runtime-health bound
 
 Every potentially blocking SDK read — including the first post-death read — runs on a daemon probe
-thread behind `_await_call`, so reproducing a hang cannot hang the pytest interpreter itself. The
+thread behind `_await_call`, so reproducing a hang cannot hang the pytest interpreter itself. Teardown
+goes through `_close_quietly`: `CodexClient.close()` flushes stdin and raises `BrokenPipeError` once the
+child has died, which is teardown noise, not the property under test (every assertion precedes it). The
 healthy-arrival deadline is 8 s: a fixed SDK answers in milliseconds, and only the genuinely-buggy
 path pays the wait, so CI load cannot turn a fix into a false xfail.
 
