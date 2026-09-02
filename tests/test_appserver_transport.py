@@ -27,6 +27,7 @@ from src.backends.appserver import (
     Notification,
     OrphanedResponse,
     PendingInteraction,
+    RequestOutcomeUnknown,
     RpcError,
     RuntimeLost,
     StaleAnswer,
@@ -872,10 +873,10 @@ async def test_write_blocked_by_stalled_reader_is_bounded_and_reaps(tmp_path):
     stalled = asyncio.create_task(transport.request("probe"))
     await asyncio.sleep(0.3)  # the child has read the line and is now asleep
     started = asyncio.get_running_loop().time()
-    with pytest.raises(RuntimeLost) as info:
+    with pytest.raises(RequestOutcomeUnknown) as info:  # bytes accepted, drain never completed
         await transport.request("probe", {"blob": "x" * 4_000_000}, timeout=HEALTHY_S)
     assert asyncio.get_running_loop().time() - started < CONTROL_S
-    assert info.value.reason == "write_timeout"
+    assert info.value.reason == "write_timeout" and info.value.method == "probe"
     # Every other waiter and later control call sees the same bounded state.
     with pytest.raises(RuntimeLost):
         await stalled
@@ -1008,7 +1009,7 @@ async def test_caller_deadline_expiring_mid_drain_terminalizes(tmp_path):
     )
     warm = asyncio.create_task(transport.request("probe"))
     await asyncio.sleep(0.2)
-    with pytest.raises(RuntimeLost) as info:
+    with pytest.raises(RequestOutcomeUnknown) as info:  # bytes accepted: ambiguous, not known-not-sent
         await transport.request("probe", {"blob": "x" * 4_000_000}, timeout=0.3)
     assert info.value.reason == "write_timeout"
     assert "caller deadline" in info.value.detail
@@ -1666,3 +1667,128 @@ async def test_delivered_orphan_is_not_also_ambiguous_when_generation_ends_befor
     assert transport._orphaned_requests == {}
     report = await transport.close()
     assert report["unresolved_orphans"] == 0 and report["unconsumed_orphan_tombstones"] == 0
+
+
+# ---------------------------------------------------------------------------
+# a live caller learns whether its request crossed the wire
+# ---------------------------------------------------------------------------
+
+
+async def test_committed_live_caller_gets_request_outcome_unknown_on_loss(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "turn/start", "actions": [{"type": "sleep", "seconds": 0.4}, {"type": "exit", "code": 9}]}],
+    )
+    events = transport.subscribe()
+    with pytest.raises(RequestOutcomeUnknown) as info:
+        await transport.request("turn/start", {"threadId": "thread-1"})
+    assert info.value.method == "turn/start" and info.value.request_id
+    assert info.value.terminal_reason in {"exit", "eof"} and info.value.exit_code == 9
+    assert isinstance(info.value, RuntimeLost)  # existing RuntimeLost handlers still catch it
+    # The live caller owns the outcome: no subscriber-level AmbiguousRequest for it.
+    items = []
+    while True:
+        item = await _next(events)
+        items.append(item)
+        if isinstance(item, TerminalEvent):
+            break
+    assert not any(isinstance(i, AmbiguousRequest) for i in items)
+    await transport.close()
+
+
+async def test_queued_zero_byte_caller_gets_plain_runtime_lost_on_loss(tmp_path):
+    """Control: the same loss while turn/start is still queued behind the
+    writer (zero bytes) is a plain RuntimeLost -- known not sent -- and no
+    ambiguity outcome exists for that request."""
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "probe", "actions": [{"type": "sleep", "seconds": 0.3}, {"type": "exit", "code": 9}]}],
+    )
+    events = transport.subscribe()
+    warm = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.05)
+    await transport._write_lock.acquire()  # writer held: turn/start can only queue
+    transport._writer_since = asyncio.get_running_loop().time()
+    queued = asyncio.create_task(transport.request("turn/start", {"threadId": "thread-1"}))
+    await _next_of(events, TerminalEvent)
+    with pytest.raises(RuntimeLost) as info:
+        await queued
+    assert not isinstance(info.value, RequestOutcomeUnknown)
+    with pytest.raises(RequestOutcomeUnknown):
+        await warm  # the probe WAS on the wire when the runtime died
+    transport._writer_since = None
+    transport._write_lock.release()
+    await asyncio.sleep(0.1)
+    assert not any(isinstance(events.get_nowait(), AmbiguousRequest) for _ in range(events.qsize()))
+    await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# settled server-request id reuse: the registry stays identity-safe
+# ---------------------------------------------------------------------------
+
+
+async def test_forget_interaction_task_is_identity_safe(tmp_path):
+    transport = await _transport(tmp_path, [])
+    try:
+        async def park():
+            await asyncio.sleep(3600)
+
+        old = asyncio.create_task(park())
+        new = asyncio.create_task(park())
+        transport._interaction_tasks["X"] = new  # the id was reused; a NEW handler is parked
+        transport._forget_interaction_task("X", old)  # the OLD handler's completion callback
+        assert transport._interaction_tasks["X"] is new
+        transport._forget_interaction_task("X", new)
+        assert "X" not in transport._interaction_tasks
+        old.cancel()
+        new.cancel()
+    finally:
+        await transport.close()
+
+
+async def test_reused_settled_server_request_id_is_handled_and_retired(tmp_path):
+    """Upstream reuses X after the first X settled. The second X must be
+    accepted (not a live duplicate), its parked handler must remain in the
+    registry despite the first handler finishing, and serverRequest/resolved(X)
+    must retire it and cancel that parked handler."""
+    seen: list = []
+    cancelled: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    async def handler(interaction: PendingInteraction):
+        seen.append(interaction)
+        if len(seen) == 1:
+            return {"decision": "decline"}
+        try:
+            await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            cancelled.set_result(interaction)
+            raise
+
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST]},
+            {"expect_id": "approval-1", "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.3}, RESOLVED_APPROVAL]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "ok"}]},
+        ],
+        interaction_handler=handler,
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        first = await _next_of(events, PendingInteraction)
+        second = await _next_of(events, PendingInteraction)
+        assert first is not second and first.id == second.id == "approval-1"
+        assert first.state == "answered" and second.open
+        assert transport.rejected_server_requests == []  # a settled id may be reused
+        await asyncio.sleep(0.05)
+        assert transport._interaction_tasks.get("approval-1") is not None  # new handler still registered
+        resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert resolved.method == "serverRequest/resolved"
+        assert second.state == "resolved"
+        assert (await asyncio.wait_for(cancelled, CONTROL_S)) is second
+        assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
+    finally:
+        probe.cancel()
+        await transport.close()

@@ -42,6 +42,10 @@ nothing else:
   generation ends first, that request is surfaced ONCE as
   ``AmbiguousRequest`` (before the ``TerminalEvent``) -- accepted work with
   no observed outcome, to be reconciled against durable state, never replayed
+- a live caller learns whether its request crossed the wire: generation loss
+  before the bytes were accepted is a plain ``RuntimeLost`` (known not sent);
+  loss after acceptance and before the response is ``RequestOutcomeUnknown``
+  (accepted-work ambiguity carrying request id/method, to be reconciled)
 - bounded subscribers: streaming deltas are droppable for a slow consumer,
   lossless items are not, and a consumer that falls too far behind on
   lossless items is disconnected instead of growing the process
@@ -142,6 +146,32 @@ class RuntimeLost(TransportError):
         self.generation = generation
         self.exit_code = exit_code
         self.detail = detail
+
+
+class RequestOutcomeUnknown(RuntimeLost):
+    """The generation ended after THIS request's bytes were accepted by the
+    runtime and before its JSON-RPC response was observed. The server may have
+    performed the work (e.g. created the turn). Raised to the caller that still
+    owns the RPC in place of a plain ``RuntimeLost`` -- which is reserved for
+    requests that never crossed the wire -- so a supervisor can branch: plain
+    loss is known-not-sent; this is accepted-work ambiguity that must be
+    reconciled against durable state, never blind-replayed.
+    """
+
+    def __init__(
+        self,
+        *,
+        request_id: str,
+        method: str,
+        generation: int,
+        terminal_reason: str,
+        exit_code: Optional[int],
+        detail: str = "",
+    ):
+        super().__init__(terminal_reason, generation=generation, exit_code=exit_code, detail=detail)
+        self.request_id = request_id
+        self.method = method
+        self.terminal_reason = terminal_reason
 
 
 class RpcError(TransportError):
@@ -533,6 +563,19 @@ class AppServerTransport:
                 )
                 raise asyncio.CancelledError()
             return result
+        except RuntimeLost as exc:
+            if committed and not isinstance(exc, RequestOutcomeUnknown):
+                # Bytes were accepted, no response was observed, the generation
+                # is gone: the live caller learns THAT, not a generic loss.
+                raise RequestOutcomeUnknown(
+                    request_id=request_id,
+                    method=method,
+                    generation=self.generation,
+                    terminal_reason=exc.reason,
+                    exit_code=exc.exit_code,
+                    detail=exc.detail,
+                ) from exc
+            raise
         except (asyncio.CancelledError, asyncio.TimeoutError):
             if committed and not orphaned_inline:
                 # The bytes were accepted before the caller left (cancelled, or
@@ -1209,7 +1252,18 @@ class AppServerTransport:
             # responses, notifications, or death detection.
             task = self._spawn_handler_task(self._run_handler(interaction))
             self._interaction_tasks[request_id] = task
-            task.add_done_callback(lambda _t, rid=request_id: self._interaction_tasks.pop(rid, None))
+            task.add_done_callback(lambda done, rid=request_id: self._forget_interaction_task(rid, done))
+
+    def _forget_interaction_task(self, request_id: Any, task: asyncio.Task) -> None:
+        """Drop the registry entry only if it still points at THIS task.
+
+        A settled server-request id may be reused by upstream; a new
+        interaction's parked handler must not be evicted by the old handler's
+        completion callback, or `serverRequest/resolved` / terminalization
+        would no longer find it.
+        """
+        if self._interaction_tasks.get(request_id) is task:
+            self._interaction_tasks.pop(request_id, None)
 
     async def _run_handler(self, interaction: PendingInteraction) -> None:
         assert self._interaction_handler is not None
