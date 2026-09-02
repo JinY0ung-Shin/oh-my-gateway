@@ -52,8 +52,6 @@ def sha256_file(path: Path) -> str | None:
 
 
 def toml_string(value: str) -> str:
-    # JSON basic-string escaping is compatible with the subset of TOML strings
-    # used by this generated config.
     return json.dumps(value, ensure_ascii=False)
 
 
@@ -86,24 +84,28 @@ def build_config(
         'approval_policy = "never"',
         'sandbox_mode = "read-only"',
         'web_search = "disabled"',
-        "",
-        f"[model_providers.{PROVIDER_ID}]",
-        f"name = {toml_string('ChatDRAGON P0 enterprise Responses')}",
-        f"base_url = {toml_string(base_url.rstrip('/'))}",
-        'wire_api = "responses"',
-        "requires_openai_auth = false",
-        "request_max_retries = 0",
-        "stream_max_retries = 0",
-        f"stream_idle_timeout_ms = {idle_timeout_ms}",
     ]
+    if extra_toml:
+        lines.extend(["", "# Deployment-specific P0 additions (for example MCP).", extra_toml.rstrip()])
+    lines.extend(
+        [
+            "",
+            f"[model_providers.{PROVIDER_ID}]",
+            f"name = {toml_string('ChatDRAGON P0 enterprise Responses')}",
+            f"base_url = {toml_string(base_url.rstrip('/'))}",
+            'wire_api = "responses"',
+            "requires_openai_auth = false",
+            "request_max_retries = 0",
+            "stream_max_retries = 0",
+            f"stream_idle_timeout_ms = {idle_timeout_ms}",
+        ]
+    )
     if api_key_env:
         lines.append(f"env_key = {toml_string(api_key_env)}")
     if header_env:
         lines.extend(["", f"[model_providers.{PROVIDER_ID}.env_http_headers]"])
         for header, env_name in header_env:
             lines.append(f"{toml_string(header)} = {toml_string(env_name)}")
-    if extra_toml:
-        lines.extend(["", "# Deployment-specific P0 additions (for example MCP).", extra_toml.rstrip()])
     return "\n".join(lines) + "\n"
 
 
@@ -138,12 +140,14 @@ def png_chunk(kind: bytes, data: bytes) -> bytes:
 
 
 def write_solid_png(path: Path, rgb: tuple[int, int, int], size: int = 32) -> None:
-    # Minimal RGB PNG using only stdlib. Filter byte 0 starts every scanline.
     raw = b"".join(b"\x00" + bytes(rgb) * size for _ in range(size))
     ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)
-    png = b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", ihdr) + png_chunk(
-        b"IDAT", zlib.compress(raw)
-    ) + png_chunk(b"IEND", b"")
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + png_chunk(b"IHDR", ihdr)
+        + png_chunk(b"IDAT", zlib.compress(raw))
+        + png_chunk(b"IEND", b"")
+    )
     path.write_bytes(png)
 
 
@@ -222,7 +226,8 @@ def summarize_events(events: list[dict[str, Any]]) -> dict[str, Any]:
 def case_ok_base(result: dict[str, Any]) -> bool:
     summary = result["summary"]
     return (
-        result["exit_code"] == 0
+        not result["timed_out"]
+        and result["exit_code"] == 0
         and not result["invalid_jsonl_lines"]
         and not summary["errors"]
         and summary["event_types"].get("turn.completed", 0) == 1
@@ -233,36 +238,36 @@ def has_agent_marker(summary: dict[str, Any], marker: str) -> bool:
     return any(marker in text for text in summary["agent_texts"])
 
 
-def evaluate_case(name: str, result: dict[str, Any], expected: dict[str, Any]) -> tuple[str, list[str]]:
+def evaluate_case(
+    name: str,
+    result: dict[str, Any],
+    expected: dict[str, Any],
+) -> tuple[str, list[str]]:
     reasons: list[str] = []
+    if name == "cancel":
+        if result.get("cancel_signal_sent") is not True:
+            return "inconclusive", ["process completed before cancellation signal"]
+        if result.get("timed_out"):
+            return "fail", ["SIGINT did not terminalize Codex before hard-kill deadline"]
+        if result["exit_code"] == 0 and result["summary"]["event_types"].get("turn.completed", 0):
+            return "fail", ["turn completed normally after cancellation signal"]
+        return "pass", []
+
     if not case_ok_base(result):
         reasons.append("exec did not produce exactly one clean turn.completed")
-
     marker = expected.get("marker")
     if marker and not has_agent_marker(result["summary"], marker):
         reasons.append(f"missing final marker {marker}")
-
     item_type = expected.get("item_type")
     if item_type and result["summary"]["item_types"].get(item_type, 0) < 1:
         reasons.append(f"missing required item type {item_type}")
-
     if expected.get("usage") and not isinstance(result["summary"].get("usage"), dict):
         reasons.append("turn.completed did not include usage")
-
     color = expected.get("image_color")
-    if color and not any(color.lower() in text.lower() for text in result["summary"]["agent_texts"]):
+    if color and not any(
+        color.lower() in text.lower() for text in result["summary"]["agent_texts"]
+    ):
         reasons.append(f"assistant did not identify generated image color {color}")
-
-    if name == "cancel":
-        # Cancellation is intentionally terminalized by SIGINT. A completed turn
-        # before the deadline means the prompt was not long enough to exercise cancel.
-        if result.get("cancel_signal_sent") is not True:
-            return "inconclusive", ["process completed before cancellation signal"]
-        if result["exit_code"] == 0 and result["summary"]["event_types"].get("turn.completed", 0):
-            reasons.append("turn completed normally after cancellation signal")
-        else:
-            reasons = []
-
     return ("pass" if not reasons else "fail"), reasons
 
 
@@ -319,7 +324,7 @@ def run_case(
         assert proc.stdin is not None
         proc.stdin.write(prompt.encode("utf-8"))
         proc.stdin.close()
-
+        proc.stdin = None
         if cancel_after_s is None:
             stdout, stderr = proc.communicate(timeout=timeout_s)
         else:
@@ -346,7 +351,6 @@ def run_case(
     stderr_path = artifact_dir / f"{name}.stderr.txt"
     stdout_path.write_bytes(stdout)
     stderr_path.write_bytes(stderr)
-
     events, invalid = parse_jsonl(stdout)
     summary = summarize_events(events)
     result: dict[str, Any] = {
@@ -367,8 +371,6 @@ def run_case(
     status, reasons = evaluate_case(name, result, expected or {})
     result["status"] = status
     result["failure_reasons"] = reasons
-
-    # Raw assistant/reasoning text remains only in the local JSONL artifact.
     result["summary"] = {
         "event_types": summary["event_types"],
         "item_types": summary["item_types"],
@@ -393,7 +395,11 @@ def main() -> int:
         type=parse_header_env,
         metavar="HEADER=ENV_VAR",
     )
-    parser.add_argument("--extra-config-toml", type=Path)
+    parser.add_argument(
+        "--extra-config-toml",
+        type=Path,
+        help="deployment-specific sections such as MCP config; content is never copied into report",
+    )
     parser.add_argument("--artifact-dir", required=True, type=Path)
     parser.add_argument("--timeout-s", type=float, default=180.0)
     parser.add_argument("--stream-idle-timeout-ms", type=int, default=120000)
@@ -407,6 +413,8 @@ def main() -> int:
         parser.error("timeouts must be positive")
     if args.long_turn_s <= 0 or args.cancel_after_s <= 0:
         parser.error("turn/cancel durations must be positive")
+    if bool(args.mcp_prompt) != bool(args.extra_config_toml):
+        parser.error("MCP case requires both --mcp-prompt and --extra-config-toml")
     if args.api_key_env:
         require_env(args.api_key_env, "provider API key")
     for header, env_name in args.header_env:
@@ -481,7 +489,6 @@ def main() -> int:
                 expected={"marker": TEXT_MARKER, "usage": True},
             )
         )
-
         report["cases"].append(
             run_case(
                 name="reasoning",
@@ -499,7 +506,6 @@ def main() -> int:
                 expected={"marker": REASONING_MARKER, "item_type": "reasoning", "usage": True},
             )
         )
-
         report["cases"].append(
             run_case(
                 name="tool",
@@ -517,8 +523,6 @@ def main() -> int:
             )
         )
 
-        # Deterministic image content without external dependencies. The prompt
-        # does not reveal the expected color, so a text-only path cannot satisfy it legitimately.
         image_path = root / "image-red.png"
         write_solid_png(image_path, (255, 0, 0))
         report["cases"].append(
@@ -535,7 +539,6 @@ def main() -> int:
                 expected={"image_color": "red", "usage": True},
             )
         )
-
         report["cases"].append(
             run_case(
                 name="long_turn",
@@ -552,7 +555,6 @@ def main() -> int:
                 expected={"marker": LONG_MARKER, "item_type": "command_execution", "usage": True},
             )
         )
-
         report["cases"].append(
             run_case(
                 name="cancel",
@@ -570,7 +572,6 @@ def main() -> int:
                 expected={},
             )
         )
-
         if args.mcp_prompt:
             report["cases"].append(
                 run_case(
@@ -591,7 +592,7 @@ def main() -> int:
                     "name": "mcp",
                     "status": "not_run",
                     "failure_reasons": [
-                        "deployment-specific MCP case requires --mcp-prompt and usually --extra-config-toml"
+                        "deployment-specific MCP case requires --mcp-prompt and --extra-config-toml"
                     ],
                 }
             )
