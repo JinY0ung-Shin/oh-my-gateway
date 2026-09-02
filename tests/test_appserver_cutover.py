@@ -22,11 +22,12 @@ def clean_registry():
     BackendRegistry.clear()
 
 
-def test_enabling_the_backend_registers_the_appserver_adapter(
+def test_opt_in_flag_registers_the_appserver_adapter(
     clean_registry, monkeypatch: pytest.MonkeyPatch
 ):
+    # The adapter is opt-in only until the production isolation gate passes.
     monkeypatch.setenv("BACKENDS", "codex")
-    monkeypatch.delenv("CODEX_BACKEND", raising=False)
+    monkeypatch.setenv("CODEX_BACKEND", "appserver")
     discover_backends(registry_cls=BackendRegistry)
 
     client = BackendRegistry.get("codex")
@@ -38,11 +39,12 @@ def test_enabling_the_backend_registers_the_appserver_adapter(
     assert resolved.provider_model == "gpt-5.5"
 
 
-def test_rollback_flag_registers_the_frozen_client(
+def test_default_registers_the_frozen_client_not_the_adapter(
     clean_registry, monkeypatch: pytest.MonkeyPatch
 ):
+    # Default (no CODEX_BACKEND) keeps the frozen client — no default cutover.
     monkeypatch.setenv("BACKENDS", "codex")
-    monkeypatch.setenv("CODEX_BACKEND", "frozen")
+    monkeypatch.delenv("CODEX_BACKEND", raising=False)
     discover_backends(registry_cls=BackendRegistry)
 
     # The frozen client (or, if its construction failed, at least not the

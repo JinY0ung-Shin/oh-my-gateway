@@ -17,10 +17,12 @@ uv run pytest --cov=src                            # with coverage
 - `ADMIN_API_KEY` must be set or the server fails fast at startup (`src/main.py`). `ANTHROPIC_AUTH_TOKEN` for the Claude backend; optional `API_KEY` bearer-protects public endpoints. See `.env.example` for the full list.
 - `src/__init__.py` loads `.env` at package import — set `GATEWAY_SKIP_DOTENV=1` on ad-hoc
   `uv run python` snippets that import `src`, or the local `.env` leaks in (conftest already sets it).
-- Backends are enabled via `BACKENDS=claude,opencode,codex` (claude is the default). `opencode` is
-  stale (frozen 2026-07): enabling it logs a startup warning and it may break without notice.
-  `codex` now runs the maintained **app-server adapter** (`src/backends/appserver`, issue #173), not
-  the frozen JSON-RPC client — set `CODEX_BACKEND=frozen` to roll back to the legacy client.
+- Backends are enabled via `BACKENDS=claude,opencode,codex` (claude is the default). `opencode` and
+  `codex` are stale (frozen 2026-07): enabling them logs a startup warning and they may break without
+  notice. The maintained **app-server adapter** (`src/backends/appserver`, issue #173) is **opt-in
+  only** — set `CODEX_BACKEND=appserver` to route `BACKENDS=codex` to it. It is NOT the default: the
+  #173 traffic cutover is a hard release gate (production two-user filesystem isolation + zero-egress
+  proof) and the default flip belongs to a separate small PR once that gate passes.
 
 ## Architecture
 

@@ -27,12 +27,15 @@ STALE_BACKENDS = ("opencode", "codex")
 def _use_frozen_codex() -> bool:
     """Whether ``BACKENDS=codex`` should register the FROZEN codex client.
 
-    Issue #173 PR E cuts ``codex`` over to the app-server adapter
-    (``src/backends/appserver``). This flag is the independent rollback: set
-    ``CODEX_BACKEND=frozen`` to fall back to the legacy JSON-RPC client without
-    reverting the cutover. Any other value (default) uses the adapter.
+    The app-server adapter (``src/backends/appserver``, #173) is opt-in and NOT
+    the default: the #173 traffic cutover is a hard release gate that requires the
+    production two-user filesystem isolation + zero-egress proof, which is not met
+    on this branch. So ``BACKENDS=codex`` keeps registering the frozen client
+    unless an operator explicitly opts into the adapter with
+    ``CODEX_BACKEND=appserver``. The final default flip belongs to a separate,
+    small cutover PR made only after that gate passes.
     """
-    return os.getenv("CODEX_BACKEND", "appserver").strip().lower() == "frozen"
+    return os.getenv("CODEX_BACKEND", "frozen").strip().lower() != "appserver"
 
 
 def _enabled_backend_names() -> list[str]:
@@ -75,8 +78,9 @@ def discover_backends(registry_cls=None) -> None:
 
                 codex.register(registry_cls=registry_cls)
             else:
-                # PR E cutover: BACKENDS=codex now runs the app-server adapter
-                # (issue #173). Rollback with CODEX_BACKEND=frozen.
+                # Opt-in only (CODEX_BACKEND=appserver): the #173 adapter is not
+                # the default until the production isolation/zero-egress gate
+                # passes and a separate small cutover PR flips it.
                 from src.backends.appserver import client as appserver_client
 
                 appserver_client.register(registry_cls=registry_cls)

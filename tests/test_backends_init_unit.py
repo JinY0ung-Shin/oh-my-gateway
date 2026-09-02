@@ -104,18 +104,18 @@ class TestDiscoverBackends:
         assert calls == [("claude", "registry"), ("opencode", "registry")]
 
     def test_discover_backends_registers_codex_from_backends_env(self, monkeypatch):
-        """BACKENDS=codex with the rollback flag dispatches to the frozen package.
+        """BACKENDS=codex dispatches to the frozen package by DEFAULT.
 
-        Since the #173 PR E cutover, BACKENDS=codex defaults to the app-server
-        adapter; CODEX_BACKEND=frozen selects the legacy client, which is what
-        this stale-suite test pins.
+        The #173 app-server adapter is opt-in only (CODEX_BACKEND=appserver)
+        until the production isolation gate passes; the default keeps the frozen
+        client, which is what this stale-suite test pins.
         """
         import src.backends.codex as codex_pkg
 
         calls = []
 
         monkeypatch.setenv("BACKENDS", "codex")
-        monkeypatch.setenv("CODEX_BACKEND", "frozen")
+        monkeypatch.delenv("CODEX_BACKEND", raising=False)
         monkeypatch.setattr(
             codex_pkg, "register", lambda registry_cls=None: calls.append(registry_cls)
         )
@@ -126,14 +126,16 @@ class TestDiscoverBackends:
 
         assert calls == ["registry"]
 
-    def test_discover_backends_defaults_codex_to_appserver_adapter(self, monkeypatch):
-        """BACKENDS=codex (no rollback flag) dispatches to the app-server adapter."""
+    def test_discover_backends_opt_in_dispatches_to_appserver_adapter(
+        self, monkeypatch
+    ):
+        """CODEX_BACKEND=appserver opts BACKENDS=codex into the app-server adapter."""
         import src.backends.appserver.client as appserver_client
 
         calls = []
 
         monkeypatch.setenv("BACKENDS", "codex")
-        monkeypatch.delenv("CODEX_BACKEND", raising=False)
+        monkeypatch.setenv("CODEX_BACKEND", "appserver")
         monkeypatch.setattr(
             appserver_client,
             "register",
