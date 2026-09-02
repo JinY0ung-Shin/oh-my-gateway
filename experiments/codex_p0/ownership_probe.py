@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """P0 Codex app-server ownership/resource probe.
 
-This intentionally lives outside ``src/backends/codex``.  The production Codex
+This intentionally lives outside ``src/backends/codex``. The production Codex
 backend is frozen; issue #164 requires evidence about the upstream runtime
 before choosing the replacement transport/topology.
 
-The probe never starts a model turn.  It exercises only app-server lifecycle,
+The probe never starts a model turn. It exercises only app-server lifecycle,
 thread persistence/resume, writer ownership, and process resource facts.
 """
 
@@ -145,7 +145,7 @@ class AppServer:
             if item.get("_invalid_json"):
                 raise RuntimeError(f"invalid app-server JSON: {item['_invalid_json']!r}")
 
-            # Server-originated request.  The ownership probe never expects to
+            # Server-originated request. The ownership probe never expects to
             # service one, but reply deterministically rather than hanging the server.
             if "method" in item and "id" in item:
                 self.server_requests.append(item)
@@ -162,7 +162,7 @@ class AppServer:
                 continue
 
             if str(item.get("id")) != request_id:
-                # This probe is intentionally single-request-at-a-time.  Keep
+                # This probe is intentionally single-request-at-a-time. Keep
                 # unexpected responses visible in the output rather than hiding them.
                 self.notifications.append({"_unexpected_response": item})
                 continue
@@ -204,6 +204,7 @@ class AppServer:
             return {"mode": mode, "already_stopped": True}
         proc = self.proc
         before = sample_process(proc.pid)
+        descendant_pids_before = before.get("descendants", [])
         started = time.monotonic()
         error: str | None = None
         try:
@@ -226,12 +227,17 @@ class AppServer:
                 proc.wait(timeout=timeout_s)
         except Exception as exc:  # probe must report cleanup failures, not hide them
             error = f"{type(exc).__name__}: {exc}"
+
+        surviving_descendants = [
+            child_pid for child_pid in descendant_pids_before if pid_alive(child_pid)
+        ]
         return {
             "mode": mode,
             "elapsed_s": round(time.monotonic() - started, 6),
             "returncode": proc.poll(),
             "before": before,
-            "descendants_after": descendants(proc.pid),
+            "descendant_pids_before": descendant_pids_before,
+            "surviving_descendants": surviving_descendants,
             "error": error,
         }
 
@@ -246,6 +252,23 @@ def _signal_process_tree(proc: subprocess.Popen[str], sig: signal.Signals) -> No
         except ProcessLookupError:
             return
     proc.send_signal(sig)
+
+
+def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    proc_root = Path("/proc") / str(pid)
+    if Path("/proc").exists():
+        return proc_root.exists()
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
 
 
 def descendants(root_pid: int) -> list[int]:
@@ -286,7 +309,7 @@ def sample_process(pid: int) -> dict[str, Any]:
     sample: dict[str, Any] = {"pid": pid, "descendants": descendants(pid)}
     proc_root = Path("/proc") / str(pid)
     if not proc_root.exists():
-        sample["alive"] = False
+        sample["alive"] = pid_alive(pid)
         return sample
     sample["alive"] = True
     try:
