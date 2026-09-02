@@ -21,20 +21,45 @@ The repository intentionally does not add `openai-codex` to production or dev de
 spike. Run the probe with an ephemeral dependency instead:
 
 ```bash
-uv run --with openai-codex pytest tests/p0/test_python_sdk_transport.py -q -rxX
+RUN_STALE_BACKEND_TESTS=1 uv run --with 'openai-codex==0.147.0' \
+  pytest tests/p0/test_codex_p0_python_sdk_transport.py -q -rxX
 ```
 
-Known upstream failure classes are strict `xfail`s. A fixed SDK therefore becomes `XPASS(strict)` and
-forces the P0 decision record to be revisited instead of silently leaving stale assumptions in place.
+Pin the SDK **exactly**: the probes assert `openai-codex==0.147.0` at collection and refuse to
+certify any other version, so a result can never be misattributed. The bundled `openai-codex-cli-bin`
+is never executed (`launch_args_override` fully replaces argv), so the ~114 MiB download is
+dependency baggage — cache it in CI.
+
+The probe file is named `test_codex_*` on purpose: this repo deselects Codex tests by default
+(`collect_ignore_glob` + the node-id deselect hook), so the probes are opt-in through the same
+`RUN_STALE_BACKEND_TESTS=1` switch as the rest of the Codex corpus and can never run by accident
+when `openai_codex` happens to be installed. The adversary self-test keeps its neutral name and stays
+in the normal suite.
+
+Known upstream failure classes are strict `xfail`s **with `raises=TimeoutError`**, so an unrelated
+failure (a signature change, a model-validation rejection, a scenario desync) fails the test instead
+of masquerading as the upstream bug. A fixed SDK becomes `XPASS(strict)` and forces the P0 decision
+record to be revisited instead of silently leaving stale assumptions in place. Every known-hang probe
+has a **positive control** on the same scenario machinery that must pass; if a control fails, the
+harness is broken and the neighbouring xfail carries no information.
+
+The probes exercise the transport **pre-`initialize`** deliberately: `CodexClient.start()` does not
+send `initialize`, the fixture is strictly step-sequential, and none of the failure classes under test
+depend on handshake state. A probe that adds `initialize()` must script that step into its scenario.
 
 Initial fixtures cover:
 
-- terminal `turn/completed` arriving before the matching `turn/start` response (`openai/codex#41078`)
+- terminal `turn/completed` arriving before the matching `turn/start` response (`openai/codex#41078`),
+  probed through the **public `turn_start()` helper** (where the registration ordering lives) and
+  through raw `request()` + manual registration, each paired with a safe-ordering control
 - a second global read after terminal transport failure (`openai/codex#40399`)
-- child-process death while a synchronous human-approval handler owns the SDK reader
+- child-process death while a synchronous human-approval handler owns the SDK reader, paired with a
+  non-parking control that proves the park — not the SDK in general — is what delays detection
 
-The potentially blocking calls run on daemon probe threads with explicit deadlines so reproducing a
-hang cannot hang the pytest interpreter itself.
+Every potentially blocking SDK read — including the first post-death read — runs on a daemon probe
+thread behind `_await_call`, so reproducing a hang cannot hang the pytest interpreter itself. The
+healthy-arrival deadline is 8 s: a fixed SDK answers in milliseconds, and only the genuinely-buggy
+path pays the wait, so CI load cannot turn a fix into a false xfail.
 
 ## Rules
 
