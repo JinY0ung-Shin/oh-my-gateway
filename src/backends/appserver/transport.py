@@ -33,9 +33,12 @@ nothing else:
   caller never leaves an interaction "answered" with nothing on the wire, and
   the WIRE is the boundary against ``serverRequest/resolved``: an answer that
   has not begun reaching the process loses to it and writes nothing
-- a caller cancelled after its request's bytes began does not release the
-  writer mid-drain: the transport finishes the write and fans the eventual
-  response out as ``OrphanedResponse`` so the owner layer can reconcile
+- a caller that leaves after its request's bytes were accepted (cancelled,
+  or its response deadline expired after a clean send) does not release the
+  writer mid-drain and does not lose the outcome: the transport finishes the
+  write and fans the response out as ``OrphanedResponse`` -- whether it had
+  already landed on the abandoned waiter or arrives later -- so the owner
+  layer can reconcile a stateful call such as ``turn/start``
 - bounded subscribers: streaming deltas are droppable for a slow consumer,
   lossless items are not, and a consumer that falls too far behind on
   lossless items is disconnected instead of growing the process
@@ -343,6 +346,7 @@ class AppServerTransport:
         self._write_lock = asyncio.Lock()
         self._writer_since: Optional[float] = None  # when the current lock holder took the writer
         self._orphaned_requests: Dict[str, str] = {}  # request id -> method, caller gone after bytes began
+        self._orphan_delivered: set[str] = set()  # ids whose orphan the reader already fanned out
         self._committed_writes: set[asyncio.Task] = set()
         self._waiters: Dict[str, asyncio.Future] = {}
         self._waiter_methods: Dict[str, str] = {}
@@ -460,6 +464,7 @@ class AppServerTransport:
         self._waiters[request_id] = future
         self._waiter_methods[request_id] = method
         committed = False
+        orphaned_inline = False
 
         def _mark_committed() -> None:
             nonlocal committed
@@ -475,14 +480,30 @@ class AppServerTransport:
                 on_committed=_mark_committed,
             )
             remaining = None if deadline is None else max(0.0, deadline - loop.time())
-            return await asyncio.wait_for(future, remaining)
-        except asyncio.CancelledError:
-            if committed:
-                # The bytes began before the caller left: the transport finishes
-                # the write (see _write) and the request WAS sent. Own its
-                # outcome instead of dropping it -- the response is fanned out
-                # as OrphanedResponse so the owner layer can reconcile.
-                self._orphaned_requests[request_id] = method
+            result = await asyncio.wait_for(future, remaining)
+            current = asyncio.current_task()
+            if committed and current is not None and getattr(current, "cancelling", lambda: 0)():
+                # The response landed in the same instant the caller was being
+                # cancelled; asyncio hands the result to a task that is leaving.
+                # Honor the cancellation and own the outcome instead: exactly
+                # one OrphanedResponse, never a result nobody reads.
+                orphaned_inline = True
+                self._fanout(
+                    OrphanedResponse(
+                        request_id=request_id, method=method, result=result, error=None, generation=self.generation
+                    )
+                )
+                raise asyncio.CancelledError()
+            return result
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            if committed and not orphaned_inline:
+                # The bytes were accepted before the caller left (cancelled, or
+                # its response deadline expired after a clean send): the request
+                # WAS sent, so the transport owns its outcome. Ownership moves
+                # from the waiter to the orphan registry atomically -- a
+                # response that already landed on the waiter becomes an
+                # OrphanedResponse right now; a later one is routed there.
+                self._orphan(request_id, method, future)
             raise
         finally:
             self._waiters.pop(request_id, None)
@@ -491,6 +512,36 @@ class AppServerTransport:
                 # Terminalization may have failed this waiter while the write
                 # itself was raising; mark that exception retrieved.
                 future.exception()
+
+    def _orphan(self, request_id: str, method: str, future: "asyncio.Future[Any]") -> None:
+        """Transfer ownership of a sent request from its departed caller to the
+        transport. Exactly one OrphanedResponse results, whether the response
+        beat the caller's departure (already on the waiter) or arrives later."""
+        self._waiters.pop(request_id, None)
+        self._waiter_methods.pop(request_id, None)
+        if request_id in self._orphan_delivered:
+            # The reader already fanned this outcome out while we were leaving.
+            self._orphan_delivered.discard(request_id)
+            return
+        if future.done() and not future.cancelled():
+            error = None
+            result = None
+            exc = future.exception()
+            if exc is None:
+                result = future.result()
+            elif isinstance(exc, RpcError):
+                error = {"code": exc.code, "message": exc.rpc_message, "data": exc.data}
+            else:
+                # RuntimeLost: the generation is gone; the TerminalEvent already
+                # told every subscriber, nothing further to reconcile.
+                return
+            self._fanout(
+                OrphanedResponse(
+                    request_id=request_id, method=method, result=result, error=error, generation=self.generation
+                )
+            )
+            return
+        self._orphaned_requests[request_id] = method
 
     async def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
         self._raise_if_lost()
@@ -630,8 +681,13 @@ class AppServerTransport:
         exit_code: Optional[int] = None
         if self._committed_writes:
             # A write that has begun finishes (or terminalizes) before teardown
-            # starts pulling the process out from under it.
-            await asyncio.gather(*self._committed_writes, return_exceptions=True)
+            # starts pulling the process out from under it. Bounded: a committed
+            # write is itself bounded by its drain deadline.
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*self._committed_writes, return_exceptions=True),
+                    self.write_timeout_s + 1.0,
+                )
         if self._reap_task is not None:
             # An unexpected loss already started transport-owned teardown; let
             # it finish rather than racing two signal sequences.
@@ -739,26 +795,28 @@ class AppServerTransport:
                     self._raise_if_lost()
                 # The holder changed under us before either clock ran out: re-arm.
 
-        # --- own the writer: gate, then a transport-owned committed write -------
+        # --- own the writer: hand it to a transport-owned committed write --------
+        # The gate and the first byte run INSIDE that task, in one synchronous
+        # section with no await between them, so the reader can never
+        # interleave `serverRequest/resolved` between "gate passed" and "bytes
+        # accepted": either the gate sees the retirement and writes nothing, or
+        # the bytes are in the stdin buffer before the reader runs again.
         self._writer_since = loop.time()
-        try:
-            self._raise_if_lost()
-            if before_write is not None:
-                before_write()
-        except BaseException:
-            self._writer_since = None
-            self._write_lock.release()
-            raise
         drain_deadline = self._writer_since + self.write_timeout_s
         if deadline is not None:
             drain_deadline = min(drain_deadline, deadline)
         committed = asyncio.ensure_future(
-            self._committed_write(proc, line, drain_deadline, caller_deadline=deadline)
+            self._committed_write(
+                proc,
+                line,
+                drain_deadline,
+                caller_deadline=deadline,
+                before_write=before_write,
+                on_committed=on_committed,
+            )
         )
         self._committed_writes.add(committed)
         committed.add_done_callback(self._committed_writes.discard)
-        if on_committed is not None:
-            on_committed()
         await asyncio.shield(committed)
 
     async def _committed_write(
@@ -768,14 +826,30 @@ class AppServerTransport:
         drain_deadline: float,
         *,
         caller_deadline: Optional[float],
+        before_write: Optional[Callable[[], None]] = None,
+        on_committed: Optional[Callable[[], None]] = None,
     ) -> None:
         """The part of a write that must finish once begun. Holds the writer
         until the drain completes or the generation is terminalized; releases
-        it in every case."""
+        it in every case.
+
+        ``before_write`` -> ``stdin.write`` -> ``on_committed`` execute with no
+        await between them (the write itself only buffers), which is what makes
+        the gate and the acceptance of the bytes one indivisible step.
+        """
         loop = asyncio.get_running_loop()
         try:
+            # Gate first, outside the write-failure handling: a gate rejection
+            # (StaleAnswer -- a TransportError, hence a RuntimeError) means zero
+            # bytes were written and must propagate as itself, never be
+            # mistaken for a broken pipe.
+            self._raise_if_lost()
+            if before_write is not None:
+                before_write()
             try:
                 proc.stdin.write(line)  # type: ignore[union-attr]
+                if on_committed is not None:
+                    on_committed()  # bytes accepted into the stdin transport buffer
                 await asyncio.wait_for(proc.stdin.drain(), max(0.0, drain_deadline - loop.time()))  # type: ignore[union-attr]
             except asyncio.TimeoutError:
                 which = "caller deadline" if caller_deadline is not None and drain_deadline == caller_deadline else "write_timeout_s"
@@ -785,6 +859,8 @@ class AppServerTransport:
                     detail=f"{which} expired mid-write with {len(line)} bytes not drained; pipe contents ambiguous",
                 )
                 self._raise_if_lost()
+            except TransportError:
+                raise
             except (BrokenPipeError, ConnectionResetError, RuntimeError, OSError) as exc:
                 self._terminalize("write_failed", exit_code=proc.returncode, detail=repr(exc))
                 self._raise_if_lost()
@@ -891,6 +967,22 @@ class AppServerTransport:
     def _on_response(self, message: Dict[str, Any]) -> None:
         request_id = message.get("id")
         future = self._waiters.get(str(request_id))
+        if future is not None and future.cancelled():
+            # The caller is being cancelled but has not run its handler yet
+            # (Task.cancel() cancels the awaited future synchronously); the
+            # request was sent, so this response is its orphaned outcome. Fan
+            # it out now and tell the handler delivery already happened.
+            self._orphan_delivered.add(str(request_id))
+            self._fanout(
+                OrphanedResponse(
+                    request_id=str(request_id),
+                    method=self._waiter_methods.get(str(request_id), "?"),
+                    result=message.get("result"),
+                    error=message.get("error"),
+                    generation=self.generation,
+                )
+            )
+            return
         if future is None or future.done():
             method = self._orphaned_requests.pop(str(request_id), None)
             if method is not None:

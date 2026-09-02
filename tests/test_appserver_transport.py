@@ -1211,3 +1211,126 @@ async def test_duplicate_live_server_request_id_fails_closed(tmp_path):
     finally:
         probe.cancel()
         await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# commit boundary: gate and first byte are indivisible; orphan ownership is
+# race-complete for cancellation and for post-commit response timeouts
+# ---------------------------------------------------------------------------
+
+
+async def test_resolved_arriving_before_committed_task_runs_writes_nothing(tmp_path, monkeypatch):
+    """The window the marker used to hide: the answer is accepted, the writer
+    is free, the committed task is scheduled but has not run yet, and
+    `serverRequest/resolved(X)` arrives. The committed task is parked before
+    its gate (monkeypatched to await a test-owned event) so the ordering is
+    deterministic. Required: X retired, nothing written, adversary sees no
+    response for X (it would desync on one)."""
+    hold = asyncio.Event()
+    hold.set()  # handshake and probe writes run normally
+    original = AppServerTransport._committed_write
+
+    async def parked(self, *args, **kwargs):
+        await hold.wait()
+        return await original(self, *args, **kwargs)
+
+    monkeypatch.setattr(AppServerTransport, "_committed_write", parked)
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.3}, RESOLVED_APPROVAL]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "no-stray-write"}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    interaction = await _next_of(events, PendingInteraction)
+    hold.clear()  # from here on committed tasks are scheduled but do not run
+    caller = asyncio.create_task(
+        transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+    )
+    await asyncio.sleep(0.05)
+    assert interaction.state == "resolving"
+    assert not interaction.wire_committed
+    assert transport._write_lock.locked()  # writer handed to the (parked) committed task
+    resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+    assert resolved.method == "serverRequest/resolved"
+    assert interaction.state == "resolved"  # upstream won: nothing was on the wire
+    hold.set()  # now the committed task runs its gate
+    with pytest.raises(StaleAnswer):
+        await caller
+    assert not interaction.wire_committed
+    assert await transport.request("probe", timeout=HEALTHY_S) == "no-stray-write"
+    probe.cancel()
+    await transport.close()
+
+
+async def test_response_that_beats_cancelled_caller_becomes_exactly_one_orphan(tmp_path):
+    """Ordering: request committed -> cancellation requested -> the reader
+    delivers the response BEFORE the cancelled task runs its handler. The
+    response must surface as exactly one OrphanedResponse, with no orphan id
+    left behind. The adversary sends no response of its own so the injected
+    one is the only one in play."""
+    transport = await _transport(tmp_path, [{"expect_method": "turn/start", "actions": []}])
+    events = transport.subscribe()
+    task = asyncio.create_task(transport.request("turn/start", {"threadId": "thread-1"}))
+    for _ in range(50):
+        await asyncio.sleep(0.01)
+        if transport._waiters and not transport._write_lock.locked():
+            break
+    (request_id,) = transport._waiters.keys()
+    task.cancel()
+    # Same tick, before the cancelled task resumes: the reader routes the response.
+    transport._dispatch({"id": request_id, "result": {"turn": {"id": "turn-1"}}})
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    orphan = await _next_of(events, OrphanedResponse, timeout=CONTROL_S)
+    assert orphan.request_id == request_id and orphan.method == "turn/start"
+    assert orphan.result == {"turn": {"id": "turn-1"}}
+    assert transport._orphaned_requests == {}
+    assert transport._waiters == {}
+    await asyncio.sleep(0.1)
+    assert not any(isinstance(events.get_nowait(), OrphanedResponse) for _ in range(events.qsize()))
+    await transport.close()
+
+
+async def test_response_timeout_after_committed_send_is_orphaned_not_dropped(tmp_path):
+    """turn/start is sent cleanly; the caller's response deadline expires; the
+    server completes it later. The owner must still receive exactly one
+    OrphanedResponse -- a stateful call that really happened is never lost."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "turn/start", "actions": [{"type": "sleep", "seconds": 0.5}, TURN_START_RESPONSE]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "alive"}]},
+        ],
+    )
+    events = transport.subscribe()
+    with pytest.raises(asyncio.TimeoutError):
+        await transport.request("turn/start", {"threadId": "thread-1"}, timeout=0.15)
+    assert list(transport._orphaned_requests.values()) == ["turn/start"]
+    assert transport.alive
+    orphan = await _next_of(events, OrphanedResponse)
+    assert orphan.method == "turn/start"
+    assert orphan.result["turn"]["id"] == "turn-1"
+    assert transport._orphaned_requests == {}
+    assert await transport.request("probe", timeout=HEALTHY_S) == "alive"
+    await transport.close()
+
+
+async def test_rpc_error_for_orphaned_request_is_surfaced_as_error(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "turn/start",
+                "actions": [{"type": "sleep", "seconds": 0.4}, {"type": "response", "error": {"code": -32000, "message": "late no"}}],
+            }
+        ],
+    )
+    events = transport.subscribe()
+    with pytest.raises(asyncio.TimeoutError):
+        await transport.request("turn/start", {"threadId": "thread-1"}, timeout=0.15)
+    orphan = await _next_of(events, OrphanedResponse)
+    assert orphan.result is None and orphan.error["code"] == -32000
+    await transport.close()
