@@ -28,6 +28,7 @@ uv run pytest --cov=src                            # with coverage
 - `src/agent_message_models.py` — strict caller-owned full-history request contract for
   `/v1/agents/messages`.
 - `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` implements them. `codex/` (JSON-RPC to a local `codex app-server`) and `opencode/` (managed subprocess / external HTTP modes) are frozen stale code — do not extend them.
+- `src/backends/appserver/` — the direct `codex app-server` stdio transport (C0 core, #163/#170): one reader per process, id→waiter routing, generation-bound `PendingInteraction`, fail-closed unsupported server requests, EOF/parse/death fanout, process-group teardown. Topology-agnostic by design: no session↔process placement, pooling, or resume policy lives here (gated on #165). Acceptance corpus: `tests/test_appserver_transport.py` against `tests/fixtures/fake_app_server.py`.
 - `src/sanitizer/` — stream sanitization + OpenAI-format bridge.
 - `src/agent_catalog.py` / `src/mcp_health.py` — client-facing read models behind
   `GET /v1/agent-resources` (skills/subagents across plugin + workspace + user scope, described
