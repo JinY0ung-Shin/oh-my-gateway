@@ -14,7 +14,9 @@ This module is the isolated counterpart: a dependency-free Responses server that
    be asked to produce.
 
 It also records every request it receives, which is how the captured Codex
-request contract in ``fixtures/`` was produced.
+request contract in ``fixtures/`` was produced. Header *values* are redacted
+unless the name is on ``SAFE_HEADER_VALUES``, so a capture log never becomes a
+credential dump; header names are always kept.
 
 A pass against this replica is NOT a P0a-1 result
 -------------------------------------------------
@@ -74,6 +76,37 @@ class Config:
 
 
 _log_lock = threading.Lock()
+
+# Header values are recorded ONLY for names on this allowlist. Everything else
+# is reduced to a redaction marker: the runner and the enterprise path supply
+# Authorization, API-key and deployment-specific `env_http_headers`, and a
+# capture log must never become a credential dump. Names are always kept so the
+# capture still shows which headers arrived.
+SAFE_HEADER_VALUES = frozenset(
+    {
+        "accept",
+        "accept-encoding",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent",
+        "openai-beta",
+        "originator",
+        "version",
+    }
+)
+
+
+def redact_headers(headers: dict[str, str]) -> dict[str, str]:
+    """Keep values only for allowlisted header names; redact the rest."""
+    redacted: dict[str, str] = {}
+    for name, value in headers.items():
+        if name.lower() in SAFE_HEADER_VALUES:
+            redacted[name] = value
+        else:
+            redacted[name] = f"<redacted:{len(value)} chars>"
+    return redacted
 
 
 def log_request(kind: str, payload: dict[str, Any]) -> None:
@@ -192,7 +225,7 @@ class Handler(BaseHTTPRequestHandler):
             "responses",
             {
                 "path": self.path,
-                "headers": dict(self.headers.items()),
+                "headers": redact_headers(dict(self.headers.items())),
                 "body": body,
             },
         )
@@ -392,7 +425,10 @@ def main() -> int:
     parser.add_argument("--idle-stall-s", type=float, default=30.0)
     parser.add_argument(
         "--log",
-        help="append every received request to this JSONL file (contract capture)",
+        help=(
+            "append every received request to this JSONL file (contract capture); "
+            "header values are redacted unless allowlisted"
+        ),
     )
     args = parser.parse_args()
 

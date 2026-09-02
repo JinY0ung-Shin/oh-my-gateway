@@ -9,11 +9,31 @@ pointed at directly, or that the P0a-1 runner can be pointed at instead of the e
 
 It serves three jobs:
 
-1. **Fault corpus.** Inject transport faults a production endpoint must never be asked to produce.
-2. **Positive control for the runner.** The P0a-1 corpus can run end to end offline, so a failure
-   there is attributable to the runner or to Codex rather than to the enterprise path.
-3. **Contract capture.** `--log` records every request verbatim; that is how
-   `fixtures/codex_responses_request_0.147.0.json` was produced.
+1. **Hermetic Responses upstream.** A conformant target with no model, no network and no
+   credentials, so Codex-side behavior can be observed in isolation.
+2. **Positive control.** The P0a-1 corpus can run end to end offline, so a failure there is
+   attributable to the runner or to Codex rather than to the enterprise path. #169 can also use
+   this as its inner upstream to self-test its proxy.
+3. **Contract capture.** `--log` records each request; that is how
+   `fixtures/codex_responses_request_0.147.0.json` was produced. Header *values* are redacted
+   unless the name is allowlisted (`SAFE_HEADER_VALUES`), because the runner and the enterprise
+   path supply `Authorization`, API-key and deployment-specific `env_http_headers` — a capture log
+   must never become a credential dump. Header names are always kept.
+
+## Scope split — #169 owns the canonical fault matrix
+
+There must not be two competing P0a-2 fault matrices drifting apart:
+
+```text
+#168  P0a-1 real-path runner
+#171  hermetic mock upstream + request-contract capture + positive control   (this file)
+#169  canonical isolated-gateway fault proxy + matrix; may use #171 as its inner upstream
+```
+
+The fault knobs below stay because they are useful for **low-level Codex control behavior** against
+a hermetic upstream — cheap, offline, no proxy or gateway required. They are not the canonical
+fault corpus: #169 injects faults into a real isolated LiteLLM/model-gateway path with real
+auth/header traffic, and that is the artifact whose matrix results count as P0a-2 evidence.
 
 ## A replica pass is never a P0a-1 result
 
@@ -114,8 +134,13 @@ work item, not cosmetic.
 
 ## Captured contract
 
-`fixtures/codex_responses_request_0.147.0.json` is a verbatim capture of what Codex sends (with
-`instructions` truncated). It is the requirement list any Responses upstream must accept:
+`fixtures/codex_responses_request_0.147.0.json` is a capture of what Codex sends, **sanitized**:
+every identity UUID (installation / session / thread / turn / window ids and `prompt_cache_key`) is
+replaced with a deterministic placeholder, environment-specific absolute paths are replaced with
+`/workspace`, and `instructions` is truncated. Only field/schema/value semantics are under test;
+identity and path values are not. Keep a raw capture local if an audit trail is needed.
+
+It is the requirement list any Responses upstream must accept:
 
 - top-level `instructions, input, model, stream, store, reasoning, tools, tool_choice,
   parallel_tool_calls, include, prompt_cache_key, client_metadata`
@@ -130,8 +155,14 @@ its absence. That field is OpenAI-proprietary, so a non-OpenAI upstream will not
 ## Out of scope
 
 - the actual enterprise path — P0a-1 / #168, which this cannot substitute for
-- whether the deployment's vLLM builds serve `/v1/responses` natively with these tools; that is the
-  open P0a question the passthrough finding above relocates onto the model servers
+- the canonical fault matrix against a real isolated gateway — #169
+- whether the **exact deployed vLLM version plus its model/tool-parser configuration** accepts the
+  Codex 0.147.0 payload and stream semantics: the ten tools, `function_call_output` continuation,
+  reasoning, image input, streaming. That is the open P0a question the passthrough finding
+  relocates onto the model servers. The question is compatibility at that level, **not** mere route
+  existence — recent vLLM is reported to implement `/v1/responses` and function tools, a claim this
+  environment could not verify independently (vLLM docs are egress-blocked here), so neither
+  direction is asserted. Replaying the captured fixture against one real model server settles it
 - `strip_thinking.py` / `THINK_OUTPUT_MODE`, which the deployment installs as a LiteLLM worker
   startup hook and which is not loaded here
 - app-server writer/`CODEX_HOME` ownership — P0b / #165
