@@ -427,3 +427,245 @@ async def test_resume_uses_durable_thread_id(
         assert handle.thread_id == "thread-1"
     finally:
         await handle.disconnect()
+
+
+# -- interaction bridge (PR B) ----------------------------------------------
+
+
+def _approval_request(request_id: str = "approval-1") -> Dict[str, Any]:
+    return _message(
+        {
+            "id": request_id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "command": "ls -la",
+                "availableDecisions": ["accept", "decline"],
+            },
+        }
+    )
+
+
+async def test_interaction_parks_as_askuserquestion_then_resumes_same_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+        ],
+    }
+    # The approval answer ({"id":"approval-1","result":{"decision":"accept"}}) is
+    # the next stdin line; after it, the turn continues to completion.
+    answer_step = {
+        "expect_id": "approval-1",
+        "expect_has_id": True,
+        "actions": [
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "m1",
+                            "phase": "final_answer",
+                            "text": "listed",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        first = await _collect(
+            backend.run_completion_with_client(handle, "run ls", session)
+        )
+        # The turn parked: a codex_approval tool_use chunk was emitted and the
+        # route-facing pending_tool_call is set for requires_action.
+        approval_block = first[-1]["content"][0]
+        assert approval_block["name"] == "codex_approval"
+        assert approval_block["metadata"]["codex_approval_request_id"] == "approval-1"
+        assert session.pending_tool_call["name"] == "AskUserQuestion"
+        assert session.pending_tool_call["call_id"] == "approval-1"
+        assert session.pending_tool_call["codex_resume"] == "approval"
+        # The subscription persisted across the pause (turn still live).
+        assert handle._subscription is not None
+
+        # Answer -> continues the SAME turn to completion.
+        second = await _collect(
+            backend.resume_approval_with_client(handle, "approval-1", "accept", session)
+        )
+        assert second[-1]["type"] == "result"
+        assert second[-1]["result"] == "listed"
+        assert session.codex_thread_id == "thread-1"
+        # The turn is fully torn down after completion.
+        assert handle._subscription is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_resume_with_mismatched_call_id_is_deterministic_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        await _collect(backend.run_completion_with_client(handle, "run ls", session))
+        chunks = await _collect(
+            backend.resume_approval_with_client(handle, "wrong-id", "accept", session)
+        )
+        assert chunks[-1]["type"] == "error"
+        assert "mismatch" in chunks[-1]["error_message"]
+    finally:
+        await handle.disconnect()
+
+
+async def test_upstream_resolved_interaction_answer_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+            # Codex resolves the request itself before the user answers.
+            _message(
+                {
+                    "method": "serverRequest/resolved",
+                    "params": {"threadId": "thread-1", "requestId": "approval-1"},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        await _collect(backend.run_completion_with_client(handle, "run ls", session))
+        # Give the reader a moment to process the resolved notification.
+        chunks = await _collect(
+            backend.resume_approval_with_client(handle, "approval-1", "accept", session)
+        )
+        assert chunks[-1]["type"] == "error"
+        assert "no longer actionable" in chunks[-1]["error_message"]
+    finally:
+        await handle.disconnect()
+
+
+async def test_route_aclose_after_park_keeps_turn_live_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The route calls aclose() on the run_completion generator right after a
+    park (to end the requires_action stream). That must not tear down the live
+    turn -- the resume needs the same subscription."""
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+        ],
+    }
+    answer_step = {
+        "expect_id": "approval-1",
+        "expect_has_id": True,
+        "actions": [
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "ok",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        # Drive until the park chunk, then aclose the generator like the route.
+        agen = backend.run_completion_with_client(handle, "run ls", session)
+        park_chunk = None
+        async for chunk in agen:
+            park_chunk = chunk
+            if (
+                isinstance(chunk, dict)
+                and chunk.get("content")
+                and chunk["content"][0].get("name") == "codex_approval"
+            ):
+                await agen.aclose()
+                break
+        assert park_chunk["content"][0]["name"] == "codex_approval"
+        # Subscription survived the aclose.
+        assert handle._subscription is not None
+
+        resumed = await _collect(
+            backend.resume_approval_with_client(handle, "approval-1", "accept", session)
+        )
+        assert resumed[-1]["result"] == "ok"
+    finally:
+        await handle.disconnect()

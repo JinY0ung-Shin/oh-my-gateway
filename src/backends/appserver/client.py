@@ -26,6 +26,7 @@ This module also does not register itself into ``discover_backends``; wiring
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
@@ -38,6 +39,10 @@ from src.backends.appserver.constants import (
     sandbox_mode,
 )
 from src.backends.appserver.events import TurnMapper
+from src.backends.appserver.interactions import (
+    answer_result_from_output,
+    interaction_arguments,
+)
 from src.backends.appserver.transport import (
     AppServerTransport,
     Notification,
@@ -64,6 +69,10 @@ _INTERRUPT_TIMEOUT_S = 2.0
 logger = logging.getLogger(__name__)
 
 BACKEND_NAME = "codex"
+
+# Canonical tool name the ChatDRAGON UI renders as the human-input card. The
+# route pauses into ``requires_action`` on a ``pending_tool_call`` with this name.
+ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
 
 # Model-param request keys -> Codex turn/start keys. Unset keys stay absent so
 # the app-server's own defaults apply.
@@ -153,6 +162,18 @@ class AppServerSessionClient(SessionHandle):
         self.current_turn_id: Optional[str] = None
         # Toggled by the route's ``_configure_client_streaming``.
         self.stream_events = False
+        # Per-turn transport view + mapper. The subscription PERSISTS across an
+        # AskUserQuestion pause (the turn stays live in the app-server, parked on
+        # the server request), so ``resume_approval_with_client`` keeps consuming
+        # the SAME stream instead of re-subscribing and losing lossless items.
+        self._subscription: Optional[Subscription] = None
+        self._mapper: Optional[TurnMapper] = None
+        # Native identity of the interaction currently parked at requires_action
+        # (issue §3): the canonical call id maps to exactly one live native
+        # request. ``None`` when no interaction is pending.
+        self.pending_interaction_id: Any = None
+        self.pending_interaction_method: Optional[str] = None
+        self.pending_interaction_params: Optional[Dict[str, Any]] = None
 
     def turn_params(self) -> Dict[str, Any]:
         """``turn/start`` params (minus ``threadId``/``input``) for this handle."""
@@ -285,9 +306,11 @@ class AppServerCodexClient(TokenEstimateMixin):
         """
         # Subscribe BEFORE issuing turn/start so the transport's "no
         # registration window" guarantee covers every turn notification, and so
-        # an OrphanedResponse for our turn/start could still be reconciled.
+        # an OrphanedResponse for our turn/start could still be reconciled. The
+        # subscription is stored on the handle and PERSISTS across an
+        # AskUserQuestion pause; it is torn down only when the turn terminalizes.
         subscription = client.transport.subscribe()
-        turn_id: Optional[str] = None
+        client._subscription = subscription
         try:
             turn_params = {
                 "threadId": client.thread_id,
@@ -299,36 +322,108 @@ class AppServerCodexClient(TokenEstimateMixin):
                     "turn/start", turn_params, timeout=request_timeout_s()
                 )
             except RuntimeLost as exc:
+                self._end_turn(client)
                 yield error_chunk(f"Codex runtime lost: {exc.reason}")
                 return
             except RpcError as exc:
+                self._end_turn(client)
                 yield error_chunk(f"Codex turn/start failed: {exc.rpc_message}")
                 return
             except Exception as exc:  # noqa: BLE001 - stay in-band, never raise
+                self._end_turn(client)
                 yield error_chunk(f"Codex turn/start error: {exc}")
                 return
 
             turn_id = self._turn_id_from_result(result)
             client.current_turn_id = turn_id
-            mapper = TurnMapper(thread_id=client.thread_id, turn_id=turn_id)
+            client._mapper = TurnMapper(thread_id=client.thread_id, turn_id=turn_id)
 
-            async for chunk in self._consume(
-                subscription, client, session, mapper, turn_id
-            ):
+            async for chunk in self._drive_turn(client, session):
                 yield chunk
-        finally:
-            client.current_turn_id = None
-            client.transport.unsubscribe(subscription)
+        except BaseException:
+            # The route calls ``aclose()`` on this generator right after a park
+            # to end the requires_action stream; that GeneratorExit must NOT tear
+            # down the still-live turn (its subscription is needed by the
+            # resume). Only a genuine error while NOT parked terminalizes.
+            if client.pending_interaction_id is None:
+                self._end_turn(client)
+            raise
 
-    async def _consume(
+    async def resume_approval_with_client(
         self,
-        subscription: Subscription,
         client: AppServerSessionClient,
+        call_id: str,
+        output: str,
         session: Any,
-        mapper: TurnMapper,
-        turn_id: Optional[str],
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Pump the subscription until the turn terminalizes."""
+        """Answer a parked interaction and continue the SAME turn (issue §3).
+
+        The canonical ``call_id`` must resolve to exactly one live native
+        request; a mismatch, an upstream-resolved/invalidated interaction, a
+        stale/duplicate answer, or a dead runtime is a deterministic error that
+        is never forwarded to a replacement runtime.
+        """
+        interaction_id = client.pending_interaction_id
+        method = client.pending_interaction_method or ""
+        params = client.pending_interaction_params or {}
+        self._clear_pending_interaction(client)
+
+        if interaction_id is None:
+            yield error_chunk("Codex interaction continuation has no pending request")
+            self._end_turn(client)
+            return
+        if str(interaction_id) != str(call_id):
+            yield error_chunk(
+                f"Codex interaction id mismatch: pending {interaction_id!r}, "
+                f"received {call_id!r}"
+            )
+            self._end_turn(client)
+            return
+        if client._subscription is None:
+            # The turn's live stream is gone (runtime lost during the pause);
+            # never forward the answer to a replacement runtime.
+            yield error_chunk("Codex interaction is no longer live; please retry")
+            return
+
+        result = answer_result_from_output(method, output, params)
+        try:
+            await client.transport.answer(
+                interaction_id, result, generation=client.generation
+            )
+        except StaleAnswer:
+            # Retired upstream (serverRequest/resolved), wrong generation, or a
+            # late/double answer -- the transport already fenced it.
+            yield error_chunk("Codex interaction is no longer actionable")
+            self._end_turn(client)
+            return
+        except RuntimeLost as exc:
+            yield error_chunk(f"Codex runtime lost: {exc.reason}")
+            self._end_turn(client)
+            return
+
+        try:
+            async for chunk in self._drive_turn(client, session):
+                yield chunk
+        except BaseException:
+            # As in run_completion: a post-park aclose must not terminalize a
+            # turn that parked again on a chained interaction.
+            if client.pending_interaction_id is None:
+                self._end_turn(client)
+            raise
+
+    async def _drive_turn(
+        self, client: AppServerSessionClient, session: Any
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Pump the handle's live subscription until the turn terminalizes or
+        parks on a human interaction. On a true terminal the subscription is
+        torn down; on a park it stays alive for ``resume_approval_with_client``.
+        """
+        subscription = client._subscription
+        mapper = client._mapper
+        turn_id = client.current_turn_id
+        if subscription is None or mapper is None:
+            return
+
         while True:
             cancelling = getattr(session, "active_response_state", None) == "cancelling"
             try:
@@ -336,6 +431,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                     subscription.get(), timeout=request_timeout_s()
                 )
             except (TimeoutError, asyncio.TimeoutError):
+                self._end_turn(client)
                 if cancelling:
                     yield _gateway_interrupt_chunk("Codex turn interrupted")
                 else:
@@ -346,6 +442,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 # A terminal turn/completed while cancelling becomes an
                 # incomplete (user_cancelled) instead of a normal completion.
                 if cancelling and self._is_turn_completed(item, turn_id):
+                    self._end_turn(client)
                     yield _gateway_interrupt_chunk("Codex turn interrupted")
                     return
                 for chunk in mapper.map_notification(item.method, item.params):
@@ -355,14 +452,18 @@ class AppServerCodexClient(TokenEstimateMixin):
                     # (#165); a failed turn must not seed a resume marker.
                     if mapper.succeeded:
                         setattr(session, "codex_thread_id", client.thread_id)
+                    self._end_turn(client)
                     return
                 continue
 
             if isinstance(item, PendingInteraction):
-                # PR B bridges these into the AskUserQuestion / approval UX. Until
-                # then, fail closed so a parked interaction never hangs the turn.
-                await self._fail_interaction_closed(client, item)
-                continue
+                # Bridge the native server request into the existing
+                # AskUserQuestion / approval UX and PARK: set pending_tool_call,
+                # emit the codex_approval tool_use chunk the route recognizes,
+                # then stop yielding. The subscription is intentionally kept
+                # alive so the resume continues this same turn.
+                yield self._park_interaction(client, session, item)
+                return
 
             if isinstance(item, OrphanedResponse):
                 # Our turn/start is awaited synchronously above, so it does not
@@ -371,6 +472,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 continue
 
             if isinstance(item, TerminalEvent):
+                self._end_turn(client)
                 if cancelling:
                     yield _gateway_interrupt_chunk("Codex turn interrupted")
                 else:
@@ -378,22 +480,66 @@ class AppServerCodexClient(TokenEstimateMixin):
                 return
 
             if isinstance(item, SubscriberOverflow):
+                self._end_turn(client)
                 yield error_chunk("Codex event stream overflowed")
                 return
 
-    async def _fail_interaction_closed(
-        self, client: AppServerSessionClient, interaction: PendingInteraction
-    ) -> None:
-        try:
-            await client.transport.fail_interaction(
-                interaction.id,
-                generation=client.generation,
-                message="interactions are not yet supported by this backend",
-            )
-        except (StaleAnswer, RuntimeLost):
-            pass
-        except Exception:  # noqa: BLE001 - never let fail-closed cleanup raise
-            logger.debug("appserver codex fail_interaction error", exc_info=True)
+    def _park_interaction(
+        self,
+        client: AppServerSessionClient,
+        session: Any,
+        interaction: PendingInteraction,
+    ) -> Dict[str, Any]:
+        """Record the parked interaction and build the codex_approval chunk.
+
+        The chunk carries a ``tool_use`` block named ``codex_approval`` whose
+        metadata id equals ``pending_tool_call.call_id``; the route's
+        ``_is_codex_pending_approval_chunk`` detects that and pauses the stream
+        into a ``requires_action`` response.
+        """
+        request_id = str(interaction.id)
+        params = interaction.params if isinstance(interaction.params, dict) else {}
+        arguments = interaction_arguments(interaction.method, params)
+
+        client.pending_interaction_id = interaction.id
+        client.pending_interaction_method = interaction.method
+        client.pending_interaction_params = params
+        session.pending_tool_call = {
+            "call_id": request_id,
+            "name": ASK_USER_QUESTION_TOOL_NAME,
+            "arguments": arguments,
+            "backend": BACKEND_NAME,
+            "codex_resume": "approval",
+        }
+        tool_block = {
+            "type": "tool_use",
+            "id": request_id,
+            "name": "codex_approval",
+            "input": arguments,
+            "metadata": {
+                "codex_approval_request_id": request_id,
+                "codex_approval_method": interaction.method,
+                "codex_thread_id": str(client.thread_id or ""),
+                "codex_turn_id": str(client.current_turn_id or ""),
+            },
+        }
+        return {"type": "assistant", "content": [tool_block]}
+
+    def _clear_pending_interaction(self, client: AppServerSessionClient) -> None:
+        client.pending_interaction_id = None
+        client.pending_interaction_method = None
+        client.pending_interaction_params = None
+
+    def _end_turn(self, client: AppServerSessionClient) -> None:
+        """Tear down the per-turn transport view (only at a true terminal)."""
+        client.current_turn_id = None
+        self._clear_pending_interaction(client)
+        subscription = client._subscription
+        client._subscription = None
+        client._mapper = None
+        if subscription is not None:
+            with contextlib.suppress(Exception):
+                client.transport.unsubscribe(subscription)
 
     # -- continuation / cancellation --------------------------------------
 
