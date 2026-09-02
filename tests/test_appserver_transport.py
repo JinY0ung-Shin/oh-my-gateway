@@ -20,11 +20,13 @@ from src.backends.appserver import (
     RUNTIME_LOST,
     SERVER_RESOLVED,
     AppServerTransport,
+    HandshakeError,
     Notification,
     PendingInteraction,
     RpcError,
     RuntimeLost,
     StaleAnswer,
+    SubscriberOverflow,
     TerminalEvent,
 )
 
@@ -82,11 +84,11 @@ async def _transport(tmp_path: Path, steps: list, **kwargs) -> AppServerTranspor
     return transport
 
 
-async def _next(queue: asyncio.Queue, timeout: float = HEALTHY_S):
+async def _next(queue, timeout: float = HEALTHY_S):
     return await asyncio.wait_for(queue.get(), timeout)
 
 
-async def _next_of(queue: asyncio.Queue, kind: type, timeout: float = HEALTHY_S):
+async def _next_of(queue, kind: type, timeout: float = HEALTHY_S):
     deadline = asyncio.get_running_loop().time() + timeout
     while True:
         remaining = deadline - asyncio.get_running_loop().time()
@@ -628,3 +630,214 @@ async def test_exit_with_stdout_held_open_by_descendant_still_terminalizes(tmp_p
     assert terminal.exit_code == 5
     report = await transport.close()
     assert report["running_descendants"] == 0
+
+
+# ---------------------------------------------------------------------------
+# bounded handshake: a failed or silent initialize never leaks the runtime
+# ---------------------------------------------------------------------------
+
+
+def _group_is_gone(transport: AppServerTransport) -> bool:
+    return transport._running_group_members() == []  # experiment-owned class
+
+
+async def test_silent_initialize_fails_within_deadline_and_tears_down(tmp_path):
+    scenario = _scenario(
+        tmp_path,
+        [{"expect_method": "initialize", "actions": [{"type": "spawn", "seconds": 120}]}],
+        handshake=False,
+    )
+    transport = AppServerTransport(
+        [sys.executable, str(FIXTURE), str(scenario)], initialize_timeout_s=0.5
+    )
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(HandshakeError) as info:
+        await transport.start()
+    assert asyncio.get_running_loop().time() - started < CONTROL_S
+    assert isinstance(info.value.cause, asyncio.TimeoutError)
+    assert transport.exit_code is not None
+    assert _group_is_gone(transport)
+    assert all(task.done() for task in transport._tasks)
+    assert transport.pending_waiters == 0
+    with pytest.raises(RuntimeLost):
+        await transport.request("probe")
+
+
+async def test_initialize_rpc_error_raises_and_tears_down(tmp_path):
+    scenario = _scenario(
+        tmp_path,
+        [
+            {
+                "expect_method": "initialize",
+                "actions": [{"type": "response", "error": {"code": -32000, "message": "no"}}],
+            }
+        ],
+        handshake=False,
+    )
+    transport = AppServerTransport([sys.executable, str(FIXTURE), str(scenario)])
+    with pytest.raises(RpcError) as info:
+        await transport.start()
+    assert info.value.code == -32000
+    assert transport.exit_code is not None
+    assert _group_is_gone(transport)
+    assert all(task.done() for task in transport._tasks)
+
+
+async def test_initialize_cancelled_by_caller_tears_down(tmp_path):
+    scenario = _scenario(
+        tmp_path, [{"expect_method": "initialize", "actions": []}], handshake=False
+    )
+    transport = AppServerTransport([sys.executable, str(FIXTURE), str(scenario)])
+    starter = asyncio.create_task(transport.start())
+    await asyncio.sleep(0.3)
+    starter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await starter
+    assert transport.exit_code is not None
+    assert _group_is_gone(transport)
+
+
+# ---------------------------------------------------------------------------
+# exactly-once answer commit under caller cancellation
+# ---------------------------------------------------------------------------
+
+
+async def test_cancelled_answer_caller_never_leaves_answered_without_bytes(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST]},
+            {
+                "expect_id": "approval-1",
+                "actions": [{"type": "message", "message": {"method": "probe/answered", "params": {}}}],
+            },
+            # A duplicate response for approval-1 would land here and desync.
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "exactly-once"}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        interaction = await _next_of(events, PendingInteraction)
+        # Hold the writer so the answer parks before any byte is written...
+        await transport._write_lock.acquire()
+        caller = asyncio.create_task(
+            transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+        )
+        await asyncio.sleep(0.1)
+        assert interaction.state == "resolving"
+        # ...and cancel the caller while it is parked.
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        # The transport owns the commit: it is neither abandoned nor duplicated.
+        assert interaction.state == "resolving"
+        with pytest.raises(StaleAnswer):
+            await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        transport._write_lock.release()
+        await asyncio.wait_for(interaction.commit, CONTROL_S)
+        assert interaction.state == "answered"
+        ack = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert ack.method == "probe/answered"
+        assert await transport.request("probe", timeout=HEALTHY_S) == "exactly-once"
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+async def test_answer_commit_records_runtime_loss(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [{"expect_method": "probe", "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.3}, {"type": "exit", "code": 3}]}],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    interaction = await _next_of(events, PendingInteraction)
+    await transport._write_lock.acquire()
+    caller = asyncio.create_task(
+        transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+    )
+    await _next_of(events, TerminalEvent)
+    transport._write_lock.release()
+    with pytest.raises(StaleAnswer):
+        await caller
+    assert interaction.state == "invalidated"
+    assert interaction.invalidation_reason == RUNTIME_LOST
+    with pytest.raises(RuntimeLost):
+        await probe
+    await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# bounded subscribers: deltas droppable, lossless never silently dropped
+# ---------------------------------------------------------------------------
+
+
+def _delta(n: int) -> dict:
+    return {
+        "type": "message",
+        "message": {"method": "item/agentMessage/delta", "params": {"delta": f"chunk-{n}"}},
+    }
+
+
+async def test_slow_subscriber_drops_deltas_but_keeps_lossless_items(tmp_path):
+    lifecycle = {"type": "message", "message": {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}}
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                "actions": [*(_delta(n) for n in range(20)), lifecycle, APPROVAL_REQUEST, {"type": "response", "result": "ok"}],
+            }
+        ],
+    )
+    slow = transport.subscribe(max_pending=3)
+    fast = transport.subscribe()
+    try:
+        assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
+        await asyncio.sleep(0.2)  # let the reader route everything before draining
+        items = []
+        while not slow.empty():
+            items.append(slow.get_nowait())
+        deltas = [i for i in items if isinstance(i, Notification) and i.method.endswith("/delta")]
+        assert len(deltas) == 3
+        assert slow.dropped_deltas == 17
+        assert any(isinstance(i, Notification) and i.method == "turn/completed" for i in items)
+        assert any(isinstance(i, PendingInteraction) for i in items)
+        assert not slow.disconnected
+        fast_items = []
+        while not fast.empty():
+            fast_items.append(fast.get_nowait())
+        assert sum(isinstance(i, Notification) and i.method.endswith("/delta") for i in fast_items) == 20
+        assert fast.dropped_deltas == 0
+    finally:
+        await transport.close()
+
+
+async def test_subscriber_far_behind_on_lossless_items_is_disconnected_not_grown(tmp_path):
+    lifecycle = [
+        {"type": "message", "message": {"method": "item/completed", "params": {"n": n}}} for n in range(10)
+    ]
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [*lifecycle, {"type": "response", "result": "first"}]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "second"}]},
+        ],
+    )
+    stalled = transport.subscribe(max_pending=1, hard_limit=4)
+    try:
+        assert await transport.request("probe", timeout=HEALTHY_S) == "first"
+        await asyncio.sleep(0.2)
+        items = []
+        while not stalled.empty():
+            items.append(stalled.get_nowait())
+        assert stalled.disconnected
+        assert isinstance(items[-1], SubscriberOverflow)
+        assert items[-1].pending == 4
+        assert len(items) == 5  # 4 retained lossless items + the overflow marker, nothing after
+        # The reader and the other side of the transport are unaffected.
+        assert await transport.request("probe", timeout=HEALTHY_S) == "second"
+        assert stalled.empty()
+    finally:
+        await transport.close()

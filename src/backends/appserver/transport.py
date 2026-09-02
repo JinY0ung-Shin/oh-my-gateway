@@ -22,6 +22,13 @@ nothing else:
 - interrupt routing
 - process-group teardown (EOF -> SIGTERM -> SIGKILL) with descendant reap and
   an idempotent, deterministic ``close()`` report
+- a bounded handshake: ``start()`` fails within ``initialize_timeout_s`` and
+  tears the runtime down on any handshake failure before re-raising
+- transport-owned, exactly-once commit of interaction answers: a cancelled
+  caller never leaves an interaction "answered" with nothing on the wire
+- bounded subscribers: streaming deltas are droppable for a slow consumer,
+  lossless items are not, and a consumer that falls too far behind on
+  lossless items is disconnected instead of growing the process
 
 Deliberately NOT here (supervisor policy, gated on #165's production-mount and
 budget evidence): session<->process placement, pooling or sharding, capacity,
@@ -125,6 +132,19 @@ class RpcError(TransportError):
         self.data = error.get("data") if isinstance(error, dict) else None
 
 
+class HandshakeError(TransportError):
+    """``start()`` could not complete ``initialize``; the runtime was torn down.
+
+    ``cause`` carries the underlying failure (``asyncio.TimeoutError`` for a
+    live-but-silent child, ``RuntimeLost`` for one that died mid-handshake).
+    An ``RpcError`` from ``initialize`` is re-raised as itself after cleanup.
+    """
+
+    def __init__(self, message: str, cause: BaseException):
+        super().__init__(f"{message}: {cause!r}")
+        self.cause = cause
+
+
 class StaleAnswer(TransportError):
     """An interaction answer arrived for a generation, process, or interaction
     that can no longer accept it. The answer is dropped; nothing is written."""
@@ -160,16 +180,87 @@ class PendingInteraction:
     params: Any
     generation: int
     created_at: float = field(default_factory=time.monotonic)
-    state: str = "pending"  # "pending" | "answered" | "failed" | "resolved" | "invalidated"
+    state: str = "pending"  # pending | resolving | answered | failed | resolved | invalidated
     invalidation_reason: Optional[str] = None  # RUNTIME_LOST | SERVER_RESOLVED
+    # Transport-owned commit of the response; set once the first answer is
+    # accepted. Await it to learn the final state even if your own call was
+    # cancelled.
+    commit: Optional["asyncio.Future[None]"] = None
 
     @property
     def open(self) -> bool:
         return self.state == "pending"
 
 
-SubscriberItem = Union[Notification, PendingInteraction, TerminalEvent]
+@dataclass(frozen=True)
+class SubscriberOverflow:
+    """Delivered once to a subscriber that fell too far behind on lossless
+    items; the subscription is disconnected and receives nothing further."""
+
+    pending: int
+    dropped_deltas: int
+    generation: int
+
+
+SubscriberItem = Union[Notification, PendingInteraction, TerminalEvent, SubscriberOverflow]
 InteractionHandler = Callable[[PendingInteraction], Awaitable[Dict[str, Any]]]
+
+
+def is_best_effort(item: SubscriberItem) -> bool:
+    """Streaming deltas may be dropped for a slow subscriber; everything else
+    (lifecycle notifications, server requests, terminal events) is lossless."""
+    if not isinstance(item, Notification):
+        return False
+    method = item.method
+    return method.endswith("Delta") or method.endswith("/delta")
+
+
+class Subscription:
+    """One subscriber's bounded view of the transport's inbound stream.
+
+    Reader progress never depends on a subscriber: enqueueing is non-blocking.
+    Memory is bounded instead by policy -- best-effort deltas are dropped once
+    ``max_pending`` items are waiting (counted in ``dropped_deltas``), and a
+    subscriber that lets lossless items pile past ``hard_limit`` is
+    disconnected with one ``SubscriberOverflow`` rather than allowed to grow
+    the gateway process without bound.
+    """
+
+    def __init__(self, *, max_pending: int, hard_limit: int, generation: int) -> None:
+        self.max_pending = max_pending
+        self.hard_limit = hard_limit
+        self.generation = generation
+        self.dropped_deltas = 0
+        self.disconnected = False
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    async def get(self) -> SubscriberItem:
+        return await self._queue.get()
+
+    def get_nowait(self) -> SubscriberItem:
+        return self._queue.get_nowait()
+
+    def empty(self) -> bool:
+        return self._queue.empty()
+
+    def qsize(self) -> int:
+        return self._queue.qsize()
+
+    def _offer(self, item: SubscriberItem) -> None:
+        if self.disconnected:
+            return
+        pending = self._queue.qsize()
+        if is_best_effort(item):
+            if pending >= self.max_pending:
+                self.dropped_deltas += 1
+                return
+        elif pending >= self.hard_limit:
+            self.disconnected = True
+            self._queue.put_nowait(
+                SubscriberOverflow(pending=pending, dropped_deltas=self.dropped_deltas, generation=self.generation)
+            )
+            return
+        self._queue.put_nowait(item)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +284,7 @@ class AppServerTransport:
         supported_server_requests: Optional[Iterable[str]] = None,
         stderr_tail_lines: int = 400,
         exit_drain_grace_s: float = 2.0,
+        initialize_timeout_s: float = 10.0,
     ) -> None:
         self.argv = list(argv)
         self.generation = generation
@@ -202,6 +294,7 @@ class AppServerTransport:
             else supported_server_requests
         )
         self.exit_drain_grace_s = exit_drain_grace_s
+        self.initialize_timeout_s = initialize_timeout_s
         self.cwd = str(cwd) if cwd is not None else None
         self.env = dict(env) if env is not None else None
         self.client_info = client_info or dict(DEFAULT_CLIENT_INFO)
@@ -214,7 +307,7 @@ class AppServerTransport:
         self._waiters: Dict[str, asyncio.Future] = {}
         self._waiter_methods: Dict[str, str] = {}
         self._interactions: Dict[Any, PendingInteraction] = {}
-        self._subscribers: List[asyncio.Queue] = []
+        self._subscribers: List[Subscription] = []
         self._tasks: List[asyncio.Task] = []
         self._handler_tasks: set[asyncio.Task] = set()
         self._interaction_tasks: Dict[Any, asyncio.Task] = {}
@@ -229,7 +322,15 @@ class AppServerTransport:
     # -- lifecycle -----------------------------------------------------------
 
     async def start(self, *, initialize: bool = True) -> None:
-        """Spawn the process, start the single reader, run the handshake."""
+        """Spawn the process, start the single reader, run the handshake.
+
+        The handshake is bounded by ``initialize_timeout_s`` (a live child that
+        never answers ``initialize`` is the bootstrap form of "alive, no
+        progress"), and any handshake failure -- timeout, JSON-RPC error,
+        runtime loss, or cancellation of the caller -- tears the spawned
+        process group and tasks down deterministically before re-raising, so a
+        factory that never returns the handle never leaks the process.
+        """
         if self._proc is not None:
             raise TransportError("transport already started")
         loop = asyncio.get_running_loop()
@@ -255,12 +356,26 @@ class AppServerTransport:
             asyncio.create_task(self._read_stderr(), name="appserver-stderr"),
             asyncio.create_task(self._watch_exit(), name="appserver-exit"),
         ]
-        if initialize:
+        if not initialize:
+            return
+        try:
             await self.request(
                 "initialize",
                 {"clientInfo": self.client_info, "capabilities": self.capabilities},
+                timeout=self.initialize_timeout_s,
             )
             await self.notify("initialized", {})
+        except BaseException as exc:  # noqa: BLE001 - cleanup, then re-raise
+            await asyncio.shield(self.close(grace_s=1.0))
+            if isinstance(exc, RpcError):
+                raise
+            if isinstance(exc, asyncio.TimeoutError):
+                raise HandshakeError(
+                    f"initialize not answered within {self.initialize_timeout_s}s", exc
+                ) from exc
+            if isinstance(exc, RuntimeLost):
+                raise HandshakeError("runtime lost during initialize", exc) from exc
+            raise
 
     @property
     def pid(self) -> Optional[int]:
@@ -321,20 +436,30 @@ class AppServerTransport:
 
     # -- inbound fanout ------------------------------------------------------
 
-    def subscribe(self) -> "asyncio.Queue[SubscriberItem]":
+    def subscribe(self, *, max_pending: int = 1000, hard_limit: Optional[int] = None) -> Subscription:
         """Receive every notification and interaction in arrival order, then one
-        ``TerminalEvent``. Queues are unbounded so the reader never blocks on a
-        slow consumer; a subscriber that stops draining leaks its own memory,
-        not everyone's progress."""
-        queue: asyncio.Queue = asyncio.Queue()
-        if self._terminal is not None:
-            queue.put_nowait(self._terminal)
-        self._subscribers.append(queue)
-        return queue
+        ``TerminalEvent``.
 
-    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        Enqueueing never blocks the reader. Memory is bounded by policy: once
+        ``max_pending`` items wait, streaming deltas are dropped (lossless
+        items still land); once lossless items alone exceed ``hard_limit``
+        (default ``4 * max_pending``) the subscriber is disconnected with one
+        ``SubscriberOverflow``. See ``Subscription``.
+        """
+        subscription = Subscription(
+            max_pending=max_pending,
+            hard_limit=hard_limit if hard_limit is not None else 4 * max_pending,
+            generation=self.generation,
+        )
+        if self._terminal is not None:
+            subscription._offer(self._terminal)
+        self._subscribers.append(subscription)
+        return subscription
+
+    def unsubscribe(self, subscription: Subscription) -> None:
+        subscription.disconnected = True
         with contextlib.suppress(ValueError):
-            self._subscribers.remove(queue)
+            self._subscribers.remove(subscription)
 
     # -- interactions --------------------------------------------------------
 
@@ -357,24 +482,39 @@ class AppServerTransport:
         Otherwise ``StaleAnswer`` -- and nothing is written.
         """
         interaction = self._fence(interaction_id, generation)
-        interaction.state = "answered"
-        try:
-            await self._write({"id": interaction.id, "result": result})
-        except RuntimeLost:
-            interaction.state = "invalidated"
-            interaction.invalidation_reason = RUNTIME_LOST
-            raise StaleAnswer(f"runtime lost before answer for {interaction.method} could be written")
+        await self._commit(interaction, {"id": interaction.id, "result": result}, "answered")
 
     async def fail_interaction(self, interaction_id: Any, *, generation: int, code: int = JSONRPC_INTERNAL_ERROR, message: str = "interaction failed") -> None:
         """Answer a server request with a JSON-RPC error (the fail-closed path)."""
         interaction = self._fence(interaction_id, generation)
-        interaction.state = "failed"
+        await self._commit(
+            interaction, {"id": interaction.id, "error": {"code": code, "message": message}}, "failed"
+        )
+
+    async def _commit(self, interaction: PendingInteraction, payload: Dict[str, Any], final_state: str) -> None:
+        """Transport-owned, exactly-once commit of an interaction's response.
+
+        The caller (an HTTP continuation, a UI task) may be cancelled at any
+        point; the ownership transition must not be half-cancelled. So the
+        interaction moves to ``resolving`` synchronously (a concurrent second
+        answer is already stale), the write runs in a task the transport owns,
+        and the caller merely waits on a shield of it. Whatever happens to the
+        caller, the commit task records the final state exactly once:
+        ``answered``/``failed`` when the bytes are on the wire, ``invalidated``
+        (RUNTIME_LOST) if the runtime was lost before they could be.
+        """
+        interaction.state = "resolving"
+        interaction.commit = asyncio.ensure_future(self._commit_task(interaction, payload, final_state))
+        await asyncio.shield(interaction.commit)
+
+    async def _commit_task(self, interaction: PendingInteraction, payload: Dict[str, Any], final_state: str) -> None:
         try:
-            await self._write({"id": interaction.id, "error": {"code": code, "message": message}})
+            await self._write(payload)
         except RuntimeLost:
             interaction.state = "invalidated"
             interaction.invalidation_reason = RUNTIME_LOST
-            raise StaleAnswer(f"runtime lost before error for {interaction.method} could be written")
+            raise StaleAnswer(f"runtime lost before the response for {interaction.method} could be written")
+        interaction.state = final_state
 
     def _fence(self, interaction_id: Any, generation: int) -> PendingInteraction:
         interaction = self._interactions.get(interaction_id)
@@ -608,8 +748,11 @@ class AppServerTransport:
         return task
 
     def _fanout(self, item: SubscriberItem) -> None:
-        for queue in list(self._subscribers):
-            queue.put_nowait(item)
+        for subscription in list(self._subscribers):
+            subscription._offer(item)
+            if subscription.disconnected:
+                with contextlib.suppress(ValueError):
+                    self._subscribers.remove(subscription)
 
     async def _read_stderr(self) -> None:
         proc = self._proc

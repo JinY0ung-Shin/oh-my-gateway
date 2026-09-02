@@ -9,18 +9,23 @@ from src.backends.appserver.transport import (
     SERVER_RESOLVED,
     SUPPORTED_SERVER_REQUESTS,
     AppServerTransport,
+    HandshakeError,
     Notification,
     PendingInteraction,
     RpcError,
     RuntimeLost,
     StaleAnswer,
+    SubscriberOverflow,
+    Subscription,
     TerminalEvent,
     TransportError,
+    is_best_effort,
 )
 
 __all__ = [
     "AppServerTransport",
     "DEFAULT_SUPPORTED_SERVER_REQUESTS",
+    "HandshakeError",
     "JSONRPC_INTERNAL_ERROR",
     "JSONRPC_METHOD_NOT_FOUND",
     "Notification",
@@ -32,6 +37,9 @@ __all__ = [
     "RuntimeLost",
     "SUPPORTED_SERVER_REQUESTS",
     "StaleAnswer",
+    "SubscriberOverflow",
+    "Subscription",
     "TerminalEvent",
     "TransportError",
+    "is_best_effort",
 ]
