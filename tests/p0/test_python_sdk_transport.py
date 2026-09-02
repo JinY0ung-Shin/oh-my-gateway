@@ -216,3 +216,144 @@ def test_sdk_detects_runtime_death_while_approval_handler_is_parked(tmp_path):
         if not human_decision.done():
             human_decision.set_result({"decision": "decline"})
         client.close()
+
+
+@pytest.mark.integration
+def test_sdk_parked_approval_does_not_block_unrelated_session(tmp_path):
+    approval_seen: Future[None] = Future()
+    human_decision: Future[dict] = Future()
+
+    def approval_handler(_method, _params):
+        if not approval_seen.done():
+            approval_seen.set_result(None)
+        return human_decision.result(timeout=30)
+
+    session_a_dir = tmp_path / "session-a"
+    session_a_dir.mkdir()
+    client_a = _client(
+        session_a_dir,
+        {
+            "steps": [
+                {
+                    "expect_method": "probe",
+                    "actions": [
+                        {
+                            "type": "message",
+                            "message": {
+                                "id": "approval-a",
+                                "method": "item/commandExecution/requestApproval",
+                                "params": {"threadId": "thread-a", "turnId": "turn-a"},
+                            },
+                        }
+                    ],
+                }
+            ],
+            "linger": True,
+        },
+        approval_handler=approval_handler,
+    )
+    request_a = _start_daemon_call(
+        lambda: client_a.request("probe", {}, response_model=ProbeResponse)
+    )
+
+    session_b_dir = tmp_path / "session-b"
+    session_b_dir.mkdir()
+    client_b = _client(
+        session_b_dir,
+        {
+            "steps": [
+                {
+                    "expect_method": "probe",
+                    "actions": [
+                        {"type": "response", "result": {"turnId": "turn-b"}}
+                    ],
+                }
+            ]
+        },
+    )
+    try:
+        approval_seen.result(timeout=1)
+        response_b = client_b.request("probe", {}, response_model=ProbeResponse)
+        assert response_b.turnId == "turn-b"
+    finally:
+        if not human_decision.done():
+            human_decision.set_result({"decision": "decline"})
+        client_a.close()
+        client_b.close()
+        try:
+            _await_call(request_a, timeout=0.2)
+        except BaseException:
+            pass
+
+
+@pytest.mark.integration
+@pytest.mark.xfail(
+    reason=(
+        "B0 hazard: turn/interrupt response cannot be routed while the sole reader "
+        "is blocked inside approval_handler"
+    ),
+    raises=TimeoutError,
+    strict=True,
+)
+def test_sdk_interrupt_progresses_while_approval_handler_is_parked(tmp_path):
+    approval_seen: Future[None] = Future()
+    human_decision: Future[dict] = Future()
+
+    def approval_handler(_method, _params):
+        if not approval_seen.done():
+            approval_seen.set_result(None)
+        return human_decision.result(timeout=30)
+
+    client = _client(
+        tmp_path,
+        {
+            "steps": [
+                {
+                    "expect_method": "probe",
+                    "actions": [
+                        {
+                            "type": "message",
+                            "message": {
+                                "id": "approval-1",
+                                "method": "item/commandExecution/requestApproval",
+                                "params": {
+                                    "threadId": "thread-1",
+                                    "turnId": "turn-1",
+                                },
+                            },
+                        }
+                    ],
+                },
+                {
+                    "expect_method": "turn/interrupt",
+                    "actions": [
+                        {"type": "response", "result": {"turnId": "turn-1"}}
+                    ],
+                },
+            ],
+            "linger": True,
+        },
+        approval_handler=approval_handler,
+    )
+    request = _start_daemon_call(
+        lambda: client.request("probe", {}, response_model=ProbeResponse)
+    )
+    try:
+        approval_seen.result(timeout=1)
+        interrupt = _start_daemon_call(
+            lambda: client.request(
+                "turn/interrupt",
+                {"threadId": "thread-1", "turnId": "turn-1"},
+                response_model=ProbeResponse,
+            )
+        )
+        result = _await_call(interrupt)
+        assert result.turnId == "turn-1"
+    finally:
+        if not human_decision.done():
+            human_decision.set_result({"decision": "decline"})
+        client.close()
+        try:
+            _await_call(request, timeout=0.2)
+        except BaseException:
+            pass
