@@ -26,6 +26,13 @@ def _codex_resolve(model: str) -> Optional[ResolvedModel]:
     )
 
 
+def _codex_discover_models():
+    """Lazy import so descriptor creation never pulls the SDK-backed module."""
+    from src.backends.codex.model_discovery import discover_models
+
+    return discover_models()
+
+
 CODEX_DESCRIPTOR = BackendDescriptor(
     name="codex",
     owned_by="openai",
@@ -34,6 +41,9 @@ CODEX_DESCRIPTOR = BackendDescriptor(
     # Codex accepts multimodal input natively via turn input items (see
     # validate_image_request in src/routes/deps.py).
     capabilities={"image_input": True},
+    # Best-effort live model listing from the app-server (opt-in via
+    # CODEX_MODEL_DISCOVERY_ENABLED); /v1/models never depends on it.
+    model_discovery_fn=_codex_discover_models,
 )
 
 

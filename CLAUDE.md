@@ -2,7 +2,8 @@
 
 Agent gateway exposing the Claude Agent SDK through the OpenAI-compatible `/v1/responses` API, plus
 a stateless Claude SDK event stream at `/v1/agents/messages` (FastAPI, Python 3.10+, uv). The
-OpenCode and Codex backends are **stale**: frozen since 2026-07 and unmaintained (see Testing).
+Codex backend runs on the official `openai-codex` SDK (rebuilt 2026-09); the OpenCode backend is
+**stale**: frozen since 2026-07 and unmaintained (see Testing).
 
 ## Commands
 
@@ -17,8 +18,12 @@ uv run pytest --cov=src                            # with coverage
 - `ADMIN_API_KEY` must be set or the server fails fast at startup (`src/main.py`). `ANTHROPIC_AUTH_TOKEN` for the Claude backend; optional `API_KEY` bearer-protects public endpoints. See `.env.example` for the full list.
 - `src/__init__.py` loads `.env` at package import — set `GATEWAY_SKIP_DOTENV=1` on ad-hoc
   `uv run python` snippets that import `src`, or the local `.env` leaks in (conftest already sets it).
-- Backends are enabled via `BACKENDS=claude,opencode,codex` (claude is the default). `opencode` and
-  `codex` are stale: enabling them logs a startup warning and they may break without notice.
+- Backends are enabled via `BACKENDS=claude,opencode,codex` (claude is the default). `codex` is
+  maintained: one `openai-codex` SDK client (= one bundled `codex app-server` process) per gateway
+  session, interactive approvals bridged through the SDK's reader-thread callback, and Codex talks
+  to model providers over the Responses API only (`wire_api = "chat"` is gone upstream — a LiteLLM
+  proxy in front of self-hosted models satisfies it). `opencode` is stale: enabling it logs a
+  startup warning and it may break without notice.
 
 ## Architecture
 
@@ -27,7 +32,7 @@ uv run pytest --cov=src                            # with coverage
   (stateless Claude SDK event stream), `admin.py`, `sessions.py`, `general.py`.
 - `src/agent_message_models.py` — strict caller-owned full-history request contract for
   `/v1/agents/messages`.
-- `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` implements them. `codex/` (JSON-RPC to a local `codex app-server`) and `opencode/` (managed subprocess / external HTTP modes) are frozen stale code — do not extend them.
+- `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` and `codex/` implement them (`codex/` = official `openai-codex` SDK per session; the dict-based notification→chunk mapping in its `client.py` predates the SDK and is shared with tests — keep it wire-dict shaped). `opencode/` (managed subprocess / external HTTP modes) is frozen stale code — do not extend it.
 - `src/sanitizer/` — stream sanitization + OpenAI-format bridge.
 - `src/agent_catalog.py` / `src/mcp_health.py` — client-facing read models behind
   `GET /v1/agent-resources` (skills/subagents across plugin + workspace + user scope, described
@@ -74,11 +79,11 @@ uv run pytest --cov=src                            # with coverage
 - `pytest-asyncio` uses `asyncio_mode = "auto"`; do not add `@pytest.mark.asyncio` unless a test specifically needs it.
 - Mock SDK calls in tests and prefer the shared fixtures in `tests/conftest.py`.
 - Markers: `integration` (real subprocess with mock binary), `slow`, `e2e` (needs live server + credentials; excluded by default).
-- OpenCode/Codex are stale (frozen 2026-07): `tests/conftest.py` skips collection of their dedicated
-  test files and deselects every test whose id mentions `opencode`/`codex` (~490 tests total; a
-  default run reports only ~130 deselected — the dedicated stale files never collect at all).
-  `RUN_STALE_BACKEND_TESTS=1` restores them. When a shared-code change breaks stale backend code or
-  its tests, do not fix the backend — leave it frozen.
-- `claude-agent-sdk` is pinned exactly (`==0.2.128`); upgrades are deliberate, gap-analyzed events — do not bump casually.
+- OpenCode is stale (frozen 2026-07): `tests/conftest.py` skips collection of its dedicated test
+  files and deselects every test whose id mentions `opencode`. `RUN_STALE_BACKEND_TESTS=1` restores
+  them. When a shared-code change breaks stale backend code or its tests, do not fix the backend —
+  leave it frozen. Codex tests collect and run normally (`tests/test_codex_backend.py` unit,
+  `tests/integration/test_codex_e2e.py` route-level against a scripted fake app-server binary).
+- `claude-agent-sdk` (`==0.2.128`) and `openai-codex` (`==0.147.0`) are pinned exactly; upgrades are deliberate, gap-analyzed events — do not bump casually. The codex backend installs its approval handler through an SDK-private seam covered by a canary test.
 - Changes to the stateless mapper must pass `uv run pytest tests/test_agent_messages.py -q` and the full
   gateway suite. If the schema/event shape changes, also run Noah's `tests/external-agent.test.ts`.

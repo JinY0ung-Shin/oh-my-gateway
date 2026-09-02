@@ -47,6 +47,33 @@ def send(payload):
     print(json.dumps(payload), flush=True)
 
 
+def thread_response(tid):
+    # The openai-codex SDK validates thread lifecycle responses against its
+    # generated v2 models, so the fake must emit every required field.
+    return {
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "cwd": "/tmp",
+        "model": "gpt-5.5",
+        "modelProvider": "openai",
+        "sandbox": {"type": "dangerFullAccess"},
+        "thread": {
+            "cliVersion": "0.0.0-test",
+            "createdAt": 0,
+            "cwd": "/tmp",
+            "ephemeral": True,
+            "id": tid,
+            "modelProvider": "openai",
+            "preview": "",
+            "sessionId": tid,
+            "source": "vscode",
+            "status": {"type": "idle"},
+            "turns": [],
+            "updatedAt": 0,
+        },
+    }
+
+
 for raw in sys.stdin:
     log("IN " + raw.strip())
     msg = json.loads(raw)
@@ -55,18 +82,40 @@ for raw in sys.stdin:
     params = msg.get("params") or {}
 
     if method == "initialize":
-        send({"id": msg_id, "result": {"protocolVersion": "2"}})
+        send({
+            "id": msg_id,
+            "result": {
+                "userAgent": "codex/0.0.0-test",
+                "serverInfo": {"name": "codex", "version": "0.0.0-test"},
+            },
+        })
         continue
     if method == "initialized":
         continue
     if method == "model/list":
-        send({"id": msg_id, "result": {"data": [{"id": "gpt-5.5"}]}})
+        send({
+            "id": msg_id,
+            "result": {
+                "data": [
+                    {
+                        "id": "gpt-5.5",
+                        "model": "gpt-5.5",
+                        "displayName": "GPT-5.5",
+                        "description": "fake model",
+                        "hidden": False,
+                        "isDefault": True,
+                        "defaultReasoningEffort": "medium",
+                        "supportedReasoningEfforts": [],
+                    }
+                ]
+            },
+        })
         continue
     if method == "thread/start":
-        send({"id": msg_id, "result": {"thread": {"id": thread_id, "path": None, "ephemeral": True}}})
+        send({"id": msg_id, "result": thread_response(thread_id)})
         continue
     if method == "thread/resume":
-        send({"id": msg_id, "result": {"thread": {"id": params.get("threadId", thread_id)}}})
+        send({"id": msg_id, "result": thread_response(params.get("threadId", thread_id))})
         continue
     if method == "turn/start":
         record_turn_start(params)
@@ -107,7 +156,7 @@ for raw in sys.stdin:
                 "reason": "e2e approval",
                 "availableDecisions": ["accept", "decline", "cancel"],
             }
-        send({"id": msg_id, "result": {"turn": {"id": turn_id, "status": "inProgress"}}})
+        send({"id": msg_id, "result": {"turn": {"id": turn_id, "items": [], "status": "inProgress"}}})
         send({
             "id": "approval_1",
             "method": approval_method,
@@ -228,6 +277,28 @@ def _write_fake_codex(tmp_path: Path) -> Path:
     return fake_bin
 
 
+def _disconnect_codex_session_clients() -> None:
+    """Close every session's SDK client before the app loop stops.
+
+    The real app does this through session_manager shutdown (mocked here).
+    Each Codex session owns an app-server process whose notification reads
+    block non-daemon executor threads; closing the process releases them,
+    otherwise TestClient teardown hangs joining the default executor.
+    """
+    import asyncio
+
+    for session in list(getattr(main.session_manager, "sessions", {}).values()):
+        client = getattr(session, "client", None)
+        loop = getattr(client, "loop", None)
+        if client is None or loop is None:
+            continue
+        try:
+            future = asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
+            future.result(timeout=5)
+        except Exception:
+            pass
+
+
 @contextmanager
 def codex_client_context(fake_bin: Path, extra_env: dict | None = None):
     """Create a TestClient with the real Codex backend and fake app-server binary."""
@@ -261,7 +332,10 @@ def codex_client_context(fake_bin: Path, extra_env: dict | None = None):
         patch.object(main.session_manager, "async_shutdown", new=AsyncMock()),
     ):
         with TestClient(main.app) as client:
-            yield client
+            try:
+                yield client
+            finally:
+                _disconnect_codex_session_clients()
 
     for backend in BackendRegistry.all_backends().values():
         close = getattr(backend, "close", None)
@@ -295,7 +369,10 @@ def test_codex_responses_e2e_approval_continuation(tmp_path, prompt, expected_ki
         tool_call = first_body["output"][0]
         assert tool_call["type"] == "function_call"
         assert tool_call["name"] == "AskUserQuestion"
-        assert tool_call["call_id"] == "approval_1"
+        # The SDK hides the wire-level JSON-RPC id, so the gateway mints its
+        # own call_id; the continuation echoes whatever the response carried.
+        call_id = tool_call["call_id"]
+        assert call_id
         arguments = json.loads(tool_call["arguments"])
         assert arguments["kind"] == expected_kind
         if expected_kind == "command":
@@ -313,7 +390,7 @@ def test_codex_responses_e2e_approval_continuation(tmp_path, prompt, expected_ki
                 "input": [
                     {
                         "type": "function_call_output",
-                        "call_id": "approval_1",
+                        "call_id": call_id,
                         "output": "accept",
                     }
                 ],
@@ -326,7 +403,8 @@ def test_codex_responses_e2e_approval_continuation(tmp_path, prompt, expected_ki
         assert second_body["status"] == "completed"
         assert second_body["output"][0]["content"][0]["text"] == "Codex e2e approved."
         # Reasoning tokens (2) roll into output (3) for OpenAI-compatible usage reporting.
-        assert second_body["usage"] == {"input_tokens": 2, "output_tokens": 5}
+        assert second_body["usage"]["input_tokens"] == 2
+        assert second_body["usage"]["output_tokens"] == 5
 
 
 def test_codex_streaming_approval_exposes_only_ask_user_question(tmp_path):
@@ -413,12 +491,13 @@ def test_codex_accept_edits_auto_accepts_file_change_e2e(tmp_path):
 
 
 def test_codex_request_body_model_params_flow_through_to_turn_start_e2e(tmp_path):
-    """temperature / max_output_tokens from the body reach Codex turn/start params.
+    """reasoning.effort reaches Codex turn/start; raw sampling knobs are dropped.
 
-    The fake codex app-server logs every received turn/start payload to a file
-    pointed to by FAKE_CODEX_TURN_START_LOG. The test then reads the file and
-    confirms the gateway forwarded the sampling overrides under the expected
-    Codex keys.
+    The current Codex turn API has no temperature/max_output_tokens fields
+    (reasoning controls replaced them), so the gateway forwards ``effort`` and
+    silently drops the raw sampling params instead of sending fields the
+    app-server would reject. The fake codex app-server logs every received
+    turn/start payload to a file pointed to by FAKE_CODEX_TURN_START_LOG.
     """
     fake_bin = _write_fake_codex(tmp_path)
     turn_log = tmp_path / "turn-start.jsonl"
@@ -434,6 +513,7 @@ def test_codex_request_body_model_params_flow_through_to_turn_start_e2e(tmp_path
                 "stream": False,
                 "temperature": 0.25,
                 "max_output_tokens": 64,
+                "reasoning": {"effort": "low"},
                 # acceptEdits lets the fake's fileChange branch run to
                 # completion so the e2e finishes cleanly.
                 "permission_mode": "acceptEdits",
@@ -446,8 +526,9 @@ def test_codex_request_body_model_params_flow_through_to_turn_start_e2e(tmp_path
     lines = [json.loads(line) for line in turn_log.read_text().splitlines() if line.strip()]
     assert lines, "turn/start log is empty"
     first = lines[0]
-    assert first.get("temperature") == 0.25
-    assert first.get("maxOutputTokens") == 64
+    assert first.get("effort") == "low"
+    assert "temperature" not in first
+    assert "maxOutputTokens" not in first
 
 
 def test_codex_continuation_request_switches_permission_mode_to_accept_edits(tmp_path):
@@ -473,6 +554,7 @@ def test_codex_continuation_request_switches_permission_mode_to_accept_edits(tmp
         assert first.status_code == 200
         assert first.json()["status"] == "requires_action"
         first_body = first.json()
+        call_id = first_body["output"][0]["call_id"]
 
         second = client.post(
             "/v1/responses",
@@ -482,7 +564,7 @@ def test_codex_continuation_request_switches_permission_mode_to_accept_edits(tmp
                 "input": [
                     {
                         "type": "function_call_output",
-                        "call_id": "approval_1",
+                        "call_id": call_id,
                         "output": "accept",
                     }
                 ],
@@ -530,6 +612,7 @@ def test_codex_continuation_request_refreshes_disallowed_tools(tmp_path):
         assert first.status_code == 200
         first_body = first.json()
         assert first_body["status"] == "requires_action"
+        call_id = first_body["output"][0]["call_id"]
 
         second = client.post(
             "/v1/responses",
@@ -539,7 +622,7 @@ def test_codex_continuation_request_refreshes_disallowed_tools(tmp_path):
                 "input": [
                     {
                         "type": "function_call_output",
-                        "call_id": "approval_1",
+                        "call_id": call_id,
                         "output": "accept",
                     }
                 ],

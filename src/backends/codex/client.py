@@ -1,8 +1,31 @@
-"""Codex app-server backend client.
+"""Codex backend client built on the official ``openai-codex`` SDK.
 
-The official Python SDK currently wraps the same ``codex app-server``
-JSON-RPC protocol.  The package is experimental and may not be available from
-PyPI, so this backend keeps a small protocol client in-tree for the MVP.
+The previous implementation kept a hand-rolled ``codex app-server`` JSON-RPC
+protocol client in-tree because no official Python SDK existed. OpenAI now
+publishes ``openai-codex`` (Codex-pinned versioning, bundled CLI binary via
+``openai-codex-cli-bin``), which speaks the same app-server protocol with
+generated v2 types. This module keeps the gateway-facing contract —
+``BackendClient`` methods, emitted chunk shapes, and the interactive approval
+continuation — while delegating transport, process lifecycle, and typed
+protocol handling to the SDK.
+
+Architecture notes:
+
+- **One SDK client (= one ``codex app-server`` process) per gateway session.**
+  ``session.client`` is persistent across continuation requests (see
+  ``_ensure_response_session_client``), so the process lives for the session
+  and ``disconnect()`` closes it. This removes the old shared-RPC design and
+  its head-of-line blocking lock.
+- **Turn streaming** uses the SDK's per-turn notification routing. A pump task
+  forwards typed notifications as camelCase wire dicts (``model_dump(
+  by_alias=True)``), so the notification→chunk mapping layer below is the same
+  dict-based code the old client used.
+- **Approvals** arrive through the SDK's synchronous ``approval_handler``
+  callback (invoked on the SDK reader thread). Tool-policy decisions are
+  answered inline; anything interactive is bridged onto the active turn's
+  queue and the handler blocks on a ``threading.Event`` until
+  ``resume_approval_with_client`` supplies the decision (or the approval
+  timeout lapses, which cancels).
 """
 
 from __future__ import annotations
@@ -12,36 +35,37 @@ import contextlib
 import fnmatch
 import json
 import logging
-import os
-import queue
-import subprocess
 import threading
 import time
 import uuid
-from collections import deque
-from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, Iterable, Iterator, List, Optional
+from dataclasses import dataclass, field
+from types import SimpleNamespace
+from typing import Any, AsyncGenerator, Dict, Iterable, Iterator, List, Optional, Tuple
 
+from openai_codex import AsyncCodex, CodexConfig
+from openai_codex.models import UnknownNotification
+
+from src.backends.base import SessionHandle
 from src.backends.codex.auth import CodexAuthProvider
 from src.backends.codex.constants import (
     CODEX_MODELS,
     approval_policy,
-    codex_bin,
+    approval_timeout_ms,
+    codex_bin_override,
     configured_config_overrides,
     disallowed_tools_from_env,
     read_idle_timeout_ms,
     sandbox_mode,
 )
-from src.backends.base import SessionHandle
-from src.backends.mcp_headers import inject_mcp_headers
-from src.mcp_config import resolve_mcp_servers
 from src.backends.common import (
     TokenEstimateMixin,
     combine_system_prompt,
     completion_chunks,
     error_chunk,
 )
+from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import DEFAULT_TIMEOUT_MS
+from src.mcp_config import resolve_mcp_servers
 from src.message_adapter import MessageAdapter
 
 logger = logging.getLogger(__name__)
@@ -85,16 +109,15 @@ CODEX_PERMISSION_MODE_TO_APPROVAL: Dict[str, str] = {
     "plan": "on-request",
 }
 
-# OpenAI Responses-style sampling/control field -> Codex app-server payload key.
-# Used by ``_translate_model_params`` so request bodies can carry the standard
-# OpenAI names (temperature, max_output_tokens, ...) while we forward them in
-# the Codex camelCase convention.
+# OpenAI Responses-style control fields the current Codex turn API understands.
+# The app-server dropped raw sampling knobs (temperature/top_p/max tokens) from
+# ``turn/start`` in favor of reasoning controls; unknown sampling fields are
+# logged and skipped so a request carrying them still runs.
 CODEX_MODEL_PARAM_KEY_MAP: Dict[str, str] = {
-    "temperature": "temperature",
-    "top_p": "topP",
-    "max_output_tokens": "maxOutputTokens",
-    # Legacy alias from the chat-completions era; treat the same as the new name.
-    "max_tokens": "maxOutputTokens",
+    "effort": "effort",
+    "reasoning_effort": "effort",
+    "summary": "summary",
+    "reasoning_summary": "summary",
 }
 
 
@@ -103,9 +126,10 @@ def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str,
 
     - ``None`` or empty dict yields ``{}`` (no payload pollution when the
       request didn't ask for overrides).
-    - Unknown keys are passed through unchanged so future params can be added
-      without code changes here.
     - ``None`` values are skipped (Pydantic optional fields default to None).
+    - Keys the current turn API has no equivalent for (temperature, top_p,
+      max_output_tokens, ...) are dropped with a debug log instead of being
+      forwarded, because the app-server rejects unknown turn fields.
     """
     if not model_params:
         return {}
@@ -113,7 +137,13 @@ def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str,
     for key, value in model_params.items():
         if value is None:
             continue
-        out[CODEX_MODEL_PARAM_KEY_MAP.get(key, key)] = value
+        mapped = CODEX_MODEL_PARAM_KEY_MAP.get(key)
+        if mapped is None:
+            logger.debug(
+                "Codex turn API has no equivalent for model param %r; dropping", key
+            )
+            continue
+        out[mapped] = value
     return out
 
 
@@ -135,7 +165,8 @@ def _resolve_approval_policy(
     When ``has_tool_policy`` is set (the caller has allowed_tools/disallowed_tools
     or a global DISALLOWED_TOOLS env), a resolved ``never`` is upgraded to
     ``on-request`` so Codex actually emits approval requests; otherwise the
-    gateway's auto-deny hook never runs and the tool policy is silently bypassed.
+    gateway's auto-deny handler never runs and the tool policy is silently
+    bypassed.
     """
     if permission_mode is None:
         resolved = approval_policy()
@@ -157,281 +188,122 @@ def _resolve_approval_policy(
 
 
 class CodexAppServerError(RuntimeError):
-    """Raised when the Codex app-server JSON-RPC transport fails."""
+    """Raised when the Codex app-server transport or protocol fails."""
 
 
-class CodexJsonRpcClient:
-    """Minimal JSON-RPC client for ``codex app-server --listen stdio://``."""
+def _consume_task_result(task: "asyncio.Task") -> None:
+    """Swallow a detached task's outcome so it never logs as un-retrieved."""
+    with contextlib.suppress(BaseException):
+        task.exception()
 
-    def __init__(
-        self,
-        *,
-        binary: Optional[str] = None,
-        cwd: Optional[str] = None,
-        env: Optional[Dict[str, str]] = None,
-        config_overrides: Optional[Iterable[str]] = None,
-        read_timeout: Optional[float] = None,
-    ) -> None:
-        self.binary = binary or codex_bin()
-        self.cwd = cwd
-        self.env = env or {}
-        self.config_overrides = list(config_overrides or [])
-        self.read_timeout = read_timeout
-        self._proc: Optional[subprocess.Popen[str]] = None
-        self._lock = threading.Lock()
-        self._pending_notifications: deque[dict[str, Any]] = deque()
-        self._stdout_queue: queue.Queue[Optional[str]] = queue.Queue()
-        self._stdout_thread: Optional[threading.Thread] = None
-        self._stderr_lines: deque[str] = deque(maxlen=400)
-        self._stderr_thread: Optional[threading.Thread] = None
 
-    def start(self) -> None:
-        if self._proc is not None:
-            return
-        args = [self.binary]
-        for override in self.config_overrides:
-            args.extend(["--config", override])
-        args.extend(["app-server", "--listen", "stdio://"])
+@dataclass
+class _PendingApproval:
+    """One approval request bridged from the SDK reader thread.
 
-        # Inherit the gateway environment so Codex CLI auth/runtime settings
-        # such as OPENAI_API_KEY and CODEX_HOME remain available. Request
-        # metadata is allowlisted separately and overlaid below.
-        proc_env = os.environ.copy()
-        proc_env.update(self.env)
-        self._proc = subprocess.Popen(  # noqa: S603 - binary is operator-configured
-            args,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            cwd=self.cwd,
-            env=proc_env,
-            bufsize=1,
-        )
-        self._stdout_queue = queue.Queue()
-        self._start_stdout_drain_thread()
-        self._start_stderr_drain_thread()
-        self._initialize()
+    ``request_id`` is gateway-generated (the SDK hides the JSON-RPC id); it
+    only needs to be consistent between the surfaced tool chunk and the
+    continuation's ``call_id``. The reader thread blocks on
+    ``decision_event`` until ``resume_approval_with_client`` stores a
+    ``decision`` and sets the event, or ``expired`` flips after the approval
+    timeout and the handler answers with a safe cancel on its own.
+    """
 
-    def is_running(self) -> bool:
-        return self._proc is not None and self._proc.poll() is None
+    request_id: str
+    method: str
+    params: Dict[str, Any]
+    decision_event: threading.Event = field(default_factory=threading.Event)
+    decision: Optional[Dict[str, Any]] = None
+    expired: bool = False
 
-    def close(self) -> None:
-        if self._proc is None:
-            return
-        proc = self._proc
-        self._proc = None
-        if proc.stdin:
-            with contextlib.suppress(Exception):
-                proc.stdin.close()
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=2)
-        if self._stdout_thread and self._stdout_thread.is_alive():
-            self._stdout_thread.join(timeout=0.5)
-        if self._stderr_thread and self._stderr_thread.is_alive():
-            self._stderr_thread.join(timeout=0.5)
 
-    def _initialize(self) -> None:
-        self.request(
-            "initialize",
-            {
-                "clientInfo": {
-                    "name": "oh_my_gateway",
-                    "title": "Oh My Gateway",
-                    "version": "0",
-                },
-                "capabilities": {"experimentalApi": True},
-            },
-        )
-        self.notify("initialized", {})
+@dataclass
+class _ActiveTurn:
+    """Streaming state for the turn currently running on a session client.
 
-    def request(self, method: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        request_id = str(uuid.uuid4())
-        self._write_message({"id": request_id, "method": method, "params": params or {}})
-        while True:
-            msg = self._read_message()
-            if "method" in msg and "id" in msg:
-                if msg.get("method") in CODEX_APPROVAL_METHODS:
-                    self._pending_notifications.append(msg)
-                    continue
-                self._write_message({"id": msg["id"], "result": self._handle_server_request(msg)})
-                continue
-            if "method" in msg and "id" not in msg:
-                self._pending_notifications.append(msg)
-                continue
-            if msg.get("id") != request_id:
-                continue
-            if "error" in msg:
-                error = msg["error"]
-                if isinstance(error, dict):
-                    raise CodexAppServerError(str(error.get("message", "Codex app-server error")))
-                raise CodexAppServerError("Codex app-server error")
-            return msg.get("result")
+    Lives across an approval suspension: the pump task keeps feeding
+    ``queue`` while the HTTP response that surfaced the approval is long
+    gone, and ``items``/``usage_box`` accumulate for the whole turn so the
+    final completion chunks see pre-approval output too.
+    """
 
-    def notify(self, method: str, params: Optional[Dict[str, Any]] = None) -> None:
-        self._write_message({"method": method, "params": params or {}})
-
-    def next_notification(self) -> dict[str, Any]:
-        if self._pending_notifications:
-            return self._pending_notifications.popleft()
-        while True:
-            msg = self._read_message()
-            if "method" in msg and "id" in msg:
-                if msg.get("method") in CODEX_APPROVAL_METHODS:
-                    return msg
-                self._write_message({"id": msg["id"], "result": self._handle_server_request(msg)})
-                continue
-            if "method" in msg and "id" not in msg:
-                return msg
-
-    def respond(self, request_id: Any, result: Dict[str, Any]) -> None:
-        self._write_message({"id": request_id, "result": result})
-
-    def thread_start(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        result = self.request("thread/start", params)
-        if not isinstance(result, dict):
-            raise CodexAppServerError("thread/start response must be an object")
-        return result
-
-    def thread_resume(self, thread_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
-        result = self.request("thread/resume", {"threadId": thread_id, **params})
-        if not isinstance(result, dict):
-            raise CodexAppServerError("thread/resume response must be an object")
-        return result
-
-    def turn_start(
-        self,
-        thread_id: str,
-        input_items: list[Dict[str, Any]],
-        params: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        result = self.request(
-            "turn/start",
-            {"threadId": thread_id, "input": input_items, **params},
-        )
-        if not isinstance(result, dict):
-            raise CodexAppServerError("turn/start response must be an object")
-        return result
-
-    def model_list(self) -> Dict[str, Any]:
-        result = self.request("model/list", {"includeHidden": False})
-        if not isinstance(result, dict):
-            raise CodexAppServerError("model/list response must be an object")
-        return result
-
-    def _handle_server_request(self, msg: dict[str, Any]) -> dict[str, Any]:
-        method = msg.get("method")
-        if method in {
-            "item/commandExecution/requestApproval",
-            "item/fileChange/requestApproval",
-        }:
-            return {"decision": "cancel"}
-        if method == "item/permissions/requestApproval":
-            return {"permissions": {}, "scope": "turn"}
-        logger.warning("Unknown Codex server request method: %r", method)
-        return {}
-
-    def _write_message(self, payload: Dict[str, Any]) -> None:
-        if self._proc is None or self._proc.stdin is None:
-            raise CodexAppServerError("Codex app-server is not running")
-        with self._lock:
-            self._proc.stdin.write(json.dumps(payload) + "\n")
-            self._proc.stdin.flush()
-
-    def _read_message(self) -> Dict[str, Any]:
-        if self._proc is None or self._proc.stdout is None:
-            raise CodexAppServerError("Codex app-server is not running")
-        try:
-            if self.read_timeout is None:
-                line = self._stdout_queue.get()
-            else:
-                line = self._stdout_queue.get(timeout=self.read_timeout)
-        except queue.Empty as exc:
-            raise CodexAppServerError(
-                "Timed out waiting for Codex app-server message "
-                f"after {self.read_timeout:.3g}s. stderr_tail={self._stderr_tail()[:2000]}"
-            ) from exc
-        if line is None:
-            raise CodexAppServerError(
-                f"Codex app-server closed stdout. stderr_tail={self._stderr_tail()[:2000]}"
-            )
-        try:
-            message = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise CodexAppServerError(f"Invalid Codex JSON-RPC line: {line!r}") from exc
-        if not isinstance(message, dict):
-            raise CodexAppServerError(f"Invalid Codex JSON-RPC payload: {message!r}")
-        return message
-
-    def _start_stdout_drain_thread(self) -> None:
-        if self._proc is None or self._proc.stdout is None:
-            return
-        stdout = self._proc.stdout
-
-        def _drain() -> None:
-            try:
-                for line in stdout:
-                    self._stdout_queue.put(line)
-            finally:
-                self._stdout_queue.put(None)
-
-        self._stdout_thread = threading.Thread(target=_drain, daemon=True)
-        self._stdout_thread.start()
-
-    def _start_stderr_drain_thread(self) -> None:
-        if self._proc is None or self._proc.stderr is None:
-            return
-
-        def _drain() -> None:
-            if self._proc is None or self._proc.stderr is None:
-                return
-            for line in self._proc.stderr:
-                self._stderr_lines.append(line.rstrip("\n"))
-
-        self._stderr_thread = threading.Thread(target=_drain, daemon=True)
-        self._stderr_thread.start()
-
-    def _stderr_tail(self, limit: int = 40) -> str:
-        return "\n".join(list(self._stderr_lines)[-limit:])
+    queue: "asyncio.Queue[Tuple[str, Any]]"
+    # Filled in once turn/start returns; the queue exists earlier so an
+    # approval request racing the turn/start response still has a consumer.
+    turn_id: str = ""
+    pump_task: Optional[asyncio.Task] = None
+    items: list[dict[str, Any]] = field(default_factory=list)
+    usage_box: dict[str, Optional[dict[str, int]]] = field(
+        default_factory=lambda: {"usage": None}
+    )
 
 
 @dataclass
 class CodexSessionClient(SessionHandle):
-    """Handle for one gateway session mapped to one Codex thread."""
+    """Handle for one gateway session mapped to one Codex thread + process."""
 
-    rpc: CodexJsonRpcClient
+    codex: AsyncCodex
     thread_id: str
     model: Optional[str]
     cwd: Optional[str]
-    env: Optional[Dict[str, str]] = None
-    owns_rpc: bool = False
+    loop: asyncio.AbstractEventLoop
     allowed_tools: Optional[List[str]] = None
     disallowed_tools: Optional[List[str]] = None
     permission_mode: Optional[str] = None
     model_params: Optional[Dict[str, Any]] = None
     mcp_servers: Optional[Dict[str, Any]] = None
-    pending_approval_request_id: Optional[Any] = None
-    pending_approval_method: Optional[str] = None
-    pending_approval_turn_id: Optional[str] = None
-    pending_approval_params: Optional[Dict[str, Any]] = None
-    # Identity of the RPC instance that surfaced the pending approval, used to
-    # fail-fast if a transport reset replaces the shared RPC between the
-    # approval being shown and the user responding.
-    pending_approval_rpc: Optional[CodexJsonRpcClient] = None
+    effort: Optional[str] = None
+    active_turn: Optional[_ActiveTurn] = None
+    pending_approval: Optional[_PendingApproval] = None
+
+    @property
+    def options(self) -> SimpleNamespace:
+        """Continuation-validation shim mirroring the claude client's options.
+
+        ``_validate_continuation_reasoning`` inspects ``client.options.effort``
+        (and ``options.thinking`` for the ``none`` case) regardless of backend.
+        """
+        thinking = {"type": "disabled"} if self.effort == "none" else None
+        return SimpleNamespace(effort=self.effort, thinking=thinking)
+
+    async def interrupt_active_turn(self) -> bool:
+        """Best-effort interrupt of the currently running turn."""
+        turn = self.active_turn
+        if turn is None:
+            return False
+        try:
+            await self.codex._client.turn_interrupt(self.thread_id, turn.turn_id)
+            return True
+        except Exception:
+            logger.debug("Codex turn interrupt failed", exc_info=True)
+            return False
 
     async def disconnect(self) -> None:
-        if self.owns_rpc:
-            await asyncio.to_thread(self.rpc.close)
+        # Unblock a reader thread stuck waiting for an approval decision so
+        # process shutdown can't hang on it.
+        pending = self.pending_approval
+        self.pending_approval = None
+        if pending is not None and not pending.decision_event.is_set():
+            pending.decision = {"decision": "cancel"}
+            pending.decision_event.set()
+        turn = self.active_turn
+        self.active_turn = None
+        # Close the process BEFORE the pump can wind down: its blocked
+        # notification read sits on a non-cancellable executor thread that
+        # only wakes when an event arrives or the transport fails over
+        # (process exit -> fail_all). Never cancel the pump task while that
+        # read is pending — cancellation would run its finally-unregister
+        # first, and fail_all cannot wake a queue that is no longer
+        # registered (the executor thread would block forever and stall
+        # interpreter shutdown).
+        await self.codex.close()
+        if turn is not None and turn.pump_task is not None:
+            with contextlib.suppress(BaseException):
+                await asyncio.wait_for(asyncio.shield(turn.pump_task), timeout=5)
 
 
 class CodexClient(TokenEstimateMixin):
-    """BackendClient implementation for local Codex app-server."""
+    """BackendClient implementation backed by the official openai-codex SDK."""
 
     _combine_system_prompt = staticmethod(combine_system_prompt)
 
@@ -441,17 +313,15 @@ class CodexClient(TokenEstimateMixin):
         read_idle_timeout: Optional[int] = None,
     ) -> None:
         # ``timeout`` is the overall turn budget (wall-clock cap for a whole
-        # turn's notification drain). ``read_idle_timeout`` is the much shorter
-        # per-message idle-gap cap used by the shared RPC transport so a wedged
-        # app-server can't hold the lock for the full turn budget and
-        # head-of-line-block other concurrent Codex requests.
+        # turn's notification drain). ``read_idle_timeout`` caps inter-event
+        # silence on one turn's stream; each session owns its own app-server
+        # process, so a wedged turn only ever stalls itself.
         self.timeout = (timeout if timeout is not None else DEFAULT_TIMEOUT_MS) / 1000
         self.read_idle_timeout = (
-            read_idle_timeout if read_idle_timeout is not None else read_idle_timeout_ms()
+            read_idle_timeout
+            if read_idle_timeout is not None
+            else read_idle_timeout_ms()
         ) / 1000
-        self._rpc: Optional[CodexJsonRpcClient] = None
-        self._rpc_env: Dict[str, str] = {}
-        self._rpc_lock = asyncio.Lock()
 
     @property
     def name(self) -> str:
@@ -486,8 +356,12 @@ class CodexClient(TokenEstimateMixin):
         ...). ``None`` here means "no override sent by this request"; the
         existing value is preserved. Pass an explicit string to change it.
         """
-        client.allowed_tools = list(allowed_tools) if allowed_tools is not None else None
-        client.disallowed_tools = list(disallowed_tools) if disallowed_tools is not None else None
+        client.allowed_tools = (
+            list(allowed_tools) if allowed_tools is not None else None
+        )
+        client.disallowed_tools = (
+            list(disallowed_tools) if disallowed_tools is not None else None
+        )
         # ``model_params`` is per-request like tool lists; ``None`` resets so the
         # next turn doesn't inherit a previous request's sampling overrides.
         client.model_params = dict(model_params) if model_params else None
@@ -495,37 +369,69 @@ class CodexClient(TokenEstimateMixin):
             client.permission_mode = permission_mode
 
     def runtime_metadata(self) -> Dict[str, Any]:
+        try:
+            from openai_codex import __version__ as sdk_version
+        except Exception:  # pragma: no cover - version metadata is best-effort
+            sdk_version = "unknown"
         return {
-            "mode": "app-server",
+            "mode": "sdk",
+            "sdk_version": sdk_version,
             "models": self.supported_models(),
             "approval_policy": approval_policy(),
             "sandbox": sandbox_mode(),
-            "shared_process": self._rpc_is_usable(self._rpc),
         }
 
     def close(self) -> None:
-        rpc = self._rpc
-        self._rpc = None
-        self._rpc_env = {}
-        if rpc is not None:
-            rpc.close()
+        """No shared process to close; sessions own their SDK clients."""
 
     shutdown = close
 
-    async def verify(self) -> bool:
-        rpc = CodexJsonRpcClient(
-            config_overrides=configured_config_overrides(),
-            read_timeout=self.read_idle_timeout,
+    def _codex_config(self, env: Optional[Dict[str, str]] = None) -> CodexConfig:
+        return CodexConfig(
+            codex_bin=codex_bin_override(),
+            config_overrides=tuple(configured_config_overrides()),
+            env=dict(env) if env else None,
+            client_name="oh_my_gateway",
+            client_title="Oh My Gateway",
         )
+
+    def _new_codex(
+        self,
+        env: Optional[Dict[str, str]] = None,
+        approval_handler=None,
+    ) -> AsyncCodex:
+        codex = AsyncCodex(self._codex_config(env))
+        if approval_handler is not None:
+            # The SDK only exposes ``approval_handler`` on the low-level sync
+            # client constructor; the high-level AsyncCodex builds that client
+            # itself, so install the handler through the (pinned-SDK) seam
+            # before the process starts. tests/test_codex_backend.py asserts
+            # this attribute path so an SDK bump that moves it fails loudly.
+            codex._client._sync._approval_handler = approval_handler
+        return codex
+
+    @staticmethod
+    async def _start_codex(codex: AsyncCodex) -> None:
+        """Start + initialize the SDK client so raw ``_client`` calls work.
+
+        Only the high-level ``AsyncCodex`` methods lazy-initialize; this
+        backend drives the raw typed client (for wire-dict params the
+        high-level API doesn't expose), so initialization is explicit.
+        """
+        await codex._ensure_initialized()
+
+    async def verify(self) -> bool:
+        codex = self._new_codex()
         try:
-            await asyncio.to_thread(rpc.start)
-            payload = await asyncio.to_thread(rpc.model_list)
-            return isinstance(payload.get("data"), list)
+            await self._start_codex(codex)
+            payload = await codex._client.model_list()
+            return isinstance(payload.data, list)
         except Exception as exc:
             logger.error("Codex backend verification failed: %s", exc)
             return False
         finally:
-            await asyncio.to_thread(rpc.close)
+            with contextlib.suppress(Exception):
+                await codex.close()
 
     async def create_client(
         self,
@@ -543,100 +449,66 @@ class CodexClient(TokenEstimateMixin):
         model_params: Optional[Dict[str, Any]] = None,
         _custom_base: Any = None,
         forward_headers: Optional[Dict[str, str]] = None,
+        effort: Optional[str] = None,
     ) -> CodexSessionClient:
         _ = (task_budget,)
         env = self._metadata_env(extra_env)
         # Resolve ``{{env:NAME}}`` templates in per-server env/headers, then inject
         # the gateway-resolved MCP context header (identity + caller-owned
         # credentials) into http/SSE server configs before forwarding them to the
-        # app-server, mirroring the claude backend. NOTE: this rides on the codex
-        # app-server honoring a per-server ``headers`` field on http MCP configs.
+        # app-server, mirroring the claude backend.
         mcp_servers = resolve_mcp_servers(mcp_servers) or mcp_servers
         mcp_servers = inject_mcp_headers(mcp_servers, forward_headers)
-        async with self._rpc_lock:
-            try:
-                rpc = await self._ensure_rpc_locked(env)
 
-                params = self._thread_params(
-                    model=model,
-                    cwd=cwd,
-                    system_prompt=combine_system_prompt(_custom_base, system_prompt),
-                    permission_mode=permission_mode,
-                    has_tool_policy=self._has_tool_policy(allowed_tools, disallowed_tools),
-                    mcp_servers=mcp_servers,
-                )
-                thread_id = getattr(session, "codex_thread_id", None)
-                if thread_id:
-                    await asyncio.to_thread(rpc.thread_resume, thread_id, params)
-                else:
-                    result = await asyncio.to_thread(
-                        rpc.thread_start,
-                        {**params, "serviceName": "oh-my-gateway"},
-                    )
-                    thread = result.get("thread")
-                    if not isinstance(thread, dict) or not thread.get("id"):
-                        raise CodexAppServerError("thread/start response missing thread.id")
-                    thread_id = str(thread["id"])
-                    setattr(session, "codex_thread_id", thread_id)
-            except Exception:
-                await self._close_rpc_locked()
-                raise
-
-        return CodexSessionClient(
-            rpc=rpc,
-            thread_id=thread_id,
+        client = CodexSessionClient(
+            codex=None,  # type: ignore[arg-type] - set right below
+            thread_id="",
             model=model,
             cwd=cwd,
-            env=env,
-            owns_rpc=False,
-            # Preserve an explicit empty list as a block-all policy; only ``None``
-            # means "no per-request allow-list / disallow-list was set."
+            loop=asyncio.get_running_loop(),
             allowed_tools=list(allowed_tools) if allowed_tools is not None else None,
-            disallowed_tools=(list(disallowed_tools) if disallowed_tools is not None else None),
+            disallowed_tools=(
+                list(disallowed_tools) if disallowed_tools is not None else None
+            ),
             permission_mode=permission_mode,
             model_params=dict(model_params) if model_params else None,
             mcp_servers=dict(mcp_servers) if mcp_servers else None,
+            effort=effort,
         )
+        codex = self._new_codex(
+            env,
+            approval_handler=lambda method, params: self._handle_approval_request(
+                client, method, params
+            ),
+        )
+        client.codex = codex
 
-    async def _ensure_rpc_locked(self, env: Dict[str, str]) -> CodexJsonRpcClient:
-        if self._rpc is not None and env != self._rpc_env:
-            await self._close_rpc_locked()
+        params = self._thread_params(
+            model=model,
+            cwd=cwd,
+            system_prompt=combine_system_prompt(_custom_base, system_prompt),
+            permission_mode=permission_mode,
+            has_tool_policy=self._has_tool_policy(allowed_tools, disallowed_tools),
+            mcp_servers=mcp_servers,
+        )
+        try:
+            await self._start_codex(codex)
+            thread_id = getattr(session, "codex_thread_id", None)
+            if thread_id:
+                await codex._client.thread_resume(thread_id, params)
+            else:
+                result = await codex._client.thread_start(
+                    {**params, "serviceName": "oh-my-gateway"}
+                )
+                thread_id = str(result.thread.id)
+                setattr(session, "codex_thread_id", thread_id)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await codex.close()
+            raise
 
-        if not self._rpc_is_usable(self._rpc):
-            if self._rpc is not None:
-                await self._close_rpc_locked()
-            rpc = CodexJsonRpcClient(
-                binary=codex_bin(),
-                cwd=None,
-                env=env,
-                config_overrides=configured_config_overrides(),
-                read_timeout=self.read_idle_timeout,
-            )
-            try:
-                await asyncio.to_thread(rpc.start)
-            except Exception:
-                await asyncio.to_thread(rpc.close)
-                raise
-            self._rpc = rpc
-            self._rpc_env = dict(env)
-
-        assert self._rpc is not None
-        return self._rpc
-
-    async def _close_rpc_locked(self) -> None:
-        rpc = self._rpc
-        self._rpc = None
-        self._rpc_env = {}
-        if rpc is not None:
-            await asyncio.to_thread(rpc.close)
-
-    def _rpc_is_usable(self, rpc: Optional[CodexJsonRpcClient]) -> bool:
-        if rpc is None:
-            return False
-        is_running = getattr(rpc, "is_running", None)
-        if callable(is_running):
-            return bool(is_running())
-        return not bool(getattr(rpc, "closed", False))
+        client.thread_id = thread_id
+        return client
 
     def _metadata_env(self, extra_env: Optional[Dict[str, str]]) -> Dict[str, str]:
         if not extra_env:
@@ -644,6 +516,41 @@ class CodexClient(TokenEstimateMixin):
         from src.constants import METADATA_ENV_ALLOWLIST
 
         return {k: v for k, v in extra_env.items() if k in METADATA_ENV_ALLOWLIST}
+
+    @staticmethod
+    def _codex_mcp_server_entry(config: Dict[str, Any]) -> Dict[str, Any]:
+        """Convert one Claude-style MCP server config to Codex config schema.
+
+        stdio servers keep command/args/env; http/SSE servers map ``url`` plus
+        ``headers`` -> ``http_headers`` (the Codex config key for static
+        streamable-HTTP headers).
+        """
+        url = config.get("url")
+        if isinstance(url, str) and url:
+            entry: Dict[str, Any] = {"url": url}
+            headers = config.get("headers")
+            if isinstance(headers, dict) and headers:
+                entry["http_headers"] = dict(headers)
+            return entry
+        entry = {}
+        if config.get("command"):
+            entry["command"] = config["command"]
+        if isinstance(config.get("args"), list):
+            entry["args"] = list(config["args"])
+        if isinstance(config.get("env"), dict) and config["env"]:
+            entry["env"] = dict(config["env"])
+        return entry
+
+    @classmethod
+    def _codex_mcp_config(cls, mcp_servers: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {}
+        for name, config in mcp_servers.items():
+            if not isinstance(config, dict):
+                continue
+            entry = cls._codex_mcp_server_entry(config)
+            if entry:
+                out[name] = entry
+        return out
 
     def _thread_params(
         self,
@@ -668,20 +575,21 @@ class CodexClient(TokenEstimateMixin):
         if system_prompt:
             params["developerInstructions"] = system_prompt
         if mcp_servers:
-            # Forward server-level MCP configuration so Codex can route tool
-            # calls to the configured upstream MCP servers. An empty dict
-            # behaves like "no servers" and the key is left out so the
-            # app-server keeps its defaults.
+            # MCP servers ride the thread-scoped config override tree in the
+            # current app-server API (the old top-level ``mcpServers`` request
+            # field is gone). An empty dict behaves like "no servers" and the
+            # key is left out so the app-server keeps its defaults.
             #
             # Filtering note: unlike the Claude backend (which narrows
             # ``mcp_servers`` against the per-request ``allowed_tools``
-            # patterns via ``mcp__<server>__*`` — see
-            # ``src/backends/claude/client.py::_configure_mcp_servers``),
-            # Codex forwards the full server set and enforces per-tool policy
-            # at approval time via ``item/mcpToolCall/requestApproval``. The
-            # net effect is the same (disallowed MCP tools never execute) but
-            # the enforcement point differs.
-            params["mcpServers"] = dict(mcp_servers)
+            # patterns via ``mcp__<server>__*``), Codex forwards the full
+            # server set and enforces per-tool policy at approval time via
+            # ``item/mcpToolCall/requestApproval``. The net effect is the same
+            # (disallowed MCP tools never execute) but the enforcement point
+            # differs.
+            converted = self._codex_mcp_config(mcp_servers)
+            if converted:
+                params["config"] = {"mcp_servers": converted}
         return params
 
     def _turn_params(self, client: CodexSessionClient) -> Dict[str, Any]:
@@ -695,9 +603,11 @@ class CodexClient(TokenEstimateMixin):
             params["model"] = client.model
         if client.cwd:
             params["cwd"] = client.cwd
-        # Sampling / output-control overrides (temperature, max_output_tokens, ...)
-        # supplied by the request body. Unset request fields stay absent from the
-        # payload so the app-server's defaults still apply.
+        if client.effort:
+            params["effort"] = client.effort
+        # Reasoning-control overrides supplied by the request body. Unset
+        # request fields stay absent from the payload so the app-server's
+        # defaults still apply; a per-request effort wins over the session one.
         translated = _translate_model_params(client.model_params)
         if translated:
             params.update(translated)
@@ -717,87 +627,6 @@ class CodexClient(TokenEstimateMixin):
     @classmethod
     def _client_has_tool_policy(cls, client: CodexSessionClient) -> bool:
         return cls._has_tool_policy(client.allowed_tools, client.disallowed_tools)
-
-    async def _start_turn_with_retry(
-        self,
-        client: CodexSessionClient,
-        prompt: Any,
-    ) -> tuple[CodexJsonRpcClient, Dict[str, Any]]:
-        """Run turn/start with a single conservative retry on transport failure.
-
-        ``prompt`` may be either a plain string (wrapped into a single
-        ``{"type": "text"}`` item for backward compatibility) or a
-        pre-normalized list of Codex input items (text plus image/file
-        attachments). Invalid item shapes raise ``ValueError`` before any
-        side effect on the app-server side.
-
-        ``turn/start`` is idempotent only until the app-server accepts it. We
-        detect "accepted" two ways:
-
-        - The call returns normally → accepted, no retry needed.
-        - Any inbound notification for this turn lands in the RPC's pending
-          queue while the request was in flight → the app-server is already
-          executing the turn. Retrying could double-run a command/edit, so
-          we surface the error instead.
-
-        Otherwise, on transport failure, we close the dead shared RPC, bring
-        up a fresh one, re-establish the gateway session's Codex thread via
-        ``thread/resume``, and try ``turn/start`` once more. The retry budget
-        is intentionally exactly one attempt.
-
-        Callers must hold ``self._rpc_lock``.
-        """
-        input_items = self._coerce_turn_input_items(prompt)
-        turn_params = self._turn_params(client)
-        thread_params = self._thread_params(
-            model=client.model,
-            cwd=client.cwd,
-            system_prompt=None,
-            permission_mode=client.permission_mode,
-            has_tool_policy=self._client_has_tool_policy(client),
-            mcp_servers=client.mcp_servers,
-        )
-
-        last_exc: Optional[BaseException] = None
-        for attempt in range(2):
-            rpc = await self._ensure_rpc_locked(client.env or {})
-            queued_before = self._pending_notification_count(rpc)
-            try:
-                if attempt > 0 and client.thread_id:
-                    # New RPC instance has no thread context; re-establish before
-                    # the retried turn/start so the app-server recognizes the id.
-                    await asyncio.to_thread(rpc.thread_resume, client.thread_id, thread_params)
-                turn = await asyncio.to_thread(
-                    rpc.turn_start, client.thread_id, input_items, turn_params
-                )
-                return rpc, turn
-            except Exception as exc:
-                last_exc = exc
-                if attempt > 0:
-                    break
-                # Did the app-server queue any inbound notification for this
-                # turn while turn/start was in flight? If yes, retrying risks
-                # duplicating the turn's side effects on the app-server side.
-                queued_after = self._pending_notification_count(rpc)
-                if queued_after > queued_before:
-                    logger.warning(
-                        "Codex turn/start failed but app-server queued %d notification(s) "
-                        "while turn/start was in flight; skipping retry to avoid duplicate "
-                        "side effects: %s",
-                        queued_after - queued_before,
-                        exc,
-                    )
-                    break
-                logger.warning(
-                    "Codex turn/start failed before turn was accepted, "
-                    "restarting RPC and retrying once: %s",
-                    exc,
-                )
-                await self._close_rpc_locked()
-                continue
-
-        assert last_exc is not None
-        raise last_exc
 
     @staticmethod
     def _coerce_turn_input_items(prompt: Any) -> list[Dict[str, Any]]:
@@ -827,219 +656,83 @@ class CodexClient(TokenEstimateMixin):
             f"Codex turn input must be a string or list of dicts, got {type(prompt).__name__}"
         )
 
-    @staticmethod
-    def _pending_notification_count(rpc: CodexJsonRpcClient) -> int:
-        """Number of inbound notifications buffered by the JSON-RPC client.
+    # ------------------------------------------------------------------
+    # Approval handling (SDK reader thread -> event loop bridge)
+    # ------------------------------------------------------------------
 
-        ``_pending_notifications`` is the real client's queue; fakes used in
-        tests may expose the same attribute as a plain list. Treat missing
-        attributes as zero (acts as a no-op for legacy transports).
-        """
-        pending = getattr(rpc, "_pending_notifications", None)
-        if pending is None:
-            return 0
-        try:
-            return len(pending)
-        except TypeError:
-            return 0
-
-    async def run_completion_with_client(
+    def _handle_approval_request(
         self,
         client: CodexSessionClient,
-        prompt: Any,
-        session: Any,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        _ = session
-        async with self._rpc_lock:
-            try:
-                rpc, turn = await self._start_turn_with_retry(client, prompt)
-                # Keep the session client's RPC reference in sync with the live
-                # shared RPC; retry may have swapped to a fresh instance.
-                client.rpc = rpc
-                turn_obj = turn.get("turn")
-                if not isinstance(turn_obj, dict) or not turn_obj.get("id"):
-                    yield error_chunk("turn/start response missing turn.id")
-                    return
-                turn_id = str(turn_obj["id"])
-                notification_iter = self._notification_iterator(
-                    rpc, client.thread_id, turn_id, client=client
+        method: str,
+        params: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """Answer an app-server approval request.
+
+        Runs on the SDK reader thread, so it must not touch the event loop
+        except through ``call_soon_threadsafe``. Policy decisions (auto-deny /
+        auto-accept) return immediately; interactive approvals are queued to
+        the active turn's consumer and this thread blocks until the
+        continuation supplies a decision or the timeout lapses.
+        """
+        params = params if isinstance(params, dict) else {}
+        notification = {"id": None, "method": method, "params": params}
+
+        if method in CODEX_APPROVAL_METHODS:
+            # Disallow / allowlist policies always take precedence over
+            # ``acceptEdits`` auto-accept so an explicit block can't be
+            # silently turned into an accept.
+            if self._should_auto_deny_approval(client, notification):
+                logger.info("Codex auto-denied approval: method=%s", method)
+                return self._deny_result(method)
+            if self._should_auto_accept_approval(client, notification):
+                logger.info(
+                    "Codex auto-accepted approval (acceptEdits): method=%s", method
                 )
-                deadline = self._turn_deadline()
-                while True:
-                    has_value, chunk = await asyncio.to_thread(
-                        self._next_chunk,
-                        notification_iter,
-                    )
-                    if not has_value:
-                        break
-                    if chunk is not None:
-                        if chunk.get("type") == "codex_approval_request":
-                            tool_chunk = self._store_pending_approval(
-                                session, client, chunk, rpc=rpc
-                            )
-                            yield tool_chunk
-                            return
-                        yield chunk
-                    self._check_turn_deadline(deadline)
-            except Exception as exc:
-                await self._close_rpc_locked()
-                logger.error("Codex app-server turn failed: %s", exc, exc_info=True)
-                yield error_chunk(self._public_error_message(exc))
+                return {"decision": "accept"}
+        else:
+            logger.warning("Unknown Codex server request method: %r", method)
+            return {}
 
-    async def resume_approval_with_client(
-        self,
-        client: CodexSessionClient,
-        call_id: str,
-        output: str,
-        session: Any,
-    ) -> AsyncGenerator[Dict[str, Any], None]:
-        _ = session
-        async with self._rpc_lock:
-            try:
-                rpc = await self._ensure_rpc_locked(client.env or {})
-                method = client.pending_approval_method or ""
-                params = client.pending_approval_params or {}
-                request_id = client.pending_approval_request_id
-                if request_id is None:
-                    logger.error(
-                        "Codex approval continuation is missing pending request id for call_id %r",
-                        call_id,
-                    )
-                    yield error_chunk("Codex approval continuation is missing request id")
-                    return
-                if str(request_id) != str(call_id):
-                    message = (
-                        "Codex approval request id mismatch: pending "
-                        f"{request_id!r}, received {call_id!r}"
-                    )
-                    logger.error(message)
-                    yield error_chunk(message)
-                    return
-                pending_rpc = client.pending_approval_rpc
-                if pending_rpc is not None and pending_rpc is not rpc:
-                    # The RPC that surfaced this approval is gone (likely a
-                    # transport reset between the approval being shown and the
-                    # user's response). The new RPC has no record of the
-                    # pending request, so responding now would be a no-op or
-                    # confuse the app-server. Surface a clear error instead.
-                    message = (
-                        "Codex approval transport was lost before the response "
-                        "arrived; please retry the original request"
-                    )
-                    logger.error(message + " (call_id=%r)", call_id)
-                    client.pending_approval_request_id = None
-                    client.pending_approval_method = None
-                    client.pending_approval_turn_id = None
-                    client.pending_approval_params = None
-                    client.pending_approval_rpc = None
-                    yield error_chunk(message)
-                    return
-                turn_id = client.pending_approval_turn_id or str(params.get("turnId") or "")
-                if not turn_id:
-                    yield error_chunk("Codex approval continuation is missing turn id")
-                    return
+        turn = client.active_turn
+        if turn is None:
+            # No consumer to surface the approval to (e.g. a request raced the
+            # turn teardown). Fail closed rather than approving blind.
+            logger.warning(
+                "Codex approval %s arrived with no active turn consumer; denying",
+                method,
+            )
+            return self._deny_result(method)
 
-                result = self._approval_result_from_output(method, output, params)
-                await asyncio.to_thread(rpc.respond, request_id, result)
-                client.pending_approval_request_id = None
-                client.pending_approval_method = None
-                client.pending_approval_turn_id = None
-                client.pending_approval_params = None
-                client.pending_approval_rpc = None
+        pending = _PendingApproval(
+            request_id=str(uuid.uuid4()),
+            method=method,
+            params=dict(params),
+        )
+        client.pending_approval = pending
+        client.loop.call_soon_threadsafe(turn.queue.put_nowait, ("approval", pending))
 
-                notification_iter = self._notification_iterator(
-                    rpc, client.thread_id, turn_id, client=client
-                )
-                deadline = self._turn_deadline()
-                while True:
-                    has_value, chunk = await asyncio.to_thread(
-                        self._next_chunk,
-                        notification_iter,
-                    )
-                    if not has_value:
-                        break
-                    if chunk is not None:
-                        if chunk.get("type") == "codex_approval_request":
-                            tool_chunk = self._store_pending_approval(
-                                session, client, chunk, rpc=rpc
-                            )
-                            yield tool_chunk
-                            return
-                        yield chunk
-                    self._check_turn_deadline(deadline)
-            except Exception as exc:
-                await self._close_rpc_locked()
-                logger.error("Codex approval continuation failed: %s", exc, exc_info=True)
-                yield error_chunk(self._public_error_message(exc))
-
-    def _public_error_message(self, exc: Exception) -> str:
-        message = str(exc)
-        if isinstance(exc, CodexAppServerError):
-            message = message.split("stderr_tail=", 1)[0].rstrip()
-        return message or "Codex app-server error"
+        if not pending.decision_event.wait(timeout=approval_timeout_ms() / 1000):
+            pending.expired = True
+            if client.pending_approval is pending:
+                client.pending_approval = None
+            logger.warning(
+                "Codex approval %s timed out waiting for a continuation; cancelling",
+                method,
+            )
+            if method == "item/permissions/requestApproval":
+                return {"permissions": {}, "scope": "turn"}
+            return {"decision": "cancel"}
+        return pending.decision or self._deny_result(method)
 
     @staticmethod
-    def _next_chunk(iterator: Iterator[Dict[str, Any]]) -> tuple[bool, Optional[Dict[str, Any]]]:
-        try:
-            return True, next(iterator)
-        except StopIteration:
-            return False, None
-
-    def _turn_deadline(self) -> float:
-        """Monotonic wall-clock deadline for one turn's notification drain.
-
-        The per-message idle timeout (``read_idle_timeout``) caps inter-message
-        silence, but a steady drip of notifications could otherwise keep the
-        shared RPC lock indefinitely. This overall budget (``self.timeout``)
-        bounds the whole turn so the lock is always released eventually.
-        """
-        return time.monotonic() + self.timeout
-
-    def _check_turn_deadline(self, deadline: float) -> None:
-        if time.monotonic() > deadline:
-            raise CodexAppServerError(
-                f"Codex turn exceeded the overall turn budget of {self.timeout:.3g}s"
-            )
-
-    def _notification_iterator(
-        self,
-        rpc: CodexJsonRpcClient,
-        thread_id: str,
-        turn_id: str,
-        *,
-        client: Optional["CodexSessionClient"] = None,
-    ) -> Iterator[Dict[str, Any]]:
-        items: list[dict[str, Any]] = []
-        usage_box: dict[str, Optional[dict[str, int]]] = {"usage": None}
-        while True:
-            notification = rpc.next_notification()
-            if client is not None and self._is_approval_request(notification):
-                # Disallow / allowlist policies always take precedence over
-                # ``acceptEdits`` auto-accept so an explicit block can't be
-                # silently turned into an accept.
-                if self._should_auto_deny_approval(client, notification):
-                    self._auto_deny_approval(rpc, notification)
-                    continue
-                if self._should_auto_accept_approval(client, notification):
-                    self._auto_accept_approval(rpc, notification)
-                    continue
-            yield from self._chunks_from_notification(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                notification=notification,
-                items=items,
-                usage_box=usage_box,
-            )
-            if self._is_terminal_notification(
-                thread_id=thread_id,
-                turn_id=turn_id,
-                notification=notification,
-            ):
-                break
+    def _deny_result(method: str) -> Dict[str, Any]:
+        if method == "item/permissions/requestApproval":
+            return {"permissions": {}, "scope": "turn"}
+        return {"decision": "decline"}
 
     def _should_auto_deny_approval(
         self,
-        client: "CodexSessionClient",
+        client: CodexSessionClient,
         notification: Dict[str, Any],
     ) -> bool:
         tool_identities = self._approval_tool_identities(notification)
@@ -1096,33 +789,15 @@ class CodexClient(TokenEstimateMixin):
             for identity in tool_identities:
                 if policy_name == identity:
                     return True
-                if policy_name.startswith("mcp__") and fnmatch.fnmatchcase(identity, policy_name):
+                if policy_name.startswith("mcp__") and fnmatch.fnmatchcase(
+                    identity, policy_name
+                ):
                     return True
         return False
 
-    def _auto_deny_approval(
-        self,
-        rpc: CodexJsonRpcClient,
-        notification: Dict[str, Any],
-    ) -> None:
-        request_id = notification.get("id")
-        if request_id is None:
-            return
-        method = str(notification.get("method") or "")
-        if method == "item/permissions/requestApproval":
-            result: Dict[str, Any] = {"permissions": {}, "scope": "turn"}
-        else:
-            result = {"decision": "decline"}
-        logger.info(
-            "Codex auto-denied approval: method=%s request_id=%s",
-            method,
-            request_id,
-        )
-        rpc.respond(request_id, result)
-
     def _should_auto_accept_approval(
         self,
-        client: "CodexSessionClient",
+        client: CodexSessionClient,
         notification: Dict[str, Any],
     ) -> bool:
         # ``acceptEdits`` mirrors Claude's permission_mode: only file edits are
@@ -1132,21 +807,213 @@ class CodexClient(TokenEstimateMixin):
             return False
         return notification.get("method") == "item/fileChange/requestApproval"
 
-    def _auto_accept_approval(
+    # ------------------------------------------------------------------
+    # Turn execution
+    # ------------------------------------------------------------------
+
+    async def run_completion_with_client(
         self,
-        rpc: CodexJsonRpcClient,
-        notification: Dict[str, Any],
-    ) -> None:
-        request_id = notification.get("id")
-        if request_id is None:
+        client: CodexSessionClient,
+        prompt: Any,
+        session: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        try:
+            input_items = self._coerce_turn_input_items(prompt)
+            turn_params = self._turn_params(client)
+            raw = client.codex._client
+            # The consumer queue must exist BEFORE turn/start: the app-server
+            # may emit an approval request on the reader thread before the
+            # event loop resumes after the turn/start response, and the
+            # approval handler needs somewhere to surface it.
+            turn_state = _ActiveTurn(queue=asyncio.Queue())
+            client.active_turn = turn_state
+            result = await raw.turn_start(
+                client.thread_id, input_items, params=turn_params
+            )
+            turn_state.turn_id = str(result.turn.id)
+            # Register before the pump task runs so early notifications are
+            # buffered instead of dropped (the router replays pre-registration
+            # events, except a turn/completed that lands entirely before
+            # registration — the same exposure the SDK's own TurnHandle has).
+            raw.register_turn_notifications(turn_state.turn_id)
+            turn_state.pump_task = asyncio.create_task(
+                self._pump_turn(raw, turn_state.turn_id, turn_state.queue)
+            )
+        except Exception as exc:
+            client.active_turn = None
+            logger.error("Codex turn start failed: %s", exc, exc_info=True)
+            yield error_chunk(self._public_error_message(exc))
             return
-        method = str(notification.get("method") or "")
-        logger.info(
-            "Codex auto-accepted approval (acceptEdits): method=%s request_id=%s",
-            method,
-            request_id,
+
+        async for chunk in self._drain_turn(client, session):
+            yield chunk
+
+    async def resume_approval_with_client(
+        self,
+        client: CodexSessionClient,
+        call_id: str,
+        output: str,
+        session: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        pending = client.pending_approval
+        turn = client.active_turn
+        if pending is None or turn is None:
+            logger.error(
+                "Codex approval continuation has no pending approval for call_id %r",
+                call_id,
+            )
+            yield error_chunk(
+                "Codex approval transport was lost before the response "
+                "arrived; please retry the original request"
+            )
+            return
+        if str(pending.request_id) != str(call_id):
+            message = (
+                "Codex approval request id mismatch: pending "
+                f"{pending.request_id!r}, received {call_id!r}"
+            )
+            logger.error(message)
+            yield error_chunk(message)
+            return
+
+        result = self._approval_result_from_output(
+            pending.method, output, pending.params
         )
-        rpc.respond(request_id, {"decision": "accept"})
+        client.pending_approval = None
+        pending.decision = result
+        pending.decision_event.set()
+
+        async for chunk in self._drain_turn(client, session):
+            yield chunk
+
+    async def _pump_turn(
+        self,
+        raw: Any,
+        turn_id: str,
+        queue: "asyncio.Queue[Tuple[str, Any]]",
+    ) -> None:
+        """Forward SDK notifications for one turn onto its consumer queue.
+
+        Runs until the turn completes or the transport fails. The consumer
+        generator may come and go (approval suspensions end the HTTP stream),
+        so this task, not the generator, owns the SDK-side stream lifecycle.
+        """
+        try:
+            while True:
+                notification = await raw.next_turn_notification(turn_id)
+                wire = self._wire_notification(notification)
+                await queue.put(("notification", wire))
+                if wire.get("method") == "turn/completed":
+                    break
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:  # noqa: BLE001 - surface transport failures
+            await queue.put(("error", exc))
+        finally:
+            with contextlib.suppress(Exception):
+                raw.unregister_turn_notifications(turn_id)
+            with contextlib.suppress(Exception):
+                await queue.put(("end", None))
+
+    @staticmethod
+    def _wire_notification(notification: Any) -> Dict[str, Any]:
+        """Convert an SDK ``Notification`` into its camelCase wire dict.
+
+        The chunk-mapping layer below predates the SDK and operates on wire
+        dicts; ``model_dump(by_alias=True)`` reproduces them exactly, and
+        unknown notification payloads pass their raw params through.
+        """
+        payload = notification.payload
+        if isinstance(payload, UnknownNotification):
+            params: Dict[str, Any] = dict(payload.params)
+        else:
+            params = payload.model_dump(by_alias=True, mode="json")
+        return {"method": notification.method, "params": params}
+
+    async def _drain_turn(
+        self,
+        client: CodexSessionClient,
+        session: Any,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield gateway chunks for the active turn until it ends or suspends."""
+        turn = client.active_turn
+        if turn is None:
+            yield error_chunk("Codex turn state was lost")
+            return
+        deadline = time.monotonic() + self.timeout
+        try:
+            while True:
+                try:
+                    kind, payload = await asyncio.wait_for(
+                        turn.queue.get(), timeout=self.read_idle_timeout
+                    )
+                except asyncio.TimeoutError:
+                    await client.interrupt_active_turn()
+                    raise CodexAppServerError(
+                        "Timed out waiting for Codex app-server message "
+                        f"after {self.read_idle_timeout:.3g}s"
+                    )
+                if kind == "approval":
+                    chunk = self._approval_request_chunk(payload)
+                    tool_chunk = self._store_pending_approval(session, client, chunk)
+                    yield tool_chunk
+                    return
+                if kind == "error":
+                    raise payload
+                if kind == "end":
+                    client.active_turn = None
+                    return
+                # kind == "notification"
+                for chunk in self._chunks_from_notification(
+                    thread_id=client.thread_id,
+                    turn_id=turn.turn_id,
+                    notification=payload,
+                    items=turn.items,
+                    usage_box=turn.usage_box,
+                ):
+                    yield chunk
+                if time.monotonic() > deadline:
+                    await client.interrupt_active_turn()
+                    raise CodexAppServerError(
+                        f"Codex turn exceeded the overall turn budget of {self.timeout:.3g}s"
+                    )
+        except Exception as exc:
+            await self._teardown_turn(client)
+            logger.error("Codex turn failed: %s", exc, exc_info=True)
+            yield error_chunk(self._public_error_message(exc))
+
+    async def _teardown_turn(self, client: CodexSessionClient) -> None:
+        turn = client.active_turn
+        client.active_turn = None
+        pending = client.pending_approval
+        client.pending_approval = None
+        if pending is not None and not pending.decision_event.is_set():
+            pending.decision = {"decision": "cancel"}
+            pending.decision_event.set()
+        if (
+            turn is not None
+            and turn.pump_task is not None
+            and not turn.pump_task.done()
+        ):
+            # Leave the pump running rather than cancelling it: cancellation
+            # would unregister the turn queue while the blocked notification
+            # read still references it, leaving an executor thread nothing
+            # can ever wake. The error paths that reach this teardown
+            # interrupt the turn, so the pump exits on its turn/completed
+            # (or on disconnect's process close via fail_all); until then it
+            # drains into an orphaned queue.
+            turn.pump_task.add_done_callback(_consume_task_result)
+
+    def _public_error_message(self, exc: BaseException) -> str:
+        message = str(exc)
+        # SDK transport errors append the process stderr tail; keep it out of
+        # client-facing chunks (it lands in server logs via exc_info instead).
+        message = message.split("stderr_tail=", 1)[0].rstrip()
+        return message or "Codex app-server error"
+
+    # ------------------------------------------------------------------
+    # Notification -> chunk mapping (wire-dict based, shared with tests)
+    # ------------------------------------------------------------------
 
     def _chunks_from_notifications(
         self,
@@ -1178,10 +1045,6 @@ class CodexClient(TokenEstimateMixin):
         method = notification.get("method")
         params = notification.get("params") if isinstance(notification, dict) else None
         if not isinstance(params, dict):
-            return
-
-        if self._is_approval_request(notification):
-            yield self._approval_request_chunk(notification, params)
             return
 
         notification_turn_id = params.get("turnId")
@@ -1238,62 +1101,31 @@ class CodexClient(TokenEstimateMixin):
 
         yield from self._completion_chunks(items, usage_box)
 
-    def _is_terminal_notification(
-        self,
-        *,
-        thread_id: str,
-        turn_id: str,
-        notification: Dict[str, Any],
-    ) -> bool:
-        method = notification.get("method")
-        params = notification.get("params")
-        if not isinstance(params, dict):
-            return False
-
-        if method == "turn/completed":
-            notification_turn_id = params.get("turnId")
-            turn = params.get("turn")
-            if isinstance(turn, dict):
-                notification_turn_id = turn.get("id") or notification_turn_id
-            return notification_turn_id == turn_id
-
-        if self._is_approval_request(notification):
-            return True
-
-        return self._is_thread_idle_notification(thread_id, notification)
-
-    def _is_approval_request(self, notification: Dict[str, Any]) -> bool:
-        return "id" in notification and notification.get("method") in CODEX_APPROVAL_METHODS
-
-    def _approval_request_chunk(
-        self,
-        notification: Dict[str, Any],
-        params: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        request_id = notification.get("id")
-        method = str(notification.get("method") or "")
-        arguments = self._approval_arguments(method, params)
+    def _approval_request_chunk(self, pending: _PendingApproval) -> Dict[str, Any]:
+        arguments = self._approval_arguments(pending.method, pending.params)
         tool_block = {
             "type": "tool_use",
-            "id": str(request_id),
+            "id": str(pending.request_id),
             "name": "codex_approval",
             "input": arguments,
             "metadata": {
-                "codex_approval_request_id": str(request_id),
-                "codex_approval_method": method,
-                "codex_thread_id": str(params.get("threadId") or ""),
-                "codex_turn_id": str(params.get("turnId") or ""),
+                "codex_approval_request_id": str(pending.request_id),
+                "codex_approval_method": pending.method,
+                "codex_thread_id": str(pending.params.get("threadId") or ""),
+                "codex_turn_id": str(pending.params.get("turnId") or ""),
             },
         }
         return {
             "type": "codex_approval_request",
-            "request_id": request_id,
-            "method": method,
-            "params": params,
+            "request_id": pending.request_id,
+            "method": pending.method,
+            "params": pending.params,
             "tool_chunk": {"type": "assistant", "content": [tool_block]},
         }
 
-    def _approval_arguments(self, method: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    def _approval_arguments(
+        self, method: str, params: Dict[str, Any]
+    ) -> Dict[str, Any]:
         kind = self._approval_kind(method)
         reason = params.get("reason")
         arguments: Dict[str, Any] = {
@@ -1345,7 +1177,9 @@ class CodexClient(TokenEstimateMixin):
             return "Codex requests additional permissions."
         return "Codex requests approval."
 
-    def _approval_options(self, kind: str, params: Dict[str, Any]) -> list[dict[str, Any]]:
+    def _approval_options(
+        self, kind: str, params: Dict[str, Any]
+    ) -> list[dict[str, Any]]:
         if kind == "permissions":
             decisions: list[Any] = ["accept", "acceptForSession", "decline"]
         else:
@@ -1401,21 +1235,10 @@ class CodexClient(TokenEstimateMixin):
         session: Any,
         client: CodexSessionClient,
         chunk: Dict[str, Any],
-        *,
-        rpc: Optional[CodexJsonRpcClient] = None,
     ) -> Dict[str, Any]:
         tool_chunk = chunk["tool_chunk"]
         tool_block = tool_chunk["content"][0]
         metadata = tool_block["metadata"]
-        client.pending_approval_request_id = chunk.get("request_id")
-        client.pending_approval_method = chunk.get("method")
-        client.pending_approval_params = (
-            chunk.get("params") if isinstance(chunk.get("params"), dict) else {}
-        )
-        client.pending_approval_turn_id = metadata.get("codex_turn_id")
-        # Remember which RPC instance owns this pending request so resume can
-        # fail fast if a transport reset replaces the shared RPC underneath us.
-        client.pending_approval_rpc = rpc
         session.pending_tool_call = {
             "call_id": metadata["codex_approval_request_id"],
             "name": ASK_USER_QUESTION_TOOL_NAME,
@@ -1430,11 +1253,18 @@ class CodexClient(TokenEstimateMixin):
             return None
         item_type = item.get("type")
         item_id = item.get("id")
-        if item_type not in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}:
+        if item_type not in {
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+        }:
             return None
         if not isinstance(item_id, str) or not item_id:
             return None
-        tool_input = {k: v for k, v in item.items() if k not in {"id", "type", "aggregatedOutput"}}
+        tool_input = {
+            k: v for k, v in item.items() if k not in {"id", "type", "aggregatedOutput"}
+        }
         return {
             "type": "tool_use",
             "id": item_id,
@@ -1447,7 +1277,12 @@ class CodexClient(TokenEstimateMixin):
             return None
         item_type = item.get("type")
         item_id = item.get("id")
-        if item_type not in {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}:
+        if item_type not in {
+            "commandExecution",
+            "fileChange",
+            "mcpToolCall",
+            "dynamicToolCall",
+        }:
             return None
         if not isinstance(item_id, str) or not item_id:
             return None
@@ -1501,14 +1336,22 @@ class CodexClient(TokenEstimateMixin):
                 return {"decision": parsed}
             logger.warning("Unrecognized Codex approval output: %r", parsed)
 
-        decision = self._normalize_approval_decision(parsed if parsed is not None else output)
+        decision = self._normalize_approval_decision(
+            parsed if parsed is not None else output
+        )
         if method == "item/permissions/requestApproval":
             if decision in {"accept", "acceptForSession"}:
-                result: Dict[str, Any] = {"permissions": params.get("permissions") or {}}
-                result["scope"] = "session" if decision == "acceptForSession" else "turn"
+                result: Dict[str, Any] = {
+                    "permissions": params.get("permissions") or {}
+                }
+                result["scope"] = (
+                    "session" if decision == "acceptForSession" else "turn"
+                )
                 return result
             return {"permissions": {}, "scope": "turn"}
-        selected_decision = self._approval_decision_from_available_options(output, params)
+        selected_decision = self._approval_decision_from_available_options(
+            output, params
+        )
         if selected_decision is not None:
             return {"decision": selected_decision}
         return {"decision": decision}
@@ -1587,7 +1430,9 @@ class CodexClient(TokenEstimateMixin):
         last = token_usage.get("last")
         if not isinstance(last, dict):
             return None
-        input_tokens = int(last.get("inputTokens") or 0) + int(last.get("cachedInputTokens") or 0)
+        input_tokens = int(last.get("inputTokens") or 0) + int(
+            last.get("cachedInputTokens") or 0
+        )
         # Reasoning tokens are emitted by the model alongside visible output;
         # OpenAI-compatible usage reporting rolls them into output_tokens so
         # totals match (input + output == totalTokens).
@@ -1618,13 +1463,17 @@ class CodexClient(TokenEstimateMixin):
 
     def parse_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
         for message in reversed(messages):
-            if message.get("subtype") == "success" and isinstance(message.get("result"), str):
+            if message.get("subtype") == "success" and isinstance(
+                message.get("result"), str
+            ):
                 result = message["result"]
                 if result.strip():
                     return result
         parts = []
         for message in messages:
-            if message.get("type") == "assistant" and isinstance(message.get("content"), list):
+            if message.get("type") == "assistant" and isinstance(
+                message.get("content"), list
+            ):
                 text = MessageAdapter.format_blocks(message["content"])
                 if text:
                     parts.append(text)

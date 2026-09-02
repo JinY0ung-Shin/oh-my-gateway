@@ -3,27 +3,35 @@
 from __future__ import annotations
 
 import os
+from typing import Optional
 
 from src.backends.common import parse_csv
 from src.env_utils import parse_int_env
 
-# Per-message (idle-gap) read timeout for the shared Codex app-server JSON-RPC
-# transport, in milliseconds. This bounds how long a single ``_read_message``
-# waits for the *next* line of output before failing, and is SEPARATE from the
-# overall turn budget (``DEFAULT_TIMEOUT_MS`` / ``CodexClient.timeout``).
-#
-# Why a short value: the app-server is a single shared process serialized by
-# one asyncio lock per ``CodexClient``. A wedged turn (process alive but
-# emitting nothing) otherwise holds that lock for the full turn budget and
-# head-of-line-blocks every other concurrent Codex request. A normal turn
-# resets this window on every incremental notification, so the cap only bites
-# on genuine inter-message silence. Override via CODEX_READ_IDLE_TIMEOUT_MS.
+# Per-event idle-gap timeout for one turn's notification stream, in
+# milliseconds. This bounds how long the stream consumer waits for the *next*
+# event before interrupting the turn, and is SEPARATE from the overall turn
+# budget (``DEFAULT_TIMEOUT_MS`` / ``CodexClient.timeout``). Each gateway
+# session owns its own ``codex app-server`` process, so a wedged turn only
+# ever stalls itself. Override via CODEX_READ_IDLE_TIMEOUT_MS.
 DEFAULT_READ_IDLE_TIMEOUT_MS = parse_int_env("CODEX_READ_IDLE_TIMEOUT_MS", 60_000)
 
 
 def read_idle_timeout_ms() -> int:
-    """Per-message idle read timeout in ms, read from the env on each call."""
+    """Per-event idle timeout in ms, read from the env on each call."""
     return parse_int_env("CODEX_READ_IDLE_TIMEOUT_MS", 60_000)
+
+
+def approval_timeout_ms() -> int:
+    """How long an interactive approval may stay pending, in ms.
+
+    The SDK answers approval requests through a synchronous callback on its
+    reader thread; the gateway blocks that callback until the caller's
+    continuation request supplies a decision. This bounds the wait so an
+    abandoned approval eventually cancels instead of pinning the reader
+    thread forever. Override via CODEX_APPROVAL_TIMEOUT_MS.
+    """
+    return parse_int_env("CODEX_APPROVAL_TIMEOUT_MS", 600_000)
 
 
 def configured_provider_models() -> list[str]:
@@ -41,8 +49,15 @@ def configured_config_overrides() -> list[str]:
     return parse_csv(os.getenv("CODEX_CONFIG_OVERRIDES", ""))
 
 
-def codex_bin() -> str:
-    return os.getenv("CODEX_BIN", "codex")
+def codex_bin_override() -> Optional[str]:
+    """Operator override for the codex binary path.
+
+    ``None`` (the default) lets the SDK resolve its bundled CLI binary from
+    the ``openai-codex-cli-bin`` runtime package, so deployments no longer
+    need a separately installed ``codex`` on PATH.
+    """
+    value = (os.getenv("CODEX_BIN") or "").strip()
+    return value or None
 
 
 def approval_policy() -> str:
@@ -50,11 +65,15 @@ def approval_policy() -> str:
 
 
 def sandbox_mode() -> str:
-    raw = os.getenv("CODEX_SANDBOX", "danger-full-access").strip() or "danger-full-access"
+    raw = (
+        os.getenv("CODEX_SANDBOX", "danger-full-access").strip() or "danger-full-access"
+    )
     legacy_aliases = {
         "readOnly": "read-only",
         "workspaceWrite": "workspace-write",
         "dangerFullAccess": "danger-full-access",
+        # SDK-preset spelling (``Sandbox.full_access``) for the wire mode.
+        "full-access": "danger-full-access",
     }
     return legacy_aliases.get(raw, raw)
 

@@ -386,7 +386,7 @@ class TestUserSessionBinding:
         mock_wm.resolve.assert_called_once_with("alice", backend="codex")
         assert mock_peek_session.call_args_list == [call(existing_session_id)]
         assert mock_get_session.call_args_list == [
-            call(existing_session_id, user="alice", cwd="/tmp/ws/alice/codex"),
+            call(existing_session_id, user="alice", cwd="/tmp/ws/alice/codex", max_turn=1),
             call(existing_session_id),
         ]
         assert create_calls[0]["cwd"] == "/tmp/ws/alice/codex"

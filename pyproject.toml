@@ -14,6 +14,10 @@ dependencies = [
     "sse-starlette>=2.1.3",
     "python-multipart>=0.0.18",
     "claude-agent-sdk==0.2.128",
+    # Codex backend: official app-server SDK, Codex-pinned versioning, bundles
+    # the CLI binary (openai-codex-cli-bin). Exact pin like claude-agent-sdk —
+    # upgrades are deliberate, gap-analyzed events.
+    "openai-codex==0.147.0",
     "slowapi>=0.1.9",
     "pyyaml>=6.0",
     "sqlalchemy[asyncio]>=2.0.0",

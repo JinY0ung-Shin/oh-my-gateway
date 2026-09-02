@@ -851,12 +851,13 @@ def _response_reasoning_effort(body: ResponseCreateRequest) -> Optional[str]:
 
 def _validate_reasoning_backend(effort: Optional[str], backend_name: str) -> None:
     """Reject reasoning.effort requests for backends that can't honor them."""
-    if effort is not None and backend_name != "claude":
+    if effort is not None and backend_name not in {"claude", "codex"}:
         raise HTTPException(
             status_code=400,
             detail=(
                 f"reasoning.effort is not supported by the '{backend_name}' "
-                f"backend; only the claude backend supports reasoning control"
+                f"backend; only the claude and codex backends support "
+                f"reasoning control"
             ),
         )
 
@@ -1105,10 +1106,11 @@ async def _ensure_response_session_client(
     create_kwargs: Dict[str, Any] = {}
     if output_format is not None:
         create_kwargs["output_format"] = output_format
-    # Like output_format, ``effort`` is claude-only and only passed when set:
-    # the route preflight already rejected reasoning.effort for other
-    # backends, so this keyword never reaches a create_client() that doesn't
-    # accept it.
+    # ``effort`` is only passed when set: the route preflight already
+    # rejected reasoning.effort for backends without reasoning control
+    # (claude bakes it into CLI flags at create time; codex forwards it as a
+    # per-turn parameter), so this keyword never reaches a create_client()
+    # that doesn't accept it.
     reasoning_effort = _response_reasoning_effort(body)
     if reasoning_effort is not None:
         create_kwargs["effort"] = reasoning_effort

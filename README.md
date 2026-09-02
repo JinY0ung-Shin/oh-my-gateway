@@ -5,7 +5,7 @@
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://github.com/JinY0ung-Shin/oh-my-gateway)
 [![MIT License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-OpenAI-compatible gateway for coding agent backends. It exposes the Claude Agent SDK through `/v1/responses`, plus a stateless Claude SDK event stream at `/v1/agents/messages`, with MCP integration, workspace isolation, and an admin dashboard. OpenCode and Codex backends are still in the tree but **stale** (frozen since July 2026, unmaintained).
+OpenAI-compatible gateway for coding agent backends. It exposes the Claude Agent SDK through `/v1/responses`, plus a stateless Claude SDK event stream at `/v1/agents/messages`, with MCP integration, workspace isolation, and an admin dashboard. The Codex backend runs on the official `openai-codex` SDK; the OpenCode backend is still in the tree but **stale** (frozen since July 2026, unmaintained).
 
 > Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose service is now `gateway`; update commands such as `docker compose logs claude-wrapper` to use `gateway`.
 
@@ -35,7 +35,7 @@ curl http://localhost:8000/v1/responses \
 - **Responses API**: `/v1/responses` with non-streaming and SSE streaming responses.
 - **Background mode**: `background: true` returns a `queued` response immediately and runs the turn server-side; poll `GET /v1/responses/{response_id}`, cancel with `POST /v1/responses/{response_id}/cancel`.
 - **Stateless agent API**: `/v1/agents/messages` with caller-owned history and Claude SDK events.
-- **Backends**: Claude (`sonnet`, `opus`, `haiku`) is the maintained backend. OpenCode (`opencode/<provider>/<model>`) and Codex (`codex/<model>`) are stale — kept frozen, unmaintained.
+- **Backends**: Claude (`sonnet`, `opus`, `haiku`) and Codex (`codex/<model>`, official openai-codex SDK) are maintained. OpenCode (`opencode/<provider>/<model>`) is stale — kept frozen, unmaintained.
 - **Session continuity**: `previous_response_id` and server-side session tracking.
 - **Workspace isolation**: session-scoped temp directories for anonymous requests, persistent per-user directories when `user` is set (see [Workspaces](#workspaces)).
 - **MCP support**: shared gateway `MCP_CONFIG`, with optional OpenCode managed-mode config generation.
@@ -51,7 +51,7 @@ curl http://localhost:8000/v1/responses \
 | OpenCode managed mode (stale) | [docs/opencode/managed.md](docs/opencode/managed.md) |
 | OpenCode external mode (stale) | [docs/opencode/external.md](docs/opencode/external.md) |
 | OpenCode + LiteLLM recipes (stale) | [docs/opencode/litellm.md](docs/opencode/litellm.md) |
-| Codex backend setup and SDK status (stale) | [docs/codex/](docs/codex/) |
+| Codex backend setup (openai-codex SDK) | [docs/codex/](docs/codex/) |
 | Streaming event reference | [docs/streaming-events.md](docs/streaming-events.md) |
 | System prompt presets | [docs/](docs/) |
 
@@ -75,14 +75,14 @@ BACKENDS=claude,opencode
 OPENCODE_MODELS=openai/gpt-5.5
 ```
 
-Enable the stale Codex backend alongside Claude:
+Enable the Codex backend alongside Claude:
 
 ```bash
 BACKENDS=claude,codex
 CODEX_MODELS=gpt-5.5
 ```
 
-The Codex backend uses the local `codex app-server` harness through JSON-RPC, not the OpenAI Responses API. It was still experimental when frozen; see [docs/codex/](docs/codex/) for the freeze-time integration notes.
+The Codex backend drives a local `codex app-server` through the official `openai-codex` Python SDK (the CLI binary ships inside the dependency — nothing extra to install). Codex talks to its model provider over the OpenAI Responses API, so self-hosted models can be served through a LiteLLM proxy; see [docs/codex/](docs/codex/) for setup, approvals, and the LiteLLM recipe.
 
 OpenCode has two modes:
 
@@ -115,7 +115,7 @@ Most settings are environment variables. Start with `.env.example`.
 |----------|---------|
 | `ANTHROPIC_AUTH_TOKEN` | Claude API key auth |
 | `CLAUDE_AUTH_METHOD` | Force `api_key` or `cli` auth |
-| `BACKENDS` | Backend allowlist; `claude` is the only maintained backend (`opencode`/`codex` are stale) |
+| `BACKENDS` | Backend allowlist; `claude` and `codex` are maintained (`opencode` is stale) |
 | `DEFAULT_MODEL` | Default model for requests without `model` |
 | `DEFAULT_MAX_TURNS` | Maximum agent turns per request |
 | `MAX_TIMEOUT` | Wall-clock budget per **non-streaming** `/v1/responses` turn in milliseconds (504 on breach); streaming turns are unbounded by design |
@@ -135,11 +135,13 @@ Most settings are environment variables. Start with `.env.example`.
 | `BLOCKED_DEFERRED_TOOLS` | Post-turn schedulers to deny; default `ScheduleWakeup,CronCreate` (see below) |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode (stale backend) |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models (stale backend) |
-| `CODEX_BIN` | Codex CLI binary name/path; default `codex` (stale backend) |
-| `CODEX_MODELS` | Gateway allowlist for Codex models; default `gpt-5.5` (stale backend) |
+| `CODEX_BIN` | Optional Codex CLI override; default: the SDK-bundled binary |
+| `CODEX_MODELS` | Gateway allowlist for Codex models; default `gpt-5.5` |
 | `CODEX_APPROVAL_POLICY` | Codex approval policy; default `never` |
 | `CODEX_SANDBOX` | Codex thread sandbox mode; default `danger-full-access` for local experimental use |
-| `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides |
+| `CODEX_CONFIG_OVERRIDES` | Comma-separated `codex --config key=value` overrides (e.g. a LiteLLM model provider) |
+| `CODEX_MODEL_DISCOVERY_ENABLED` | Opt-in live Codex model discovery for `/v1/models` |
+| `CODEX_APPROVAL_TIMEOUT_MS` | Pending Codex approval auto-cancel window; default 600000 |
 | `API_KEY` | Optional public API bearer token |
 | `ADMIN_API_KEY` | Required admin dashboard key |
 | `USAGE_LOG_DB_URL` | Optional SQLAlchemy URL for usage logging |
@@ -348,8 +350,9 @@ matching platform package such as `opencode-linux-x64` or
 `opencode-linux-arm64`.
 
 For a Codex-only deployment, use the separate Compose file. It builds a
-Codex-specific image, installs `@openai/codex`, forces `BACKENDS=codex`, and
-persists Codex CLI state in a named Docker volume:
+Codex-specific image (the Codex CLI ships inside the `openai-codex` Python
+dependency), forces `BACKENDS=codex`, and persists Codex CLI state in a named
+Docker volume:
 
 ```bash
 docker compose -f docker-compose.codex.yml up -d --build

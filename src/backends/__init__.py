@@ -20,8 +20,9 @@ from src.backends.base import (  # noqa: F401
 logger = logging.getLogger(__name__)
 
 # Frozen 2026-07: still registerable, but unmaintained and excluded from the
-# default test suite (tests/conftest.py). Only 'claude' is maintained.
-STALE_BACKENDS = ("opencode", "codex")
+# default test suite (tests/conftest.py). 'codex' was un-frozen in 2026-09 on
+# the official openai-codex SDK; 'claude' and 'codex' are maintained.
+STALE_BACKENDS = ("opencode",)
 
 
 def _enabled_backend_names() -> list[str]:

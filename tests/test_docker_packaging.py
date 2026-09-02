@@ -317,14 +317,19 @@ def test_compose_does_not_configure_external_opencode_server():
     assert "OPENCODE_BASE_URL" not in compose
 
 
-def test_codex_dockerfile_installs_codex_cli_runtime():
-    """The Codex image should install the Codex app-server CLI."""
+def test_codex_dockerfile_relies_on_sdk_bundled_cli():
+    """The Codex image gets its CLI from the openai-codex pip dependency.
+
+    The SDK's openai-codex-cli-bin runtime package ships the binary,
+    version-locked by uv.lock — no npm install, and no CODEX_BIN override
+    that could shadow the bundled binary with a mismatched CLI.
+    """
     dockerfile = (ROOT / "Dockerfile.codex").read_text()
 
-    assert "FROM python:3.12-slim-trixie AS codex-builder" in dockerfile
-    assert "ARG CODEX_VERSION=" in dockerfile
-    assert '"@openai/codex@${CODEX_VERSION}"' in dockerfile
-    assert "codex --version" in dockerfile
+    assert "codex-builder" not in dockerfile
+    assert "@openai/codex@" not in dockerfile
+    assert "CODEX_BIN" not in dockerfile.replace("# npm install. Leave CODEX_BIN unset", "")
+    assert "openai-codex-cli-bin" in dockerfile
     assert "CODEX_HOME=/home/app/.codex" in dockerfile
     assert "ENTRYPOINT [\"python\", \"/usr/local/bin/docker-entrypoint.py\"]" in dockerfile
 
@@ -334,7 +339,10 @@ def test_codex_compose_enables_codex_backend_and_state_volume():
     compose = (ROOT / "docker-compose.codex.yml").read_text()
 
     assert "dockerfile: Dockerfile.codex" in compose
-    assert "- CODEX_VERSION" in compose
+    # No CODEX_VERSION build arg / CODEX_BIN override: the CLI is the
+    # SDK-bundled binary from the openai-codex pip dependency.
+    assert "- CODEX_VERSION" not in compose
+    assert "CODEX_BIN" not in compose
     assert "- BACKENDS=codex" in compose
     assert "- DEFAULT_MODEL=${CODEX_DEFAULT_GATEWAY_MODEL:-codex/gpt-5.5}" in compose
     assert "- CODEX_HOME=/home/app/.codex" in compose

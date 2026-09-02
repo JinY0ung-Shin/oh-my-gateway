@@ -68,43 +68,45 @@ def test_request_rejects_unknown_effort():
 # ---------------------------------------------------------------------------
 
 
-def test_validate_reasoning_backend_rejects_non_claude():
-    for backend_name in ("codex", "opencode"):
+def test_validate_reasoning_backend_rejects_non_reasoning_backends():
+    for backend_name in ("opencode",):
         with pytest.raises(HTTPException) as exc_info:
             _validate_reasoning_backend("high", backend_name)
         assert exc_info.value.status_code == 400
         assert "reasoning.effort" in exc_info.value.detail
 
 
-def test_validate_reasoning_backend_allows_claude_and_noop():
+def test_validate_reasoning_backend_allows_claude_codex_and_noop():
     _validate_reasoning_backend("max", "claude")
+    # Codex forwards reasoning.effort as a per-turn parameter.
+    _validate_reasoning_backend("high", "codex")
     _validate_reasoning_backend(None, "codex")
     _validate_reasoning_backend(None, "opencode")
 
 
-def _register_fake_codex_backend():
+def _register_fake_opencode_backend():
     def resolve(model):
-        if model == "codex/gpt-5.5":
-            return ResolvedModel(model, "codex", "gpt-5.5")
+        if model == "opencode/some-model":
+            return ResolvedModel(model, "opencode", "some-model")
         return None
 
     backend = MagicMock()
-    backend.name = "codex"
+    backend.name = "opencode"
     BackendRegistry.register_descriptor(
-        BackendDescriptor("codex", "openai", ["codex/gpt-5.5"], resolve)
+        BackendDescriptor("opencode", "opencode", ["opencode/some-model"], resolve)
     )
-    BackendRegistry.register("codex", backend)
+    BackendRegistry.register("opencode", backend)
     return backend
 
 
-def test_responses_endpoint_rejects_reasoning_for_codex_backend():
-    backend = _register_fake_codex_backend()
+def test_responses_endpoint_rejects_reasoning_for_non_reasoning_backend():
+    backend = _register_fake_opencode_backend()
 
     with client_context() as (client, _mock_cli):
         response = client.post(
             "/v1/responses",
             json={
-                "model": "codex/gpt-5.5",
+                "model": "opencode/some-model",
                 "input": "hi",
                 "reasoning": {"effort": "high"},
             },

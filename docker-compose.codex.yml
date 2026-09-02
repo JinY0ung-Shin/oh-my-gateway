@@ -13,7 +13,6 @@ services:
         - APT_MIRROR_URL
         - APT_SECURITY_MIRROR_URL
         - NPM_CONFIG_REGISTRY
-        - CODEX_VERSION
         - PIP_INDEX_URL
         - PIP_EXTRA_INDEX_URL
         - PIP_TRUSTED_HOST
@@ -47,7 +46,6 @@ services:
       - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
       - BACKENDS=codex
       - DEFAULT_MODEL=${CODEX_DEFAULT_GATEWAY_MODEL:-codex/gpt-5.5}
-      - CODEX_BIN=codex
       - CODEX_HOME=/home/app/.codex
       - CODEX_MODELS=${CODEX_MODELS:-gpt-5.5}
       - CODEX_APPROVAL_POLICY=${CODEX_APPROVAL_POLICY:-never}
