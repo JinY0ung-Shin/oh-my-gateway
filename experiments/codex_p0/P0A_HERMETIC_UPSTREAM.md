@@ -1,4 +1,4 @@
-# P0a-2: isolated Responses replica and fault corpus
+# P0a hermetic Responses upstream, contract fixture and positive control
 
 Canonical decision gate: #163. Decision record: #170. Real-path runner (P0a-1): #168.
 
@@ -61,7 +61,7 @@ model_provider = "replica"
 approval_policy = "never"
 
 [model_providers.replica]
-name = "P0a-2 replica"
+name = "P0a hermetic upstream"
 base_url = "http://127.0.0.1:8099/v1"
 wire_api = "responses"
 requires_openai_auth = false

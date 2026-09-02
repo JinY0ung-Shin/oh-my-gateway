@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0a-2 isolated replica: a deterministic OpenAI Responses upstream for Codex (#163).
+"""Hermetic OpenAI Responses upstream for Codex P0a evidence (#163).
 
 Purpose
 -------
@@ -443,7 +443,7 @@ def main() -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     print(
-        f"P0a-2 replica listening on http://{args.host}:{args.port}/v1 "
+        f"P0a hermetic upstream listening on http://{args.host}:{args.port}/v1 "
         f"(model={args.model}, fault={args.fault})",
         file=sys.stderr,
         flush=True,
