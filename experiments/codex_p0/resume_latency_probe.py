@@ -41,21 +41,38 @@ def run_iteration(
     stop_mode: str,
     model: str | None,
     timeout_s: float,
+    prepopulate_threads: int = 0,
+    materialize_upstream: str | None = None,
 ) -> dict[str, Any]:
     case = root / stop_mode / str(index)
     home = case / "codex-home"
     workspace = case / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    owner = AppServer(codex_bin, home, cwd=workspace, timeout_s=timeout_s)
+    owner = AppServer(
+        codex_bin, home, cwd=workspace, timeout_s=timeout_s, materialize_upstream=materialize_upstream
+    )
     replacement: AppServer | None = None
     result: dict[str, Any] = {"index": index, "stop_mode": stop_mode}
     try:
         result["owner_startup_s"] = owner.start()
+        # Optionally fill the store first so resume is timed against a store
+        # holding a realistic number of threads, not a single one. Store-size
+        # effects (thread index scan, first-acquire stale-lock cleanup) are
+        # invisible on a one-thread store.
+        for _ in range(prepopulate_threads):
+            _thread_id(owner.start_thread(model=model))
+        result["prepopulated_threads"] = prepopulate_threads
         thread_id = _thread_id(owner.start_thread(model=model))
         result["thread_id"] = thread_id
+        if materialize_upstream:
+            result["materialize"] = owner.run_text_turn(thread_id)
+            if not result["materialize"]["ok"]:
+                raise RuntimeError(f"materializing turn failed: {result['materialize']}")
         result["owner_stop"] = owner.stop(stop_mode, timeout_s=timeout_s)
 
-        replacement = AppServer(codex_bin, home, cwd=workspace, timeout_s=timeout_s)
+        replacement = AppServer(
+            codex_bin, home, cwd=workspace, timeout_s=timeout_s, materialize_upstream=materialize_upstream
+        )
         result["replacement_startup_s"] = replacement.start()
         started = time.monotonic()
         response = replacement.resume_thread(thread_id)
@@ -88,10 +105,23 @@ def main() -> int:
     parser.add_argument("--stop-modes", default="stdin_eof,sigterm,sigkill")
     parser.add_argument("--timeout-s", type=float, default=10.0)
     parser.add_argument("--model", default=os.getenv("CODEX_P0_MODEL"))
+    parser.add_argument(
+        "--prepopulate-threads",
+        type=int,
+        default=0,
+        help="threads to create in the owner before the timed one (0 = one-thread store)",
+    )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--keep-root", type=Path)
+    parser.add_argument(
+        "--materialize-upstream",
+        metavar="BASE_URL",
+        help="Responses upstream for one text turn per thread before release; required for resume to be possible",
+    )
     args = parser.parse_args()
 
+    if args.prepopulate_threads < 0:
+        parser.error("--prepopulate-threads must be >= 0")
     if args.iterations <= 0:
         parser.error("--iterations must be > 0")
     budget = load_budget(args.budget)
@@ -114,6 +144,12 @@ def main() -> int:
         "model": args.model,
         "iterations": args.iterations,
         "budget_resume_p95_s": float(budget["acceptable_resume_p95_s"]),
+        "prepopulated_threads_per_store": args.prepopulate_threads,
+        "materialization_enabled": bool(args.materialize_upstream),
+        "store_note": (
+            "resume timed against a store holding prepopulated_threads_per_store + 1 "
+            "threads; 0 means a one-thread store, an optimistic floor"
+        ),
         "modes": {},
     }
     try:
@@ -126,6 +162,8 @@ def main() -> int:
                     stop_mode=mode,
                     model=args.model,
                     timeout_s=args.timeout_s,
+                    prepopulate_threads=args.prepopulate_threads,
+                    materialize_upstream=args.materialize_upstream,
                 )
                 for index in range(args.iterations)
             ]

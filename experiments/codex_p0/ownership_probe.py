@@ -41,11 +41,13 @@ class AppServer:
         *,
         cwd: Path,
         timeout_s: float,
+        materialize_upstream: str | None = None,
     ) -> None:
         self.codex_bin = codex_bin
         self.codex_home = codex_home
         self.cwd = cwd
         self.timeout_s = timeout_s
+        self.materialize_upstream = materialize_upstream
         self.proc: subprocess.Popen[str] | None = None
         self._messages: queue.Queue[object] = queue.Queue()
         self._stderr = collections.deque(maxlen=200)
@@ -63,6 +65,8 @@ class AppServer:
         env = os.environ.copy()
         env["CODEX_HOME"] = str(self.codex_home)
         self.codex_home.mkdir(parents=True, exist_ok=True)
+        if self.materialize_upstream:
+            write_provider_config(self.codex_home, self.materialize_upstream)
         started_at = time.monotonic()
         kwargs: dict[str, Any] = {}
         if os.name == "posix":
@@ -196,6 +200,76 @@ class AppServer:
     def resume_thread(self, thread_id: str) -> dict[str, Any]:
         return self.request("thread/resume", {"threadId": thread_id, "cwd": str(self.cwd)})
 
+    def wait_for_notification(self, predicate, timeout_s: float) -> dict[str, Any] | None:
+        """Drain notifications until ``predicate(msg)`` is true or the deadline passes.
+
+        Server-originated requests met here are declined deterministically, as in
+        ``request()``; EOF raises so a dead runtime is never mistaken for a slow one.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            try:
+                item = self._messages.get(timeout=remaining)
+            except queue.Empty:
+                return None
+            if item is _EOF:
+                raise RuntimeError(
+                    f"app-server stdout closed while waiting for a notification; stderr={self.stderr_tail()}"
+                )
+            if not isinstance(item, dict):
+                continue
+            if "method" in item and "id" in item:
+                self.server_requests.append(item)
+                self._write(
+                    {
+                        "id": item["id"],
+                        "error": {"code": -32601, "message": "P0 probe does not service requests"},
+                    }
+                )
+                continue
+            if "method" in item:
+                self.notifications.append(item)
+                if predicate(item):
+                    return item
+
+    def run_text_turn(self, thread_id: str, *, timeout_s: float = 60.0) -> dict[str, Any]:
+        """Run one text-only turn so the thread is materialized (rollout written).
+
+        ``thread/start`` alone persists nothing: app-server reports the thread as
+        "not materialized yet ... before first user message" and ``thread/resume``
+        in a replacement process fails with "no rollout found". Ownership and
+        resume measurements are therefore only meaningful on a thread that has
+        completed at least one turn. The upstream is expected to be the hermetic
+        Responses upstream from this directory (see README), not a real model.
+        """
+        started = self.request(
+            "turn/start",
+            {
+                "threadId": thread_id,
+                "input": [{"type": "text", "text": "Reply with exactly CHATDRAGON_P0_MATERIALIZE_OK"}],
+            },
+        )
+        if not started.get("ok"):
+            return {"ok": False, "stage": "turn/start", "error": started.get("error")}
+        turn = (started.get("result") or {}).get("turn") or {}
+        turn_id = turn.get("id")
+        began = time.monotonic()
+        done = self.wait_for_notification(
+            lambda m: m.get("method") == "turn/completed"
+            and ((m.get("params") or {}).get("turn") or {}).get("id") == turn_id,
+            timeout_s,
+        )
+        return {
+            "ok": done is not None,
+            "turn_id": turn_id,
+            "elapsed_s": round(time.monotonic() - began, 6),
+            "status": ((done or {}).get("params") or {}).get("turn", {}).get("status"),
+            "error": None if done is not None else f"no turn/completed within {timeout_s}s",
+        }
+
     def stderr_tail(self, limit: int = 40) -> str:
         return "\n".join(list(self._stderr)[-limit:])
 
@@ -228,18 +302,47 @@ class AppServer:
         except Exception as exc:  # probe must report cleanup failures, not hide them
             error = f"{type(exc).__name__}: {exc}"
 
-        surviving_descendants = [
-            child_pid for child_pid in descendant_pids_before if pid_alive(child_pid)
-        ]
+        survivors = classify_survivors(descendant_pids_before)
         return {
             "mode": mode,
             "elapsed_s": round(time.monotonic() - started, 6),
             "returncode": proc.poll(),
             "before": before,
             "descendant_pids_before": descendant_pids_before,
-            "surviving_descendants": surviving_descendants,
+            # Genuinely running orphans only; zombies awaiting reap are listed
+            # separately and are not leaks.
+            "surviving_descendants": sorted(survivors["running"]),
+            "surviving_descendant_states": survivors["running"],
+            "zombie_descendants": survivors["zombie"],
+            "survivor_grace_s": survivors["grace_s"],
             "error": error,
         }
+
+
+def write_provider_config(codex_home: Path, base_url: str) -> None:
+    """Point this CODEX_HOME at a Responses upstream using public provider fields only."""
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (codex_home / "config.toml").write_text(
+        "\n".join(
+            [
+                'model = "replica-model"',
+                'model_provider = "p0"',
+                'approval_policy = "never"',
+                'sandbox_mode = "read-only"',
+                'web_search = "disabled"',
+                "",
+                "[model_providers.p0]",
+                'name = "P0 hermetic upstream"',
+                f'base_url = "{base_url.rstrip("/")}"',
+                'wire_api = "responses"',
+                "requires_openai_auth = false",
+                "request_max_retries = 0",
+                "stream_max_retries = 0",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
 
 
 def _signal_process_tree(proc: subprocess.Popen[str], sig: signal.Signals) -> None:
@@ -254,12 +357,55 @@ def _signal_process_tree(proc: subprocess.Popen[str], sig: signal.Signals) -> No
     proc.send_signal(sig)
 
 
+def pid_state(pid: int) -> tuple[str | None, str | None]:
+    """(State letter, comm) from /proc, or (None, None) if gone/unavailable."""
+    try:
+        text = (Path("/proc") / str(pid) / "status").read_text()
+    except OSError:
+        return None, None
+    state = comm = None
+    for line in text.splitlines():
+        if line.startswith("State:"):
+            state = line.split()[1]
+        elif line.startswith("Name:"):
+            comm = line.split(None, 1)[1] if len(line.split(None, 1)) > 1 else ""
+    return state, comm
+
+
+def classify_survivors(pids: list[int], grace_s: float = 2.0) -> dict[str, Any]:
+    """Split descendant PIDs into genuinely running vs zombie after a grace poll.
+
+    Only ``running`` counts as an orphan. Zombies are dead processes awaiting
+    reap by their reparented parent -- a transient /proc entry, not a leak.
+    """
+    deadline = time.monotonic() + grace_s
+    running: dict[int, str] = {}
+    zombies: dict[int, str] = {}
+    while True:
+        running.clear()
+        zombies.clear()
+        for pid in pids:
+            state, comm = pid_state(pid)
+            if state is None:
+                continue
+            (zombies if state.startswith("Z") else running)[pid] = f"{state} {comm or ''}".strip()
+        if not running or time.monotonic() >= deadline:
+            break
+        time.sleep(0.1)
+    return {
+        "running": running,
+        "zombie": zombies,
+        "grace_s": grace_s,
+    }
+
+
 def pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
     proc_root = Path("/proc") / str(pid)
     if Path("/proc").exists():
-        return proc_root.exists()
+        state, _ = pid_state(pid)
+        return state is not None and not state.startswith("Z")
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -327,10 +473,24 @@ def sample_process(pid: int) -> dict[str, Any]:
 
 
 def writer_lock_snapshot(codex_home: Path) -> list[str]:
+    """Per-thread writer lock files only.
+
+    ``.coordination.lock`` lives in the same directory but is the serialization
+    primitive *around* the per-thread locks (acquire/cleanup/drop all take it
+    first), not a writer claim. ``pathlib.Path.glob`` matches dotfiles -- unlike
+    ``glob.glob`` -- so it must be excluded explicitly or every snapshot and
+    ``writer_lock_count`` is inflated by one.
+    """
     lock_dir = codex_home / "thread-writer-locks"
     if not lock_dir.exists():
         return []
-    return sorted(path.name for path in lock_dir.glob("*.lock"))
+    return sorted(
+        path.name for path in lock_dir.glob("*.lock") if not path.name.startswith(".")
+    )
+
+
+def coordination_lock_present(codex_home: Path) -> bool:
+    return (codex_home / "thread-writer-locks" / ".coordination.lock").exists()
 
 
 def _thread_id(response: dict[str, Any]) -> str:
@@ -352,12 +512,15 @@ def run_ownership_case(
     action: str,
     model: str | None,
     timeout_s: float,
+    materialize_upstream: str | None = None,
 ) -> dict[str, Any]:
     case_dir = root / action
     home = case_dir / "codex-home"
     workspace = case_dir / "workspace"
     workspace.mkdir(parents=True, exist_ok=True)
-    a = AppServer(codex_bin, home, cwd=workspace, timeout_s=timeout_s)
+    a = AppServer(
+        codex_bin, home, cwd=workspace, timeout_s=timeout_s, materialize_upstream=materialize_upstream
+    )
     b: AppServer | None = None
     result: dict[str, Any] = {"action": action, "home": str(home)}
     try:
@@ -365,8 +528,23 @@ def run_ownership_case(
         started = a.start_thread(model=model)
         thread_id = _thread_id(started)
         result["thread_id"] = thread_id
+        if materialize_upstream:
+            result["materialize"] = a.run_text_turn(thread_id)
+            if not result["materialize"]["ok"]:
+                raise RuntimeError(f"materializing turn failed: {result['materialize']}")
+        else:
+            result["materialize"] = {
+                "ok": False,
+                "skipped": True,
+                "warning": (
+                    "thread not materialized: thread/start alone writes no rollout, so "
+                    "thread/resume is expected to fail with 'no rollout found' before "
+                    "any writer-lock contention is reached"
+                ),
+            }
         result["a_resource"] = sample_process(a.pid or -1)
         result["locks_before"] = writer_lock_snapshot(home)
+        result["coordination_lock_present"] = coordination_lock_present(home)
 
         if action == "healthy_conflict":
             pass
@@ -381,7 +559,9 @@ def run_ownership_case(
         else:
             raise ValueError(action)
 
-        b = AppServer(codex_bin, home, cwd=workspace, timeout_s=timeout_s)
+        b = AppServer(
+            codex_bin, home, cwd=workspace, timeout_s=timeout_s, materialize_upstream=materialize_upstream
+        )
         result["b_startup_s"] = round(b.start(), 6)
         result["b_resume"] = b.resume_thread(thread_id)
         result["b_resource"] = sample_process(b.pid or -1)
@@ -445,16 +625,24 @@ def run_density_case(
 
 
 def codex_version(codex_bin: str) -> str | None:
+    """Best-effort ``codex --version``; never raises.
+
+    A cold-cache first invocation of the pinned binary was measured at ~8 s, so
+    the bound is generous and a timeout is recorded rather than crashing the
+    probe before any case runs.
+    """
     try:
         completed = subprocess.run(
             [codex_bin, "--version"],
             capture_output=True,
             text=True,
-            timeout=5,
+            timeout=30,
             check=False,
         )
-    except OSError:
-        return None
+    except subprocess.TimeoutExpired:
+        return "unavailable: --version timed out after 30s"
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"unavailable: {type(exc).__name__}"
     value = (completed.stdout or completed.stderr).strip()
     return value or None
 
@@ -481,6 +669,15 @@ def main() -> int:
     parser.add_argument("--skip-density", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--keep-root", type=Path)
+    parser.add_argument(
+        "--materialize-upstream",
+        metavar="BASE_URL",
+        help=(
+            "Responses upstream used to run one text turn per thread before ownership "
+            "actions, e.g. http://127.0.0.1:8099/v1 from mock_responses_upstream.py. "
+            "Without it threads are never materialized and resume cannot succeed."
+        ),
+    )
     args = parser.parse_args()
 
     if shutil.which(args.codex_bin) is None and not Path(args.codex_bin).exists():
@@ -503,6 +700,14 @@ def main() -> int:
             "codex_bin": str(args.codex_bin),
             "codex_version": codex_version(args.codex_bin),
             "root": str(root),
+            "materialization": {
+                "enabled": bool(args.materialize_upstream),
+                "note": (
+                    "thread/start alone persists no rollout (app-server: 'not materialized "
+                    "yet ... before first user message'); ownership/resume evidence requires "
+                    "one completed turn per thread"
+                ),
+            },
             "ownership": [],
             "density": [],
         }
@@ -515,6 +720,7 @@ def main() -> int:
                     action=action,
                     model=args.model,
                     timeout_s=args.timeout,
+                    materialize_upstream=args.materialize_upstream,
                 )
             )
 

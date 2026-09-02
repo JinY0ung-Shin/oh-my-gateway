@@ -173,16 +173,18 @@ def measure_idle_cpu(servers: list[AppServer], seconds: float) -> dict[str, Any]
 
 def stderr_tail_stats(server: AppServer) -> dict[str, Any]:
     lines = list(server._stderr)  # experiment-owned class; not an upstream/private SDK access
+    capacity = server._stderr.maxlen  # single source of truth for the ring bound
     return {
         "retained_lines": len(lines),
         "retained_bytes": sum(len(line.encode("utf-8")) + 1 for line in lines),
-        "tail_capacity_lines": 200,
-        "may_be_truncated": len(lines) >= 200,
+        "tail_capacity_lines": capacity,
+        "may_be_truncated": capacity is not None and len(lines) >= capacity,
     }
 
 
 def evaluate(case: dict[str, Any], budget: dict[str, Any]) -> dict[str, Any]:
     resource = case.get("resource", {})
+    idle = case.get("idle_cpu", {})
     limits = {
         "rss_mib": (
             resource.get("rss_kib") / 1024.0 if isinstance(resource.get("rss_kib"), int) else None,
@@ -199,11 +201,20 @@ def evaluate(case: dict[str, Any], budget: dict[str, Any]) -> dict[str, Any]:
             float(budget["acceptable_teardown_p95_s"]),
         ),
         "idle_cpu_percent": (
-            case.get("idle_cpu", {}).get("aggregate_cpu_percent"),
+            # An incomplete sample (some PIDs' ticks unreadable, typical when
+            # short-lived descendants churn at high counts) under-counts CPU and
+            # would pass in the permissive direction. Treat it as unknown so the
+            # case becomes inconclusive rather than pass.
+            idle.get("aggregate_cpu_percent") if idle.get("complete") else None,
             float(budget["acceptable_idle_cpu_percent"]),
         ),
-        "surviving_descendants": (
-            case.get("surviving_descendant_count"),
+        # Judged against the *hard-kill* budget only when teardown actually used
+        # SIGKILL; a graceful SIGTERM measures a different property and must not
+        # certify process-group ownership it never exercised.
+        "surviving_descendants_after_hard_kill": (
+            case.get("surviving_descendant_count")
+            if case.get("teardown_mode") == "sigkill"
+            else None,
             int(budget["maximum_orphan_descendants_after_hard_kill"]),
         ),
     }
@@ -237,6 +248,7 @@ def run_case(
     timeout_s: float,
     idle_sample_s: float,
     budget: dict[str, Any],
+    teardown_mode: str = "sigkill",
 ) -> dict[str, Any]:
     case_root = root / f"process-per-session-{count}"
     shared_home = case_root / "codex-home"
@@ -250,10 +262,13 @@ def run_case(
             workspace = case_root / "workspaces" / str(index)
             workspace.mkdir(parents=True, exist_ok=True)
             server = AppServer(codex_bin, shared_home, cwd=workspace, timeout_s=timeout_s)
-            startup_times.append(server.start())
-            # Register immediately after process start so a later thread/start
-            # failure cannot leak a live runtime past this probe's cleanup path.
+            # Register BEFORE start(): start() both spawns the process and runs
+            # initialize(), and initialize() raises on timeout. Registering after
+            # it would leave a spawned runtime outside the cleanup loop -- the
+            # exact orphan this probe exists to count. stop() tolerates an
+            # object that never spawned.
             servers.append(server)
+            startup_times.append(server.start())
             thread_started = time.monotonic()
             _thread_id(server.start_thread(model=model))
             thread_start_times.append(time.monotonic() - thread_started)
@@ -272,13 +287,14 @@ def run_case(
         surviving: set[int] = set()
         teardown = []
         for server in reversed(servers):
-            stopped = server.stop("sigterm", timeout_s=timeout_s)
+            stopped = server.stop(teardown_mode, timeout_s=timeout_s)
             teardown.append(stopped)
             elapsed = stopped.get("elapsed_s")
             if isinstance(elapsed, (int, float)):
                 teardown_times.append(float(elapsed))
             surviving.update(stopped.get("surviving_descendants") or [])
         result["teardown"] = teardown
+        result["teardown_mode"] = teardown_mode
         result["teardown_p95_s"] = percentile95(teardown_times)
         result["surviving_descendant_pids"] = sorted(surviving)
         result["surviving_descendant_count"] = len(surviving)
@@ -294,6 +310,16 @@ def main() -> int:
     parser.add_argument("--model", default=os.getenv("CODEX_P0_MODEL"))
     parser.add_argument("--timeout-s", type=float, default=10.0)
     parser.add_argument("--idle-sample-s", type=float, default=2.0)
+    parser.add_argument(
+        "--teardown-mode",
+        choices=("sigkill", "sigterm"),
+        default="sigkill",
+        help=(
+            "sigkill exercises process-group ownership and is judged against the "
+            "hard-kill orphan budget; sigterm measures graceful shutdown only and "
+            "leaves that check unknown"
+        ),
+    )
     parser.add_argument("--keep-root", type=Path)
     args = parser.parse_args()
 
@@ -325,6 +351,7 @@ def main() -> int:
                     timeout_s=args.timeout_s,
                     idle_sample_s=args.idle_sample_s,
                     budget=budget,
+                    teardown_mode=args.teardown_mode,
                 )
             )
     finally:

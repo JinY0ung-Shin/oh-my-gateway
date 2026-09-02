@@ -41,9 +41,32 @@ uv run python experiments/codex_p0/ownership_probe.py \
 CODEX_P0_MODEL=<model-id> uv run python experiments/codex_p0/ownership_probe.py
 ```
 
+### Threads must be materialized first — pass `--materialize-upstream`
+
+`thread/start` alone persists **nothing**: app-server reports the thread as "not materialized yet …
+before first user message", writes no rollout, and a replacement process's `thread/resume` fails with
+`no rollout found for thread id …` under every shutdown mode. An ownership or resume case run on such a
+thread never reaches the writer-lock contention it is meant to measure. Every ownership and resume case
+therefore runs **one text turn** per thread first, against the hermetic Responses upstream from this
+directory (no model, no network, no credentials):
+
+```bash
+python3 experiments/codex_p0/mock_responses_upstream.py --port 8099 &
+
+uv run python experiments/codex_p0/ownership_probe.py \
+  --codex-bin /path/to/codex \
+  --materialize-upstream http://127.0.0.1:8099/v1 \
+  --output artifacts/codex-p0-ownership.json
+```
+
+Without the flag the probe still runs but records `materialization.enabled: false` and a per-case
+warning; treat those resume results as "unmaterialized", not as ownership evidence. This is also a
+gateway design fact in its own right: a `codex_thread_id` is not resumable until its first turn has
+completed, so it must not be recorded as durable session state on `thread/start`.
+
 ### What it measures
 
-Each ownership case gets an isolated `CODEX_HOME` and durable thread:
+Each ownership case gets an isolated `CODEX_HOME` and a materialized durable thread:
 
 - `healthy_conflict`: process B attempts `thread/resume` while process A remains alive.
 - `sigstop`: A is frozen, B attempts resume, then A is continued. POSIX only.
@@ -51,9 +74,23 @@ Each ownership case gets an isolated `CODEX_HOME` and durable thread:
 - `sigterm`: A's process group is terminated before B resumes.
 - `sigkill`: A's process group is killed before B resumes.
 
-The output records `thread/resume` success/error payloads, `thread-writer-locks` snapshots, app-server startup/teardown latency, Linux `/proc` RSS and FD counts when available, descendant PIDs, surviving descendants after teardown, and stderr tails on failure.
+The output records `thread/resume` success/error payloads, per-thread `thread-writer-locks` snapshots
+(`.coordination.lock` is the serialization primitive around them, recorded separately as
+`coordination_lock_present`, never counted as a writer), app-server startup/teardown latency, Linux `/proc` RSS and FD counts when available, descendant PIDs, surviving descendants after teardown, and stderr tails on failure.
 
 The probe deliberately records evidence rather than encoding expectations such as “SIGKILL must make resume succeed”. Those expectations are exactly what P0b is supposed to establish for the pinned Codex version.
+
+Survivor accounting distinguishes **running** descendants from **zombies**: a killed grandchild lingers
+in `/proc` in state `Z` until its reparented parent reaps it, which is a transient entry, not a leak.
+Only running processes count as orphans; zombies are listed separately with their `comm` so the
+artifact is interpretable (app-server shells out to `git`/`git-remote-http`/`bash` on thread start).
+
+Observed on `codex-cli 0.147.0` against this container's local filesystem (re-run on the production
+mount before treating it as deployment evidence): a live or `SIGSTOP`ped owner keeps the per-thread lock
+and the replacement's resume is refused with `already has an active writer`; after `stdin_eof`,
+`SIGTERM` or `SIGKILL` the lock is released and resume succeeds (p95 ≈ 50 ms on a one-thread store), with
+zero running orphans. There is no steal or timeout path: a wedged-but-alive owner must be killed before
+takeover is possible.
 
 ### Thread-density cases
 
@@ -89,6 +126,12 @@ For each count in `process_per_session_counts` it records:
 - surviving descendant PIDs
 - mechanical `pass` / `fail` / `inconclusive` against the predeclared budget
 
+Teardown defaults to **SIGKILL** so `surviving_descendants_after_hard_kill` is judged against the
+hard-kill orphan budget it is named for. `--teardown-mode sigterm` measures graceful shutdown instead
+and leaves that check unknown rather than certifying process-group ownership it never exercised. An
+incomplete idle-CPU sample (some PIDs' ticks unreadable) is likewise reported as unknown, not as a
+pass: under-counted CPU always looks better than reality.
+
 This keeps the B0-vs-C0 transport decision separate from the later C1 multiplexing question.
 
 ## Resume latency probe
@@ -99,11 +142,17 @@ This keeps the B0-vs-C0 transport decision separate from the later C1 multiplexi
 uv run python experiments/codex_p0/resume_latency_probe.py \
   --codex-bin /path/to/codex \
   --budget /tmp/codex-p0-budget.json \
+  --materialize-upstream http://127.0.0.1:8099/v1 \
   --iterations 20 \
   --output artifacts/codex-p0-resume.json
 ```
 
 By default it measures `stdin_eof`, `SIGTERM`, and `SIGKILL` release paths separately. A mode fails if any iteration cannot resume successfully or if its measured p95 exceeds `acceptable_resume_p95_s`.
+
+Each iteration uses a fresh `CODEX_HOME`, so by default the p95 is measured against a **one-thread
+store** — an optimistic floor. Store-size effects (thread index scan, first-acquire stale-lock cleanup)
+are invisible there. Pass `--prepopulate-threads N` to fill the store to a realistic count before the
+timed resume, and judge the budget against that run.
 
 ## Safety / interpretation
 
