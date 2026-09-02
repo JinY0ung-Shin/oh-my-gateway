@@ -22,7 +22,9 @@ from typing import Callable, TypeVar
 import pytest
 from pydantic import BaseModel
 
-pytest.importorskip("openai_codex", reason="P0 probe: run with `uv run --with openai-codex ...`")
+pytest.importorskip(
+    "openai_codex", reason="P0 probe: run with `uv run --with openai-codex ...`"
+)
 
 from openai_codex import CodexConfig, TransportClosedError  # noqa: E402
 from openai_codex.client import CodexClient  # noqa: E402
@@ -76,7 +78,10 @@ def _await_call(result: queue.Queue[tuple[str, object]], timeout: float = 0.5):
 
 @pytest.mark.integration
 @pytest.mark.xfail(
-    reason="openai/codex#41078: early turn/completed is dropped before turn registration",
+    reason=(
+        "openai/codex#41078: early turn/completed is dropped before "
+        "turn registration"
+    ),
     strict=True,
 )
 def test_sdk_retains_terminal_notification_emitted_before_turn_start_response(tmp_path):
@@ -121,7 +126,10 @@ def test_sdk_retains_terminal_notification_emitted_before_turn_start_response(tm
 
 @pytest.mark.integration
 @pytest.mark.xfail(
-    reason="openai/codex#40399: reads arriving after terminal transport failure can block forever",
+    reason=(
+        "openai/codex#40399: reads arriving after terminal transport failure "
+        "can block forever"
+    ),
     strict=True,
 )
 def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
@@ -153,8 +161,8 @@ def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
 @pytest.mark.integration
 @pytest.mark.xfail(
     reason=(
-        "B0 hazard: sync approval handler owns the sole reader, so child death is not observed "
-        "until the human future returns"
+        "B0 hazard: sync approval handler owns the sole reader, so child death "
+        "is not observed until the human future returns"
     ),
     strict=True,
 )
