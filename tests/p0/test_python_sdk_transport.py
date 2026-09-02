@@ -12,9 +12,12 @@ forces the P0 decision record to be revisited.
 from __future__ import annotations
 
 import json
+import queue
 import sys
-from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
+import threading
+from concurrent.futures import Future
 from pathlib import Path
+from typing import Callable, TypeVar
 
 import pytest
 from pydantic import BaseModel
@@ -25,6 +28,7 @@ from openai_codex import CodexConfig, TransportClosedError  # noqa: E402
 from openai_codex.client import CodexClient  # noqa: E402
 
 FIXTURE = Path(__file__).parents[1] / "fixtures" / "fake_app_server.py"
+T = TypeVar("T")
 
 
 class ProbeResponse(BaseModel):
@@ -45,6 +49,29 @@ def _client(tmp_path: Path, payload: dict, *, approval_handler=None) -> CodexCli
     client = CodexClient(config=config, approval_handler=approval_handler)
     client.start()
     return client
+
+
+def _start_daemon_call(fn: Callable[[], T]) -> queue.Queue[tuple[str, object]]:
+    result: queue.Queue[tuple[str, object]] = queue.Queue(maxsize=1)
+
+    def _target() -> None:
+        try:
+            result.put(("result", fn()))
+        except BaseException as exc:
+            result.put(("error", exc))
+
+    threading.Thread(target=_target, daemon=True).start()
+    return result
+
+
+def _await_call(result: queue.Queue[tuple[str, object]], timeout: float = 0.5):
+    try:
+        kind, value = result.get(timeout=timeout)
+    except queue.Empty as exc:
+        raise TimeoutError(f"call did not terminate within {timeout}s") from exc
+    if kind == "error":
+        raise value  # type: ignore[misc]
+    return value
 
 
 @pytest.mark.integration
@@ -81,23 +108,15 @@ def test_sdk_retains_terminal_notification_emitted_before_turn_start_response(tm
             "linger": True,
         },
     )
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = None
     try:
         response = client.request("turn/start", {}, response_model=ProbeResponse)
         assert response.turnId == "turn-1"
         client.register_turn_notifications("turn-1")
-        future = executor.submit(client.next_turn_notification, "turn-1")
-        notification = future.result(timeout=0.5)
+        pending = _start_daemon_call(lambda: client.next_turn_notification("turn-1"))
+        notification = _await_call(pending)
         assert notification.method == "turn/completed"
     finally:
         client.close()
-        if future is not None:
-            try:
-                future.result(timeout=1)
-            except BaseException:
-                pass
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 @pytest.mark.integration
@@ -117,8 +136,6 @@ def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
             ]
         },
     )
-    executor = ThreadPoolExecutor(max_workers=1)
-    second_read = None
     try:
         with pytest.raises(TransportClosedError):
             client.request("probe", {}, response_model=ProbeResponse)
@@ -126,17 +143,11 @@ def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
         with pytest.raises(TransportClosedError):
             client.next_notification()
 
-        second_read = executor.submit(client.next_notification)
+        pending = _start_daemon_call(client.next_notification)
         with pytest.raises(TransportClosedError):
-            second_read.result(timeout=0.5)
+            _await_call(pending)
     finally:
         client.close()
-        if second_read is not None:
-            try:
-                second_read.result(timeout=1)
-            except (BaseException, FutureTimeout):
-                pass
-        executor.shutdown(wait=False, cancel_futures=True)
 
 
 @pytest.mark.integration
@@ -183,18 +194,14 @@ def test_sdk_detects_runtime_death_while_approval_handler_is_parked(tmp_path):
         },
         approval_handler=approval_handler,
     )
-    executor = ThreadPoolExecutor(max_workers=1)
-    request = executor.submit(client.request, "probe", {}, response_model=ProbeResponse)
+    request = _start_daemon_call(
+        lambda: client.request("probe", {}, response_model=ProbeResponse)
+    )
     try:
         approval_seen.result(timeout=1)
         with pytest.raises(TransportClosedError):
-            request.result(timeout=0.5)
+            _await_call(request)
     finally:
         if not human_decision.done():
             human_decision.set_result({"decision": "decline"})
         client.close()
-        try:
-            request.result(timeout=1)
-        except BaseException:
-            pass
-        executor.shutdown(wait=False, cancel_futures=True)
