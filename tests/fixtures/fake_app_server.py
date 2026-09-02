@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,8 @@ def _matches(step: dict[str, Any], message: dict[str, Any]) -> bool:
     if "expect_id" in step and message.get("id") != step["expect_id"]:
         return False
     if "expect_has_id" in step and ("id" in message) != bool(step["expect_has_id"]):
+        return False
+    if "expect_has_error" in step and ("error" in message) != bool(step["expect_has_error"]):
         return False
     return True
 
@@ -64,6 +67,25 @@ def _run_action(action: dict[str, Any], request: dict[str, Any]) -> None:
         return
     if kind == "sleep":
         time.sleep(float(action.get("seconds", 0)))
+        return
+    if kind == "spawn":
+        # A long-lived descendant in the same process group, to prove that a
+        # transport's teardown reaches the whole group and not just the root.
+        # With ``inherit_stdout`` the descendant keeps the transport's stdout
+        # pipe open after this process exits, so EOF cannot be the signal.
+        subprocess.Popen(  # noqa: S603 - fixture-owned interpreter
+            [sys.executable, "-c", f"import time; time.sleep({float(action.get('seconds', 60))})"],
+            stdin=subprocess.DEVNULL,
+            stdout=None if action.get("inherit_stdout") else subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return
+    if kind == "close_stdout":
+        # The root stays alive but its stdout is gone: EOF from a live runtime.
+        sys.stdout.flush()
+        import os
+
+        os.close(1)
         return
     if kind == "exit":
         raise SystemExit(int(action.get("code", 0)))
