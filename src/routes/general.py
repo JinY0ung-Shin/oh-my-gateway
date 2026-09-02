@@ -39,7 +39,7 @@ async def list_models(
 
     return {
         "object": "list",
-        "data": BackendRegistry.available_models(),
+        "data": await BackendRegistry.available_models_async(),
     }
 
 
