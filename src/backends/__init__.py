@@ -24,6 +24,17 @@ logger = logging.getLogger(__name__)
 STALE_BACKENDS = ("opencode", "codex")
 
 
+def _use_frozen_codex() -> bool:
+    """Whether ``BACKENDS=codex`` should register the FROZEN codex client.
+
+    Issue #173 PR E cuts ``codex`` over to the app-server adapter
+    (``src/backends/appserver``). This flag is the independent rollback: set
+    ``CODEX_BACKEND=frozen`` to fall back to the legacy JSON-RPC client without
+    reverting the cutover. Any other value (default) uses the adapter.
+    """
+    return os.getenv("CODEX_BACKEND", "appserver").strip().lower() == "frozen"
+
+
 def _enabled_backend_names() -> list[str]:
     """Return backend names enabled by BACKENDS, preserving order."""
     raw = os.getenv("BACKENDS", "claude")
@@ -41,7 +52,10 @@ def discover_backends(registry_cls=None) -> None:
         registry_cls = BackendRegistry
 
     for name in _enabled_backend_names():
-        if name in STALE_BACKENDS:
+        # 'codex' on the app-server adapter (the default after the #173 cutover)
+        # is maintained; only the frozen fallback and opencode are stale.
+        is_stale = name == "opencode" or (name == "codex" and _use_frozen_codex())
+        if is_stale:
             logger.warning(
                 "Backend %r is stale: frozen since 2026-07 and unmaintained; "
                 "it may break without notice. Only 'claude' is supported.",
@@ -56,9 +70,16 @@ def discover_backends(registry_cls=None) -> None:
 
             opencode.register(registry_cls=registry_cls)
         elif name == "codex":
-            from src.backends import codex
+            if _use_frozen_codex():
+                from src.backends import codex
 
-            codex.register(registry_cls=registry_cls)
+                codex.register(registry_cls=registry_cls)
+            else:
+                # PR E cutover: BACKENDS=codex now runs the app-server adapter
+                # (issue #173). Rollback with CODEX_BACKEND=frozen.
+                from src.backends.appserver import client as appserver_client
+
+                appserver_client.register(registry_cls=registry_cls)
         else:
             logger.warning("Unknown backend in BACKENDS=%r; skipping", name)
 

@@ -238,6 +238,7 @@ class AppServerCodexClient(TokenEstimateMixin):
         cwd: Optional[str] = None,
         extra_env: Optional[Dict[str, str]] = None,
         model_params: Optional[Dict[str, Any]] = None,
+        forward_headers: Optional[Dict[str, str]] = None,
         _custom_base: Any = None,
         **_ignored: Any,
     ) -> AppServerSessionClient:
@@ -282,6 +283,7 @@ class AppServerCodexClient(TokenEstimateMixin):
             env=env or None,
             env_remove=env_remove,
         )
+        resolved_mcp = self._resolve_mcp_servers(mcp_servers, forward_headers)
         try:
             await transport.start()
             thread_params = self._thread_params(
@@ -289,7 +291,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 cwd=cwd,
                 system_prompt=combine_system_prompt(_custom_base, system_prompt),
                 runtime_policy=runtime_policy,
-                mcp_servers=mcp_servers,
+                mcp_servers=resolved_mcp,
             )
             durable_thread_id = getattr(session, "codex_thread_id", None)
             if durable_thread_id:
@@ -324,7 +326,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 list(disallowed_tools) if disallowed_tools is not None else None
             ),
             model_params=dict(model_params) if model_params else None,
-            mcp_servers=dict(mcp_servers) if mcp_servers else None,
+            mcp_servers=dict(resolved_mcp) if resolved_mcp else None,
         )
 
     async def run_completion_with_client(
@@ -626,6 +628,23 @@ class AppServerCodexClient(TokenEstimateMixin):
         from src.constants import METADATA_ENV_ALLOWLIST
 
         return frozenset(METADATA_ENV_ALLOWLIST)
+
+    def _resolve_mcp_servers(
+        self,
+        mcp_servers: Optional[Dict[str, Any]],
+        forward_headers: Optional[Dict[str, str]],
+    ) -> Optional[Dict[str, Any]]:
+        """Resolve ``{{env:NAME}}`` templates and inject the gateway MCP context
+        header (identity + caller-owned credentials) into http/SSE server configs,
+        mirroring the claude backend. Codex forwards the full server set and
+        enforces per-tool policy at approval time."""
+        if not mcp_servers:
+            return None
+        from src.backends.mcp_headers import inject_mcp_headers
+        from src.mcp_config import resolve_mcp_servers
+
+        resolved = resolve_mcp_servers(mcp_servers) or mcp_servers
+        return inject_mcp_headers(resolved, forward_headers)
 
     def _thread_params(
         self,
