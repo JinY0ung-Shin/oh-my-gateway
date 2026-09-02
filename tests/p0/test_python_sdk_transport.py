@@ -82,6 +82,7 @@ def _await_call(result: queue.Queue[tuple[str, object]], timeout: float = 0.5):
         "openai/codex#41078: early turn/completed is dropped before "
         "turn registration"
     ),
+    raises=TimeoutError,
     strict=True,
 )
 def test_sdk_retains_terminal_notification_emitted_before_turn_start_response(tmp_path):
@@ -130,6 +131,7 @@ def test_sdk_retains_terminal_notification_emitted_before_turn_start_response(tm
         "openai/codex#40399: reads arriving after terminal transport failure "
         "can block forever"
     ),
+    raises=TimeoutError,
     strict=True,
 )
 def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
@@ -164,6 +166,7 @@ def test_sdk_subsequent_global_read_fails_after_transport_death(tmp_path):
         "B0 hazard: sync approval handler owns the sole reader, so child death "
         "is not observed until the human future returns"
     ),
+    raises=TimeoutError,
     strict=True,
 )
 def test_sdk_detects_runtime_death_while_approval_handler_is_parked(tmp_path):
