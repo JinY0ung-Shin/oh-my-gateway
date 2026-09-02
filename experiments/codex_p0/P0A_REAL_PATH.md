@@ -67,7 +67,7 @@ The default real-path corpus runs:
 3. **tool** — safe local `printf`, `command_execution` item required.
 4. **image** — runner generates a red PNG with stdlib; model must identify red without the prompt revealing the color.
 5. **long_turn** — safe local sleep + marker, exercises a sustained stream without writes/network tools.
-6. **cancel** — starts a long sleep command and sends SIGINT after a bounded delay. If the turn finishes before the signal, the case is `inconclusive`; if SIGINT itself wedges until hard-kill, it fails.
+6. **cancel** — starts a long sleep command and sends SIGINT after a bounded delay. If the turn finishes before the signal, the case is `inconclusive`; if SIGINT itself wedges until hard-kill, it fails. **Claim scope is `codex_client_cancel_terminalization`** (recorded in the case result as `claim` / `claim_scope`): a pass proves that the Codex process terminalizes non-successfully within the bound after SIGINT. It does **not** prove that the enterprise Responses gateway or model server stopped work it had already accepted; upstream cancellation / no-stray-work is an operational requirement that needs gateway- or model-server-side observation, not inference from the Codex exit code.
 7. **MCP** — deployment-specific and therefore only runs when both `--extra-config-toml` and `--mcp-prompt` are supplied. Without it, overall P0a-1 is `incomplete`, never `pass`.
 
 The tool/long-turn cases use read-only sandboxing and `approval_policy=never`; they do not intentionally modify files or access the network.

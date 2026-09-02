@@ -245,6 +245,11 @@ def evaluate_case(
 ) -> tuple[str, list[str]]:
     reasons: list[str] = []
     if name == "cancel":
+        # Claim scope: codex_client_cancel_terminalization. This proves only that
+        # the Codex process terminalizes non-successfully within a bound after
+        # SIGINT. It says nothing about whether the Responses gateway / model
+        # server stopped work it had already accepted; that needs gateway-side
+        # observation and is not inferred from the exit code here.
         if result.get("cancel_signal_sent") is not True:
             return "inconclusive", ["process completed before cancellation signal"]
         if result.get("timed_out"):
@@ -359,6 +364,15 @@ def run_case(
         "duration_s": round(duration, 6),
         "timed_out": timed_out,
         "cancel_signal_sent": cancel_signal_sent,
+        # What a passing cancel case does and does not certify; carried in the
+        # artifact so the number cannot be quoted as provider-side cancellation.
+        "claim": "codex_client_cancel_terminalization" if cancel_after_s is not None else None,
+        "claim_scope": (
+            "Codex process terminalizes non-successfully within the bound after SIGINT; "
+            "does NOT prove the Responses gateway / model server stopped already-accepted work"
+        )
+        if cancel_after_s is not None
+        else None,
         "invalid_jsonl_lines": len(invalid),
         "summary": summary,
         "artifacts": {
