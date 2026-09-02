@@ -44,7 +44,11 @@ from src.backends.appserver.interactions import (
     interaction_arguments,
 )
 from src.backends.appserver.isolation import ISOLATION_ENV_REMOVE, build_isolated_env
-from src.backends.appserver.policy import resolve_runtime_policy
+from src.backends.appserver.policy import (
+    resolve_runtime_policy,
+    should_auto_accept_approval,
+    should_auto_deny_approval,
+)
 from src.backends.appserver.transport import (
     AmbiguousRequest,
     AppServerTransport,
@@ -84,20 +88,6 @@ _MODEL_PARAM_KEYS = {
     "top_p": "topP",
     "max_output_tokens": "maxOutputTokens",
 }
-
-
-def _resolve_approval_policy(permission_mode: Optional[str]) -> str:
-    """Map a gateway permission mode onto a Codex approval policy.
-
-    PR A does not bridge approvals, so the safe default is the configured
-    policy (``never`` out of the box): no approval server-requests fire, so no
-    turn is interrupted by the fail-closed interaction handling below. A caller
-    that explicitly asks to be prompted (``permission_mode == "default"``) gets
-    ``on-request``; those prompts are then failed closed until PR B.
-    """
-    if permission_mode == "default":
-        return "on-request"
-    return approval_policy()
 
 
 def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -264,7 +254,9 @@ class AppServerCodexClient(TokenEstimateMixin):
         # rather than running with the denied capability silently available.
         runtime_policy = resolve_runtime_policy(
             default_sandbox=sandbox_mode(),
-            default_approval=_resolve_approval_policy(permission_mode),
+            default_approval=approval_policy(),
+            permission_mode=permission_mode,
+            allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
 
@@ -506,11 +498,13 @@ class AppServerCodexClient(TokenEstimateMixin):
                 continue
 
             if isinstance(item, PendingInteraction):
-                # Bridge the native server request into the existing
-                # AskUserQuestion / approval UX and PARK: set pending_tool_call,
-                # emit the codex_approval tool_use chunk the route recognizes,
-                # then stop yielding. The subscription is intentionally kept
-                # alive so the resume continues this same turn.
+                # Tool-policy enforcement (frozen parity, #6): auto-decide the
+                # approval BEFORE bridging to the user. A tool the policy does
+                # not permit is auto-denied; acceptEdits auto-accepts file
+                # changes. Only an interaction with no policy verdict is parked
+                # into the AskUserQuestion / approval UX.
+                if await self._auto_decide_interaction(client, item):
+                    continue
                 yield self._park_interaction(client, session, item)
                 return
 
@@ -554,6 +548,43 @@ class AppServerCodexClient(TokenEstimateMixin):
                 self._end_turn(client)
                 yield error_chunk("Codex event stream overflowed")
                 return
+
+    async def _auto_decide_interaction(
+        self, client: AppServerSessionClient, interaction: PendingInteraction
+    ) -> bool:
+        """Auto-answer an approval by tool policy (frozen parity, #6).
+
+        Returns True if the interaction was decided here (answered) and must NOT
+        be bridged to the user; False to bridge it. A tool the policy forbids is
+        auto-denied; ``acceptEdits`` auto-accepts file-change approvals.
+        """
+        method = interaction.method
+        params = interaction.params if isinstance(interaction.params, dict) else {}
+        deny = should_auto_deny_approval(
+            method,
+            params,
+            allowed_tools=client.allowed_tools,
+            disallowed_tools=client.disallowed_tools,
+        )
+        accept = (not deny) and should_auto_accept_approval(
+            method, permission_mode=client.permission_mode
+        )
+        if not deny and not accept:
+            return False
+        if method == "item/permissions/requestApproval":
+            result: Dict[str, Any] = {"permissions": {}, "scope": "turn"}
+        else:
+            result = {"decision": "accept" if accept else "decline"}
+        try:
+            await client.transport.answer(
+                interaction.id,
+                result,
+                generation=client.generation,
+                token=interaction.token,
+            )
+        except (StaleAnswer, RuntimeLost):
+            pass
+        return True
 
     def _park_interaction(
         self,
@@ -692,7 +723,11 @@ class AppServerCodexClient(TokenEstimateMixin):
         if system_prompt:
             params["developerInstructions"] = system_prompt
         if mcp_servers:
-            params["mcpServers"] = dict(mcp_servers)
+            # v2 ThreadStartParams exposes ``config`` (Record<string, JsonValue>),
+            # not a top-level ``mcpServers`` field (#174 review §5). Route MCP
+            # server configuration through config.mcp_servers so the app-server
+            # actually applies it, mirroring the CLI's mcp_servers.* config.
+            params["config"] = {"mcp_servers": dict(mcp_servers)}
         return params
 
     def _thread_id_from_result(self, result: Any) -> str:

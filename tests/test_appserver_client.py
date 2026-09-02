@@ -700,11 +700,13 @@ async def test_subagent_spawn_and_completion_stream_as_task_events(
                 {
                     "method": "item/completed",
                     "params": {
+                        "threadId": "thread-1",
                         "item": {
                             "type": "subAgentActivity",
-                            "threadId": "child-1",
-                            "state": "completed",
-                        }
+                            "id": "act-1",
+                            "kind": "completed",
+                            "agentThreadId": "child-1",
+                        },
                     },
                 }
             ),
@@ -801,3 +803,59 @@ async def test_runtime_loss_terminalizes_open_child_rows(
         c["task_id"] == "child-1" and c["status"] == "failed" for c in task_updates
     )
     assert chunks[-1]["type"] == "error"
+
+
+# -- tool-policy auto-deny at approval time (PR B/#6) ------------------------
+
+
+async def test_disallowed_tool_approval_is_auto_denied_not_parked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A command approval for a disallowed tool is auto-denied by policy before
+    it is ever bridged to the user (no requires_action park)."""
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),  # item/commandExecution/requestApproval
+        ],
+    }
+    # The auto-deny answer ({"id":"approval-1","result":{"decision":"decline"}})
+    # is the next stdin line; then the turn completes.
+    answer_step = {
+        "expect_id": "approval-1",
+        "expect_has_id": True,
+        "actions": [
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    # Disallow the command tool -> its approval must be auto-denied.
+    handle = await backend.create_client(session=session, disallowed_tools=["Bash"])
+    try:
+        # Approval policy was forced to on-request so the gate runs.
+        assert handle.approval_policy == "on-request"
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "run ls", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # No park happened: the turn ran to completion and no pending_tool_call is set.
+    assert getattr(session, "pending_tool_call", None) in (None, {})
+    assert chunks[-1]["type"] == "result"

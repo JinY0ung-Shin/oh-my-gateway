@@ -51,7 +51,7 @@ def test_empty_agent_message_delta_is_dropped():
 def test_reasoning_delta_opens_thinking_block_then_deltas():
     mapper = _mapper()
     first = _drain(
-        mapper, "item/reasoning/delta", {"turnId": "turn-1", "delta": "thinking..."}
+        mapper, "item/reasoning/textDelta", {"turnId": "turn-1", "delta": "thinking..."}
     )
     assert first[0]["event"]["type"] == "content_block_start"
     assert first[0]["event"]["content_block"] == {"type": "thinking"}
@@ -62,14 +62,14 @@ def test_reasoning_delta_opens_thinking_block_then_deltas():
 
     # A second reasoning delta does not reopen the block.
     second = _drain(
-        mapper, "item/reasoning/delta", {"turnId": "turn-1", "delta": " more"}
+        mapper, "item/reasoning/textDelta", {"turnId": "turn-1", "delta": " more"}
     )
     assert [c["event"]["type"] for c in second] == ["content_block_delta"]
 
 
 def test_reasoning_then_text_closes_the_thinking_block_first():
     mapper = _mapper()
-    _drain(mapper, "item/reasoning/delta", {"turnId": "turn-1", "delta": "hmm"})
+    _drain(mapper, "item/reasoning/textDelta", {"turnId": "turn-1", "delta": "hmm"})
     chunks = _drain(
         mapper, "item/agentMessage/delta", {"turnId": "turn-1", "delta": "answer"}
     )
@@ -203,8 +203,11 @@ def test_turn_completed_emits_completion_with_final_text_and_usage():
     assert result["usage"] == {"input_tokens": 10, "output_tokens": 5}
 
 
-def test_reasoning_tokens_roll_into_output_usage():
+def test_cached_input_is_not_double_counted_and_reasoning_rolls_into_output():
     mapper = _mapper()
+    # inputTokens already INCLUDES cachedInputTokens (cached is a subset), so the
+    # prompt total is inputTokens (10), not inputTokens + cached (#174 review §8).
+    # totalTokens cross-checks: 10 input + (3 output + 7 reasoning) = 20.
     _drain(
         mapper,
         "thread/tokenUsage/updated",
@@ -212,10 +215,11 @@ def test_reasoning_tokens_roll_into_output_usage():
             "turnId": "turn-1",
             "tokenUsage": {
                 "last": {
-                    "inputTokens": 4,
+                    "inputTokens": 10,
                     "cachedInputTokens": 6,
                     "outputTokens": 3,
                     "reasoningOutputTokens": 7,
+                    "totalTokens": 20,
                 }
             },
         },
@@ -223,7 +227,23 @@ def test_reasoning_tokens_roll_into_output_usage():
     chunks = _drain(
         mapper, "turn/completed", {"turn": {"id": "turn-1", "status": "completed"}}
     )
-    assert chunks[1]["usage"] == {"input_tokens": 10, "output_tokens": 10}
+    usage = chunks[1]["usage"]
+    assert usage == {"input_tokens": 10, "output_tokens": 10}
+    assert usage["input_tokens"] + usage["output_tokens"] == 20  # == totalTokens
+
+
+def test_reasoning_summary_delta_is_recognized():
+    mapper = _mapper()
+    chunks = _drain(
+        mapper,
+        "item/reasoning/summaryTextDelta",
+        {"turnId": "turn-1", "delta": "summary..."},
+    )
+    assert chunks[0]["event"]["type"] == "content_block_start"
+    assert chunks[1]["event"]["delta"] == {
+        "type": "thinking_delta",
+        "thinking": "summary...",
+    }
 
 
 def test_turn_failed_emits_error_chunk_and_is_not_success():

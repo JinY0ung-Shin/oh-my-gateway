@@ -49,22 +49,40 @@ def test_root_thread_start_is_not_a_subagent():
 def test_subagent_activity_item_states():
     started = normalize_subagent_event(
         "item/started",
-        {"item": {"type": "subAgentActivity", "threadId": "c1", "state": "started"}},
+        {
+            "threadId": "thread-1",
+            "item": {
+                "type": "subAgentActivity",
+                "id": "a1",
+                "kind": "started",
+                "agentThreadId": "c1",
+            },
+        },
     )
     assert started is not None and started.kind == "spawned"
     interacted = normalize_subagent_event(
         "item/updated",
-        {"item": {"type": "subAgentActivity", "threadId": "c1", "state": "interacted"}},
+        {
+            "threadId": "thread-1",
+            "item": {
+                "type": "subAgentActivity",
+                "id": "a2",
+                "kind": "interacted",
+                "agentThreadId": "c1",
+            },
+        },
     )
     assert interacted is not None and interacted.kind == "progress"
     interrupted = normalize_subagent_event(
         "item/completed",
         {
+            "threadId": "thread-1",
             "item": {
                 "type": "subAgentActivity",
-                "threadId": "c1",
-                "state": "interrupted",
-            }
+                "id": "a3",
+                "kind": "interrupted",
+                "agentThreadId": "c1",
+            },
         },
     )
     assert interrupted is not None and interrupted.kind == "terminal"
@@ -120,7 +138,15 @@ def test_child_completion_maps_to_task_notification():
     chunks = _drain(
         mapper,
         "item/completed",
-        {"item": {"type": "subAgentActivity", "threadId": "c1", "state": "completed"}},
+        {
+            "threadId": "thread-1",
+            "item": {
+                "type": "subAgentActivity",
+                "id": "a4",
+                "kind": "completed",
+                "agentThreadId": "c1",
+            },
+        },
     )
     assert chunks[0]["subtype"] == "task_notification"
     assert chunks[0]["status"] == "completed"
@@ -165,7 +191,15 @@ def test_completed_child_is_not_terminalized_again_at_turn_end():
     _drain(
         mapper,
         "item/completed",
-        {"item": {"type": "subAgentActivity", "threadId": "c1", "state": "completed"}},
+        {
+            "threadId": "thread-1",
+            "item": {
+                "type": "subAgentActivity",
+                "id": "a4",
+                "kind": "completed",
+                "agentThreadId": "c1",
+            },
+        },
     )
     chunks = _drain(
         mapper, "turn/completed", {"turn": {"id": "turn-1", "status": "completed"}}

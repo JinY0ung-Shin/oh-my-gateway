@@ -27,15 +27,10 @@ from typing import Any, Dict, Optional
 SPAWN_METHODS = {"thread/started", "thread/spawned", "thread/spawn"}
 # Item-carrying notifications that may hold subagent activity.
 ITEM_METHODS = {"item/started", "item/updated", "item/completed"}
-# Item types that denote subagent activity.
-SUBAGENT_ITEM_TYPES = {
-    "subAgentActivity",
-    "subagentActivity",
-    "subAgent",
-    "threadSpawn",
-}
+# The current Codex v2 SubAgentActivity item type.
+SUBAGENT_ITEM_TYPES = {"subAgentActivity"}
 
-# Terminal vs live activity states, mapped onto canonical task statuses.
+# SubAgentActivity.kind / thread-status -> canonical task status.
 _TERMINAL_STATES = {
     "completed": "completed",
     "succeeded": "completed",
@@ -96,36 +91,38 @@ def _from_thread(thread: Dict[str, Any]) -> Optional[SubAgentEvent]:
     )
 
 
-def _from_item(item: Dict[str, Any]) -> Optional[SubAgentEvent]:
+def _from_item(
+    item: Dict[str, Any], owner_thread_id: Optional[str]
+) -> Optional[SubAgentEvent]:
+    """Normalize a v2 ``SubAgentActivity`` item.
+
+    The item is ``{type:"subAgentActivity", id, kind, agentThreadId, agentPath}``
+    (#174 review §4): the CHILD identity is ``agentThreadId`` (the item's own
+    ``id`` is the activity id, not the child), lifecycle is ``kind``, and the
+    parent is the owning ``params.threadId`` — never a field invented on the item.
+    """
     if item.get("type") not in SUBAGENT_ITEM_TYPES:
         return None
-    child_id = _first_str(
-        item, "threadId", "childThreadId", "child_thread_id", "targetThreadId", "id"
-    )
+    child_id = _first_str(item, "agentThreadId", "agent_thread_id")
     if not child_id:
         return None
-    parent_id = _first_str(item, "parentThreadId", "parent_thread_id")
-    role = _first_str(item, "role", "nickname", "name")
-    description = _first_str(item, "description", "title")
-    raw_state = (
-        _first_str(item, "state", "status", "activity", "subAgentState") or ""
-    ).lower()
-    if raw_state in _TERMINAL_STATES:
+    parent_id = owner_thread_id
+    description = _first_str(item, "agentPath", "agent_path")
+    raw_kind = (_first_str(item, "kind") or "").lower()
+    if raw_kind in _TERMINAL_STATES:
         return SubAgentEvent(
             kind="terminal",
             child_id=child_id,
             parent_id=parent_id,
-            status=_TERMINAL_STATES[raw_state],
+            status=_TERMINAL_STATES[raw_kind],
             description=description,
-            role=role,
         )
-    if raw_state == "started":
+    if raw_kind == "started":
         return SubAgentEvent(
             kind="spawned",
             child_id=child_id,
             parent_id=parent_id,
             description=description,
-            role=role,
         )
     # interacted / running / unknown-but-live -> progress
     return SubAgentEvent(
@@ -133,7 +130,6 @@ def _from_item(item: Dict[str, Any]) -> Optional[SubAgentEvent]:
         child_id=child_id,
         parent_id=parent_id,
         description=description,
-        role=role,
     )
 
 
@@ -142,10 +138,11 @@ def normalize_subagent_event(
 ) -> Optional[SubAgentEvent]:
     """Return a normalized subagent event for a native notification, or None.
 
-    Recognizes both a dedicated spawn notification (``thread/started`` carrying a
-    thread with a ``parentThreadId``) and ``SubAgentActivity`` items. Any
-    notification that is not subagent-related returns ``None`` so the caller
-    falls through to normal turn handling.
+    Recognizes a dedicated spawn notification (``thread/started`` carrying a
+    thread with a ``parentThreadId``) and a ``subAgentActivity`` item (parent
+    correlated from ``params.threadId``). Any notification that is not
+    subagent-related returns ``None`` so the caller falls through to normal turn
+    handling.
     """
     if method in SPAWN_METHODS:
         thread = params.get("thread")
@@ -155,5 +152,8 @@ def normalize_subagent_event(
     if method in ITEM_METHODS:
         item = params.get("item")
         if isinstance(item, dict):
-            return _from_item(item)
+            owner_thread_id = params.get("threadId")
+            return _from_item(
+                item, owner_thread_id if isinstance(owner_thread_id, str) else None
+            )
     return None

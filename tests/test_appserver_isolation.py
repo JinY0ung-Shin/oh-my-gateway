@@ -25,7 +25,7 @@ from src.backends.appserver.isolation import (
     build_isolated_env,
     resolve_codex_home,
 )
-from src.backends.appserver.policy import CapabilityError, resolve_runtime_policy
+from src.backends.appserver.policy import resolve_runtime_policy
 from src.backends.appserver.transport import AppServerTransport
 
 PROBE = Path(__file__).parent / "fixtures" / "env_probe_app_server.py"
@@ -96,13 +96,8 @@ def test_denying_network_drops_to_read_only():
     assert policy["sandbox"] == "read-only"
 
 
-def test_denying_shell_is_fail_closed():
-    with pytest.raises(CapabilityError):
-        resolve_runtime_policy(
-            default_sandbox="workspace-write",
-            default_approval="never",
-            disallowed_tools=["Bash"],
-        )
+# Per-tool policy parity (shell/command/file/MCP auto-deny, block-all, forced
+# on-request) lives in tests/test_appserver_policy.py.
 
 
 # -- real process boundary: secrets stripped, per-user CODEX_HOME injected ---

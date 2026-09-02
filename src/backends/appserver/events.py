@@ -31,15 +31,14 @@ from src.backends.appserver.subagents import SubAgentEvent, normalize_subagent_e
 # either visible text (``agentMessage``), reasoning, or accumulation-only.
 TOOL_ITEM_TYPES = {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
 
-# Reasoning delta methods. The app-server may emit reasoning either as a visible
-# summary stream or as raw reasoning; both map to the canonical reasoning
-# (thinking) channel. Absent from a given build => no reasoning events, which is
-# the correct "do not fake" behavior.
+# Reasoning delta methods (current Codex v2 generated protocol). Raw reasoning
+# text and the reasoning summary both map to the canonical reasoning (thinking)
+# channel; the route emits reasoning_text.delta and reasoning_summary_text.delta
+# together for a thinking delta, so one mapping covers both. Absent from a build
+# => no reasoning events, which is the correct "do not fake" behavior.
 REASONING_DELTA_METHODS = {
-    "item/reasoning/delta",
-    "item/reasoningSummary/delta",
-    "item/agentReasoning/delta",
-    "item/agentReasoningSummary/delta",
+    "item/reasoning/textDelta",
+    "item/reasoning/summaryTextDelta",
 }
 
 # Wrapper stream_event helpers -------------------------------------------------
@@ -375,9 +374,10 @@ class TurnMapper:
         last = token_usage.get("last")
         if not isinstance(last, dict):
             return None
-        input_tokens = int(last.get("inputTokens") or 0) + int(
-            last.get("cachedInputTokens") or 0
-        )
+        # Codex TokenUsage treats cachedInputTokens as a SUBSET of inputTokens
+        # (non_cached = input - cached), so inputTokens is already the prompt
+        # total — adding cached would double-count it (#174 review §8).
+        input_tokens = int(last.get("inputTokens") or 0)
         # Reasoning tokens are billed as output so input + output == totalTokens.
         output_tokens = int(last.get("outputTokens") or 0) + int(
             last.get("reasoningOutputTokens") or 0
