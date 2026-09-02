@@ -46,6 +46,9 @@ nothing else:
   accepted is invalidated (``OWNER_CLOSED``) and writes nothing; one whose
   bytes were accepted settles before shutdown; ``close()`` awaits all of them
   (bounded) and reports unsettled interactions, not just pending ones
+- ``close()`` is the admission barrier: from its first call no new request,
+  notification, or answer is admitted (``RuntimeLost("closing")`` /
+  ``StaleAnswer``, zero bytes), and concurrent closers share one teardown
 
 Deliberately NOT here (supervisor policy, gated on #165's production-mount and
 budget evidence): session<->process placement, pooling or sharding, capacity,
@@ -361,6 +364,7 @@ class AppServerTransport:
         self._orphaned_requests: Dict[str, str] = {}  # request id -> method, caller gone after bytes began
         self._orphan_delivered: set[str] = set()  # ids whose orphan the reader already fanned out
         self._interaction_commits: set[asyncio.Task] = set()  # accepted answers not yet settled
+        self._close_task: Optional[asyncio.Task] = None
         self._committed_writes: set[asyncio.Task] = set()
         self._waiters: Dict[str, asyncio.Future] = {}
         self._waiter_methods: Dict[str, str] = {}
@@ -610,7 +614,10 @@ class AppServerTransport:
 
     @property
     def pending_waiters(self) -> int:
-        return len(self._waiters)
+        """Requests that have not yet been given a result or a terminal error.
+        A waiter already failed by terminalization but not yet unwound by its
+        (scheduled) caller task is settled, not pending."""
+        return sum(1 for future in self._waiters.values() if not future.done())
 
     def interaction(self, interaction_id: Any) -> Optional[PendingInteraction]:
         return self._interactions.get(interaction_id)
@@ -667,13 +674,22 @@ class AppServerTransport:
 
         try:
             await self._write(payload, before_write=_gate)
-        except RuntimeLost:
-            interaction.state = "invalidated"
-            interaction.invalidation_reason = RUNTIME_LOST
-            raise StaleAnswer(f"runtime lost before the response for {interaction.method} could be written")
+        except RuntimeLost as exc:
+            if interaction.state == "resolving":
+                # Not already retired by close()/terminalize: record why the
+                # accepted answer never reached the wire.
+                interaction.state = "invalidated"
+                interaction.invalidation_reason = OWNER_CLOSED if exc.reason == "closing" else RUNTIME_LOST
+            raise StaleAnswer(
+                f"runtime {exc.reason} before the response for {interaction.method} could be written"
+            )
         interaction.state = final_state
 
     def _fence(self, interaction_id: Any, generation: int) -> PendingInteraction:
+        if self._closing and self._terminal is None:
+            raise StaleAnswer(
+                f"owner close in progress; answer for {interaction_id!r} not admitted"
+            )
         interaction = self._interactions.get(interaction_id)
         if interaction is None:
             raise StaleAnswer(f"unknown interaction {interaction_id!r}")
@@ -693,17 +709,25 @@ class AppServerTransport:
     # -- teardown ------------------------------------------------------------
 
     async def close(self, *, grace_s: float = 2.0) -> Dict[str, Any]:
-        """Deterministic, idempotent teardown.
+        """Deterministic, idempotent teardown -- and the admission barrier.
 
-        stdin EOF -> SIGTERM (process group) -> SIGKILL (process group), each
-        bounded by ``grace_s``; then every waiter/interaction/subscriber is
-        terminalized (if the process had not already died) and the process
-        group is checked for running descendants. Returns the same report on
-        every call.
+        From the first call, no new request/notify/answer is admitted (see
+        ``_raise_if_lost`` / ``_fence``); pre-existing work is settled or
+        retired; then stdin EOF -> SIGTERM (process group) -> SIGKILL (process
+        group), each bounded by ``grace_s``; then every waiter/interaction/
+        subscriber is terminalized (if the process had not already died) and
+        the process group is checked for running descendants. Concurrent and
+        repeated callers share ONE transport-owned close task and receive the
+        same report; a cancelled closer does not abort the teardown.
         """
         if self._close_report is not None:
             return self._close_report
-        self._closing = True
+        if self._close_task is None:
+            self._closing = True  # admission barrier: set before the first await
+            self._close_task = asyncio.ensure_future(self._close_impl(grace_s))
+        return await asyncio.shield(self._close_task)
+
+    async def _close_impl(self, grace_s: float) -> Dict[str, Any]:
         proc = self._proc
         exit_code: Optional[int] = None
         # Policy for accepted answers at owner close (explicit, tested):
@@ -767,7 +791,7 @@ class AppServerTransport:
             "generation": self.generation,
             "exit_code": exit_code,
             "reason": self._terminal.reason if self._terminal else "closed",
-            "pending_waiters": len(self._waiters),
+            "pending_waiters": self.pending_waiters,
             # Counts unsettled interactions: awaiting an answer OR carrying an
             # accepted answer that never settled. Must be 0 after close().
             "pending_interactions": len(self.unsettled_interactions),
@@ -824,23 +848,37 @@ class AppServerTransport:
             holder_since = self._writer_since if self._writer_since is not None else now
             health_deadline = holder_since + self.write_timeout_s
             wait_until = health_deadline if deadline is None else min(health_deadline, deadline)
+            acquire = asyncio.ensure_future(self._write_lock.acquire())
+            waits: set = {acquire}
+            if self._terminal_waiter is not None and not self._terminal_waiter.done():
+                # Stop queueing the moment the generation ends.
+                waits.add(asyncio.shield(self._terminal_waiter))
             try:
-                await asyncio.wait_for(self._write_lock.acquire(), max(0.0, wait_until - now))
+                await asyncio.wait(
+                    waits, timeout=max(0.0, wait_until - now), return_when=asyncio.FIRST_COMPLETED
+                )
+            except BaseException:
+                # Caller cancelled while queued: nothing written, never keep the lock.
+                if await self._settle_acquire(acquire):
+                    self._write_lock.release()
+                raise
+            if await self._settle_acquire(acquire):
                 break
-            except asyncio.TimeoutError:
-                now = loop.time()
-                if deadline is not None and now >= deadline:
-                    raise asyncio.TimeoutError(
-                        "request deadline expired while queued for the writer; nothing was written"
-                    )
-                if self._writer_since is not None and now - self._writer_since >= self.write_timeout_s:
-                    self._terminalize(
-                        "write_timeout",
-                        exit_code=proc.returncode,
-                        detail=f"writer held the transport for {now - self._writer_since:.2f}s; runtime not consuming stdin",
-                    )
-                    self._raise_if_lost()
-                # The holder changed under us before either clock ran out: re-arm.
+            if self._terminal is not None:
+                self._raise_if_lost()
+            now = loop.time()
+            if deadline is not None and now >= deadline:
+                raise asyncio.TimeoutError(
+                    "request deadline expired while queued for the writer; nothing was written"
+                )
+            if self._writer_since is not None and now - self._writer_since >= self.write_timeout_s:
+                self._terminalize(
+                    "write_timeout",
+                    exit_code=proc.returncode,
+                    detail=f"writer held the transport for {now - self._writer_since:.2f}s; runtime not consuming stdin",
+                )
+                self._raise_if_lost()
+            # The holder changed under us before either clock ran out: re-arm.
 
         # --- own the writer: hand it to a transport-owned committed write --------
         # The gate and the first byte run INSIDE that task, in one synchronous
@@ -865,6 +903,21 @@ class AppServerTransport:
         self._committed_writes.add(committed)
         committed.add_done_callback(self._committed_writes.discard)
         await asyncio.shield(committed)
+
+    @staticmethod
+    async def _settle_acquire(acquire: "asyncio.Future[bool]") -> bool:
+        """Resolve an in-flight ``Lock.acquire()``; True iff the lock is now ours.
+
+        A cancel that lands after the lock was granted leaves the future
+        completed with True (asyncio.Lock hands an unfinished, cancelled
+        acquire on to the next waiter), so the answer is read from the future,
+        never assumed.
+        """
+        if not acquire.done():
+            acquire.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await acquire
+        return acquire.done() and not acquire.cancelled() and acquire.exception() is None
 
     async def _committed_write(
         self,
@@ -916,12 +969,28 @@ class AppServerTransport:
             self._write_lock.release()
 
     def _raise_if_lost(self) -> None:
+        """Admission fence for every outbound path.
+
+        Raises once the runtime is lost, and ALSO from the instant owner close
+        begins: ``close()`` is the linearization point after which no new
+        request, notification, or interaction answer is admitted -- it only
+        settles or retires work that existed before it. Bytes already accepted
+        by the runtime are never subject to this check (nothing calls it after
+        ``stdin.write``), so an in-flight committed write still drains.
+        """
         if self._terminal is not None:
             raise RuntimeLost(
                 self._terminal.reason,
                 generation=self.generation,
                 exit_code=self._terminal.exit_code,
                 detail=self._terminal.detail,
+            )
+        if self._closing:
+            raise RuntimeLost(
+                "closing",
+                generation=self.generation,
+                exit_code=self._proc.returncode if self._proc is not None else None,
+                detail="owner close in progress; no new work admitted",
             )
 
     # -- internals: the one reader -------------------------------------------

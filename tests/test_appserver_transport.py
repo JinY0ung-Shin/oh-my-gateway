@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import signal
 import sys
 from pathlib import Path
 
@@ -1446,3 +1447,113 @@ async def test_runtime_loss_retires_unsent_accepted_answer(tmp_path):
         await probe
     report = await transport.close()
     assert report["pending_interactions"] == 0 and report["unsettled_interaction_commits"] == 0
+
+
+# ---------------------------------------------------------------------------
+# close() is the admission barrier; concurrent closers share one teardown
+# ---------------------------------------------------------------------------
+
+
+async def test_close_admits_no_new_work_once_started(tmp_path):
+    """close() is blocked (bounded) behind an in-flight committed write, so it
+    has crossed its barrier but has not torn anything down. Work submitted in
+    that window must be rejected with zero bytes: answer(X) -> StaleAnswer,
+    request -> RuntimeLost("closing"). The adversary's catch-all step turns ANY
+    further line into exit 77; stdin EOF alone is exit 64."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.6}]},
+            {"expect_method": "turn/start", "actions": [TURN_START_RESPONSE]},
+            {"actions": [{"type": "exit", "code": 77}]},  # anything else that arrives
+        ],
+        write_timeout_s=10.0,
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    interaction = await _next_of(events, PendingInteraction)
+    big = asyncio.create_task(transport.request("turn/start", {"threadId": "thread-1", "blob": "x" * 4_000_000}))
+    await asyncio.sleep(0.1)
+    assert transport._write_lock.locked()  # committed write mid-drain: close will wait on it
+    closing = asyncio.create_task(transport.close(grace_s=1.0))
+    await asyncio.sleep(0.05)
+    assert transport._closing and not closing.done() and transport.terminal is None
+    # --- concurrent admissions while close is in progress ---
+    with pytest.raises(StaleAnswer):
+        await transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(RuntimeLost) as info:
+        await transport.request("probe")
+    assert info.value.reason == "closing"
+    assert asyncio.get_running_loop().time() - started < 0.5
+    with pytest.raises(RuntimeLost):
+        await transport.notify("noop")
+    with pytest.raises(RuntimeLost):
+        await transport.interrupt("thread-1", "turn-1")
+    assert interaction.state == "pending"  # never accepted; retired by terminalize below
+    report = await asyncio.wait_for(closing, HEALTHY_S)
+    assert report["pending_waiters"] == 0
+    assert report["pending_interactions"] == 0
+    assert report["unsettled_interaction_commits"] == 0
+    assert report["running_descendants"] == 0
+    assert report["exit_code"] == 64  # the adversary saw the big request, then EOF -- nothing else
+    assert interaction.state == "invalidated"
+    with pytest.raises(RuntimeLost):
+        await probe  # never answered by the adversary
+    # big's bytes were accepted before close: it settles -- with its response
+    # if the adversary answered before teardown, else with the terminal error.
+    try:
+        assert (await big)["turn"]["id"] == "turn-1"
+    except RuntimeLost:
+        pass
+    assert await transport.close() == report
+
+
+async def test_queued_request_admitted_before_close_is_retired_not_written(tmp_path):
+    """A request that was admitted before close() but whose bytes were never
+    accepted (queued behind the writer) is retired at close, not flushed."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "first"}]},
+            {"actions": [{"type": "exit", "code": 77}]},
+        ],
+    )
+    assert await transport.request("probe", timeout=HEALTHY_S) == "first"
+    await transport._write_lock.acquire()  # "A" holds the writer
+    transport._writer_since = asyncio.get_running_loop().time()
+    queued = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.05)
+    closing = asyncio.create_task(transport.close(grace_s=1.0))
+    await asyncio.sleep(0.05)
+    transport._writer_since = None
+    transport._write_lock.release()
+    report = await asyncio.wait_for(closing, HEALTHY_S)
+    with pytest.raises(RuntimeLost):
+        await queued
+    assert report["exit_code"] == 64  # the queued probe never reached the adversary
+    assert report["pending_waiters"] == 0
+
+
+async def test_concurrent_closers_share_one_teardown(tmp_path):
+    transport = await _transport(tmp_path, [{"expect_method": "probe", "actions": [{"type": "spawn", "seconds": 120}]}])
+    probe = asyncio.create_task(transport.request("probe"))
+    await asyncio.sleep(0.2)
+    signals: list = []
+    original = transport._signal_group
+
+    def counting(sig):
+        signals.append(sig)
+        original(sig)
+
+    transport._signal_group = counting  # type: ignore[method-assign]
+    reports = await asyncio.wait_for(
+        asyncio.gather(transport.close(grace_s=0.5), transport.close(grace_s=0.5), transport.close(grace_s=0.5)),
+        HEALTHY_S,
+    )
+    assert reports[0] is reports[1] is reports[2]
+    assert reports[0]["running_descendants"] == 0
+    # One teardown sequence ran: at most one SIGTERM and one SIGKILL to the group.
+    assert signals.count(signal.SIGTERM) <= 1 and signals.count(signal.SIGKILL) <= 1
+    with pytest.raises(RuntimeLost):
+        await probe
