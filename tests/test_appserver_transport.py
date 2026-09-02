@@ -22,6 +22,7 @@ from src.backends.appserver import (
     AppServerTransport,
     HandshakeError,
     Notification,
+    OrphanedResponse,
     PendingInteraction,
     RpcError,
     RuntimeLost,
@@ -1029,4 +1030,184 @@ async def test_contention_between_fast_writes_never_trips_health_bound(tmp_path)
         assert sorted(results) == list(range(n))
         assert transport.alive and transport.terminal is None
     finally:
+        await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# the WIRE is the boundary: serverRequest/resolved beats an answer that has
+# not begun reaching the process, and never unsends one that has
+# ---------------------------------------------------------------------------
+
+
+async def test_server_resolved_beats_resolving_answer_before_wire_commit(tmp_path):
+    """UI answer accepted locally (state=resolving) but queued behind the
+    writer with zero bytes written; upstream then retires the request. The
+    answer must be dropped, and the adversary must observe NO response for
+    approval-1 after the writer frees."""
+    transport = await _transport(
+        tmp_path,
+        [
+            {
+                "expect_method": "probe",
+                "actions": [APPROVAL_REQUEST, {"type": "sleep", "seconds": 0.5}, RESOLVED_APPROVAL],
+            },
+            # A stray response for approval-1 would land here and desync.
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "no-stray-write"}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        interaction = await _next_of(events, PendingInteraction)
+        await transport._write_lock.acquire()  # the writer is busy elsewhere
+        caller = asyncio.create_task(
+            transport.answer(interaction.id, {"decision": "accept"}, generation=transport.generation)
+        )
+        await asyncio.sleep(0.1)
+        assert interaction.state == "resolving"
+        assert not interaction.wire_committed
+        resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert resolved.method == "serverRequest/resolved"
+        # Upstream won while the answer was still queued.
+        assert interaction.state == "resolved"
+        assert interaction.invalidation_reason == SERVER_RESOLVED
+        transport._write_lock.release()
+        with pytest.raises(StaleAnswer):
+            await caller
+        assert not interaction.wire_committed
+        assert await transport.request("probe", timeout=HEALTHY_S) == "no-stray-write"
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+async def test_server_resolved_after_wire_commit_is_recorded_not_unsent(tmp_path):
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST]},
+            {"expect_id": "approval-1", "actions": [RESOLVED_APPROVAL]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "ok"}]},
+        ],
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        interaction = await _next_of(events, PendingInteraction)
+        await transport.answer(interaction.id, {"decision": "decline"}, generation=transport.generation)
+        assert interaction.state == "answered" and interaction.wire_committed
+        resolved = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert resolved.method == "serverRequest/resolved"
+        assert interaction.state == "answered"
+        assert interaction.resolved_after_commit
+        assert await transport.request("probe", timeout=HEALTHY_S) == "ok"
+    finally:
+        probe.cancel()
+        await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# cancellation phases: queued = local; after bytes began = transport-owned
+# ---------------------------------------------------------------------------
+
+
+async def test_request_cancelled_while_queued_for_writer_is_local(tmp_path):
+    transport = await _transport(
+        tmp_path, [{"expect_method": "probe", "actions": [{"type": "response", "result": "later"}]}]
+    )
+    try:
+        await transport._write_lock.acquire()
+        caller = asyncio.create_task(transport.request("probe"))
+        await asyncio.sleep(0.1)
+        caller.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await caller
+        transport._write_lock.release()
+        assert transport.alive
+        assert transport._orphaned_requests == {}
+        # Nothing was written: the adversary's first probe step is still unconsumed.
+        assert await transport.request("probe", timeout=HEALTHY_S) == "later"
+    finally:
+        await transport.close()
+
+
+async def test_request_cancelled_during_drain_completes_write_and_orphans_response(tmp_path):
+    """The child pauses reading so a 4 MB request blocks in drain(); the
+    caller is cancelled mid-drain. The writer must NOT be released early: the
+    transport finishes the write, the request really reaches the child, and
+    its response comes back as OrphanedResponse for the owner to reconcile."""
+    payload = "x" * 4_000_000
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [{"type": "sleep", "seconds": 0.6}, {"type": "response", "result": "warm"}]},
+            {"expect_method": "turn/start", "actions": [TURN_START_RESPONSE]},
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "after"}]},
+        ],
+        write_timeout_s=10.0,
+    )
+    events = transport.subscribe()
+    try:
+        warm = asyncio.create_task(transport.request("probe"))
+        await asyncio.sleep(0.1)  # child has read "warm" and is asleep
+        big = asyncio.create_task(transport.request("turn/start", {"threadId": "thread-1", "blob": payload}))
+        await asyncio.sleep(0.1)  # big owns the writer, blocked in drain()
+        assert transport._write_lock.locked()
+        big.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await big
+        # The writer is still held by the transport-owned committed write.
+        assert transport._write_lock.locked()
+        assert list(transport._orphaned_requests.values()) == ["turn/start"]
+        # A concurrent small request queues behind it rather than interleaving.
+        follow = asyncio.create_task(transport.request("probe"))
+        assert await asyncio.wait_for(warm, HEALTHY_S) == "warm"
+        orphan = await _next_of(events, OrphanedResponse)
+        assert orphan.method == "turn/start"
+        assert orphan.result["turn"]["id"] == "turn-1"
+        assert transport._orphaned_requests == {}
+        assert await asyncio.wait_for(follow, HEALTHY_S) == "after"
+        assert transport.alive and transport.terminal is None
+    finally:
+        await transport.close()
+
+
+# ---------------------------------------------------------------------------
+# hardening: a duplicate live server-request id fails closed
+# ---------------------------------------------------------------------------
+
+
+async def test_duplicate_live_server_request_id_fails_closed(tmp_path):
+    handled: list = []
+
+    async def handler(interaction: PendingInteraction):
+        handled.append(interaction.id)
+        await asyncio.sleep(3600)  # parked
+
+    transport = await _transport(
+        tmp_path,
+        [
+            {"expect_method": "probe", "actions": [APPROVAL_REQUEST, APPROVAL_REQUEST]},
+            # The duplicate must be answered with an ERROR; the original stays live.
+            {
+                "expect_id": "approval-1",
+                "expect_has_error": True,
+                "actions": [{"type": "message", "message": {"method": "probe/dup-rejected", "params": {}}}],
+            },
+            {"expect_method": "probe", "actions": [{"type": "response", "result": "alive"}]},
+        ],
+        interaction_handler=handler,
+    )
+    events = transport.subscribe()
+    probe = asyncio.create_task(transport.request("probe"))
+    try:
+        first = await _next_of(events, PendingInteraction)
+        ack = await _next_of(events, Notification, timeout=CONTROL_S)
+        assert ack.method == "probe/dup-rejected"
+        assert transport.interaction("approval-1") is first and first.open
+        assert handled == ["approval-1"]
+        assert transport.rejected_server_requests[-1]["reason"] == "duplicate_live_id"
+        assert await transport.request("probe", timeout=HEALTHY_S) == "alive"
+    finally:
+        probe.cancel()
         await transport.close()

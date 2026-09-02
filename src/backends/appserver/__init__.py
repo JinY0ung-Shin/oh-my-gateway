@@ -2,6 +2,7 @@
 
 from src.backends.appserver.transport import (
     JSONRPC_INTERNAL_ERROR,
+    JSONRPC_INVALID_REQUEST,
     JSONRPC_METHOD_NOT_FOUND,
     DEFAULT_SUPPORTED_SERVER_REQUESTS,
     RUNTIME_LOST,
@@ -11,6 +12,7 @@ from src.backends.appserver.transport import (
     AppServerTransport,
     HandshakeError,
     Notification,
+    OrphanedResponse,
     PendingInteraction,
     RpcError,
     RuntimeLost,
@@ -27,8 +29,10 @@ __all__ = [
     "DEFAULT_SUPPORTED_SERVER_REQUESTS",
     "HandshakeError",
     "JSONRPC_INTERNAL_ERROR",
+    "JSONRPC_INVALID_REQUEST",
     "JSONRPC_METHOD_NOT_FOUND",
     "Notification",
+    "OrphanedResponse",
     "PendingInteraction",
     "RUNTIME_LOST",
     "SERVER_REQUEST_RESOLVED",

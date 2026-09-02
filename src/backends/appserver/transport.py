@@ -30,7 +30,12 @@ nothing else:
 - transport-owned teardown on ANY unexpected loss: the process group is
   reaped (SIGTERM -> SIGKILL, bounded) without waiting for ``close()``
 - transport-owned, exactly-once commit of interaction answers: a cancelled
-  caller never leaves an interaction "answered" with nothing on the wire
+  caller never leaves an interaction "answered" with nothing on the wire, and
+  the WIRE is the boundary against ``serverRequest/resolved``: an answer that
+  has not begun reaching the process loses to it and writes nothing
+- a caller cancelled after its request's bytes began does not release the
+  writer mid-drain: the transport finishes the write and fans the eventual
+  response out as ``OrphanedResponse`` so the owner layer can reconcile
 - bounded subscribers: streaming deltas are droppable for a slow consumer,
   lossless items are not, and a consumer that falls too far behind on
   lossless items is disconnected instead of growing the process
@@ -83,6 +88,7 @@ SUPPORTED_SERVER_REQUESTS = DEFAULT_SUPPORTED_SERVER_REQUESTS  # backwards-compa
 SERVER_REQUEST_RESOLVED = "serverRequest/resolved"
 
 JSONRPC_METHOD_NOT_FOUND = -32601
+JSONRPC_INVALID_REQUEST = -32600
 JSONRPC_INTERNAL_ERROR = -32603
 
 RUNTIME_LOST = "RUNTIME_LOST"
@@ -191,10 +197,30 @@ class PendingInteraction:
     # accepted. Await it to learn the final state even if your own call was
     # cancelled.
     commit: Optional["asyncio.Future[None]"] = None
+    # True from the instant the response's bytes begin reaching the process.
+    # Before it, `serverRequest/resolved` still wins and the answer is dropped;
+    # after it, the answer stands and a late `resolved` is only recorded.
+    wire_committed: bool = False
+    resolved_after_commit: bool = False
 
     @property
     def open(self) -> bool:
         return self.state == "pending"
+
+
+@dataclass(frozen=True)
+class OrphanedResponse:
+    """A response to a request whose caller was cancelled AFTER its bytes had
+    begun reaching the process. The transport completed the write (a partial
+    line must never be left in the pipe), so the request was really sent; the
+    owner layer sees the outcome here and reconciles (e.g. interrupts a turn
+    it no longer wants)."""
+
+    request_id: str
+    method: str
+    result: Any
+    error: Any
+    generation: int
 
 
 @dataclass(frozen=True)
@@ -207,7 +233,7 @@ class SubscriberOverflow:
     generation: int
 
 
-SubscriberItem = Union[Notification, PendingInteraction, TerminalEvent, SubscriberOverflow]
+SubscriberItem = Union[Notification, PendingInteraction, TerminalEvent, SubscriberOverflow, OrphanedResponse]
 InteractionHandler = Callable[[PendingInteraction], Awaitable[Dict[str, Any]]]
 
 
@@ -316,6 +342,8 @@ class AppServerTransport:
         self._pgid: Optional[int] = None
         self._write_lock = asyncio.Lock()
         self._writer_since: Optional[float] = None  # when the current lock holder took the writer
+        self._orphaned_requests: Dict[str, str] = {}  # request id -> method, caller gone after bytes began
+        self._committed_writes: set[asyncio.Task] = set()
         self._waiters: Dict[str, asyncio.Future] = {}
         self._waiter_methods: Dict[str, str] = {}
         self._interactions: Dict[Any, PendingInteraction] = {}
@@ -431,6 +459,12 @@ class AppServerTransport:
         future: asyncio.Future = loop.create_future()
         self._waiters[request_id] = future
         self._waiter_methods[request_id] = method
+        committed = False
+
+        def _mark_committed() -> None:
+            nonlocal committed
+            committed = True
+
         try:
             # One absolute deadline covers the write AND the response: a live
             # runtime that stopped reading stdin cannot pin the caller before
@@ -438,9 +472,18 @@ class AppServerTransport:
             await self._write(
                 {"id": request_id, "method": method, "params": params or {}},
                 deadline=deadline,
+                on_committed=_mark_committed,
             )
             remaining = None if deadline is None else max(0.0, deadline - loop.time())
             return await asyncio.wait_for(future, remaining)
+        except asyncio.CancelledError:
+            if committed:
+                # The bytes began before the caller left: the transport finishes
+                # the write (see _write) and the request WAS sent. Own its
+                # outcome instead of dropping it -- the response is fanned out
+                # as OrphanedResponse so the owner layer can reconcile.
+                self._orphaned_requests[request_id] = method
+            raise
         finally:
             self._waiters.pop(request_id, None)
             self._waiter_methods.pop(request_id, None)
@@ -533,8 +576,19 @@ class AppServerTransport:
         await asyncio.shield(interaction.commit)
 
     async def _commit_task(self, interaction: PendingInteraction, payload: Dict[str, Any], final_state: str) -> None:
+        def _gate() -> None:
+            # Runs under the writer lock, immediately before the first byte.
+            # If upstream retired the interaction while this answer was queued,
+            # nothing may be written; the wire, not the scheduling, decides.
+            if interaction.state != "resolving":
+                raise StaleAnswer(
+                    f"interaction {interaction.id!r} was {interaction.state} "
+                    f"({interaction.invalidation_reason}) before its answer reached the wire"
+                )
+            interaction.wire_committed = True
+
         try:
-            await self._write(payload)
+            await self._write(payload, before_write=_gate)
         except RuntimeLost:
             interaction.state = "invalidated"
             interaction.invalidation_reason = RUNTIME_LOST
@@ -574,6 +628,10 @@ class AppServerTransport:
         self._closing = True
         proc = self._proc
         exit_code: Optional[int] = None
+        if self._committed_writes:
+            # A write that has begun finishes (or terminalizes) before teardown
+            # starts pulling the process out from under it.
+            await asyncio.gather(*self._committed_writes, return_exceptions=True)
         if self._reap_task is not None:
             # An unexpected loss already started transport-owned teardown; let
             # it finish rather than racing two signal sequences.
@@ -618,22 +676,38 @@ class AppServerTransport:
 
     # -- internals: writing ----------------------------------------------------
 
-    async def _write(self, payload: Dict[str, Any], *, deadline: Optional[float] = None) -> None:
-        """Bounded write with two separate clocks.
+    async def _write(
+        self,
+        payload: Dict[str, Any],
+        *,
+        deadline: Optional[float] = None,
+        before_write: Optional[Callable[[], None]] = None,
+        on_committed: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Bounded write with two clocks and two cancellation phases.
 
+        Clocks:
         - The **caller's** ``deadline`` expiring while this request is still
           queued for the writer is local: zero bytes of it were written, so it
-          raises ``asyncio.TimeoutError`` for this request only and the
-          transport stays alive. Being queued behind another, healthy write is
-          not evidence about the runtime.
+          raises ``asyncio.TimeoutError`` for this request only.
         - The **transport health** bound ``write_timeout_s`` is judged against
           the *current lock holder*: if the writer that owns the lock has held
           it that long, the runtime has stopped consuming stdin and the
-          generation is terminalized (``write_timeout``). Contention between
-          several fast writes never trips it.
-        - Once this request has written bytes, the caller's deadline expiring
-          during ``drain()`` leaves a partial, ambiguous line in the pipe, so
-          that too terminalizes the generation rather than being abandoned.
+          generation is terminalized (``write_timeout``).
+        - Once bytes are in flight, the caller's deadline expiring during
+          ``drain()`` leaves a partial, ambiguous line, so that too terminalizes.
+
+        Cancellation phases:
+        - Cancelled while **queued** (before ``before_write``): local and safe,
+          nothing written, the lock was never taken.
+        - Cancelled after the write has **begun**: the write is owned by a
+          transport task that finishes the drain and only then releases the
+          writer -- a partial line is never left in the pipe and another writer
+          never interleaves. ``on_committed`` tells the caller this phase was
+          reached so it can own the outcome (``request()`` registers the id as
+          orphaned and its response is fanned out as ``OrphanedResponse``).
+        ``before_write`` runs under the lock immediately before the first byte
+        and may raise to abort with nothing written.
         """
         proc = self._proc
         if proc is None or proc.stdin is None:
@@ -641,7 +715,7 @@ class AppServerTransport:
         loop = asyncio.get_running_loop()
         line = (json.dumps(payload, separators=(",", ":")) + "\n").encode("utf-8")
 
-        # --- acquire the writer -------------------------------------------
+        # --- acquire the writer (cancellable, nothing written yet) ------------
         while True:
             now = loop.time()
             holder_since = self._writer_since if self._writer_since is not None else now
@@ -665,18 +739,46 @@ class AppServerTransport:
                     self._raise_if_lost()
                 # The holder changed under us before either clock ran out: re-arm.
 
-        # --- own the writer -------------------------------------------------
+        # --- own the writer: gate, then a transport-owned committed write -------
         self._writer_since = loop.time()
         try:
             self._raise_if_lost()
-            drain_deadline = self._writer_since + self.write_timeout_s
-            if deadline is not None:
-                drain_deadline = min(drain_deadline, deadline)
+            if before_write is not None:
+                before_write()
+        except BaseException:
+            self._writer_since = None
+            self._write_lock.release()
+            raise
+        drain_deadline = self._writer_since + self.write_timeout_s
+        if deadline is not None:
+            drain_deadline = min(drain_deadline, deadline)
+        committed = asyncio.ensure_future(
+            self._committed_write(proc, line, drain_deadline, caller_deadline=deadline)
+        )
+        self._committed_writes.add(committed)
+        committed.add_done_callback(self._committed_writes.discard)
+        if on_committed is not None:
+            on_committed()
+        await asyncio.shield(committed)
+
+    async def _committed_write(
+        self,
+        proc: asyncio.subprocess.Process,
+        line: bytes,
+        drain_deadline: float,
+        *,
+        caller_deadline: Optional[float],
+    ) -> None:
+        """The part of a write that must finish once begun. Holds the writer
+        until the drain completes or the generation is terminalized; releases
+        it in every case."""
+        loop = asyncio.get_running_loop()
+        try:
             try:
-                proc.stdin.write(line)
-                await asyncio.wait_for(proc.stdin.drain(), max(0.0, drain_deadline - loop.time()))
+                proc.stdin.write(line)  # type: ignore[union-attr]
+                await asyncio.wait_for(proc.stdin.drain(), max(0.0, drain_deadline - loop.time()))  # type: ignore[union-attr]
             except asyncio.TimeoutError:
-                which = "caller deadline" if deadline is not None and drain_deadline == deadline else "write_timeout_s"
+                which = "caller deadline" if caller_deadline is not None and drain_deadline == caller_deadline else "write_timeout_s"
                 self._terminalize(
                     "write_timeout",
                     exit_code=proc.returncode,
@@ -766,8 +868,20 @@ class AppServerTransport:
         nothing; a handler still parked on it is cancelled."""
         request_id = params.get("requestId") if isinstance(params, dict) else None
         interaction = self._interactions.get(request_id)
-        if interaction is None or not interaction.open:
+        if interaction is None:
             return
+        if interaction.state == "resolving" and interaction.wire_committed:
+            # The answer's bytes have begun reaching the process; upstream
+            # retiring it afterwards is recorded, not allowed to unsend them.
+            interaction.resolved_after_commit = True
+            return
+        if interaction.state not in ("pending", "resolving"):
+            if interaction.state in ("answered", "failed"):
+                interaction.resolved_after_commit = True
+            return
+        # Pending, or resolving with nothing on the wire yet: upstream wins. The
+        # commit task's pre-write gate sees `resolved` under the writer lock and
+        # writes nothing.
         interaction.state = "resolved"
         interaction.invalidation_reason = SERVER_RESOLVED
         task = self._interaction_tasks.pop(request_id, None)
@@ -778,6 +892,18 @@ class AppServerTransport:
         request_id = message.get("id")
         future = self._waiters.get(str(request_id))
         if future is None or future.done():
+            method = self._orphaned_requests.pop(str(request_id), None)
+            if method is not None:
+                self._fanout(
+                    OrphanedResponse(
+                        request_id=str(request_id),
+                        method=method,
+                        result=message.get("result"),
+                        error=message.get("error"),
+                        generation=self.generation,
+                    )
+                )
+                return
             logger.debug("app-server response for unknown/finished request %r", request_id)
             return
         if "error" in message:
@@ -786,6 +912,27 @@ class AppServerTransport:
             future.set_result(message.get("result"))
 
     def _on_server_request(self, request_id: Any, method: str, params: Any) -> None:
+        live = self._interactions.get(request_id)
+        if live is not None and live.state in ("pending", "resolving"):
+            # A JSON-RPC peer must not reuse a live id. Never replace the
+            # existing interaction (an old handler could then resolve the new
+            # one under the same key): answer the newcomer with an error.
+            self.rejected_server_requests.append(
+                {"id": request_id, "method": method, "reason": "duplicate_live_id"}
+            )
+            logger.warning("rejecting server request with live duplicate id %r (%s)", request_id, method)
+            self._spawn_handler_task(
+                self._write(
+                    {
+                        "id": request_id,
+                        "error": {
+                            "code": JSONRPC_INVALID_REQUEST,
+                            "message": f"duplicate live server request id {request_id!r}",
+                        },
+                    }
+                )
+            )
+            return
         if method not in self.supported_server_requests:
             # Fail closed: answer with a protocol error right away, record it,
             # and keep reading. Never a permissive result, never an interaction.
