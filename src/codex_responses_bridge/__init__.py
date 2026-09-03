@@ -8,8 +8,10 @@ contract (an unrepresentable capability is refused, never silently degraded).
 This is distinct from ``src/routes/responses.py`` (the client-facing ChatDRAGON
 ``/v1/responses`` endpoint) and does not share its state.
 
-PR-1 lands the request half (Responses request -> chat request); the response +
-streaming halves and real-runtime certification are separate checkpoint-2 work.
+PR-1 landed the request half (Responses request -> chat request); PR-2 lands the
+response half (chat response/stream -> Responses object/events). The
+``previous_response_id`` conversation store, the live HTTP route, and real-runtime
+certification remain separate checkpoint-2 work.
 """
 
 from __future__ import annotations
@@ -17,10 +19,14 @@ from __future__ import annotations
 from .errors import BridgeCapabilityError
 from .reasoning_effort import clamp_reasoning_effort
 from .request import namespace_map_from_tools, responses_request_to_chat_body
+from .response import chat_response_to_responses_body
+from .stream import chat_stream_to_responses_events
 
 __all__ = [
     "BridgeCapabilityError",
     "clamp_reasoning_effort",
     "namespace_map_from_tools",
     "responses_request_to_chat_body",
+    "chat_response_to_responses_body",
+    "chat_stream_to_responses_events",
 ]
