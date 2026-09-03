@@ -31,12 +31,17 @@ from .system_norm import normalize_system_messages
 
 def _map_role(role: Any) -> str:
     # chat endpoints accept system/user/assistant/tool; map the Responses-only
-    # ``developer`` role to ``system`` for broad compatibility.
+    # ``developer`` role to ``system``. An UNKNOWN/privileged role must NOT be
+    # reinterpreted as user input (that could silently downgrade a privileged
+    # instruction to user text, or hide a new semantic role) -- fail closed.
     if role == "developer":
         return "system"
     if role in ("user", "assistant", "system", "tool"):
         return role
-    return "user"
+    raise BridgeCapabilityError(
+        f"unsupported message role {role!r}; refusing rather than reinterpreting "
+        "it as user input"
+    )
 
 
 def _content_to_chat(content: Any, role: str) -> Any:
@@ -51,14 +56,22 @@ def _content_to_chat(content: Any, role: str) -> Any:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
-        return ""
+        # A non-list, non-string content value (a number, a dict, ...) has no
+        # representable shape; refuse rather than collapse it to "" and lose it.
+        raise BridgeCapabilityError(
+            f"unsupported message content shape {type(content).__name__}; "
+            "refusing rather than dropping it"
+        )
 
     text_parts: list[str] = []
     multimodal: list[dict] = []
     has_image = False
     for part in content:
         if not isinstance(part, dict):
-            continue
+            raise BridgeCapabilityError(
+                "unsupported non-object content part; refusing rather than "
+                "dropping it"
+            )
         ptype = part.get("type")
         if ptype in ("input_text", "output_text", "text"):
             t = part.get("text")
@@ -92,6 +105,13 @@ def _content_to_chat(content: Any, role: str) -> Any:
             t = part.get("refusal")
             if isinstance(t, str):
                 text_parts.append(t)
+        else:
+            # An unknown content-part type (a new/privileged part upstream may
+            # add) must not silently disappear -- refuse rather than degrade.
+            raise BridgeCapabilityError(
+                f"unsupported content part type {ptype!r}; refusing rather than "
+                "dropping it"
+            )
 
     if has_image:
         return multimodal
@@ -370,12 +390,24 @@ def _tool_choice_to_chat(tc: Any) -> Any:
 
 
 def _text_format_to_response_format(text: Any) -> Optional[dict]:
+    """Translate ``text.format`` to a chat ``response_format``, or ``None``.
+
+    Fail closed: only an ABSENT format or the explicit default ``type:"text"``
+    is omitted. A present-but-unrepresentable ``text.format`` raises rather than
+    being dropped, which would turn a constrained (structured-output) request
+    into an unconstrained completion.
+    """
     if not isinstance(text, dict):
         return None
     fmt = text.get("format")
-    if not isinstance(fmt, dict):
+    if fmt is None:
         return None
+    if not isinstance(fmt, dict):
+        raise BridgeCapabilityError("text.format must be an object")
     ftype = fmt.get("type")
+    if ftype == "text":
+        # The explicit default carries no constraint -> omit response_format.
+        return None
     if ftype == "json_object":
         return {"type": "json_object"}
     if ftype == "json_schema":
@@ -385,8 +417,10 @@ def _text_format_to_response_format(text: Any) -> Optional[dict]:
         if "strict" in fmt:
             schema["strict"] = fmt.get("strict")
         return {"type": "json_schema", "json_schema": schema}
-    # "text" (the default) -> omit response_format entirely.
-    return None
+    raise BridgeCapabilityError(
+        f"unsupported text.format type {ftype!r}; refusing rather than dropping "
+        "the structured-output constraint"
+    )
 
 
 def responses_request_to_chat_body(

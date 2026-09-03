@@ -505,6 +505,74 @@ def test_namespace_map_refuses_collision_consistently():
         namespace_map_from_tools(tools)
 
 
+# -- role / content semantics fail closed -----------------------------------
+
+
+def test_unknown_role_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "message", "role": "root", "content": "x"}]}
+        )
+
+
+def test_unknown_content_part_type_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_file", "file_id": "f"}],
+                    }
+                ]
+            }
+        )
+
+
+def test_non_object_content_part_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "message", "role": "user", "content": ["bare string"]}]}
+        )
+
+
+def test_non_list_non_string_content_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "message", "role": "user", "content": 123}]}
+        )
+
+
+# -- structured-output constraint fails closed ------------------------------
+
+
+def test_unsupported_text_format_type_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "text": {"format": {"type": "grammar", "grammar": "..."}}}
+        )
+
+
+def test_text_format_type_text_is_omitted():
+    out = responses_request_to_chat_body(
+        {"input": "x", "text": {"format": {"type": "text"}}}
+    )
+    assert "response_format" not in out
+
+
+def test_text_format_json_object_is_kept():
+    out = responses_request_to_chat_body(
+        {"input": "x", "text": {"format": {"type": "json_object"}}}
+    )
+    assert out["response_format"] == {"type": "json_object"}
+
+
+def test_absent_text_format_omits_response_format():
+    out = responses_request_to_chat_body({"input": "x", "text": {"verbosity": "low"}})
+    assert "response_format" not in out
+
+
 # -- reasoning effort --------------------------------------------------------
 
 
