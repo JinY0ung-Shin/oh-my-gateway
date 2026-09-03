@@ -36,6 +36,14 @@ def main() -> int:
                         "codex_home": os.environ.get("CODEX_HOME"),
                         "has_anthropic_token": "ANTHROPIC_AUTH_TOKEN" in os.environ,
                         "marker_present": "OMG_ISOLATION_MARKER" in os.environ,
+                        # A non-allowlisted, non-denylisted gateway var: present
+                        # under the inheriting (denylist) mode, absent under the
+                        # non-inheriting (allowlist) mode.
+                        "probe_secret_present": "OMG_PROBE_SECRET" in os.environ,
+                        # An allowlisted runtime essential: must survive the
+                        # allowlist so the child can actually run.
+                        "has_path": "PATH" in os.environ,
+                        "env_key_count": len(os.environ),
                     },
                 }
             )

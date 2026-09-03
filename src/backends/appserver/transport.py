@@ -446,6 +446,7 @@ class AppServerTransport:
         cwd: Optional[Union[str, Path]] = None,
         env: Optional[Mapping[str, str]] = None,
         env_remove: Optional[Iterable[str]] = None,
+        env_allowlist: Optional[Iterable[str]] = None,
         interaction_handler: Optional[InteractionHandler] = None,
         client_info: Optional[Dict[str, Any]] = None,
         capabilities: Optional[Dict[str, Any]] = None,
@@ -471,12 +472,23 @@ class AppServerTransport:
         self._reaped: Optional[asyncio.Future] = None
         self.cwd = str(cwd) if cwd is not None else None
         self.env = dict(env) if env is not None else None
-        # Keys removed from the child's environment AFTER the os.environ merge.
+        # Keys removed from the child's environment AFTER the base env is built.
         # An override cannot unset an inherited var, so isolation (e.g. keeping a
         # sibling backend's auth token out of a Codex subprocess) needs an
-        # explicit removal step -- see start().
+        # explicit removal step -- see start(). Applied in BOTH env modes as a
+        # hard defense-in-depth "never", even over the allowlist.
         self.env_remove = (
             frozenset(env_remove) if env_remove is not None else frozenset()
+        )
+        # When set, the child does NOT inherit the parent environment: it starts
+        # from ONLY these allowlisted names (pulled from ``os.environ``) plus the
+        # explicit ``env`` overrides. This is the default-deny posture for a
+        # model-controlled child so unrelated gateway/cloud/DB/signing secrets
+        # never reach it -- preferred over growing ``env_remove`` (#173 §6). When
+        # ``None`` (default) the child inherits ``os.environ`` minus ``env_remove``
+        # (the topology-agnostic default; other callers keep their behavior).
+        self.env_allowlist = (
+            frozenset(env_allowlist) if env_allowlist is not None else None
         )
         self.client_info = client_info or dict(DEFAULT_CLIENT_INFO)
         self.capabilities = capabilities or dict(DEFAULT_CAPABILITIES)
@@ -532,7 +544,17 @@ class AppServerTransport:
         self._terminal_waiter = loop.create_future()
         self._reaped = loop.create_future()
         self._stdout_eof = asyncio.Event()
-        proc_env = os.environ.copy()
+        if self.env_allowlist is not None:
+            # Non-inheriting: the child starts from ONLY the allowlisted names,
+            # so unrelated parent env (gateway/cloud/DB/signing secrets) never
+            # reaches a model-controlled child.
+            proc_env = {
+                name: os.environ[name]
+                for name in self.env_allowlist
+                if name in os.environ
+            }
+        else:
+            proc_env = os.environ.copy()
         if self.env:
             proc_env.update(self.env)
         for key in self.env_remove:

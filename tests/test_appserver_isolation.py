@@ -13,6 +13,7 @@ These tests instead prove the *enforceable in-code* boundary:
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -23,6 +24,7 @@ from src.backends.appserver.client import AppServerCodexClient
 from src.backends.appserver.isolation import (
     ISOLATION_ENV_REMOVE,
     build_isolated_env,
+    child_env_allowlist,
     resolve_codex_home,
 )
 from src.backends.appserver.policy import resolve_runtime_policy
@@ -103,11 +105,18 @@ def test_denying_network_drops_to_read_only():
 # -- real process boundary: secrets stripped, per-user CODEX_HOME injected ---
 
 
-async def _probe_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
+async def _probe_env(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    env_allowlist=None,
+) -> dict:
     monkeypatch.setenv("CODEX_HOME_BASE", str(tmp_path / "homes"))
-    # A sibling-backend secret and a marker are present in the gateway env.
+    # A sibling-backend secret, a marker, and an arbitrary non-denylisted var
+    # are present in the gateway env.
     monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "super-secret")
     monkeypatch.setenv("OMG_ISOLATION_MARKER", "leak-me")
+    monkeypatch.setenv("OMG_PROBE_SECRET", "unrelated-gateway-secret")
 
     env = build_isolated_env(
         auth_env={},
@@ -120,6 +129,7 @@ async def _probe_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict:
         [sys.executable, str(PROBE)],
         env=env,
         env_remove=ISOLATION_ENV_REMOVE | {"OMG_ISOLATION_MARKER"},
+        env_allowlist=env_allowlist,
     )
     await transport.start(initialize=False)
     try:
@@ -138,6 +148,97 @@ async def test_child_env_strips_secrets_and_injects_runtime_home(
     assert result["marker_present"] is False
     # The per-user CODEX_HOME reached the child.
     assert result["codex_home"] == str(resolve_codex_home("alice", "s1"))
+    # Under the inheriting (denylist) mode, an UNRELATED gateway var still leaks:
+    # this is exactly why the adapter uses the non-inheriting allowlist below.
+    assert result["probe_secret_present"] is True
+
+
+async def test_child_env_allowlist_blocks_unlisted_gateway_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Real process boundary: with the non-inheriting allowlist, an arbitrary
+    gateway secret that is neither allowlisted nor denylisted does NOT reach the
+    child, while an allowlisted runtime essential and the injected CODEX_HOME
+    do (#173 §6, child-environment allowlist)."""
+    result = await _probe_env(
+        tmp_path, monkeypatch, env_allowlist=child_env_allowlist()
+    )
+    # The unrelated gateway secret was dropped by default-deny (not inherited).
+    assert result["probe_secret_present"] is False
+    assert result["has_anthropic_token"] is False
+    assert result["marker_present"] is False
+    # An allowlisted essential survived so the child can actually run...
+    assert result["has_path"] is True
+    # ...and the injected per-user override reached the child.
+    assert result["codex_home"] == str(resolve_codex_home("alice", "s1"))
+    # A non-inheriting child carries far fewer vars than the full gateway env.
+    assert result["env_key_count"] < len(os.environ)
+
+
+def test_child_env_allowlist_extends_from_operator_env(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.delenv("CODEX_ENV_ALLOWLIST", raising=False)
+    base = child_env_allowlist()
+    assert "PATH" in base and "OMG_EXTRA_ONE" not in base
+    monkeypatch.setenv("CODEX_ENV_ALLOWLIST", "OMG_EXTRA_ONE, OMG_EXTRA_TWO")
+    extended = child_env_allowlist()
+    assert {"OMG_EXTRA_ONE", "OMG_EXTRA_TWO"} <= extended
+    assert "PATH" in extended  # base essentials are preserved
+
+
+async def test_create_client_uses_non_inheriting_env_allowlist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The adapter wires the non-inheriting allowlist into every spawned child."""
+    from types import SimpleNamespace
+    import json
+
+    monkeypatch.setenv("CODEX_HOME_BASE", str(tmp_path / "homes"))
+    steps = [
+        {
+            "expect_method": "initialize",
+            "actions": [{"type": "response", "result": {}}],
+        },
+        {"expect_method": "initialized", "actions": []},
+        {
+            "expect_method": "thread/start",
+            "actions": [{"type": "response", "result": {"thread": {"id": "t"}}}],
+        },
+    ]
+    scenario = tmp_path / "s.json"
+    scenario.write_text(json.dumps({"steps": steps, "linger": True}), encoding="utf-8")
+    monkeypatch.setattr(
+        adapter_client,
+        "app_server_argv",
+        lambda: [
+            sys.executable,
+            str(PROBE.parent / "fake_app_server.py"),
+            str(scenario),
+        ],
+    )
+
+    captured = {}
+    real_transport = adapter_client.AppServerTransport
+
+    def _spy(argv, **kwargs):
+        captured["env_allowlist"] = kwargs.get("env_allowlist")
+        return real_transport(argv, **kwargs)
+
+    monkeypatch.setattr(adapter_client, "AppServerTransport", _spy)
+
+    backend = AppServerCodexClient()
+    handle = await backend.create_client(
+        session=SimpleNamespace(user="alice", session_id="s1")
+    )
+    try:
+        allowlist = captured["env_allowlist"]
+        # A non-empty allowlist including the base essentials was passed, i.e.
+        # the child is spawned non-inheriting rather than denylist-inheriting.
+        assert allowlist is not None
+        assert "PATH" in allowlist and "HOME" in allowlist
+    finally:
+        await handle.disconnect()
 
 
 # -- two users never share Codex state / workspace --------------------------

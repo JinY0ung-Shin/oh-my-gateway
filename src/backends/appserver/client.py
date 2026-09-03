@@ -44,7 +44,11 @@ from src.backends.appserver.interactions import (
     answer_result_from_output,
     interaction_arguments,
 )
-from src.backends.appserver.isolation import ISOLATION_ENV_REMOVE, build_isolated_env
+from src.backends.appserver.isolation import (
+    ISOLATION_ENV_REMOVE,
+    build_isolated_env,
+    child_env_allowlist,
+)
 from src.backends.appserver.policy import (
     CapabilityError,
     resolve_runtime_policy,
@@ -372,8 +376,10 @@ class AppServerCodexClient(TokenEstimateMixin):
             )
 
         # Per-user isolation (issue §6): a dedicated process (C0), a per-user
-        # workspace (cwd), a per-user CODEX_HOME, and sibling-backend secrets
-        # stripped from the child environment.
+        # workspace (cwd), a per-user CODEX_HOME, and a NON-INHERITING child
+        # environment -- the child starts from an explicit allowlist plus the
+        # injected per-user overrides, so unrelated gateway secrets never reach
+        # a model-controlled child (env_remove stays as defense-in-depth).
         env = build_isolated_env(
             auth_env=self._auth_provider.build_env(),
             extra_env=extra_env,
@@ -390,6 +396,7 @@ class AppServerCodexClient(TokenEstimateMixin):
             cwd=cwd,
             env=env or None,
             env_remove=env_remove,
+            env_allowlist=child_env_allowlist(),
         )
         try:
             await transport.start()

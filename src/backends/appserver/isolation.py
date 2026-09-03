@@ -24,17 +24,82 @@ from __future__ import annotations
 import os
 import re
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, FrozenSet, Optional
+
+from src.backends.common import parse_csv
 
 # Secrets that belong to sibling backends (or the gateway itself) and must never
 # be readable by a Codex subprocess/model. Removed from the child environment
-# after the os.environ merge (an override cannot unset an inherited var).
+# as a hard defense-in-depth "never" in BOTH env modes (an override cannot unset
+# an inherited var). With the allowlist below these names are already excluded;
+# the removal keeps them out even if an operator allowlists one by mistake.
 ISOLATION_ENV_REMOVE = frozenset(
     {
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_API_KEY",
     }
 )
+
+# Default-deny child environment (#173 §6): the Codex child inherits NOTHING
+# from the gateway process except these allowlisted names (plus the explicit
+# per-user overrides the adapter injects -- CODEX_HOME, auth, allowlisted
+# metadata). This is preferred over a growing secret denylist: an unrelated
+# gateway/cloud/DB/signing var never reaches a model-controlled child unless it
+# is named here. Only OS/runtime essentials belong in the base set; anything a
+# specific deployment additionally needs is added via ``CODEX_ENV_ALLOWLIST``.
+_BASE_ENV_ALLOWLIST = frozenset(
+    {
+        # POSIX runtime essentials.
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "LANGUAGE",
+        "LC_ALL",
+        "LC_CTYPE",
+        "LC_MESSAGES",
+        "TERM",
+        "TZ",
+        "TMPDIR",
+        # Windows runtime essentials (harmless/absent on POSIX; os.environ is
+        # case-insensitive on Windows so casing here does not matter).
+        "SystemRoot",
+        "SystemDrive",
+        "windir",
+        "COMSPEC",
+        "PATHEXT",
+        "TEMP",
+        "TMP",
+        "USERPROFILE",
+        "HOMEDRIVE",
+        "HOMEPATH",
+        "APPDATA",
+        "LOCALAPPDATA",
+        "PROGRAMDATA",
+        "PROGRAMFILES",
+        "PROGRAMFILES(X86)",
+        "NUMBER_OF_PROCESSORS",
+        "PROCESSOR_ARCHITECTURE",
+    }
+)
+
+
+def child_env_allowlist() -> FrozenSet[str]:
+    """Env-var names the Codex child may inherit from the gateway process.
+
+    The base set (OS/runtime essentials) plus any deployment-specific names in
+    the ``CODEX_ENV_ALLOWLIST`` env var (comma-separated). Everything else is
+    dropped by the transport's non-inheriting env mode; the adapter's own
+    injected overrides (CODEX_HOME, auth, metadata) are applied on top and are
+    not subject to the allowlist.
+    """
+    extra = parse_csv(os.getenv("CODEX_ENV_ALLOWLIST", ""))
+    if not extra:
+        return _BASE_ENV_ALLOWLIST
+    return _BASE_ENV_ALLOWLIST | frozenset(extra)
+
 
 _SAFE_SEGMENT = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 
