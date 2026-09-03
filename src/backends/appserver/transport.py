@@ -200,6 +200,31 @@ class RequestOutcomeUnknown(RuntimeLost):
         self.terminal_reason = terminal_reason
 
 
+class CommittedRequestCancelled(asyncio.CancelledError):
+    """A committed request's caller was cancelled after the bytes crossed the wire.
+
+    Raised in place of a plain ``CancelledError`` whenever the request's bytes
+    were accepted before the caller was cancelled -- INCLUDING the
+    response-beats-cancellation race, where the transport has already fanned the
+    ``OrphanedResponse`` and no unresolved-orphan registry entry remains. The
+    owner layer keys ownership transfer on THIS type (atomic, explicit), never on
+    the current unresolved-orphan registry (which answers a different question:
+    "is an outcome still pending?"). A plain ``CancelledError`` is known-not-sent.
+
+    It subclasses ``asyncio.CancelledError`` so asyncio still treats the task as
+    cancelled and the cancellation still propagates.
+    """
+
+    def __init__(self, *, request_id: str, method: str, generation: int):
+        super().__init__(
+            f"committed request cancelled ({method}; id={request_id}; "
+            f"generation={generation})"
+        )
+        self.request_id = request_id
+        self.method = method
+        self.generation = generation
+
+
 class RpcError(TransportError):
     """The process answered a request with a JSON-RPC error object."""
 
@@ -654,15 +679,34 @@ class AppServerTransport:
                     detail=exc.detail,
                 ) from exc
             raise
-        except (asyncio.CancelledError, asyncio.TimeoutError):
+        except asyncio.TimeoutError:
             if committed and not orphaned_inline:
-                # The bytes were accepted before the caller left (cancelled, or
-                # its response deadline expired after a clean send): the request
-                # WAS sent, so the transport owns its outcome. Ownership moves
-                # from the waiter to the orphan registry atomically -- a
-                # response that already landed on the waiter becomes an
-                # OrphanedResponse right now; a later one is routed there.
+                # The bytes were accepted before the response deadline expired
+                # after a clean send: the request WAS sent, so the transport owns
+                # its outcome. Ownership moves from the waiter to the orphan
+                # registry atomically -- a response that already landed on the
+                # waiter becomes an OrphanedResponse right now; a later one is
+                # routed there.
                 self._orphan(request_id, method, future)
+            raise
+        except asyncio.CancelledError as exc:
+            if committed and not orphaned_inline:
+                # Bytes accepted before the caller was cancelled: transfer
+                # ownership to the orphan registry (a later response/terminal is
+                # routed there).
+                self._orphan(request_id, method, future)
+            if committed:
+                # EVERY committed cancellation is surfaced to the owner as a
+                # CommittedRequestCancelled -- including the response-beats-
+                # cancellation inline case, where the OrphanedResponse was already
+                # fanned out and no unresolved-orphan registry entry remains. The
+                # owner must transfer ownership atomically on THIS type, never by
+                # inspecting the (possibly-empty) unresolved-orphan registry.
+                raise CommittedRequestCancelled(
+                    request_id=request_id,
+                    method=method,
+                    generation=self.generation,
+                ) from exc
             raise
         finally:
             self._waiters.pop(request_id, None)
@@ -795,16 +839,6 @@ class AppServerTransport:
         A waiter already failed by terminalization but not yet unwound by its
         (scheduled) caller task is settled, not pending."""
         return sum(1 for future in self._waiters.values() if not future.done())
-
-    def orphaned_methods(self) -> List[str]:
-        """Methods of requests whose bytes were accepted but whose caller left
-        (cancelled, or response deadline expired) and whose outcome has not yet
-        been delivered -- i.e. requests the transport now owns as orphans.
-
-        Read-only. An owner layer uses it to tell a post-commit cancellation
-        (``turn/start`` present here -> accepted work whose outcome must be
-        reconciled) from a known-not-sent one (absent -> safe to end locally)."""
-        return list(self._orphaned_requests.values())
 
     def interaction(self, interaction_id: Any) -> Optional[PendingInteraction]:
         return self._interactions.get(interaction_id)

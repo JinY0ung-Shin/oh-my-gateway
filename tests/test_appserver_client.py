@@ -611,7 +611,7 @@ async def test_turn_start_post_commit_cancel_retires_recovered_turn(
         # No blind replay (only one turn/start step existed) and no leaks.
         assert handle._reconcile_task is None
         assert handle._subscription is None
-        assert handle.transport.orphaned_methods() == []
+        assert handle.transport._orphaned_requests == {}
     finally:
         await handle.disconnect()
 
@@ -665,6 +665,85 @@ async def test_turn_start_post_commit_cancel_then_death_is_ambiguous(
         await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
         # No turn ever materialized -> nothing retired, and never replayed.
         assert interrupted == []
+        assert handle._reconcile_task is None
+        assert handle._subscription is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_turn_start_response_beats_cancel_still_transfers_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-6 blocker: the response-beats-cancellation race. When the reader
+    delivers turn/start's response in the SAME tick the caller is cancelled, the
+    transport fans the OrphanedResponse inline and leaves NO unresolved-orphan
+    registry entry. Ownership must still transfer (keyed on the explicit
+    CommittedRequestCancelled type, never on the empty registry): the detached
+    owner consumes the already-queued outcome and retires exactly that turn."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 5.0)
+    # The fake never answers turn/start itself; the test injects the response via
+    # the transport reader to pin the interleaving (mirrors the #172 transport
+    # corpus). A turn/interrupt step lets the owner's retire land.
+    turn_step = {"expect_method": "turn/start", "actions": []}
+    interrupt_step = {
+        "expect_method": "turn/interrupt",
+        "actions": [{"type": "response", "result": {}}],
+    }
+    scenario = _write_scenario(
+        tmp_path,
+        HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, interrupt_step],
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    interrupted: List[tuple] = []
+    original_interrupt = handle.transport.interrupt
+
+    async def _spy_interrupt(thread_id, turn_id, **kwargs):
+        interrupted.append((thread_id, turn_id))
+        return await original_interrupt(thread_id, turn_id, **kwargs)
+
+    handle.transport.interrupt = _spy_interrupt
+
+    try:
+        run = asyncio.ensure_future(
+            _collect(backend.run_completion_with_client(handle, "hi", session))
+        )
+        # Wait until turn/start is committed (waiter registered, write lock free).
+        request_id = None
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            methods = handle.transport._waiter_methods
+            if (
+                "turn/start" in methods.values()
+                and not handle.transport._write_lock.locked()
+            ):
+                request_id = next(
+                    rid for rid, m in methods.items() if m == "turn/start"
+                )
+                break
+        assert request_id is not None
+
+        run.cancel()
+        # Same tick, before the cancelled task resumes: the reader routes the
+        # response, so the transport fans the OrphanedResponse INLINE and leaves
+        # no unresolved-orphan registry entry.
+        handle.transport._dispatch(
+            {"id": request_id, "result": {"turn": {"id": "turn-1"}}}
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+        # The response beat the cancellation -> empty unresolved-orphan registry...
+        assert handle.transport._orphaned_requests == {}
+        # ...yet ownership STILL transferred (keyed on CommittedRequestCancelled).
+        owner = handle._reconcile_task
+        assert owner is not None
+        await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
+        # The owner consumed the queued outcome and retired exactly that turn once.
+        assert interrupted == [("thread-1", "turn-1")]
         assert handle._reconcile_task is None
         assert handle._subscription is None
     finally:

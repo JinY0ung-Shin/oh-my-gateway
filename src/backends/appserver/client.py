@@ -55,6 +55,7 @@ from src.backends.claude.client import UnsupportedContinuationPolicy
 from src.backends.appserver.transport import (
     AmbiguousRequest,
     AppServerTransport,
+    CommittedRequestCancelled,
     Notification,
     OrphanedResponse,
     PendingInteraction,
@@ -493,21 +494,24 @@ class AppServerCodexClient(TokenEstimateMixin):
                 async for chunk in self._reconcile_orphaned_turn_start(client, session):
                     yield chunk
                 return
+            except CommittedRequestCancelled:
+                # turn/start's bytes were committed and the caller was cancelled
+                # (a client disconnect cancels the StreamingResponse generator;
+                # see responses.py _shielded_stream_teardown). The transport
+                # raises this for EVERY committed cancellation -- including the
+                # response-beats-cancellation race where the OrphanedResponse is
+                # already queued and the unresolved-orphan registry is empty -- so
+                # ownership is transferred ATOMICALLY on the type, never inferred
+                # from that registry (#174 round-6). Hand the orphan to a
+                # DETACHED, handle-owned owner whose lifetime is independent of
+                # this cancelled generator (it may immediately consume the queued
+                # OrphanedResponse or wait for a pending one), then re-raise.
+                self._detach_orphan_owner(client)
+                raise
             except asyncio.CancelledError:
-                # The SSE generator was cancelled (a client disconnect cancels
-                # the StreamingResponse generator; see responses.py
-                # _shielded_stream_teardown). If turn/start's bytes were already
-                # committed, the transport now OWNS the orphaned request -- its
-                # outcome must still be reconciled and a resulting turn retired,
-                # but this task is dying. Hand the orphan to a DETACHED,
-                # handle-owned owner whose lifetime is independent of this
-                # cancelled generator, then re-raise. A not-committed
-                # (known-not-sent) cancel just unwinds locally (#174 blocker:
-                # post-commit cancellation ownership).
-                if "turn/start" in client.transport.orphaned_methods():
-                    self._detach_orphan_owner(client)
-                else:
-                    self._end_turn(client)
+                # A plain cancellation is known-not-sent: turn/start's bytes never
+                # crossed the wire, so there is no accepted work to reconcile.
+                self._end_turn(client)
                 raise
             except Exception as exc:  # noqa: BLE001 - stay in-band, never raise
                 self._end_turn(client)
