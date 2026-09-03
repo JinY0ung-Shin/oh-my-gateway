@@ -874,6 +874,94 @@ async def test_update_request_policy_applies_and_rejects_unsafe_changes(
         await handle.disconnect()
 
 
+async def test_mcp_servers_refuses_session_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Gateway-supplied MCP servers are not contract-proven on this runtime, so
+    a session that requests them fails closed at creation (#174 review §B3)
+    rather than sending an unverified config that might expose unfiltered
+    MCP tools."""
+    from src.backends.appserver.policy import CapabilityError
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    with pytest.raises(CapabilityError):
+        await backend.create_client(
+            session=session,
+            mcp_servers={"github": {"url": "https://example.invalid/mcp"}},
+        )
+
+
+async def test_unsupported_model_param_refuses_session_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A model param the adapter cannot translate to a turn/start field is
+    rejected explicitly, never silently dropped (#174 review §B5)."""
+    from src.backends.appserver.policy import CapabilityError
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    with pytest.raises(CapabilityError):
+        await backend.create_client(
+            session=session,
+            model_params={"frequency_penalty": 0.5},
+        )
+
+
+async def test_continuation_unsupported_change_leaves_handle_policy_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A rejected continuation policy update must not partially mutate the reused
+    handle (#174 review §B4): validate first, commit second."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(
+        session=session, permission_mode="default", model_params={"temperature": 0.2}
+    )
+    try:
+        before = (
+            handle.permission_mode,
+            handle.allowed_tools,
+            handle.disallowed_tools,
+            dict(handle.model_params or {}),
+            handle.approval_policy,
+        )
+        # An unsupported model param on continuation -> 400, no field mutated.
+        with pytest.raises(UnsupportedContinuationPolicy):
+            backend.update_request_policy(
+                handle,
+                permission_mode="bypassPermissions",
+                model_params={"frequency_penalty": 0.9},
+            )
+        after = (
+            handle.permission_mode,
+            handle.allowed_tools,
+            handle.disallowed_tools,
+            dict(handle.model_params or {}),
+            handle.approval_policy,
+        )
+        assert before == after
+        # An explicit allow-list on continuation is equally unenforceable -> 400.
+        with pytest.raises(UnsupportedContinuationPolicy):
+            backend.update_request_policy(handle, allowed_tools=["Bash"])
+    finally:
+        await handle.disconnect()
+
+
 async def test_optionless_user_input_is_failed_closed_not_parked(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):

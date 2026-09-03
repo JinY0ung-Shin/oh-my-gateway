@@ -1,21 +1,29 @@
 """Canonical capability + tool policy -> Codex runtime policy (issue #173 §6-7).
 
-Two concerns live here:
+The enforcement model is **fail-closed** (#174 review §B1/§B2): the primary
+boundary is a capability validator (:func:`resolve_runtime_policy`) that admits
+a policy only when every allow/deny it expresses maps onto a proven executable
+enforcement primitive, and raises :class:`CapabilityError` (refusing the
+session) for anything unproven -- BEFORE the app-server process is spawned. It
+runs on both fresh session creation and continuation (``update_request_policy``).
 
-* **Sandbox/capability** (§7): requested capability denies (from
-  ``disallowed_tools``) map onto the Codex ``sandbox`` mode, and a deny that no
-  Codex setting can enforce (``shell.execute``) rejects the session
-  (``CapabilityError``) rather than silently weakening the harness.
-* **Per-tool approval policy** (§6): parity with the frozen backend's
-  approval-time enforcement — ``allowed_tools`` / ``disallowed_tools`` (request
-  and global ``DISALLOWED_TOOLS`` env), including an explicit ``allowed_tools=[]``
-  block-all and ``mcp__server__tool`` wildcards, are enforced by forcing
-  ``approvalPolicy=on-request`` whenever a tool policy exists and auto-denying an
-  approval for a tool the policy does not permit *before* it is bridged to the
-  user. An ``acceptEdits`` mode auto-accepts file-change approvals.
+* **Proven-enforceable:** a ``filesystem.write`` / ``network`` deny -> the
+  ``read-only`` sandbox (a real Codex setting).
+* **Fail-closed (rejected):** any explicit ``allowed_tools`` allow-list (its
+  denied complement cannot be enforced without a per-tool disable primitive,
+  ``allowed_tools=[]`` being the obvious case), and any deny with no primitive
+  (command/shell, Read/Glob/Grep, Skill, Task/Agent/subagents, ``mcp__*``, or an
+  unrecognized name), from the request OR the global ``DISALLOWED_TOOLS`` env.
+  ``approvalPolicy=on-request`` is NOT accepted as a stand-in barrier -- it is
+  not "ask before every command".
 
-The frozen client enforces the same rules (``src/backends/codex/client.py``);
-this is a faithful port so the cutover is not a policy regression.
+A **secondary** approval-time layer (:func:`should_auto_deny_approval` /
+:func:`should_auto_accept_approval`) mirrors the frozen backend's per-approval
+handling for the surviving policies (forcing ``on-request`` when a tool policy
+exists, ``acceptEdits`` auto-accepting file changes). It is defense-in-depth,
+not the boundary: any policy that would depend on it for enforcement (e.g. an
+MCP allow/deny) is already refused by the validator, because a matched approval
+string is not proof a real tool invocation was blocked.
 """
 
 from __future__ import annotations
@@ -148,23 +156,37 @@ def requested_denies(disallowed_tools: Optional[List[str]]) -> set:
     return denies
 
 
-def _command_execution_denied(
-    allowed_tools: Optional[List[str]],
-    disallowed_tools: Optional[List[str]],
-) -> bool:
-    """Whether the requested policy means to deny built-in command execution.
+# The ONLY capability denies with a proven executable enforcement primitive on
+# the (unpinned) app-server runtime: both map onto the ``read-only`` sandbox, a
+# real Codex setting. Every other deny -- command/shell execution, read-only
+# built-ins (Read/Glob/Grep), Skill, Task/Agent/subagents, MCP tool patterns,
+# and any unrecognized tool name -- has NO proven runtime disable primitive, so
+# a policy that asks for one must fail closed rather than run silently weakened.
+_SANDBOX_ENFORCEABLE_DENIES = frozenset({FILESYSTEM_WRITE, NETWORK})
 
-    True when ``commandExecution`` is disallowed (request or global env) or when
-    an explicit allow-list (including ``allowed_tools=[]`` block-all) omits it.
+
+def _effective_disallowed(disallowed_tools: Optional[List[str]]) -> List[str]:
+    """Request + global-env deny names, dropping blanks/non-strings."""
+    merged = list(disallowed_tools or []) + _disallowed_from_env()
+    return [name for name in merged if isinstance(name, str) and name.strip()]
+
+
+def unenforceable_denies(disallowed_tools: Optional[List[str]]) -> List[str]:
+    """Requested deny names with no proven Codex enforcement primitive (§B1).
+
+    A deny is honorable only if it maps onto :data:`_SANDBOX_ENFORCEABLE_DENIES`
+    (``filesystem.write`` / ``network`` -> read-only sandbox). Everything else --
+    ``shell.execute`` / ``Bash``, ``Read`` / ``Glob`` / ``Grep``, ``Skill``,
+    ``Task`` / ``Agent`` / subagents, ``mcp__server__tool`` patterns, and any
+    unrecognized name -- is returned so the caller can fail the session closed.
     """
-    disallowed = _normalize_tool_names(
-        list(disallowed_tools or []) + _disallowed_from_env()
-    )
-    if "commandExecution" in disallowed:
-        return True
-    if allowed_tools is not None:
-        return "commandExecution" not in _normalize_tool_names(allowed_tools)
-    return False
+    unenforceable: List[str] = []
+    for name in _effective_disallowed(disallowed_tools):
+        cap = _TOOL_TO_CAPABILITY.get(name.strip().lower())
+        if cap in _SANDBOX_ENFORCEABLE_DENIES:
+            continue
+        unenforceable.append(name)
+    return unenforceable
 
 
 def resolve_runtime_policy(
@@ -177,17 +199,26 @@ def resolve_runtime_policy(
 ) -> Dict[str, Any]:
     """Return the Codex ``sandbox`` + ``approvalPolicy`` for the requested policy.
 
-    Enforcement paths:
-      * ``filesystem.write`` / ``network`` deny -> ``read-only`` sandbox (a real
-        Codex primitive).
+    This is the fail-closed capability validator (#174 review §B1/§B2): a policy
+    is accepted only when every allow/deny it expresses maps onto a proven
+    executable enforcement primitive; anything unproven raises
+    :class:`CapabilityError` BEFORE the app-server process/thread is started, so
+    an opt-in adapter session can never run with a requested constraint silently
+    ignored.
 
-    Fail-closed (§5/§7): a requested deny with no proven enforcement primitive
-    rejects the session (:class:`CapabilityError`) rather than running weakened:
-      * denying built-in **command execution** (``shell.execute`` / ``Bash`` /
-        an allow-list that omits it, incl. ``allowed_tools=[]``). ``on-request``
-        is not a guarantee that every command surfaces an approval before it
-        runs, so it is NOT accepted as a boundary; without an executable
-        tool-disable primitive on the pinned runtime the session is refused.
+    Proven-enforceable (accepted):
+      * ``filesystem.write`` / ``network`` deny -> ``read-only`` sandbox.
+
+    Fail-closed (rejected):
+      * **Any explicit ``allowed_tools`` allow-list** (§B2). An allow-list means
+        every omitted capability is denied; there is no per-tool disable
+        primitive on this runtime to enforce that denied complement, so the
+        allow-list cannot be honored (``allowed_tools=[]`` block-all is only the
+        most obvious case). ``on-request`` is not "ask before every command", so
+        it is not accepted as the missing barrier.
+      * **Any deny without a proven primitive** (§B1): command/shell execution,
+        Read/Glob/Grep, Skill, Task/Agent/subagents, ``mcp__*`` patterns, or an
+        unrecognized name -- from the request OR the global ``DISALLOWED_TOOLS``.
       * a tool policy that, after forcing ``on-request``, still resolves to
         ``never`` (approvals could not be turned on).
     """
@@ -196,13 +227,30 @@ def resolve_runtime_policy(
     if FILESYSTEM_WRITE in denies or NETWORK in denies:
         sandbox = "read-only"
 
-    if _command_execution_denied(allowed_tools, disallowed_tools):
+    # §B2: an explicit allow-list is an allow-list contract -- omitted tools are
+    # denied. Without an enforceable denied-complement primitive it is
+    # unsupported and must fail closed (never merely auto-approve the named set).
+    if allowed_tools is not None:
         raise CapabilityError(
-            "Codex cannot guarantee blocking built-in command execution on this "
-            "runtime (approvalPolicy=on-request is not 'ask before every "
-            "command'); refusing the session rather than running weakened. "
-            "Remove the command/shell deny or use a runtime with an enforceable "
-            "tool-disable primitive."
+            "an explicit allowed_tools allow-list is unsupported on this Codex "
+            "runtime: it implies denying every omitted capability, and there is "
+            "no proven per-tool disable primitive to enforce that complement "
+            "(approvalPolicy=on-request is not 'ask before every command'). "
+            "Refusing the session rather than running with the allow-list "
+            "silently unenforced. Remove allowed_tools (rely on the sandbox / "
+            "disallowed_tools capability denies) or use a runtime with an "
+            "enforceable tool-disable primitive."
+        )
+
+    # §B1: every requested deny must map to a proven enforcement primitive.
+    unenforceable = unenforceable_denies(disallowed_tools)
+    if unenforceable:
+        raise CapabilityError(
+            "Codex cannot enforce these requested tool denies on this runtime "
+            f"(no proven disable primitive): {sorted(set(unenforceable))}. Only "
+            "filesystem.write / network denies (read-only sandbox) are "
+            "enforceable; command/shell, Read/Glob/Grep, Skill, Task/Agent and "
+            "mcp__* denies are refused rather than run silently weakened."
         )
 
     tool_policy = has_tool_policy(allowed_tools, disallowed_tools)

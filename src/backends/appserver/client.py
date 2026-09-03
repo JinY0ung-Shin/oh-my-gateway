@@ -104,6 +104,25 @@ def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str,
     return translated
 
 
+def _validate_model_params(model_params: Optional[Dict[str, Any]]) -> None:
+    """Fail closed on model-param keys the adapter cannot honor (#174 §B5).
+
+    Only the keys in :data:`_MODEL_PARAM_KEYS` translate to a Codex ``turn/start``
+    field; any other override (reasoning controls, penalties, arbitrary keys)
+    must be rejected explicitly rather than silently dropped, so a caller never
+    believes an unsupported sampling control took effect. (``reasoning.effort``
+    is already rejected for non-claude backends at the route.)
+    """
+    if not model_params:
+        return
+    unsupported = sorted(key for key in model_params if key not in _MODEL_PARAM_KEYS)
+    if unsupported:
+        raise CapabilityError(
+            "Codex adapter does not support these model params: "
+            f"{unsupported}. Supported keys: {sorted(_MODEL_PARAM_KEYS)}."
+        )
+
+
 def _to_turn_input(prompt: Union[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     """Shape a gateway prompt into Codex ``turn/start`` input items.
 
@@ -273,10 +292,12 @@ class AppServerCodexClient(TokenEstimateMixin):
         """
         generation = getattr(session, "turn_counter", 0) + 1
 
-        # Resolve the canonical capability policy BEFORE spawning: a requested
-        # deny that no Codex setting can enforce (e.g. shell.execute) raises
-        # CapabilityError here, so session creation fails closed (HTTP 503)
-        # rather than running with the denied capability silently available.
+        # Resolve the canonical capability policy BEFORE spawning: an explicit
+        # allow-list, or a requested deny that no Codex setting can enforce
+        # (shell.execute, Read, Skill, Task/Agent, mcp__*, ...), raises
+        # CapabilityError here (#174 §B1/§B2), so session creation fails closed
+        # (HTTP 503) rather than running with a requested constraint silently
+        # ignored.
         runtime_policy = resolve_runtime_policy(
             default_sandbox=sandbox_mode(),
             default_approval=approval_policy(),
@@ -284,6 +305,25 @@ class AppServerCodexClient(TokenEstimateMixin):
             allowed_tools=allowed_tools,
             disallowed_tools=disallowed_tools,
         )
+
+        # §B5: reject unsupported model-param overrides rather than dropping them.
+        _validate_model_params(model_params)
+
+        # §B3: gateway-supplied MCP server configuration is NOT contract-proven
+        # on this runtime -- the exact ThreadStartParams.config shape (dotted
+        # ``mcp_servers.`` overrides vs a nested object) and per-server
+        # enabled/disabled-tools filtering can only be certified against the
+        # pinned app-server (checkpoint-2, #173). Rather than send an unverified
+        # config that might silently expose unfiltered MCP tools, refuse the
+        # session when MCP servers are requested.
+        if mcp_servers:
+            raise CapabilityError(
+                "Codex adapter cannot yet prove gateway-supplied MCP server "
+                "configuration is applied and per-tool filtered on the "
+                "app-server runtime; refusing the session rather than exposing "
+                "unverified MCP tools (checkpoint-2, #173). Remove mcp_servers "
+                "or use the claude backend for MCP."
+            )
 
         # Per-user isolation (issue §6): a dedicated process (C0), a per-user
         # workspace (cwd), a per-user CODEX_HOME, and sibling-backend secrets
@@ -305,7 +345,6 @@ class AppServerCodexClient(TokenEstimateMixin):
             env=env or None,
             env_remove=env_remove,
         )
-        resolved_mcp = self._resolve_mcp_servers(mcp_servers, forward_headers)
         try:
             await transport.start()
             thread_params = self._thread_params(
@@ -313,7 +352,6 @@ class AppServerCodexClient(TokenEstimateMixin):
                 cwd=cwd,
                 system_prompt=combine_system_prompt(_custom_base, system_prompt),
                 runtime_policy=runtime_policy,
-                mcp_servers=resolved_mcp,
             )
             durable_thread_id = getattr(session, "codex_thread_id", None)
             if durable_thread_id:
@@ -348,7 +386,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 list(disallowed_tools) if disallowed_tools is not None else None
             ),
             model_params=dict(model_params) if model_params else None,
-            mcp_servers=dict(resolved_mcp) if resolved_mcp else None,
+            mcp_servers=None,
         )
 
     async def run_completion_with_client(
@@ -756,6 +794,10 @@ class AppServerCodexClient(TokenEstimateMixin):
         thread: a deny the runtime can't enforce, or a sandbox change (the
         sandbox is fixed at ``thread/start`` and cannot be tightened mid-thread).
         """
+        # Validate the WHOLE requested policy through the same fail-closed
+        # capability validator (#174 §B4) BEFORE mutating any handle field, so a
+        # continuation that tightens to an unenforceable policy is rejected with
+        # the handle's previously stored policy left untouched.
         try:
             new_policy = resolve_runtime_policy(
                 default_sandbox=sandbox_mode(),
@@ -764,6 +806,7 @@ class AppServerCodexClient(TokenEstimateMixin):
                 allowed_tools=allowed_tools,
                 disallowed_tools=disallowed_tools,
             )
+            _validate_model_params(model_params)
         except CapabilityError as exc:
             raise UnsupportedContinuationPolicy(str(exc)) from exc
 
@@ -811,23 +854,6 @@ class AppServerCodexClient(TokenEstimateMixin):
 
         return frozenset(METADATA_ENV_ALLOWLIST)
 
-    def _resolve_mcp_servers(
-        self,
-        mcp_servers: Optional[Dict[str, Any]],
-        forward_headers: Optional[Dict[str, str]],
-    ) -> Optional[Dict[str, Any]]:
-        """Resolve ``{{env:NAME}}`` templates and inject the gateway MCP context
-        header (identity + caller-owned credentials) into http/SSE server configs,
-        mirroring the claude backend. Codex forwards the full server set and
-        enforces per-tool policy at approval time."""
-        if not mcp_servers:
-            return None
-        from src.backends.mcp_headers import inject_mcp_headers
-        from src.mcp_config import resolve_mcp_servers
-
-        resolved = resolve_mcp_servers(mcp_servers) or mcp_servers
-        return inject_mcp_headers(resolved, forward_headers)
-
     def _thread_params(
         self,
         *,
@@ -835,8 +861,11 @@ class AppServerCodexClient(TokenEstimateMixin):
         cwd: Optional[str],
         system_prompt: Optional[str],
         runtime_policy: Dict[str, Any],
-        mcp_servers: Optional[Dict[str, Any]],
     ) -> Dict[str, Any]:
+        # MCP configuration is deliberately NOT emitted here: gateway-supplied
+        # MCP servers are rejected at create_client (#174 §B3) until the exact
+        # app-server ``config`` shape and per-tool filtering are certified on the
+        # pinned runtime (checkpoint-2). No unverified config surface is sent.
         params: Dict[str, Any] = {
             "approvalPolicy": runtime_policy["approvalPolicy"],
             "sandbox": runtime_policy["sandbox"],
@@ -847,12 +876,6 @@ class AppServerCodexClient(TokenEstimateMixin):
             params["cwd"] = cwd
         if system_prompt:
             params["developerInstructions"] = system_prompt
-        if mcp_servers:
-            # v2 ThreadStartParams exposes ``config`` (Record<string, JsonValue>),
-            # not a top-level ``mcpServers`` field (#174 review §5). Route MCP
-            # server configuration through config.mcp_servers so the app-server
-            # actually applies it, mirroring the CLI's mcp_servers.* config.
-            params["config"] = {"mcp_servers": dict(mcp_servers)}
         return params
 
     def _thread_id_from_result(self, result: Any) -> str:

@@ -172,13 +172,95 @@ def test_filesystem_write_deny_drops_to_read_only():
     assert policy["sandbox"] == "read-only"
 
 
-def test_allow_list_including_command_is_accepted(monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
-    # An allow-list that DOES permit command execution is representable; it just
-    # forces on-request so file/MCP approvals can still be gated.
+def test_network_deny_drops_to_read_only():
     policy = resolve_runtime_policy(
         default_sandbox="workspace-write",
         default_approval="never",
-        allowed_tools=["Bash", "Read"],
+        disallowed_tools=["network"],
     )
-    assert policy["approvalPolicy"] == "on-request"
+    assert policy["sandbox"] == "read-only"
+
+
+def test_any_allow_list_is_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # §B2: an explicit allow-list means the omitted complement is denied, and
+    # there is no per-tool disable primitive to enforce that complement -- so
+    # even an allow-list naming a "proven" subset is unsupported and fails
+    # closed (not merely auto-approved). on-request is not the missing barrier.
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            allowed_tools=["Bash", "Read"],
+        )
+    # An allow-list of only read-only builtins is equally unenforceable.
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            allowed_tools=["Read"],
+        )
+
+
+def test_mcp_deny_is_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # §B1: an MCP allow/deny has no proven native exposure filter on this
+    # runtime (the fake command-approval helper is not execution enforcement),
+    # so a policy that names one refuses the session.
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            disallowed_tools=["mcp__github__*"],
+        )
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            disallowed_tools=["mcp__github__create_issue"],
+        )
+
+
+def test_read_only_builtin_deny_is_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # Read/Glob/Grep have no runtime disable primitive -> reject, never ignore.
+    for tool in ("Read", "Glob", "Grep"):
+        with pytest.raises(CapabilityError):
+            resolve_runtime_policy(
+                default_sandbox="workspace-write",
+                default_approval="never",
+                disallowed_tools=[tool],
+            )
+
+
+def test_skill_and_agent_deny_is_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # Skill / Task / Agent (subagent) denies have no proven native primitive.
+    for tool in ("Skill", "Task", "Agent"):
+        with pytest.raises(CapabilityError):
+            resolve_runtime_policy(
+                default_sandbox="workspace-write",
+                default_approval="never",
+                disallowed_tools=[tool],
+            )
+
+
+def test_global_env_command_deny_is_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    # A global DISALLOWED_TOOLS operator deny that cannot be enforced also fails
+    # closed -- the validator merges request + env denies.
+    monkeypatch.setenv("DISALLOWED_TOOLS", "Bash")
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+        )
+
+
+def test_no_policy_uses_defaults(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # No allow-list, no denies -> defaults pass through, nothing rejected.
+    policy = resolve_runtime_policy(
+        default_sandbox="workspace-write",
+        default_approval="never",
+    )
+    assert policy == {"sandbox": "workspace-write", "approvalPolicy": "never"}
