@@ -248,6 +248,25 @@ def _deny(reason: str) -> Dict[str, Any]:
 _PATH_RE = re.compile(r"(?:^|[\s=:'\"`(])((?:/|\.\.?/|~/?)[\w./\-+@]*)")
 
 
+# Network URLs (``scheme://authority/...``) are blanked out before path
+# extraction: the ``:`` before ``//host`` is a path boundary for ``_PATH_RE``
+# and ``//host/...`` then reads as an absolute path outside the workspace, so
+# every ``curl https://...`` / ``git clone https://...`` was denied (#176).
+# Two forms are deliberately left visible because they address the local
+# filesystem: an empty authority (``file:///etc/x``, ``sqlite:////srv/x.db``)
+# and any ``file`` scheme (``file://localhost/etc/x``, ``git+file://...``).
+# The scheme must start a token so ``file://`` cannot be matched one
+# character in as ``ile://``.
+_NET_URL_RE = re.compile(
+    r"(?<![\w+.\-])"  # scheme starts a token
+    r"(?!(?:[\w+.\-]*\+)?file:)"  # ``file:`` / ``git+file:`` stay visible
+    r"[A-Za-z][\w+.\-]*://"
+    r"[^\s'\"`()<>/]"  # non-empty authority; ``:///`` stays visible
+    r"[^\s'\"`()<>]*",
+    re.IGNORECASE,
+)
+
+
 def _is_path_like(token: str) -> bool:
     """Whether *token* looks like a filesystem path worth boundary-checking.
 
@@ -266,11 +285,14 @@ def _expand_user(path: str) -> str:
 def _bash_path_candidates(command: str) -> list[str]:
     """Extract path-like substrings from a Bash *command*.
 
-    ``shlex`` handles quoting and ``--flag=value`` / ``VAR=value`` forms (the
-    value after ``=`` is inspected separately so an escape hidden in a flag is
-    not masked by the flag name). A regex pass over the raw command is layered
-    on top for shell constructs ``shlex`` cannot split cleanly.
+    Network URLs are blanked out first (see ``_NET_URL_RE``) so ``https://host``
+    is not mistaken for an absolute path. ``shlex`` handles quoting and
+    ``--flag=value`` / ``VAR=value`` forms (the value after ``=`` is inspected
+    separately so an escape hidden in a flag is not masked by the flag name). A
+    regex pass over the raw command is layered on top for shell constructs
+    ``shlex`` cannot split cleanly.
     """
+    command = _NET_URL_RE.sub(" ", command)
     candidates: list[str] = []
     try:
         tokens = shlex.split(command, posix=True)

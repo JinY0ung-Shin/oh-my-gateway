@@ -182,6 +182,74 @@ class TestBash:
         assert _is_deny(result)
 
 
+class TestBashUrls:
+    """URLs are not filesystem paths (#176) — but local-FS URL forms still are."""
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl https://example.com/api/v1",
+            "curl http://localhost:8000/health",
+            'curl -s "http://127.0.0.1:8000/v1/responses"',
+            "git clone https://github.com/org/repo.git",
+            "pip install git+https://github.com/org/repo.git",
+            "curl --url=https://example.com/x",
+            'curl "https://user:pw@host:8443/p?a=b&c=/d"',
+            "curl HTTPS://EXAMPLE.COM/X",
+            "curl -o out.json $(echo https://example.com/x)",
+        ],
+        ids=[
+            "https",
+            "http-localhost-port",
+            "quoted-loopback",
+            "git-clone",
+            "pip-git-plus-https",
+            "flag-value-url",
+            "userinfo-port-query",
+            "uppercase-scheme",
+            "command-substitution",
+        ],
+    )
+    async def test_network_url_allowed(self, workspace, command):
+        hook = make_workspace_sandbox_hook(workspace)
+        assert await _call(hook, "Bash", {"command": command}) == {}
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl file:///etc/passwd",
+            "curl FILE:///etc/passwd",
+            "curl file://localhost/etc/passwd",
+            "pip install git+file:///srv/other-user/repo",
+            "cat //etc/passwd",
+            "cat ///etc/passwd",
+            "python -c \"open('//etc/passwd')\"",
+            "python - <<'EOF'\nprint(open('//etc/passwd').read())\nEOF",
+            "python -c \"create_engine('sqlite:////srv/x.db')\"",
+            "curl https://example.com/x -o /etc/cron.d/evil",
+            "curl https://example.com/x; cat /etc/passwd",
+            "curl 'https://example.com/x'/etc/passwd",
+        ],
+        ids=[
+            "file-empty-authority",
+            "file-uppercase-scheme",
+            "file-localhost-authority",
+            "git-plus-file",
+            "double-slash-path",
+            "triple-slash-path",
+            "quoted-double-slash",
+            "heredoc-double-slash",
+            "sqlite-empty-authority",
+            "url-then-outside-output",
+            "url-then-chained-command",
+            "path-glued-after-quoted-url",
+        ],
+    )
+    async def test_local_url_forms_and_double_slash_denied(self, workspace, command):
+        hook = make_workspace_sandbox_hook(workspace)
+        assert _is_deny(await _call(hook, "Bash", {"command": command}))
+
+
 class TestAllowOutside:
     async def test_read_category_releases_read_glob_grep(
         self, monkeypatch, workspace, other_workspace
