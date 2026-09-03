@@ -553,6 +553,19 @@ def test_move_no_clobber_refuses_destination_appearing_after_validation(
     assert (workspace / "raced.txt").read_text() == "winner"
 
 
+@pytest.mark.parametrize("no_clobber", [False, True])
+def test_move_directory_into_itself_is_a_precise_400(client, workspace, no_clobber):
+    """자기 하위로의 이동은 renameat2의 EINVAL(→501)이나 shutil.Error(→500)로
+    새지 않고 명확한 400이어야 한다."""
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub/nested", "no_clobber": no_clobber},
+    )
+    assert r.status_code == 400
+    assert (workspace / "sub" / "inner.md").exists()  # untouched
+
+
 def test_move_no_clobber_unavailable_fails_closed(client, workspace, monkeypatch):
     """renameat2를 못 쓰는 환경에서는 교체 가능한 move로 조용히 fallback하지 않고
     501로 거부한다 — no-clobber는 보장이거나 거부이지, best effort가 아니다."""

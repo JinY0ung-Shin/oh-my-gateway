@@ -607,6 +607,11 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="source not found")
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
+    # Same rule as copy: a directory cannot move into its own subtree. Without
+    # this, the user error surfaces as renameat2's EINVAL (mapped to 501) or
+    # shutil.Error (500) instead of a precise 400.
+    if src.is_dir() and not src.is_symlink() and (dst == src or src in dst.parents):
+        raise HTTPException(status_code=400, detail="cannot move a directory into itself")
     if body.no_clobber:
         # No check-then-move: rename(2) replaces an existing destination by
         # design, so only the kernel can enforce no-replace atomically.
