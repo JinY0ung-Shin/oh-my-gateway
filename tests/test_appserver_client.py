@@ -409,6 +409,140 @@ async def test_runtime_loss_terminalizes_the_turn(
     assert "terminated" in chunks[-1]["error_message"]
 
 
+# -- turn/start post-commit reconciliation (#172 seam / #174 blocker 2) -------
+
+
+async def test_turn_start_deadline_then_late_response_is_recovered_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Causal test A: turn/start bytes commit, the response deadline expires, then
+    the response arrives late. The transport orphans the accepted request and
+    delivers the late result as an OrphanedResponse; the adapter must consume it
+    (recover the accepted turn and stream it to completion), never re-send
+    turn/start."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            # Blow the response deadline (0.5s) with margin before answering.
+            {"type": "sleep", "seconds": 0.8},
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    # Exactly ONE turn/start step: a blind replay would send a second turn/start
+    # and the fixture would fail on the unexpected input.
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # The accepted turn was recovered and driven to a clean completion.
+    assert chunks[-1]["type"] == "result"
+    assert chunks[-1]["subtype"] == "success"
+    assert getattr(session, "codex_thread_id", None) == "thread-1"
+
+
+async def test_turn_start_deadline_then_death_is_ambiguous_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Causal test B: turn/start bytes commit, the response deadline expires, and
+    the runtime then dies before answering. The transport surfaces the accepted
+    request as an AmbiguousRequest before the TerminalEvent; the adapter must end
+    with a reconciliation-required terminal (never a blind replay, never a plain
+    retryable failure) that keeps the thread identity."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {"type": "sleep", "seconds": 0.8},
+            {"type": "exit", "code": 1},
+        ],
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal["type"] == "error"
+    assert "ambiguous" in terminal["error_message"]
+    assert "not replayed" in terminal["error_message"]
+    # Ambiguous accepted work is not a clean completion -> no durable id seeded.
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+async def test_turn_start_runtime_lost_before_commit_is_known_not_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Causal test C: the runtime dies before turn/start bytes cross the wire.
+    That is a plain RuntimeLost (known-not-sent), distinct from committed-loss:
+    it ends normally as a runtime-lost error, not a reconciliation-required
+    ambiguous terminal."""
+    # Handshake + thread/start only; the process then exits with no turn/start
+    # step, so the runtime is gone before the turn is ever attempted.
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps({"steps": HANDSHAKE_STEPS + [THREAD_START_STEP], "linger": False}),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        # Deterministically wait for the process to be gone before the turn, so
+        # turn/start's bytes are known-not-sent (committed=False -> plain
+        # RuntimeLost, never RequestOutcomeUnknown).
+        await handle.transport.wait_terminal(timeout=2.0)
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal["type"] == "error"
+    assert "before turn start" in terminal["error_message"]
+    # Known-not-sent is NOT the ambiguous/committed-loss path.
+    assert "ambiguous" not in terminal["error_message"]
+    assert "not replayed" not in terminal["error_message"]
+    assert getattr(session, "codex_thread_id", None) is None
+
+
 async def test_resume_uses_durable_thread_id(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -850,17 +984,16 @@ async def test_update_request_policy_applies_and_rejects_unsafe_changes(
     )
     try:
         assert handle.approval_policy == "never"
-        # A safe change (tighten approvals, new model params) is applied in place.
+        # A safe change (tighten approvals) is applied in place.
         backend.update_request_policy(
             handle,
             allowed_tools=None,
             disallowed_tools=None,
             permission_mode="default",
-            model_params={"temperature": 0.1},
+            model_params=None,
         )
         assert handle.approval_policy == "on-request"
         assert handle.permission_mode == "default"
-        assert handle.model_params == {"temperature": 0.1}
         # A continuation that denies command execution cannot be enforced -> 400.
         with pytest.raises(UnsupportedContinuationPolicy):
             backend.update_request_policy(
@@ -899,8 +1032,9 @@ async def test_mcp_servers_refuses_session_creation(
 async def test_unsupported_model_param_refuses_session_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A model param the adapter cannot translate to a turn/start field is
-    rejected explicitly, never silently dropped (#174 review §B5)."""
+    """No OpenAI sampling control is a current-v2 TurnStartParams field, so every
+    non-empty model_params is rejected before turn/start rather than written as
+    an unpromised field or silently dropped (#174 review, blocker 1)."""
     from src.backends.appserver.policy import CapabilityError
 
     scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
@@ -909,11 +1043,15 @@ async def test_unsupported_model_param_refuses_session_creation(
     backend = AppServerCodexClient()
     session = _session()
 
-    with pytest.raises(CapabilityError):
-        await backend.create_client(
-            session=session,
-            model_params={"frequency_penalty": 0.5},
-        )
+    # temperature / top_p / max_output_tokens are NOT v2 turn fields -> reject.
+    for params in (
+        {"temperature": 0.1},
+        {"top_p": 0.9},
+        {"max_output_tokens": 256},
+        {"frequency_penalty": 0.5},
+    ):
+        with pytest.raises(CapabilityError):
+            await backend.create_client(session=session, model_params=params)
 
 
 async def test_continuation_unsupported_change_leaves_handle_policy_unchanged(
@@ -929,9 +1067,7 @@ async def test_continuation_unsupported_change_leaves_handle_policy_unchanged(
     backend = AppServerCodexClient()
     session = _session()
 
-    handle = await backend.create_client(
-        session=session, permission_mode="default", model_params={"temperature": 0.2}
-    )
+    handle = await backend.create_client(session=session, permission_mode="default")
     try:
         before = (
             handle.permission_mode,

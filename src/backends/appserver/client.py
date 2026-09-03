@@ -58,6 +58,7 @@ from src.backends.appserver.transport import (
     Notification,
     OrphanedResponse,
     PendingInteraction,
+    RequestOutcomeUnknown,
     RpcError,
     RuntimeLost,
     StaleAnswer,
@@ -84,42 +85,40 @@ BACKEND_NAME = "codex"
 # route pauses into ``requires_action`` on a ``pending_tool_call`` with this name.
 ASK_USER_QUESTION_TOOL_NAME = "AskUserQuestion"
 
-# Model-param request keys -> Codex turn/start keys. Unset keys stay absent so
-# the app-server's own defaults apply.
-_MODEL_PARAM_KEYS = {
-    "temperature": "temperature",
-    "top_p": "topP",
-    "max_output_tokens": "maxOutputTokens",
-}
-
-
-def _translate_model_params(model_params: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    if not model_params:
-        return {}
-    translated: Dict[str, Any] = {}
-    for src_key, dst_key in _MODEL_PARAM_KEYS.items():
-        value = model_params.get(src_key)
-        if value is not None:
-            translated[dst_key] = value
-    return translated
+# Gateway ``model_params`` keys the adapter can PROVE map onto a real current-v2
+# ``TurnStartParams`` field. This is deliberately EMPTY: the OpenAI-style sampling
+# controls the Responses route forwards (``temperature`` / ``top_p`` /
+# ``max_output_tokens``) are NOT fields in the current generated v2
+# ``TurnStartParams`` (which exposes ``model`` / ``effort`` / ``serviceTier`` /
+# ``sandboxPolicy`` / ``summary`` / ... instead), so none of them is promised to
+# be honored by the app-server. Writing them into ``turn/start`` only looked safe
+# because the fake server accepts unknown fields. Until a canonical product
+# contract maps onto real v2 turn fields (checkpoint-2), the adapter supports NO
+# model params and fails closed on any that are requested rather than silently
+# dropping them (#174 review, blocker 1).
+_SUPPORTED_MODEL_PARAM_KEYS: frozenset = frozenset()
 
 
 def _validate_model_params(model_params: Optional[Dict[str, Any]]) -> None:
-    """Fail closed on model-param keys the adapter cannot honor (#174 §B5).
+    """Fail closed on model params the adapter cannot map to current v2 turn/start.
 
-    Only the keys in :data:`_MODEL_PARAM_KEYS` translate to a Codex ``turn/start``
-    field; any other override (reasoning controls, penalties, arbitrary keys)
-    must be rejected explicitly rather than silently dropped, so a caller never
-    believes an unsupported sampling control took effect. (``reasoning.effort``
-    is already rejected for non-claude backends at the route.)
+    No OpenAI sampling control is a proven current-v2 ``TurnStartParams`` field,
+    so any non-empty ``model_params`` is rejected explicitly (never silently
+    dropped or written as an unpromised field). ``reasoning.effort`` is already
+    rejected for non-claude backends at the route; a future checkpoint that
+    exposes Codex-native ``effort`` / ``serviceTier`` must map them deliberately
+    from a canonical product contract, not reinterpret OpenAI sampling fields.
     """
     if not model_params:
         return
-    unsupported = sorted(key for key in model_params if key not in _MODEL_PARAM_KEYS)
+    unsupported = sorted(
+        key for key in model_params if key not in _SUPPORTED_MODEL_PARAM_KEYS
+    )
     if unsupported:
         raise CapabilityError(
-            "Codex adapter does not support these model params: "
-            f"{unsupported}. Supported keys: {sorted(_MODEL_PARAM_KEYS)}."
+            "Codex adapter does not support these model params (no current-v2 "
+            f"TurnStartParams field maps to them): {unsupported}. Use the claude "
+            "backend for sampling controls."
         )
 
 
@@ -223,13 +222,18 @@ class AppServerSessionClient(SessionHandle):
         self.pending_interaction_generation: Optional[int] = None
 
     def turn_params(self) -> Dict[str, Any]:
-        """``turn/start`` params (minus ``threadId``/``input``) for this handle."""
+        """``turn/start`` params (minus ``threadId``/``input``) for this handle.
+
+        No ``model_params`` are emitted: none of the OpenAI sampling controls map
+        to a current-v2 ``TurnStartParams`` field, so any request carrying them is
+        already refused at create/continuation (#174 blocker 1) and never reaches
+        a live handle.
+        """
         params: Dict[str, Any] = {"approvalPolicy": self.approval_policy}
         if self.model:
             params["model"] = self.model
         if self.cwd:
             params["cwd"] = self.cwd
-        params.update(_translate_model_params(self.model_params))
         return params
 
     async def disconnect(self) -> None:
@@ -415,13 +419,38 @@ class AppServerCodexClient(TokenEstimateMixin):
                 result = await client.transport.request(
                     "turn/start", turn_params, timeout=request_timeout_s()
                 )
+            except RequestOutcomeUnknown as exc:
+                # turn/start bytes were accepted and the generation then died
+                # before the response: accepted work with an unknown outcome
+                # (#172). Retain the thread identity, reconcile against durable
+                # state, and NEVER replay -- collapsing this into a generic
+                # runtime-lost error (as ``except RuntimeLost`` would) discards
+                # exactly the seam #172 built (#174 blocker 2).
+                async for chunk in self._reconcile_committed_turn_start_loss(
+                    client, exc.method, exc.terminal_reason
+                ):
+                    yield chunk
+                return
             except RuntimeLost as exc:
+                # Plain loss is known-not-sent: the bytes never crossed the wire,
+                # so there is no accepted work to reconcile and ending here is safe.
                 self._end_turn(client)
-                yield error_chunk(f"Codex runtime lost: {exc.reason}")
+                yield error_chunk(f"Codex runtime lost before turn start: {exc.reason}")
                 return
             except RpcError as exc:
                 self._end_turn(client)
                 yield error_chunk(f"Codex turn/start failed: {exc.rpc_message}")
+                return
+            except (TimeoutError, asyncio.TimeoutError):
+                # The response deadline expired AFTER the bytes were accepted: the
+                # transport has ORPHANED the accepted turn/start and owns its
+                # outcome, delivering it on the persisted subscription (a late
+                # OrphanedResponse, or an AmbiguousRequest before the
+                # TerminalEvent). Do NOT unsubscribe -- drive the subscription to
+                # reconcile that owned outcome rather than discarding it (#174
+                # blocker 2). A committed turn/start is never re-sent.
+                async for chunk in self._reconcile_orphaned_turn_start(client, session):
+                    yield chunk
                 return
             except Exception as exc:  # noqa: BLE001 - stay in-band, never raise
                 self._end_turn(client)
@@ -442,6 +471,135 @@ class AppServerCodexClient(TokenEstimateMixin):
             if client.pending_interaction_call_id is None:
                 self._end_turn(client)
             raise
+
+    async def _reconcile_committed_turn_start_loss(
+        self,
+        client: AppServerSessionClient,
+        method: str,
+        terminal_reason: str,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Reconcile a ``turn/start`` whose bytes were accepted before the
+        generation died (``RequestOutcomeUnknown``).
+
+        The turn may or may not have been created; the outcome is genuinely
+        unknown. Surface a deterministic reconciliation-required terminal that
+        keeps the thread identity, never seed a durable id (the turn did not
+        cleanly complete), and NEVER replay -- the durable-state reconciliation
+        belongs to the supervisor, not a blind re-send here (#172 / #174 blocker
+        2).
+        """
+        thread_id = client.thread_id
+        self._end_turn(client)
+        yield error_chunk(
+            f"Codex {method} was accepted but its outcome is unknown after "
+            f"runtime loss ({terminal_reason}); not replayed -- reconcile "
+            f"against thread {thread_id}"
+        )
+
+    async def _reconcile_orphaned_turn_start(
+        self, client: AppServerSessionClient, session: Any
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Reconcile a ``turn/start`` orphaned by a response-deadline expiry.
+
+        The bytes were accepted, so the transport owns the outcome and delivers
+        it on the persisted subscription (#172):
+
+        * a late ``OrphanedResponse`` for ``turn/start`` -> the turn was really
+          created. If the caller is still present, adopt that exact turn and
+          stream it to completion (recovering the accepted work); if the caller
+          is cancelling, interrupt/retire that exact turn rather than letting
+          model/tool work run detached.
+        * an ``AmbiguousRequest`` (before the ``TerminalEvent``) or a bare
+          ``TerminalEvent`` -> the generation ended with no observed outcome:
+          a reconciliation-required terminal, never replayed.
+
+        A committed ``turn/start`` is never re-sent.
+        """
+        subscription = client._subscription
+        if subscription is None:
+            yield error_chunk("Codex turn/start timed out")
+            return
+
+        while True:
+            cancelling = getattr(session, "active_response_state", None) == "cancelling"
+            try:
+                item = await asyncio.wait_for(
+                    subscription.get(), timeout=request_timeout_s()
+                )
+            except (TimeoutError, asyncio.TimeoutError):
+                self._end_turn(client)
+                yield error_chunk(
+                    "Codex turn/start was accepted but no outcome was observed; "
+                    "not replayed"
+                )
+                return
+
+            if isinstance(item, OrphanedResponse) and item.method == "turn/start":
+                if item.error is not None:
+                    self._end_turn(client)
+                    message = (
+                        item.error.get("message")
+                        if isinstance(item.error, dict)
+                        else str(item.error)
+                    )
+                    yield error_chunk(f"Codex turn/start failed: {message}")
+                    return
+                turn_id = self._turn_id_from_result(item.result)
+                if cancelling:
+                    # The caller is gone: retire the exact accepted turn instead
+                    # of letting it continue detached, then end incomplete.
+                    await self._interrupt_turn(client, turn_id)
+                    self._end_turn(client)
+                    yield _gateway_interrupt_chunk("Codex turn interrupted")
+                    return
+                # Recover: adopt the accepted turn and stream it to completion.
+                # The turn/start response precedes its turn notifications on the
+                # wire, so the mapper opens on the response and sees the rest.
+                client.current_turn_id = turn_id
+                client._mapper = TurnMapper(thread_id=client.thread_id, turn_id=turn_id)
+                async for chunk in self._drive_turn(client, session):
+                    yield chunk
+                return
+
+            if isinstance(item, AmbiguousRequest):
+                self._end_turn(client)
+                yield error_chunk(
+                    f"Codex turn/start outcome is ambiguous ({item.method}); not "
+                    f"replayed ({item.terminal_reason}) -- reconcile against "
+                    f"thread {client.thread_id}"
+                )
+                return
+
+            if isinstance(item, TerminalEvent):
+                self._end_turn(client)
+                yield error_chunk(
+                    "Codex runtime terminated before turn/start completed: "
+                    f"{item.reason}"
+                )
+                return
+
+            if isinstance(item, SubscriberOverflow):
+                self._end_turn(client)
+                yield error_chunk("Codex event stream overflowed")
+                return
+
+            # A notification / interaction / other-method orphan arriving before
+            # the turn/start outcome cannot be mapped yet (no turn id); ignore it
+            # and keep waiting for the orphaned turn/start's own outcome.
+            continue
+
+    async def _interrupt_turn(
+        self, client: AppServerSessionClient, turn_id: Optional[str]
+    ) -> None:
+        """Best-effort interrupt of a specific turn id (never raises)."""
+        if not turn_id:
+            return
+        try:
+            await client.transport.interrupt(
+                client.thread_id, turn_id, timeout=_INTERRUPT_TIMEOUT_S
+            )
+        except (RuntimeLost, RpcError, StaleAnswer, TimeoutError, asyncio.TimeoutError):
+            pass
 
     async def resume_approval_with_client(
         self,
@@ -584,8 +742,10 @@ class AppServerCodexClient(TokenEstimateMixin):
                 return
 
             if isinstance(item, OrphanedResponse):
-                # Our turn/start is awaited synchronously above, so it does not
-                # orphan; a stray orphan is logged and ignored.
+                # A turn/start orphaned by a response-deadline expiry is consumed
+                # by _reconcile_orphaned_turn_start BEFORE the turn is driven, so
+                # any orphan reaching this loop is for a different in-flight
+                # request (or a duplicate); log and ignore it.
                 logger.debug("appserver codex orphaned response: %s", item.method)
                 continue
 
@@ -765,15 +925,7 @@ class AppServerCodexClient(TokenEstimateMixin):
 
     async def interrupt_client(self, client: AppServerSessionClient) -> None:
         """Interrupt the live turn (backing ``POST /v1/responses/{id}/cancel``)."""
-        turn_id = client.current_turn_id
-        if not turn_id:
-            return
-        try:
-            await client.transport.interrupt(
-                client.thread_id, turn_id, timeout=_INTERRUPT_TIMEOUT_S
-            )
-        except (RuntimeLost, RpcError, StaleAnswer, TimeoutError, asyncio.TimeoutError):
-            pass
+        await self._interrupt_turn(client, client.current_turn_id)
 
     def update_request_policy(
         self,
