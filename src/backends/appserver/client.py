@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional, Union
 
 from src.backends.appserver.auth import AppServerAuthProvider
@@ -45,10 +46,12 @@ from src.backends.appserver.interactions import (
 )
 from src.backends.appserver.isolation import ISOLATION_ENV_REMOVE, build_isolated_env
 from src.backends.appserver.policy import (
+    CapabilityError,
     resolve_runtime_policy,
     should_auto_accept_approval,
     should_auto_deny_approval,
 )
+from src.backends.claude.client import UnsupportedContinuationPolicy
 from src.backends.appserver.transport import (
     AmbiguousRequest,
     AppServerTransport,
@@ -112,6 +115,25 @@ def _to_turn_input(prompt: Union[str, List[Dict[str, Any]]]) -> List[Dict[str, A
     return [{"type": "text", "text": prompt}]
 
 
+def _card_is_completable(arguments: Dict[str, Any]) -> bool:
+    """Whether the current AskUserQuestion card can actually be submitted.
+
+    The renderer (``AskUserQuestionBlock.svelte``) shows only option buttons and
+    its ``complete`` predicate requires at least one selected option per
+    question. A question with no options (a free-text / secret / "Other" native
+    ``requestUserInput``) would render a card with no answerable control, so such
+    an interaction is not completable and must be failed closed (#174 review §1).
+    """
+    questions = arguments.get("questions")
+    if not isinstance(questions, list) or not questions:
+        return False
+    for question in questions:
+        options = question.get("options") if isinstance(question, dict) else None
+        if not isinstance(options, list) or not options:
+            return False
+    return True
+
+
 def _gateway_interrupt_chunk(message: str) -> Dict[str, Any]:
     """The terminal chunk the route maps to ``response.incomplete``."""
     return {
@@ -167,16 +189,19 @@ class AppServerSessionClient(SessionHandle):
         # the SAME stream instead of re-subscribing and losing lossless items.
         self._subscription: Optional[Subscription] = None
         self._mapper: Optional[TurnMapper] = None
-        # Native identity of the interaction currently parked at requires_action
-        # (issue §3): the canonical call id maps to exactly one live native
-        # request. ``None`` when no interaction is pending.
-        self.pending_interaction_id: Any = None
+        # The interaction currently parked at requires_action (issue §3). The
+        # UI only ever sees ``pending_interaction_call_id`` -- an OPAQUE per-
+        # occurrence id, NOT the native JSON-RPC request id, which a later
+        # interaction could reuse. The adapter resolves that canonical id back
+        # to the exact native request + occurrence token here; a stale card for
+        # a retired occurrence can never match a new interaction. ``None`` when
+        # nothing is pending.
+        self.pending_interaction_call_id: Optional[str] = None
+        self.pending_interaction_native_id: Any = None
         self.pending_interaction_method: Optional[str] = None
         self.pending_interaction_params: Optional[Dict[str, Any]] = None
-        # The occurrence token of the parked interaction (transport requires it
-        # to answer): a stale card or a late answer for an OLD occurrence can
-        # never authorize a NEW server request that reused the id.
         self.pending_interaction_token: Optional[str] = None
+        self.pending_interaction_generation: Optional[int] = None
 
     def turn_params(self) -> Dict[str, Any]:
         """``turn/start`` params (minus ``threadId``/``input``) for this handle."""
@@ -376,7 +401,7 @@ class AppServerCodexClient(TokenEstimateMixin):
             # to end the requires_action stream; that GeneratorExit must NOT tear
             # down the still-live turn (its subscription is needed by the
             # resume). Only a genuine error while NOT parked terminalizes.
-            if client.pending_interaction_id is None:
+            if client.pending_interaction_call_id is None:
                 self._end_turn(client)
             raise
 
@@ -394,19 +419,24 @@ class AppServerCodexClient(TokenEstimateMixin):
         stale/duplicate answer, or a dead runtime is a deterministic error that
         is never forwarded to a replacement runtime.
         """
-        interaction_id = client.pending_interaction_id
+        canonical_id = client.pending_interaction_call_id
+        native_id = client.pending_interaction_native_id
         method = client.pending_interaction_method or ""
         params = client.pending_interaction_params or {}
         token = client.pending_interaction_token
         self._clear_pending_interaction(client)
 
-        if interaction_id is None:
+        if canonical_id is None:
             yield error_chunk("Codex interaction continuation has no pending request")
             self._end_turn(client)
             return
-        if str(interaction_id) != str(call_id):
+        # The UI submits the opaque canonical id; it must match the exact parked
+        # occurrence. A stale card for a retired occurrence (even one whose
+        # native id was later reused) never matches, so its answer can never
+        # reach a replacement interaction.
+        if str(canonical_id) != str(call_id):
             yield error_chunk(
-                f"Codex interaction id mismatch: pending {interaction_id!r}, "
+                f"Codex interaction id mismatch: pending {canonical_id!r}, "
                 f"received {call_id!r}"
             )
             self._end_turn(client)
@@ -420,7 +450,7 @@ class AppServerCodexClient(TokenEstimateMixin):
         result = answer_result_from_output(method, output, params)
         try:
             await client.transport.answer(
-                interaction_id,
+                native_id,
                 result,
                 generation=client.generation,
                 token=token,
@@ -442,7 +472,7 @@ class AppServerCodexClient(TokenEstimateMixin):
         except BaseException:
             # As in run_completion: a post-park aclose must not terminalize a
             # turn that parked again on a chained interaction.
-            if client.pending_interaction_id is None:
+            if client.pending_interaction_call_id is None:
                 self._end_turn(client)
             raise
 
@@ -505,7 +535,14 @@ class AppServerCodexClient(TokenEstimateMixin):
                 # into the AskUserQuestion / approval UX.
                 if await self._auto_decide_interaction(client, item):
                     continue
-                yield self._park_interaction(client, session, item)
+                park_chunk = await self._park_interaction(client, session, item)
+                if park_chunk is None:
+                    # The interaction could not be represented as a completable
+                    # card (e.g. a free-text/secret requestUserInput the current
+                    # renderer can't answer); it was failed closed, so keep
+                    # consuming the same turn instead of emitting a dead card.
+                    continue
+                yield park_chunk
                 return
 
             if isinstance(item, OrphanedResponse):
@@ -586,29 +623,50 @@ class AppServerCodexClient(TokenEstimateMixin):
             pass
         return True
 
-    def _park_interaction(
+    async def _park_interaction(
         self,
         client: AppServerSessionClient,
         session: Any,
         interaction: PendingInteraction,
-    ) -> Dict[str, Any]:
-        """Record the parked interaction and build the codex_approval chunk.
+    ) -> Optional[Dict[str, Any]]:
+        """Park an interaction as an AskUserQuestion card, or fail it closed.
 
-        The chunk carries a ``tool_use`` block named ``codex_approval`` whose
-        metadata id equals ``pending_tool_call.call_id``; the route's
-        ``_is_codex_pending_approval_chunk`` detects that and pauses the stream
-        into a ``requires_action`` response.
+        Returns the ``codex_approval`` chunk the route detects
+        (``_is_codex_pending_approval_chunk``) to pause into ``requires_action``,
+        or ``None`` when the interaction cannot be represented as a card the
+        current renderer can complete (#174 review §1): rather than emit an
+        apparently-actionable card with no answerable control, the interaction is
+        failed closed so the turn ends deterministically.
+
+        The UI-facing ``call_id`` is an OPAQUE per-occurrence id, never the native
+        JSON-RPC request id (#174 review §3), so a stale card can never be matched
+        against a later interaction that reused the native id.
         """
-        request_id = str(interaction.id)
         params = interaction.params if isinstance(interaction.params, dict) else {}
         arguments = interaction_arguments(interaction.method, params)
 
-        client.pending_interaction_id = interaction.id
+        if not _card_is_completable(arguments):
+            # The current AskUserQuestion card only renders option buttons and
+            # requires a selection per question; a free-text / secret / "Other"
+            # / optionless question would render an un-submittable card. Fail
+            # closed instead (a canonical free-text/secret capability is tracked
+            # as review §1 follow-up).
+            await self._fail_interaction_closed(
+                client,
+                interaction,
+                "interaction form not supported by the current UI",
+            )
+            return None
+
+        canonical_id = uuid.uuid4().hex
+        client.pending_interaction_call_id = canonical_id
+        client.pending_interaction_native_id = interaction.id
         client.pending_interaction_method = interaction.method
         client.pending_interaction_params = params
         client.pending_interaction_token = interaction.token
+        client.pending_interaction_generation = interaction.generation
         session.pending_tool_call = {
-            "call_id": request_id,
+            "call_id": canonical_id,
             "name": ASK_USER_QUESTION_TOOL_NAME,
             "arguments": arguments,
             "backend": BACKEND_NAME,
@@ -616,11 +674,13 @@ class AppServerCodexClient(TokenEstimateMixin):
         }
         tool_block = {
             "type": "tool_use",
-            "id": request_id,
+            "id": canonical_id,
             "name": "codex_approval",
             "input": arguments,
             "metadata": {
-                "codex_approval_request_id": request_id,
+                # The canonical (opaque) id the route/UI key on. The native
+                # request id and occurrence token stay private to the adapter.
+                "codex_approval_request_id": canonical_id,
                 "codex_approval_method": interaction.method,
                 "codex_thread_id": str(client.thread_id or ""),
                 "codex_turn_id": str(client.current_turn_id or ""),
@@ -628,11 +688,29 @@ class AppServerCodexClient(TokenEstimateMixin):
         }
         return {"type": "assistant", "content": [tool_block]}
 
+    async def _fail_interaction_closed(
+        self,
+        client: AppServerSessionClient,
+        interaction: PendingInteraction,
+        message: str,
+    ) -> None:
+        try:
+            await client.transport.fail_interaction(
+                interaction.id,
+                generation=client.generation,
+                token=interaction.token,
+                message=message,
+            )
+        except (StaleAnswer, RuntimeLost):
+            pass
+
     def _clear_pending_interaction(self, client: AppServerSessionClient) -> None:
-        client.pending_interaction_id = None
+        client.pending_interaction_call_id = None
+        client.pending_interaction_native_id = None
         client.pending_interaction_method = None
         client.pending_interaction_params = None
         client.pending_interaction_token = None
+        client.pending_interaction_generation = None
 
     def _end_turn(self, client: AppServerSessionClient) -> None:
         """Tear down the per-turn transport view (only at a true terminal)."""
@@ -658,6 +736,53 @@ class AppServerCodexClient(TokenEstimateMixin):
             )
         except (RuntimeLost, RpcError, StaleAnswer, TimeoutError, asyncio.TimeoutError):
             pass
+
+    def update_request_policy(
+        self,
+        client: AppServerSessionClient,
+        *,
+        allowed_tools: Optional[List[str]] = None,
+        disallowed_tools: Optional[List[str]] = None,
+        permission_mode: Optional[str] = None,
+        model_params: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Apply a continuation turn's policy to the reused handle (#174 §6).
+
+        The gateway reuses ``session.client`` across turns, so without this the
+        first turn's ``allowed_tools``/``disallowed_tools``/``permission_mode``/
+        ``model_params`` would stick and a continuation that tightens policy would
+        silently run under the old one. Fail closed (``UnsupportedContinuationPolicy``
+        -> HTTP 400) for any change that cannot be applied safely to a live
+        thread: a deny the runtime can't enforce, or a sandbox change (the
+        sandbox is fixed at ``thread/start`` and cannot be tightened mid-thread).
+        """
+        try:
+            new_policy = resolve_runtime_policy(
+                default_sandbox=sandbox_mode(),
+                default_approval=approval_policy(),
+                permission_mode=permission_mode,
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+            )
+        except CapabilityError as exc:
+            raise UnsupportedContinuationPolicy(str(exc)) from exc
+
+        if new_policy["sandbox"] != client.sandbox:
+            raise UnsupportedContinuationPolicy(
+                "Codex sandbox cannot change mid-session (it is fixed at "
+                f"thread start: {client.sandbox!r} -> {new_policy['sandbox']!r}); "
+                "start a new session to change it"
+            )
+
+        client.allowed_tools = (
+            list(allowed_tools) if allowed_tools is not None else None
+        )
+        client.disallowed_tools = (
+            list(disallowed_tools) if disallowed_tools is not None else None
+        )
+        client.permission_mode = permission_mode
+        client.model_params = dict(model_params) if model_params else None
+        client.approval_policy = new_policy["approvalPolicy"]
 
     # -- non-streaming / background ---------------------------------------
 

@@ -148,6 +148,25 @@ def requested_denies(disallowed_tools: Optional[List[str]]) -> set:
     return denies
 
 
+def _command_execution_denied(
+    allowed_tools: Optional[List[str]],
+    disallowed_tools: Optional[List[str]],
+) -> bool:
+    """Whether the requested policy means to deny built-in command execution.
+
+    True when ``commandExecution`` is disallowed (request or global env) or when
+    an explicit allow-list (including ``allowed_tools=[]`` block-all) omits it.
+    """
+    disallowed = _normalize_tool_names(
+        list(disallowed_tools or []) + _disallowed_from_env()
+    )
+    if "commandExecution" in disallowed:
+        return True
+    if allowed_tools is not None:
+        return "commandExecution" not in _normalize_tool_names(allowed_tools)
+    return False
+
+
 def resolve_runtime_policy(
     *,
     default_sandbox: str,
@@ -159,20 +178,32 @@ def resolve_runtime_policy(
     """Return the Codex ``sandbox`` + ``approvalPolicy`` for the requested policy.
 
     Enforcement paths:
-      * ``filesystem.write`` / ``network`` deny -> ``read-only`` sandbox.
-      * ``shell.execute`` and any named-tool / MCP deny -> the per-tool
-        auto-deny gate (:func:`should_auto_deny_approval`) with
-        ``approvalPolicy`` forced to ``on-request`` so the gate actually runs.
+      * ``filesystem.write`` / ``network`` deny -> ``read-only`` sandbox (a real
+        Codex primitive).
 
-    Fail-closed (§7): if a tool policy exists but the resolved approval policy is
-    still ``never`` — meaning approvals could not be forced on and the auto-deny
-    gate would never run — the session is rejected rather than run with the
-    policy silently bypassed.
+    Fail-closed (§5/§7): a requested deny with no proven enforcement primitive
+    rejects the session (:class:`CapabilityError`) rather than running weakened:
+      * denying built-in **command execution** (``shell.execute`` / ``Bash`` /
+        an allow-list that omits it, incl. ``allowed_tools=[]``). ``on-request``
+        is not a guarantee that every command surfaces an approval before it
+        runs, so it is NOT accepted as a boundary; without an executable
+        tool-disable primitive on the pinned runtime the session is refused.
+      * a tool policy that, after forcing ``on-request``, still resolves to
+        ``never`` (approvals could not be turned on).
     """
     denies = requested_denies(disallowed_tools)
     sandbox = default_sandbox
     if FILESYSTEM_WRITE in denies or NETWORK in denies:
         sandbox = "read-only"
+
+    if _command_execution_denied(allowed_tools, disallowed_tools):
+        raise CapabilityError(
+            "Codex cannot guarantee blocking built-in command execution on this "
+            "runtime (approvalPolicy=on-request is not 'ask before every "
+            "command'); refusing the session rather than running weakened. "
+            "Remove the command/shell deny or use a runtime with an enforceable "
+            "tool-disable primitive."
+        )
 
     tool_policy = has_tool_policy(allowed_tools, disallowed_tools)
     approval = resolve_approval_policy(

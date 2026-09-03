@@ -232,18 +232,25 @@ def test_cached_input_is_not_double_counted_and_reasoning_rolls_into_output():
     assert usage["input_tokens"] + usage["output_tokens"] == 20  # == totalTokens
 
 
-def test_reasoning_summary_delta_is_recognized():
+def test_reasoning_summary_delta_is_dropped_to_avoid_duplication():
+    # The streamer mirrors one thinking delta onto BOTH canonical reasoning
+    # channels, so forwarding the summary stream too would duplicate content
+    # (#174 review §8). Only raw reasoning text is forwarded; summary is dropped.
     mapper = _mapper()
-    chunks = _drain(
-        mapper,
-        "item/reasoning/summaryTextDelta",
-        {"turnId": "turn-1", "delta": "summary..."},
+    assert (
+        _drain(
+            mapper,
+            "item/reasoning/summaryTextDelta",
+            {"turnId": "turn-1", "delta": "summary..."},
+        )
+        == []
     )
-    assert chunks[0]["event"]["type"] == "content_block_start"
-    assert chunks[1]["event"]["delta"] == {
-        "type": "thinking_delta",
-        "thinking": "summary...",
-    }
+    # Raw reasoning text is still mapped to the reasoning (thinking) channel.
+    raw = _drain(
+        mapper, "item/reasoning/textDelta", {"turnId": "turn-1", "delta": "raw..."}
+    )
+    assert raw[0]["event"]["type"] == "content_block_start"
+    assert raw[1]["event"]["delta"] == {"type": "thinking_delta", "thinking": "raw..."}
 
 
 def test_turn_failed_emits_error_chunk_and_is_not_success():

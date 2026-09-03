@@ -31,15 +31,20 @@ from src.backends.appserver.subagents import SubAgentEvent, normalize_subagent_e
 # either visible text (``agentMessage``), reasoning, or accumulation-only.
 TOOL_ITEM_TYPES = {"commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall"}
 
-# Reasoning delta methods (current Codex v2 generated protocol). Raw reasoning
-# text and the reasoning summary both map to the canonical reasoning (thinking)
-# channel; the route emits reasoning_text.delta and reasoning_summary_text.delta
-# together for a thinking delta, so one mapping covers both. Absent from a build
+# Reasoning delta method (current Codex v2 generated protocol). The gateway
+# streamer turns ONE canonical thinking delta into BOTH
+# response.reasoning_text.delta and response.reasoning_summary_text.delta, so if
+# the adapter forwarded both native streams (raw ``item/reasoning/textDelta`` and
+# ``item/reasoning/summaryTextDelta``) each canonical channel would carry the raw
+# text AND the summary -- duplicated/misclassified content (#174 review §8).
+# We therefore forward exactly ONE native stream: raw reasoning text (the
+# complete stream), and deliberately DROP the summary stream. Absent from a build
 # => no reasoning events, which is the correct "do not fake" behavior.
-REASONING_DELTA_METHODS = {
-    "item/reasoning/textDelta",
-    "item/reasoning/summaryTextDelta",
-}
+REASONING_DELTA_METHOD = "item/reasoning/textDelta"
+# Recognized-but-dropped so it is never mistaken for a normal item notification.
+REASONING_SUMMARY_DELTA_METHOD = "item/reasoning/summaryTextDelta"
+REASONING_DELTA_METHODS = {REASONING_DELTA_METHOD}
+_DROPPED_REASONING_METHODS = {REASONING_SUMMARY_DELTA_METHOD}
 
 # Wrapper stream_event helpers -------------------------------------------------
 
@@ -163,6 +168,11 @@ class TurnMapper:
             if isinstance(delta, str) and delta:
                 yield from self._open_reasoning()
                 yield _thinking_delta(delta)
+            return
+
+        if method in _DROPPED_REASONING_METHODS:
+            # Summary reasoning is intentionally dropped: forwarding it too would
+            # duplicate content across both canonical reasoning channels (#174 §8).
             return
 
         if method == "item/started":

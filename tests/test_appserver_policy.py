@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from src.backends.appserver.policy import (
+    CapabilityError,
     has_tool_policy,
     resolve_approval_policy,
     resolve_runtime_policy,
@@ -132,30 +133,34 @@ def test_accept_edits_auto_accepts_file_changes_only():
 # -- capability sandbox (fail closed) ---------------------------------------
 
 
-def test_command_deny_is_enforced_via_auto_deny_not_session_refusal(
-    monkeypatch: pytest.MonkeyPatch,
-):
+def test_command_deny_is_fail_closed_session_refusal(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
-    # Disallowing shell/command does NOT refuse the session; it forces
-    # on-request so the auto-deny gate denies every command approval.
-    policy = resolve_runtime_policy(
-        default_sandbox="workspace-write",
-        default_approval="never",
-        disallowed_tools=["shell.execute"],
-    )
-    assert policy["approvalPolicy"] == "on-request"
-    assert should_auto_deny_approval(
-        COMMAND, {}, allowed_tools=None, disallowed_tools=["shell.execute"]
-    )
+    # on-request is not a proven "ask before every command" boundary, so a
+    # command/shell deny with no enforceable primitive REFUSES the session
+    # (#174 review §5) rather than running weakened.
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            disallowed_tools=["shell.execute"],
+        )
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            disallowed_tools=["Bash"],
+        )
 
 
-def test_block_all_forces_on_request_even_with_never_default():
-    policy = resolve_runtime_policy(
-        default_sandbox="workspace-write",
-        default_approval="never",
-        allowed_tools=[],
-    )
-    assert policy["approvalPolicy"] == "on-request"
+def test_block_all_allow_list_is_fail_closed(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # allowed_tools=[] omits commandExecution -> command denied -> refuse.
+    with pytest.raises(CapabilityError):
+        resolve_runtime_policy(
+            default_sandbox="workspace-write",
+            default_approval="never",
+            allowed_tools=[],
+        )
 
 
 def test_filesystem_write_deny_drops_to_read_only():
@@ -165,3 +170,15 @@ def test_filesystem_write_deny_drops_to_read_only():
         disallowed_tools=["filesystem.write"],
     )
     assert policy["sandbox"] == "read-only"
+
+
+def test_allow_list_including_command_is_accepted(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    # An allow-list that DOES permit command execution is representable; it just
+    # forces on-request so file/MCP approvals can still be gated.
+    policy = resolve_runtime_policy(
+        default_sandbox="workspace-write",
+        default_approval="never",
+        allowed_tools=["Bash", "Read"],
+    )
+    assert policy["approvalPolicy"] == "on-request"

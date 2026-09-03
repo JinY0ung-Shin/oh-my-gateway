@@ -505,16 +505,20 @@ async def test_interaction_parks_as_askuserquestion_then_resumes_same_turn(
         # route-facing pending_tool_call is set for requires_action.
         approval_block = first[-1]["content"][0]
         assert approval_block["name"] == "codex_approval"
-        assert approval_block["metadata"]["codex_approval_request_id"] == "approval-1"
         assert session.pending_tool_call["name"] == "AskUserQuestion"
-        assert session.pending_tool_call["call_id"] == "approval-1"
         assert session.pending_tool_call["codex_resume"] == "approval"
+        # The UI-facing call_id is an OPAQUE per-occurrence id, NOT the native
+        # request id "approval-1" (#174 review §3).
+        canonical_id = session.pending_tool_call["call_id"]
+        assert canonical_id != "approval-1"
+        assert approval_block["metadata"]["codex_approval_request_id"] == canonical_id
         # The subscription persisted across the pause (turn still live).
         assert handle._subscription is not None
 
-        # Answer -> continues the SAME turn to completion.
+        # Answer with the canonical id -> continues the SAME turn to completion.
+        # (transport.answer still writes the native "approval-1" to the wire.)
         second = await _collect(
-            backend.resume_approval_with_client(handle, "approval-1", "accept", session)
+            backend.resume_approval_with_client(handle, canonical_id, "accept", session)
         )
         assert second[-1]["type"] == "result"
         assert second[-1]["result"] == "listed"
@@ -587,9 +591,10 @@ async def test_upstream_resolved_interaction_answer_is_rejected(
     handle = await backend.create_client(session=session)
     try:
         await _collect(backend.run_completion_with_client(handle, "run ls", session))
+        canonical_id = session.pending_tool_call["call_id"]
         # Give the reader a moment to process the resolved notification.
         chunks = await _collect(
-            backend.resume_approval_with_client(handle, "approval-1", "accept", session)
+            backend.resume_approval_with_client(handle, canonical_id, "accept", session)
         )
         assert chunks[-1]["type"] == "error"
         assert "no longer actionable" in chunks[-1]["error_message"]
@@ -663,8 +668,9 @@ async def test_route_aclose_after_park_keeps_turn_live_for_resume(
         # Subscription survived the aclose.
         assert handle._subscription is not None
 
+        canonical_id = session.pending_tool_call["call_id"]
         resumed = await _collect(
-            backend.resume_approval_with_client(handle, "approval-1", "accept", session)
+            backend.resume_approval_with_client(handle, canonical_id, "accept", session)
         )
         assert resumed[-1]["result"] == "ok"
     finally:
@@ -805,14 +811,75 @@ async def test_runtime_loss_terminalizes_open_child_rows(
     assert chunks[-1]["type"] == "error"
 
 
-# -- tool-policy auto-deny at approval time (PR B/#6) ------------------------
+# -- tool policy (#5/#6) -----------------------------------------------------
 
 
-async def test_disallowed_tool_approval_is_auto_denied_not_parked(
+async def test_command_deny_refuses_session_creation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    """A command approval for a disallowed tool is auto-denied by policy before
-    it is ever bridged to the user (no requires_action park)."""
+    """A command/shell deny that the runtime cannot enforce fails closed at
+    session creation (#174 review §5) rather than relying on approvals."""
+    from src.backends.appserver.policy import CapabilityError
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    with pytest.raises(CapabilityError):
+        await backend.create_client(session=session, disallowed_tools=["Bash"])
+
+
+async def test_update_request_policy_applies_and_rejects_unsafe_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The reused handle must not run stale policy across turns (#174 review §6):
+    update_request_policy applies a safe change and fails closed on one that
+    cannot be applied to a live thread."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(
+        session=session, permission_mode="bypassPermissions"
+    )
+    try:
+        assert handle.approval_policy == "never"
+        # A safe change (tighten approvals, new model params) is applied in place.
+        backend.update_request_policy(
+            handle,
+            allowed_tools=None,
+            disallowed_tools=None,
+            permission_mode="default",
+            model_params={"temperature": 0.1},
+        )
+        assert handle.approval_policy == "on-request"
+        assert handle.permission_mode == "default"
+        assert handle.model_params == {"temperature": 0.1}
+        # A continuation that denies command execution cannot be enforced -> 400.
+        with pytest.raises(UnsupportedContinuationPolicy):
+            backend.update_request_policy(
+                handle,
+                allowed_tools=None,
+                disallowed_tools=["Bash"],
+                permission_mode="default",
+                model_params=None,
+            )
+    finally:
+        await handle.disconnect()
+
+
+async def test_optionless_user_input_is_failed_closed_not_parked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A requestUserInput whose question has no options (free-text/secret) cannot
+    be rendered as a completable card, so it is failed closed rather than emitted
+    as a dead requires_action card (#174 review §1)."""
     turn_step = {
         "expect_method": "turn/start",
         "actions": [
@@ -820,14 +887,28 @@ async def test_disallowed_tool_approval_is_auto_denied_not_parked(
                 "type": "response",
                 "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
             },
-            _approval_request(),  # item/commandExecution/requestApproval
+            _message(
+                {
+                    "id": "ui-1",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "itemId": "i1",
+                        "isBlocking": True,
+                        "questions": [
+                            {"id": "q1", "question": "Enter your name", "options": []}
+                        ],
+                    },
+                }
+            ),
         ],
     }
-    # The auto-deny answer ({"id":"approval-1","result":{"decision":"decline"}})
-    # is the next stdin line; then the turn completes.
+    # The fail-closed answer is a JSON-RPC error for ui-1; then the turn completes.
     answer_step = {
-        "expect_id": "approval-1",
+        "expect_id": "ui-1",
         "expect_has_id": True,
+        "expect_has_error": True,
         "actions": [
             _message(
                 {
@@ -841,21 +922,17 @@ async def test_disallowed_tool_approval_is_auto_denied_not_parked(
         tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
     )
     _install_argv(monkeypatch, scenario)
-    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
     backend = AppServerCodexClient()
     session = _session()
 
-    # Disallow the command tool -> its approval must be auto-denied.
-    handle = await backend.create_client(session=session, disallowed_tools=["Bash"])
+    handle = await backend.create_client(session=session)
     try:
-        # Approval policy was forced to on-request so the gate runs.
-        assert handle.approval_policy == "on-request"
         chunks = await _collect(
-            backend.run_completion_with_client(handle, "run ls", session)
+            backend.run_completion_with_client(handle, "hi", session)
         )
     finally:
         await handle.disconnect()
 
-    # No park happened: the turn ran to completion and no pending_tool_call is set.
+    # No dead card was emitted; the turn ended normally.
     assert getattr(session, "pending_tool_call", None) in (None, {})
     assert chunks[-1]["type"] == "result"
