@@ -358,6 +358,37 @@ def test_move_traversal_blocked(client, workspace):
     assert (workspace / "notes.txt").exists()  # unchanged
 
 
+def test_move_overwrites_by_default_preserving_filenav_contract(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin"},
+    )
+    assert r.status_code == 200
+    assert (workspace / "blob.bin").read_text() == "hello\nworld\n"
+
+
+def test_move_no_clobber_refuses_existing_destination(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin", "no_clobber": True},
+    )
+    assert r.status_code == 409
+    assert (workspace / "notes.txt").exists()  # source untouched
+    assert (workspace / "blob.bin").read_bytes() == b"\xff\xfe\x00\x01binary"
+
+
+def test_move_no_clobber_still_moves_to_free_name(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/renamed.txt", "no_clobber": True},
+    )
+    assert r.status_code == 200
+    assert (workspace / "renamed.txt").read_text() == "hello\nworld\n"
+
+
 def test_copy_duplicates_file(client, workspace):
     r = client.post(
         "/files/copy",

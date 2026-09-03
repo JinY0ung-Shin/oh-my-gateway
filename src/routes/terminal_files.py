@@ -79,6 +79,12 @@ class _PathBody(BaseModel):
 class _MoveBody(BaseModel):
     source: str
     destination: str
+    # Opt-in atomic no-overwrite for move: the default (False) keeps the
+    # historical FileNav contract where move silently replaces the
+    # destination. A file manager that resolves name conflicts client-side
+    # sets True so a file appearing between its listing and the move gets a
+    # 409 instead of being clobbered (copy already refuses unconditionally).
+    no_clobber: bool = False
 
 
 class _ArchiveBody(BaseModel):
@@ -579,6 +585,12 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="source not found")
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
+    # Checked server-side at execution time: this closes the client's
+    # list-then-move round-trip race (the practical TOCTOU window); a
+    # same-instant local write can still slip in, as POSIX rename offers no
+    # portable no-replace for directories.
+    if body.no_clobber and dst.exists():
+        raise HTTPException(status_code=409, detail="destination already exists")
     await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
 
