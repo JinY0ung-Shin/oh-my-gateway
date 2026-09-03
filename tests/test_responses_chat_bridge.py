@@ -187,7 +187,7 @@ def test_tool_result_starts_a_fresh_assistant_block():
     assert out["messages"][2]["tool_calls"][0]["id"] == "c2"
 
 
-def test_function_call_output_array_extracts_text_and_counts_non_text():
+def test_function_call_output_text_only_array_collapses_to_string():
     out = responses_request_to_chat_body(
         {
             "input": [
@@ -195,8 +195,8 @@ def test_function_call_output_array_extracts_text_and_counts_non_text():
                     "type": "function_call_output",
                     "call_id": "c1",
                     "output": [
-                        {"type": "output_text", "text": "result"},
-                        {"type": "input_image", "image_url": "data:..."},
+                        {"type": "output_text", "text": "part-a "},
+                        {"type": "output_text", "text": "part-b"},
                     ],
                 }
             ]
@@ -204,8 +204,69 @@ def test_function_call_output_array_extracts_text_and_counts_non_text():
     )
     tool_msg = out["messages"][0]
     assert tool_msg["role"] == "tool" and tool_msg["tool_call_id"] == "c1"
-    assert "result" in tool_msg["content"]
-    assert "1 non-text tool output part" in tool_msg["content"]
+    assert tool_msg["content"] == "part-a part-b"
+
+
+def test_function_call_output_with_image_part_is_refused():
+    # Codex view_image / image-gen tools return an input_image data URL. A chat
+    # role:"tool" message is text-only, so refuse rather than drop the image
+    # behind a placeholder -- the model would otherwise act on an emptier tool
+    # result than the tool produced (round-3 finding 1).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "c1",
+                        "output": [
+                            {"type": "output_text", "text": "result"},
+                            {"type": "input_image", "image_url": "data:..."},
+                        ],
+                    }
+                ]
+            }
+        )
+
+
+def test_function_call_output_with_unknown_part_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {
+                        "type": "function_call_output",
+                        "call_id": "c1",
+                        "output": [{"type": "some_new_part", "data": {}}],
+                    }
+                ]
+            }
+        )
+
+
+def test_function_call_output_without_call_id_is_refused():
+    # A tool result with no correlation id has no assistant tool call to attach
+    # to; refuse rather than emit an empty tool_call_id (round-3 finding 2).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "function_call_output", "output": "ok"}]}
+        )
+
+
+def test_function_call_without_name_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "function_call", "call_id": "c1", "arguments": "{}"}]}
+        )
+
+
+def test_function_call_without_call_id_is_refused():
+    # Missing call_id/id -> no correlation id; refuse rather than synthesize one
+    # that no tool result can match (round-3 finding 2).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "function_call", "name": "a", "arguments": "{}"}]}
+        )
 
 
 # -- multimodal input --------------------------------------------------------
@@ -592,12 +653,12 @@ def test_reasoning_effort_above_vocabulary_is_clamped():
     assert out["reasoning_effort"] == "high"
 
 
-def test_unknown_reasoning_effort_is_dropped():
-    out = responses_request_to_chat_body(
-        {"input": "x", "reasoning": {"effort": "bogus"}}
-    )
-    assert "reasoning_effort" not in out
-    assert "allowed_openai_params" not in out
+def test_unknown_reasoning_effort_is_refused():
+    # An off-ladder effort has no deterministic mapping; refuse rather than drop
+    # the caller's reasoning constraint and silently run at backend default
+    # effort (round-3 finding 4).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "reasoning": {"effort": "bogus"}})
 
 
 def test_no_reasoning_omits_both_keys():
@@ -646,6 +707,26 @@ def test_normalize_asis_passes_through():
     assert normalize_system_messages(msgs, "asis") is msgs
 
 
+def test_normalize_reject_policy_raises_when_rewrite_needed():
+    msgs = [{"role": "user", "content": "u"}, {"role": "system", "content": "s"}]
+    with pytest.raises(BridgeCapabilityError):
+        normalize_system_messages(msgs, "reject")
+
+
+def test_normalize_reject_policy_passes_valid_placement():
+    # A single leading system message needs no rewrite -> accepted, not raised.
+    msgs = [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]
+    assert normalize_system_messages(msgs, "reject") is msgs
+
+
+def test_normalize_unknown_policy_does_not_demote_it_rejects():
+    # An unrecognized policy must take the fail-closed reject path, never a
+    # silent demote (round-3 finding 3).
+    msgs = [{"role": "user", "content": "u"}, {"role": "system", "content": "s"}]
+    with pytest.raises(BridgeCapabilityError):
+        normalize_system_messages(msgs, "bogus-policy")
+
+
 def test_normalize_model_gate_skips_non_matching_model():
     msgs = [{"role": "user", "content": "u"}, {"role": "system", "content": "s"}]
     pattern = re.compile(r"qwen3\.\d", re.IGNORECASE)
@@ -661,8 +742,38 @@ def test_normalize_model_gate_skips_non_matching_model():
     assert rewritten[1]["role"] == "user"
 
 
-def test_request_applies_mid_system_gate(monkeypatch: pytest.MonkeyPatch):
-    # With a qwen3.x model the mid-array system reminder is demoted to user.
+def test_request_default_policy_refuses_mid_system_for_gated_model():
+    # Default policy is fail-closed reject: a qwen3.x model with a mid-array
+    # system reminder is refused, not silently demoted (round-3 finding 3).
+    body = {
+        "model": "qwen3.5-8b",
+        "input": [
+            {"type": "message", "role": "user", "content": "u"},
+            {"type": "message", "role": "system", "content": "reminder"},
+        ],
+    }
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(body)
+
+
+def test_request_default_policy_passes_non_matching_model():
+    # A non-matching model is not gated, so the mid-array system stays system.
+    body = {
+        "model": "gpt-4o",
+        "input": [
+            {"type": "message", "role": "user", "content": "u"},
+            {"type": "message", "role": "system", "content": "reminder"},
+        ],
+    }
+    out = responses_request_to_chat_body(body)
+    assert out["messages"][1]["role"] == "system"
+
+
+def test_request_user_policy_opt_in_demotes_mid_system(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    # The demote rewrite is now an explicit opt-in.
+    monkeypatch.setenv("CODEX_BRIDGE_MID_SYSTEM_POLICY", "user")
     body = {
         "model": "qwen3.5-8b",
         "input": [
@@ -672,7 +783,49 @@ def test_request_applies_mid_system_gate(monkeypatch: pytest.MonkeyPatch):
     }
     out = responses_request_to_chat_body(body)
     assert out["messages"][1]["role"] == "user"
-    # A non-matching model leaves it as system.
-    body["model"] = "gpt-4o"
-    out2 = responses_request_to_chat_body(body)
-    assert out2["messages"][1]["role"] == "system"
+
+
+def test_request_default_policy_allows_single_leading_system_for_gated_model():
+    # A single leading system message needs no rewrite, so the fail-closed
+    # default accepts it even for a gated model.
+    body = {
+        "model": "qwen3.5-8b",
+        "instructions": "lead",
+        "input": [{"type": "message", "role": "user", "content": "u"}],
+    }
+    out = responses_request_to_chat_body(body)
+    assert out["messages"][0] == {"role": "system", "content": "lead"}
+    assert out["messages"][1]["role"] == "user"
+
+
+# -- malformed request shapes fail closed (round-3 finding 4) ----------------
+
+
+def test_non_list_non_string_input_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": {"role": "user"}})
+
+
+def test_non_object_input_item_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": ["bare string"]})
+
+
+def test_non_string_text_content_payload_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": 123}],
+                    }
+                ]
+            }
+        )
+
+
+def test_present_non_object_text_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "text": "structured"})

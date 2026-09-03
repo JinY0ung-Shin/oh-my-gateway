@@ -16,6 +16,8 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+from .errors import BridgeCapabilityError
+
 # Separator between two MERGED system messages: each is an independent
 # instruction block, unlike the fragments within one message's content.
 _MERGE_SEPARATOR = "\n\n"
@@ -45,6 +47,16 @@ def _merge_texts(texts: list[str]) -> str:
 
 def _is_system(message: Any) -> bool:
     return isinstance(message, dict) and message.get("role") == "system"
+
+
+def _needs_system_rewrite(messages: list[dict]) -> bool:
+    """Whether a strict template would 400 on this system-message placement.
+
+    True iff any ``system`` message sits past index 0 (which also covers the
+    >1-system case, since a second system message cannot also be at index 0).
+    A single leading system message, or none, is accepted as-is.
+    """
+    return any(_is_system(message) for message in messages[1:])
 
 
 def _hoist(messages: list[dict]) -> list[dict]:
@@ -103,10 +115,13 @@ def normalize_system_messages(
     missing/non-string model therefore passes through). ``None`` normalizes
     unconditionally (how the unit tests exercise the policies).
 
-    Policies: ``user`` (default) merges the leading system run + role-swaps later
-    system messages to ``user`` in place; ``hoist`` merges ALL system text into
-    one leading system message; ``asis`` passes through. Any unrecognized policy
-    takes the ``user`` path. Never mutates the input.
+    Policies: ``reject`` (default) refuses (:class:`BridgeCapabilityError`) a
+    gated request whose system placement would 400, rather than lowering a
+    later ``system`` instruction's authority; ``user`` merges the leading
+    system run + role-swaps later system messages to ``user`` in place;
+    ``hoist`` merges ALL system text into one leading system message; ``asis``
+    passes through. Any UNRECOGNIZED policy takes the ``reject`` path -- it
+    never silently demotes. Never mutates the input.
     """
     if model_pattern is not None and not (
         isinstance(model, str) and model_pattern.search(model)
@@ -116,4 +131,17 @@ def normalize_system_messages(
         return messages
     if policy == "hoist":
         return _hoist(messages)
-    return _demote_to_user(messages)
+    if policy == "user":
+        return _demote_to_user(messages)
+    # ``reject`` and any unrecognized policy: fail closed. Passing through a
+    # system message that a strict template rejects would 400, and demoting it
+    # to ``user`` would lower its authority -- so refuse only when a rewrite is
+    # actually required, leaving already-valid placement untouched.
+    if _needs_system_rewrite(messages):
+        raise BridgeCapabilityError(
+            "a later 'system' message cannot be represented for this model "
+            "without lowering its authority; the default fail-closed policy "
+            "refuses it (set CODEX_BRIDGE_MID_SYSTEM_POLICY=user|hoist to opt "
+            "into an explicit rewrite, or asis to pass through unchanged)"
+        )
+    return messages

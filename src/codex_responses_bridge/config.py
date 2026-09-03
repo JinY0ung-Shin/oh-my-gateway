@@ -55,8 +55,18 @@ def reasoning_effort_levels() -> Optional[frozenset[str]]:
 
 
 def mid_system_policy() -> str:
-    """``user`` | ``hoist`` | ``asis`` (default ``user``); see system_norm.py."""
-    return os.getenv("CODEX_BRIDGE_MID_SYSTEM_POLICY", "user").strip().lower() or "user"
+    """``reject`` | ``user`` | ``hoist`` | ``asis`` (default ``reject``).
+
+    The default is fail-closed: for a gated model whose system messages would
+    have to be rewritten, the request is refused rather than silently lowering
+    a later ``system`` instruction's authority to ``user``. ``user``/``hoist``/
+    ``asis`` are explicit operator opt-ins (see system_norm.py). An unrecognized
+    value takes the ``reject`` path, never a silent demote.
+    """
+    return (
+        os.getenv("CODEX_BRIDGE_MID_SYSTEM_POLICY", "reject").strip().lower()
+        or "reject"
+    )
 
 
 def mid_system_model_regex() -> Optional[re.Pattern[str]]:

@@ -15,7 +15,6 @@ certification are separate checkpoint-2 work.
 from __future__ import annotations
 
 import json
-import uuid
 from typing import Any, Optional
 
 from .config import (
@@ -75,9 +74,16 @@ def _content_to_chat(content: Any, role: str) -> Any:
         ptype = part.get("type")
         if ptype in ("input_text", "output_text", "text"):
             t = part.get("text")
-            if isinstance(t, str):
-                text_parts.append(t)
-                multimodal.append({"type": "text", "text": t})
+            if not isinstance(t, str):
+                # A text part whose payload is absent or non-string is
+                # malformed; refuse rather than drop it (a dropped text part
+                # silently shortens the message the model sees).
+                raise BridgeCapabilityError(
+                    f"{ptype!r} content part has a non-string 'text' payload "
+                    f"({type(t).__name__}); refusing rather than dropping it"
+                )
+            text_parts.append(t)
+            multimodal.append({"type": "text", "text": t})
         elif ptype == "input_image":
             url = part.get("image_url")
             if isinstance(url, dict):
@@ -103,8 +109,12 @@ def _content_to_chat(content: Any, role: str) -> Any:
             multimodal.append({"type": "image_url", "image_url": img})
         elif ptype == "refusal":
             t = part.get("refusal")
-            if isinstance(t, str):
-                text_parts.append(t)
+            if not isinstance(t, str):
+                raise BridgeCapabilityError(
+                    "'refusal' content part has a non-string 'refusal' payload "
+                    f"({type(t).__name__}); refusing rather than dropping it"
+                )
+            text_parts.append(t)
         else:
             # An unknown content-part type (a new/privileged part upstream may
             # add) must not silently disappear -- refuse rather than degrade.
@@ -138,7 +148,13 @@ def _input_to_messages(input_data: Any) -> list[dict]:
     if isinstance(input_data, str):
         return [{"role": "user", "content": input_data}]
     if not isinstance(input_data, list):
-        return []
+        # ``input`` is either a string or an item array; anything else is
+        # malformed. Refuse rather than silently produce an empty message list
+        # (which would run a contentless request the caller never intended).
+        raise BridgeCapabilityError(
+            "Responses 'input' must be a string or a list, got "
+            f"{type(input_data).__name__}"
+        )
 
     messages: list[dict] = []
     # The assistant message currently accumulating tool_calls, or None. Reset by
@@ -148,7 +164,12 @@ def _input_to_messages(input_data: Any) -> list[dict]:
 
     for item in input_data:
         if not isinstance(item, dict):
-            continue
+            # A non-object input item has no representable shape; refuse rather
+            # than skip it (a skipped item silently drops conversation/tool
+            # state the follow-up turn may depend on).
+            raise BridgeCapabilityError(
+                "Responses input item must be an object, got " f"{type(item).__name__}"
+            )
         itype = item.get("type")
         if itype in (None, "message"):
             if "role" not in item:
@@ -163,15 +184,34 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                 {"role": role, "content": _content_to_chat(item.get("content"), role)}
             )
         elif itype == "function_call":
+            name = item.get("name")
+            if not isinstance(name, str) or not name:
+                # A tool call with no function name cannot be routed to a tool;
+                # refuse rather than emit an empty name the backend would reject
+                # or misroute.
+                raise BridgeCapabilityError(
+                    "Responses 'function_call' item is missing its function "
+                    "'name'; refusing rather than emitting an unnamed tool call"
+                )
+            call_id = item.get("call_id") or item.get("id")
+            if not isinstance(call_id, str) or not call_id:
+                # The chat contract correlates a tool result to its call by id.
+                # Synthesizing one here would not match the result's
+                # ``tool_call_id`` (that comes from the caller's own item), so a
+                # missing id is a real correlation gap -- refuse rather than
+                # invent an id that lines up with nothing.
+                raise BridgeCapabilityError(
+                    "Responses 'function_call' item is missing its 'call_id'/"
+                    "'id'; refusing rather than synthesizing a correlation id "
+                    "that no tool result can match"
+                )
             args = item.get("arguments")
             if not isinstance(args, str):
                 args = json.dumps(args or {}, ensure_ascii=False)
             tool_call = {
-                "id": item.get("call_id")
-                or item.get("id")
-                or f"call_{uuid.uuid4().hex[:16]}",
+                "id": call_id,
                 "type": "function",
-                "function": {"name": item.get("name") or "", "arguments": args},
+                "function": {"name": name, "arguments": args},
             }
             if pending is None:
                 if (
@@ -192,34 +232,56 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                 pending["tool_calls"].append(tool_call)
         elif itype == "function_call_output":
             pending = None
+            call_id = item.get("call_id")
+            if not isinstance(call_id, str) or not call_id:
+                # A tool result with no correlation id cannot be attached to the
+                # assistant tool call that produced it; the chat contract rejects
+                # a ``role:"tool"`` message whose ``tool_call_id`` matches no
+                # prior call. Refuse rather than emit an empty id.
+                raise BridgeCapabilityError(
+                    "Responses 'function_call_output' item is missing its "
+                    "'call_id'; refusing rather than emitting a tool result that "
+                    "correlates to no tool call"
+                )
             out = item.get("output", "")
             if isinstance(out, list):
-                # A chat ``role:"tool"`` message is text-only; collapse text
-                # parts and count non-text ones (Codex view_image returns an
-                # ``input_image`` data URL) so the model sees an explanation, not
-                # an empty result.
+                # A chat ``role:"tool"`` message is text-only. A non-text output
+                # part (Codex ``view_image``/image-gen return an ``input_image``
+                # data URL, and structured parts carry model-visible payload)
+                # has no faithful text-only representation, so refuse rather than
+                # drop it behind a placeholder -- the model would otherwise act
+                # on a materially emptier tool result than the tool produced.
                 texts: list[str] = []
-                omitted = 0
                 for p in out:
                     if not isinstance(p, dict):
-                        continue
+                        raise BridgeCapabilityError(
+                            "'function_call_output' has a non-object output "
+                            "part; refusing rather than dropping it"
+                        )
                     if p.get("type") in ("output_text", "text", "input_text"):
-                        texts.append(p.get("text", ""))
+                        t = p.get("text")
+                        if not isinstance(t, str):
+                            raise BridgeCapabilityError(
+                                "'function_call_output' text part has a "
+                                f"non-string 'text' payload ({type(t).__name__})"
+                                "; refusing rather than dropping it"
+                            )
+                        texts.append(t)
                     else:
-                        omitted += 1
+                        raise BridgeCapabilityError(
+                            "'function_call_output' carries a non-text output "
+                            f"part {p.get('type')!r} (e.g. an image); it has no "
+                            "text-only chat/completions representation and is "
+                            "refused rather than dropped -- the tool result would "
+                            "otherwise lose model-visible payload"
+                        )
                 out = "".join(texts)
-                if omitted:
-                    placeholder = (
-                        f"[{omitted} non-text tool output part(s) omitted: "
-                        "tool results reach this model as text only]"
-                    )
-                    out = f"{out}\n{placeholder}" if out else placeholder
             elif not isinstance(out, str):
                 out = json.dumps(out, ensure_ascii=False)
             messages.append(
                 {
                     "role": "tool",
-                    "tool_call_id": item.get("call_id") or "",
+                    "tool_call_id": call_id,
                     "content": out,
                 }
             )
@@ -397,8 +459,16 @@ def _text_format_to_response_format(text: Any) -> Optional[dict]:
     being dropped, which would turn a constrained (structured-output) request
     into an unconstrained completion.
     """
-    if not isinstance(text, dict):
+    if text is None:
         return None
+    if not isinstance(text, dict):
+        # ``text`` is absent (handled above) or an object; a present non-object
+        # value is malformed. Refuse rather than treat it as absent -- a
+        # structured-output constraint could be hiding in a shape we do not
+        # understand.
+        raise BridgeCapabilityError(
+            f"Responses 'text' must be an object, got {type(text).__name__}"
+        )
     fmt = text.get("format")
     if fmt is None:
         return None
@@ -464,13 +534,24 @@ def responses_request_to_chat_body(
     if isinstance(reasoning, dict) and reasoning.get("effort"):
         # Clamp Codex's ladder to the backend vocabulary; ``allowed_openai_params``
         # is LiteLLM's per-request escape hatch so the value is forwarded verbatim
-        # instead of being dropped for non-reasoning models.
+        # instead of being dropped for non-reasoning models. A known ladder value
+        # maps deterministically to the nearest allowed level; a present effort
+        # with no representable mapping (an unknown/off-ladder name, a non-string
+        # value, or a vocabulary that clamps to nothing) is refused rather than
+        # dropped -- silently omitting it would run the turn at the backend's
+        # default effort while the caller believes they constrained it.
         effort = clamp_reasoning_effort(
             reasoning.get("effort"), reasoning_effort_levels()
         )
-        if effort is not None:
-            out["reasoning_effort"] = effort
-            out["allowed_openai_params"] = ["reasoning_effort"]
+        if effort is None:
+            raise BridgeCapabilityError(
+                f"reasoning.effort {reasoning.get('effort')!r} has no "
+                "representable chat/completions mapping (unknown ladder value or "
+                "empty backend vocabulary); refusing rather than dropping the "
+                "caller's reasoning-effort constraint"
+            )
+        out["reasoning_effort"] = effort
+        out["allowed_openai_params"] = ["reasoning_effort"]
 
     user = body.get("user") or body.get("safety_identifier")
     if user:
