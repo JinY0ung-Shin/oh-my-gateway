@@ -358,6 +358,83 @@ def test_move_traversal_blocked(client, workspace):
     assert (workspace / "notes.txt").exists()  # unchanged
 
 
+def test_copy_duplicates_file(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/notes copy.txt"},
+    )
+    assert r.status_code == 200
+    assert r.json()["type"] == "file"
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"  # source untouched
+    assert (workspace / "notes copy.txt").read_text() == "hello\nworld\n"
+
+
+def test_copy_duplicates_directory_recursively(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub copy"},
+    )
+    assert r.status_code == 200
+    assert r.json()["type"] == "directory"
+    assert (workspace / "sub" / "inner.md").exists()  # source untouched
+    assert (workspace / "sub copy" / "inner.md").read_text() == "# inner"
+
+
+def test_copy_refuses_existing_destination(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin"},
+    )
+    assert r.status_code == 409
+    assert (workspace / "blob.bin").read_bytes() == b"\xff\xfe\x00\x01binary"  # untouched
+
+
+def test_copy_refuses_directory_into_itself(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub/nested"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "sub" / "nested").exists()
+
+
+def test_copy_missing_source_is_404(client):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/nope.txt", "destination": "/copy.txt"},
+    )
+    assert r.status_code == 404
+
+
+def test_copy_traversal_blocked(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/../secret.txt", "destination": "/stolen.txt"},
+    )
+    assert r.status_code in (400, 403)
+    assert not (workspace / "stolen.txt").exists()
+
+
+def test_copy_does_not_follow_symlinks_inside_tree(client, workspace, tmp_path):
+    (workspace / "linked").mkdir()
+    link = workspace / "linked" / "out"
+    link.symlink_to(workspace.parent.parent / "secret.txt")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/linked", "destination": "/linked copy"},
+    )
+    assert r.status_code == 200
+    copied = workspace / "linked copy" / "out"
+    assert copied.is_symlink()  # preserved as a link, content not duplicated
+
+
 def test_archive_zips_selection(client):
     r = client.post(
         "/files/archive",

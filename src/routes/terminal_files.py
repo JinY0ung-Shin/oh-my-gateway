@@ -18,6 +18,7 @@ Contract (what FileNav calls):
 - ``POST /files/mkdir``  {path}       -> ``{path}``
 - ``DELETE /files/delete?path=<p>``   -> ``{path,type}``
 - ``POST /files/move``  {source,destination} -> ``{source,destination}``
+- ``POST /files/copy``  {source,destination} -> ``{source,destination,type}``
 - ``POST /files/archive`` {paths}     -> zip stream
 
 Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
@@ -580,6 +581,52 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="destination directory not found")
     await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
+
+
+@router.post("/files/copy")
+async def copy_entry(
+    request: Request,
+    body: _MoveBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Duplicate a file or directory inside the workspace.
+
+    Unlike ``move``, the destination must not already exist: the file-manager
+    client resolves name conflicts itself (VS Code-style ``name copy.ext``), so
+    a collision reaching this endpoint is a race we refuse rather than resolve
+    by silently overwriting someone's file.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    src = _resolve_or_403(root, body.source)
+    dst = _resolve_or_403(root, body.destination)
+    if src == root.resolve() or dst == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source not found")
+    if dst.exists():
+        raise HTTPException(status_code=409, detail="destination already exists")
+    if not dst.parent.is_dir():
+        raise HTTPException(status_code=404, detail="destination directory not found")
+    is_dir = src.is_dir() and not src.is_symlink()
+    if is_dir:
+        # Copying a directory into its own subtree would recurse forever.
+        if dst == src or src in dst.parents:
+            raise HTTPException(status_code=400, detail="cannot copy a directory into itself")
+        # symlinks=True copies links as links instead of following them — a
+        # link inside the tree may point outside the workspace root, and
+        # following it here would duplicate foreign content into the workspace.
+        await run_in_threadpool(
+            shutil.copytree, str(src), str(dst), symlinks=True
+        )
+    else:
+        await run_in_threadpool(shutil.copy2, str(src), str(dst))
+    return {
+        "source": body.source,
+        "destination": body.destination,
+        "type": "directory" if is_dir else "file",
+    }
 
 
 @router.post("/files/archive")
