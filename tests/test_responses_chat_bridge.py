@@ -685,6 +685,104 @@ def test_non_list_tools_is_refused():
         responses_request_to_chat_body({"input": "x", "tools": {"type": "function"}})
 
 
+# -- nested tool-object contract fails closed (round-7 finding) ---------------
+
+
+def test_namespace_custom_freeform_tool_is_refused():
+    # A custom/freeform tool has its own invocation grammar; it must never be
+    # coerced into a JSON function with empty parameters.
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "ns",
+                        "tools": [
+                            {
+                                "type": "custom",
+                                "name": "apply_patch",
+                                "description": "Apply a patch",
+                                "format": {"type": "grammar", "definition": "..."},
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_unknown_namespace_inner_tool_type_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "ns",
+                        "tools": [{"type": "widget", "name": "w"}],
+                    }
+                ],
+            }
+        )
+
+
+def test_top_level_function_defer_loading_is_refused():
+    # Lazy/deferred exposure has no equivalent here; emitting the tool eagerly
+    # would broaden the model-visible tool set -> refuse.
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [{"type": "function", "name": "f", "defer_loading": True}],
+            }
+        )
+
+
+def test_namespaced_function_defer_loading_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "ns",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "f",
+                                "defer_loading": True,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+
+
+def test_function_defer_loading_false_is_accepted():
+    out = responses_request_to_chat_body(
+        {
+            "input": "x",
+            "tools": [{"type": "function", "name": "f", "defer_loading": False}],
+        }
+    )
+    assert out["tools"][0]["function"]["name"] == "f"
+
+
+def test_unknown_function_tool_field_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [{"type": "function", "name": "f", "mystery": 1}],
+            }
+        )
+
+
 def test_namespace_map_refuses_collision_consistently():
     tools = [
         {

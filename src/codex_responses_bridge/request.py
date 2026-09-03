@@ -19,9 +19,15 @@ certification (checkpoint-2):**
 * **Active provider controls.** Consumed request fields are accepted only for
   their proven-neutral value (e.g. ``store:false``, empty ``include``, default
   ``service_tier``, absent ``reasoning.summary``/``reasoning.context``,
-  ``text.verbosity:"medium"``, no ``access_programs``). A known field carrying a
-  non-neutral value is refused rather than silently erased, because certifying
-  its faithful translation needs the real backend.
+  ``text.verbosity:"medium"``, no ``access_programs``, absent/empty
+  ``stream_options``). A known field carrying a non-neutral value is refused
+  rather than silently erased, because certifying its faithful translation needs
+  the real backend.
+* **Custom/freeform + deferred tools.** A ``custom``/freeform tool carries its
+  own invocation grammar and is refused rather than coerced into JSON-function
+  calling; ``defer_loading:true`` (lazy tool exposure) is refused rather than
+  emitted eagerly. Function-tool objects have their own field contract, so an
+  unknown tool field fails loudly like the request boundary does.
 
 So "request translation" here means the request SHAPE this slice proves it can
 carry, not the full current-Codex request surface -- the remaining fields fail
@@ -452,6 +458,50 @@ def _input_to_messages(input_data: Any) -> list[dict]:
     return messages
 
 
+# Fields a Responses FUNCTION tool object may carry. ``defer_loading`` is a
+# current-Codex control (tool-search sets it) and is validated by value, not
+# ignored. Anything outside this set is an unknown tool semantic -> refused, so a
+# future tool field cannot silently disappear (same rule as the request boundary).
+_FUNCTION_TOOL_FIELDS = frozenset(
+    {"type", "function", "name", "description", "parameters", "strict", "defer_loading"}
+)
+_FUNCTION_TOOL_INNER_FIELDS = frozenset({"name", "description", "parameters", "strict"})
+
+
+def _assert_function_tool_contract(t: Any, source: str) -> None:
+    """Fail closed on a function tool carrying an unknown or active-control field.
+
+    ``defer_loading=true`` is deferred/lazy exposure with no equivalent on this
+    provider path, so eagerly emitting the tool would broaden the model-visible
+    tool set -- refuse it (``None``/``false`` is the neutral form). An unknown
+    top-level or nested ``function`` field is refused rather than ignored.
+    """
+    if not isinstance(t, dict):
+        raise BridgeCapabilityError(f"{source} must be an object")
+    unknown = sorted(set(t) - _FUNCTION_TOOL_FIELDS)
+    if unknown:
+        raise BridgeCapabilityError(
+            f"{source} carries unsupported field(s) {unknown}; refusing rather "
+            "than ignoring a tool control that may change its semantics"
+        )
+    if t.get("defer_loading"):
+        raise BridgeCapabilityError(
+            f"{source} sets defer_loading=true (deferred/lazy exposure); this "
+            "provider path has no equivalent, so refusing rather than exposing "
+            "the tool eagerly"
+        )
+    fn = t.get("function")
+    if fn is not None:
+        if not isinstance(fn, dict):
+            raise BridgeCapabilityError(f"{source} 'function' must be an object")
+        inner_unknown = sorted(set(fn) - _FUNCTION_TOOL_INNER_FIELDS)
+        if inner_unknown:
+            raise BridgeCapabilityError(
+                f"{source} function object carries unsupported field(s) "
+                f"{inner_unknown}; refusing rather than ignoring a tool control"
+            )
+
+
 def _function_tool_to_chat(t: Any) -> Optional[dict]:
     """Translate one Responses function tool to a chat ``{type, function}`` dict.
 
@@ -535,6 +585,7 @@ def _translate_tools(tools: Any) -> tuple[list[dict], dict[str, str]]:
             raise BridgeCapabilityError("each Responses tool must be an object")
         ttype = t.get("type")
         if ttype == "function":
+            _assert_function_tool_contract(t, "function tool")
             _emit(_function_tool_to_chat(t), source="function tool", namespace=None)
         elif ttype == "namespace":
             if not flatten:
@@ -547,6 +598,31 @@ def _translate_tools(tools: Any) -> tuple[list[dict], dict[str, str]]:
             if not isinstance(ns, str) or not ns:
                 raise BridgeCapabilityError("namespace tool is missing its name")
             for inner in t.get("tools") or []:
+                if not isinstance(inner, dict):
+                    raise BridgeCapabilityError(
+                        f"inner tool of namespace '{ns}' must be an object"
+                    )
+                itype = inner.get("type")
+                if itype == "custom":
+                    # A ``custom``/freeform tool carries its OWN invocation
+                    # grammar (``format``); coercing it into a JSON-argument
+                    # function would change the tool's calling contract. No
+                    # certified chat representation in PR-1 -> refuse.
+                    raise BridgeCapabilityError(
+                        f"namespace '{ns}' inner tool {inner.get('name')!r} is a "
+                        "custom/freeform tool (its own invocation grammar); it "
+                        "has no proven chat/completions function representation "
+                        "and is refused rather than coerced into a JSON function"
+                    )
+                if itype != "function":
+                    raise BridgeCapabilityError(
+                        f"namespace '{ns}' inner tool has unsupported type "
+                        f"{itype!r}; refusing rather than translating an unknown "
+                        "tool variant"
+                    )
+                _assert_function_tool_contract(
+                    inner, f"inner function of namespace '{ns}'"
+                )
                 _emit(
                     _function_tool_to_chat(inner),
                     source=f"inner function of namespace '{ns}'",
