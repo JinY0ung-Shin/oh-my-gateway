@@ -452,6 +452,49 @@ def test_copy_traversal_blocked(client, workspace):
     assert not (workspace / "stolen.txt").exists()
 
 
+def test_upload_overwrites_by_default(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("notes.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 200
+    assert (workspace / "notes.txt").read_text() == "new"
+
+
+def test_upload_no_clobber_refuses_existing(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("notes.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 409
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"  # untouched
+
+
+def test_upload_no_clobber_writes_fresh_name(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("fresh.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 200
+    assert (workspace / "fresh.txt").read_text() == "new"
+
+
+def test_upload_no_clobber_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    _race_in_threadpool(monkeypatch, lambda: (workspace / "late.txt").write_text("winner"))
+    r = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("late.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 409
+    assert (workspace / "late.txt").read_text() == "winner"
+
+
 def _race_in_threadpool(monkeypatch, create: "callable"):
     """다음 run_in_threadpool 호출 직전에 destination을 만들어, '검증 후
     실행 전' 레이스를 실제로 재현한다."""

@@ -508,9 +508,18 @@ async def set_cwd(
 async def upload_file(
     request: Request,
     directory: str = "/",
+    no_clobber: bool = False,
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
+    """Write one uploaded file into the workspace.
+
+    Default keeps the historical contract: same name overwrites (this is how
+    "save" works through the proxy chain). ``no_clobber=true`` is the opt-in
+    for file managers dropping OS files: creation is O_EXCL, so a destination
+    appearing after the client's listing gets a 409 instead of being replaced
+    — same contract as ``/files/copy`` and move's ``no_clobber``.
+    """
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -525,7 +534,18 @@ async def upload_file(
     target = _resolve_or_403(root, f"{directory}/{name}")
 
     data = await file.read()
-    await run_in_threadpool(target.write_bytes, data)
+    if no_clobber:
+
+        def _write_exclusive() -> None:
+            with open(target, "xb") as f:
+                f.write(data)
+
+        try:
+            await run_in_threadpool(_write_exclusive)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="destination already exists")
+    else:
+        await run_in_threadpool(target.write_bytes, data)
     return {"path": str(target), "size": len(data)}
 
 
