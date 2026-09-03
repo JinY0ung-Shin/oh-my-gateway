@@ -14,7 +14,6 @@ certification are separate checkpoint-2 work.
 
 from __future__ import annotations
 
-import json
 from typing import Any, Optional
 
 from .config import (
@@ -26,6 +25,85 @@ from .config import (
 from .errors import BridgeCapabilityError
 from .reasoning_effort import clamp_reasoning_effort
 from .system_norm import normalize_system_messages
+
+# --- inbound Responses request contract (fail-closed field boundary) --------
+# The boundary derives from the fields the current Codex ``ResponsesApiRequest``
+# can emit, so a newly-added control fails loudly HERE rather than disappearing
+# one nested field at a time. Every present field is either TRANSLATED into the
+# chat body or CONSUMED as a documented provider-local no-op; anything else is
+# refused (:class:`BridgeCapabilityError`).
+
+# Faithfully translated into the chat/completions body.
+_TRANSLATED_BODY_FIELDS = frozenset(
+    {
+        "model",
+        "input",
+        "instructions",
+        "tools",
+        "tool_choice",
+        "text",
+        "reasoning",
+        "max_output_tokens",
+        "temperature",
+        "top_p",
+        "parallel_tool_calls",
+        "metadata",
+        "stream",
+        "user",
+        "safety_identifier",
+    }
+)
+# Present in current Codex requests but deliberately NOT forwarded: they govern
+# Responses-side persistence/delivery/telemetry that the chat/completions data
+# plane has no equivalent for, so dropping them changes no model-visible
+# authority or tool semantics. ``store``/``include`` drive the encrypted-
+# reasoning continuation loop, which this bridge does not carry (reasoning input
+# items are refused), so they are consistently no-ops here.
+_CONSUMED_BODY_FIELDS = frozenset(
+    {
+        "store",
+        "include",
+        "stream_options",
+        "service_tier",
+        "prompt_cache_key",
+        "client_metadata",
+        "access_programs",
+        "previous_response_id",
+    }
+)
+
+_TRANSLATED_REASONING_FIELDS = frozenset({"effort"})
+# ``summary``/``context`` shape reasoning DELIVERY/output, which chat/completions
+# does not honor; dropping them changes output verbosity, not authority or
+# correctness. Documented no-op, tested.
+_CONSUMED_REASONING_FIELDS = frozenset({"summary", "context", "generate_summary"})
+
+_TRANSLATED_TEXT_FIELDS = frozenset({"format"})
+_CONSUMED_TEXT_FIELDS = frozenset({"verbosity"})
+
+
+def _assert_known_fields(
+    obj: Any,
+    kind: str,
+    translated: frozenset[str],
+    consumed: frozenset[str],
+) -> None:
+    """Fail closed on any key of *obj* outside the known contract.
+
+    A field the bridge neither translates nor deliberately consumes could carry
+    model-affecting semantics; refuse rather than accept the request after
+    silently ignoring it, so a newly-added Codex field fails loudly here. A
+    non-dict *obj* is left for its own translator to validate.
+    """
+    if not isinstance(obj, dict):
+        return
+    unknown = sorted(set(obj) - translated - consumed)
+    if unknown:
+        raise BridgeCapabilityError(
+            f"unsupported Responses {kind} field(s) {unknown}; refusing rather "
+            "than accepting a request after silently ignoring a control (add the "
+            "field to the bridge contract to translate or consume it)"
+        )
 
 
 def _map_role(role: Any) -> str:
@@ -128,13 +206,6 @@ def _content_to_chat(content: Any, role: str) -> Any:
     return "".join(text_parts)
 
 
-# Responses input item types intentionally ignored on the request path: they
-# carry no conversation/tool state a chat request needs. Everything NOT handled
-# and NOT listed here is refused (fail closed) rather than silently dropped, so
-# an unknown/new semantic item cannot be degraded invisibly.
-_IGNORABLE_INPUT_ITEM_TYPES = frozenset({"reasoning"})
-
-
 def _input_to_messages(input_data: Any) -> list[dict]:
     """Translate the Responses ``input`` (string or item array) to chat messages.
 
@@ -193,21 +264,29 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                     "Responses 'function_call' item is missing its function "
                     "'name'; refusing rather than emitting an unnamed tool call"
                 )
-            call_id = item.get("call_id") or item.get("id")
+            # A tool result correlates to the function ``call_id``, which is a
+            # DISTINCT identity from the response item's own ``id``. Reusing
+            # ``id`` here would mint a chat tool-call id that a later result
+            # (keyed by the real call_id) can never match -- so require a real,
+            # non-empty ``call_id`` and never substitute ``id`` for it.
+            call_id = item.get("call_id")
             if not isinstance(call_id, str) or not call_id:
-                # The chat contract correlates a tool result to its call by id.
-                # Synthesizing one here would not match the result's
-                # ``tool_call_id`` (that comes from the caller's own item), so a
-                # missing id is a real correlation gap -- refuse rather than
-                # invent an id that lines up with nothing.
                 raise BridgeCapabilityError(
-                    "Responses 'function_call' item is missing its 'call_id'/"
-                    "'id'; refusing rather than synthesizing a correlation id "
-                    "that no tool result can match"
+                    "Responses 'function_call' item is missing its 'call_id'; "
+                    "refusing rather than correlating on the distinct item 'id' "
+                    "or synthesizing an id no tool result can match"
                 )
+            # ``arguments`` is a JSON string in the Responses function-call
+            # contract. A missing/non-string value must not be coerced (``None``
+            # -> ``{}`` would turn a malformed call into an executable
+            # zero-argument invocation) -- refuse the unproven shape.
             args = item.get("arguments")
             if not isinstance(args, str):
-                args = json.dumps(args or {}, ensure_ascii=False)
+                raise BridgeCapabilityError(
+                    "Responses 'function_call.arguments' must be a JSON string, "
+                    f"got {type(args).__name__}; refusing rather than coercing a "
+                    "malformed value into a different tool call"
+                )
             tool_call = {
                 "id": call_id,
                 "type": "function",
@@ -277,7 +356,15 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                         )
                 out = "".join(texts)
             elif not isinstance(out, str):
-                out = json.dumps(out, ensure_ascii=False)
+                # The proven output shapes are a string or the content-part array
+                # handled above. An arbitrary dict/number/bool must not become
+                # JSON text just because chat can carry text -- that invents a
+                # tool result the caller never sent. Refuse the unproven shape.
+                raise BridgeCapabilityError(
+                    "Responses 'function_call_output.output' must be a string or "
+                    f"a content-part array, got {type(out).__name__}; refusing "
+                    "rather than coercing an unproven shape to JSON text"
+                )
             messages.append(
                 {
                     "role": "tool",
@@ -285,10 +372,22 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                     "content": out,
                 }
             )
-        elif itype in _IGNORABLE_INPUT_ITEM_TYPES:
-            # Non-semantic for the chat request (e.g. a reasoning trace); dropped
-            # without ending a tool-call run.
-            continue
+        elif itype == "reasoning":
+            # A Responses ``reasoning`` item is NOT safely ignorable: current
+            # Codex runs with ``store:false`` + ``include:["reasoning.
+            # encrypted_content"]`` and carries encrypted reasoning items forward
+            # in the continuation, so they participate in model state. chat/
+            # completions has no representation for them, and there is no
+            # certified shape here we can prove display-only -- so refuse rather
+            # than silently strip reasoning state from an accepted continuation.
+            # (A certified display-only allowlist is deferred to the pinned-
+            # runtime contract; see the PR discussion.)
+            raise BridgeCapabilityError(
+                "Responses 'reasoning' input item has no certified chat/"
+                "completions representation; refusing rather than silently "
+                "dropping reasoning-continuation state (store:false + "
+                "include:['reasoning.encrypted_content'] carries it forward)"
+            )
         else:
             # An unknown item type may carry conversation/tool semantics that
             # upstream could add later; refuse rather than degrade it invisibly.
@@ -469,6 +568,7 @@ def _text_format_to_response_format(text: Any) -> Optional[dict]:
         raise BridgeCapabilityError(
             f"Responses 'text' must be an object, got {type(text).__name__}"
         )
+    _assert_known_fields(text, "text", _TRANSLATED_TEXT_FIELDS, _CONSUMED_TEXT_FIELDS)
     fmt = text.get("format")
     if fmt is None:
         return None
@@ -503,6 +603,9 @@ def responses_request_to_chat_body(
     as a system message. Raises :class:`BridgeCapabilityError` when a requested
     tool capability cannot be faithfully represented (see :func:`_translate_tools`).
     """
+    _assert_known_fields(
+        body, "request", _TRANSLATED_BODY_FIELDS, _CONSUMED_BODY_FIELDS
+    )
     out: dict[str, Any] = {}
     if body.get("model") is not None:
         out["model"] = body["model"]
@@ -531,6 +634,18 @@ def responses_request_to_chat_body(
         out["stream"] = bool(body["stream"])
 
     reasoning = body.get("reasoning")
+    if reasoning is not None and not isinstance(reasoning, dict):
+        raise BridgeCapabilityError(
+            f"Responses 'reasoning' must be an object, got "
+            f"{type(reasoning).__name__}"
+        )
+    if isinstance(reasoning, dict):
+        _assert_known_fields(
+            reasoning,
+            "reasoning",
+            _TRANSLATED_REASONING_FIELDS,
+            _CONSUMED_REASONING_FIELDS,
+        )
     if isinstance(reasoning, dict) and reasoning.get("effort"):
         # Clamp Codex's ladder to the backend vocabulary; ``allowed_openai_params``
         # is LiteLLM's per-request escape hatch so the value is forwarded verbatim

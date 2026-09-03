@@ -269,6 +269,97 @@ def test_function_call_without_call_id_is_refused():
         )
 
 
+def test_function_call_item_id_is_not_used_as_call_id():
+    # The response item 'id' is a distinct identity from the tool 'call_id'; an
+    # item with only 'id' must be refused, not correlated on 'id' (round-4
+    # finding 3) -- a later result keyed by the real call_id could not match it.
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {
+                        "type": "function_call",
+                        "id": "fc_item_1",
+                        "name": "f",
+                        "arguments": "{}",
+                    }
+                ]
+            }
+        )
+
+
+def test_function_call_correlates_on_call_id_not_item_id():
+    # When both are present the emitted chat tool-call id is the call_id.
+    out = responses_request_to_chat_body(
+        {
+            "input": [
+                {
+                    "type": "function_call",
+                    "id": "fc_item_1",
+                    "call_id": "call_real",
+                    "name": "f",
+                    "arguments": "{}",
+                }
+            ]
+        }
+    )
+    assert out["messages"][0]["tool_calls"][0]["id"] == "call_real"
+
+
+def test_function_call_non_string_arguments_are_refused():
+    # arguments is a JSON string; None/{} must not be coerced into a different
+    # (zero-argument) call (round-4 finding 4).
+    for bad in (None, {}, {"a": 1}, 5):
+        with pytest.raises(BridgeCapabilityError):
+            responses_request_to_chat_body(
+                {
+                    "input": [
+                        {
+                            "type": "function_call",
+                            "call_id": "c1",
+                            "name": "f",
+                            "arguments": bad,
+                        }
+                    ]
+                }
+            )
+
+
+def test_function_call_string_arguments_unchanged():
+    args = '{"path": "/x", "n": 3}'
+    out = responses_request_to_chat_body(
+        {
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "c1",
+                    "name": "f",
+                    "arguments": args,
+                }
+            ]
+        }
+    )
+    assert out["messages"][0]["tool_calls"][0]["function"]["arguments"] == args
+
+
+def test_function_call_output_scalar_shape_is_refused():
+    # An arbitrary dict/number output must not become JSON text (round-4
+    # finding 4); only a string or the handled content-part array is accepted.
+    for bad in ({"k": "v"}, 5, True):
+        with pytest.raises(BridgeCapabilityError):
+            responses_request_to_chat_body(
+                {
+                    "input": [
+                        {
+                            "type": "function_call_output",
+                            "call_id": "c1",
+                            "output": bad,
+                        }
+                    ]
+                }
+            )
+
+
 # -- multimodal input --------------------------------------------------------
 
 
@@ -322,16 +413,19 @@ def test_unknown_input_item_type_is_refused():
         )
 
 
-def test_reasoning_input_item_is_ignored():
-    out = responses_request_to_chat_body(
-        {
-            "input": [
-                {"type": "reasoning", "summary": "thinking"},
-                {"type": "message", "role": "user", "content": "hi"},
-            ]
-        }
-    )
-    assert out["messages"] == [{"role": "user", "content": "hi"}]
+def test_reasoning_input_item_is_refused():
+    # A reasoning item participates in Codex continuation state (store:false +
+    # include:["reasoning.encrypted_content"]); chat/completions cannot carry it,
+    # so refuse rather than silently strip it (round-4 finding 1).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {"type": "reasoning", "summary": "thinking"},
+                    {"type": "message", "role": "user", "content": "hi"},
+                ]
+            }
+        )
 
 
 def test_message_item_without_role_is_refused():
@@ -632,6 +726,75 @@ def test_text_format_json_object_is_kept():
 def test_absent_text_format_omits_response_format():
     out = responses_request_to_chat_body({"input": "x", "text": {"verbosity": "low"}})
     assert "response_format" not in out
+
+
+# -- inbound field contract fails closed (round-4 finding 2) -----------------
+
+
+def test_unknown_top_level_field_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "frobnicate": True})
+
+
+def test_codex_shaped_request_translates_known_and_consumes_rest():
+    # A request shaped like the current Codex builder: translated controls are
+    # applied, provider-local controls are consumed (no-op, not forwarded), and
+    # nothing raises.
+    out = responses_request_to_chat_body(
+        {
+            "model": "m",
+            "input": "hi",
+            "store": False,
+            "include": ["reasoning.encrypted_content"],
+            "service_tier": "default",
+            "prompt_cache_key": "k",
+            "client_metadata": {"trace": "1"},
+            "access_programs": ["p"],
+            "reasoning": {"effort": "high", "summary": "auto"},
+            "text": {"verbosity": "low", "format": {"type": "json_object"}},
+        }
+    )
+    assert out["reasoning_effort"] == "high"
+    assert out["response_format"] == {"type": "json_object"}
+    # Consumed fields are not forwarded to chat/completions.
+    for consumed in (
+        "store",
+        "include",
+        "service_tier",
+        "prompt_cache_key",
+        "client_metadata",
+        "access_programs",
+    ):
+        assert consumed not in out
+
+
+def test_present_non_object_reasoning_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "reasoning": "high"})
+
+
+def test_unknown_reasoning_subfield_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "reasoning": {"effort": "high", "bogus": 1}}
+        )
+
+
+def test_consumed_reasoning_subfields_do_not_raise():
+    out = responses_request_to_chat_body(
+        {
+            "input": "x",
+            "reasoning": {"effort": "high", "summary": "auto", "context": "c"},
+        }
+    )
+    assert out["reasoning_effort"] == "high"
+
+
+def test_unknown_text_subfield_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "text": {"format": {"type": "text"}, "bogus": 1}}
+        )
 
 
 # -- reasoning effort --------------------------------------------------------
