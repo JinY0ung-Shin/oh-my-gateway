@@ -796,6 +796,16 @@ class AppServerTransport:
         (scheduled) caller task is settled, not pending."""
         return sum(1 for future in self._waiters.values() if not future.done())
 
+    def orphaned_methods(self) -> List[str]:
+        """Methods of requests whose bytes were accepted but whose caller left
+        (cancelled, or response deadline expired) and whose outcome has not yet
+        been delivered -- i.e. requests the transport now owns as orphans.
+
+        Read-only. An owner layer uses it to tell a post-commit cancellation
+        (``turn/start`` present here -> accepted work whose outcome must be
+        reconciled) from a known-not-sent one (absent -> safe to end locally)."""
+        return list(self._orphaned_requests.values())
+
     def interaction(self, interaction_id: Any) -> Optional[PendingInteraction]:
         return self._interactions.get(interaction_id)
 

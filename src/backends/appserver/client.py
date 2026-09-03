@@ -163,6 +163,28 @@ def _gateway_interrupt_chunk(message: str) -> Dict[str, Any]:
     }
 
 
+def _rpc_error_message(error: Any) -> str:
+    """Human-readable message from a JSON-RPC error object (or its repr)."""
+    if isinstance(error, dict):
+        return str(error.get("message") or error)
+    return str(error)
+
+
+# Last-resort wall-clock bound for OWNING a committed-but-unresolved
+# ``turn/start`` (a generous multiple of the per-request timeout). It is NOT an
+# abandon deadline: once ``turn/start`` is known committed there is no safe state
+# "live generation + unresolved orphan + no owner", so on expiry the owner
+# DELIBERATELY terminalizes the generation and keeps ownership until the accepted
+# request is classified (see ``_await_turn_start_outcome``). A merely-slow
+# response is recovered well within it, never terminalized (#174 blocker: the
+# second local timeout must not abandon accepted work while the runtime is live).
+_RECONCILE_HEALTH_MULTIPLIER = 4
+
+
+def _reconcile_health_bound_s() -> float:
+    return request_timeout_s() * _RECONCILE_HEALTH_MULTIPLIER
+
+
 class AppServerSessionClient(SessionHandle):
     """Per-session handle owning exactly one ``codex app-server`` process."""
 
@@ -220,6 +242,12 @@ class AppServerSessionClient(SessionHandle):
         self.pending_interaction_params: Optional[Dict[str, Any]] = None
         self.pending_interaction_token: Optional[str] = None
         self.pending_interaction_generation: Optional[int] = None
+        # A detached, handle-owned task that reconciles a ``turn/start`` orphaned
+        # by a post-commit CALLER cancellation (the SSE generator was cancelled
+        # by a client disconnect). Its lifetime is independent of that cancelled
+        # generator; ``disconnect()`` coordinates with it (#174 blocker: owner
+        # liveness). ``None`` when no orphan is being owned.
+        self._reconcile_task: Optional["asyncio.Task[Any]"] = None
 
     def turn_params(self) -> Dict[str, Any]:
         """``turn/start`` params (minus ``threadId``/``input``) for this handle.
@@ -237,7 +265,20 @@ class AppServerSessionClient(SessionHandle):
         return params
 
     async def disconnect(self) -> None:
-        await self.transport.close()
+        # Coordinate with the detached orphan-reconciliation owner instead of
+        # destroying its evidence: close() terminalizes the generation (which
+        # unblocks the owner with an AmbiguousRequest/TerminalEvent), then we
+        # await the owner so it settles and releases its subscription rather than
+        # being torn out from under mid-reconciliation.
+        task = self._reconcile_task
+        try:
+            await self.transport.close()
+        finally:
+            if task is not None and not task.done():
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.shield(task), timeout=_INTERRUPT_TIMEOUT_S
+                    )
 
 
 class AppServerCodexClient(TokenEstimateMixin):
@@ -452,6 +493,22 @@ class AppServerCodexClient(TokenEstimateMixin):
                 async for chunk in self._reconcile_orphaned_turn_start(client, session):
                     yield chunk
                 return
+            except asyncio.CancelledError:
+                # The SSE generator was cancelled (a client disconnect cancels
+                # the StreamingResponse generator; see responses.py
+                # _shielded_stream_teardown). If turn/start's bytes were already
+                # committed, the transport now OWNS the orphaned request -- its
+                # outcome must still be reconciled and a resulting turn retired,
+                # but this task is dying. Hand the orphan to a DETACHED,
+                # handle-owned owner whose lifetime is independent of this
+                # cancelled generator, then re-raise. A not-committed
+                # (known-not-sent) cancel just unwinds locally (#174 blocker:
+                # post-commit cancellation ownership).
+                if "turn/start" in client.transport.orphaned_methods():
+                    self._detach_orphan_owner(client)
+                else:
+                    self._end_turn(client)
+                raise
             except Exception as exc:  # noqa: BLE001 - stay in-band, never raise
                 self._end_turn(client)
                 yield error_chunk(f"Codex turn/start error: {exc}")
@@ -496,97 +553,179 @@ class AppServerCodexClient(TokenEstimateMixin):
             f"against thread {thread_id}"
         )
 
+    async def _await_turn_start_outcome(
+        self,
+        client: AppServerSessionClient,
+        subscription: Subscription,
+        *,
+        health_bound_s: Optional[float],
+    ) -> tuple:
+        """Own a committed-but-unresolved ``turn/start`` subscription to a
+        DEFINITIVE outcome, never abandoning a live generation.
+
+        The bytes were accepted, so the transport owns the outcome and delivers
+        it here (#172): a late ``OrphanedResponse`` for ``turn/start``, or -- if
+        the generation ends first -- an ``AmbiguousRequest`` before the
+        ``TerminalEvent``. Returns one of:
+
+          ``("recovered", turn_id)`` | ``("failed", message)``
+          | ``("ambiguous", reason)`` | ``("terminal", reason)``
+          | ``("overflow", None)``
+
+        ``health_bound_s`` is a LAST-RESORT wall-clock bound, never an abandon
+        deadline: on expiry the generation is deliberately terminalized
+        (``transport.close()``) and ownership is HELD until the accepted request
+        is classified ambiguous -- it never merely unsubscribes from a still-live
+        generation (#174 blocker: second-timeout orphan abandonment). ``None``
+        waits without any local bound (the caller guarantees termination, e.g.
+        ``disconnect()``).
+
+        Pre-outcome notifications/interactions are dropped: current app-server
+        returns the ``turn/start`` result before its turn notifications, so the
+        outcome is observed first (reviewer's non-blocking ordering note).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + health_bound_s if health_bound_s is not None else None
+        terminalized = False
+        while True:
+            if deadline is not None and not terminalized and loop.time() >= deadline:
+                # Deliberately terminalize this generation, then keep ownership
+                # until the orphan is classified (close() fans an AmbiguousRequest
+                # before the TerminalEvent for the accepted request).
+                terminalized = True
+                deadline = None
+                with contextlib.suppress(Exception):
+                    await client.transport.close()
+                continue
+            try:
+                if deadline is None:
+                    item = await subscription.get()
+                else:
+                    item = await asyncio.wait_for(
+                        subscription.get(), timeout=max(0.0, deadline - loop.time())
+                    )
+            except (TimeoutError, asyncio.TimeoutError):
+                # Do NOT abandon: loop back so the health-bound branch above
+                # terminalizes rather than releasing a live-generation orphan.
+                continue
+
+            if isinstance(item, OrphanedResponse) and item.method == "turn/start":
+                if item.error is not None:
+                    return ("failed", _rpc_error_message(item.error))
+                return ("recovered", self._turn_id_from_result(item.result))
+            if isinstance(item, AmbiguousRequest):
+                return ("ambiguous", item.terminal_reason)
+            if isinstance(item, TerminalEvent):
+                return ("terminal", item.reason)
+            if isinstance(item, SubscriberOverflow):
+                return ("overflow", None)
+            # A notification / interaction / other-method orphan before the
+            # outcome cannot be mapped yet (no turn id); ignore and keep waiting.
+            continue
+
     async def _reconcile_orphaned_turn_start(
         self, client: AppServerSessionClient, session: Any
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Reconcile a ``turn/start`` orphaned by a response-deadline expiry.
+        """Reconcile a ``turn/start`` orphaned by a response-deadline expiry,
+        with the caller still present (streaming into this generator).
 
-        The bytes were accepted, so the transport owns the outcome and delivers
-        it on the persisted subscription (#172):
-
-        * a late ``OrphanedResponse`` for ``turn/start`` -> the turn was really
-          created. If the caller is still present, adopt that exact turn and
-          stream it to completion (recovering the accepted work); if the caller
-          is cancelling, interrupt/retire that exact turn rather than letting
-          model/tool work run detached.
-        * an ``AmbiguousRequest`` (before the ``TerminalEvent``) or a bare
-          ``TerminalEvent`` -> the generation ended with no observed outcome:
-          a reconciliation-required terminal, never replayed.
-
-        A committed ``turn/start`` is never re-sent.
+        On a late ``OrphanedResponse`` the accepted turn was really created:
+        adopt and stream it to completion (or interrupt/retire it if the caller
+        is cancelling). An ambiguous/terminal outcome ends deterministically. A
+        committed ``turn/start`` is never re-sent, and ownership is never
+        abandoned on a wall-clock deadline while the generation is live.
         """
         subscription = client._subscription
         if subscription is None:
             yield error_chunk("Codex turn/start timed out")
             return
 
-        while True:
-            cancelling = getattr(session, "active_response_state", None) == "cancelling"
-            try:
-                item = await asyncio.wait_for(
-                    subscription.get(), timeout=request_timeout_s()
-                )
-            except (TimeoutError, asyncio.TimeoutError):
+        outcome, detail = await self._await_turn_start_outcome(
+            client, subscription, health_bound_s=_reconcile_health_bound_s()
+        )
+        cancelling = getattr(session, "active_response_state", None) == "cancelling"
+
+        if outcome == "recovered":
+            turn_id = detail
+            if cancelling:
+                await self._interrupt_turn(client, turn_id)
                 self._end_turn(client)
-                yield error_chunk(
-                    "Codex turn/start was accepted but no outcome was observed; "
-                    "not replayed"
-                )
+                yield _gateway_interrupt_chunk("Codex turn interrupted")
                 return
+            # Adopt the accepted turn and stream it to completion. The turn/start
+            # response precedes its turn notifications on the wire, so the mapper
+            # opens on the response and sees the rest.
+            client.current_turn_id = turn_id
+            client._mapper = TurnMapper(thread_id=client.thread_id, turn_id=turn_id)
+            async for chunk in self._drive_turn(client, session):
+                yield chunk
+            return
 
-            if isinstance(item, OrphanedResponse) and item.method == "turn/start":
-                if item.error is not None:
-                    self._end_turn(client)
-                    message = (
-                        item.error.get("message")
-                        if isinstance(item.error, dict)
-                        else str(item.error)
-                    )
-                    yield error_chunk(f"Codex turn/start failed: {message}")
-                    return
-                turn_id = self._turn_id_from_result(item.result)
-                if cancelling:
-                    # The caller is gone: retire the exact accepted turn instead
-                    # of letting it continue detached, then end incomplete.
-                    await self._interrupt_turn(client, turn_id)
-                    self._end_turn(client)
-                    yield _gateway_interrupt_chunk("Codex turn interrupted")
-                    return
-                # Recover: adopt the accepted turn and stream it to completion.
-                # The turn/start response precedes its turn notifications on the
-                # wire, so the mapper opens on the response and sees the rest.
-                client.current_turn_id = turn_id
-                client._mapper = TurnMapper(thread_id=client.thread_id, turn_id=turn_id)
-                async for chunk in self._drive_turn(client, session):
-                    yield chunk
-                return
+        self._end_turn(client)
+        if outcome == "failed":
+            yield error_chunk(f"Codex turn/start failed: {detail}")
+        elif outcome == "ambiguous":
+            yield error_chunk(
+                f"Codex turn/start outcome is ambiguous (turn/start); not "
+                f"replayed ({detail}) -- reconcile against thread "
+                f"{client.thread_id}"
+            )
+        elif outcome == "overflow":
+            yield error_chunk("Codex event stream overflowed")
+        else:  # terminal
+            yield error_chunk(
+                f"Codex runtime terminated before turn/start completed: {detail}"
+            )
 
-            if isinstance(item, AmbiguousRequest):
-                self._end_turn(client)
-                yield error_chunk(
-                    f"Codex turn/start outcome is ambiguous ({item.method}); not "
-                    f"replayed ({item.terminal_reason}) -- reconcile against "
-                    f"thread {client.thread_id}"
-                )
-                return
+    def _detach_orphan_owner(self, client: AppServerSessionClient) -> None:
+        """Move ownership of a committed-but-unresolved ``turn/start`` off the
+        (cancelled) generator and onto a detached, handle-owned task.
 
-            if isinstance(item, TerminalEvent):
-                self._end_turn(client)
-                yield error_chunk(
-                    "Codex runtime terminated before turn/start completed: "
-                    f"{item.reason}"
-                )
-                return
+        The subscription is transferred to the task and cleared from the handle,
+        so the generator's outer ``except BaseException`` cannot unsubscribe it
+        out from under the owner; ``disconnect()`` awaits the task instead.
+        """
+        subscription = client._subscription
+        client._subscription = None
+        client._mapper = None
+        client.current_turn_id = None
+        self._clear_pending_interaction(client)
+        if subscription is None:
+            return
+        client._reconcile_task = asyncio.get_running_loop().create_task(
+            self._own_orphaned_turn_start(client, subscription),
+            name="codex-orphan-turn-start-owner",
+        )
 
-            if isinstance(item, SubscriberOverflow):
-                self._end_turn(client)
-                yield error_chunk("Codex event stream overflowed")
-                return
+    async def _own_orphaned_turn_start(
+        self, client: AppServerSessionClient, subscription: Subscription
+    ) -> None:
+        """Detached owner for a ``turn/start`` orphaned by caller cancellation.
 
-            # A notification / interaction / other-method orphan arriving before
-            # the turn/start outcome cannot be mapped yet (no turn id); ignore it
-            # and keep waiting for the orphaned turn/start's own outcome.
-            continue
+        Independent of the cancelled SSE generator: it drives the subscription to
+        a definitive outcome, retires a recovered turn (the HTTP caller is gone,
+        so the accepted turn must not run detached), observes an
+        ambiguous/terminal outcome, never replays, and releases the subscription.
+        ``disconnect()`` coordinates by closing the transport (which terminalizes
+        and unblocks this owner) and then awaiting it.
+        """
+        try:
+            # No local health bound here: the cancel path is always followed by
+            # disconnect() (transport.close), which terminalizes and delivers a
+            # definitive outcome; bounding here could terminalize a runtime the
+            # teardown is about to close anyway.
+            outcome, detail = await self._await_turn_start_outcome(
+                client, subscription, health_bound_s=None
+            )
+            if outcome == "recovered":
+                await self._interrupt_turn(client, detail)
+        except Exception:  # noqa: BLE001 - a detached owner must never escape
+            logger.debug("codex orphan turn/start owner failed", exc_info=True)
+        finally:
+            with contextlib.suppress(Exception):
+                client.transport.unsubscribe(subscription)
+            if client._reconcile_task is asyncio.current_task():
+                client._reconcile_task = None
 
     async def _interrupt_turn(
         self, client: AppServerSessionClient, turn_id: Optional[str]

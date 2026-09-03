@@ -14,6 +14,7 @@ so these run in the default suite.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sys
 from pathlib import Path
@@ -540,6 +541,221 @@ async def test_turn_start_runtime_lost_before_commit_is_known_not_sent(
     # Known-not-sent is NOT the ambiguous/committed-loss path.
     assert "ambiguous" not in terminal["error_message"]
     assert "not replayed" not in terminal["error_message"]
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+# -- post-commit cancellation + owner-liveness (#174 round-5 blockers) --------
+
+
+async def test_turn_start_post_commit_cancel_retires_recovered_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 1: a post-commit caller cancellation (the SSE generator is
+    cancelled by client disconnect) must not drop the orphan seam. A detached,
+    handle-owned owner survives the cancelled generator, consumes the late
+    OrphanedResponse, and interrupts/retires exactly that accepted turn -- with no
+    blind replay and no leaked subscription/orphan owner."""
+    # A generous per-request timeout so the run is cancelled (CancelledError),
+    # not timed out, while turn/start's response is outstanding.
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 5.0)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {"type": "sleep", "seconds": 0.8},
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+        ],
+    }
+    interrupt_step = {
+        "expect_method": "turn/interrupt",
+        "actions": [{"type": "response", "result": {}}],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, interrupt_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+
+    # Record the exact turn the owner retires.
+    interrupted: List[tuple] = []
+    original_interrupt = handle.transport.interrupt
+
+    async def _spy_interrupt(thread_id, turn_id, **kwargs):
+        interrupted.append((thread_id, turn_id))
+        return await original_interrupt(thread_id, turn_id, **kwargs)
+
+    handle.transport.interrupt = _spy_interrupt
+
+    try:
+        run = asyncio.ensure_future(
+            _collect(backend.run_completion_with_client(handle, "hi", session))
+        )
+        # Let turn/start commit (the fake is now sleeping on the response), then
+        # cancel the run mid-flight.
+        await asyncio.sleep(0.3)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+        # A detached owner took over the orphaned turn/start.
+        owner = handle._reconcile_task
+        assert owner is not None
+        # It consumes the late response and retires exactly that turn.
+        await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
+        assert interrupted == [("thread-1", "turn-1")]
+        # No blind replay (only one turn/start step existed) and no leaks.
+        assert handle._reconcile_task is None
+        assert handle._subscription is None
+        assert handle.transport.orphaned_methods() == []
+    finally:
+        await handle.disconnect()
+
+
+async def test_turn_start_post_commit_cancel_then_death_is_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 1 sibling: post-commit cancel, then the generation dies
+    before the response. The detached owner consumes the AmbiguousRequest,
+    retires nothing (no turn to retire), and never replays."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 5.0)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {"type": "sleep", "seconds": 0.8},
+            {"type": "exit", "code": 1},
+        ],
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    interrupted: List[tuple] = []
+    original_interrupt = handle.transport.interrupt
+
+    async def _spy_interrupt(thread_id, turn_id, **kwargs):
+        interrupted.append((thread_id, turn_id))
+        return await original_interrupt(thread_id, turn_id, **kwargs)
+
+    handle.transport.interrupt = _spy_interrupt
+
+    try:
+        run = asyncio.ensure_future(
+            _collect(backend.run_completion_with_client(handle, "hi", session))
+        )
+        await asyncio.sleep(0.3)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+        owner = handle._reconcile_task
+        assert owner is not None
+        await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
+        # No turn ever materialized -> nothing retired, and never replayed.
+        assert interrupted == []
+        assert handle._reconcile_task is None
+        assert handle._subscription is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_turn_start_orphan_ownership_survives_beyond_second_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 2: once turn/start is committed, the reconciler must not
+    abandon a live generation on a second local deadline. With the runtime silent
+    well beyond 2 * request_timeout, ownership is retained; when the late response
+    finally arrives it is recovered (not lost, not replayed)."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    # Health bound (2.0s) comfortably exceeds the > 2*R silent window.
+    monkeypatch.setattr(adapter_client, "_reconcile_health_bound_s", lambda: 2.0)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            # Silent for 1.3s: past the old second-timeout (2*0.5=1.0s) that used
+            # to abandon, but within the 2.0s health bound.
+            {"type": "sleep", "seconds": 1.3},
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # Ownership was retained past the old abandon point -> the turn recovered.
+    assert chunks[-1]["type"] == "result"
+    assert chunks[-1]["subtype"] == "success"
+    assert getattr(session, "codex_thread_id", None) == "thread-1"
+
+
+async def test_turn_start_health_bound_terminalizes_not_abandons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 2: if a committed turn/start stays unresolved against a
+    silent-but-live runtime past the health bound, the reconciler DELIBERATELY
+    terminalizes the generation and classifies the accepted request as ambiguous
+    -- it never merely unsubscribes from a live generation."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    monkeypatch.setattr(adapter_client, "_reconcile_health_bound_s", lambda: 1.2)
+    turn_step = {
+        "expect_method": "turn/start",
+        # Never answers; the process stays alive and silent (lingering sleep).
+        "actions": [{"type": "sleep", "seconds": 60}],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal["type"] == "error"
+    # Classified as ambiguous (terminalized + observed), NOT the old
+    # "no outcome observed" local-abandon error.
+    assert "ambiguous" in terminal["error_message"]
+    assert "not replayed" in terminal["error_message"]
+    assert "no outcome was observed" not in terminal["error_message"]
     assert getattr(session, "codex_thread_id", None) is None
 
 
