@@ -841,22 +841,67 @@ def test_non_null_access_programs_is_refused():
         )
 
 
-def test_previous_response_id_without_prior_history_is_refused():
-    # Present id but no materialized history -> forwarding only the delta would
-    # run a truncated conversation; refuse (round-5 finding 1).
+def test_raw_previous_response_id_is_refused():
+    # A raw previous_response_id must be resolved+stripped upstream (round-6).
     with pytest.raises(BridgeCapabilityError):
         responses_request_to_chat_body(
             {"input": "delta", "previous_response_id": "resp_R"}
         )
 
 
-def test_previous_response_id_with_prior_history_ok():
+def test_raw_previous_response_id_refused_even_with_prior_history():
+    # A non-empty prior_messages list is NOT proof it was resolved from THIS id;
+    # accepting the pair could run history for A while the caller named B.
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "delta", "previous_response_id": "resp_B"},
+            prior_messages=[{"role": "user", "content": "from A"}],
+        )
+
+
+def test_resolved_prior_messages_without_raw_id_ok():
+    # The supported follow-up shape: history materialized upstream, raw field
+    # stripped.
     out = responses_request_to_chat_body(
-        {"input": "delta", "previous_response_id": "resp_R"},
+        {"input": "delta"},
         prior_messages=[{"role": "user", "content": "q"}],
     )
     assert out["messages"][0] == {"role": "user", "content": "q"}
     assert "previous_response_id" not in out
+
+
+def test_null_previous_response_id_is_accepted():
+    # An explicit None is equivalent to absent -> accepted, not refused.
+    out = responses_request_to_chat_body({"input": "hi", "previous_response_id": None})
+    assert out["messages"] == [{"role": "user", "content": "hi"}]
+
+
+# stream_options is value-sensitive: an active delivery control is refused, never
+# accepted-and-erased (round-6 finding 1).
+
+
+def test_active_stream_options_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "stream_options": {"reasoning_summary_delivery": "sequential_cutoff"},
+            }
+        )
+
+
+def test_empty_stream_options_is_accepted():
+    out = responses_request_to_chat_body({"input": "x", "stream_options": {}})
+    assert "stream_options" not in out
+
+
+def test_stream_options_not_populated_from_request_on_stream():
+    # With stream:true the bridge builds its OWN stream_options (include_usage);
+    # a request-supplied value is never the source, so an empty one stays neutral.
+    out = responses_request_to_chat_body(
+        {"input": "x", "stream": True, "stream_options": {}}
+    )
+    assert out["stream_options"] == {"include_usage": True}
 
 
 def test_present_non_object_reasoning_is_refused():

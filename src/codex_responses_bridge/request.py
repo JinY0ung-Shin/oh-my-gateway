@@ -86,19 +86,24 @@ _Neutral = Callable[[Any], bool]
 # refused. ``service_tier`` accepts only the default routing; a specific tier
 # (e.g. flex) is a behavior change. ``access_programs`` selects a Codex access
 # program with no certified backend mapping, so any non-empty selection is
-# refused. ``prompt_cache_key``/``client_metadata`` are pure optimization/
-# telemetry with no output effect. ``previous_response_id`` is key-allowed here
-# but its value invariant (history already materialized into ``prior_messages``)
-# is enforced in :func:`responses_request_to_chat_body`.
+# refused. ``stream_options`` carries model/delivery-affecting controls (current
+# Codex sets ``reasoning_summary_delivery``) that have no certified chat
+# equivalent, so only an absent/empty value is a no-op -- an active one is
+# refused, never accepted-and-replaced by the bridge's own include_usage stream
+# options. ``prompt_cache_key``/``client_metadata`` are pure optimization/
+# telemetry with no output effect. ``previous_response_id`` is NOT listed: a raw
+# value is refused outright in :func:`responses_request_to_chat_body` (it must be
+# resolved to ``prior_messages`` and stripped upstream), so a ``None``/absent
+# value is the only accepted form and is handled there.
 _CONSUMED_BODY_FIELDS: dict[str, _Neutral] = {
     "store": lambda v: not v,
     "include": lambda v: not v,
-    "stream_options": lambda v: True,
+    "stream_options": lambda v: not v,
     "service_tier": lambda v: v in (None, "auto", "default"),
     "prompt_cache_key": lambda v: True,
     "client_metadata": lambda v: True,
     "access_programs": lambda v: not v,
-    "previous_response_id": lambda v: True,
+    "previous_response_id": lambda v: v is None,
 }
 
 _TRANSLATED_REASONING_FIELDS = frozenset({"effort"})
@@ -647,24 +652,31 @@ def responses_request_to_chat_body(
 ) -> dict:
     """Translate a Responses request body to a Chat Completions request body.
 
-    ``prior_messages`` (resolved from ``previous_response_id`` upstream) is
-    prepended; a new ``instructions`` on a follow-up applies to the current turn
-    as a system message. Raises :class:`BridgeCapabilityError` when a requested
-    tool capability cannot be faithfully represented (see :func:`_translate_tools`).
+    ``prior_messages`` is the already-materialized history a follow-up turn
+    continues; the caller MUST resolve ``previous_response_id`` into it and strip
+    the raw field upstream, because this pure translator cannot verify that a
+    supplied history corresponds to a given id (a raw ``previous_response_id`` in
+    *body* is refused). A new ``instructions`` on a follow-up applies to the
+    current turn as a system message. Raises :class:`BridgeCapabilityError` when a
+    requested capability cannot be faithfully represented (see the module
+    docstring for the deliberately-unsupported set).
     """
     _assert_field_contract(
         body, "request", _TRANSLATED_BODY_FIELDS, _CONSUMED_BODY_FIELDS
     )
-    # ``previous_response_id`` is resolved to ``prior_messages`` upstream; a raw
-    # value present here without materialized history means the referenced turns
-    # were never carried in, so forwarding only the incremental ``input`` would
-    # run a truncated conversation. Enforce the invariant rather than consume it.
-    if body.get("previous_response_id") and not prior_messages:
+    # ``previous_response_id`` must be resolved to ``prior_messages`` and stripped
+    # upstream. A raw value reaching this pure translator is refused OUTRIGHT: a
+    # non-empty ``prior_messages`` list only proves *some* history exists, not
+    # that it was resolved from THIS id, so accepting the pair could run history
+    # for response A while the caller named response B. Making the raw field
+    # unrepresentable here keeps that misuse structurally impossible.
+    if body.get("previous_response_id") is not None:
         raise BridgeCapabilityError(
-            "Responses 'previous_response_id' is present but no resolved prior "
-            "history was supplied; refusing rather than forwarding only the "
-            "incremental input as a fresh conversation (resolve it to "
-            "prior_messages upstream before this boundary)"
+            "raw Responses 'previous_response_id' reached the translator; it must "
+            "be resolved to prior_messages and stripped upstream. A non-empty "
+            "prior_messages list is not proof the history was resolved from this "
+            "id, so the raw field is refused rather than accepted on an "
+            "unverifiable correlation"
         )
     out: dict[str, Any] = {}
     if body.get("model") is not None:
