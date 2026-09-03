@@ -1,5 +1,6 @@
 """Tests for the Open Terminal-compatible read-only workspace file server."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -356,6 +357,282 @@ def test_move_traversal_blocked(client, workspace):
     )
     assert r.status_code in (400, 403)
     assert (workspace / "notes.txt").exists()  # unchanged
+
+
+def test_move_overwrites_by_default_preserving_filenav_contract(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin"},
+    )
+    assert r.status_code == 200
+    assert (workspace / "blob.bin").read_text() == "hello\nworld\n"
+
+
+def test_move_no_clobber_refuses_existing_destination(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin", "no_clobber": True},
+    )
+    assert r.status_code == 409
+    assert (workspace / "notes.txt").exists()  # source untouched
+    assert (workspace / "blob.bin").read_bytes() == b"\xff\xfe\x00\x01binary"
+
+
+def test_move_no_clobber_still_moves_to_free_name(client, workspace):
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/renamed.txt", "no_clobber": True},
+    )
+    assert r.status_code == 200
+    assert (workspace / "renamed.txt").read_text() == "hello\nworld\n"
+
+
+def test_copy_duplicates_file(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/notes copy.txt"},
+    )
+    assert r.status_code == 200
+    assert r.json()["type"] == "file"
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"  # source untouched
+    assert (workspace / "notes copy.txt").read_text() == "hello\nworld\n"
+
+
+def test_copy_duplicates_directory_recursively(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub copy"},
+    )
+    assert r.status_code == 200
+    assert r.json()["type"] == "directory"
+    assert (workspace / "sub" / "inner.md").exists()  # source untouched
+    assert (workspace / "sub copy" / "inner.md").read_text() == "# inner"
+
+
+def test_copy_refuses_existing_destination(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/blob.bin"},
+    )
+    assert r.status_code == 409
+    assert (workspace / "blob.bin").read_bytes() == b"\xff\xfe\x00\x01binary"  # untouched
+
+
+def test_copy_refuses_directory_into_itself(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub/nested"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "sub" / "nested").exists()
+
+
+def test_copy_missing_source_is_404(client):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/nope.txt", "destination": "/copy.txt"},
+    )
+    assert r.status_code == 404
+
+
+def test_copy_traversal_blocked(client, workspace):
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/../secret.txt", "destination": "/stolen.txt"},
+    )
+    assert r.status_code in (400, 403)
+    assert not (workspace / "stolen.txt").exists()
+
+
+def test_upload_overwrites_by_default(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("notes.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 200
+    assert (workspace / "notes.txt").read_text() == "new"
+
+
+def test_upload_no_clobber_refuses_existing(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("notes.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 409
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"  # untouched
+
+
+def test_upload_no_clobber_writes_fresh_name(client, workspace):
+    r = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("fresh.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 200
+    assert (workspace / "fresh.txt").read_text() == "new"
+
+
+def test_upload_no_clobber_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    _race_in_threadpool(monkeypatch, lambda: (workspace / "late.txt").write_text("winner"))
+    r = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("late.txt", b"new", "text/plain")},
+    )
+    assert r.status_code == 409
+    assert (workspace / "late.txt").read_text() == "winner"
+
+
+def _race_in_threadpool(monkeypatch, create: "callable"):
+    """다음 run_in_threadpool 호출 직전에 destination을 만들어, '검증 후
+    실행 전' 레이스를 실제로 재현한다."""
+    real = tf.run_in_threadpool
+
+    async def raced(fn, *args, **kwargs):
+        create()
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(tf, "run_in_threadpool", raced)
+
+
+def test_copy_file_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    _race_in_threadpool(monkeypatch, lambda: (workspace / "raced.txt").write_text("winner"))
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/raced.txt"},
+    )
+    assert r.status_code == 409
+    # 레이스에서 이긴 쪽의 파일이 절대 덮어써지지 않는다 — O_EXCL 계약
+    assert (workspace / "raced.txt").read_text() == "winner"
+
+
+def test_copy_directory_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    def create():
+        (workspace / "raced-dir").mkdir()
+        (workspace / "raced-dir" / "keep.txt").write_text("winner")
+
+    _race_in_threadpool(monkeypatch, create)
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/raced-dir"},
+    )
+    assert r.status_code == 409  # FileExistsError가 500으로 새지 않는다
+    assert (workspace / "raced-dir" / "keep.txt").read_text() == "winner"
+
+
+def test_move_no_clobber_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    _race_in_threadpool(monkeypatch, lambda: (workspace / "raced.txt").write_text("winner"))
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/raced.txt", "no_clobber": True},
+    )
+    assert r.status_code == 409
+    assert (workspace / "notes.txt").exists()  # source 보존
+    assert (workspace / "raced.txt").read_text() == "winner"
+
+
+@pytest.mark.parametrize("no_clobber", [False, True])
+def test_move_directory_into_itself_is_a_precise_400(client, workspace, no_clobber):
+    """자기 하위로의 이동은 renameat2의 EINVAL(→501)이나 shutil.Error(→500)로
+    새지 않고 명확한 400이어야 한다."""
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/sub/nested", "no_clobber": no_clobber},
+    )
+    assert r.status_code == 400
+    assert (workspace / "sub" / "inner.md").exists()  # untouched
+
+
+def test_move_no_clobber_unavailable_fails_closed(client, workspace, monkeypatch):
+    """renameat2를 못 쓰는 환경에서는 교체 가능한 move로 조용히 fallback하지 않고
+    501로 거부한다 — no-clobber는 보장이거나 거부이지, best effort가 아니다."""
+
+    def unavailable(src, dst):
+        raise NotImplementedError("no renameat2")
+
+    monkeypatch.setattr(tf, "_rename_noreplace", unavailable)
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/renamed.txt", "no_clobber": True},
+    )
+    assert r.status_code == 501
+    assert (workspace / "notes.txt").exists()  # source untouched
+    assert not (workspace / "renamed.txt").exists()
+
+
+def test_copy_refuses_fifo_source(client, workspace):
+    os.mkfifo(workspace / "pipe")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/pipe", "destination": "/pipe copy"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "pipe copy").exists()
+
+
+def test_copy_fifo_refused_even_past_the_fast_path(client, workspace, monkeypatch):
+    """fast-path(is_file) 검사를 우회해도 fstat 검증이 막는다 — 타입 스왑 레이스
+    대비가 실제로 fd 기준인지 확인한다."""
+    monkeypatch.setattr(tf.Path, "is_file", lambda self: True)
+    os.mkfifo(workspace / "pipe2")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/pipe2", "destination": "/pipe2 copy"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "pipe2 copy").exists()
+
+
+def test_copy_directory_containing_fifo_is_client_error(client, workspace):
+    (workspace / "mix").mkdir()
+    (workspace / "mix" / "ok.txt").write_text("x")
+    os.mkfifo(workspace / "mix" / "pipe")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/mix", "destination": "/mix copy"},
+    )
+    assert r.status_code == 400  # SpecialFileError가 500으로 새지 않는다
+
+
+def test_copy_does_not_follow_symlinks_inside_tree(client, workspace, tmp_path):
+    (workspace / "linked").mkdir()
+    link = workspace / "linked" / "out"
+    link.symlink_to(workspace.parent.parent / "secret.txt")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/linked", "destination": "/linked copy"},
+    )
+    assert r.status_code == 200
+    copied = workspace / "linked copy" / "out"
+    assert copied.is_symlink()  # preserved as a link, content not duplicated
 
 
 def test_archive_zips_selection(client):

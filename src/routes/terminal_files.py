@@ -18,6 +18,7 @@ Contract (what FileNav calls):
 - ``POST /files/mkdir``  {path}       -> ``{path}``
 - ``DELETE /files/delete?path=<p>``   -> ``{path,type}``
 - ``POST /files/move``  {source,destination} -> ``{source,destination}``
+- ``POST /files/copy``  {source,destination} -> ``{source,destination,type}``
 - ``POST /files/archive`` {paths}     -> zip stream
 
 Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
@@ -52,6 +53,8 @@ Security:
   ``~/.claude`` etc.).
 """
 
+import ctypes
+import errno
 import io
 import mimetypes
 import os
@@ -78,6 +81,12 @@ class _PathBody(BaseModel):
 class _MoveBody(BaseModel):
     source: str
     destination: str
+    # Opt-in atomic no-overwrite for move: the default (False) keeps the
+    # historical FileNav contract where move silently replaces the
+    # destination. A file manager that resolves name conflicts client-side
+    # sets True so a file appearing between its listing and the move gets a
+    # 409 instead of being clobbered (copy already refuses unconditionally).
+    no_clobber: bool = False
 
 
 class _ArchiveBody(BaseModel):
@@ -501,9 +510,18 @@ async def set_cwd(
 async def upload_file(
     request: Request,
     directory: str = "/",
+    no_clobber: bool = False,
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
+    """Write one uploaded file into the workspace.
+
+    Default keeps the historical contract: same name overwrites (this is how
+    "save" works through the proxy chain). ``no_clobber=true`` is the opt-in
+    for file managers dropping OS files: creation is O_EXCL, so a destination
+    appearing after the client's listing gets a 409 instead of being replaced
+    — same contract as ``/files/copy`` and move's ``no_clobber``.
+    """
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -518,7 +536,18 @@ async def upload_file(
     target = _resolve_or_403(root, f"{directory}/{name}")
 
     data = await file.read()
-    await run_in_threadpool(target.write_bytes, data)
+    if no_clobber:
+
+        def _write_exclusive() -> None:
+            with open(target, "xb") as f:
+                f.write(data)
+
+        try:
+            await run_in_threadpool(_write_exclusive)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="destination already exists")
+    else:
+        await run_in_threadpool(target.write_bytes, data)
     return {"path": str(target), "size": len(data)}
 
 
@@ -578,8 +607,170 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="source not found")
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
-    await run_in_threadpool(shutil.move, str(src), str(dst))
+    # Same rule as copy: a directory cannot move into its own subtree. Without
+    # this, the user error surfaces as renameat2's EINVAL (mapped to 501) or
+    # shutil.Error (500) instead of a precise 400.
+    if src.is_dir() and not src.is_symlink() and (dst == src or src in dst.parents):
+        raise HTTPException(status_code=400, detail="cannot move a directory into itself")
+    if body.no_clobber:
+        # No check-then-move: rename(2) replaces an existing destination by
+        # design, so only the kernel can enforce no-replace atomically.
+        # _rename_noreplace is renameat2(RENAME_NOREPLACE); when the primitive
+        # is unavailable we fail closed (501) instead of silently falling back
+        # to a replace-capable move.
+        try:
+            await run_in_threadpool(_rename_noreplace, src, dst)
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=501,
+                detail="atomic no-replace move is unavailable on this system",
+            )
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                raise HTTPException(status_code=409, detail="destination already exists")
+            raise
+    else:
+        await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
+
+
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+
+
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """Atomic no-replace rename via Linux ``renameat2(RENAME_NOREPLACE)``.
+
+    ``os.rename``/``shutil.move`` replace an existing destination by design,
+    so any exists-check followed by a move is a TOCTOU, however small the
+    window. Raises ``NotImplementedError`` when the primitive cannot give the
+    guarantee (missing symbol, unsupported filesystem, cross-device) — callers
+    must fail closed, never fall back to a replace-capable move.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (OSError, AttributeError) as exc:  # pragma: no cover — non-Linux
+        raise NotImplementedError("renameat2 unavailable") from exc
+    ret = renameat2(
+        ctypes.c_int(_AT_FDCWD),
+        os.fsencode(str(src)),
+        ctypes.c_int(_AT_FDCWD),
+        os.fsencode(str(dst)),
+        ctypes.c_uint(_RENAME_NOREPLACE),
+    )
+    if ret != 0:
+        err = ctypes.get_errno()
+        if err in (errno.ENOSYS, errno.EINVAL, errno.EXDEV):
+            raise NotImplementedError(os.strerror(err))
+        raise OSError(err, os.strerror(err), str(src), None, str(dst))
+
+
+class _UnsupportedSourceError(Exception):
+    """Copy source is not a regular file (FIFO/socket/device) — refused."""
+
+
+def _copy_file_exclusive(src: Path, dst: Path) -> None:
+    """Copy a REGULAR file, failing with ``FileExistsError`` if ``dst`` exists.
+
+    ``open(dst, "xb")`` (O_CREAT|O_EXCL) makes the no-clobber promise a
+    filesystem guarantee instead of a check-then-copy: a destination that
+    appears after validation loses the race to us or we lose it to them, but
+    nobody's file is overwritten either way.
+
+    The source is opened with ``O_NONBLOCK`` and validated via ``fstat`` on
+    the open fd: a plain ``open(src, "rb")`` on a FIFO would block the worker
+    until a writer appears (exhausting the shared threadpool), and checking
+    the type before opening would just be another TOCTOU.
+    """
+    try:
+        fd = os.open(str(src), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:  # e.g. a socket file
+            raise _UnsupportedSourceError(str(src)) from exc
+        raise
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise _UnsupportedSourceError(str(src))
+        os.set_blocking(fd, True)
+        with open(dst, "xb") as fdst, os.fdopen(os.dup(fd), "rb") as fsrc:
+            shutil.copyfileobj(fsrc, fdst)
+    finally:
+        os.close(fd)
+    shutil.copystat(str(src), str(dst))
+
+
+@router.post("/files/copy")
+async def copy_entry(
+    request: Request,
+    body: _MoveBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Duplicate a file or directory inside the workspace.
+
+    Unlike ``move``, the destination must not already exist: the file-manager
+    client resolves name conflicts itself (VS Code-style ``name copy.ext``), so
+    a collision reaching this endpoint is a race we refuse rather than resolve
+    by silently overwriting someone's file. The refusal is enforced at
+    creation time (O_EXCL for files, ``copytree``'s exclusive mkdir for
+    directories) — the early ``dst.exists()`` check below is only a fast path
+    for a clear error message.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    src = _resolve_or_403(root, body.source)
+    dst = _resolve_or_403(root, body.destination)
+    if src == root.resolve() or dst == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source not found")
+    if dst.exists():
+        raise HTTPException(status_code=409, detail="destination already exists")
+    if not dst.parent.is_dir():
+        raise HTTPException(status_code=404, detail="destination directory not found")
+    is_dir = src.is_dir() and not src.is_symlink()
+    # Only regular files and directories are copyable — a FIFO/socket/device
+    # in the workspace must be a deterministic 4xx, not a blocked worker. This
+    # is a fast path for the error message; the race-proof check is the fstat
+    # on the opened fd inside _copy_file_exclusive.
+    if not is_dir and not src.is_file():
+        raise HTTPException(status_code=400, detail="unsupported file type")
+    try:
+        if is_dir:
+            # Copying a directory into its own subtree would recurse forever.
+            if dst == src or src in dst.parents:
+                raise HTTPException(
+                    status_code=400, detail="cannot copy a directory into itself"
+                )
+            # symlinks=True copies links as links instead of following them — a
+            # link inside the tree may point outside the workspace root, and
+            # following it here would duplicate foreign content into the
+            # workspace. dirs_exist_ok stays False, so copytree's own mkdir
+            # refuses a destination that appeared after validation.
+            await run_in_threadpool(shutil.copytree, str(src), str(dst), symlinks=True)
+        else:
+            await run_in_threadpool(_copy_file_exclusive, src, dst)
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="destination already exists")
+    except _UnsupportedSourceError:
+        raise HTTPException(status_code=400, detail="unsupported file type")
+    except shutil.SpecialFileError:
+        # copytree hit a named pipe inside the tree (shutil.copyfile refuses).
+        raise HTTPException(
+            status_code=400, detail="directory contains unsupported special files"
+        )
+    except shutil.Error:
+        # copytree's aggregate error — some entries could not be copied
+        # (special files, unreadable entries). Client-visible, not a 500.
+        raise HTTPException(
+            status_code=400, detail="directory contains entries that cannot be copied"
+        )
+    return {
+        "source": body.source,
+        "destination": body.destination,
+        "type": "directory" if is_dir else "file",
+    }
 
 
 @router.post("/files/archive")
