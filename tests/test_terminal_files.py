@@ -1,5 +1,6 @@
 """Tests for the Open Terminal-compatible read-only workspace file server."""
 
+import os
 from pathlib import Path
 
 import pytest
@@ -550,6 +551,61 @@ def test_move_no_clobber_refuses_destination_appearing_after_validation(
     assert r.status_code == 409
     assert (workspace / "notes.txt").exists()  # source 보존
     assert (workspace / "raced.txt").read_text() == "winner"
+
+
+def test_move_no_clobber_unavailable_fails_closed(client, workspace, monkeypatch):
+    """renameat2를 못 쓰는 환경에서는 교체 가능한 move로 조용히 fallback하지 않고
+    501로 거부한다 — no-clobber는 보장이거나 거부이지, best effort가 아니다."""
+
+    def unavailable(src, dst):
+        raise NotImplementedError("no renameat2")
+
+    monkeypatch.setattr(tf, "_rename_noreplace", unavailable)
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/renamed.txt", "no_clobber": True},
+    )
+    assert r.status_code == 501
+    assert (workspace / "notes.txt").exists()  # source untouched
+    assert not (workspace / "renamed.txt").exists()
+
+
+def test_copy_refuses_fifo_source(client, workspace):
+    os.mkfifo(workspace / "pipe")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/pipe", "destination": "/pipe copy"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "pipe copy").exists()
+
+
+def test_copy_fifo_refused_even_past_the_fast_path(client, workspace, monkeypatch):
+    """fast-path(is_file) 검사를 우회해도 fstat 검증이 막는다 — 타입 스왑 레이스
+    대비가 실제로 fd 기준인지 확인한다."""
+    monkeypatch.setattr(tf.Path, "is_file", lambda self: True)
+    os.mkfifo(workspace / "pipe2")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/pipe2", "destination": "/pipe2 copy"},
+    )
+    assert r.status_code == 400
+    assert not (workspace / "pipe2 copy").exists()
+
+
+def test_copy_directory_containing_fifo_is_client_error(client, workspace):
+    (workspace / "mix").mkdir()
+    (workspace / "mix" / "ok.txt").write_text("x")
+    os.mkfifo(workspace / "mix" / "pipe")
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/mix", "destination": "/mix copy"},
+    )
+    assert r.status_code == 400  # SpecialFileError가 500으로 새지 않는다
 
 
 def test_copy_does_not_follow_symlinks_inside_tree(client, workspace, tmp_path):

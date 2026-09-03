@@ -53,6 +53,8 @@ Security:
   ``~/.claude`` etc.).
 """
 
+import ctypes
+import errno
 import io
 import mimetypes
 import os
@@ -606,36 +608,90 @@ async def move_entry(
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
     if body.no_clobber:
-        # The exists-check runs in the same threadpool closure immediately
-        # before the move — no event-loop hop in between. This closes the
-        # client's list-then-move round-trip race; a same-instant local write
-        # can still slip in, as POSIX rename offers no portable no-replace
-        # (rename(2) replaces atomically by design, and directories have no
-        # O_EXCL equivalent).
-        def _move_no_clobber() -> None:
-            if dst.exists():
-                raise FileExistsError(str(dst))
-            shutil.move(str(src), str(dst))
-
+        # No check-then-move: rename(2) replaces an existing destination by
+        # design, so only the kernel can enforce no-replace atomically.
+        # _rename_noreplace is renameat2(RENAME_NOREPLACE); when the primitive
+        # is unavailable we fail closed (501) instead of silently falling back
+        # to a replace-capable move.
         try:
-            await run_in_threadpool(_move_no_clobber)
-        except FileExistsError:
-            raise HTTPException(status_code=409, detail="destination already exists")
+            await run_in_threadpool(_rename_noreplace, src, dst)
+        except NotImplementedError:
+            raise HTTPException(
+                status_code=501,
+                detail="atomic no-replace move is unavailable on this system",
+            )
+        except OSError as exc:
+            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+                raise HTTPException(status_code=409, detail="destination already exists")
+            raise
     else:
         await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
 
 
+_RENAME_NOREPLACE = 1
+_AT_FDCWD = -100
+
+
+def _rename_noreplace(src: Path, dst: Path) -> None:
+    """Atomic no-replace rename via Linux ``renameat2(RENAME_NOREPLACE)``.
+
+    ``os.rename``/``shutil.move`` replace an existing destination by design,
+    so any exists-check followed by a move is a TOCTOU, however small the
+    window. Raises ``NotImplementedError`` when the primitive cannot give the
+    guarantee (missing symbol, unsupported filesystem, cross-device) — callers
+    must fail closed, never fall back to a replace-capable move.
+    """
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        renameat2 = libc.renameat2
+    except (OSError, AttributeError) as exc:  # pragma: no cover — non-Linux
+        raise NotImplementedError("renameat2 unavailable") from exc
+    ret = renameat2(
+        ctypes.c_int(_AT_FDCWD),
+        os.fsencode(str(src)),
+        ctypes.c_int(_AT_FDCWD),
+        os.fsencode(str(dst)),
+        ctypes.c_uint(_RENAME_NOREPLACE),
+    )
+    if ret != 0:
+        err = ctypes.get_errno()
+        if err in (errno.ENOSYS, errno.EINVAL, errno.EXDEV):
+            raise NotImplementedError(os.strerror(err))
+        raise OSError(err, os.strerror(err), str(src), None, str(dst))
+
+
+class _UnsupportedSourceError(Exception):
+    """Copy source is not a regular file (FIFO/socket/device) — refused."""
+
+
 def _copy_file_exclusive(src: Path, dst: Path) -> None:
-    """Copy a regular file, failing with ``FileExistsError`` if ``dst`` exists.
+    """Copy a REGULAR file, failing with ``FileExistsError`` if ``dst`` exists.
 
     ``open(dst, "xb")`` (O_CREAT|O_EXCL) makes the no-clobber promise a
     filesystem guarantee instead of a check-then-copy: a destination that
     appears after validation loses the race to us or we lose it to them, but
     nobody's file is overwritten either way.
+
+    The source is opened with ``O_NONBLOCK`` and validated via ``fstat`` on
+    the open fd: a plain ``open(src, "rb")`` on a FIFO would block the worker
+    until a writer appears (exhausting the shared threadpool), and checking
+    the type before opening would just be another TOCTOU.
     """
-    with open(src, "rb") as fsrc, open(dst, "xb") as fdst:
-        shutil.copyfileobj(fsrc, fdst)
+    try:
+        fd = os.open(str(src), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:  # e.g. a socket file
+            raise _UnsupportedSourceError(str(src)) from exc
+        raise
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise _UnsupportedSourceError(str(src))
+        os.set_blocking(fd, True)
+        with open(dst, "xb") as fdst, os.fdopen(os.dup(fd), "rb") as fsrc:
+            shutil.copyfileobj(fsrc, fdst)
+    finally:
+        os.close(fd)
     shutil.copystat(str(src), str(dst))
 
 
@@ -669,6 +725,12 @@ async def copy_entry(
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
     is_dir = src.is_dir() and not src.is_symlink()
+    # Only regular files and directories are copyable — a FIFO/socket/device
+    # in the workspace must be a deterministic 4xx, not a blocked worker. This
+    # is a fast path for the error message; the race-proof check is the fstat
+    # on the opened fd inside _copy_file_exclusive.
+    if not is_dir and not src.is_file():
+        raise HTTPException(status_code=400, detail="unsupported file type")
     try:
         if is_dir:
             # Copying a directory into its own subtree would recurse forever.
@@ -686,6 +748,19 @@ async def copy_entry(
             await run_in_threadpool(_copy_file_exclusive, src, dst)
     except FileExistsError:
         raise HTTPException(status_code=409, detail="destination already exists")
+    except _UnsupportedSourceError:
+        raise HTTPException(status_code=400, detail="unsupported file type")
+    except shutil.SpecialFileError:
+        # copytree hit a named pipe inside the tree (shutil.copyfile refuses).
+        raise HTTPException(
+            status_code=400, detail="directory contains unsupported special files"
+        )
+    except shutil.Error:
+        # copytree's aggregate error — some entries could not be copied
+        # (special files, unreadable entries). Client-visible, not a 500.
+        raise HTTPException(
+            status_code=400, detail="directory contains entries that cannot be copied"
+        )
     return {
         "source": body.source,
         "destination": body.destination,
