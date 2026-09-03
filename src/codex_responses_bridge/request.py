@@ -70,9 +70,18 @@ def _content_to_chat(content: Any, role: str) -> Any:
             if isinstance(url, dict):
                 url = url.get("url")
             if not url:
-                # input_image referenced only by file_id has no clean chat
-                # equivalent; skip rather than emit image_url:{url:null}.
-                continue
+                # An input_image referenced only by file_id has no chat
+                # equivalent here: silently dropping it would run a materially
+                # different text-only request while the caller believes an image
+                # was supplied. Fail closed (#173 image-input gate) -- the file
+                # reference must be resolved to a URL/data URI before this
+                # boundary, or the request is refused.
+                raise BridgeCapabilityError(
+                    "input_image referenced only by file_id has no "
+                    "chat/completions representation; resolve the file reference "
+                    "to a URL/data URI before this boundary rather than dropping "
+                    "the image"
+                )
             has_image = True
             img: dict[str, Any] = {"url": url}
             detail = part.get("detail")
@@ -87,6 +96,13 @@ def _content_to_chat(content: Any, role: str) -> Any:
     if has_image:
         return multimodal
     return "".join(text_parts)
+
+
+# Responses input item types intentionally ignored on the request path: they
+# carry no conversation/tool state a chat request needs. Everything NOT handled
+# and NOT listed here is refused (fail closed) rather than silently dropped, so
+# an unknown/new semantic item cannot be degraded invisibly.
+_IGNORABLE_INPUT_ITEM_TYPES = frozenset({"reasoning"})
 
 
 def _input_to_messages(input_data: Any) -> list[dict]:
@@ -114,7 +130,13 @@ def _input_to_messages(input_data: Any) -> list[dict]:
         if not isinstance(item, dict):
             continue
         itype = item.get("type")
-        if itype in (None, "message") and "role" in item:
+        if itype in (None, "message"):
+            if "role" not in item:
+                # A message (or typeless) item must carry a role; refuse a
+                # malformed one rather than drop it.
+                raise BridgeCapabilityError(
+                    "Responses 'message' input item is missing 'role'"
+                )
             pending = None
             role = _map_role(item.get("role"))
             messages.append(
@@ -181,7 +203,17 @@ def _input_to_messages(input_data: Any) -> list[dict]:
                     "content": out,
                 }
             )
-        # reasoning items and unknown types are dropped on the request path.
+        elif itype in _IGNORABLE_INPUT_ITEM_TYPES:
+            # Non-semantic for the chat request (e.g. a reasoning trace); dropped
+            # without ending a tool-call run.
+            continue
+        else:
+            # An unknown item type may carry conversation/tool semantics that
+            # upstream could add later; refuse rather than degrade it invisibly.
+            raise BridgeCapabilityError(
+                f"unrecognized Responses input item type '{itype}'; refusing "
+                "rather than silently dropping a potentially semantic item"
+            )
     return messages
 
 
@@ -304,19 +336,37 @@ def namespace_map_from_tools(tools: Any) -> dict[str, str]:
 
 
 def _tool_choice_to_chat(tc: Any) -> Any:
+    """Translate a Responses ``tool_choice`` to chat form, or ``None`` when absent.
+
+    Fail closed: a PRESENT ``tool_choice`` that cannot be represented faithfully
+    raises rather than being omitted -- omitting it would drop the caller's
+    tool-selection constraint and fall back to default behavior, broadening which
+    tool is callable (the opposite of fail closed).
+    """
     if tc is None:
         return None
     if isinstance(tc, str):
-        return tc if tc in ("auto", "none", "required") else None
+        if tc in ("auto", "none", "required"):
+            return tc
+        raise BridgeCapabilityError(
+            f"unsupported tool_choice '{tc}'; refusing rather than dropping the "
+            "caller's tool-selection constraint"
+        )
     if isinstance(tc, dict):
         ttype = tc.get("type")
         if ttype == "function":
             name = tc.get("name") or (tc.get("function") or {}).get("name")
             if name:
                 return {"type": "function", "function": {"name": name}}
+            raise BridgeCapabilityError(
+                "tool_choice of type 'function' is missing its function name"
+            )
         if ttype in ("auto", "none", "required"):
             return ttype
-    return None
+    raise BridgeCapabilityError(
+        f"unsupported tool_choice form {tc!r}; refusing rather than dropping the "
+        "caller's tool-selection constraint"
+    )
 
 
 def _text_format_to_response_format(text: Any) -> Optional[dict]:
@@ -397,9 +447,13 @@ def responses_request_to_chat_body(
     # ``tools:[]`` on compaction turns, and vLLM/SGLang reject either param
     # without tools -- so both are emitted only alongside a non-empty tool list.
     tools, _namespace_map = _translate_tools(body.get("tools"))
+    # Validate tool_choice whenever present (raises on an unrepresentable form),
+    # even for an empty tool set -- an unsupported constraint must never be
+    # silently dropped. It is EMITTED only alongside a non-empty tool list
+    # (vLLM/SGLang reject tool_choice without tools).
+    tc = _tool_choice_to_chat(body.get("tool_choice"))
     if tools:
         out["tools"] = tools
-        tc = _tool_choice_to_chat(body.get("tool_choice"))
         if tc is not None:
             out["tool_choice"] = tc
     else:

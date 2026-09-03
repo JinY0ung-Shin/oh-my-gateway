@@ -231,23 +231,109 @@ def test_input_image_by_url_becomes_multimodal():
     assert {"type": "image_url", "image_url": {"url": "http://x/y.png"}} in content
 
 
-def test_input_image_file_id_only_is_skipped():
+def test_input_image_file_id_only_is_refused():
+    # No usable image url -> refuse rather than silently running a text-only
+    # request while the caller believes an image was supplied (#173 image gate).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {"type": "input_text", "text": "hi"},
+                            {"type": "input_image", "file_id": "f1"},
+                        ],
+                    }
+                ]
+            }
+        )
+
+
+# -- unknown input items fail closed; ignorable ones pass --------------------
+
+
+def test_unknown_input_item_type_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "item_reference", "id": "abc"}]}
+        )
+
+
+def test_reasoning_input_item_is_ignored():
     out = responses_request_to_chat_body(
         {
             "input": [
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        {"type": "input_text", "text": "hi"},
-                        {"type": "input_image", "file_id": "f1"},
-                    ],
-                }
+                {"type": "reasoning", "summary": "thinking"},
+                {"type": "message", "role": "user", "content": "hi"},
             ]
         }
     )
-    # No usable image url -> text-only string content, image dropped.
-    assert out["messages"][0]["content"] == "hi"
+    assert out["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_message_item_without_role_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": [{"type": "message", "content": "no role"}]}
+        )
+
+
+# -- tool_choice fails closed on unrepresentable forms ----------------------
+
+
+def test_unsupported_tool_choice_string_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [{"type": "function", "name": "f"}],
+                "tool_choice": "sometimes",
+            }
+        )
+
+
+def test_unsupported_tool_choice_dict_form_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [{"type": "function", "name": "f"}],
+                "tool_choice": {"type": "mcp", "server": "s"},
+            }
+        )
+
+
+def test_function_tool_choice_without_name_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [{"type": "function", "name": "f"}],
+                "tool_choice": {"type": "function"},
+            }
+        )
+
+
+def test_unsupported_tool_choice_refused_even_with_empty_tools():
+    # An unrepresentable constraint must not slip through just because the tool
+    # set is empty and tool_choice would be dropped anyway.
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "tools": [], "tool_choice": "sometimes"}
+        )
+
+
+def test_function_tool_choice_by_name_is_forwarded():
+    out = responses_request_to_chat_body(
+        {
+            "input": "x",
+            "tools": [{"type": "function", "name": "f"}],
+            "tool_choice": {"type": "function", "name": "f"},
+        }
+    )
+    assert out["tool_choice"] == {"type": "function", "function": {"name": "f"}}
 
 
 # -- tools translation -------------------------------------------------------
