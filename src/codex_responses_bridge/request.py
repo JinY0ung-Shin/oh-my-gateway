@@ -8,13 +8,32 @@ hardened to the gateway's fail-closed contract:
   never silently dropped;
 * a flattened-function-name **collision** is rejected, never last-wins-collapsed.
 
+**Deliberately unsupported in PR-1 (refused, not degraded), pending pinned-runtime
+certification (checkpoint-2):**
+
+* **Reasoning continuation.** A ``reasoning`` input item participates in Codex
+  continuation state (``store:false`` + ``include:["reasoning.encrypted_content"]``
+  carries encrypted reasoning forward). chat/completions cannot represent it, so
+  a request carrying one is refused. A normal multi-turn Codex flow that relies
+  on reasoning state therefore does not run through this bridge yet.
+* **Active provider controls.** Consumed request fields are accepted only for
+  their proven-neutral value (e.g. ``store:false``, empty ``include``, default
+  ``service_tier``, absent ``reasoning.summary``/``reasoning.context``,
+  ``text.verbosity:"medium"``, no ``access_programs``). A known field carrying a
+  non-neutral value is refused rather than silently erased, because certifying
+  its faithful translation needs the real backend.
+
+So "request translation" here means the request SHAPE this slice proves it can
+carry, not the full current-Codex request surface -- the remaining fields fail
+loudly until certified.
+
 The response + streaming halves (chat -> Responses) and real-runtime
 certification are separate checkpoint-2 work.
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .config import (
     flatten_namespace_tools,
@@ -30,8 +49,11 @@ from .system_norm import normalize_system_messages
 # The boundary derives from the fields the current Codex ``ResponsesApiRequest``
 # can emit, so a newly-added control fails loudly HERE rather than disappearing
 # one nested field at a time. Every present field is either TRANSLATED into the
-# chat body or CONSUMED as a documented provider-local no-op; anything else is
-# refused (:class:`BridgeCapabilityError`).
+# chat body or CONSUMED -- but "consumed" is VALUE-sensitive, not key-only: a
+# consumed field is accepted only for the exact value(s) proven to be a semantic
+# no-op for this bridge. A known field carrying an ACTIVE (non-neutral) value is
+# refused (:class:`BridgeCapabilityError`), never silently erased; its faithful
+# translation is deferred to the pinned-runtime certification (checkpoint-2).
 
 # Faithfully translated into the chat/completions body.
 _TRANSLATED_BODY_FIELDS = frozenset(
@@ -53,57 +75,84 @@ _TRANSLATED_BODY_FIELDS = frozenset(
         "safety_identifier",
     }
 )
-# Present in current Codex requests but deliberately NOT forwarded: they govern
-# Responses-side persistence/delivery/telemetry that the chat/completions data
-# plane has no equivalent for, so dropping them changes no model-visible
-# authority or tool semantics. ``store``/``include`` drive the encrypted-
-# reasoning continuation loop, which this bridge does not carry (reasoning input
-# items are refused), so they are consistently no-ops here.
-_CONSUMED_BODY_FIELDS = frozenset(
-    {
-        "store",
-        "include",
-        "stream_options",
-        "service_tier",
-        "prompt_cache_key",
-        "client_metadata",
-        "access_programs",
-        "previous_response_id",
-    }
-)
+
+_Neutral = Callable[[Any], bool]
+
+# Consumed top-level fields -> predicate for the value(s) accepted as a proven
+# no-op. ``store``/``include`` drive the encrypted-reasoning continuation loop
+# this bridge does not carry (reasoning input items are refused), so only their
+# neutral form (persistence off / nothing to include) is accepted; a request
+# that actively asks to persist state or to receive encrypted reasoning is
+# refused. ``service_tier`` accepts only the default routing; a specific tier
+# (e.g. flex) is a behavior change. ``access_programs`` selects a Codex access
+# program with no certified backend mapping, so any non-empty selection is
+# refused. ``prompt_cache_key``/``client_metadata`` are pure optimization/
+# telemetry with no output effect. ``previous_response_id`` is key-allowed here
+# but its value invariant (history already materialized into ``prior_messages``)
+# is enforced in :func:`responses_request_to_chat_body`.
+_CONSUMED_BODY_FIELDS: dict[str, _Neutral] = {
+    "store": lambda v: not v,
+    "include": lambda v: not v,
+    "stream_options": lambda v: True,
+    "service_tier": lambda v: v in (None, "auto", "default"),
+    "prompt_cache_key": lambda v: True,
+    "client_metadata": lambda v: True,
+    "access_programs": lambda v: not v,
+    "previous_response_id": lambda v: True,
+}
 
 _TRANSLATED_REASONING_FIELDS = frozenset({"effort"})
-# ``summary``/``context`` shape reasoning DELIVERY/output, which chat/completions
-# does not honor; dropping them changes output verbosity, not authority or
-# correctness. Documented no-op, tested.
-_CONSUMED_REASONING_FIELDS = frozenset({"summary", "context", "generate_summary"})
+# ``summary``/``context``/``generate_summary`` actively change reasoning
+# delivery/context; chat/completions cannot honor them, so only their absent/
+# empty form is a no-op -- a request that actively asks for a reasoning summary
+# or injects reasoning context is refused pending certification.
+_CONSUMED_REASONING_FIELDS: dict[str, _Neutral] = {
+    "summary": lambda v: not v,
+    "context": lambda v: not v,
+    "generate_summary": lambda v: not v,
+}
 
 _TRANSLATED_TEXT_FIELDS = frozenset({"format"})
-_CONSUMED_TEXT_FIELDS = frozenset({"verbosity"})
+# ``verbosity`` changes output length; only the API default ``medium`` (or
+# absent) is a no-op. ``low``/``high`` are behavior changes -> refused.
+_CONSUMED_TEXT_FIELDS: dict[str, _Neutral] = {
+    "verbosity": lambda v: v in (None, "medium"),
+}
 
 
-def _assert_known_fields(
+def _assert_field_contract(
     obj: Any,
     kind: str,
     translated: frozenset[str],
-    consumed: frozenset[str],
+    consumed: dict[str, _Neutral],
 ) -> None:
-    """Fail closed on any key of *obj* outside the known contract.
+    """Fail closed on any field of *obj* outside the known, value-sensitive contract.
 
-    A field the bridge neither translates nor deliberately consumes could carry
-    model-affecting semantics; refuse rather than accept the request after
-    silently ignoring it, so a newly-added Codex field fails loudly here. A
-    non-dict *obj* is left for its own translator to validate.
+    A key the bridge neither translates nor knows how to consume is refused
+    (a newly-added Codex control fails loudly). A consumed key whose VALUE is
+    not a proven no-op is also refused, so a known field carrying an active
+    control cannot be silently erased. A non-dict *obj* is left for its own
+    translator to validate.
     """
     if not isinstance(obj, dict):
         return
-    unknown = sorted(set(obj) - translated - consumed)
-    if unknown:
-        raise BridgeCapabilityError(
-            f"unsupported Responses {kind} field(s) {unknown}; refusing rather "
-            "than accepting a request after silently ignoring a control (add the "
-            "field to the bridge contract to translate or consume it)"
-        )
+    for key, value in obj.items():
+        if key in translated:
+            continue
+        predicate = consumed.get(key)
+        if predicate is None:
+            raise BridgeCapabilityError(
+                f"unsupported Responses {kind} field {key!r}; refusing rather "
+                "than accepting a request after silently ignoring a control (add "
+                "it to the bridge contract to translate or consume it)"
+            )
+        if not predicate(value):
+            raise BridgeCapabilityError(
+                f"Responses {kind} field {key!r}={value!r} is not a proven no-op "
+                "for this bridge; refusing rather than silently erasing an active "
+                "control (its faithful translation is deferred to pinned-runtime "
+                "certification)"
+            )
 
 
 def _map_role(role: Any) -> str:
@@ -568,7 +617,7 @@ def _text_format_to_response_format(text: Any) -> Optional[dict]:
         raise BridgeCapabilityError(
             f"Responses 'text' must be an object, got {type(text).__name__}"
         )
-    _assert_known_fields(text, "text", _TRANSLATED_TEXT_FIELDS, _CONSUMED_TEXT_FIELDS)
+    _assert_field_contract(text, "text", _TRANSLATED_TEXT_FIELDS, _CONSUMED_TEXT_FIELDS)
     fmt = text.get("format")
     if fmt is None:
         return None
@@ -603,9 +652,20 @@ def responses_request_to_chat_body(
     as a system message. Raises :class:`BridgeCapabilityError` when a requested
     tool capability cannot be faithfully represented (see :func:`_translate_tools`).
     """
-    _assert_known_fields(
+    _assert_field_contract(
         body, "request", _TRANSLATED_BODY_FIELDS, _CONSUMED_BODY_FIELDS
     )
+    # ``previous_response_id`` is resolved to ``prior_messages`` upstream; a raw
+    # value present here without materialized history means the referenced turns
+    # were never carried in, so forwarding only the incremental ``input`` would
+    # run a truncated conversation. Enforce the invariant rather than consume it.
+    if body.get("previous_response_id") and not prior_messages:
+        raise BridgeCapabilityError(
+            "Responses 'previous_response_id' is present but no resolved prior "
+            "history was supplied; refusing rather than forwarding only the "
+            "incremental input as a fresh conversation (resolve it to "
+            "prior_messages upstream before this boundary)"
+        )
     out: dict[str, Any] = {}
     if body.get("model") is not None:
         out["model"] = body["model"]
@@ -640,7 +700,7 @@ def responses_request_to_chat_body(
             f"{type(reasoning).__name__}"
         )
     if isinstance(reasoning, dict):
-        _assert_known_fields(
+        _assert_field_contract(
             reasoning,
             "reasoning",
             _TRANSLATED_REASONING_FIELDS,
@@ -683,11 +743,33 @@ def responses_request_to_chat_body(
     # (vLLM/SGLang reject tool_choice without tools).
     tc = _tool_choice_to_chat(body.get("tool_choice"))
     if tools:
+        # A named function choice must reference a tool that actually survived
+        # translation; a syntactically valid but missing name is an impossible
+        # constraint, not a forwardable one.
+        if isinstance(tc, dict):
+            chosen = tc["function"]["name"]
+            if chosen not in {t["function"]["name"] for t in tools}:
+                raise BridgeCapabilityError(
+                    f"tool_choice names function {chosen!r}, absent from the "
+                    "translated tool set; refusing an unsatisfiable constraint "
+                    "rather than forwarding a misbound one"
+                )
         out["tools"] = tools
         if tc is not None:
             out["tool_choice"] = tc
     else:
         out.pop("parallel_tool_calls", None)
+        # Empty translated tool set: omitting tool_choice is only equivalent for
+        # ``auto``/``none`` (nothing to call anyway -- ``auto`` is the Codex
+        # compaction case). ``required`` and a named function DEMAND a tool call
+        # that zero tools cannot satisfy, so refuse rather than silently relax
+        # "must call a tool" into an unconstrained completion.
+        if tc is not None and tc not in ("auto", "none"):
+            raise BridgeCapabilityError(
+                f"tool_choice {tc!r} requires a tool call but the translated "
+                "tool set is empty; refusing rather than dropping the constraint "
+                "into an unconstrained completion"
+            )
     rf = _text_format_to_response_format(body.get("text"))
     if rf is not None:
         out["response_format"] = rf

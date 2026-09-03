@@ -491,6 +491,48 @@ def test_function_tool_choice_by_name_is_forwarded():
     assert out["tool_choice"] == {"type": "function", "function": {"name": "f"}}
 
 
+def test_empty_tools_required_choice_is_refused():
+    # 'required' demands a tool call; zero tools cannot satisfy it, so refuse
+    # rather than relax it into an unconstrained completion (round-5 finding 2).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "tools": [], "tool_choice": "required"}
+        )
+
+
+def test_empty_tools_named_choice_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [],
+                "tool_choice": {"type": "function", "name": "f"},
+            }
+        )
+
+
+def test_empty_tools_none_choice_is_omitted():
+    # 'none' is equivalent to no constraint when there are no tools -> omitted.
+    out = responses_request_to_chat_body(
+        {"input": "x", "tools": [], "tool_choice": "none"}
+    )
+    assert "tool_choice" not in out
+    assert "tools" not in out
+
+
+def test_named_choice_absent_from_translated_tool_set_is_refused():
+    # A named choice must reference a tool that survived translation; a missing
+    # name is an impossible constraint, not a forwardable one (round-5 finding 2).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {
+                "input": "x",
+                "tools": [{"type": "function", "name": "g"}],
+                "tool_choice": {"type": "function", "name": "f"},
+            }
+        )
+
+
 # -- tools translation -------------------------------------------------------
 
 
@@ -724,7 +766,9 @@ def test_text_format_json_object_is_kept():
 
 
 def test_absent_text_format_omits_response_format():
-    out = responses_request_to_chat_body({"input": "x", "text": {"verbosity": "low"}})
+    out = responses_request_to_chat_body(
+        {"input": "x", "text": {"verbosity": "medium"}}
+    )
     assert "response_format" not in out
 
 
@@ -736,36 +780,83 @@ def test_unknown_top_level_field_is_refused():
         responses_request_to_chat_body({"input": "x", "frobnicate": True})
 
 
-def test_codex_shaped_request_translates_known_and_consumes_rest():
-    # A request shaped like the current Codex builder: translated controls are
-    # applied, provider-local controls are consumed (no-op, not forwarded), and
-    # nothing raises.
+def test_neutral_consumed_fields_translate_and_consume():
+    # Consumed controls at their proven-neutral value: translated controls apply,
+    # neutral provider controls are consumed (not forwarded), nothing raises.
     out = responses_request_to_chat_body(
         {
             "model": "m",
             "input": "hi",
             "store": False,
-            "include": ["reasoning.encrypted_content"],
-            "service_tier": "default",
+            "include": [],
+            "service_tier": "auto",
             "prompt_cache_key": "k",
             "client_metadata": {"trace": "1"},
-            "access_programs": ["p"],
-            "reasoning": {"effort": "high", "summary": "auto"},
-            "text": {"verbosity": "low", "format": {"type": "json_object"}},
+            "reasoning": {"effort": "high"},
+            "text": {"verbosity": "medium", "format": {"type": "json_object"}},
         }
     )
     assert out["reasoning_effort"] == "high"
     assert out["response_format"] == {"type": "json_object"}
-    # Consumed fields are not forwarded to chat/completions.
     for consumed in (
         "store",
         "include",
         "service_tier",
         "prompt_cache_key",
         "client_metadata",
-        "access_programs",
     ):
         assert consumed not in out
+
+
+def test_unknown_top_level_field_still_refused_with_neutral_siblings():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "store": False, "frobnicate": 1})
+
+
+# consumed fields are value-sensitive: an ACTIVE (non-neutral) value is refused,
+# never silently erased (round-5 finding 1).
+
+
+def test_store_true_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "store": True})
+
+
+def test_non_empty_include_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "include": ["reasoning.encrypted_content"]}
+        )
+
+
+def test_non_default_service_tier_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "service_tier": "flex"})
+
+
+def test_non_null_access_programs_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "access_programs": ["daybreak_red"]}
+        )
+
+
+def test_previous_response_id_without_prior_history_is_refused():
+    # Present id but no materialized history -> forwarding only the delta would
+    # run a truncated conversation; refuse (round-5 finding 1).
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "delta", "previous_response_id": "resp_R"}
+        )
+
+
+def test_previous_response_id_with_prior_history_ok():
+    out = responses_request_to_chat_body(
+        {"input": "delta", "previous_response_id": "resp_R"},
+        prior_messages=[{"role": "user", "content": "q"}],
+    )
+    assert out["messages"][0] == {"role": "user", "content": "q"}
+    assert "previous_response_id" not in out
 
 
 def test_present_non_object_reasoning_is_refused():
@@ -780,14 +871,18 @@ def test_unknown_reasoning_subfield_is_refused():
         )
 
 
-def test_consumed_reasoning_subfields_do_not_raise():
-    out = responses_request_to_chat_body(
-        {
-            "input": "x",
-            "reasoning": {"effort": "high", "summary": "auto", "context": "c"},
-        }
-    )
-    assert out["reasoning_effort"] == "high"
+def test_active_reasoning_summary_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "reasoning": {"effort": "high", "summary": "auto"}}
+        )
+
+
+def test_active_reasoning_context_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body(
+            {"input": "x", "reasoning": {"context": "all_turns"}}
+        )
 
 
 def test_unknown_text_subfield_is_refused():
@@ -795,6 +890,18 @@ def test_unknown_text_subfield_is_refused():
         responses_request_to_chat_body(
             {"input": "x", "text": {"format": {"type": "text"}, "bogus": 1}}
         )
+
+
+def test_active_text_verbosity_is_refused():
+    with pytest.raises(BridgeCapabilityError):
+        responses_request_to_chat_body({"input": "x", "text": {"verbosity": "low"}})
+
+
+def test_neutral_text_verbosity_medium_is_consumed():
+    out = responses_request_to_chat_body(
+        {"input": "x", "text": {"verbosity": "medium"}}
+    )
+    assert "response_format" not in out
 
 
 # -- reasoning effort --------------------------------------------------------
