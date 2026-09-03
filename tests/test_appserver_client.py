@@ -1,0 +1,1457 @@
+"""Integration tests for the app-server-backed Codex ``BackendClient``.
+
+These drive the real :class:`~src.backends.appserver.transport.AppServerTransport`
+against the deterministic ``fake_app_server`` stdio adversary, through the
+adapter's ``create_client`` / ``run_completion_with_client`` surface -- the same
+path ``/v1/responses`` uses. They assert the adapter satisfies the internal
+chunk contract (issue #173 PR A) end to end: handshake, thread/turn lifecycle,
+canonical event mapping, the #165 durable-thread rule, cancellation, and
+runtime-loss terminalization.
+
+File/test/param names avoid the substring the stale-backend deselector matches,
+so these run in the default suite.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List
+
+import pytest
+
+from src.backends.appserver import client as adapter_client
+from src.backends.appserver.client import (
+    AppServerCodexClient,
+    DESCRIPTOR,
+    _resolve_model,
+)
+
+FIXTURE = Path(__file__).parent / "fixtures" / "fake_app_server.py"
+
+# Handshake steps every scenario begins with (initialize request + initialized
+# notification), mirroring the transport's own test corpus.
+HANDSHAKE_STEPS: List[Dict[str, Any]] = [
+    {"expect_method": "initialize", "actions": [{"type": "response", "result": {}}]},
+    {"expect_method": "initialized", "actions": []},
+]
+
+THREAD_START_STEP: Dict[str, Any] = {
+    "expect_method": "thread/start",
+    "actions": [{"type": "response", "result": {"thread": {"id": "thread-1"}}}],
+}
+
+
+def _message(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {"type": "message", "message": payload}
+
+
+def _write_scenario(
+    tmp_path: Path, steps: List[Dict[str, Any]], *, exit_code: int = 0
+) -> Path:
+    scenario = {"steps": steps, "linger": True, "exit_code": exit_code}
+    path = tmp_path / "scenario.json"
+    path.write_text(json.dumps(scenario), encoding="utf-8")
+    return path
+
+
+def _install_argv(monkeypatch: pytest.MonkeyPatch, scenario: Path) -> None:
+    monkeypatch.setattr(
+        adapter_client,
+        "app_server_argv",
+        lambda: [sys.executable, str(FIXTURE), str(scenario)],
+    )
+
+
+def _session(**attrs: Any) -> SimpleNamespace:
+    return SimpleNamespace(**attrs)
+
+
+async def _collect(agen) -> List[Dict[str, Any]]:
+    return [chunk async for chunk in agen]
+
+
+# -- descriptor / resolution -------------------------------------------------
+
+
+def test_descriptor_and_model_resolution():
+    assert DESCRIPTOR.name == "codex"
+    assert DESCRIPTOR.owned_by == "openai"
+    assert DESCRIPTOR.capabilities == {"image_input": True}
+
+    resolved = _resolve_model("codex/gpt-5.5")
+    assert resolved is not None
+    assert resolved.backend == "codex"
+    assert resolved.provider_model == "gpt-5.5"
+    assert _resolve_model("sonnet") is None
+
+
+async def test_verify_reports_binary_availability(monkeypatch: pytest.MonkeyPatch):
+    backend = AppServerCodexClient()
+    monkeypatch.setattr(adapter_client, "app_server_argv", lambda: ["/no/such/bin"])
+    monkeypatch.setattr(
+        backend._auth_provider,
+        "validate",
+        lambda: {"valid": False, "errors": ["x"], "config": {}},
+    )
+    assert await backend.verify() is False
+    monkeypatch.setattr(backend._auth_provider, "validate", lambda: {"valid": True})
+    assert await backend.verify() is True
+
+
+# -- lifecycle ---------------------------------------------------------------
+
+
+async def test_create_client_starts_thread_without_seeding_durable_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(
+        session=session, model="gpt-5.5", cwd=str(tmp_path)
+    )
+    try:
+        assert handle.thread_id == "thread-1"
+        # #165: the durable marker is NOT written on thread/start.
+        assert getattr(session, "codex_thread_id", None) is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_full_text_turn_maps_to_canonical_chunks_and_seeds_durable_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {"turnId": "turn-1", "delta": "Hi"},
+                }
+            ),
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "m1",
+                            "phase": "final_answer",
+                            "text": "Hi there",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "thread/tokenUsage/updated",
+                    "params": {
+                        "turnId": "turn-1",
+                        "tokenUsage": {"last": {"inputTokens": 3, "outputTokens": 2}},
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session, model="gpt-5.5")
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hello", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # A visible text delta was mapped.
+    assert any(
+        c.get("type") == "stream_event"
+        and c["event"].get("delta", {}).get("type") == "text_delta"
+        and c["event"]["delta"]["text"] == "Hi"
+        for c in chunks
+    )
+    # The turn terminated with a success result carrying final text + usage.
+    result = chunks[-1]
+    assert result["type"] == "result"
+    assert result["subtype"] == "success"
+    assert result["result"] == "Hi there"
+    assert result["usage"] == {"input_tokens": 3, "output_tokens": 2}
+    # #165: durable thread id is seeded only after the turn completes.
+    assert session.codex_thread_id == "thread-1"
+    # parse_message reads the same terminal chunk (non-stream/background path).
+    assert backend.parse_message(chunks) == "Hi there"
+
+
+async def test_tool_turn_maps_tool_use_and_tool_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "item/started",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "c1",
+                            "command": "ls",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "commandExecution",
+                            "id": "c1",
+                            "status": "completed",
+                            "exitCode": 0,
+                            "aggregatedOutput": "file.txt\n",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "run ls", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    tool_use = next(
+        b
+        for c in chunks
+        if c.get("type") == "assistant"
+        for b in c.get("content", [])
+        if b.get("type") == "tool_use"
+    )
+    assert tool_use["name"] == "commandExecution"
+    assert tool_use["id"] == "c1"
+    tool_result = next(
+        b
+        for c in chunks
+        if c.get("type") == "user"
+        for b in c.get("content", [])
+        if b.get("type") == "tool_result"
+    )
+    assert tool_result["tool_use_id"] == "c1"
+    assert tool_result["content"] == "file.txt\n"
+    assert tool_result["is_error"] is False
+
+
+async def test_turn_failure_maps_to_error_chunk_and_no_durable_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "turn": {
+                            "id": "turn-1",
+                            "status": "failed",
+                            "error": {"message": "nope"},
+                        }
+                    },
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    assert chunks[-1] == {"type": "error", "is_error": True, "error_message": "nope"}
+    # A failed turn must not seed a resume marker.
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+async def test_cancellation_emits_gateway_interrupt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    # The route flips this to "cancelling" when POST /cancel lands.
+    session = _session(active_response_state="cancelling")
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal.get("gateway_interrupted") is True
+    assert terminal["subtype"] == "error_during_execution"
+    # An interrupted turn is not a clean completion, so no durable id.
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+async def test_runtime_loss_terminalizes_the_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            {"type": "exit", "code": 3},
+        ],
+    }
+    # No linger: the process exits mid-turn.
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    assert chunks[-1]["type"] == "error"
+    assert chunks[-1]["is_error"] is True
+    assert "terminated" in chunks[-1]["error_message"]
+
+
+# -- turn/start post-commit reconciliation (#172 seam / #174 blocker 2) -------
+
+
+async def test_turn_start_deadline_then_late_response_is_recovered_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Causal test A: turn/start bytes commit, the response deadline expires, then
+    the response arrives late. The transport orphans the accepted request and
+    delivers the late result as an OrphanedResponse; the adapter must consume it
+    (recover the accepted turn and stream it to completion), never re-send
+    turn/start."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            # Blow the response deadline (0.5s) with margin before answering.
+            {"type": "sleep", "seconds": 0.8},
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    # Exactly ONE turn/start step: a blind replay would send a second turn/start
+    # and the fixture would fail on the unexpected input.
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # The accepted turn was recovered and driven to a clean completion.
+    assert chunks[-1]["type"] == "result"
+    assert chunks[-1]["subtype"] == "success"
+    assert getattr(session, "codex_thread_id", None) == "thread-1"
+
+
+async def test_turn_start_deadline_then_death_is_ambiguous_not_replayed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Causal test B: turn/start bytes commit, the response deadline expires, and
+    the runtime then dies before answering. The transport surfaces the accepted
+    request as an AmbiguousRequest before the TerminalEvent; the adapter must end
+    with a reconciliation-required terminal (never a blind replay, never a plain
+    retryable failure) that keeps the thread identity."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {"type": "sleep", "seconds": 0.8},
+            {"type": "exit", "code": 1},
+        ],
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal["type"] == "error"
+    assert "ambiguous" in terminal["error_message"]
+    assert "not replayed" in terminal["error_message"]
+    # Ambiguous accepted work is not a clean completion -> no durable id seeded.
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+async def test_turn_start_runtime_lost_before_commit_is_known_not_sent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Causal test C: the runtime dies before turn/start bytes cross the wire.
+    That is a plain RuntimeLost (known-not-sent), distinct from committed-loss:
+    it ends normally as a runtime-lost error, not a reconciliation-required
+    ambiguous terminal."""
+    # Handshake + thread/start only; the process then exits with no turn/start
+    # step, so the runtime is gone before the turn is ever attempted.
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps({"steps": HANDSHAKE_STEPS + [THREAD_START_STEP], "linger": False}),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        # Deterministically wait for the process to be gone before the turn, so
+        # turn/start's bytes are known-not-sent (committed=False -> plain
+        # RuntimeLost, never RequestOutcomeUnknown).
+        await handle.transport.wait_terminal(timeout=2.0)
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal["type"] == "error"
+    assert "before turn start" in terminal["error_message"]
+    # Known-not-sent is NOT the ambiguous/committed-loss path.
+    assert "ambiguous" not in terminal["error_message"]
+    assert "not replayed" not in terminal["error_message"]
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+# -- post-commit cancellation + owner-liveness (#174 round-5 blockers) --------
+
+
+async def test_turn_start_post_commit_cancel_retires_recovered_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 1: a post-commit caller cancellation (the SSE generator is
+    cancelled by client disconnect) must not drop the orphan seam. A detached,
+    handle-owned owner survives the cancelled generator, consumes the late
+    OrphanedResponse, and interrupts/retires exactly that accepted turn -- with no
+    blind replay and no leaked subscription/orphan owner."""
+    # A generous per-request timeout so the run is cancelled (CancelledError),
+    # not timed out, while turn/start's response is outstanding.
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 5.0)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {"type": "sleep", "seconds": 0.8},
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+        ],
+    }
+    interrupt_step = {
+        "expect_method": "turn/interrupt",
+        "actions": [{"type": "response", "result": {}}],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, interrupt_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+
+    # Record the exact turn the owner retires.
+    interrupted: List[tuple] = []
+    original_interrupt = handle.transport.interrupt
+
+    async def _spy_interrupt(thread_id, turn_id, **kwargs):
+        interrupted.append((thread_id, turn_id))
+        return await original_interrupt(thread_id, turn_id, **kwargs)
+
+    handle.transport.interrupt = _spy_interrupt
+
+    try:
+        run = asyncio.ensure_future(
+            _collect(backend.run_completion_with_client(handle, "hi", session))
+        )
+        # Let turn/start commit (the fake is now sleeping on the response), then
+        # cancel the run mid-flight.
+        await asyncio.sleep(0.3)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+        # A detached owner took over the orphaned turn/start.
+        owner = handle._reconcile_task
+        assert owner is not None
+        # It consumes the late response and retires exactly that turn.
+        await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
+        assert interrupted == [("thread-1", "turn-1")]
+        # No blind replay (only one turn/start step existed) and no leaks.
+        assert handle._reconcile_task is None
+        assert handle._subscription is None
+        assert handle.transport._orphaned_requests == {}
+    finally:
+        await handle.disconnect()
+
+
+async def test_turn_start_post_commit_cancel_then_death_is_ambiguous(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 1 sibling: post-commit cancel, then the generation dies
+    before the response. The detached owner consumes the AmbiguousRequest,
+    retires nothing (no turn to retire), and never replays."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 5.0)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {"type": "sleep", "seconds": 0.8},
+            {"type": "exit", "code": 1},
+        ],
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    interrupted: List[tuple] = []
+    original_interrupt = handle.transport.interrupt
+
+    async def _spy_interrupt(thread_id, turn_id, **kwargs):
+        interrupted.append((thread_id, turn_id))
+        return await original_interrupt(thread_id, turn_id, **kwargs)
+
+    handle.transport.interrupt = _spy_interrupt
+
+    try:
+        run = asyncio.ensure_future(
+            _collect(backend.run_completion_with_client(handle, "hi", session))
+        )
+        await asyncio.sleep(0.3)
+        run.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+        owner = handle._reconcile_task
+        assert owner is not None
+        await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
+        # No turn ever materialized -> nothing retired, and never replayed.
+        assert interrupted == []
+        assert handle._reconcile_task is None
+        assert handle._subscription is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_turn_start_response_beats_cancel_still_transfers_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-6 blocker: the response-beats-cancellation race. When the reader
+    delivers turn/start's response in the SAME tick the caller is cancelled, the
+    transport fans the OrphanedResponse inline and leaves NO unresolved-orphan
+    registry entry. Ownership must still transfer (keyed on the explicit
+    CommittedRequestCancelled type, never on the empty registry): the detached
+    owner consumes the already-queued outcome and retires exactly that turn."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 5.0)
+    # The fake never answers turn/start itself; the test injects the response via
+    # the transport reader to pin the interleaving (mirrors the #172 transport
+    # corpus). A turn/interrupt step lets the owner's retire land.
+    turn_step = {"expect_method": "turn/start", "actions": []}
+    interrupt_step = {
+        "expect_method": "turn/interrupt",
+        "actions": [{"type": "response", "result": {}}],
+    }
+    scenario = _write_scenario(
+        tmp_path,
+        HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, interrupt_step],
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    interrupted: List[tuple] = []
+    original_interrupt = handle.transport.interrupt
+
+    async def _spy_interrupt(thread_id, turn_id, **kwargs):
+        interrupted.append((thread_id, turn_id))
+        return await original_interrupt(thread_id, turn_id, **kwargs)
+
+    handle.transport.interrupt = _spy_interrupt
+
+    try:
+        run = asyncio.ensure_future(
+            _collect(backend.run_completion_with_client(handle, "hi", session))
+        )
+        # Wait until turn/start is committed (waiter registered, write lock free).
+        request_id = None
+        for _ in range(200):
+            await asyncio.sleep(0.01)
+            methods = handle.transport._waiter_methods
+            if (
+                "turn/start" in methods.values()
+                and not handle.transport._write_lock.locked()
+            ):
+                request_id = next(
+                    rid for rid, m in methods.items() if m == "turn/start"
+                )
+                break
+        assert request_id is not None
+
+        run.cancel()
+        # Same tick, before the cancelled task resumes: the reader routes the
+        # response, so the transport fans the OrphanedResponse INLINE and leaves
+        # no unresolved-orphan registry entry.
+        handle.transport._dispatch(
+            {"id": request_id, "result": {"turn": {"id": "turn-1"}}}
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+        # The response beat the cancellation -> empty unresolved-orphan registry...
+        assert handle.transport._orphaned_requests == {}
+        # ...yet ownership STILL transferred (keyed on CommittedRequestCancelled).
+        owner = handle._reconcile_task
+        assert owner is not None
+        await asyncio.wait_for(asyncio.shield(owner), timeout=3.0)
+        # The owner consumed the queued outcome and retired exactly that turn once.
+        assert interrupted == [("thread-1", "turn-1")]
+        assert handle._reconcile_task is None
+        assert handle._subscription is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_turn_start_orphan_ownership_survives_beyond_second_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 2: once turn/start is committed, the reconciler must not
+    abandon a live generation on a second local deadline. With the runtime silent
+    well beyond 2 * request_timeout, ownership is retained; when the late response
+    finally arrives it is recovered (not lost, not replayed)."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    # Health bound (2.0s) comfortably exceeds the > 2*R silent window.
+    monkeypatch.setattr(adapter_client, "_reconcile_health_bound_s", lambda: 2.0)
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            # Silent for 1.3s: past the old second-timeout (2*0.5=1.0s) that used
+            # to abandon, but within the 2.0s health bound.
+            {"type": "sleep", "seconds": 1.3},
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # Ownership was retained past the old abandon point -> the turn recovered.
+    assert chunks[-1]["type"] == "result"
+    assert chunks[-1]["subtype"] == "success"
+    assert getattr(session, "codex_thread_id", None) == "thread-1"
+
+
+async def test_turn_start_health_bound_terminalizes_not_abandons(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Round-5 blocker 2: if a committed turn/start stays unresolved against a
+    silent-but-live runtime past the health bound, the reconciler DELIBERATELY
+    terminalizes the generation and classifies the accepted request as ambiguous
+    -- it never merely unsubscribes from a live generation."""
+    monkeypatch.setattr(adapter_client, "request_timeout_s", lambda: 0.5)
+    monkeypatch.setattr(adapter_client, "_reconcile_health_bound_s", lambda: 1.2)
+    turn_step = {
+        "expect_method": "turn/start",
+        # Never answers; the process stays alive and silent (lingering sleep).
+        "actions": [{"type": "sleep", "seconds": 60}],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    terminal = chunks[-1]
+    assert terminal["type"] == "error"
+    # Classified as ambiguous (terminalized + observed), NOT the old
+    # "no outcome observed" local-abandon error.
+    assert "ambiguous" in terminal["error_message"]
+    assert "not replayed" in terminal["error_message"]
+    assert "no outcome was observed" not in terminal["error_message"]
+    assert getattr(session, "codex_thread_id", None) is None
+
+
+async def test_resume_uses_durable_thread_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    resume_step = {
+        "expect_method": "thread/resume",
+        "actions": [{"type": "response", "result": {"thread": {"id": "thread-1"}}}],
+    }
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [resume_step])
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    # A prior completed turn left a durable id on the session.
+    session = _session(codex_thread_id="thread-1")
+
+    handle = await backend.create_client(session=session)
+    try:
+        assert handle.thread_id == "thread-1"
+    finally:
+        await handle.disconnect()
+
+
+# -- interaction bridge (PR B) ----------------------------------------------
+
+
+def _approval_request(request_id: str = "approval-1") -> Dict[str, Any]:
+    return _message(
+        {
+            "id": request_id,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "itemId": "item-1",
+                "command": "ls -la",
+                "availableDecisions": ["accept", "decline"],
+            },
+        }
+    )
+
+
+async def test_interaction_parks_as_askuserquestion_then_resumes_same_turn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+        ],
+    }
+    # The approval answer ({"id":"approval-1","result":{"decision":"accept"}}) is
+    # the next stdin line; after it, the turn continues to completion.
+    answer_step = {
+        "expect_id": "approval-1",
+        "expect_has_id": True,
+        "actions": [
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "id": "m1",
+                            "phase": "final_answer",
+                            "text": "listed",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        first = await _collect(
+            backend.run_completion_with_client(handle, "run ls", session)
+        )
+        # The turn parked: a codex_approval tool_use chunk was emitted and the
+        # route-facing pending_tool_call is set for requires_action.
+        approval_block = first[-1]["content"][0]
+        assert approval_block["name"] == "codex_approval"
+        assert session.pending_tool_call["name"] == "AskUserQuestion"
+        assert session.pending_tool_call["codex_resume"] == "approval"
+        # The UI-facing call_id is an OPAQUE per-occurrence id, NOT the native
+        # request id "approval-1" (#174 review §3).
+        canonical_id = session.pending_tool_call["call_id"]
+        assert canonical_id != "approval-1"
+        assert approval_block["metadata"]["codex_approval_request_id"] == canonical_id
+        # The subscription persisted across the pause (turn still live).
+        assert handle._subscription is not None
+
+        # Answer with the canonical id -> continues the SAME turn to completion.
+        # (transport.answer still writes the native "approval-1" to the wire.)
+        second = await _collect(
+            backend.resume_approval_with_client(handle, canonical_id, "accept", session)
+        )
+        assert second[-1]["type"] == "result"
+        assert second[-1]["result"] == "listed"
+        assert session.codex_thread_id == "thread-1"
+        # The turn is fully torn down after completion.
+        assert handle._subscription is None
+    finally:
+        await handle.disconnect()
+
+
+async def test_resume_with_mismatched_call_id_is_deterministic_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        await _collect(backend.run_completion_with_client(handle, "run ls", session))
+        chunks = await _collect(
+            backend.resume_approval_with_client(handle, "wrong-id", "accept", session)
+        )
+        assert chunks[-1]["type"] == "error"
+        assert "mismatch" in chunks[-1]["error_message"]
+    finally:
+        await handle.disconnect()
+
+
+async def test_upstream_resolved_interaction_answer_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+            # Codex resolves the request itself before the user answers.
+            _message(
+                {
+                    "method": "serverRequest/resolved",
+                    "params": {"threadId": "thread-1", "requestId": "approval-1"},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        await _collect(backend.run_completion_with_client(handle, "run ls", session))
+        canonical_id = session.pending_tool_call["call_id"]
+        # Give the reader a moment to process the resolved notification.
+        chunks = await _collect(
+            backend.resume_approval_with_client(handle, canonical_id, "accept", session)
+        )
+        assert chunks[-1]["type"] == "error"
+        assert "no longer actionable" in chunks[-1]["error_message"]
+    finally:
+        await handle.disconnect()
+
+
+async def test_route_aclose_after_park_keeps_turn_live_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The route calls aclose() on the run_completion generator right after a
+    park (to end the requires_action stream). That must not tear down the live
+    turn -- the resume needs the same subscription."""
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _approval_request(),
+        ],
+    }
+    answer_step = {
+        "expect_id": "approval-1",
+        "expect_has_id": True,
+        "actions": [
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "ok",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        # Drive until the park chunk, then aclose the generator like the route.
+        agen = backend.run_completion_with_client(handle, "run ls", session)
+        park_chunk = None
+        async for chunk in agen:
+            park_chunk = chunk
+            if (
+                isinstance(chunk, dict)
+                and chunk.get("content")
+                and chunk["content"][0].get("name") == "codex_approval"
+            ):
+                await agen.aclose()
+                break
+        assert park_chunk["content"][0]["name"] == "codex_approval"
+        # Subscription survived the aclose.
+        assert handle._subscription is not None
+
+        canonical_id = session.pending_tool_call["call_id"]
+        resumed = await _collect(
+            backend.resume_approval_with_client(handle, canonical_id, "accept", session)
+        )
+        assert resumed[-1]["result"] == "ok"
+    finally:
+        await handle.disconnect()
+
+
+# -- subagents (PR C) --------------------------------------------------------
+
+
+async def test_subagent_spawn_and_completion_stream_as_task_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {
+                            "id": "child-1",
+                            "parentThreadId": "thread-1",
+                            "role": "explorer",
+                        }
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread-1",
+                        "item": {
+                            "type": "subAgentActivity",
+                            "id": "act-1",
+                            "kind": "completed",
+                            "agentThreadId": "child-1",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "turnId": "turn-1",
+                        "item": {
+                            "type": "agentMessage",
+                            "phase": "final_answer",
+                            "text": "done",
+                        },
+                    },
+                }
+            ),
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "spawn", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    started = next(c for c in chunks if c.get("subtype") == "task_started")
+    assert started["task_id"] == "child-1"
+    assert started["parent_tool_use_id"] == "thread-1"
+    assert started["subagent_type"] == "explorer"
+    notified = next(c for c in chunks if c.get("subtype") == "task_notification")
+    assert notified["task_id"] == "child-1"
+    assert notified["status"] == "completed"
+    assert chunks[-1]["result"] == "done"
+
+
+async def test_runtime_loss_terminalizes_open_child_rows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "method": "thread/started",
+                    "params": {
+                        "thread": {"id": "child-1", "parentThreadId": "thread-1"}
+                    },
+                }
+            ),
+            {"type": "exit", "code": 1},
+        ],
+    }
+    scenario_path = tmp_path / "scenario.json"
+    scenario_path.write_text(
+        json.dumps(
+            {"steps": HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step], "linger": False}
+        ),
+        encoding="utf-8",
+    )
+    _install_argv(monkeypatch, scenario_path)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "spawn", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # The open child was terminalized before the turn's error terminal, so no
+    # forever-running row is left behind.
+    task_updates = [c for c in chunks if c.get("subtype") == "task_updated"]
+    assert any(
+        c["task_id"] == "child-1" and c["status"] == "failed" for c in task_updates
+    )
+    assert chunks[-1]["type"] == "error"
+
+
+# -- tool policy (#5/#6) -----------------------------------------------------
+
+
+async def test_command_deny_refuses_session_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A command/shell deny that the runtime cannot enforce fails closed at
+    session creation (#174 review §5) rather than relying on approvals."""
+    from src.backends.appserver.policy import CapabilityError
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    with pytest.raises(CapabilityError):
+        await backend.create_client(session=session, disallowed_tools=["Bash"])
+
+
+async def test_update_request_policy_applies_and_rejects_unsafe_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """The reused handle must not run stale policy across turns (#174 review §6):
+    update_request_policy applies a safe change and fails closed on one that
+    cannot be applied to a live thread."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(
+        session=session, permission_mode="bypassPermissions"
+    )
+    try:
+        assert handle.approval_policy == "never"
+        # A safe change (tighten approvals) is applied in place.
+        backend.update_request_policy(
+            handle,
+            allowed_tools=None,
+            disallowed_tools=None,
+            permission_mode="default",
+            model_params=None,
+        )
+        assert handle.approval_policy == "on-request"
+        assert handle.permission_mode == "default"
+        # A continuation that denies command execution cannot be enforced -> 400.
+        with pytest.raises(UnsupportedContinuationPolicy):
+            backend.update_request_policy(
+                handle,
+                allowed_tools=None,
+                disallowed_tools=["Bash"],
+                permission_mode="default",
+                model_params=None,
+            )
+    finally:
+        await handle.disconnect()
+
+
+async def test_mcp_servers_refuses_session_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Gateway-supplied MCP servers are not contract-proven on this runtime, so
+    a session that requests them fails closed at creation (#174 review §B3)
+    rather than sending an unverified config that might expose unfiltered
+    MCP tools."""
+    from src.backends.appserver.policy import CapabilityError
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    with pytest.raises(CapabilityError):
+        await backend.create_client(
+            session=session,
+            mcp_servers={"github": {"url": "https://example.invalid/mcp"}},
+        )
+
+
+async def test_unsupported_model_param_refuses_session_creation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """No OpenAI sampling control is a current-v2 TurnStartParams field, so every
+    non-empty model_params is rejected before turn/start rather than written as
+    an unpromised field or silently dropped (#174 review, blocker 1)."""
+    from src.backends.appserver.policy import CapabilityError
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    # temperature / top_p / max_output_tokens are NOT v2 turn fields -> reject.
+    for params in (
+        {"temperature": 0.1},
+        {"top_p": 0.9},
+        {"max_output_tokens": 256},
+        {"frequency_penalty": 0.5},
+    ):
+        with pytest.raises(CapabilityError):
+            await backend.create_client(session=session, model_params=params)
+
+
+async def test_continuation_unsupported_change_leaves_handle_policy_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A rejected continuation policy update must not partially mutate the reused
+    handle (#174 review §B4): validate first, commit second."""
+    from src.backends.claude.client import UnsupportedContinuationPolicy
+
+    scenario = _write_scenario(tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP])
+    _install_argv(monkeypatch, scenario)
+    monkeypatch.delenv("DISALLOWED_TOOLS", raising=False)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session, permission_mode="default")
+    try:
+        before = (
+            handle.permission_mode,
+            handle.allowed_tools,
+            handle.disallowed_tools,
+            dict(handle.model_params or {}),
+            handle.approval_policy,
+        )
+        # An unsupported model param on continuation -> 400, no field mutated.
+        with pytest.raises(UnsupportedContinuationPolicy):
+            backend.update_request_policy(
+                handle,
+                permission_mode="bypassPermissions",
+                model_params={"frequency_penalty": 0.9},
+            )
+        after = (
+            handle.permission_mode,
+            handle.allowed_tools,
+            handle.disallowed_tools,
+            dict(handle.model_params or {}),
+            handle.approval_policy,
+        )
+        assert before == after
+        # An explicit allow-list on continuation is equally unenforceable -> 400.
+        with pytest.raises(UnsupportedContinuationPolicy):
+            backend.update_request_policy(handle, allowed_tools=["Bash"])
+    finally:
+        await handle.disconnect()
+
+
+async def test_optionless_user_input_is_failed_closed_not_parked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A requestUserInput whose question has no options (free-text/secret) cannot
+    be rendered as a completable card, so it is failed closed rather than emitted
+    as a dead requires_action card (#174 review §1)."""
+    turn_step = {
+        "expect_method": "turn/start",
+        "actions": [
+            {
+                "type": "response",
+                "result": {"turn": {"id": "turn-1", "status": "inProgress"}},
+            },
+            _message(
+                {
+                    "id": "ui-1",
+                    "method": "item/tool/requestUserInput",
+                    "params": {
+                        "threadId": "thread-1",
+                        "turnId": "turn-1",
+                        "itemId": "i1",
+                        "isBlocking": True,
+                        "questions": [
+                            {"id": "q1", "question": "Enter your name", "options": []}
+                        ],
+                    },
+                }
+            ),
+        ],
+    }
+    # The fail-closed answer is a JSON-RPC error for ui-1; then the turn completes.
+    answer_step = {
+        "expect_id": "ui-1",
+        "expect_has_id": True,
+        "expect_has_error": True,
+        "actions": [
+            _message(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-1", "status": "completed"}},
+                }
+            ),
+        ],
+    }
+    scenario = _write_scenario(
+        tmp_path, HANDSHAKE_STEPS + [THREAD_START_STEP, turn_step, answer_step]
+    )
+    _install_argv(monkeypatch, scenario)
+    backend = AppServerCodexClient()
+    session = _session()
+
+    handle = await backend.create_client(session=session)
+    try:
+        chunks = await _collect(
+            backend.run_completion_with_client(handle, "hi", session)
+        )
+    finally:
+        await handle.disconnect()
+
+    # No dead card was emitted; the turn ended normally.
+    assert getattr(session, "pending_tool_call", None) in (None, {})
+    assert chunks[-1]["type"] == "result"

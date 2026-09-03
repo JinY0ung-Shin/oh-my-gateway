@@ -24,6 +24,20 @@ logger = logging.getLogger(__name__)
 STALE_BACKENDS = ("opencode", "codex")
 
 
+def _use_frozen_codex() -> bool:
+    """Whether ``BACKENDS=codex`` should register the FROZEN codex client.
+
+    The app-server adapter (``src/backends/appserver``, #173) is opt-in and NOT
+    the default: the #173 traffic cutover is a hard release gate that requires the
+    production two-user filesystem isolation + zero-egress proof, which is not met
+    on this branch. So ``BACKENDS=codex`` keeps registering the frozen client
+    unless an operator explicitly opts into the adapter with
+    ``CODEX_BACKEND=appserver``. The final default flip belongs to a separate,
+    small cutover PR made only after that gate passes.
+    """
+    return os.getenv("CODEX_BACKEND", "frozen").strip().lower() != "appserver"
+
+
 def _enabled_backend_names() -> list[str]:
     """Return backend names enabled by BACKENDS, preserving order."""
     raw = os.getenv("BACKENDS", "claude")
@@ -41,7 +55,10 @@ def discover_backends(registry_cls=None) -> None:
         registry_cls = BackendRegistry
 
     for name in _enabled_backend_names():
-        if name in STALE_BACKENDS:
+        # 'codex' on the app-server adapter (the default after the #173 cutover)
+        # is maintained; only the frozen fallback and opencode are stale.
+        is_stale = name == "opencode" or (name == "codex" and _use_frozen_codex())
+        if is_stale:
             logger.warning(
                 "Backend %r is stale: frozen since 2026-07 and unmaintained; "
                 "it may break without notice. Only 'claude' is supported.",
@@ -56,9 +73,17 @@ def discover_backends(registry_cls=None) -> None:
 
             opencode.register(registry_cls=registry_cls)
         elif name == "codex":
-            from src.backends import codex
+            if _use_frozen_codex():
+                from src.backends import codex
 
-            codex.register(registry_cls=registry_cls)
+                codex.register(registry_cls=registry_cls)
+            else:
+                # Opt-in only (CODEX_BACKEND=appserver): the #173 adapter is not
+                # the default until the production isolation/zero-egress gate
+                # passes and a separate small cutover PR flips it.
+                from src.backends.appserver import client as appserver_client
+
+                appserver_client.register(registry_cls=registry_cls)
         else:
             logger.warning("Unknown backend in BACKENDS=%r; skipping", name)
 

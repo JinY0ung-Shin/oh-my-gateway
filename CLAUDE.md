@@ -18,7 +18,11 @@ uv run pytest --cov=src                            # with coverage
 - `src/__init__.py` loads `.env` at package import — set `GATEWAY_SKIP_DOTENV=1` on ad-hoc
   `uv run python` snippets that import `src`, or the local `.env` leaks in (conftest already sets it).
 - Backends are enabled via `BACKENDS=claude,opencode,codex` (claude is the default). `opencode` and
-  `codex` are stale: enabling them logs a startup warning and they may break without notice.
+  `codex` are stale (frozen 2026-07): enabling them logs a startup warning and they may break without
+  notice. The maintained **app-server adapter** (`src/backends/appserver`, issue #173) is **opt-in
+  only** — set `CODEX_BACKEND=appserver` to route `BACKENDS=codex` to it. It is NOT the default: the
+  #173 traffic cutover is a hard release gate (production two-user filesystem isolation + zero-egress
+  proof) and the default flip belongs to a separate small PR once that gate passes.
 
 ## Architecture
 
@@ -28,7 +32,7 @@ uv run pytest --cov=src                            # with coverage
 - `src/agent_message_models.py` — strict caller-owned full-history request contract for
   `/v1/agents/messages`.
 - `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` implements them. `codex/` (JSON-RPC to a local `codex app-server`) and `opencode/` (managed subprocess / external HTTP modes) are frozen stale code — do not extend them.
-- `src/backends/appserver/` — the direct `codex app-server` stdio transport (C0 core, #163/#170): one reader per process, id→waiter routing, generation-bound `PendingInteraction`, fail-closed unsupported server requests, EOF/parse/death fanout, process-group teardown. Topology-agnostic by design: no session↔process placement, pooling, or resume policy lives here (gated on #165). Acceptance corpus: `tests/test_appserver_transport.py` against `tests/fixtures/fake_app_server.py`.
+- `src/backends/appserver/` — the direct `codex app-server` stdio transport (C0 core, #163/#170) plus the Codex compatibility adapter on top of it (#173). `transport.py`: one reader per process, id→waiter routing, generation-bound `PendingInteraction`, fail-closed unsupported server requests, EOF/parse/death fanout, process-group teardown; topology-agnostic (no session↔process placement, pooling, or resume policy — gated on #165). `events.py` (`TurnMapper`): maps native Codex thread/turn/item notifications into the canonical `/v1/responses` chunk contract so the same ChatDRAGON reducer renders Claude and Codex — conservative (translate only where semantics match; never fake absent fields). `client.py` (`AppServerCodexClient`/`AppServerSessionClient`): `BackendClient`/`SessionHandle` with 1-process-per-handle placement, `create_client`/`run_completion_with_client`/`interrupt_client`; records `session.codex_thread_id` as durable **only after a turn completes** (#165). Modules: `events.py` (`TurnMapper`, basic events + reasoning + subagent→`task_*` mapping), `interactions.py` (human-interaction bridge → AskUserQuestion UX), `subagents.py` (child-thread normalization), `isolation.py` (per-user `CODEX_HOME` + secret stripping), `policy.py` (canonical capability → sandbox/approval, fail-closed). `BACKENDS=codex` runs this adapter via `discover_backends` (rollback: `CODEX_BACKEND=frozen`); the adapter never reaches into the frozen `src/backends/codex/`. Acceptance corpus: `tests/test_appserver_{transport,events,client,interactions,subagents,isolation,cutover}.py` against `tests/fixtures/fake_app_server.py` + `env_probe_app_server.py`.
 - `src/sanitizer/` — stream sanitization + OpenAI-format bridge.
 - `src/agent_catalog.py` / `src/mcp_health.py` — client-facing read models behind
   `GET /v1/agent-resources` (skills/subagents across plugin + workspace + user scope, described

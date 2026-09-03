@@ -11,7 +11,6 @@ from unittest.mock import patch
 
 from src.backends.base import BackendRegistry
 
-
 # ---------------------------------------------------------------------------
 # Fixture: clean registry for every test
 # ---------------------------------------------------------------------------
@@ -105,14 +104,42 @@ class TestDiscoverBackends:
         assert calls == [("claude", "registry"), ("opencode", "registry")]
 
     def test_discover_backends_registers_codex_from_backends_env(self, monkeypatch):
-        """BACKENDS=codex dispatches to the Codex backend package."""
+        """BACKENDS=codex dispatches to the frozen package by DEFAULT.
+
+        The #173 app-server adapter is opt-in only (CODEX_BACKEND=appserver)
+        until the production isolation gate passes; the default keeps the frozen
+        client, which is what this stale-suite test pins.
+        """
         import src.backends.codex as codex_pkg
 
         calls = []
 
         monkeypatch.setenv("BACKENDS", "codex")
+        monkeypatch.delenv("CODEX_BACKEND", raising=False)
         monkeypatch.setattr(
             codex_pkg, "register", lambda registry_cls=None: calls.append(registry_cls)
+        )
+
+        from src.backends import discover_backends
+
+        discover_backends(registry_cls="registry")
+
+        assert calls == ["registry"]
+
+    def test_discover_backends_opt_in_dispatches_to_appserver_adapter(
+        self, monkeypatch
+    ):
+        """CODEX_BACKEND=appserver opts BACKENDS=codex into the app-server adapter."""
+        import src.backends.appserver.client as appserver_client
+
+        calls = []
+
+        monkeypatch.setenv("BACKENDS", "codex")
+        monkeypatch.setenv("CODEX_BACKEND", "appserver")
+        monkeypatch.setattr(
+            appserver_client,
+            "register",
+            lambda registry_cls=None: calls.append(registry_cls),
         )
 
         from src.backends import discover_backends
@@ -164,7 +191,9 @@ class TestDiscoverBackends:
             discover_backends()
 
         assert calls == ["opencode"]
-        assert any("Unknown backend in BACKENDS" in record.message for record in caplog.records)
+        assert any(
+            "Unknown backend in BACKENDS" in record.message for record in caplog.records
+        )
 
 
 # ===========================================================================
@@ -256,7 +285,9 @@ class TestClaudeRegister:
             with pytest.raises(RuntimeError):
                 register(cwd="/tmp")
 
-        assert any("Claude backend client creation failed" in r.message for r in caplog.records)
+        assert any(
+            "Claude backend client creation failed" in r.message for r in caplog.records
+        )
 
     def test_register_uses_default_registry_cls(self, tmp_path):
         """When registry_cls is None, defaults to BackendRegistry."""
