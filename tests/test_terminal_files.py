@@ -452,6 +452,63 @@ def test_copy_traversal_blocked(client, workspace):
     assert not (workspace / "stolen.txt").exists()
 
 
+def _race_in_threadpool(monkeypatch, create: "callable"):
+    """다음 run_in_threadpool 호출 직전에 destination을 만들어, '검증 후
+    실행 전' 레이스를 실제로 재현한다."""
+    real = tf.run_in_threadpool
+
+    async def raced(fn, *args, **kwargs):
+        create()
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(tf, "run_in_threadpool", raced)
+
+
+def test_copy_file_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    _race_in_threadpool(monkeypatch, lambda: (workspace / "raced.txt").write_text("winner"))
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/raced.txt"},
+    )
+    assert r.status_code == 409
+    # 레이스에서 이긴 쪽의 파일이 절대 덮어써지지 않는다 — O_EXCL 계약
+    assert (workspace / "raced.txt").read_text() == "winner"
+
+
+def test_copy_directory_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    def create():
+        (workspace / "raced-dir").mkdir()
+        (workspace / "raced-dir" / "keep.txt").write_text("winner")
+
+    _race_in_threadpool(monkeypatch, create)
+    r = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/sub", "destination": "/raced-dir"},
+    )
+    assert r.status_code == 409  # FileExistsError가 500으로 새지 않는다
+    assert (workspace / "raced-dir" / "keep.txt").read_text() == "winner"
+
+
+def test_move_no_clobber_refuses_destination_appearing_after_validation(
+    client, workspace, monkeypatch
+):
+    _race_in_threadpool(monkeypatch, lambda: (workspace / "raced.txt").write_text("winner"))
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": "/notes.txt", "destination": "/raced.txt", "no_clobber": True},
+    )
+    assert r.status_code == 409
+    assert (workspace / "notes.txt").exists()  # source 보존
+    assert (workspace / "raced.txt").read_text() == "winner"
+
+
 def test_copy_does_not_follow_symlinks_inside_tree(client, workspace, tmp_path):
     (workspace / "linked").mkdir()
     link = workspace / "linked" / "out"

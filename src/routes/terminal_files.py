@@ -585,14 +585,38 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="source not found")
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
-    # Checked server-side at execution time: this closes the client's
-    # list-then-move round-trip race (the practical TOCTOU window); a
-    # same-instant local write can still slip in, as POSIX rename offers no
-    # portable no-replace for directories.
-    if body.no_clobber and dst.exists():
-        raise HTTPException(status_code=409, detail="destination already exists")
-    await run_in_threadpool(shutil.move, str(src), str(dst))
+    if body.no_clobber:
+        # The exists-check runs in the same threadpool closure immediately
+        # before the move — no event-loop hop in between. This closes the
+        # client's list-then-move round-trip race; a same-instant local write
+        # can still slip in, as POSIX rename offers no portable no-replace
+        # (rename(2) replaces atomically by design, and directories have no
+        # O_EXCL equivalent).
+        def _move_no_clobber() -> None:
+            if dst.exists():
+                raise FileExistsError(str(dst))
+            shutil.move(str(src), str(dst))
+
+        try:
+            await run_in_threadpool(_move_no_clobber)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="destination already exists")
+    else:
+        await run_in_threadpool(shutil.move, str(src), str(dst))
     return {"source": body.source, "destination": body.destination}
+
+
+def _copy_file_exclusive(src: Path, dst: Path) -> None:
+    """Copy a regular file, failing with ``FileExistsError`` if ``dst`` exists.
+
+    ``open(dst, "xb")`` (O_CREAT|O_EXCL) makes the no-clobber promise a
+    filesystem guarantee instead of a check-then-copy: a destination that
+    appears after validation loses the race to us or we lose it to them, but
+    nobody's file is overwritten either way.
+    """
+    with open(src, "rb") as fsrc, open(dst, "xb") as fdst:
+        shutil.copyfileobj(fsrc, fdst)
+    shutil.copystat(str(src), str(dst))
 
 
 @router.post("/files/copy")
@@ -606,7 +630,10 @@ async def copy_entry(
     Unlike ``move``, the destination must not already exist: the file-manager
     client resolves name conflicts itself (VS Code-style ``name copy.ext``), so
     a collision reaching this endpoint is a race we refuse rather than resolve
-    by silently overwriting someone's file.
+    by silently overwriting someone's file. The refusal is enforced at
+    creation time (O_EXCL for files, ``copytree``'s exclusive mkdir for
+    directories) — the early ``dst.exists()`` check below is only a fast path
+    for a clear error message.
     """
     await verify_api_key(request, credentials)
     _ensure_api_key()
@@ -622,18 +649,23 @@ async def copy_entry(
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
     is_dir = src.is_dir() and not src.is_symlink()
-    if is_dir:
-        # Copying a directory into its own subtree would recurse forever.
-        if dst == src or src in dst.parents:
-            raise HTTPException(status_code=400, detail="cannot copy a directory into itself")
-        # symlinks=True copies links as links instead of following them — a
-        # link inside the tree may point outside the workspace root, and
-        # following it here would duplicate foreign content into the workspace.
-        await run_in_threadpool(
-            shutil.copytree, str(src), str(dst), symlinks=True
-        )
-    else:
-        await run_in_threadpool(shutil.copy2, str(src), str(dst))
+    try:
+        if is_dir:
+            # Copying a directory into its own subtree would recurse forever.
+            if dst == src or src in dst.parents:
+                raise HTTPException(
+                    status_code=400, detail="cannot copy a directory into itself"
+                )
+            # symlinks=True copies links as links instead of following them — a
+            # link inside the tree may point outside the workspace root, and
+            # following it here would duplicate foreign content into the
+            # workspace. dirs_exist_ok stays False, so copytree's own mkdir
+            # refuses a destination that appeared after validation.
+            await run_in_threadpool(shutil.copytree, str(src), str(dst), symlinks=True)
+        else:
+            await run_in_threadpool(_copy_file_exclusive, src, dst)
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="destination already exists")
     return {
         "source": body.source,
         "destination": body.destination,
