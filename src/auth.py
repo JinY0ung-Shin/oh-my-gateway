@@ -123,7 +123,9 @@ class ClaudeCodeAuthManager:
         try:
             parsed = json.loads(raw)
         except json.JSONDecodeError as exc:
-            raise ValueError("USER_API_KEYS must be a JSON object mapping user ids to API keys") from exc
+            raise ValueError(
+                "USER_API_KEYS must be a JSON object mapping user ids to API keys"
+            ) from exc
         if not isinstance(parsed, dict):
             raise ValueError("USER_API_KEYS must be a JSON object mapping user ids to API keys")
 
@@ -292,7 +294,9 @@ async def verify_api_key(
 
 def get_authenticated_user(request: Request) -> Optional[str]:
     """Return the credential-derived user principal, if this request has one."""
-    return getattr(request.state, "auth_user", None)
+    state = getattr(request, "state", None)
+    principal = getattr(state, "auth_user", None) if state is not None else None
+    return principal if isinstance(principal, str) and principal else None
 
 
 def validate_claude_code_auth() -> Tuple[bool, Dict[str, Any]]:
