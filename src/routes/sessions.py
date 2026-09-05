@@ -32,8 +32,13 @@ async def get_session_stats(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Get session manager statistics."""
+    """Get gateway-wide session manager statistics for an unscoped service key."""
     await verify_api_key(request, credentials)
+    if get_authenticated_user(request) is not None:
+        raise HTTPException(
+            status_code=403,
+            detail="Session statistics require an unscoped service key",
+        )
     stats = session_manager.get_stats()
     rehydrate_stats = session_manager.stats()
     return {
