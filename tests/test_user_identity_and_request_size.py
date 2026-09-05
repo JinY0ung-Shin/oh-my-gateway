@@ -16,18 +16,21 @@ from src.session_manager import SessionManager
 
 
 class _Slot:
-    def __init__(self):
+    def __init__(self, limiter):
+        self.limiter = limiter
         self.released = False
 
     def release(self):
-        self.released = True
+        if not self.released:
+            self.released = True
+            self.limiter.in_flight -= 1
 
 
 class _Limiter:
     def __init__(self):
         self.in_flight = 0
         self.users = []
-        self.slot = _Slot()
+        self.slot = _Slot(self)
 
     def try_acquire(self, user):
         self.users.append(user)
