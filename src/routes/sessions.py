@@ -6,7 +6,7 @@ from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 
 from src.models import SessionListResponse
-from src.auth import verify_api_key, security
+from src.auth import get_authenticated_user, verify_api_key, security
 from src.session_manager import session_manager
 from src.session_outbox import (
     get_outbox,
@@ -15,6 +15,16 @@ from src.session_outbox import (
 )
 
 router = APIRouter()
+
+
+def _session_for_request(request: Request, session_id: str):
+    """Return a visible session without touching a foreign tenant's TTL."""
+    session = session_manager.peek_session(session_id)
+    auth_user = get_authenticated_user(request)
+    if session is None or (auth_user is not None and session.user != auth_user):
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.touch()
+    return session
 
 
 @router.get("/v1/sessions/stats")
@@ -39,9 +49,17 @@ async def get_session_stats(
 async def list_sessions(
     request: Request, credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)
 ):
-    """List all active sessions."""
+    """List active sessions visible to the authenticated caller."""
     await verify_api_key(request, credentials)
     sessions = session_manager.list_sessions()
+    auth_user = get_authenticated_user(request)
+    if auth_user is not None:
+        sessions = [
+            info
+            for info in sessions
+            if (session := session_manager.peek_session(info.session_id)) is not None
+            and session.user == auth_user
+        ]
     return SessionListResponse(sessions=sessions, total=len(sessions))
 
 
@@ -51,12 +69,9 @@ async def get_session(
     session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Get information about a specific session."""
+    """Get information about a specific visible session."""
     await verify_api_key(request, credentials)
-    session = session_manager.get_session(session_id)
-    if not session:
-        raise HTTPException(status_code=404, detail="Session not found")
-
+    session = _session_for_request(request, session_id)
     return session.to_session_info()
 
 
@@ -78,15 +93,19 @@ async def get_session_pending_events(
 
     Polling touches the session TTL, so a watched session (and the SDK client
     owning its background processes) stays alive while a client keeps polling.
-    User scoping mirrors ``GET /v1/responses/{id}``: a ``user`` mismatch is a
-    non-revealing 404.
+    Credential-scoped callers are bound to their authenticated user. Legacy
+    service-key callers retain the optional ``user`` query scoping behavior.
     """
     await verify_api_key(request, credentials)
-    session = session_manager.get_session(session_id)
+    session = session_manager.peek_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
-    if user is not None and session.user != user:
+
+    auth_user = get_authenticated_user(request)
+    effective_user = auth_user if auth_user is not None else user
+    if effective_user is not None and session.user != effective_user:
         raise HTTPException(status_code=404, detail="Session not found")
+    session.touch()
 
     # Self-heal: a turn path that ended without restarting the reader (or a
     # gateway that just processed its first poll) starts it here. Gated inside
@@ -117,8 +136,13 @@ async def delete_session(
     session_id: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Delete a specific session."""
+    """Delete a specific visible session."""
     await verify_api_key(request, credentials)
+    session = session_manager.peek_session(session_id)
+    auth_user = get_authenticated_user(request)
+    if session is None or (auth_user is not None and session.user != auth_user):
+        raise HTTPException(status_code=404, detail="Session not found")
+
     deleted = await session_manager.delete_session_async(session_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Session not found")
