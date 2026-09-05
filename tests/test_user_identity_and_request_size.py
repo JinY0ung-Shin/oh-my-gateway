@@ -237,3 +237,14 @@ async def test_foreign_session_is_hidden_from_authenticated_user(monkeypatch):
     with pytest.raises(HTTPException) as exc_info:
         await sessions_route.get_session(request, bob.session_id, None)
     assert exc_info.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_scoped_user_cannot_read_gateway_wide_session_stats(monkeypatch):
+    monkeypatch.setattr(sessions_route, "verify_api_key", AsyncMock(return_value=True))
+    monkeypatch.setattr(sessions_route, "get_authenticated_user", lambda request: "alice")
+
+    request = SimpleNamespace(state=SimpleNamespace(auth_user="alice"))
+    with pytest.raises(HTTPException) as exc_info:
+        await sessions_route.get_session_stats(request, None)
+    assert exc_info.value.status_code == 403
