@@ -21,6 +21,7 @@ When a bearer token matches `USER_API_KEYS`, the gateway derives the user from t
 - `POST /v1/responses`: the request body's `user` field is overwritten before FastAPI parses it.
 - `GET`, `DELETE`, and cancel routes under `/v1/responses/{id}`: the existing `user` query scope is replaced with the authenticated user.
 - `/v1/sessions`: list/get/delete and pending-event access are restricted to sessions owned by the authenticated user.
+- `/v1/sessions/stats`: gateway-wide statistics are operator-only and require the unscoped `API_KEY`.
 - `/files/*`: `WORKSPACE_USER_HEADER` is overwritten with the authenticated user before the file routes resolve a workspace.
 - per-user turn concurrency: `MAX_CONCURRENT_TURNS_PER_USER` uses the credential-derived identity instead of a caller-controlled body field.
 
