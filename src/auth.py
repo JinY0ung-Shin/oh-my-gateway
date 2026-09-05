@@ -1,6 +1,8 @@
 import hmac
+import json
 import os
 import logging
+import re
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import HTTPException, Request
@@ -8,6 +10,8 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 logger = logging.getLogger(__name__)
 # Note: load_dotenv() runs in src/__init__.py, before any src submodule import
+
+_USER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 
 
 # ============================================================================
@@ -83,17 +87,63 @@ class ClaudeCodeAuthManager:
     instances internally.  All existing public attributes and methods are
     preserved so that callers (main.py, claude_cli.py, tests) continue
     to work without changes.
+
+    Gateway client authentication supports two modes that may coexist:
+
+    * ``API_KEY`` — the legacy unscoped/service key. Holders may act across
+      users, preserving the historical single-user behavior.
+    * ``USER_API_KEYS`` — a JSON object mapping a workspace/user id to a
+      bearer token, e.g. ``{"alice":"secret-a","bob":"secret-b"}``.
+      A matching token yields an authenticated user principal that middleware
+      binds to the request so caller-supplied ``user`` values cannot select a
+      different tenant/workspace.
     """
 
     def __init__(self):
-        self.env_api_key = os.getenv("API_KEY")  # Environment API key
+        self.env_api_key = os.getenv("API_KEY")  # Legacy unscoped/service API key
         self.runtime_api_key = None  # Set at startup by run_server()
+        self.user_api_keys = self._load_user_api_keys()
 
         # Delegate Claude auth to the provider (lazy import to break circular dep)
         _ClaudeAuthProvider = _get_claude_auth_provider_class()
         self._claude_provider = _ClaudeAuthProvider()
         self.auth_method = self._claude_provider.auth_method
         self.auth_status = self._validate_auth_method()
+
+    @staticmethod
+    def _load_user_api_keys() -> Dict[str, str]:
+        """Parse and validate ``USER_API_KEYS`` (user -> bearer token).
+
+        Invalid configuration fails fast at import/startup rather than silently
+        falling back to an unscoped identity boundary.
+        """
+        raw = os.getenv("USER_API_KEYS", "").strip()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise ValueError(
+                "USER_API_KEYS must be a JSON object mapping user ids to API keys"
+            ) from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("USER_API_KEYS must be a JSON object mapping user ids to API keys")
+
+        result: Dict[str, str] = {}
+        seen_keys: set[str] = set()
+        for user, key in parsed.items():
+            if not isinstance(user, str) or not _USER_ID_PATTERN.fullmatch(user):
+                raise ValueError(
+                    "USER_API_KEYS user ids must match "
+                    "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$"
+                )
+            if not isinstance(key, str) or not key:
+                raise ValueError(f"USER_API_KEYS entry for {user!r} must be a non-empty string")
+            if key in seen_keys:
+                raise ValueError("USER_API_KEYS must not map the same API key to multiple users")
+            seen_keys.add(key)
+            result[user] = key
+        return result
 
     # ------------------------------------------------------------------
     # Backend provider access
@@ -132,10 +182,39 @@ class ClaudeCodeAuthManager:
     # ------------------------------------------------------------------
 
     def get_api_key(self):
-        """Get the active API key (environment or runtime-generated)."""
+        """Get the active legacy unscoped API key (environment or runtime-generated)."""
         if self.runtime_api_key:
             return self.runtime_api_key
         return self.env_api_key
+
+    def has_api_auth(self) -> bool:
+        """True when either legacy or user-scoped bearer authentication is configured."""
+        return bool(self.get_api_key() or self.user_api_keys)
+
+    def authenticate_gateway_key(self, provided_key: str) -> Tuple[bool, Optional[str]]:
+        """Authenticate a gateway bearer key and return ``(valid, principal)``.
+
+        ``principal`` is the authenticated user for a ``USER_API_KEYS`` match.
+        A legacy ``API_KEY`` match returns ``None`` to preserve its historical
+        unscoped/service-key behavior.
+        """
+        matched_user: Optional[str] = None
+        # Compare every configured user key so the position of a matching entry
+        # does not leak through a short-circuit timing difference.
+        for user, configured_key in self.user_api_keys.items():
+            if hmac.compare_digest(provided_key, configured_key):
+                matched_user = user
+
+        legacy_key = self.get_api_key()
+        legacy_match = bool(
+            legacy_key and hmac.compare_digest(provided_key, legacy_key)
+        )
+
+        if matched_user is not None:
+            return True, matched_user
+        if legacy_match:
+            return True, None
+        return False, None
 
     # ------------------------------------------------------------------
     # Claude-specific validation (backward compat)
@@ -180,12 +259,11 @@ async def verify_api_key(
     """
     Verify API key if one is configured for FastAPI endpoint protection.
     This is separate from Claude Code authentication.
-    """
-    # Get the active API key (environment or runtime-generated)
-    active_api_key = auth_manager.get_api_key()
 
-    # If no API key is configured, allow all requests
-    if not active_api_key:
+    When a ``USER_API_KEYS`` token matches, the credential-derived user is
+    published on ``request.state.auth_user`` for route-level tenant checks.
+    """
+    if not auth_manager.has_api_auth():
         return True
 
     # Get credentials from Authorization header
@@ -200,15 +278,25 @@ async def verify_api_key(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    # Verify the API key (timing-safe comparison to prevent timing attacks)
-    if not hmac.compare_digest(credentials.credentials, active_api_key):
+    valid, principal = auth_manager.authenticate_gateway_key(credentials.credentials)
+    if not valid:
         raise HTTPException(
             status_code=401,
             detail="Invalid API key",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    if principal is not None:
+        request.state.auth_user = principal
+
     return True
+
+
+def get_authenticated_user(request: Request) -> Optional[str]:
+    """Return the credential-derived user principal, if this request has one."""
+    state = getattr(request, "state", None)
+    principal = getattr(state, "auth_user", None) if state is not None else None
+    return principal if isinstance(principal, str) and principal else None
 
 
 def validate_claude_code_auth() -> Tuple[bool, Dict[str, Any]]:
