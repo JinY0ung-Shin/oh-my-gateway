@@ -1,13 +1,14 @@
 """Create-only named prompt contract used by external admin UIs."""
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from src.named_prompt_create import create_named_prompt
-from src.system_prompt import get_named_prompt, save_named_prompt
+from src.system_prompt import get_named_prompt
 
 
 @pytest.fixture
@@ -39,6 +40,29 @@ def test_service_create_only_preserves_existing_content(prompt_dir):
     saved = get_named_prompt("safe-name")
     assert saved is not None
     assert saved["content"] == "first version"
+
+
+def test_concurrent_creators_have_exactly_one_winner(prompt_dir):
+    contents = [f"candidate-{i}" for i in range(8)]
+
+    def attempt(content: str) -> tuple[str, str]:
+        try:
+            created = create_named_prompt("raced", content)
+            return ("created", created["content"])
+        except FileExistsError:
+            return ("exists", content)
+
+    with ThreadPoolExecutor(max_workers=len(contents)) as pool:
+        results = list(pool.map(attempt, contents))
+
+    winners = [content for status, content in results if status == "created"]
+    assert len(winners) == 1
+    assert sum(status == "exists" for status, _ in results) == len(contents) - 1
+
+    saved = get_named_prompt("raced")
+    assert saved is not None
+    assert saved["content"] == winners[0]
+    assert list(prompt_dir.glob("*.tmp")) == []
 
 
 def test_post_creates_but_duplicate_returns_409(admin_client):
