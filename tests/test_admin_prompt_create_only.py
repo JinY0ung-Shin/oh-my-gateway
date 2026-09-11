@@ -2,6 +2,7 @@
 
 import os
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -65,6 +66,20 @@ def test_concurrent_creators_have_exactly_one_winner(prompt_dir):
     assert list(prompt_dir.glob("*.tmp")) == []
 
 
+def test_cleanup_failure_after_publish_does_not_reverse_success(prompt_dir, monkeypatch):
+    def fail_unlink(self: Path, *, missing_ok: bool = False) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    created = create_named_prompt("cleanup-success", "published content")
+    assert created["content"] == "published content"
+
+    saved = get_named_prompt("cleanup-success")
+    assert saved is not None
+    assert saved["content"] == "published content"
+
+
 def test_post_creates_but_duplicate_returns_409(admin_client):
     first = admin_client.post(
         "/admin/api/prompts/atomic",
@@ -81,6 +96,30 @@ def test_post_creates_but_duplicate_returns_409(admin_client):
     assert duplicate.json()["error"] == "Prompt already exists: atomic"
 
     loaded = admin_client.get("/admin/api/prompts/atomic")
+    assert loaded.status_code == 200
+    assert loaded.json()["content"] == "original"
+
+
+def test_cleanup_failure_does_not_mask_duplicate_409(admin_client, monkeypatch):
+    first = admin_client.post(
+        "/admin/api/prompts/cleanup-conflict",
+        json={"content": "original"},
+    )
+    assert first.status_code == 200
+
+    def fail_unlink(self: Path, *, missing_ok: bool = False) -> None:
+        raise OSError("cleanup denied")
+
+    monkeypatch.setattr(Path, "unlink", fail_unlink)
+
+    duplicate = admin_client.post(
+        "/admin/api/prompts/cleanup-conflict",
+        json={"content": "replacement"},
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["error"] == "Prompt already exists: cleanup-conflict"
+
+    loaded = admin_client.get("/admin/api/prompts/cleanup-conflict")
     assert loaded.status_code == 200
     assert loaded.json()["content"] == "original"
 
