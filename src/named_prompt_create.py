@@ -58,7 +58,15 @@ def create_named_prompt(name: str, content: str) -> dict:
         # Same-directory hard-link publish is atomic and never replaces a target.
         os.link(tmp_path, path)
     finally:
-        tmp_path.unlink(missing_ok=True)
+        # Cleanup is deliberately best-effort. Once ``os.link`` succeeds, the
+        # externally visible mutation is committed; a failure to remove the hidden
+        # staging inode must not turn that successful create into a 500. Likewise,
+        # on a duplicate-name conflict the original ``FileExistsError`` must reach
+        # the route so it remains a 409 instead of being masked by cleanup I/O.
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.warning("Failed to remove named-prompt staging file %s: %s", tmp_path, exc)
 
     logger.info("Named prompt created: %s (%d chars)", name, len(content))
     return data
