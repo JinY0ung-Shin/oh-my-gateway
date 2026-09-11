@@ -582,10 +582,16 @@ def make_function_call_response_sse(
     call_id: str,
     name: str,
     arguments: str,
+    sequence_number: Optional[int] = None,
 ) -> str:
     """Build SSE events for a function_call output item (e.g. AskUserQuestion).
 
     Emits response.output_item.added with the function_call data.
+
+    ``sequence_number`` continues the response's own numbering.  It is optional
+    only so existing callers keep working; a pause emits this frame in the middle
+    of a live response, and a client that orders or de-duplicates by sequence has
+    no way to place an unnumbered frame.
     """
     item = {
         "type": "function_call",
@@ -595,9 +601,11 @@ def make_function_call_response_sse(
         "arguments": arguments,
         "status": "completed",
     }
-    event_data = {
+    event_data: Dict[str, Any] = {
         "type": "response.output_item.added",
         "response_id": response_id,
         "item": item,
     }
+    if sequence_number is not None:
+        event_data["sequence_number"] = sequence_number
     return f"event: response.output_item.added\ndata: {_sse_dumps(event_data)}\n\n"

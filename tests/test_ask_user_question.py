@@ -66,6 +66,53 @@ def test_make_function_call_response_sse_id_format():
     assert data["response_id"] == "resp_abc_2"
 
 
+def test_make_function_call_response_sse_carries_a_sequence_number():
+    """A pause frame lands mid-response, so it has to say where it sits.
+
+    Without a number a client that orders or de-duplicates by sequence cannot
+    place the frame; with a *restarted* number it looks older than what came
+    before and gets dropped.  Both failure modes end the same way: the caller
+    never sees the question.
+    """
+    numbered = make_function_call_response_sse(
+        response_id="resp_seq_1",
+        call_id="toolu_seq",
+        name="AskUserQuestion",
+        arguments="{}",
+        sequence_number=7,
+    )
+    data = json.loads(numbered.split("data: ")[1].split("\n")[0])
+    assert data["sequence_number"] == 7
+
+    # Callers that do not number stay valid — the key is simply absent.
+    plain = make_function_call_response_sse(
+        response_id="resp_seq_2",
+        call_id="toolu_seq",
+        name="AskUserQuestion",
+        arguments="{}",
+    )
+    assert "sequence_number" not in json.loads(plain.split("data: ")[1].split("\n")[0])
+
+
+def test_route_sequence_helper_continues_the_stream_numbering():
+    """The route keeps counting where the stream generator stopped.
+
+    ``_take_sequence`` is what replaced the hardcoded ``sequence_number=0`` on the
+    pause and failure frames.  ChatDRAGON drops a terminal event whose sequence
+    goes backwards, so a paused turn read as "stream cut off" and the question
+    card never rendered.
+    """
+    from src.routes.responses import _take_sequence
+
+    stream_result = {"next_sequence": 12}
+    assert _take_sequence(stream_result) == 12
+    assert _take_sequence(stream_result) == 13
+    assert stream_result["next_sequence"] == 14
+
+    # A stream that died before emitting anything still yields a usable number.
+    assert _take_sequence({}) == 0
+
+
 # ---------------------------------------------------------------------------
 # _detect_function_call_output tests
 # ---------------------------------------------------------------------------

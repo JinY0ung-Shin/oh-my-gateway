@@ -133,3 +133,33 @@ async def test_no_session_in_context_behaves_as_before():
         lines.append(line)
     assert len(_completions(lines)) == 1
     assert result.get("success") is True
+
+
+@pytest.mark.asyncio
+async def test_paused_stream_hands_its_sequence_counter_to_the_route():
+    """파킹한 턴의 다음 시퀀스가 라우트에 넘어가야 한다.
+
+    파킹 뒤의 프레임(`function_call` + `requires_action` 완료)은 이 제너레이터가
+    아니라 라우트가 쏜다. 그 두 개를 `sequence_number=0`으로 박으면 **이미 보낸
+    프레임보다 오래된 것**이 되고, 시퀀스로 순서를 보거나 중복을 거르는 클라이언트는
+    턴의 종료를 버린다 — ChatDRAGON에서 질문 카드 대신 "완료 신호 없이 끊어졌다"가
+    뜬 경로가 정확히 이것이다. 그래서 카운터를 넘겨준다.
+    """
+    session = _Session(pending={"call_id": "toolu_1", "name": "AskUserQuestion", "arguments": {}})
+    lines, result = await _collect(_thinking_then_end(), session)
+
+    emitted = []
+    for line in lines:
+        for part in line.split("\n"):
+            if part.startswith("data:"):
+                try:
+                    seq = json.loads(part[5:].strip()).get("sequence_number")
+                except ValueError:
+                    continue
+                if isinstance(seq, int):
+                    emitted.append(seq)
+
+    assert emitted == sorted(emitted), f"스트림 안에서 이미 역행한다: {emitted}"
+    assert result.get("next_sequence") == max(emitted) + 1, (
+        f"라우트가 이어 쓸 번호가 없다: next={result.get('next_sequence')} emitted={emitted}"
+    )
