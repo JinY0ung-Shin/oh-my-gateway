@@ -265,6 +265,20 @@ def _split_response_input(
     return system_prompt, user_items if user_items else body.input
 
 
+def _take_sequence(stream_result: dict) -> int:
+    """Next sequence number for a frame the route emits itself.
+
+    The per-response counter lives inside ``streaming_utils`` stream generator;
+    frames emitted after it returns (an AskUserQuestion pause, a route-level
+    failure) have to keep counting from where it stopped.  A restart at 0 makes
+    those frames look stale to any client that orders or de-duplicates by
+    sequence, and the terminal event is the one frame that must never be dropped.
+    """
+    nxt = int(stream_result.get("next_sequence", 0) or 0)
+    stream_result["next_sequence"] = nxt + 1
+    return nxt
+
+
 def _build_requires_action_response(
     resp_id: str,
     model: str,
@@ -2171,11 +2185,17 @@ async def create_response(
                 # If so, emit function_call SSE and complete with requires_action.
                 if session.pending_tool_call is not None:
                     tc = session.pending_tool_call
+                    # The pause continues this response's numbering.  Stamping 0
+                    # here made the terminal event look older than the frames
+                    # already sent, and a client that de-duplicates by sequence
+                    # drops it — the turn then looks cut off instead of asking
+                    # its question (ChatDRAGON reported exactly that).
                     yield streaming_utils.make_function_call_response_sse(
                         response_id=resp_id,
                         call_id=tc["call_id"],
                         name=tc["name"],
                         arguments=json.dumps(tc.get("arguments", {})),
+                        sequence_number=_take_sequence(stream_result),
                     )
                     # Emit response.completed with requires_action status
                     requires_action_resp = _build_requires_action_response(
@@ -2184,7 +2204,7 @@ async def create_response(
                     yield streaming_utils.make_response_sse(
                         "response.completed",
                         response_obj=requires_action_resp,
-                        sequence_number=0,
+                        sequence_number=_take_sequence(stream_result),
                     )
                     # Commit turn even for requires_action so the next
                     # function_call_output can reference this response_id.
@@ -2242,7 +2262,7 @@ async def create_response(
                     yield streaming_utils.make_response_sse(
                         "response.failed",
                         response_obj=failed_resp,
-                        sequence_number=0,
+                        sequence_number=_take_sequence(stream_result),
                     )
                 elif stream_result.get("success"):
                     # SUCCESS-ONLY: commit turn counter and session messages.
@@ -2286,7 +2306,7 @@ async def create_response(
                 yield streaming_utils.make_response_sse(
                     "response.failed",
                     response_obj=failed_resp,
-                    sequence_number=0,
+                    sequence_number=_take_sequence(stream_result),
                 )
             finally:
 
@@ -2619,6 +2639,7 @@ async def _handle_function_call_output(
                         call_id=tc["call_id"],
                         name=tc["name"],
                         arguments=json.dumps(tc.get("arguments", {})),
+                        sequence_number=_take_sequence(stream_result),
                     )
                     requires_action_resp = _build_requires_action_response(
                         resp_id, body.model, tc, body.metadata
@@ -2626,7 +2647,7 @@ async def _handle_function_call_output(
                     yield streaming_utils.make_response_sse(
                         "response.completed",
                         response_obj=requires_action_resp,
-                        sequence_number=0,
+                        sequence_number=_take_sequence(stream_result),
                     )
                     session.turn_counter = next_turn
                     _record_turn_response(
@@ -2695,7 +2716,7 @@ async def _handle_function_call_output(
                 yield streaming_utils.make_response_sse(
                     "response.failed",
                     response_obj=failed_resp,
-                    sequence_number=0,
+                    sequence_number=_take_sequence(stream_result),
                 )
             finally:
 

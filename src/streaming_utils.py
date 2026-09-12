@@ -1081,6 +1081,8 @@ async def stream_response_chunks(
     _metadata = metadata or {}
     if stream_result is None:
         stream_result = {}
+    # Visible to the route from the first frame on, even if the stream dies early.
+    stream_result.setdefault("next_sequence", 0)
 
     # Usage-log state.  ``usage_start`` measures wall duration; ``tool_stats``
     # aggregates tool-call name/count/errors/latency for the usage_tool table.
@@ -1092,9 +1094,22 @@ async def stream_response_chunks(
     compaction = CompactionTracker()
 
     def _next_seq() -> int:
+        """Hand out this response's next sequence number.
+
+        The counter is also published on ``stream_result`` because the *route* has
+        to keep numbering after this generator returns: an AskUserQuestion pause
+        emits ``function_call`` + ``response.completed(requires_action)`` from
+        ``routes/responses.py``, outside this closure.  Those frames used to be
+        stamped ``sequence_number=0``, which reads as "older than everything sent
+        so far" to a client that drops out-of-order frames — and ChatDRAGON's
+        stream layer does exactly that, so the terminal event of a paused turn
+        was silently discarded and the question card never appeared.  The
+        Responses stream is monotonic per response; the pause is not an exception.
+        """
         nonlocal seq
         current = seq
         seq += 1
+        stream_result["next_sequence"] = seq
         return current
 
     def _error_context() -> str:
