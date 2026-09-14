@@ -5,72 +5,11 @@ the ``FileNav`` right-sidebar explorer uses, scoped to a single user's Claude
 workspace, so the gateway can be registered in open-webui as a terminal
 connection and its workspace browsed/edited exactly as the agent sees it.
 
-Contract (what FileNav calls):
-- ``GET  /api/config``                -> ``{"features": {"terminal": false}}`` (handshake)
-- ``GET  /files/cwd``                 -> ``{"cwd": "/"}`` (workspace root is the virtual "/")
-- ``POST /files/cwd``  {path}         -> ``{"cwd": path}`` (validate; cwd is client-tracked)
-- ``GET  /files/list?directory=<p>``  -> ``{"entries": [{name,type,size,modified}]}``
-- ``GET  /files/search?query=<q>``    -> ``{"results": [{path,name,type,size,modified}], "truncated"}``
-- ``GET  /files/digest?path=<p>``     -> ``{"path","size","sha256"}`` (content identity)
-- ``GET  /files/read?path=<p>``       -> text ``{path,total_lines,content}`` | raw bytes (binary)
-- ``GET  /files/view?path=<p>``       -> raw bytes (download)
-- ``GET  /files/serve/<path>``        -> raw bytes, inline (HTML iframe preview; relative assets)
-- ``POST /files/upload?directory=<p>``-> ``{path,size}`` (also how "new file" is created)
-- ``POST /files/mkdir``  {path}       -> ``{path}``
-- ``DELETE /files/delete?path=<p>``   -> ``{path,type}``
-- ``POST /files/move``  {source,destination} -> ``{source,destination}``
-- ``POST /files/copy``  {source,destination} -> ``{source,destination,type}``
-- ``POST /files/archive`` {paths}     -> zip stream
-
-Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
-default ``X-User-Email``) and used WHOLE — the same value ``/v1/responses`` keys its
-workspace on — so the explorer resolves the very files the agent wrote. The caller
-(e.g. open-webui) forwards the user's identity under that header name; on open-webui
-set ``FORWARD_USER_INFO_HEADER_USER_EMAIL`` to the same name so the two agree (no code
-coupling to the caller's product).
-
-This router used to key the workspace on the identity's *localpart* (everything
-before ``@``). That collapsed distinct principals: ``alice@a.com``, ``alice@b.com``
-and bare ``alice`` are three identities and were one directory, so any of them could
-list, read, overwrite and delete the others' files, and ``/v1/agent-resources``
-reported the others' private skills and subagents. It also disagreed with
-``/v1/responses``, which never truncated — the file browser and the agent could end
-up in different workspaces for one and the same caller. The whole identity is now
-the key. Set ``WORKSPACE_LEGACY_LOCALPART_KEY=true`` to restore the old truncation
-while migrating an existing deployment's directories; it re-opens the collision, so
-it logs a warning on every resolve.
-
-Config:
-- ``WORKSPACE_USER_HEADER`` — inbound identity header name (default ``X-User-Email``).
-- ``WORKSPACE_LEGACY_LOCALPART_KEY`` — when true, key the workspace on the identity's
-  localpart as releases before this one did. Insecure (see above); migration only.
-- ``WORKSPACE_HIDE_DOTFILES`` — when true, dot-prefixed entries are neither
-  listed nor accessible. Default **false**: hiding is a presentation choice that
-  belongs to the client rendering the tree, and hiding them here also blocks
-  writes to the workspace's agent-resource directories.
-- ``USER_WORKSPACE_QUOTA_MB`` — cumulative named-user quota across every backend
-  directory below ``<base>/<user>``. ``0``/unset means unlimited. This is a soft
-  gateway quota, not a filesystem project quota.
-
-Concurrency:
-- Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
-  in the threadpool via ``run_in_threadpool``. FileNav polls ``/files/list``
-  continuously for every connected user; done synchronously that I/O would
-  block the gateway event loop and stall everything else it serves
-  (``/v1/responses`` streams, terminal websockets).
-- Quota-increasing file API mutations are serialized per user so two concurrent
-  uploads/copies cannot both pass the same preflight and exceed the configured
-  cumulative quota.
-
-Security:
-- ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
-  these endpoints would expose every user's files unauthenticated, so we fail
-  closed here.
-- Every path (read AND write) is confined to the single workspace root via
-  ``_resolve_or_403`` (``Path.resolve()`` collapses ``..`` and resolves symlinks
-  before the containment check); anything above/outside the root is a 403.
-  Uploaded filenames are reduced to a basename. No extra roots (never
-  ``~/.claude`` etc.).
+Identity is read from ``WORKSPACE_USER_HEADER`` (default ``X-User-Email``) and
+used whole so the file browser and agent resolve the same per-user workspace.
+All paths are confined to that workspace. ``USER_WORKSPACE_QUOTA_MB`` optionally
+adds a cumulative soft quota across all backend directories below one user root;
+the existing ``WORKSPACE_UPLOAD_MAX_BYTES`` remains the independent per-file cap.
 """
 
 import asyncio
@@ -114,11 +53,6 @@ class _PathBody(BaseModel):
 class _MoveBody(BaseModel):
     source: str
     destination: str
-    # Opt-in atomic no-overwrite for move: the default (False) keeps the
-    # historical FileNav contract where move silently replaces the
-    # destination. A file manager that resolves name conflicts client-side
-    # sets True so a file appearing between its listing and the move gets a
-    # 409 instead of being clobbered (copy already refuses unconditionally).
     no_clobber: bool = False
 
 
@@ -129,42 +63,17 @@ class _ArchiveBody(BaseModel):
 router = APIRouter(tags=["workspace-files"])
 
 _BACKEND = "claude"
-# Cap in-band text previews; larger files must be fetched via /files/view.
 _MAX_READ_BYTES = 5 * 1024 * 1024
-
-# Name of the inbound header carrying the user identity. Kept generic and
-# configurable (no hard dependency on the caller's product) — the frontend just
-# has to forward the user's identity under this name. Its value keys the workspace
-# WHOLE, matching how ``/v1/responses`` keys ``body.user``. Default is deliberately
-# vendor-neutral.
 _DEFAULT_USER_HEADER = "X-User-Email"
-
-# Room for the multipart envelope around the file bytes: boundary lines, the
-# part headers and a filename of up to 255 bytes. The request boundary counts
-# the WHOLE body, so a ceiling advertised as the file size must leave space for
-# the wrapper — otherwise a file of exactly the advertised size is rejected and
-# the number we published is a lie.
 _MULTIPART_ENVELOPE_RESERVE = 8192
 
-# Per-process serialization is sufficient for the gateway's own file API. Agent
-# subprocesses do not acquire these locks, which is why USER_WORKSPACE_QUOTA_MB is
-# documented as a soft quota rather than an OS-level hard ceiling.
+# The lock only serializes gateway file-API mutations in this process. Claude
+# subprocesses and other gateway workers do not acquire it, hence "soft quota".
 _QUOTA_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _max_upload_bytes() -> int:
-    """Largest single file ``POST /files/upload`` will actually accept.
-
-    Read through the module namespace rather than captured at import so a
-    deployment (or a test) can move either limit without reimporting the route.
-
-    ``0`` is a real answer, not a failure: a deployment whose request cap is at
-    or below the envelope reserve cannot carry any file at all, and saying so is
-    the point of publishing the number. A client that sizes its picker against
-    this reports "uploads unavailable" instead of offering a control whose every
-    use ends in a 413. Whether such a configuration should be refused outright at
-    startup is a separate call and deliberately not made here.
-    """
+    """Largest single file ``POST /files/upload`` will actually accept."""
     ceiling = min(WORKSPACE_UPLOAD_MAX_BYTES, MAX_REQUEST_SIZE - _MULTIPART_ENVELOPE_RESERVE)
     return max(0, ceiling)
 
@@ -174,23 +83,10 @@ def _user_header() -> str:
 
 
 def _hide_dotfiles() -> bool:
-    """When true, dot-prefixed entries are neither listed nor accessible.
-
-    Defaults to **false**: hiding dotfiles protects nothing here — the agent
-    itself reads and writes them freely through Bash/Read within the same
-    workspace, and the real guards are ``API_KEY`` plus root confinement. What it
-    *did* do was make the workspace's agent-resource directories unreachable over
-    ``/files/*`` (a 404 on any dot-prefixed component, including writes), which
-    silently breaks clients that install skills/subagents through this API. Hiding
-    is presentation, so it belongs to the client that renders the tree — see the
-    Finder-style "show hidden items" toggle in ChatDRAGON's files panel. Set this
-    to ``true`` to restore server-side hiding for a deployment that wants it.
-    """
     return os.getenv("WORKSPACE_HIDE_DOTFILES", "false").strip().lower() == "true"
 
 
 def _ensure_api_key() -> None:
-    """Fail closed unless an API key is configured (verify_api_key no-ops without one)."""
     if not auth_manager.get_api_key():
         raise HTTPException(
             status_code=503,
@@ -199,13 +95,6 @@ def _ensure_api_key() -> None:
 
 
 def _legacy_localpart_key() -> bool:
-    """Opt back into the pre-fix localpart workspace key (migration only).
-
-    Truncating the identity at ``@`` maps every principal sharing a localpart onto
-    one workspace, so this is a known cross-user isolation hole. It stays reachable
-    only so an existing deployment can stage a directory migration, and it says so
-    on every resolve rather than failing quietly into the old behaviour.
-    """
     if os.getenv("WORKSPACE_LEGACY_LOCALPART_KEY", "").strip().lower() != "true":
         return False
     logger.warning(
@@ -216,7 +105,6 @@ def _legacy_localpart_key() -> bool:
 
 
 def _workspace_key(request: Request) -> str:
-    """The caller's identity as the workspace key ("" when the header is absent)."""
     identity = (request.headers.get(_user_header()) or "").strip()
     if _legacy_localpart_key():
         return identity.split("@")[0]
@@ -238,7 +126,6 @@ def _workspace_root(user: str) -> Path:
 
 
 def _user_root(workspace_root: Path) -> Path:
-    """Named user's aggregate quota root (parent of the backend workspace)."""
     return workspace_root.resolve().parent
 
 
@@ -256,13 +143,6 @@ def _raise_quota_http(exc: WorkspaceQuotaExceeded) -> None:
 
 
 def resolve_workspace_for_request(request: Request) -> Optional[Path]:
-    """The caller's workspace directory, or ``None`` when it can't be keyed.
-
-    Same identity header and workspace mapping as the file browser, but soft:
-    endpoints that merely *describe* a workspace (e.g. the agent-resource
-    catalog) should degrade to "no project scope" rather than 400 when the
-    header is absent. Never creates the directory.
-    """
     user = _workspace_key(request)
     if not user:
         return None
@@ -273,7 +153,6 @@ def resolve_workspace_for_request(request: Request) -> Optional[Path]:
 
 
 def _is_under(path: Path, base: Path) -> bool:
-    """True when *path* is *base* or nested inside it."""
     try:
         path.relative_to(base)
         return True
@@ -282,18 +161,6 @@ def _is_under(path: Path, base: Path) -> bool:
 
 
 def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
-    """Resolve *rel* and confine it to *root*; ``None`` if it escapes the root.
-
-    ``Path.resolve()`` collapses ``..`` and follows symlinks so an escape via
-    either is caught by the containment check. This is containment only —
-    dotfile hiding is applied separately so callers can distinguish "outside
-    your workspace" (403) from "hidden/not found" (404).
-
-    The explorer echoes the real cwd, so most paths arrive absolute and under
-    the root. An absolute path that is an *ancestor* of the root (breadcrumb
-    navigation above the workspace) is rejected outright; any other stray
-    leading-slash path is reinterpreted as workspace-relative.
-    """
     try:
         root_resolved = root.resolve()
     except (OSError, RuntimeError):
@@ -317,16 +184,6 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
 
 
 def _resolve_or_403(root: Path, rel: str) -> Path:
-    """Resolve within the workspace root or raise.
-
-    - Outside the root -> **403** ("outside your workspace"), so the explorer can
-      warn the user that navigation there isn't allowed.
-    - A dot-prefixed (hidden) component, when hiding is on -> **404**, so hidden
-      entries stay invisible rather than advertising that something is blocked.
-
-    The returned path may not exist yet (callers that create paths check as
-    needed); callers reading/listing must still verify existence.
-    """
     target = _resolve_in_root(root, rel)
     if target is None:
         raise HTTPException(
@@ -345,7 +202,6 @@ async def terminal_config(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Handshake: advertise a read-only, no-terminal file server."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     return {"features": {"terminal": False}}
@@ -356,15 +212,6 @@ async def tool_specs(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Empty OpenAPI so open-webui exposes ZERO LLM tools for this connection.
-
-    A terminal connection's ``path`` (default ``/openapi.json``) is fetched by
-    open-webui, and every operation in it becomes an LLM-callable tool (whose
-    callables it then builds — and can fail to serialize with a manifold/pipe
-    model). This gateway is a file *browser*, not a tool provider — point the
-    connection ``path`` here so no tools are built. The FileNav sidebar calls
-    ``/files/*`` directly and is unaffected.
-    """
     await verify_api_key(request, credentials)
     return {
         "openapi": "3.1.0",
@@ -378,7 +225,6 @@ async def get_limits(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Publish static upload and cumulative workspace limits."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     return {
@@ -392,7 +238,6 @@ async def get_quota(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Current aggregate quota usage for the authenticated named user."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -439,9 +284,7 @@ async def list_files(
                 entries.append(
                     {
                         "name": entry.name,
-                        "type": (
-                            "directory" if stat_module.S_ISDIR(st.st_mode) else "file"
-                        ),
+                        "type": "directory" if stat_module.S_ISDIR(st.st_mode) else "file",
                         "size": st.st_size,
                         "modified": int(st.st_mtime),
                     }
@@ -459,7 +302,6 @@ async def search_files(
     limit: int = 50,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Recursive filename search under the workspace root."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -469,22 +311,18 @@ async def search_files(
     if not q:
         return {"results": [], "truncated": False}
     limit = max(1, min(limit, 200))
-
     hide_dot = _hide_dotfiles()
-    _SCAN_CAP = 1000
+    scan_cap = 1000
 
     def _search() -> dict:
         matches: List[dict] = []
         scan_capped = False
-
         for dirpath, dirnames, filenames in os.walk(root_resolved):
             if hide_dot:
                 dirnames[:] = [d for d in dirnames if not d.startswith(".")]
             dirnames.sort()
             base = Path(dirpath)
-            candidates = [(d, True) for d in dirnames] + [
-                (f, False) for f in sorted(filenames)
-            ]
+            candidates = [(d, True) for d in dirnames] + [(f, False) for f in sorted(filenames)]
             for name, is_dir in candidates:
                 if hide_dot and name.startswith("."):
                     continue
@@ -506,12 +344,11 @@ async def search_files(
                         "modified": int(st.st_mtime),
                     }
                 )
-                if len(matches) >= _SCAN_CAP:
+                if len(matches) >= scan_cap:
                     scan_capped = True
                     break
             if scan_capped:
                 break
-
         matches.sort(
             key=lambda e: (
                 not e["name"].lower().startswith(q),
@@ -519,8 +356,7 @@ async def search_files(
                 e["name"].lower(),
             )
         )
-        truncated = scan_capped or len(matches) > limit
-        return {"results": matches[:limit], "truncated": truncated}
+        return {"results": matches[:limit], "truncated": scan_capped or len(matches) > limit}
 
     return await run_in_threadpool(_search)
 
@@ -531,7 +367,6 @@ async def file_digest(
     path: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Content identity for one file: equality of ``sha256`` means equal bytes."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -564,20 +399,17 @@ async def read_file(
     target = _resolve_or_403(root, path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
-
     if target.stat().st_size > _MAX_READ_BYTES:
         raise HTTPException(
             status_code=413,
             detail=f"file too large to preview (> {_MAX_READ_BYTES} bytes); use download",
         )
-
     data = await run_in_threadpool(target.read_bytes)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         return Response(content=data, media_type=media)
-
     return {"path": path, "total_lines": text.count("\n") + 1, "content": text}
 
 
@@ -593,7 +425,6 @@ async def view_file(
     target = _resolve_or_403(root, path)
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
-
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=media, filename=target.name)
 
@@ -610,7 +441,6 @@ async def serve_file(
     target = _resolve_or_403(root, path if path.startswith("/") else f"/{path}")
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
-
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=media, content_disposition_type="inline")
 
@@ -621,7 +451,6 @@ async def set_cwd(
     body: _PathBody,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Validate a directory; cwd itself is tracked client-side."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -629,6 +458,19 @@ async def set_cwd(
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
     return {"cwd": body.path}
+
+
+async def _write_upload(target: Path, data: bytes, no_clobber: bool) -> None:
+    if no_clobber:
+        def _write_exclusive() -> None:
+            with open(target, "xb") as fh:
+                fh.write(data)
+        try:
+            await run_in_threadpool(_write_exclusive)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="destination already exists")
+    else:
+        await run_in_threadpool(target.write_bytes, data)
 
 
 @router.post("/files/upload")
@@ -639,7 +481,6 @@ async def upload_file(
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Write one uploaded file into the workspace."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -655,10 +496,14 @@ async def upload_file(
     data = await file.read()
     ceiling = _max_upload_bytes()
     if len(data) > ceiling:
-        raise HTTPException(
-            status_code=413,
-            detail=f"file exceeds the upload limit of {ceiling} bytes",
-        )
+        raise HTTPException(status_code=413, detail=f"file exceeds the upload limit of {ceiling} bytes")
+
+    # Critical compatibility fast-path: when cumulative quota is disabled, use
+    # exactly the pre-quota write sequence. Besides avoiding a full-tree scan,
+    # this preserves existing atomic-race behavior and tests.
+    if workspace_quota_limit_bytes() <= 0:
+        await _write_upload(target, data, no_clobber)
+        return {"path": str(target), "size": len(data)}
 
     user_root = _user_root(root)
     async with _quota_lock(user_root):
@@ -679,19 +524,7 @@ async def upload_file(
             )
         except WorkspaceQuotaExceeded as exc:
             _raise_quota_http(exc)
-
-        if no_clobber:
-
-            def _write_exclusive() -> None:
-                with open(target, "xb") as f:
-                    f.write(data)
-
-            try:
-                await run_in_threadpool(_write_exclusive)
-            except FileExistsError:
-                raise HTTPException(status_code=409, detail="destination already exists")
-        else:
-            await run_in_threadpool(target.write_bytes, data)
+        await _write_upload(target, data, no_clobber)
     return {"path": str(target), "size": len(data)}
 
 
@@ -756,10 +589,7 @@ async def move_entry(
         try:
             await run_in_threadpool(_rename_noreplace, src, dst)
         except NotImplementedError:
-            raise HTTPException(
-                status_code=501,
-                detail="atomic no-replace move is unavailable on this system",
-            )
+            raise HTTPException(status_code=501, detail="atomic no-replace move is unavailable on this system")
         except OSError as exc:
             if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
                 raise HTTPException(status_code=409, detail="destination already exists")
@@ -774,7 +604,6 @@ _AT_FDCWD = -100
 
 
 def _rename_noreplace(src: Path, dst: Path) -> None:
-    """Atomic no-replace rename via Linux ``renameat2(RENAME_NOREPLACE)``."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
@@ -795,11 +624,10 @@ def _rename_noreplace(src: Path, dst: Path) -> None:
 
 
 class _UnsupportedSourceError(Exception):
-    """Copy source is not a regular file (FIFO/socket/device) — refused."""
+    pass
 
 
 def _copy_file_exclusive(src: Path, dst: Path) -> None:
-    """Copy a REGULAR file, failing with ``FileExistsError`` if ``dst`` exists."""
     try:
         fd = os.open(str(src), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
@@ -817,13 +645,30 @@ def _copy_file_exclusive(src: Path, dst: Path) -> None:
     shutil.copystat(str(src), str(dst))
 
 
+async def _perform_copy(src: Path, dst: Path, is_dir: bool) -> None:
+    try:
+        if is_dir:
+            if dst == src or src in dst.parents:
+                raise HTTPException(status_code=400, detail="cannot copy a directory into itself")
+            await run_in_threadpool(shutil.copytree, str(src), str(dst), symlinks=True)
+        else:
+            await run_in_threadpool(_copy_file_exclusive, src, dst)
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="destination already exists")
+    except _UnsupportedSourceError:
+        raise HTTPException(status_code=400, detail="unsupported file type")
+    except shutil.SpecialFileError:
+        raise HTTPException(status_code=400, detail="directory contains unsupported special files")
+    except shutil.Error:
+        raise HTTPException(status_code=400, detail="directory contains entries that cannot be copied")
+
+
 @router.post("/files/copy")
 async def copy_entry(
     request: Request,
     body: _MoveBody,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Duplicate a file or directory inside the workspace."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -841,39 +686,22 @@ async def copy_entry(
     if not is_dir and not src.is_file():
         raise HTTPException(status_code=400, detail="unsupported file type")
 
-    user_root = _user_root(root)
-    async with _quota_lock(user_root):
-        added_bytes = await run_in_threadpool(copy_growth_bytes, src)
-        try:
-            await run_in_threadpool(
-                lambda: ensure_growth_fits(user_root, added_bytes=added_bytes)
-            )
-        except WorkspaceQuotaExceeded as exc:
-            _raise_quota_http(exc)
-
-        try:
-            if is_dir:
-                if dst == src or src in dst.parents:
-                    raise HTTPException(
-                        status_code=400, detail="cannot copy a directory into itself"
-                    )
+    # No quota configured: preserve the exact legacy mutation path and avoid
+    # extra scans/threadpool hops.
+    if workspace_quota_limit_bytes() <= 0:
+        await _perform_copy(src, dst, is_dir)
+    else:
+        user_root = _user_root(root)
+        async with _quota_lock(user_root):
+            added_bytes = await run_in_threadpool(copy_growth_bytes, src)
+            try:
                 await run_in_threadpool(
-                    shutil.copytree, str(src), str(dst), symlinks=True
+                    lambda: ensure_growth_fits(user_root, added_bytes=added_bytes)
                 )
-            else:
-                await run_in_threadpool(_copy_file_exclusive, src, dst)
-        except FileExistsError:
-            raise HTTPException(status_code=409, detail="destination already exists")
-        except _UnsupportedSourceError:
-            raise HTTPException(status_code=400, detail="unsupported file type")
-        except shutil.SpecialFileError:
-            raise HTTPException(
-                status_code=400, detail="directory contains unsupported special files"
-            )
-        except shutil.Error:
-            raise HTTPException(
-                status_code=400, detail="directory contains entries that cannot be copied"
-            )
+            except WorkspaceQuotaExceeded as exc:
+                _raise_quota_http(exc)
+            await _perform_copy(src, dst, is_dir)
+
     return {
         "source": body.source,
         "destination": body.destination,
@@ -912,11 +740,7 @@ async def archive_entries(
             for t in targets:
                 if t.is_dir():
                     for sub in t.rglob("*"):
-                        if (
-                            sub.is_file()
-                            and not sub.is_symlink()
-                            and not _is_hidden(sub)
-                        ):
+                        if sub.is_file() and not sub.is_symlink() and not _is_hidden(sub):
                             zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
                 elif t.is_file() and not t.is_symlink():
                     zf.write(t, arcname=str(t.relative_to(root_resolved)))
