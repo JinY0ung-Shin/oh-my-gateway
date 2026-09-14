@@ -207,6 +207,25 @@ def test_copy_growth_is_checked_before_destination_creation(quota_client, monkey
     assert not (workspace / "source copy.bin").exists()
 
 
+def test_directory_self_copy_stays_400_before_quota_preflight(quota_client, monkeypatch):
+    client, _, workspace = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    source = workspace / "foo"
+    source.mkdir()
+    (source / "payload.bin").write_bytes(b"s" * (700 * 1024))
+    (workspace / "other.bin").write_bytes(b"o" * (300 * 1024))
+
+    response = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/foo", "destination": "/foo/bar"},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "cannot copy a directory into itself"
+    assert not (source / "bar").exists()
+
+
 def test_copy_fails_closed_when_quota_scan_hits_io_error(quota_client, monkeypatch):
     client, _, workspace = quota_client
     monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
