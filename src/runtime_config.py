@@ -20,6 +20,12 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
+# Multipart file uploads carry a small boundary/header envelope in addition to
+# file bytes. The request-boundary middleware and /files/upload route share this
+# one reserve so the advertised file ceiling and the accepted request body stay
+# in lockstep.
+WORKSPACE_UPLOAD_MULTIPART_RESERVE = 8192
+
 
 def _int_env(name: str) -> int:
     """Read an int env var, treating unset/junk as 0 ("not configured")."""
@@ -97,9 +103,9 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "type": "int",
         "min": 0,
         "description": (
-            "Maximum size of one file accepted by POST /files/upload. 0 disables "
-            "workspace uploads. The effective ceiling is still capped by "
-            "MAX_REQUEST_SIZE minus multipart overhead. Applies on the next file request."
+            "Maximum size of one file accepted by POST /files/upload. This is the "
+            "single file-upload ceiling used by both request-boundary enforcement "
+            "and the workspace file route. Applies on the next upload request."
         ),
     },
     "agent_teams_enabled": {
@@ -140,7 +146,6 @@ class RuntimeConfig:
         coerced = self._coerce(key, value)
         with self._lock:
             self._overrides[key] = coerced
-        self._publish_live_value(key, coerced)
         logger.info(f"Runtime config updated: {key} = {coerced!r}")
 
     def is_overridden(self, key: str) -> bool:
@@ -157,22 +162,16 @@ class RuntimeConfig:
             raise KeyError(f"Key '{key}' is not editable at runtime")
         with self._lock:
             self._overrides.pop(key, None)
-        self._publish_live_value(key, self._get_original(key))
         logger.info(f"Runtime config reset: {key}")
 
     def reset_all(self) -> None:
         """Remove all runtime overrides."""
         with self._lock:
-            keys = tuple(self._overrides)
             self._overrides.clear()
-        for key in keys:
-            self._publish_live_value(key, self._get_original(key))
         logger.info("Runtime config: all overrides cleared")
 
     def get_all(self) -> Dict[str, Any]:
         """Return all editable keys with their current effective values."""
-        # Snapshot overrides once under a single lock, then compute everything
-        # from the snapshot without re-acquiring the lock per key.
         with self._lock:
             overrides = dict(self._overrides)
         result = {}
@@ -187,8 +186,6 @@ class RuntimeConfig:
                 "overridden": is_overridden,
             }
         return result
-
-    # ---- helpers ----
 
     @staticmethod
     def _get_original(key: str) -> Any:
@@ -205,8 +202,6 @@ class RuntimeConfig:
             TOKEN_STREAMING,
         )
 
-        # Lazy import to avoid a circular dependency: sanitizer.config imports
-        # back from runtime_config to honor admin overrides.
         from src.sanitizer.config import _env_enabled as _sanitizer_env_enabled
 
         _map = {
@@ -218,36 +213,12 @@ class RuntimeConfig:
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
             "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
-            # Mirrors the CLI's own truthiness on the raw env string: any
-            # non-empty value activates the gate, including "0".
             "agent_teams_enabled": bool(
                 os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
             ),
-            # 0 = not set — the CLI picks its own window from the model.
-            # A junk value reads as 0 rather than crashing the config read;
-            # the CLI ignores junk the same way.
             "auto_compact_window": _int_env("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
         }
         return _map.get(key)
-
-    @staticmethod
-    def _publish_live_value(key: str, value: Any) -> None:
-        """Push runtime values into legacy modules that captured startup constants.
-
-        New code should call the convenience getters below. ``terminal_files``
-        predates runtime-config and imports its upload ceiling by value; updating
-        that already-loaded module keeps one authoritative admin value without
-        introducing a second ChatDRAGON-side setting. If the route has not been
-        imported yet there is nothing to publish: it will read the startup value,
-        and any later override is published by ``set``.
-        """
-        if key != "workspace_upload_max_bytes":
-            return
-        import sys
-
-        module = sys.modules.get("src.routes.terminal_files")
-        if module is not None:
-            module.WORKSPACE_UPLOAD_MAX_BYTES = int(value)
 
     @staticmethod
     def _coerce(key: str, value: Any) -> Any:
@@ -256,8 +227,6 @@ class RuntimeConfig:
         expected = meta["type"]
         if expected == "int":
             v = int(value)
-            # A per-key floor where 1 is meaningless — a 1-token compaction
-            # window would compact on every turn and lose the conversation.
             low = meta.get("min", 1)
             if v < low:
                 raise ValueError(f"{key} must be >= {low}, got {v}")
@@ -284,10 +253,6 @@ class RuntimeConfig:
         return s
 
 
-# ---------------------------------------------------------------------------
-# Convenience getters — import these instead of raw constants
-# ---------------------------------------------------------------------------
-
 runtime_config = RuntimeConfig()
 
 
@@ -309,3 +274,8 @@ def get_token_streaming() -> bool:
 
 def get_workspace_upload_max_bytes() -> int:
     return runtime_config.get("workspace_upload_max_bytes")
+
+
+def get_workspace_upload_request_max_bytes() -> int:
+    """Maximum raw multipart body accepted by POST /files/upload."""
+    return max(0, get_workspace_upload_max_bytes()) + WORKSPACE_UPLOAD_MULTIPART_RESERVE
