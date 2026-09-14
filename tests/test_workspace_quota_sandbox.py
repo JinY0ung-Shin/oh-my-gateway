@@ -56,7 +56,10 @@ async def test_write_over_remaining_quota_is_denied(managed_workspace):
     result = await _call(
         hook,
         "Write",
-        {"file_path": str(managed_workspace / "new.txt"), "content": "y" * (200 * 1024)},
+        {
+            "file_path": str(managed_workspace / "new.txt"),
+            "content": "y" * (200 * 1024),
+        },
     )
 
     assert _is_deny(result)
