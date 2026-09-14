@@ -9,9 +9,11 @@ This is a gateway-level *soft* quota, not a filesystem project quota. File-API
 upload/copy paths can preflight mutations inside their process-local quota lock.
 Agent hooks use the same accounting for best-effort projected-size checks, but do
 not reserve bytes between hook approval and the later tool commit, so concurrent
-sessions or direct subprocess writers can race past the threshold. Deployments
-that need an unbreakable byte ceiling should use a filesystem quota in addition
-to this policy.
+sessions or direct subprocess writers can race past the threshold. Accounting
+failures are never treated as zero usage: benign concurrent disappearance is
+skipped, while unreadable/I/O-failed subtrees raise an explicit error so growth
+paths can fail closed. Deployments that need an unbreakable byte ceiling should
+use a filesystem quota in addition to this policy.
 """
 
 from __future__ import annotations
@@ -28,6 +30,24 @@ _ENV_NAME = "USER_WORKSPACE_QUOTA_MB"
 
 class WorkspaceQuotaConfigError(ValueError):
     """Raised when ``USER_WORKSPACE_QUOTA_MB`` is not a non-negative integer."""
+
+
+class WorkspaceQuotaAccountingError(RuntimeError):
+    """Raised when workspace usage cannot be measured without under-counting."""
+
+    def __init__(self, path: Path, cause: OSError) -> None:
+        self.path = Path(path)
+        self.errno = getattr(cause, "errno", None)
+        super().__init__(f"workspace quota accounting failed at {self.path}: {cause}")
+
+    def as_detail(self) -> dict:
+        return {
+            "error": {
+                "message": "Workspace storage quota could not be measured safely.",
+                "type": "service_unavailable",
+                "code": "workspace_quota_accounting_unavailable",
+            }
+        }
 
 
 @dataclass(frozen=True)
@@ -130,8 +150,17 @@ def workspace_quota_limit_bytes() -> int:
     return value * _MIB
 
 
+def _accounting_error(path: Path, exc: OSError) -> WorkspaceQuotaAccountingError:
+    return WorkspaceQuotaAccountingError(path, exc)
+
+
 def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
-    """Yield lstat results for regular files below *root*, never following links."""
+    """Yield lstat results for regular files below *root*, never following links.
+
+    Concurrent disappearance is benign: an entry that is gone by the time we
+    inspect it contributes no current bytes. Any other stat/scandir failure could
+    hide real storage, so it is surfaced rather than silently under-counted.
+    """
 
     stack = [Path(root)]
     while stack:
@@ -141,11 +170,10 @@ def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
                 for entry in entries:
                     try:
                         st = entry.stat(follow_symlinks=False)
-                    except OSError:
-                        # Workspaces can mutate concurrently (agent + file UI).
-                        # A disappearing/unreadable entry should not turn a usage
-                        # query into a 500; the next scan observes the new state.
+                    except (FileNotFoundError, NotADirectoryError):
                         continue
+                    except OSError as exc:
+                        raise _accounting_error(Path(entry.path), exc) from exc
                     mode = st.st_mode
                     if stat.S_ISLNK(mode):
                         continue
@@ -153,12 +181,14 @@ def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
                         stack.append(Path(entry.path))
                     elif stat.S_ISREG(mode):
                         yield st
-        except OSError:
-            # A child directory can disappear or become unreadable after its
-            # parent was scanned (for example via Bash chmod/rm). Quota usage is
-            # intentionally best-effort under concurrent filesystem mutation;
-            # skip that subtree instead of turning /files/quota and writes into 500s.
+        except (FileNotFoundError, NotADirectoryError):
+            # The directory disappeared or stopped being a directory after its
+            # parent was scanned; the current tree legitimately no longer owns it.
             continue
+        except WorkspaceQuotaAccountingError:
+            raise
+        except OSError as exc:
+            raise _accounting_error(directory, exc) from exc
 
 
 def logical_size_bytes(path: Path) -> int:
@@ -174,6 +204,8 @@ def logical_size_bytes(path: Path) -> int:
         st = path.lstat()
     except FileNotFoundError:
         return 0
+    except OSError as exc:
+        raise _accounting_error(path, exc) from exc
 
     if stat.S_ISLNK(st.st_mode):
         return 0
@@ -207,6 +239,8 @@ def copy_growth_bytes(path: Path) -> int:
         st = path.lstat()
     except FileNotFoundError:
         return 0
+    except OSError as exc:
+        raise _accounting_error(path, exc) from exc
     if stat.S_ISLNK(st.st_mode):
         return 0
     if stat.S_ISREG(st.st_mode):
@@ -238,6 +272,8 @@ def ensure_growth_fits(
     It is clamped to current usage so a stale caller cannot manufacture negative
     projected usage. When quota is disabled this fast-path does not walk the
     filesystem, so the feature has no per-write scan cost unless configured.
+    Accounting failures propagate so callers can fail closed instead of treating
+    an unreadable subtree as zero bytes.
     """
 
     limit = workspace_quota_limit_bytes()
