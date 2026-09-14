@@ -13,8 +13,10 @@ slot on cancellation or error.
 This middleware also carries two request-boundary guards that need raw ASGI
 access before FastAPI parses the body:
 
-* enforce ``MAX_REQUEST_SIZE`` against the **actual received bytes**, including
-  ``Transfer-Encoding: chunked`` requests with no ``Content-Length``;
+* enforce a route-aware request body limit against the **actual received bytes**,
+  including ``Transfer-Encoding: chunked`` requests with no ``Content-Length``.
+  Normal requests use ``MAX_REQUEST_SIZE``; ``POST /files/upload`` uses the
+  runtime-editable workspace upload ceiling plus multipart envelope room;
 * bind an optional ``USER_API_KEYS`` credential-derived principal to request
   state/body/query/header identity so caller-controlled ``user`` values cannot
   select another tenant workspace.
@@ -37,6 +39,7 @@ from src import metrics
 from src.auth import auth_manager
 from src.concurrency import turn_limiter
 from src.constants import MAX_REQUEST_SIZE
+from src.runtime_config import get_workspace_upload_request_max_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +120,19 @@ def _is_guarded(scope: Scope) -> bool:
     if scope.get("method") != "POST":
         return False
     return scope.get("path", "") in GUARDED_PATHS
+
+
+def _request_body_limit(scope: Scope) -> int:
+    """Return the raw-body ceiling for this request.
+
+    File uploads are intentionally the sole exception to the generic request
+    cap: their operator-facing control is ``workspace_upload_max_bytes``. The
+    multipart envelope reserve is added at this boundary, while the route later
+    checks the actual file bytes against exactly the configured file ceiling.
+    """
+    if scope.get("method") == "POST" and scope.get("path") == "/files/upload":
+        return get_workspace_upload_request_max_bytes()
+    return MAX_REQUEST_SIZE
 
 
 async def _buffer_body(receive: Receive) -> Tuple[bytes, Optional[Message]]:
@@ -304,16 +320,17 @@ class ConcurrencyLimitMiddleware:
         original_receive = receive
         body: Optional[bytes] = None
         method = scope.get("method", "")
+        body_limit = _request_body_limit(scope)
 
         # Fast reject a declared oversized body, then still count the actual
         # bytes for accepted declarations. This closes the chunked/no-CL bypass
-        # in RequestSizeLimitMiddleware and also catches understated lengths.
+        # and also catches understated lengths.
         headers = Headers(scope=scope)
         raw_length = headers.get("content-length")
         if raw_length is not None:
             try:
-                if int(raw_length) > MAX_REQUEST_SIZE:
-                    await self._send_413(send)
+                if int(raw_length) > body_limit:
+                    await self._send_413(send, body_limit)
                     return
             except ValueError:
                 # Uvicorn normally rejects malformed Content-Length before ASGI;
@@ -322,10 +339,10 @@ class ConcurrencyLimitMiddleware:
 
         if method in _BODY_METHODS:
             body, disconnected, too_large = await _buffer_body_with_limit(
-                original_receive, MAX_REQUEST_SIZE
+                original_receive, body_limit
             )
             if too_large:
-                await self._send_413(send)
+                await self._send_413(send, body_limit)
                 return
             if disconnected is not None:
                 receive = _replay_message(disconnected, original_receive)
@@ -354,8 +371,6 @@ class ConcurrencyLimitMiddleware:
             return
 
         metrics.set_turns_in_flight(self.limiter.in_flight)
-        # Published on request.state so a handler that outlives the response
-        # (background mode) can take ownership; see take_turn_slot().
         state = scope.setdefault("state", {})
         state[SLOT_KEY] = slot
         state.pop(TRANSFERRED_KEY, None)
@@ -368,23 +383,13 @@ class ConcurrencyLimitMiddleware:
                 slot.release()
             state.pop(SLOT_KEY, None)
             metrics.set_turns_in_flight(self.limiter.in_flight)
-            # This middleware is one of the few places that observes a
-            # streaming response all the way to its final body chunk, so it
-            # is also where the true end-to-end duration becomes measurable.
             metrics.record_stream_duration(
                 path=scope.get("path", ""),
                 duration_seconds=time.monotonic() - started,
             )
 
     def _log_rejection(self, path: str, reason: str) -> None:
-        """Warn about a rejection at most once per window, with a suppressed count.
-
-        Rejections short-circuit before the per-IP rate limiter, so the
-        limiter structurally cannot damp this: a client retrying against a
-        full gateway would otherwise write one WARNING per attempt and turn
-        an overload into a log flood. ``gateway_turns_rejected_total`` still
-        counts every single rejection exactly.
-        """
+        """Warn about a rejection at most once per window, with a suppressed count."""
         global _last_warned, _suppressed
 
         now = time.monotonic()
@@ -430,8 +435,6 @@ class ConcurrencyLimitMiddleware:
 
         body, disconnected = await _buffer_body(receive)
         if disconnected is not None:
-            # Let the disconnect reach the app instead of replaying an empty
-            # body as if the client had sent one.
             return None, _replay_message(disconnected, receive)
 
         replayed = _replay(body, receive)
@@ -446,13 +449,11 @@ class ConcurrencyLimitMiddleware:
         user = parsed.get("user")
         return (user if isinstance(user, str) and user else None), replayed
 
-    async def _send_413(self, send: Send) -> None:
+    async def _send_413(self, send: Send, limit: int) -> None:
         payload = json.dumps(
             {
                 "error": {
-                    "message": (
-                        f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes."
-                    ),
+                    "message": f"Request body too large. Maximum size is {limit} bytes.",
                     "type": "request_too_large",
                     "code": 413,
                 }
