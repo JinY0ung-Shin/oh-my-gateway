@@ -415,16 +415,15 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
     """Limit request body size to prevent DoS attacks.
 
-    Workspace file uploads use the gateway-owned runtime upload limit; every
-    other route keeps the existing ``MAX_REQUEST_SIZE`` ceiling. The inner pure
-    ASGI middleware still counts actual bytes (including chunked requests); this
-    layer is only the cheap declared-Content-Length fast rejection.
+    Authenticated workspace file uploads use the gateway-owned runtime upload
+    limit; unauthenticated/invalid callers and every other route keep the
+    existing ``MAX_REQUEST_SIZE`` ceiling. The inner pure ASGI middleware still
+    counts actual bytes (including chunked requests); this layer is only the
+    cheap declared-Content-Length fast rejection.
     """
 
     async def dispatch(self, request: Request, call_next):
-        body_limit = _request_body_limit(
-            {"type": "http", "method": request.method, "path": request.url.path}
-        )
+        body_limit = _request_body_limit(request.scope)
         content_length = request.headers.get("content-length")
         if content_length and int(content_length) > body_limit:
             return JSONResponse(
