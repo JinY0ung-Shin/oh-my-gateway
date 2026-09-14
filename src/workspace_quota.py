@@ -24,6 +24,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
 
+from fastapi import HTTPException
+
 _MIB = 1024 * 1024
 _ENV_NAME = "USER_WORKSPACE_QUOTA_MB"
 
@@ -32,13 +34,21 @@ class WorkspaceQuotaConfigError(ValueError):
     """Raised when ``USER_WORKSPACE_QUOTA_MB`` is not a non-negative integer."""
 
 
-class WorkspaceQuotaAccountingError(RuntimeError):
-    """Raised when workspace usage cannot be measured without under-counting."""
+class WorkspaceQuotaAccountingError(HTTPException):
+    """Fail-closed 503 when workspace usage cannot be measured safely.
+
+    This exception is intentionally HTTP-aware because the same accounting helpers
+    run inside the file API's threadpool. Letting the error propagate as a FastAPI
+    ``HTTPException`` guarantees every quota-dependent route fails closed without
+    duplicating catch/translation logic around each scan. Non-HTTP callers still
+    receive an exception and therefore cannot silently treat failed accounting as
+    zero usage.
+    """
 
     def __init__(self, path: Path, cause: OSError) -> None:
         self.path = Path(path)
         self.errno = getattr(cause, "errno", None)
-        super().__init__(f"workspace quota accounting failed at {self.path}: {cause}")
+        super().__init__(status_code=503, detail=self.as_detail())
 
     def as_detail(self) -> dict:
         return {
