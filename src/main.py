@@ -40,7 +40,7 @@ from src.constants import (
 from src import __version__
 from src import metrics
 from src.concurrency import SessionLimitExceeded
-from src.concurrency_middleware import ConcurrencyLimitMiddleware
+from src.concurrency_middleware import ConcurrencyLimitMiddleware, _request_body_limit
 from src.mcp_config import get_mcp_servers
 from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
@@ -204,22 +204,16 @@ async def lifespan(app: FastAPI):
     """Initialize backends, verify authentication, and start background tasks."""
     logger.info("Initializing backend registry...")
 
-    # Validate admin configuration — fail fast if ADMIN_API_KEY is missing
     from src.admin_auth import validate_admin_config
 
     validate_admin_config()
 
-    # Validate env configuration — log warnings for confusing combinations and
-    # refuse to start on contradictory ones (bypass with SKIP_CONFIG_CHECK=true).
     from src.config_check import run_startup_config_check
 
     run_startup_config_check()
 
-    # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
 
-    # Project the gateway-managed env block into the Claude settings file so a
-    # GATEWAY_CLAUDE_SETTINGS_ENV declaration applies without any admin action.
     try:
         from src import claude_settings_env
 
@@ -237,7 +231,6 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Claude settings env projection failed", exc_info=True)
 
-    # Validate Claude authentication first
     auth_valid, auth_info = validate_claude_code_auth()
 
     if not auth_valid:
@@ -250,27 +243,16 @@ async def lifespan(app: FastAPI):
     else:
         logger.info(f"✅ Claude Code authentication validated: {auth_info['method']}")
 
-    # Load custom system prompt (if configured)
     from src.system_prompt import load_default_prompt
     from src.constants import SYSTEM_PROMPT_FILE
 
     load_default_prompt(SYSTEM_PROMPT_FILE)
 
-    # Discover and register backends
     discover_backends()
-
-    # Verify all registered backends
     await _verify_backends()
-
-    # Prime optional backend model discovery before readiness. Resolution is
-    # synchronous, so the first request must see an already-populated cache.
     await BackendRegistry.warm_model_discovery()
-
-    # Warm up slash-command allowlist so the first /v1/responses request
-    # doesn't pay the round-trip, and surface the list in startup logs.
     await _log_slash_commands()
 
-    # Log debug information if debug mode is enabled
     if DEBUG_MODE or VERBOSE:
         logger.debug("🔧 Debug mode enabled - Enhanced logging active")
         logger.debug("🔧 Environment variables:")
@@ -289,7 +271,6 @@ async def lifespan(app: FastAPI):
             f"🔧 API Key protection: {'Enabled' if auth_manager.get_api_key() else 'Disabled'}"
         )
 
-    # Log Responses API parameter notice
     logger.info("Responses API parameters:")
     logger.info(
         "  Supported: model, input, instructions, previous_response_id, stream, "
@@ -298,16 +279,12 @@ async def lifespan(app: FastAPI):
     )
     logger.info("  See README.md for details")
 
-    # Log MCP configuration
     mcp_servers = get_mcp_servers()
     if mcp_servers:
         logger.info(f"MCP servers configured: {list(mcp_servers.keys())}")
     else:
         logger.info("No MCP servers configured (set MCP_CONFIG to enable)")
 
-    # Warn when MAX_LIVE_SESSIONS cannot fit in the memory this process
-    # actually has. Sessions pin a Claude CLI subprocess for their whole TTL,
-    # so an over-large cap means the host OOMs before the cap ever trips.
     from src.concurrency import check_session_limit_fits_memory
     from src.constants import (
         MAX_CONCURRENT_TURNS,
@@ -328,19 +305,12 @@ async def lifespan(app: FastAPI):
         session_manager.oldest_active_turn_silence
     )
 
-    # Start session cleanup task
     session_manager.start_cleanup_task()
 
-    # Start the marketplace auto-refresh poller. Admin-toggled via the plugin
-    # manifest (re-read every tick), so it idles while disabled and needs no
-    # restart to enable.
     from src.plugin_autorefresh import auto_refresher
 
     auto_refresher.start()
 
-    # Sweep orphaned anonymous workspaces left behind by prior runs. Sessions are
-    # in-memory only, so a restart orphans every active anonymous session's
-    # _tmp_ directory; without this they accumulate forever under the base path.
     try:
         from src.workspace_manager import workspace_manager
         from src.constants import SESSION_MAX_AGE_MINUTES
@@ -349,19 +319,13 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.debug("Orphan workspace sweep skipped", exc_info=True)
 
-    # Bring up the optional usage-log SQLAlchemy engine (no-op when the env var is
-    # unset).  Kept late in startup so a flaky logging DB cannot block the
-    # gateway from becoming healthy.
     from src.usage_logger import usage_logger
 
     await usage_logger.start()
-
-    # Record server start time for uptime tracking
     app.state.started_at = time.time()
 
     yield
 
-    # Cleanup on shutdown (async to disconnect SDK clients)
     await auto_refresher.stop()
     logger.info("Shutting down session manager...")
     await session_manager.async_shutdown()
@@ -369,7 +333,6 @@ async def lifespan(app: FastAPI):
     await usage_logger.close()
 
 
-# Create FastAPI app
 app = FastAPI(
     title="Oh My Gateway",
     description="OpenAI-compatible gateway for coding agent backends",
@@ -377,11 +340,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# Configure CORS
 cors_origins = json.loads(os.getenv("CORS_ORIGINS", '["*"]'))
-# A wildcard origin combined with credentials is unsafe (and Starlette would
-# echo the request origin back with Access-Control-Allow-Credentials: true).
-# Only allow credentials when an explicit origin allowlist is configured.
 cors_allow_credentials = "*" not in cors_origins
 app.add_middleware(
     CORSMiddleware,
@@ -391,7 +350,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Add rate limiting error handler
 if limiter:
     app.state.limiter = limiter
     app.add_exception_handler(429, cast(Any, rate_limit_exceeded_handler))
@@ -413,16 +371,26 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Limit request body size to prevent DoS attacks."""
+    """Fast Content-Length rejection using the same route-aware body ceiling.
+
+    The pure-ASGI concurrency middleware still counts actual received bytes and
+    catches chunked/understated requests. This outer layer only avoids reading a
+    body that already declares itself too large. Workspace uploads deliberately
+    use the gateway-owned runtime upload ceiling; all other routes keep the
+    existing ``MAX_REQUEST_SIZE`` cap.
+    """
 
     async def dispatch(self, request: Request, call_next):
+        body_limit = _request_body_limit(
+            {"type": "http", "method": request.method, "path": request.url.path}
+        )
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_SIZE:
+        if content_length and int(content_length) > body_limit:
             return JSONResponse(
                 status_code=413,
                 content={
                     "error": {
-                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes.",
+                        "message": f"Request body too large. Maximum size is {body_limit} bytes.",
                         "type": "request_too_large",
                         "code": 413,
                     }
@@ -435,16 +403,13 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
     """ASGI-compliant middleware for logging request/response details when debug mode is enabled."""
 
     async def dispatch(self, request: Request, call_next):
-        # Get request ID for correlation
         request_id = getattr(request.state, "request_id", "unknown")
 
         if not (DEBUG_MODE or VERBOSE):
             return await call_next(request)
 
-        # Log request details
         start_time = asyncio.get_event_loop().time()
 
-        # Log basic request info with request ID for correlation
         logger.debug(f"🔍 [{request_id}] Incoming request: {request.method} {request.url}")
         _SENSITIVE_HEADERS = {"authorization", "cookie", "x-api-key", "proxy-authorization"}
         safe_headers = {
@@ -452,25 +417,19 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
         }
         logger.debug(f"🔍 [{request_id}] Headers: {safe_headers}")
 
-        # For POST requests, try to log body (but don't break if we can't)
         body_logged = False
         if request.method == "POST" and request.url.path.startswith("/v1/"):
             try:
-                # Only attempt to read body if it's reasonable size and content-type
                 content_length = request.headers.get("content-length")
-                if content_length and int(content_length) < 100000:  # Less than 100KB
+                if content_length and int(content_length) < 100000:
                     body = await request.body()
                     if body:
                         try:
                             parsed_body = json.loads(body.decode())
-                            # Truncate base64 image data in logged body
                             logged_body = truncate_image_data(parsed_body)
                             logger.debug(f"🔍 Request body: {json.dumps(logged_body, indent=2)}")
                             body_logged = True
                         except Exception:
-                            # Do not log raw bytes: a malformed JSON body may
-                            # contain Bearer tokens, API keys, or PII. Log only
-                            # metadata useful for debugging.
                             logger.debug(
                                 "🔍 Request body: [non-JSON, %d bytes, content-type: %s]",
                                 len(body),
@@ -483,22 +442,16 @@ class DebugLoggingMiddleware(BaseHTTPMiddleware):
         if not body_logged and request.method == "POST":
             logger.debug("🔍 Request body: [not logged - streaming or large payload]")
 
-        # Process the request
         try:
             response = await call_next(request)
-
-            # Log response details
             end_time = asyncio.get_event_loop().time()
-            duration = (end_time - start_time) * 1000  # Convert to milliseconds
-
+            duration = (end_time - start_time) * 1000
             logger.debug(f"🔍 Response: {response.status_code} in {duration:.2f}ms")
-
             return response
 
         except Exception as e:
             end_time = asyncio.get_event_loop().time()
             duration = (end_time - start_time) * 1000
-
             logger.debug(f"🔍 Request failed after {duration:.2f}ms: {e}")
             raise
 
@@ -507,7 +460,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
     """Log request metadata to the in-memory request logger for admin observability.
 
     Excludes ``/admin/api/*`` and other non-API paths by default (configured
-    via ``request_logger.should_log``).  Latency measures handler creation
+    via ``request_logger.should_log``). Latency measures handler creation
     time only — streaming completion time is **not** included.
     """
 
@@ -522,9 +475,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
         backend: Optional[str] = None
         streaming: Optional[bool] = None
 
-        # Extract model/session_id from request body for /v1/ POST endpoints.
-        # Follow the same safety pattern as the existing debug middleware:
-        # small payloads only, tolerate parse failure.
         if request.method == "POST" and path.startswith("/v1/"):
             try:
                 content_length = request.headers.get("content-length")
@@ -536,7 +486,6 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                         session_id = parsed.get("session_id")
                         if path == "/v1/responses":
                             streaming = bool(parsed.get("stream", False))
-                        # Resolve backend from model name
                         if model:
                             try:
                                 from src.backends import resolve_model
@@ -585,37 +534,24 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
                 )
 
 
-# Add security middleware (order matters - first added = last executed)
 app.add_middleware(RequestIDMiddleware)
 
-# Admission control for agent runs. Placement is load-bearing in both
-# directions (last added = outermost):
-#   - inside the logging middlewares, so a 503 from a full gateway is still
-#     counted in request metrics and the admin log;
-#   - inside RequestSizeLimitMiddleware, so an oversized body is rejected with
-#     413 on its own merits instead of being masked by a 503 whenever the
-#     gateway happens to be at capacity.
 app.add_middleware(ConcurrencyLimitMiddleware)
 app.add_middleware(RequestSizeLimitMiddleware)
 
-# Add the debug middleware
 app.add_middleware(DebugLoggingMiddleware)
-
-# Add request logging middleware (for admin observability)
 app.add_middleware(RequestLoggingMiddleware)
 
 
 # ==================== Exception Handlers ====================
 
 
-# Custom exception handler for 422 validation errors
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle request validation errors with sanitized field-level details."""
 
     sanitized_errors = _sanitize_validation_errors(exc.errors())
 
-    # Log the validation error details
     logger.error(f"❌ Request validation failed for {request.method} {request.url}")
     logger.error("❌ Validation errors: %s", sanitized_errors)
 
@@ -673,8 +609,6 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
     """Format HTTP exceptions as OpenAI-style errors."""
     detail = exc.detail
     if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
-        # Caller already produced an OpenAI-style {"error": {...}} payload;
-        # pass it through unchanged to avoid double-nesting.
         return JSONResponse(status_code=exc.status_code, content=detail)
     return JSONResponse(
         status_code=exc.status_code,
@@ -698,23 +632,16 @@ app.include_router(sessions_router)
 app.include_router(general_router)
 app.include_router(admin_router)
 
-# Open Terminal-compatible read-only file server over per-user workspaces, so
-# open-webui can browse a user's Claude workspace in its file-explorer sidebar.
 from src.routes.terminal_files import router as terminal_files_router  # noqa: E402
 
 app.include_router(terminal_files_router)
 
-# Anthropic Messages SSE sanitizer for upstream LiteLLM-like proxies that emit
-# non-spec-conforming streams (LiteLLM #21128). The route is always mounted so
-# the admin panel can flip it on/off at runtime; the handler short-circuits to
-# 404 when disabled. The boot-time default is SANITIZER_ENABLED.
 from src.sanitizer.routes import router as sanitizer_router  # noqa: E402
 
 app.include_router(sanitizer_router)
 
 
 # ==================== Backward-compat re-exports ====================
-# Tests call these functions directly as main.X() — re-exports are required.
 
 from src.routes.responses import (  # noqa: E402, F401
     _generate_msg_id,
@@ -740,7 +667,7 @@ def find_available_port(start_port: int = 8000, max_attempts: int = 10) -> int:
         sock.settimeout(1)
         try:
             result = sock.connect_ex(("127.0.0.1", port))
-            if result != 0:  # Port is available
+            if result != 0:
                 return port
         except Exception:
             return port
@@ -756,12 +683,10 @@ def run_server(port: Optional[int] = None, host: Optional[str] = None) -> None:
     """Run the server - used as script entry point."""
     import uvicorn
 
-    # Handle interactive API key protection
     global runtime_api_key
     runtime_api_key = prompt_for_api_protection()
     auth_manager.runtime_api_key = runtime_api_key
 
-    # Priority: CLI arg > constants (which reads env vars)
     if port is None:
         port = DEFAULT_PORT
     if host is None:
@@ -769,8 +694,6 @@ def run_server(port: Optional[int] = None, host: Optional[str] = None) -> None:
     preferred_port = port
 
     try:
-        # Try the preferred port first
-        # Binding to 0.0.0.0 is intentional for container/development use
         uvicorn.run(app, host=host, port=preferred_port)  # nosec B104
     except OSError as e:
         if "Address already in use" in str(e) or e.errno == 48:
@@ -780,7 +703,6 @@ def run_server(port: Optional[int] = None, host: Optional[str] = None) -> None:
                 logger.info(f"Starting server on alternative port {available_port}")
                 print(f"\n🚀 Server starting on http://localhost:{available_port}")
                 print(f"📝 Update your client base_url to: http://localhost:{available_port}/v1")
-                # Binding to 0.0.0.0 is intentional for container/development use
                 uvicorn.run(app, host=host, port=available_port)  # nosec B104
             except RuntimeError as port_error:
                 logger.error(f"Could not find available port: {port_error}")
@@ -794,7 +716,6 @@ def run_server(port: Optional[int] = None, host: Optional[str] = None) -> None:
 if __name__ == "__main__":
     import sys
 
-    # Simple CLI argument parsing for port
     port: Optional[int] = None
     if len(sys.argv) > 1:
         try:
