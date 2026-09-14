@@ -467,10 +467,16 @@ def make_workspace_sandbox_hook(workspace_root: Path):
 
     * ``write_roots`` — workspace plus SDK-owned ``$HOME/.claude``;
     * ``read_roots`` — write roots plus shared plugin resource roots.
+
+    Direct callers historically receive a boundary-enforcing hook even when the
+    env flag is off; preserve that behavior when quota is disabled. The special
+    quota-only mode (quota on, sandbox flag off) is the only case where boundary
+    checks are intentionally skipped.
     """
     workspace_root = Path(workspace_root).resolve()
+    quota_enabled = workspace_quota_limit_bytes() > 0
     quota_user_root = _quota_user_root(workspace_root)
-    boundary_enabled = _boundary_enabled()
+    boundary_enabled = _boundary_enabled() or not quota_enabled
 
     claude_home = _claude_home()
     write_roots = [workspace_root] + _writable_extra_roots()
