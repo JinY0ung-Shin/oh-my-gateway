@@ -28,14 +28,27 @@ def test_upload_limit_is_an_editable_gateway_runtime_setting():
     assert terminal_files._max_upload_bytes() == 3 * 1024 * 1024
 
 
-def test_upload_request_boundary_uses_the_same_runtime_setting():
+def test_upload_request_boundary_uses_the_same_runtime_setting(monkeypatch):
     runtime_config.set("workspace_upload_max_bytes", 16 * 1024 * 1024)
+    monkeypatch.setattr(
+        concurrency_middleware.auth_manager, "has_api_auth", lambda: True
+    )
+    monkeypatch.setattr(
+        concurrency_middleware.auth_manager,
+        "authenticate_gateway_key",
+        lambda token: (token == "test-key", None),
+    )
 
     expected = 16 * 1024 * 1024 + WORKSPACE_UPLOAD_MULTIPART_RESERVE
     assert get_workspace_upload_request_max_bytes() == expected
     assert (
         concurrency_middleware._request_body_limit(
-            {"type": "http", "method": "POST", "path": "/files/upload"}
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/files/upload",
+                "headers": [(b"authorization", b"Bearer test-key")],
+            }
         )
         == expected
     )
