@@ -60,3 +60,13 @@ def test_anonymous_workspace_layout_ignores_claude_override(tmp_path, monkeypatc
 
     assert workspace.parent == tmp_path / "workspaces"
     assert workspace.name.startswith("_tmp_")
+
+
+def test_anonymous_workspace_ignores_invalid_claude_override(tmp_path, monkeypatch):
+    manager = WorkspaceManager(base_path=tmp_path / "workspaces")
+    monkeypatch.setenv("CLAUDE_WORKSPACE_DIR", "../pro")
+
+    workspace = manager.resolve(None, backend="claude")
+
+    assert workspace.parent == tmp_path / "workspaces"
+    assert workspace.name.startswith("_tmp_")
