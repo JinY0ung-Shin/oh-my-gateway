@@ -351,3 +351,53 @@ def reset_rate_limiter_module():
     with patch.dict(os.environ, {"RATE_LIMIT_ENABLED": "true"}, clear=False):
         importlib.reload(src.constants)
         importlib.reload(src.rate_limiter)
+
+
+class TestGetUserRateLimitKey:
+    """Per-user key for the responses family (BFF deployments share one IP)."""
+
+    def _request(self, headers):
+        req = MagicMock(spec=Request)
+        req.headers = headers
+        return req
+
+    def test_uses_workspace_user_header_when_present(self, monkeypatch):
+        monkeypatch.delenv("RATE_LIMIT_KEY_BY_USER", raising=False)
+        monkeypatch.delenv("WORKSPACE_USER_HEADER", raising=False)
+        from src.rate_limiter import get_user_rate_limit_key
+
+        with patch("src.rate_limiter.get_remote_address") as mock_get_addr:
+            mock_get_addr.return_value = "10.0.0.5"
+            assert get_user_rate_limit_key(self._request({"X-User-Email": "alice"})) == "user:alice"
+            mock_get_addr.assert_not_called()
+
+    def test_falls_back_to_ip_without_header(self, monkeypatch):
+        monkeypatch.delenv("RATE_LIMIT_KEY_BY_USER", raising=False)
+        from src.rate_limiter import get_user_rate_limit_key
+
+        with patch("src.rate_limiter.get_remote_address") as mock_get_addr:
+            mock_get_addr.return_value = "10.0.0.5"
+            assert get_user_rate_limit_key(self._request({})) == "10.0.0.5"
+            assert get_user_rate_limit_key(self._request({"X-User-Email": "   "})) == "10.0.0.5"
+
+    def test_honours_custom_header_name(self, monkeypatch):
+        monkeypatch.setenv("WORKSPACE_USER_HEADER", "X-Caller")
+        from src.rate_limiter import get_user_rate_limit_key
+
+        with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
+            assert get_user_rate_limit_key(self._request({"X-Caller": "bob"})) == "user:bob"
+            assert get_user_rate_limit_key(self._request({"X-User-Email": "bob"})) == "10.0.0.5"
+
+    def test_can_be_forced_back_to_ip(self, monkeypatch):
+        monkeypatch.setenv("RATE_LIMIT_KEY_BY_USER", "false")
+        from src.rate_limiter import get_user_rate_limit_key
+
+        with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
+            assert get_user_rate_limit_key(self._request({"X-User-Email": "alice"})) == "10.0.0.5"
+
+    def test_only_responses_family_is_user_keyed(self):
+        from src.rate_limiter import USER_KEYED_ENDPOINTS
+
+        assert "responses" in USER_KEYED_ENDPOINTS
+        assert "auth" not in USER_KEYED_ENDPOINTS
+        assert "admin_login" not in USER_KEYED_ENDPOINTS

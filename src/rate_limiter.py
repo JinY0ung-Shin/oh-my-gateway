@@ -1,3 +1,4 @@
+import os
 import re
 from typing import Optional
 from slowapi import Limiter
@@ -13,6 +14,32 @@ from src.env_utils import parse_bool_env
 def get_rate_limit_key(request: Request) -> str:
     """Get the rate limiting key (IP address) from the request."""
     return get_remote_address(request)
+
+
+def _user_header_name() -> str:
+    return os.getenv("WORKSPACE_USER_HEADER", "X-User-Email")
+
+
+def get_user_rate_limit_key(request: Request) -> str:
+    """Key for per-user limits: the caller identity when present, else the IP.
+
+    A BFF such as ChatDRAGON fronts every end user from one process, so an IP
+    key makes the whole deployment share a single bucket (10 turns/minute for
+    everyone with the defaults).  The gateway already trusts the
+    ``WORKSPACE_USER_HEADER`` value for workspace isolation once the request
+    passed ``API_KEY`` auth, so the same identity is the right unit here.
+    Requests without the header (direct clients) keep the IP key.  Set
+    ``RATE_LIMIT_KEY_BY_USER=false`` to force the IP key everywhere.
+    """
+    if parse_bool_env("RATE_LIMIT_KEY_BY_USER", "true"):
+        user = (request.headers.get(_user_header_name()) or "").strip()
+        if user:
+            return f"user:{user}"
+    return get_remote_address(request)
+
+
+# Endpoint families whose bucket follows the caller identity rather than the IP.
+USER_KEYED_ENDPOINTS = frozenset({"responses"})
 
 
 def create_rate_limiter() -> Optional[Limiter]:
@@ -72,6 +99,10 @@ def rate_limit_endpoint(endpoint: str):
 
     def decorator(func):
         if limiter:
+            if endpoint in USER_KEYED_ENDPOINTS:
+                return limiter.limit(
+                    get_rate_limit_for_endpoint(endpoint), key_func=get_user_rate_limit_key
+                )(func)
             return limiter.limit(get_rate_limit_for_endpoint(endpoint))(func)
         return func
 
