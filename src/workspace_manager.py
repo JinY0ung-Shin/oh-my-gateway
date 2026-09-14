@@ -62,8 +62,11 @@ class WorkspaceManager:
         """Return the workspace path for *user*, creating it if necessary.
 
         Named users use ``base_path/user/backend`` when *backend* is provided.
-        Anonymous workspaces remain session-scoped ``_tmp_{uuid}`` directories.
-        Workspaces are created empty — no configuration is seeded into them.
+        ``CLAUDE_WORKSPACE_DIR`` may override only the filesystem directory name
+        used for the ``claude`` backend; the backend identifier itself remains
+        unchanged. Anonymous workspaces remain session-scoped ``_tmp_{uuid}``
+        directories. Workspaces are created empty — no configuration is seeded
+        into them.
 
         ``WORKSPACE_LEGACY_LOCALPART_KEY=true`` is a migration-only compatibility
         mode. It is applied here rather than in an HTTP route so every consumer
@@ -71,6 +74,7 @@ class WorkspaceManager:
         the same workspace key.
         """
         backend_name = self._sanitize_backend(backend)
+        workspace_dir_name = self._workspace_dir_name(backend_name)
         if user is not None:
             workspace_key = user
             if _legacy_localpart_key_enabled():
@@ -82,8 +86,8 @@ class WorkspaceManager:
                 )
             sanitized = self._sanitize(workspace_key)
             workspace = self.base_path / sanitized
-            if backend_name:
-                workspace = workspace / backend_name
+            if workspace_dir_name:
+                workspace = workspace / workspace_dir_name
         else:
             workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
 
@@ -159,6 +163,30 @@ class WorkspaceManager:
         if not backend or not _BACKEND_PATTERN.match(backend):
             raise ValueError(f"Invalid backend: {backend!r}. Must match ^[a-z][a-z0-9_-]{{0,31}}$")
         return backend
+
+    def _workspace_dir_name(self, backend: Optional[str]) -> Optional[str]:
+        """Return the filesystem directory name for a backend.
+
+        Backend identifiers are part of routing semantics and must remain stable.
+        ``CLAUDE_WORKSPACE_DIR`` therefore aliases only the on-disk directory used
+        by the ``claude`` backend. Empty/unset values preserve the default name.
+        The override is validated with the same single-component rules as backend
+        names so it cannot introduce path traversal or separators.
+        """
+        if backend != "claude":
+            return backend
+
+        override = os.getenv("CLAUDE_WORKSPACE_DIR", "").strip()
+        if not override:
+            return backend
+
+        try:
+            return self._sanitize_backend(override)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid CLAUDE_WORKSPACE_DIR: {override!r}. "
+                "Must match ^[a-z][a-z0-9_-]{0,31}$"
+            ) from exc
 
 
 # ---------------------------------------------------------------------------
