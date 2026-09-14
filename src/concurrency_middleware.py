@@ -16,8 +16,9 @@ access before FastAPI parses the body:
 * enforce a route-aware request body limit against the **actual received bytes**,
   including ``Transfer-Encoding: chunked`` requests with no ``Content-Length``.
   Normal requests use ``MAX_REQUEST_SIZE``; authenticated ``POST /files/upload``
-  requests (or public deployments with gateway auth disabled) use the runtime-
-  editable workspace upload ceiling plus multipart envelope room;
+  requests use the runtime-editable workspace upload ceiling plus multipart
+  envelope room. A gateway with no API auth configured fails closed at the
+  generic cap because the workspace file routes themselves are disabled;
 * bind an optional ``USER_API_KEYS`` credential-derived principal to request
   state/body/query/header identity so caller-controlled ``user`` values cannot
   select another tenant workspace.
@@ -127,11 +128,10 @@ def _request_body_limit(scope: Scope) -> int:
     """Return the raw-body ceiling for this request.
 
     The larger workspace upload allowance is a privileged resource boundary:
-    when gateway API auth is enabled, only a request carrying a valid legacy or
-    ``USER_API_KEYS`` bearer may use it. Missing/invalid credentials stay under
-    ``MAX_REQUEST_SIZE`` until FastAPI returns the normal 401. Deployments with
-    gateway auth disabled remain intentionally public and may use the upload
-    ceiling directly.
+    only a request carrying a valid legacy or ``USER_API_KEYS`` bearer may use
+    it. Missing/invalid credentials stay under ``MAX_REQUEST_SIZE`` until
+    FastAPI returns the normal 401. If no gateway API auth is configured at all,
+    the workspace file routes are disabled and the generic cap still applies.
     """
     if (
         scope.get("method") == "POST"
@@ -250,7 +250,7 @@ def _bearer_token(scope: Scope) -> Optional[str]:
 def _gateway_credential_valid(scope: Scope) -> bool:
     """Whether this request may consume auth-gated resource allowances."""
     if not auth_manager.has_api_auth():
-        return True
+        return False
     token = _bearer_token(scope)
     if token is None:
         return False
