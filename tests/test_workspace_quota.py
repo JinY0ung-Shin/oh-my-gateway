@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
@@ -7,6 +8,7 @@ import pytest
 
 import src.workspace_quota as workspace_quota_module
 from src.workspace_quota import (
+    WorkspaceQuotaAccountingError,
     WorkspaceQuotaConfigError,
     WorkspaceQuotaExceeded,
     copy_growth_bytes,
@@ -44,8 +46,36 @@ def test_logical_usage_spans_backend_directories(tmp_path: Path):
     assert logical_size_bytes(user_root) == 24
 
 
-def test_unreadable_subtree_is_skipped_instead_of_failing_usage(
+def test_disappearing_subtree_is_skipped_without_failing_usage(
     tmp_path: Path, monkeypatch
+):
+    user_root = tmp_path / "alice"
+    vanished = user_root / "vanished"
+    vanished.mkdir(parents=True)
+    (user_root / "visible.bin").write_bytes(b"v" * 11)
+    (vanished / "gone.bin").write_bytes(b"g" * 13)
+
+    real_scandir = workspace_quota_module.os.scandir
+
+    def racing_scandir(path):
+        if Path(path) == vanished:
+            raise FileNotFoundError(errno.ENOENT, "simulated concurrent removal")
+        return real_scandir(path)
+
+    monkeypatch.setattr(workspace_quota_module.os, "scandir", racing_scandir)
+
+    assert logical_size_bytes(user_root) == 11
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        PermissionError(errno.EACCES, "simulated unreadable subtree"),
+        OSError(errno.EIO, "simulated I/O failure"),
+    ],
+)
+def test_unreadable_or_io_failed_subtree_fails_accounting(
+    tmp_path: Path, monkeypatch, failure: OSError
 ):
     user_root = tmp_path / "alice"
     blocked = user_root / "blocked"
@@ -57,12 +87,14 @@ def test_unreadable_subtree_is_skipped_instead_of_failing_usage(
 
     def guarded_scandir(path):
         if Path(path) == blocked:
-            raise PermissionError("simulated unreadable workspace subtree")
+            raise failure
         return real_scandir(path)
 
     monkeypatch.setattr(workspace_quota_module.os, "scandir", guarded_scandir)
 
-    assert logical_size_bytes(user_root) == 11
+    with pytest.raises(WorkspaceQuotaAccountingError) as raised:
+        logical_size_bytes(user_root)
+    assert raised.value.errno == failure.errno
 
 
 def test_symlinks_are_not_followed(tmp_path: Path):
