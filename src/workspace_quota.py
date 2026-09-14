@@ -2,12 +2,12 @@
 
 The quota is intentionally defined over the *user root* (``<base>/<user>``), not
 one backend directory, so changing Claude's on-disk alias or enabling another
-backend cannot create a fresh bucket.  Usage is logical regular-file bytes across
+backend cannot create a fresh bucket. Usage is logical regular-file bytes across
 all backend directories below that root.
 
-This is a gateway-level *soft* quota, not a filesystem project quota.  Gateway
+This is a gateway-level *soft* quota, not a filesystem project quota. Gateway
 write paths can preflight mutations exactly, while an arbitrary subprocess (most
-notably Claude's Bash tool) can still grow the workspace between checks.  Agent
+notably Claude's Bash tool) can still grow the workspace between checks. Agent
 hooks use the same accounting to refuse deterministic writes and to surface an
 over-quota state; deployments that need an unbreakable byte ceiling should use a
 filesystem quota in addition to this policy.
@@ -148,7 +148,7 @@ def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
 def logical_size_bytes(path: Path) -> int:
     """Logical regular-file bytes at *path*, without following symlinks.
 
-    Hard-linked files are counted once per inode.  Special files and symlinks are
+    Hard-linked files are counted once per inode. Special files and symlinks are
     zero-byte for quota accounting; following either could block or escape the
     user root and would not represent storage owned by this workspace anyway.
     """
@@ -175,6 +175,29 @@ def logical_size_bytes(path: Path) -> int:
         seen.add(key)
         total += item.st_size
     return total
+
+
+def copy_growth_bytes(path: Path) -> int:
+    """Bytes a normal file/directory copy would add at a new destination.
+
+    Unlike :func:`logical_size_bytes`, hard-linked source names are counted
+    separately because ``shutil.copytree``/``copyfile`` materialize each path as
+    a new destination file. Symlinks remain links and therefore contribute no
+    regular-file payload bytes.
+    """
+
+    path = Path(path)
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return 0
+    if stat.S_ISLNK(st.st_mode):
+        return 0
+    if stat.S_ISREG(st.st_mode):
+        return st.st_size
+    if not stat.S_ISDIR(st.st_mode):
+        return 0
+    return sum(item.st_size for item in _iter_regular_files(path))
 
 
 def quota_snapshot(user_root: Path) -> WorkspaceQuotaSnapshot:
