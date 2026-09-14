@@ -1,6 +1,7 @@
 """Integration coverage for cumulative per-user workspace quota file routes."""
 
 import errno
+import os
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,10 @@ def quota_client(tmp_path: Path, monkeypatch):
         return target
 
     monkeypatch.setattr(tf.workspace_manager, "resolve", _resolve)
+    # The quota scope is derived from the managed base, so the fixture must own
+    # that base too — stubbing only `resolve` would let the route validate the
+    # user root against a production path that has nothing to do with tmp_path.
+    monkeypatch.setattr(tf.workspace_manager, "base_path", tmp_path)
     tf._QUOTA_LOCKS.clear()
 
     app = FastAPI()
@@ -266,3 +271,98 @@ def test_quota_unset_keeps_existing_upload_behavior(quota_client, monkeypatch):
 
     assert response.status_code == 200
     assert (workspace / "normal.txt").read_bytes() == b"ok"
+
+
+def test_quota_endpoint_does_not_walk_the_tree_when_disabled(quota_client, monkeypatch):
+    """A disabled quota must not make /files/quota the priciest call in the API.
+
+    The walk is O(files) and holds a shared threadpool worker, so polling a
+    figure that is meaningless while the feature is off would let one client
+    starve real file I/O.
+    """
+    client, _, workspace = quota_client
+    monkeypatch.delenv("USER_WORKSPACE_QUOTA_MB", raising=False)
+    (workspace / "payload.bin").write_bytes(b"x" * 4096)
+
+    scans = []
+    real_scandir = os.scandir
+
+    def counting_scandir(path):
+        scans.append(str(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(workspace_quota_module.os, "scandir", counting_scandir)
+
+    response = client.get("/files/quota", headers={**_AUTH, **_USER})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is False
+    assert body["limit_bytes"] == 0
+    assert body["remaining_bytes"] is None
+    assert body["over_quota"] is False
+    assert scans == [], f"disabled quota still scanned the workspace: {scans}"
+
+
+def test_quota_endpoint_still_reports_usage_when_enabled(quota_client, monkeypatch):
+    client, _, workspace = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    (workspace / "payload.bin").write_bytes(b"x" * 4096)
+
+    response = client.get("/files/quota", headers={**_AUTH, **_USER})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["enabled"] is True
+    assert body["used_bytes"] == 4096
+
+
+def test_quota_scope_requires_the_managed_user_root_shape(quota_client, monkeypatch):
+    """Quota must never be charged against a root we cannot identify.
+
+    ``workspace_manager.resolve`` returns ``<base>/<user>`` when no backend name
+    is passed. Taking ``.parent`` of that would silently make the shared base the
+    quota scope, so every user would be charged for everyone's bytes. The numbers
+    would stay plausible, so this fails closed instead.
+    """
+    client, user_root, workspace = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+
+    def _resolve_without_backend(user, backend=None):
+        return user_root
+
+    monkeypatch.setattr(tf.workspace_manager, "resolve", _resolve_without_backend)
+
+    response = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("scoped.txt", b"data", "text/plain")},
+    )
+
+    assert response.status_code == 503
+    assert (
+        response.json()["detail"]["error"]["code"]
+        == "workspace_quota_accounting_unavailable"
+    )
+    assert not (user_root / "scoped.txt").exists()
+
+
+def test_quota_scope_rejects_anonymous_temp_workspaces(quota_client, monkeypatch):
+    """An anonymous ``_tmp_*`` workspace has no named user to charge."""
+    client, _, _ = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    base = tf.workspace_manager.base_path
+    anonymous = base / "_tmp_deadbeef" / "claude"
+    anonymous.mkdir(parents=True, exist_ok=True)
+
+    monkeypatch.setattr(
+        tf.workspace_manager, "resolve", lambda user, backend=None: anonymous
+    )
+
+    response = client.get("/files/quota", headers={**_AUTH, **_USER})
+
+    assert response.status_code == 503
+    assert (
+        response.json()["detail"]["error"]["code"]
+        == "workspace_quota_accounting_unavailable"
+    )

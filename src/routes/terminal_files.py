@@ -98,6 +98,7 @@ from src.constants import MAX_REQUEST_SIZE, WORKSPACE_UPLOAD_MAX_BYTES
 from src.workspace_manager import workspace_manager
 from src.workspace_quota import (
     WorkspaceQuotaExceeded,
+    WorkspaceQuotaSnapshot,
     copy_growth_bytes,
     ensure_growth_fits,
     quota_snapshot,
@@ -149,6 +150,16 @@ _MULTIPART_ENVELOPE_RESERVE = 8192
 # Per-process serialization for quota-increasing file API mutations. This does
 # not turn the application quota into an OS/filesystem hard quota.
 _QUOTA_LOCKS: dict[str, asyncio.Lock] = {}
+
+# Fail closed when the quota scope cannot be determined: charging a user for a
+# root we cannot identify is worse than refusing the quota-dependent call.
+_QUOTA_SCOPE_UNAVAILABLE = {
+    "error": {
+        "message": "Workspace storage quota scope could not be determined.",
+        "type": "service_unavailable",
+        "code": "workspace_quota_accounting_unavailable",
+    }
+}
 
 
 def _max_upload_bytes() -> int:
@@ -237,8 +248,30 @@ def _workspace_root(user: str) -> Path:
 
 
 def _user_root(workspace_root: Path) -> Path:
-    """Aggregate quota root for a named user (parent of the backend directory)."""
-    return workspace_root.resolve().parent
+    """Aggregate quota root for a named user (parent of the backend directory).
+
+    The shape is verified rather than assumed. ``workspace_manager.resolve``
+    returns ``<base>/<user>/<backend-dir>`` only while a backend name is passed;
+    without one it returns ``<base>/<user>``, and this function's ``parent``
+    would then be the shared base holding **every** user's workspace. Quota would
+    silently become a global figure charged to each user individually — a wrong
+    answer that no test would notice because the numbers stay plausible.
+
+    Today ``_BACKEND`` is a module constant so that cannot happen, which is
+    exactly why the coupling deserves a check rather than a comment: the failure
+    arrives whenever someone changes the caller, not when they change this line.
+    The agent-side hook (``workspace_sandbox._quota_user_root``) already
+    validates the same shape; this keeps the HTTP mutation path from being the
+    weaker of the two.
+    """
+    resolved = Path(workspace_root).resolve()
+    try:
+        relative = resolved.relative_to(workspace_manager.base_path.resolve())
+    except (OSError, ValueError):
+        raise HTTPException(status_code=503, detail=_QUOTA_SCOPE_UNAVAILABLE)
+    if len(relative.parts) != 2 or relative.parts[0].startswith("_tmp_"):
+        raise HTTPException(status_code=503, detail=_QUOTA_SCOPE_UNAVAILABLE)
+    return resolved.parent
 
 
 def _quota_lock(user_root: Path) -> asyncio.Lock:
@@ -391,10 +424,21 @@ async def get_quota(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Return current aggregate quota usage for the authenticated named user."""
+    """Return current aggregate quota usage for the authenticated named user.
+
+    When quota is disabled this answers from configuration alone. Walking the
+    tree anyway would make a disabled feature the most expensive endpoint in the
+    file API: every call is O(files in the workspace) and holds a threadpool
+    worker that the rest of the file routes share, so a client polling a usage
+    figure that is definitionally meaningless could starve real file I/O. The
+    same "no scan unless configured" rule already governs upload/copy.
+    """
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
+    limit = workspace_quota_limit_bytes()
+    if limit <= 0:
+        return WorkspaceQuotaSnapshot(used_bytes=0, limit_bytes=0).as_dict()
     snapshot = await run_in_threadpool(quota_snapshot, _user_root(root))
     return snapshot.as_dict()
 
