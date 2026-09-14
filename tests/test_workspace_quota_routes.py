@@ -1,5 +1,6 @@
 """Integration coverage for cumulative per-user workspace quota file routes."""
 
+import errno
 from pathlib import Path
 
 import pytest
@@ -7,6 +8,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 import src.auth as auth_module
+import src.workspace_quota as workspace_quota_module
 from src.routes import terminal_files as tf
 from src.routes.terminal_files import router
 
@@ -18,6 +20,17 @@ _MIB = 1024 * 1024
 def _patch_api_key(monkeypatch, value: str) -> None:
     for manager in {tf.auth_manager, auth_module.auth_manager}:
         monkeypatch.setattr(manager, "get_api_key", lambda: value)
+
+
+def _fail_quota_scan_at(monkeypatch, blocked: Path, failure: OSError) -> None:
+    real_scandir = workspace_quota_module.os.scandir
+
+    def guarded_scandir(path):
+        if Path(path) == blocked:
+            raise failure
+        return real_scandir(path)
+
+    monkeypatch.setattr(workspace_quota_module.os, "scandir", guarded_scandir)
 
 
 @pytest.fixture
@@ -100,6 +113,31 @@ def test_upload_over_user_quota_is_507_and_does_not_write(quota_client, monkeypa
     assert not (workspace / "too-much.bin").exists()
 
 
+def test_upload_fails_closed_when_quota_scan_is_unreadable(quota_client, monkeypatch):
+    client, _, workspace = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    blocked = workspace / "blocked"
+    blocked.mkdir()
+    (blocked / "hidden.bin").write_bytes(b"h" * (800 * 1024))
+    _fail_quota_scan_at(
+        monkeypatch,
+        blocked,
+        PermissionError(errno.EACCES, "simulated unreadable subtree"),
+    )
+
+    response = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("new.bin", b"n" * (300 * 1024), "application/octet-stream")},
+    )
+
+    assert response.status_code == 503
+    error = response.json()["detail"]["error"]
+    assert error["code"] == "workspace_quota_accounting_unavailable"
+    assert error["type"] == "service_unavailable"
+    assert not (workspace / "new.bin").exists()
+
+
 def test_no_clobber_existing_destination_stays_409_even_when_quota_is_full(
     quota_client, monkeypatch
 ):
@@ -167,6 +205,34 @@ def test_copy_growth_is_checked_before_destination_creation(quota_client, monkey
 
     assert response.status_code == 507
     assert not (workspace / "source copy.bin").exists()
+
+
+def test_copy_fails_closed_when_quota_scan_hits_io_error(quota_client, monkeypatch):
+    client, _, workspace = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    source = workspace / "source.bin"
+    source.write_bytes(b"s" * (200 * 1024))
+    blocked = workspace / "blocked"
+    blocked.mkdir()
+    (blocked / "hidden.bin").write_bytes(b"h" * (700 * 1024))
+    _fail_quota_scan_at(
+        monkeypatch,
+        blocked,
+        OSError(errno.EIO, "simulated quota scan I/O failure"),
+    )
+
+    destination = workspace / "source copy.bin"
+    response = client.post(
+        "/files/copy",
+        headers={**_AUTH, **_USER},
+        json={"source": "/source.bin", "destination": "/source copy.bin"},
+    )
+
+    assert response.status_code == 503
+    error = response.json()["detail"]["error"]
+    assert error["code"] == "workspace_quota_accounting_unavailable"
+    assert error["type"] == "service_unavailable"
+    assert not destination.exists()
 
 
 def test_quota_unset_keeps_existing_upload_behavior(quota_client, monkeypatch):
