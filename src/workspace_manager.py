@@ -74,8 +74,8 @@ class WorkspaceManager:
         the same workspace key.
         """
         backend_name = self._sanitize_backend(backend)
-        workspace_dir_name = self._workspace_dir_name(backend_name)
         if user is not None:
+            workspace_dir_name = self._workspace_dir_name(backend_name)
             workspace_key = user
             if _legacy_localpart_key_enabled():
                 workspace_key = user.split("@", 1)[0]
