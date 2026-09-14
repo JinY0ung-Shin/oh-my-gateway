@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 _USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,126}$")
 _BACKEND_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
+# Every known backend owns its default directory name.  Keep these names reserved
+# even when a backend is disabled: workspaces persist across configuration changes,
+# and allowing Claude to claim (for example) ``codex`` today would make a later
+# ``BACKENDS=claude,codex`` deployment silently merge two backend workspaces.
+_BACKEND_WORKSPACE_NAMES = frozenset({"claude", "opencode", "codex"})
+
 
 def _legacy_localpart_key_enabled() -> bool:
     """Whether all named workspace consumers should use the pre-fix localpart key.
@@ -62,8 +68,11 @@ class WorkspaceManager:
         """Return the workspace path for *user*, creating it if necessary.
 
         Named users use ``base_path/user/backend`` when *backend* is provided.
-        Anonymous workspaces remain session-scoped ``_tmp_{uuid}`` directories.
-        Workspaces are created empty — no configuration is seeded into them.
+        ``CLAUDE_WORKSPACE_DIR`` may override only the filesystem directory name
+        used for the ``claude`` backend; the backend identifier itself remains
+        unchanged. Anonymous workspaces remain session-scoped ``_tmp_{uuid}``
+        directories. Workspaces are created empty — no configuration is seeded
+        into them.
 
         ``WORKSPACE_LEGACY_LOCALPART_KEY=true`` is a migration-only compatibility
         mode. It is applied here rather than in an HTTP route so every consumer
@@ -72,6 +81,7 @@ class WorkspaceManager:
         """
         backend_name = self._sanitize_backend(backend)
         if user is not None:
+            workspace_dir_name = self._workspace_dir_name(backend_name)
             workspace_key = user
             if _legacy_localpart_key_enabled():
                 workspace_key = user.split("@", 1)[0]
@@ -82,8 +92,8 @@ class WorkspaceManager:
                 )
             sanitized = self._sanitize(workspace_key)
             workspace = self.base_path / sanitized
-            if backend_name:
-                workspace = workspace / backend_name
+            if workspace_dir_name:
+                workspace = workspace / workspace_dir_name
         else:
             workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
 
@@ -159,6 +169,37 @@ class WorkspaceManager:
         if not backend or not _BACKEND_PATTERN.match(backend):
             raise ValueError(f"Invalid backend: {backend!r}. Must match ^[a-z][a-z0-9_-]{{0,31}}$")
         return backend
+
+    def _workspace_dir_name(self, backend: Optional[str]) -> Optional[str]:
+        """Return the filesystem directory name for a backend.
+
+        Backend identifiers are part of routing semantics and must remain stable.
+        ``CLAUDE_WORKSPACE_DIR`` therefore aliases only the on-disk directory used
+        by the ``claude`` backend. Empty/unset values preserve the default name.
+        The override is validated with the same single-component rules as backend
+        names and may not claim another backend's reserved workspace name.
+        """
+        if backend != "claude":
+            return backend
+
+        override = os.getenv("CLAUDE_WORKSPACE_DIR", "").strip()
+        if not override:
+            return backend
+
+        try:
+            workspace_dir = self._sanitize_backend(override)
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid CLAUDE_WORKSPACE_DIR: {override!r}. "
+                "Must match ^[a-z][a-z0-9_-]{0,31}$"
+            ) from exc
+
+        if workspace_dir != backend and workspace_dir in _BACKEND_WORKSPACE_NAMES:
+            raise ValueError(
+                f"Invalid CLAUDE_WORKSPACE_DIR: {override!r} collides with the "
+                f"{workspace_dir!r} backend workspace directory"
+            )
+        return workspace_dir
 
 
 # ---------------------------------------------------------------------------
