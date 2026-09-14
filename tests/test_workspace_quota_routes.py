@@ -420,3 +420,45 @@ async def test_concurrent_same_user_mutations_share_one_lock(tmp_path, monkeypat
 
     assert overlapped is False, "same-user quota mutations ran concurrently"
     assert tf._QUOTA_LOCKS == {}, "entry survived after both callers finished"
+
+
+def test_claude_workspace_dir_alias_shares_one_quota_bucket(tmp_path, monkeypatch):
+    """A renamed Claude workspace directory must not open a fresh quota bucket.
+
+    This is a headline claim of the feature and the only test that exercises the
+    real ``workspace_manager`` instead of a stubbed ``resolve``, so it also pins
+    that the quota scope derivation agrees with how workspaces are actually laid
+    out on disk.
+    """
+    _patch_api_key(monkeypatch, "testkey")
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    monkeypatch.setenv("CLAUDE_WORKSPACE_DIR", "pro")
+    monkeypatch.setattr(tf.workspace_manager, "base_path", tmp_path)
+    tf._QUOTA_LOCKS.clear()
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app)
+
+    workspace = tf.workspace_manager.resolve("alice@corp.com", backend="claude")
+    assert workspace.relative_to(tmp_path).parts == ("alice@corp.com", "pro")
+
+    # Bytes parked in a sibling backend directory, outside the aliased one.
+    sibling = tmp_path / "alice@corp.com" / "codex"
+    sibling.mkdir(parents=True, exist_ok=True)
+    (sibling / "big.bin").write_bytes(b"x" * (900 * 1024))
+
+    quota = client.get("/files/quota", headers={**_AUTH, **_USER})
+    assert quota.status_code == 200
+    assert quota.json()["used_bytes"] == 900 * 1024, "alias started a fresh bucket"
+
+    response = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("new.bin", b"y" * (200 * 1024), "application/octet-stream")},
+    )
+
+    assert response.status_code == 507
+    assert response.json()["detail"]["error"]["code"] == "workspace_quota_exceeded"
+    assert not (workspace / "new.bin").exists()
+    tf._QUOTA_LOCKS.clear()
