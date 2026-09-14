@@ -131,6 +131,12 @@ def _max_upload_bytes() -> int:
     The runtime-config value is the single source of truth. The ASGI request
     boundary uses that same value plus multipart envelope room, so this route,
     ``/files/limits`` and an admin-edited limit cannot drift apart.
+
+    ``0`` is a real answer, not a failure: it means this deployment accepts no
+    workspace uploads at all, and saying so is the point of publishing the
+    number. A client that sizes its picker against ``/files/limits`` reports
+    "uploads unavailable" instead of offering a control whose every use ends in
+    a 413.
     """
     return max(0, get_workspace_upload_max_bytes())
 

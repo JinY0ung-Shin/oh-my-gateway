@@ -5,8 +5,10 @@ import pytest
 from src import concurrency_middleware
 from src.constants import MAX_REQUEST_SIZE, WORKSPACE_UPLOAD_MAX_BYTES
 from src.routes import terminal_files
+from src.routes import terminal_files as tf
 from src.runtime_config import (
     WORKSPACE_UPLOAD_MULTIPART_RESERVE,
+    get_workspace_upload_max_bytes,
     get_workspace_upload_request_max_bytes,
     runtime_config,
 )
@@ -89,3 +91,29 @@ def test_reset_restores_startup_workspace_upload_limit():
 
     assert runtime_config.get("workspace_upload_max_bytes") == WORKSPACE_UPLOAD_MAX_BYTES
     assert terminal_files._max_upload_bytes() == WORKSPACE_UPLOAD_MAX_BYTES
+
+
+def test_zero_limit_disables_uploads_and_is_published(monkeypatch):
+    """``0`` is a real answer: uploads off, and ``/files/limits`` says so.
+
+    A client sizes its picker against the published number, so a disabled
+    deployment must publish 0 rather than a value whose every use ends in a 413.
+    """
+    runtime_config.set("workspace_upload_max_bytes", 0)
+    try:
+        assert get_workspace_upload_max_bytes() == 0
+        assert tf._max_upload_bytes() == 0
+        # The raw request boundary still leaves envelope room so the rejection
+        # comes from the route with a file-shaped message, not a bare 413 on a
+        # body of zero bytes.
+        assert (
+            get_workspace_upload_request_max_bytes()
+            == WORKSPACE_UPLOAD_MULTIPART_RESERVE
+        )
+    finally:
+        runtime_config.reset_all()
+
+
+def test_negative_limit_is_rejected():
+    with pytest.raises(ValueError):
+        runtime_config.set("workspace_upload_max_bytes", -1)

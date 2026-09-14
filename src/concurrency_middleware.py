@@ -342,7 +342,7 @@ class ConcurrencyLimitMiddleware:
 
         # Fast reject a declared oversized body, then still count the actual
         # bytes for accepted declarations. This closes the chunked/no-CL bypass
-        # and also catches understated lengths.
+        # in RequestSizeLimitMiddleware and also catches understated lengths.
         headers = Headers(scope=scope)
         raw_length = headers.get("content-length")
         if raw_length is not None:
@@ -389,6 +389,8 @@ class ConcurrencyLimitMiddleware:
             return
 
         metrics.set_turns_in_flight(self.limiter.in_flight)
+        # Published on request.state so a handler that outlives the response
+        # (background mode) can take ownership; see take_turn_slot().
         state = scope.setdefault("state", {})
         state[SLOT_KEY] = slot
         state.pop(TRANSFERRED_KEY, None)
@@ -401,13 +403,23 @@ class ConcurrencyLimitMiddleware:
                 slot.release()
             state.pop(SLOT_KEY, None)
             metrics.set_turns_in_flight(self.limiter.in_flight)
+            # This middleware is one of the few places that observes a
+            # streaming response all the way to its final body chunk, so it
+            # is also where the true end-to-end duration becomes measurable.
             metrics.record_stream_duration(
                 path=scope.get("path", ""),
                 duration_seconds=time.monotonic() - started,
             )
 
     def _log_rejection(self, path: str, reason: str) -> None:
-        """Warn about a rejection at most once per window, with a suppressed count."""
+        """Warn about a rejection at most once per window, with a suppressed count.
+
+        Rejections short-circuit before the per-IP rate limiter, so the
+        limiter structurally cannot damp this: a client retrying against a
+        full gateway would otherwise write one WARNING per attempt and turn
+        an overload into a log flood. ``gateway_turns_rejected_total`` still
+        counts every single rejection exactly.
+        """
         global _last_warned, _suppressed
 
         now = time.monotonic()
@@ -453,6 +465,8 @@ class ConcurrencyLimitMiddleware:
 
         body, disconnected = await _buffer_body(receive)
         if disconnected is not None:
+            # Let the disconnect reach the app instead of replaying an empty
+            # body as if the client had sent one.
             return None, _replay_message(disconnected, receive)
 
         replayed = _replay(body, receive)

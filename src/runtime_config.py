@@ -105,7 +105,10 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "description": (
             "Maximum size of one file accepted by POST /files/upload. This is the "
             "single file-upload ceiling used by both request-boundary enforcement "
-            "and the workspace file route. Applies on the next upload request."
+            "and the workspace file route. Applies on the next upload request. "
+            "0 disables workspace uploads entirely: /files/limits then publishes 0 "
+            "so clients report 'uploads unavailable' instead of offering a control "
+            "whose every use ends in a 413."
         ),
     },
     "agent_teams_enabled": {
@@ -172,6 +175,8 @@ class RuntimeConfig:
 
     def get_all(self) -> Dict[str, Any]:
         """Return all editable keys with their current effective values."""
+        # Snapshot overrides once under a single lock, then compute everything
+        # from the snapshot without re-acquiring the lock per key.
         with self._lock:
             overrides = dict(self._overrides)
         result = {}
@@ -202,6 +207,8 @@ class RuntimeConfig:
             TOKEN_STREAMING,
         )
 
+        # Lazy import to avoid a circular dependency: sanitizer.config imports
+        # back from runtime_config to honor admin overrides.
         from src.sanitizer.config import _env_enabled as _sanitizer_env_enabled
 
         _map = {
@@ -213,9 +220,14 @@ class RuntimeConfig:
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
             "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
+            # Mirrors the CLI's own truthiness on the raw env string: any
+            # non-empty value activates the gate, including "0".
             "agent_teams_enabled": bool(
                 os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
             ),
+            # 0 = not set — the CLI picks its own window from the model.
+            # A junk value reads as 0 rather than crashing the config read;
+            # the CLI ignores junk the same way.
             "auto_compact_window": _int_env("CLAUDE_CODE_AUTO_COMPACT_WINDOW"),
         }
         return _map.get(key)
@@ -227,6 +239,8 @@ class RuntimeConfig:
         expected = meta["type"]
         if expected == "int":
             v = int(value)
+            # A per-key floor where 1 is meaningless — a 1-token compaction
+            # window would compact on every turn and lose the conversation.
             low = meta.get("min", 1)
             if v < low:
                 raise ValueError(f"{key} must be >= {low}, got {v}")
@@ -252,6 +266,10 @@ class RuntimeConfig:
             raise ValueError(f"{key} must be one of {options}, got {s!r}")
         return s
 
+
+# ---------------------------------------------------------------------------
+# Convenience getters — import these instead of raw constants
+# ---------------------------------------------------------------------------
 
 runtime_config = RuntimeConfig()
 
