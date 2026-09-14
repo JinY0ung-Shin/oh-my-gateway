@@ -220,13 +220,16 @@ def ensure_growth_fits(
     ``reclaimed_bytes`` is used for overwrite semantics: replacing a 10 MiB file
     with an 8 MiB file must still be allowed when the workspace is at its limit.
     It is clamped to current usage so a stale caller cannot manufacture negative
-    projected usage.
+    projected usage. When quota is disabled this fast-path does not walk the
+    filesystem, so the feature has no per-write scan cost unless configured.
     """
 
-    snapshot = quota_snapshot(user_root)
-    if not snapshot.enabled:
-        return snapshot
+    limit = workspace_quota_limit_bytes()
+    if limit <= 0:
+        return WorkspaceQuotaSnapshot(used_bytes=0, limit_bytes=0)
 
+    used = logical_size_bytes(user_root)
+    snapshot = WorkspaceQuotaSnapshot(used_bytes=used, limit_bytes=limit)
     reclaimed = min(snapshot.used_bytes, max(0, int(reclaimed_bytes)))
     added = max(0, int(added_bytes))
     projected = snapshot.used_bytes - reclaimed + added
