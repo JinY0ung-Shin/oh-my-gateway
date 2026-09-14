@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import src.workspace_quota as workspace_quota_module
 from src.workspace_quota import (
     WorkspaceQuotaConfigError,
     WorkspaceQuotaExceeded,
@@ -41,6 +42,27 @@ def test_logical_usage_spans_backend_directories(tmp_path: Path):
     (user_root / "codex" / "b.bin").write_bytes(b"b" * 13)
 
     assert logical_size_bytes(user_root) == 24
+
+
+def test_unreadable_subtree_is_skipped_instead_of_failing_usage(
+    tmp_path: Path, monkeypatch
+):
+    user_root = tmp_path / "alice"
+    blocked = user_root / "blocked"
+    blocked.mkdir(parents=True)
+    (user_root / "visible.bin").write_bytes(b"v" * 11)
+    (blocked / "hidden.bin").write_bytes(b"h" * 13)
+
+    real_scandir = workspace_quota_module.os.scandir
+
+    def guarded_scandir(path):
+        if Path(path) == blocked:
+            raise PermissionError("simulated unreadable workspace subtree")
+        return real_scandir(path)
+
+    monkeypatch.setattr(workspace_quota_module.os, "scandir", guarded_scandir)
+
+    assert logical_size_bytes(user_root) == 11
 
 
 def test_symlinks_are_not_followed(tmp_path: Path):
