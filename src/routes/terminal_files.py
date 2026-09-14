@@ -48,6 +48,9 @@ Config:
   listed nor accessible. Default **false**: hiding is a presentation choice that
   belongs to the client rendering the tree, and hiding them here also blocks
   writes to the workspace's agent-resource directories.
+- ``USER_WORKSPACE_QUOTA_MB`` — cumulative named-user quota across every backend
+  directory below ``<base>/<user>``. ``0``/unset means unlimited. This is a soft
+  gateway quota, not a filesystem project quota.
 
 Concurrency:
 - Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
@@ -55,6 +58,9 @@ Concurrency:
   continuously for every connected user; done synchronously that I/O would
   block the gateway event loop and stall everything else it serves
   (``/v1/responses`` streams, terminal websockets).
+- Quota-increasing file API mutations are serialized per user so two concurrent
+  uploads/copies cannot both pass the same preflight and exceed the configured
+  cumulative quota.
 
 Security:
 - ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
@@ -67,6 +73,7 @@ Security:
   ``~/.claude`` etc.).
 """
 
+import asyncio
 import ctypes
 import errno
 import hashlib
@@ -89,6 +96,13 @@ from pydantic import BaseModel
 from src.auth import auth_manager, security, verify_api_key
 from src.constants import MAX_REQUEST_SIZE, WORKSPACE_UPLOAD_MAX_BYTES
 from src.workspace_manager import workspace_manager
+from src.workspace_quota import (
+    WorkspaceQuotaExceeded,
+    copy_growth_bytes,
+    ensure_growth_fits,
+    quota_snapshot,
+    workspace_quota_limit_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +125,7 @@ class _MoveBody(BaseModel):
 class _ArchiveBody(BaseModel):
     paths: List[str]
 
+
 router = APIRouter(tags=["workspace-files"])
 
 _BACKEND = "claude"
@@ -130,6 +145,11 @@ _DEFAULT_USER_HEADER = "X-User-Email"
 # the wrapper — otherwise a file of exactly the advertised size is rejected and
 # the number we published is a lie.
 _MULTIPART_ENVELOPE_RESERVE = 8192
+
+# Per-process serialization is sufficient for the gateway's own file API. Agent
+# subprocesses do not acquire these locks, which is why USER_WORKSPACE_QUOTA_MB is
+# documented as a soft quota rather than an OS-level hard ceiling.
+_QUOTA_LOCKS: dict[str, asyncio.Lock] = {}
 
 
 def _max_upload_bytes() -> int:
@@ -217,6 +237,24 @@ def _workspace_root(user: str) -> Path:
         raise HTTPException(status_code=400, detail="invalid user identity")
 
 
+def _user_root(workspace_root: Path) -> Path:
+    """Named user's aggregate quota root (parent of the backend workspace)."""
+    return workspace_root.resolve().parent
+
+
+def _quota_lock(user_root: Path) -> asyncio.Lock:
+    key = str(user_root.resolve())
+    lock = _QUOTA_LOCKS.get(key)
+    if lock is None:
+        lock = asyncio.Lock()
+        _QUOTA_LOCKS[key] = lock
+    return lock
+
+
+def _raise_quota_http(exc: WorkspaceQuotaExceeded) -> None:
+    raise HTTPException(status_code=507, detail=exc.as_detail())
+
+
 def resolve_workspace_for_request(request: Request) -> Optional[Path]:
     """The caller's workspace directory, or ``None`` when it can't be keyed.
 
@@ -246,7 +284,7 @@ def _is_under(path: Path, base: Path) -> bool:
 def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
     """Resolve *rel* and confine it to *root*; ``None`` if it escapes the root.
 
-    ``Path.resolve()`` collapses ``..`` and follows symlinks, so an escape via
+    ``Path.resolve()`` collapses ``..`` and follows symlinks so an escape via
     either is caught by the containment check. This is containment only —
     dotfile hiding is applied separately so callers can distinguish "outside
     your workspace" (403) from "hidden/not found" (404).
@@ -262,14 +300,14 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
         return None
     p = rel or "/"
     if p in ("/", ""):
-        return root_resolved  # workspace root (virtual "/")
+        return root_resolved
     try:
         candidate = Path(p)
         if candidate.is_absolute():
             resolved = candidate.resolve()
             if not _is_under(resolved, root_resolved):
                 if _is_under(root_resolved, resolved):
-                    return None  # ancestor of the root -> above-workspace nav
+                    return None
                 resolved = (root_resolved / p.lstrip("/")).resolve()
         else:
             resolved = (root_resolved / p).resolve()
@@ -340,16 +378,26 @@ async def get_limits(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Publish the upload ceiling so clients can refuse a file before sending it.
-
-    Without this the limit is only discoverable by hitting it, and what comes
-    back is the request-boundary 413 — shaped for the responses API and phrased
-    in whole-request bytes, which no file manager can turn into "this file is
-    too big". A client that reads this number can say so before the upload.
-    """
+    """Publish static upload and cumulative workspace limits."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
-    return {"max_upload_bytes": _max_upload_bytes()}
+    return {
+        "max_upload_bytes": _max_upload_bytes(),
+        "workspace_quota_bytes": workspace_quota_limit_bytes(),
+    }
+
+
+@router.get("/files/quota")
+async def get_quota(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Current aggregate quota usage for the authenticated named user."""
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    snapshot = await run_in_threadpool(quota_snapshot, _user_root(root))
+    return snapshot.as_dict()
 
 
 @router.get("/files/cwd")
@@ -360,8 +408,6 @@ async def get_cwd(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    # Report the real workspace path so the explorer's breadcrumb matches the
-    # paths the agent uses (e.g. what MEMORY.md references).
     return {"cwd": str(root.resolve())}
 
 
@@ -380,9 +426,6 @@ async def list_files(
 
     hide_dot = _hide_dotfiles()
 
-    # Run the directory scan off the event loop: FileNav polls this endpoint
-    # continuously across all users, and a synchronous scandir would stall
-    # every other request (chat streams, terminal websockets) on the loop.
     def _scan() -> list:
         entries = []
         with os.scandir(target) as it:
@@ -390,7 +433,7 @@ async def list_files(
                 if hide_dot and entry.name.startswith("."):
                     continue
                 try:
-                    st = entry.stat()  # follow symlinks; broken links are skipped
+                    st = entry.stat()
                 except OSError:
                     continue
                 entries.append(
@@ -416,14 +459,7 @@ async def search_files(
     limit: int = 50,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Recursive filename search under the workspace root.
-
-    Case-insensitive substring match on entry names. Hidden entries follow
-    the same rule as listing (dot-prefixed components pruned while hiding is
-    on), symlinks are skipped like the archive walk, and results are capped
-    at ``limit`` (1-200) with a ``truncated`` flag. Name-prefix matches sort
-    before substring matches, shallower paths before deeper ones.
-    """
+    """Recursive filename search under the workspace root."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -435,11 +471,8 @@ async def search_files(
     limit = max(1, min(limit, 200))
 
     hide_dot = _hide_dotfiles()
-    _SCAN_CAP = 1000  # stop collecting beyond this many matches
+    _SCAN_CAP = 1000
 
-    # The recursive walk is the most expensive scan this router does — run it
-    # in the threadpool like the other filesystem work so it cannot stall the
-    # event loop.
     def _search() -> dict:
         matches: List[dict] = []
         scan_capped = False
@@ -498,21 +531,7 @@ async def file_digest(
     path: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Content identity for one file: equality of ``sha256`` means equal bytes.
-
-    ``modified``/``st_mtime`` cannot carry this, at any resolution. A timestamp
-    says when a write happened, not what the bytes are: filesystem granularity
-    can coalesce two writes, and a metadata-preserving writer can restore an old
-    value with ``os.utime``. A caller that pins a file's revision — ChatDRAGON
-    pins chat attachments so a later overwrite cannot be accepted as the evidence
-    an earlier turn read — needs equality to actually imply sameness, so it needs
-    the content.
-
-    This deliberately does NOT live on ``/files/list`` or ``/files/search``:
-    hashing every entry would make a directory listing cost the size of the
-    directory. It is asked for one file at a time, at the moment a caller pins
-    or re-checks that file.
-    """
+    """Content identity for one file: equality of ``sha256`` means equal bytes."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -523,7 +542,6 @@ async def file_digest(
     def _digest() -> tuple[str, int]:
         h = hashlib.sha256()
         size = 0
-        # Streamed: pinning a revision must not depend on the file fitting in memory.
         with target.open("rb") as fh:
             while chunk := fh.read(1024 * 1024):
                 h.update(chunk)
@@ -557,7 +575,6 @@ async def read_file(
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
-        # Binary: return raw bytes so FileNav renders a preview / placeholder.
         media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
         return Response(content=data, media_type=media)
 
@@ -587,16 +604,6 @@ async def serve_file(
     path: str,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Serve a file inline for in-browser preview.
-
-    FileNav previews HTML documents via ``<iframe src=".../files/serve/<path>">``
-    (path-based, unlike the query-based ``/files/view`` download endpoint) so
-    that relative references inside the document — ``./style.css``, images,
-    scripts — resolve to sibling files through this same route. The leading
-    slash of the absolute workspace path is consumed by the URL, so re-anchor
-    before resolving; confinement and dotfile hiding are the same as every
-    other endpoint.
-    """
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -606,11 +613,6 @@ async def serve_file(
 
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     return FileResponse(target, media_type=media, content_disposition_type="inline")
-
-
-# ---------------------------------------------------------------------------
-# Write operations (all confined to the workspace root by _resolve_or_403)
-# ---------------------------------------------------------------------------
 
 
 @router.post("/files/cwd")
@@ -637,14 +639,7 @@ async def upload_file(
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Write one uploaded file into the workspace.
-
-    Default keeps the historical contract: same name overwrites (this is how
-    "save" works through the proxy chain). ``no_clobber=true`` is the opt-in
-    for file managers dropping OS files: creation is O_EXCL, so a destination
-    appearing after the client's listing gets a 409 instead of being replaced
-    — same contract as ``/files/copy`` and move's ``no_clobber``.
-    """
+    """Write one uploaded file into the workspace."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -652,36 +647,51 @@ async def upload_file(
     if not dest_dir.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
 
-    # Reduce the client filename to a basename so it can't carry path segments.
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
     target = _resolve_or_403(root, f"{directory}/{name}")
 
     data = await file.read()
-    # Defence in depth against the request boundary, not a duplicate of it: the
-    # middleware caps the whole body under MAX_REQUEST_SIZE, while this bounds
-    # the file itself under its own limit. They are separate knobs, so an
-    # operator who raises the JSON cap does not silently widen what may be
-    # written into a workspace.
     ceiling = _max_upload_bytes()
     if len(data) > ceiling:
         raise HTTPException(
             status_code=413,
             detail=f"file exceeds the upload limit of {ceiling} bytes",
         )
-    if no_clobber:
 
-        def _write_exclusive() -> None:
-            with open(target, "xb") as f:
-                f.write(data)
-
+    user_root = _user_root(root)
+    async with _quota_lock(user_root):
+        reclaimed = 0
+        if not no_clobber:
+            try:
+                if target.is_file():
+                    reclaimed = target.stat().st_size
+            except OSError:
+                reclaimed = 0
         try:
-            await run_in_threadpool(_write_exclusive)
-        except FileExistsError:
-            raise HTTPException(status_code=409, detail="destination already exists")
-    else:
-        await run_in_threadpool(target.write_bytes, data)
+            await run_in_threadpool(
+                lambda: ensure_growth_fits(
+                    user_root,
+                    added_bytes=len(data),
+                    reclaimed_bytes=reclaimed,
+                )
+            )
+        except WorkspaceQuotaExceeded as exc:
+            _raise_quota_http(exc)
+
+        if no_clobber:
+
+            def _write_exclusive() -> None:
+                with open(target, "xb") as f:
+                    f.write(data)
+
+            try:
+                await run_in_threadpool(_write_exclusive)
+            except FileExistsError:
+                raise HTTPException(status_code=409, detail="destination already exists")
+        else:
+            await run_in_threadpool(target.write_bytes, data)
     return {"path": str(target), "size": len(data)}
 
 
@@ -716,7 +726,6 @@ async def delete_entry(
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
     is_dir = target.is_dir() and not target.is_symlink()
-    # rmtree over a large workspace subtree can take seconds — keep it off the loop.
     if is_dir:
         await run_in_threadpool(shutil.rmtree, target)
     else:
@@ -741,17 +750,9 @@ async def move_entry(
         raise HTTPException(status_code=404, detail="source not found")
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
-    # Same rule as copy: a directory cannot move into its own subtree. Without
-    # this, the user error surfaces as renameat2's EINVAL (mapped to 501) or
-    # shutil.Error (500) instead of a precise 400.
     if src.is_dir() and not src.is_symlink() and (dst == src or src in dst.parents):
         raise HTTPException(status_code=400, detail="cannot move a directory into itself")
     if body.no_clobber:
-        # No check-then-move: rename(2) replaces an existing destination by
-        # design, so only the kernel can enforce no-replace atomically.
-        # _rename_noreplace is renameat2(RENAME_NOREPLACE); when the primitive
-        # is unavailable we fail closed (501) instead of silently falling back
-        # to a replace-capable move.
         try:
             await run_in_threadpool(_rename_noreplace, src, dst)
         except NotImplementedError:
@@ -773,18 +774,11 @@ _AT_FDCWD = -100
 
 
 def _rename_noreplace(src: Path, dst: Path) -> None:
-    """Atomic no-replace rename via Linux ``renameat2(RENAME_NOREPLACE)``.
-
-    ``os.rename``/``shutil.move`` replace an existing destination by design,
-    so any exists-check followed by a move is a TOCTOU, however small the
-    window. Raises ``NotImplementedError`` when the primitive cannot give the
-    guarantee (missing symbol, unsupported filesystem, cross-device) — callers
-    must fail closed, never fall back to a replace-capable move.
-    """
+    """Atomic no-replace rename via Linux ``renameat2(RENAME_NOREPLACE)``."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
-    except (OSError, AttributeError) as exc:  # pragma: no cover — non-Linux
+    except (OSError, AttributeError) as exc:
         raise NotImplementedError("renameat2 unavailable") from exc
     ret = renameat2(
         ctypes.c_int(_AT_FDCWD),
@@ -805,22 +799,11 @@ class _UnsupportedSourceError(Exception):
 
 
 def _copy_file_exclusive(src: Path, dst: Path) -> None:
-    """Copy a REGULAR file, failing with ``FileExistsError`` if ``dst`` exists.
-
-    ``open(dst, "xb")`` (O_CREAT|O_EXCL) makes the no-clobber promise a
-    filesystem guarantee instead of a check-then-copy: a destination that
-    appears after validation loses the race to us or we lose it to them, but
-    nobody's file is overwritten either way.
-
-    The source is opened with ``O_NONBLOCK`` and validated via ``fstat`` on
-    the open fd: a plain ``open(src, "rb")`` on a FIFO would block the worker
-    until a writer appears (exhausting the shared threadpool), and checking
-    the type before opening would just be another TOCTOU.
-    """
+    """Copy a REGULAR file, failing with ``FileExistsError`` if ``dst`` exists."""
     try:
         fd = os.open(str(src), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
     except OSError as exc:
-        if exc.errno == errno.ENXIO:  # e.g. a socket file
+        if exc.errno == errno.ENXIO:
             raise _UnsupportedSourceError(str(src)) from exc
         raise
     try:
@@ -840,16 +823,7 @@ async def copy_entry(
     body: _MoveBody,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Duplicate a file or directory inside the workspace.
-
-    Unlike ``move``, the destination must not already exist: the file-manager
-    client resolves name conflicts itself (VS Code-style ``name copy.ext``), so
-    a collision reaching this endpoint is a race we refuse rather than resolve
-    by silently overwriting someone's file. The refusal is enforced at
-    creation time (O_EXCL for files, ``copytree``'s exclusive mkdir for
-    directories) — the early ``dst.exists()`` check below is only a fast path
-    for a clear error message.
-    """
+    """Duplicate a file or directory inside the workspace."""
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
@@ -864,42 +838,42 @@ async def copy_entry(
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
     is_dir = src.is_dir() and not src.is_symlink()
-    # Only regular files and directories are copyable — a FIFO/socket/device
-    # in the workspace must be a deterministic 4xx, not a blocked worker. This
-    # is a fast path for the error message; the race-proof check is the fstat
-    # on the opened fd inside _copy_file_exclusive.
     if not is_dir and not src.is_file():
         raise HTTPException(status_code=400, detail="unsupported file type")
-    try:
-        if is_dir:
-            # Copying a directory into its own subtree would recurse forever.
-            if dst == src or src in dst.parents:
-                raise HTTPException(
-                    status_code=400, detail="cannot copy a directory into itself"
+
+    user_root = _user_root(root)
+    async with _quota_lock(user_root):
+        added_bytes = await run_in_threadpool(copy_growth_bytes, src)
+        try:
+            await run_in_threadpool(
+                lambda: ensure_growth_fits(user_root, added_bytes=added_bytes)
+            )
+        except WorkspaceQuotaExceeded as exc:
+            _raise_quota_http(exc)
+
+        try:
+            if is_dir:
+                if dst == src or src in dst.parents:
+                    raise HTTPException(
+                        status_code=400, detail="cannot copy a directory into itself"
+                    )
+                await run_in_threadpool(
+                    shutil.copytree, str(src), str(dst), symlinks=True
                 )
-            # symlinks=True copies links as links instead of following them — a
-            # link inside the tree may point outside the workspace root, and
-            # following it here would duplicate foreign content into the
-            # workspace. dirs_exist_ok stays False, so copytree's own mkdir
-            # refuses a destination that appeared after validation.
-            await run_in_threadpool(shutil.copytree, str(src), str(dst), symlinks=True)
-        else:
-            await run_in_threadpool(_copy_file_exclusive, src, dst)
-    except FileExistsError:
-        raise HTTPException(status_code=409, detail="destination already exists")
-    except _UnsupportedSourceError:
-        raise HTTPException(status_code=400, detail="unsupported file type")
-    except shutil.SpecialFileError:
-        # copytree hit a named pipe inside the tree (shutil.copyfile refuses).
-        raise HTTPException(
-            status_code=400, detail="directory contains unsupported special files"
-        )
-    except shutil.Error:
-        # copytree's aggregate error — some entries could not be copied
-        # (special files, unreadable entries). Client-visible, not a 500.
-        raise HTTPException(
-            status_code=400, detail="directory contains entries that cannot be copied"
-        )
+            else:
+                await run_in_threadpool(_copy_file_exclusive, src, dst)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="destination already exists")
+        except _UnsupportedSourceError:
+            raise HTTPException(status_code=400, detail="unsupported file type")
+        except shutil.SpecialFileError:
+            raise HTTPException(
+                status_code=400, detail="directory contains unsupported special files"
+            )
+        except shutil.Error:
+            raise HTTPException(
+                status_code=400, detail="directory contains entries that cannot be copied"
+            )
     return {
         "source": body.source,
         "destination": body.destination,
@@ -928,15 +902,10 @@ async def archive_entries(
     hide_dot = _hide_dotfiles()
 
     def _is_hidden(p: Path) -> bool:
-        # Same rule as listing/_resolve_or_403: any dot-prefixed component
-        # relative to the workspace root is hidden. Keeps downloads consistent
-        # with the browser view — e.g. ``.claude`` never ends up in the zip.
         return hide_dot and any(
             part.startswith(".") for part in p.relative_to(root_resolved).parts
         )
 
-    # Walking the tree and deflating can take seconds on big workspaces — keep
-    # the whole zip build off the event loop.
     def _build_zip() -> bytes:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
