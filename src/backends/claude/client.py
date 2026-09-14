@@ -287,6 +287,22 @@ class UnsupportedContinuationPolicy(ValueError):
     """
 
 
+
+def _error_result_text(message: Any) -> str:
+    """Return the CLI's ``result`` text when ``message`` is an error result.
+
+    Works for both the SDK's ``ResultMessage`` object and the raw dict shape so
+    the verify probe can surface "API Error: 400 …" instead of the subtype.
+    """
+    if isinstance(message, dict):
+        if message.get("type") != "result" or not message.get("is_error"):
+            return ""
+        return str(message.get("result") or "")
+    if getattr(message, "is_error", False) and hasattr(message, "result"):
+        return str(getattr(message, "result", "") or "")
+    return ""
+
+
 class ClaudeCodeCLI(TokenEstimateMixin):
     """Gateway for Claude Agent SDK queries.
 
@@ -1101,6 +1117,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
             options = self._build_sdk_options(max_turns=1)
             messages = []
+            # The CLI's structured error text. The pinned SDK replaces the
+            # trailing ProcessError with "Claude Code returned an error result:
+            # <subtype>" — for an API failure that subtype is literally
+            # "success", so the only actionable text ("API Error: 400 …") lives
+            # in the result message we saw just before the crash. Keep it.
+            last_error_result = ""
             async for message in query(
                 prompt="Hello",
                 options=options,
@@ -1111,7 +1133,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
                 if msg_type == "assistant":
                     break
+                last_error_result = _error_result_text(message) or last_error_result
 
+            if last_error_result:
+                logger.error(
+                    "Claude Agent SDK verification failed: CLI reported an error "
+                    "result: %s",
+                    last_error_result,
+                )
+                return False
             if messages:
                 logger.info("Claude Agent SDK verified successfully")
                 return True
@@ -1120,7 +1150,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 return False
 
         except Exception as e:
-            logger.error(f"Claude Agent SDK verification failed: {e}")
+            detail = f"{e}"
+            if last_error_result and last_error_result not in detail:
+                detail = f"{detail} (CLI result: {last_error_result})"
+            logger.error(f"Claude Agent SDK verification failed: {detail}")
             logger.warning("Please ensure Claude Code is installed and authenticated:")
             logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
             logger.warning("  2. Set ANTHROPIC_AUTH_TOKEN environment variable")
