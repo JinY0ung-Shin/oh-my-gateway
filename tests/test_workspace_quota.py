@@ -91,7 +91,11 @@ def test_growth_over_limit_is_rejected_with_projection(tmp_path: Path, monkeypat
     assert exc.limit_bytes == 1024 * 1024
     assert exc.used_bytes == 900 * 1024
     assert exc.projected_bytes == 1100 * 1024
-    assert exc.as_detail()["error"] == "workspace_quota_exceeded"
+    error = exc.as_detail()["error"]
+    assert error["code"] == "workspace_quota_exceeded"
+    assert error["type"] == "insufficient_storage"
+    assert error["used_bytes"] == 900 * 1024
+    assert error["projected_bytes"] == 1100 * 1024
 
 
 def test_snapshot_reports_remaining_and_overage(tmp_path: Path, monkeypatch):
