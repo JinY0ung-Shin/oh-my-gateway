@@ -30,6 +30,12 @@ logger = logging.getLogger(__name__)
 _USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,126}$")
 _BACKEND_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
+# Every known backend owns its default directory name.  Keep these names reserved
+# even when a backend is disabled: workspaces persist across configuration changes,
+# and allowing Claude to claim (for example) ``codex`` today would make a later
+# ``BACKENDS=claude,codex`` deployment silently merge two backend workspaces.
+_BACKEND_WORKSPACE_NAMES = frozenset({"claude", "opencode", "codex"})
+
 
 def _legacy_localpart_key_enabled() -> bool:
     """Whether all named workspace consumers should use the pre-fix localpart key.
@@ -171,7 +177,7 @@ class WorkspaceManager:
         ``CLAUDE_WORKSPACE_DIR`` therefore aliases only the on-disk directory used
         by the ``claude`` backend. Empty/unset values preserve the default name.
         The override is validated with the same single-component rules as backend
-        names so it cannot introduce path traversal or separators.
+        names and may not claim another backend's reserved workspace name.
         """
         if backend != "claude":
             return backend
@@ -181,12 +187,19 @@ class WorkspaceManager:
             return backend
 
         try:
-            return self._sanitize_backend(override)
+            workspace_dir = self._sanitize_backend(override)
         except ValueError as exc:
             raise ValueError(
                 f"Invalid CLAUDE_WORKSPACE_DIR: {override!r}. "
                 "Must match ^[a-z][a-z0-9_-]{0,31}$"
             ) from exc
+
+        if workspace_dir != backend and workspace_dir in _BACKEND_WORKSPACE_NAMES:
+            raise ValueError(
+                f"Invalid CLAUDE_WORKSPACE_DIR: {override!r} collides with the "
+                f"{workspace_dir!r} backend workspace directory"
+            )
+        return workspace_dir
 
 
 # ---------------------------------------------------------------------------
