@@ -1,5 +1,6 @@
 """Quota-specific coverage for the Claude PreToolUse workspace policy hook."""
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,47 @@ async def test_edit_projected_growth_is_denied(managed_workspace):
     )
 
     assert _is_deny(result)
+
+
+async def test_concurrent_same_user_hooks_are_best_effort_and_recovery_denies_growth(
+    managed_workspace,
+):
+    """PreToolUse checks do not reserve bytes across concurrent Claude sessions.
+
+    Both sessions can observe the same pre-write snapshot and independently fit.
+    That race is an intentional soft-quota limitation. Once the overrun exists,
+    later deterministic growth must be denied until usage is reduced.
+    """
+
+    (managed_workspace / "existing.bin").write_bytes(b"x" * (600 * 1024))
+    hook_a = sandbox.make_workspace_sandbox_hook(managed_workspace)
+    hook_b = sandbox.make_workspace_sandbox_hook(managed_workspace)
+    target_a = managed_workspace / "a.txt"
+    target_b = managed_workspace / "b.txt"
+    content = "y" * (300 * 1024)
+
+    result_a, result_b = await asyncio.gather(
+        _call(hook_a, "Write", {"file_path": str(target_a), "content": content}),
+        _call(hook_b, "Write", {"file_path": str(target_b), "content": content}),
+    )
+
+    # Each proposed write fits against the shared 600 KiB pre-write snapshot,
+    # so both PreToolUse checks can allow before either Claude tool commits.
+    assert result_a == {}
+    assert result_b == {}
+
+    target_a.write_text(content)
+    target_b.write_text(content)
+    assert sum(p.stat().st_size for p in managed_workspace.iterdir()) > _MIB
+
+    follow_up = await _call(
+        hook_a,
+        "Write",
+        {"file_path": str(managed_workspace / "c.txt"), "content": "z"},
+    )
+    assert _is_deny(follow_up)
+    reason = follow_up["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "Workspace quota exceeded" in reason
 
 
 async def test_bash_remains_best_effort_in_quota_only_mode(managed_workspace):
