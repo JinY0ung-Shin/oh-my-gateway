@@ -1026,6 +1026,29 @@ def _embedded_tool_events(
     return events
 
 
+def _without_blank_reasoning(items: list) -> list:
+    """Drop reasoning items whose summary AND content never got any text.
+
+    The stream must open a reasoning item as soon as the first thinking block
+    starts (the client renders it live), so a block whose text never
+    materialises — redacted/summarised reasoning, or a provider that reports
+    thinking tokens without text — still leaves an ``output_item.added/done``
+    pair on the wire.  The terminal ``response.completed/incomplete.output``
+    is the durable record OpenAI-shaped clients store, so mirror the
+    non-stream path (``_build_completed_response``) and keep it free of empty
+    reasoning items (#198).
+    """
+    kept = []
+    for item in items:
+        if getattr(item, "type", None) == "reasoning":
+            texts = [getattr(s, "text", "") for s in (getattr(item, "summary", None) or [])]
+            texts += [getattr(c, "text", "") for c in (getattr(item, "content", None) or [])]
+            if not any((t or "").strip() for t in texts):
+                continue
+        kept.append(item)
+    return kept
+
+
 async def stream_response_chunks(
     chunk_source,
     model: str,
@@ -1387,7 +1410,7 @@ async def stream_response_chunks(
                     id=response_id,
                     model=model,
                     status="incomplete",
-                    output=list(completed_output_items),
+                    output=_without_blank_reasoning(completed_output_items),
                     usage=ResponseUsage(
                         input_tokens=prompt_tokens,
                         output_tokens=completion_tokens,
@@ -1433,7 +1456,7 @@ async def stream_response_chunks(
                     id=response_id,
                     model=model,
                     status="incomplete",
-                    output=list(completed_output_items),
+                    output=_without_blank_reasoning(completed_output_items),
                     usage=ResponseUsage(
                         input_tokens=prompt_tokens,
                         output_tokens=completion_tokens,
@@ -1874,7 +1897,7 @@ async def stream_response_chunks(
         id=response_id,
         model=model,
         status="completed",
-        output=list(completed_output_items),
+        output=_without_blank_reasoning(completed_output_items),
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
