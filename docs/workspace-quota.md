@@ -21,11 +21,13 @@ The quota bucket is the user root, `<USER_WORKSPACES_DIR>/<user>/`, not a backen
 
 Usage counts regular-file payload bytes recursively. Symlinks are not followed, special files do not contribute payload bytes, and hard-linked files are counted once by inode for current usage. Directory/file copies account for the bytes the copy would materialize at the destination.
 
+Quota accounting is fail-closed. An entry or directory that concurrently disappears (`ENOENT`/`ENOTDIR`) is skipped because it no longer contributes current storage, but permission failures and unexpected filesystem/I/O errors are never treated as zero bytes. If usage cannot be measured safely, quota-dependent HTTP routes return `503 Service Unavailable` with error code `workspace_quota_accounting_unavailable` rather than under-counting the workspace.
+
 ## File API behavior
 
-`GET /files/limits` exposes both `max_upload_bytes` and `workspace_quota_bytes`. `GET /files/quota` exposes current `used_bytes`, `limit_bytes`, `remaining_bytes`, `enabled`, and `over_quota` for the caller.
+`GET /files/limits` exposes both `max_upload_bytes` and `workspace_quota_bytes`. `GET /files/quota` exposes current `used_bytes`, `limit_bytes`, `remaining_bytes`, `enabled`, and `over_quota` for the caller. If the usage scan is incomplete because of an unreadable or failed subtree, `/files/quota` returns the same `503 workspace_quota_accounting_unavailable` response instead of publishing a misleading partial total.
 
-Quota-growing `POST /files/upload` and `POST /files/copy` operations are preflighted. Within one gateway process, the file API serializes its own quota-growing operations per user so the usage check and upload/copy mutation share one accounting critical section. An operation whose projected usage exceeds the quota returns HTTP `507 Insufficient Storage` with error code `workspace_quota_exceeded`. Overwriting a file with a smaller replacement is allowed even when the workspace is already at its limit.
+Quota-growing `POST /files/upload` and `POST /files/copy` operations are preflighted. Within one gateway process, the file API serializes its own quota-growing operations per user so the usage check and upload/copy mutation share one accounting critical section. An operation whose projected usage exceeds the quota returns HTTP `507 Insufficient Storage` with error code `workspace_quota_exceeded`. If quota accounting itself fails, the operation returns HTTP `503` and performs no write/copy. Overwriting a file with a smaller replacement is allowed even when the workspace is already at its limit.
 
 This serialization only covers mutations that enter through the file API. A simultaneous Claude tool, shell command, direct filesystem writer, or another gateway process can still change the same user root while a file API operation is in flight; the quota remains application-level rather than a filesystem transaction.
 
