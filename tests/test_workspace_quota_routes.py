@@ -100,6 +100,26 @@ def test_upload_over_user_quota_is_507_and_does_not_write(quota_client, monkeypa
     assert not (workspace / "too-much.bin").exists()
 
 
+def test_no_clobber_existing_destination_stays_409_even_when_quota_is_full(
+    quota_client, monkeypatch
+):
+    client, _, workspace = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    target = workspace / "existing.bin"
+    original = b"x" * _MIB
+    target.write_bytes(original)
+
+    response = client.post(
+        "/files/upload?directory=/&no_clobber=true",
+        headers={**_AUTH, **_USER},
+        files={"file": ("existing.bin", b"replacement", "application/octet-stream")},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "destination already exists"
+    assert target.read_bytes() == original
+
+
 def test_overwrite_that_shrinks_is_allowed_at_quota(quota_client, monkeypatch):
     client, _, workspace = quota_client
     monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
