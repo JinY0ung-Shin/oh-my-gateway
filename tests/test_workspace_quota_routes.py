@@ -91,11 +91,12 @@ def test_upload_over_user_quota_is_507_and_does_not_write(quota_client, monkeypa
     )
 
     assert response.status_code == 507
-    detail = response.json()["detail"]
-    assert detail["error"] == "workspace_quota_exceeded"
-    assert detail["used_bytes"] == 900 * 1024
-    assert detail["limit_bytes"] == _MIB
-    assert detail["projected_bytes"] == 1100 * 1024
+    error = response.json()["detail"]["error"]
+    assert error["code"] == "workspace_quota_exceeded"
+    assert error["type"] == "insufficient_storage"
+    assert error["used_bytes"] == 900 * 1024
+    assert error["limit_bytes"] == _MIB
+    assert error["projected_bytes"] == 1100 * 1024
     assert not (workspace / "too-much.bin").exists()
 
 
