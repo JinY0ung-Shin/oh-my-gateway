@@ -742,6 +742,13 @@ async def upload_file(
 
     user_root = _user_root(root)
     async with _quota_lock(user_root):
+        if no_clobber and target.exists():
+            # Preserve the historical conflict contract before quota accounting:
+            # an already-existing destination is a 409, not a quota-dependent 507.
+            # O_EXCL in _write_uploaded_file remains the race-proof final check if
+            # the destination appears after this fast path.
+            raise HTTPException(status_code=409, detail="destination already exists")
+
         reclaimed = 0
         if not no_clobber:
             try:
