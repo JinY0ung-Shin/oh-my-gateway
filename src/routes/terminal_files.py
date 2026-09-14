@@ -57,9 +57,9 @@ Concurrency:
   (``/v1/responses`` streams, terminal websockets).
 
 Security:
-- ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
-  these endpoints would expose every user's files unauthenticated, so we fail
-  closed here.
+- Gateway API authentication (``API_KEY`` or ``USER_API_KEYS``) MUST be configured;
+  otherwise ``verify_api_key`` is a no-op and these endpoints would expose every
+  user's files unauthenticated, so we fail closed here.
 - Every path (read AND write) is confined to the single workspace root via
   ``_resolve_or_403`` (``Path.resolve()`` collapses ``..`` and resolves symlinks
   before the containment check); anything above/outside the root is a 403.
@@ -144,23 +144,24 @@ def _hide_dotfiles() -> bool:
 
     Defaults to **false**: hiding dotfiles protects nothing here — the agent
     itself reads and writes them freely through Bash/Read within the same
-    workspace, and the real guards are ``API_KEY`` plus root confinement. What it
-    *did* do was make the workspace's agent-resource directories unreachable over
-    ``/files/*`` (a 404 on any dot-prefixed component, including writes), which
-    silently breaks clients that install skills/subagents through this API. Hiding
-    is presentation, so it belongs to the client that renders the tree — see the
-    Finder-style "show hidden items" toggle in ChatDRAGON's files panel. Set this
-    to ``true`` to restore server-side hiding for a deployment that wants it.
+    workspace, and the real guards are gateway API auth plus root confinement.
+    What it *did* do was make the workspace's agent-resource directories
+    unreachable over ``/files/*`` (a 404 on any dot-prefixed component,
+    including writes), which silently breaks clients that install skills/subagents
+    through this API. Hiding is presentation, so it belongs to the client that
+    renders the tree — see the Finder-style "show hidden items" toggle in
+    ChatDRAGON's files panel. Set this to ``true`` to restore server-side hiding
+    for a deployment that wants it.
     """
     return os.getenv("WORKSPACE_HIDE_DOTFILES", "false").strip().lower() == "true"
 
 
 def _ensure_api_key() -> None:
-    """Fail closed unless an API key is configured (verify_api_key no-ops without one)."""
-    if not auth_manager.get_api_key():
+    """Fail closed unless gateway API auth is configured."""
+    if not auth_manager.has_api_auth():
         raise HTTPException(
             status_code=503,
-            detail="workspace file browser is disabled: API_KEY is not configured",
+            detail="workspace file browser is disabled: gateway API auth is not configured",
         )
 
 
