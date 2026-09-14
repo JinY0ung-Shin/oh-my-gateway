@@ -52,7 +52,16 @@ def test_invalid_claude_workspace_dir_override_is_rejected(tmp_path, monkeypatch
         manager.resolve("alice", backend="claude")
 
 
-@pytest.mark.parametrize("value", ["codex", "opencode"])
+# tests/conftest.py deselects stale-backend tests by matching "codex"/"opencode"
+# in the pytest node id. Keep those backend names out of parameter ids so these
+# workspace-isolation regressions remain part of the default test/CI run.
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param("codex", id="other_backend_a"),
+        pytest.param("opencode", id="other_backend_b"),
+    ],
+)
 def test_claude_workspace_dir_cannot_collide_with_other_backend(tmp_path, monkeypatch, value):
     manager = WorkspaceManager(base_path=tmp_path / "workspaces")
     monkeypatch.setenv("CLAUDE_WORKSPACE_DIR", value)
