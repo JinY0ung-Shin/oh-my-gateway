@@ -84,6 +84,8 @@ import os
 import shutil
 import stat as stat_module
 import zipfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -149,7 +151,22 @@ _MULTIPART_ENVELOPE_RESERVE = 8192
 
 # Per-process serialization for quota-increasing file API mutations. This does
 # not turn the application quota into an OS/filesystem hard quota.
-_QUOTA_LOCKS: dict[str, asyncio.Lock] = {}
+#
+# Entries are reference-counted rather than cached: a gateway serves an unbounded
+# set of named users over its lifetime, so a plain dict keyed by user root only
+# ever grows. Counting is exact instead of policy-based (LRU, TTL) because the
+# only unsafe eviction is removing a lock someone still holds or awaits, and a
+# refcount answers that question directly — no tuning, and no window where two
+# callers hold different lock objects for the same user.
+_QUOTA_LOCKS: dict[str, "_QuotaLockEntry"] = {}
+
+
+@dataclass
+class _QuotaLockEntry:
+    """One user's mutation lock plus the number of callers holding or awaiting it."""
+
+    lock: asyncio.Lock
+    users: int = 0
 
 # Fail closed when the quota scope cannot be determined: charging a user for a
 # root we cannot identify is worse than refusing the quota-dependent call.
@@ -274,13 +291,32 @@ def _user_root(workspace_root: Path) -> Path:
     return resolved.parent
 
 
-def _quota_lock(user_root: Path) -> asyncio.Lock:
+@asynccontextmanager
+async def _quota_lock(user_root: Path):
+    """Hold this user's quota-mutation lock, dropping the entry when idle.
+
+    The reference count is taken **before** awaiting the lock, so a second
+    caller arriving while the first holds it finds the same entry and shares the
+    same lock — the entry can only be removed once nobody is inside or waiting.
+    Everything here runs on one event loop and no ``await`` sits between the
+    lookup and the increment, so the count cannot be observed mid-update.
+    """
     key = str(user_root.resolve())
-    lock = _QUOTA_LOCKS.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _QUOTA_LOCKS[key] = lock
-    return lock
+    entry = _QUOTA_LOCKS.get(key)
+    if entry is None:
+        entry = _QuotaLockEntry(lock=asyncio.Lock())
+        _QUOTA_LOCKS[key] = entry
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        # The identity check matters if a test (or a future caller) cleared the
+        # registry while this request was in flight: dropping a newer entry that
+        # other callers are already sharing would split the lock in two.
+        if entry.users <= 0 and _QUOTA_LOCKS.get(key) is entry:
+            del _QUOTA_LOCKS[key]
 
 
 def _raise_quota_http(exc: WorkspaceQuotaExceeded) -> None:

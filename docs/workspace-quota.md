@@ -31,6 +31,8 @@ When the quota is disabled, `/files/quota` answers from configuration alone (`en
 
 The quota scope is always the named user's `<base>/<user>` directory, validated rather than assumed: a workspace path that is not exactly one user directory plus one backend directory below the managed base — or that belongs to an anonymous `_tmp_*` workspace — fails closed with `503 workspace_quota_accounting_unavailable` rather than charging usage against a root the gateway cannot identify.
 
+The per-user mutation lock is reference-counted rather than cached: a gateway serves an unbounded set of named users over its lifetime, so an entry is dropped as soon as no caller holds or awaits it. Counting is exact rather than policy-based (LRU/TTL) because the only unsafe eviction is removing a lock someone is still using, and a refcount answers that directly.
+
 Quota-growing `POST /files/upload` and `POST /files/copy` operations are preflighted. Within one gateway process, the file API serializes its own quota-growing operations per user so the usage check and upload/copy mutation share one accounting critical section. An operation whose projected usage exceeds the quota returns HTTP `507 Insufficient Storage` with error code `workspace_quota_exceeded`. If quota accounting itself fails, the operation returns HTTP `503` and performs no write/copy. Overwriting a file with a smaller replacement is allowed even when the workspace is already at its limit.
 
 This serialization only covers mutations that enter through the file API. A simultaneous Claude tool, shell command, direct filesystem writer, or another gateway process can still change the same user root while a file API operation is in flight; the quota remains application-level rather than a filesystem transaction.

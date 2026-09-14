@@ -1,5 +1,6 @@
 """Integration coverage for cumulative per-user workspace quota file routes."""
 
+import asyncio
 import errno
 import os
 from pathlib import Path
@@ -366,3 +367,65 @@ def test_quota_scope_rejects_anonymous_temp_workspaces(quota_client, monkeypatch
         response.json()["detail"]["error"]["code"]
         == "workspace_quota_accounting_unavailable"
     )
+
+
+def test_quota_locks_do_not_accumulate_per_user(quota_client, monkeypatch):
+    """The lock registry must not grow for the lifetime of the process.
+
+    A gateway serves an unbounded set of named users, so a plain cache keyed by
+    user root only ever grows. Entries are reference-counted, so once a request
+    finishes nothing is left behind.
+    """
+    client, _, _ = quota_client
+    monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "1")
+    assert tf._QUOTA_LOCKS == {}
+
+    for index in range(5):
+        response = client.post(
+            "/files/upload?directory=/",
+            headers={**_AUTH, **_USER},
+            files={"file": (f"lock-{index}.txt", b"x", "text/plain")},
+        )
+        assert response.status_code == 200
+
+    assert tf._QUOTA_LOCKS == {}, f"lock registry leaked entries: {tf._QUOTA_LOCKS}"
+
+
+async def test_concurrent_same_user_mutations_share_one_lock(tmp_path, monkeypatch):
+    """Reference counting must not split one user's lock into two.
+
+    The count is taken before awaiting, so a second caller arriving while the
+    first holds the lock joins the same entry instead of creating a fresh one
+    and running concurrently.
+    """
+    monkeypatch.setattr(tf.workspace_manager, "base_path", tmp_path)
+    tf._QUOTA_LOCKS.clear()
+    user_root = tmp_path / "alice@corp.com"
+    (user_root / "claude").mkdir(parents=True)
+
+    started = asyncio.Event()
+    overlapped = False
+    inside = 0
+
+    async def hold(delay: float) -> None:
+        nonlocal overlapped, inside
+        async with tf._quota_lock(user_root):
+            inside += 1
+            if inside > 1:
+                overlapped = True
+            started.set()
+            await asyncio.sleep(delay)
+            inside -= 1
+
+    first = asyncio.create_task(hold(0.05))
+    await started.wait()
+    # While the first holds it, a second caller must find the same entry.
+    second = asyncio.create_task(hold(0.0))
+    await asyncio.sleep(0)
+    assert len(tf._QUOTA_LOCKS) == 1
+    assert tf._QUOTA_LOCKS[str(user_root.resolve())].users == 2
+
+    await asyncio.gather(first, second)
+
+    assert overlapped is False, "same-user quota mutations ran concurrently"
+    assert tf._QUOTA_LOCKS == {}, "entry survived after both callers finished"
