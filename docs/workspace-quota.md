@@ -25,12 +25,14 @@ Usage counts regular-file payload bytes recursively. Symlinks are not followed, 
 
 `GET /files/limits` exposes both `max_upload_bytes` and `workspace_quota_bytes`. `GET /files/quota` exposes current `used_bytes`, `limit_bytes`, `remaining_bytes`, `enabled`, and `over_quota` for the caller.
 
-Quota-growing `POST /files/upload` and `POST /files/copy` operations are preflighted. An operation whose projected usage exceeds the quota returns HTTP `507 Insufficient Storage` with error code `workspace_quota_exceeded`. Overwriting a file with a smaller replacement is allowed even when the workspace is already at its limit.
+Quota-growing `POST /files/upload` and `POST /files/copy` operations are preflighted. Within one gateway process, the file API serializes its own quota-growing operations per user so the usage check and upload/copy mutation share one accounting critical section. An operation whose projected usage exceeds the quota returns HTTP `507 Insufficient Storage` with error code `workspace_quota_exceeded`. Overwriting a file with a smaller replacement is allowed even when the workspace is already at its limit.
 
 When the cumulative quota is disabled, the upload/copy path does not scan workspace usage or acquire quota locks; existing behavior and cost remain unchanged.
 
 ## Claude agent writes
 
-When the quota is enabled, the existing Claude `PreToolUse` hook transport is also installed for deterministic workspace writes. `Write`, `Edit`, and `MultiEdit` are preflighted against projected final size. Enabling the quota does **not** implicitly enable `WORKSPACE_SANDBOX_ENABLED`; path-boundary policy remains a separate setting.
+When the quota is enabled, the existing Claude `PreToolUse` hook transport is also installed for workspace writes whose projected final size can be estimated. `Write`, `Edit`, and `MultiEdit` receive a **best-effort projected-size preflight**. Enabling the quota does **not** implicitly enable `WORKSPACE_SANDBOX_ENABLED`; path-boundary policy remains a separate setting.
 
-Arbitrary Bash commands and other opaque subprocess behavior cannot be predicted exactly, so this remains a **soft application quota**. The file API serializes quota-growing operations per user within one gateway process, but multiple gateway worker processes or direct filesystem writers can still race past the threshold. Deployments that require an unbreakable byte ceiling should enforce an OS/filesystem project quota in addition to this setting.
+The Claude hook does **not** reserve bytes between `PreToolUse` approval and the later tool execution. Consequently, two concurrent sessions for the same named user can both inspect the same pre-write usage, each independently fit, and then together push the workspace above the configured limit. Multiple gateway processes introduce the same class of race. Once the workspace is over quota, subsequent deterministic growth is denied by later preflight checks until usage is reduced; shrinking replacements remain allowed when their projected result fits.
+
+Arbitrary Bash commands, direct filesystem writers, and other opaque subprocess behavior are also outside a transactional accounting boundary. `USER_WORKSPACE_QUOTA_MB` is therefore a **soft application quota**, not a hard storage ceiling. Deployments that require an unbreakable byte ceiling or cross-process reservation semantics should enforce an OS/filesystem project quota in addition to this setting.
