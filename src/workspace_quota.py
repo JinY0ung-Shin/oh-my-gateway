@@ -5,12 +5,13 @@ one backend directory, so changing Claude's on-disk alias or enabling another
 backend cannot create a fresh bucket. Usage is logical regular-file bytes across
 all backend directories below that root.
 
-This is a gateway-level *soft* quota, not a filesystem project quota. Gateway
-write paths can preflight mutations exactly, while an arbitrary subprocess (most
-notably Claude's Bash tool) can still grow the workspace between checks. Agent
-hooks use the same accounting to refuse deterministic writes and to surface an
-over-quota state; deployments that need an unbreakable byte ceiling should use a
-filesystem quota in addition to this policy.
+This is a gateway-level *soft* quota, not a filesystem project quota. File-API
+upload/copy paths can preflight mutations inside their process-local quota lock.
+Agent hooks use the same accounting for best-effort projected-size checks, but do
+not reserve bytes between hook approval and the later tool commit, so concurrent
+sessions or direct subprocess writers can race past the threshold. Deployments
+that need an unbreakable byte ceiling should use a filesystem quota in addition
+to this policy.
 """
 
 from __future__ import annotations
@@ -140,7 +141,7 @@ def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
                 for entry in entries:
                     try:
                         st = entry.stat(follow_symlinks=False)
-                    except (FileNotFoundError, PermissionError, OSError):
+                    except OSError:
                         # Workspaces can mutate concurrently (agent + file UI).
                         # A disappearing/unreadable entry should not turn a usage
                         # query into a 500; the next scan observes the new state.
@@ -152,7 +153,11 @@ def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
                         stack.append(Path(entry.path))
                     elif stat.S_ISREG(mode):
                         yield st
-        except (FileNotFoundError, NotADirectoryError):
+        except OSError:
+            # A child directory can disappear or become unreadable after its
+            # parent was scanned (for example via Bash chmod/rm). Quota usage is
+            # intentionally best-effort under concurrent filesystem mutation;
+            # skip that subtree instead of turning /files/quota and writes into 500s.
             continue
 
 
