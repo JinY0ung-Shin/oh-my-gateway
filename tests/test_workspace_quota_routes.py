@@ -2,7 +2,6 @@
 
 import asyncio
 import errno
-import os
 from pathlib import Path
 
 import pytest
@@ -274,25 +273,17 @@ def test_quota_unset_keeps_existing_upload_behavior(quota_client, monkeypatch):
     assert (workspace / "normal.txt").read_bytes() == b"ok"
 
 
-def test_quota_endpoint_does_not_walk_the_tree_when_disabled(quota_client, monkeypatch):
-    """A disabled quota must not make /files/quota the priciest call in the API.
+def test_quota_endpoint_reports_live_usage_even_when_disabled(quota_client, monkeypatch):
+    """Usage is measured with or without a limit.
 
-    The walk is O(files) and holds a shared threadpool worker, so polling a
-    figure that is meaningless while the feature is off would let one client
-    starve real file I/O.
+    "How much am I using?" is a real question when nothing is enforced, and the
+    endpoint promises a live figure. Returning 0 to skip the walk would publish a
+    number that is simply wrong — the same class of misleading total the
+    fail-closed accounting path exists to prevent.
     """
     client, _, workspace = quota_client
     monkeypatch.delenv("USER_WORKSPACE_QUOTA_MB", raising=False)
     (workspace / "payload.bin").write_bytes(b"x" * 4096)
-
-    scans = []
-    real_scandir = os.scandir
-
-    def counting_scandir(path):
-        scans.append(str(path))
-        return real_scandir(path)
-
-    monkeypatch.setattr(workspace_quota_module.os, "scandir", counting_scandir)
 
     response = client.get("/files/quota", headers={**_AUTH, **_USER})
 
@@ -302,7 +293,7 @@ def test_quota_endpoint_does_not_walk_the_tree_when_disabled(quota_client, monke
     assert body["limit_bytes"] == 0
     assert body["remaining_bytes"] is None
     assert body["over_quota"] is False
-    assert scans == [], f"disabled quota still scanned the workspace: {scans}"
+    assert body["used_bytes"] == 4096, "disabled quota must still report live usage"
 
 
 def test_quota_endpoint_still_reports_usage_when_enabled(quota_client, monkeypatch):

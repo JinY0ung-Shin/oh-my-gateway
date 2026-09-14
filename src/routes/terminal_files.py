@@ -100,7 +100,6 @@ from src.constants import MAX_REQUEST_SIZE, WORKSPACE_UPLOAD_MAX_BYTES
 from src.workspace_manager import workspace_manager
 from src.workspace_quota import (
     WorkspaceQuotaExceeded,
-    WorkspaceQuotaSnapshot,
     copy_growth_bytes,
     ensure_growth_fits,
     quota_snapshot,
@@ -462,19 +461,15 @@ async def get_quota(
 ):
     """Return current aggregate quota usage for the authenticated named user.
 
-    When quota is disabled this answers from configuration alone. Walking the
-    tree anyway would make a disabled feature the most expensive endpoint in the
-    file API: every call is O(files in the workspace) and holds a threadpool
-    worker that the rest of the file routes share, so a client polling a usage
-    figure that is definitionally meaningless could starve real file I/O. The
-    same "no scan unless configured" rule already governs upload/copy.
+    Usage is measured even when no limit is configured. "How much am I using?"
+    is a real question without an enforced ceiling, and a client that renders a
+    workspace needs the answer either way; reporting 0 to save a scan would
+    publish a number that is simply wrong. The "no scan unless configured" rule
+    belongs to the mutation paths (upload/copy), where the walk buys nothing.
     """
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    limit = workspace_quota_limit_bytes()
-    if limit <= 0:
-        return WorkspaceQuotaSnapshot(used_bytes=0, limit_bytes=0).as_dict()
     snapshot = await run_in_threadpool(quota_snapshot, _user_root(root))
     return snapshot.as_dict()
 
