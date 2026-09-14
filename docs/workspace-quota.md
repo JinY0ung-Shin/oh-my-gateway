@@ -27,6 +27,8 @@ Usage counts regular-file payload bytes recursively. Symlinks are not followed, 
 
 Quota-growing `POST /files/upload` and `POST /files/copy` operations are preflighted. Within one gateway process, the file API serializes its own quota-growing operations per user so the usage check and upload/copy mutation share one accounting critical section. An operation whose projected usage exceeds the quota returns HTTP `507 Insufficient Storage` with error code `workspace_quota_exceeded`. Overwriting a file with a smaller replacement is allowed even when the workspace is already at its limit.
 
+This serialization only covers mutations that enter through the file API. A simultaneous Claude tool, shell command, direct filesystem writer, or another gateway process can still change the same user root while a file API operation is in flight; the quota remains application-level rather than a filesystem transaction.
+
 When the cumulative quota is disabled, the upload/copy path does not scan workspace usage or acquire quota locks; existing behavior and cost remain unchanged.
 
 ## Claude agent writes
