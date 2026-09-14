@@ -657,7 +657,7 @@ async def upload_file(
     # this final check measures the actual file bytes, so boundary and route
     # cannot disagree about the operator-configured limit.
     ceiling = _max_upload_bytes()
-    if len(data) > ceiling:
+    if ceiling == 0 or len(data) > ceiling:
         raise HTTPException(
             status_code=413,
             detail=f"file exceeds the upload limit of {ceiling} bytes",
