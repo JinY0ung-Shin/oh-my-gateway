@@ -983,6 +983,11 @@ async def copy_entry(
     if not dst.parent.is_dir():
         raise HTTPException(status_code=404, detail="destination directory not found")
     is_dir = src.is_dir() and not src.is_symlink()
+    # Preserve validation precedence before any quota/accounting work. An invalid
+    # self/subtree directory copy is a deterministic 400 regardless of whether
+    # cumulative quota is enabled or whether the workspace is near its limit.
+    if is_dir and (dst == src or src in dst.parents):
+        raise HTTPException(status_code=400, detail="cannot copy a directory into itself")
     # Only regular files and directories are copyable — a FIFO/socket/device
     # in the workspace must be a deterministic 4xx, not a blocked worker. This
     # is a fast path for the error message; the race-proof check is the fstat
