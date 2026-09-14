@@ -83,13 +83,24 @@ class WorkspaceQuotaExceeded(Exception):
         )
 
     def as_detail(self) -> dict:
+        """Return the gateway's standard OpenAI-style HTTP error envelope.
+
+        ``src.main`` passes through ``detail`` unchanged when ``detail['error']``
+        is already an object. Keeping the quota metadata inside that object gives
+        production clients the same shape as every other gateway error while a
+        bare FastAPI router test still sees the data under ``detail.error``.
+        """
         return {
-            "error": "workspace_quota_exceeded",
-            "used_bytes": self.used_bytes,
-            "limit_bytes": self.limit_bytes,
-            "projected_bytes": self.projected_bytes,
-            "added_bytes": self.added_bytes,
-            "reclaimed_bytes": self.reclaimed_bytes,
+            "error": {
+                "message": "Workspace storage quota exceeded.",
+                "type": "insufficient_storage",
+                "code": "workspace_quota_exceeded",
+                "used_bytes": self.used_bytes,
+                "limit_bytes": self.limit_bytes,
+                "projected_bytes": self.projected_bytes,
+                "added_bytes": self.added_bytes,
+                "reclaimed_bytes": self.reclaimed_bytes,
+            }
         }
 
 
