@@ -52,6 +52,26 @@ def test_invalid_claude_workspace_dir_override_is_rejected(tmp_path, monkeypatch
         manager.resolve("alice", backend="claude")
 
 
+@pytest.mark.parametrize("value", ["codex", "opencode"])
+def test_claude_workspace_dir_cannot_collide_with_other_backend(tmp_path, monkeypatch, value):
+    manager = WorkspaceManager(base_path=tmp_path / "workspaces")
+    monkeypatch.setenv("CLAUDE_WORKSPACE_DIR", value)
+
+    with pytest.raises(ValueError, match="collides with"):
+        manager.resolve("alice", backend="claude")
+
+    assert not (tmp_path / "workspaces" / "alice" / value).exists()
+
+
+def test_claude_workspace_dir_may_explicitly_keep_claude_name(tmp_path, monkeypatch):
+    manager = WorkspaceManager(base_path=tmp_path / "workspaces")
+    monkeypatch.setenv("CLAUDE_WORKSPACE_DIR", "claude")
+
+    workspace = manager.resolve("alice", backend="claude")
+
+    assert workspace == tmp_path / "workspaces" / "alice" / "claude"
+
+
 def test_anonymous_workspace_layout_ignores_claude_override(tmp_path, monkeypatch):
     manager = WorkspaceManager(base_path=tmp_path / "workspaces")
     monkeypatch.setenv("CLAUDE_WORKSPACE_DIR", "pro")
