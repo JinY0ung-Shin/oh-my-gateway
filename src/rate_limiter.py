@@ -20,21 +20,57 @@ def _user_header_name() -> str:
     return os.getenv("WORKSPACE_USER_HEADER", "X-User-Email")
 
 
+def _bearer_token(request: Request) -> Optional[str]:
+    value = request.headers.get("authorization") or ""
+    scheme, sep, token = value.partition(" ")
+    if not sep or scheme.lower() != "bearer" or not token.strip():
+        return None
+    return token.strip()
+
+
 def get_user_rate_limit_key(request: Request) -> str:
-    """Key for per-user limits: the caller identity when present, else the IP.
+    """Key for per-user limits: the *authenticated* caller identity, else the IP.
 
     A BFF such as ChatDRAGON fronts every end user from one process, so an IP
     key makes the whole deployment share a single bucket (10 turns/minute for
-    everyone with the defaults).  The gateway already trusts the
-    ``WORKSPACE_USER_HEADER`` value for workspace isolation once the request
-    passed ``API_KEY`` auth, so the same identity is the right unit here.
-    Requests without the header (direct clients) keep the IP key.  Set
-    ``RATE_LIMIT_KEY_BY_USER=false`` to force the IP key everywhere.
+    everyone with the defaults).  The identity has to come from something the
+    gateway actually verified, because SlowAPI runs this key function *before*
+    the endpoint's ``verify_api_key`` — a caller-supplied header on an
+    unauthenticated request must not be able to spend (or mint) another user's
+    bucket.  Precedence:
+
+    1. a valid ``USER_API_KEYS`` bearer → ``user:<principal>`` (the credential
+       is the identity; any forwarded header is ignored);
+    2. a valid legacy/unscoped ``API_KEY`` bearer + non-empty
+       ``WORKSPACE_USER_HEADER`` → ``user:<header>`` (the trusted-BFF case: the
+       service credential has no principal of its own);
+    3. anything else — missing/invalid credential, no gateway auth configured,
+       or no usable identity — the IP, exactly as before this key existed.
+
+    Set ``RATE_LIMIT_KEY_BY_USER=false`` to force the IP key everywhere.
     """
-    if parse_bool_env("RATE_LIMIT_KEY_BY_USER", "true"):
-        user = (request.headers.get(_user_header_name()) or "").strip()
-        if user:
-            return f"user:{user}"
+    if not parse_bool_env("RATE_LIMIT_KEY_BY_USER", "true"):
+        return get_remote_address(request)
+
+    # Lazy import: src.auth pulls in the backend auth providers, and the rate
+    # limiter is imported by src.main before the routes; keep this module light.
+    from src.auth import auth_manager
+
+    if not auth_manager.has_api_auth():
+        # Nothing can vouch for a forwarded identity; per-user keying would
+        # let any caller choose whose bucket to drain.
+        return get_remote_address(request)
+    token = _bearer_token(request)
+    if token is None:
+        return get_remote_address(request)
+    valid, principal = auth_manager.authenticate_gateway_key(token)
+    if not valid:
+        return get_remote_address(request)
+    if principal:
+        return f"user:{principal}"
+    user = (request.headers.get(_user_header_name()) or "").strip()
+    if user:
+        return f"user:{user}"
     return get_remote_address(request)
 
 

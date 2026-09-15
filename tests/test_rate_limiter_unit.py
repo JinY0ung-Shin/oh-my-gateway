@@ -354,46 +354,114 @@ def reset_rate_limiter_module():
 
 
 class TestGetUserRateLimitKey:
-    """Per-user key for the responses family (BFF deployments share one IP)."""
+    """Per-user key for the responses family (BFF deployments share one IP).
+
+    The key function runs BEFORE the endpoint's ``verify_api_key``, so the
+    identity must come from a credential the gateway verified — never from a
+    bare caller-supplied header.
+    """
 
     def _request(self, headers):
+        from starlette.datastructures import Headers
+
         req = MagicMock(spec=Request)
-        req.headers = headers
+        # Real request headers are case-insensitive; a plain dict would hide a
+        # lookup-by-canonical-name bug.
+        req.headers = Headers(headers=headers)
         return req
 
-    def test_uses_workspace_user_header_when_present(self, monkeypatch):
+    @pytest.fixture(autouse=True)
+    def _auth(self, monkeypatch):
+        from src.auth import auth_manager
+
+        monkeypatch.setattr(auth_manager, "env_api_key", "svc-key")
+        monkeypatch.setattr(auth_manager, "runtime_api_key", None)
+        monkeypatch.setattr(auth_manager, "user_api_keys", {"alice": "alice-key"})
         monkeypatch.delenv("RATE_LIMIT_KEY_BY_USER", raising=False)
         monkeypatch.delenv("WORKSPACE_USER_HEADER", raising=False)
+
+    def test_user_api_key_principal_is_authoritative_over_header(self):
         from src.rate_limiter import get_user_rate_limit_key
 
         with patch("src.rate_limiter.get_remote_address") as mock_get_addr:
             mock_get_addr.return_value = "10.0.0.5"
-            assert get_user_rate_limit_key(self._request({"X-User-Email": "alice"})) == "user:alice"
+            for spoofed in ("bob", "carol", "alice", ""):
+                headers = {"Authorization": "Bearer alice-key"}
+                if spoofed:
+                    headers["X-User-Email"] = spoofed
+                assert get_user_rate_limit_key(self._request(headers)) == "user:alice"
             mock_get_addr.assert_not_called()
 
-    def test_falls_back_to_ip_without_header(self, monkeypatch):
-        monkeypatch.delenv("RATE_LIMIT_KEY_BY_USER", raising=False)
+    def test_service_key_uses_forwarded_user_header(self):
+        """The trusted-BFF case: legacy API_KEY has no principal of its own."""
         from src.rate_limiter import get_user_rate_limit_key
 
-        with patch("src.rate_limiter.get_remote_address") as mock_get_addr:
-            mock_get_addr.return_value = "10.0.0.5"
-            assert get_user_rate_limit_key(self._request({})) == "10.0.0.5"
-            assert get_user_rate_limit_key(self._request({"X-User-Email": "   "})) == "10.0.0.5"
+        with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
+            headers = {"Authorization": "Bearer svc-key", "X-User-Email": "alice"}
+            assert get_user_rate_limit_key(self._request(headers)) == "user:alice"
+            headers["X-User-Email"] = "bob"
+            assert get_user_rate_limit_key(self._request(headers)) == "user:bob"
+
+    def test_service_key_without_header_falls_back_to_ip(self):
+        from src.rate_limiter import get_user_rate_limit_key
+
+        with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
+            assert (
+                get_user_rate_limit_key(self._request({"Authorization": "Bearer svc-key"}))
+                == "10.0.0.5"
+            )
+            assert (
+                get_user_rate_limit_key(
+                    self._request({"Authorization": "Bearer svc-key", "X-User-Email": "   "})
+                )
+                == "10.0.0.5"
+            )
+
+    def test_missing_or_invalid_credential_never_gets_a_user_bucket(self):
+        """An unauthenticated caller must not be able to spend a victim's bucket."""
+        from src.rate_limiter import get_user_rate_limit_key
+
+        with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
+            assert get_user_rate_limit_key(self._request({"X-User-Email": "alice"})) == "10.0.0.5"
+            assert (
+                get_user_rate_limit_key(
+                    self._request({"Authorization": "Bearer wrong", "X-User-Email": "alice"})
+                )
+                == "10.0.0.5"
+            )
+            assert (
+                get_user_rate_limit_key(
+                    self._request({"Authorization": "Basic alice-key", "X-User-Email": "alice"})
+                )
+                == "10.0.0.5"
+            )
+
+    def test_no_gateway_auth_configured_keeps_ip_key(self, monkeypatch):
+        from src.auth import auth_manager
+        from src.rate_limiter import get_user_rate_limit_key
+
+        monkeypatch.setattr(auth_manager, "env_api_key", None)
+        monkeypatch.setattr(auth_manager, "user_api_keys", {})
+        with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
+            assert get_user_rate_limit_key(self._request({"X-User-Email": "alice"})) == "10.0.0.5"
 
     def test_honours_custom_header_name(self, monkeypatch):
         monkeypatch.setenv("WORKSPACE_USER_HEADER", "X-Caller")
         from src.rate_limiter import get_user_rate_limit_key
 
         with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
-            assert get_user_rate_limit_key(self._request({"X-Caller": "bob"})) == "user:bob"
-            assert get_user_rate_limit_key(self._request({"X-User-Email": "bob"})) == "10.0.0.5"
+            auth = {"Authorization": "Bearer svc-key"}
+            assert get_user_rate_limit_key(self._request({**auth, "X-Caller": "bob"})) == "user:bob"
+            other_header = self._request({**auth, "X-User-Email": "bob"})
+            assert get_user_rate_limit_key(other_header) == "10.0.0.5"
 
     def test_can_be_forced_back_to_ip(self, monkeypatch):
         monkeypatch.setenv("RATE_LIMIT_KEY_BY_USER", "false")
         from src.rate_limiter import get_user_rate_limit_key
 
         with patch("src.rate_limiter.get_remote_address", return_value="10.0.0.5"):
-            assert get_user_rate_limit_key(self._request({"X-User-Email": "alice"})) == "10.0.0.5"
+            headers = {"Authorization": "Bearer alice-key", "X-User-Email": "alice"}
+            assert get_user_rate_limit_key(self._request(headers)) == "10.0.0.5"
 
     def test_only_responses_family_is_user_keyed(self):
         from src.rate_limiter import USER_KEYED_ENDPOINTS
