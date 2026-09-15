@@ -551,3 +551,33 @@ class TestStreamingEmptyThinkingTurnCommitted:
                 },
             )
             assert followup.status_code == 200
+
+
+def test_build_completed_response_drops_empty_thinking_texts():
+    """A thinking block with no text must not become an empty reasoning item.
+
+    OpenAI-shaped clients treat every output item as content; an item whose
+    summary and content are both blank is noise (issue #199).
+    """
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        "resp_1",
+        "m",
+        "hi",
+        {},
+        output_tokens=1,
+        input_tokens=1,
+        thinking_texts=["", "   ", "real thought"],
+    )
+    assert [item.type for item in resp.output] == ["reasoning", "message"]
+    assert resp.output[0].summary[0].text == "real thought"
+
+
+def test_build_completed_response_all_empty_thinking_yields_message_only():
+    from src.routes.responses import _build_completed_response
+
+    resp = _build_completed_response(
+        "resp_1", "m", "hi", {}, output_tokens=1, input_tokens=1, thinking_texts=[""]
+    )
+    assert [item.type for item in resp.output] == ["message"]

@@ -444,6 +444,30 @@ class TestBackendAuthProviders:
         provider = ClaudeAuthProvider()
         assert "OPENAI_API_KEY" in provider.get_isolation_vars()
 
+    def test_api_key_mode_isolates_oauth_token(self):
+        """In api_key mode a leftover CLAUDE_CODE_OAUTH_TOKEN must not reach the CLI.
+
+        The CLI prefers the OAuth token over ANTHROPIC_AUTH_TOKEN and would send it
+        as the bearer to the configured ANTHROPIC_BASE_URL (e.g. a LiteLLM proxy).
+        """
+        from src.auth import ClaudeAuthProvider
+
+        with patch.dict(
+            os.environ,
+            {"CLAUDE_AUTH_METHOD": "api_key", "ANTHROPIC_AUTH_TOKEN": "sk-1234"},
+        ):
+            provider = ClaudeAuthProvider()
+            assert "CLAUDE_CODE_OAUTH_TOKEN" in provider.get_isolation_vars()
+
+    def test_cli_mode_keeps_oauth_token(self):
+        """CLI auth mode relies on the OAuth token, so it must stay untouched."""
+        from src.auth import ClaudeAuthProvider
+
+        with patch.dict(os.environ, {"CLAUDE_AUTH_METHOD": "cli"}, clear=False):
+            os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
+            provider = ClaudeAuthProvider()
+            assert "CLAUDE_CODE_OAUTH_TOKEN" not in provider.get_isolation_vars()
+
 
 class TestCrossIsolation:
     """Verify that backend env isolation works bidirectionally."""
