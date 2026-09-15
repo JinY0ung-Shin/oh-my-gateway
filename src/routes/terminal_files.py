@@ -63,9 +63,9 @@ Concurrency:
   outside that lock; this is a soft application quota, not a filesystem quota.
 
 Security:
-- ``API_KEY`` MUST be configured; otherwise ``verify_api_key`` is a no-op and
-  these endpoints would expose every user's files unauthenticated, so we fail
-  closed here.
+- Gateway API authentication (``API_KEY`` or ``USER_API_KEYS``) MUST be configured;
+  otherwise ``verify_api_key`` is a no-op and these endpoints would expose every
+  user's files unauthenticated, so we fail closed here.
 - Every path (read AND write) is confined to the single workspace root via
   ``_resolve_or_403`` (``Path.resolve()`` collapses ``..`` and resolves symlinks
   before the containment check); anything above/outside the root is a 403.
@@ -96,7 +96,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel
 
 from src.auth import auth_manager, security, verify_api_key
-from src.constants import MAX_REQUEST_SIZE, WORKSPACE_UPLOAD_MAX_BYTES
+from src.runtime_config import get_workspace_upload_max_bytes
 from src.workspace_manager import workspace_manager
 from src.workspace_quota import (
     WorkspaceQuotaExceeded,
@@ -141,13 +141,6 @@ _MAX_READ_BYTES = 5 * 1024 * 1024
 # vendor-neutral.
 _DEFAULT_USER_HEADER = "X-User-Email"
 
-# Room for the multipart envelope around the file bytes: boundary lines, the
-# part headers and a filename of up to 255 bytes. The request boundary counts
-# the WHOLE body, so a ceiling advertised as the file size must leave space for
-# the wrapper — otherwise a file of exactly the advertised size is rejected and
-# the number we published is a lie.
-_MULTIPART_ENVELOPE_RESERVE = 8192
-
 # Per-process serialization for quota-increasing file API mutations. This does
 # not turn the application quota into an OS/filesystem hard quota.
 #
@@ -167,6 +160,7 @@ class _QuotaLockEntry:
     lock: asyncio.Lock
     users: int = 0
 
+
 # Fail closed when the quota scope cannot be determined: charging a user for a
 # root we cannot identify is worse than refusing the quota-dependent call.
 _QUOTA_SCOPE_UNAVAILABLE = {
@@ -181,18 +175,17 @@ _QUOTA_SCOPE_UNAVAILABLE = {
 def _max_upload_bytes() -> int:
     """Largest single file ``POST /files/upload`` will actually accept.
 
-    Read through the module namespace rather than captured at import so a
-    deployment (or a test) can move either limit without reimporting the route.
+    The runtime-config value is the single source of truth. The ASGI request
+    boundary uses that same value plus multipart envelope room, so this route,
+    ``/files/limits`` and an admin-edited limit cannot drift apart.
 
-    ``0`` is a real answer, not a failure: a deployment whose request cap is at
-    or below the envelope reserve cannot carry any file at all, and saying so is
-    the point of publishing the number. A client that sizes its picker against
-    this reports "uploads unavailable" instead of offering a control whose every
-    use ends in a 413. Whether such a configuration should be refused outright at
-    startup is a separate call and deliberately not made here.
+    ``0`` is a real answer, not a failure: it means this deployment accepts no
+    workspace uploads at all, and saying so is the point of publishing the
+    number. A client that sizes its picker against ``/files/limits`` reports
+    "uploads unavailable" instead of offering a control whose every use ends in
+    a 413.
     """
-    ceiling = min(WORKSPACE_UPLOAD_MAX_BYTES, MAX_REQUEST_SIZE - _MULTIPART_ENVELOPE_RESERVE)
-    return max(0, ceiling)
+    return max(0, get_workspace_upload_max_bytes())
 
 
 def _user_header() -> str:
@@ -204,23 +197,24 @@ def _hide_dotfiles() -> bool:
 
     Defaults to **false**: hiding dotfiles protects nothing here — the agent
     itself reads and writes them freely through Bash/Read within the same
-    workspace, and the real guards are ``API_KEY`` plus root confinement. What it
-    *did* do was make the workspace's agent-resource directories unreachable over
-    ``/files/*`` (a 404 on any dot-prefixed component, including writes), which
-    silently breaks clients that install skills/subagents through this API. Hiding
-    is presentation, so it belongs to the client that renders the tree — see the
-    Finder-style "show hidden items" toggle in ChatDRAGON's files panel. Set this
-    to ``true`` to restore server-side hiding for a deployment that wants it.
+    workspace, and the real guards are gateway API auth plus root confinement.
+    What it *did* do was make the workspace's agent-resource directories
+    unreachable over ``/files/*`` (a 404 on any dot-prefixed component,
+    including writes), which silently breaks clients that install skills/subagents
+    through this API. Hiding is presentation, so it belongs to the client that
+    renders the tree — see the Finder-style "show hidden items" toggle in
+    ChatDRAGON's files panel. Set this to ``true`` to restore server-side hiding
+    for a deployment that wants it.
     """
     return os.getenv("WORKSPACE_HIDE_DOTFILES", "false").strip().lower() == "true"
 
 
 def _ensure_api_key() -> None:
-    """Fail closed unless an API key is configured (verify_api_key no-ops without one)."""
-    if not auth_manager.get_api_key():
+    """Fail closed unless gateway API auth is configured."""
+    if not auth_manager.has_api_auth():
         raise HTTPException(
             status_code=503,
-            detail="workspace file browser is disabled: API_KEY is not configured",
+            detail="workspace file browser is disabled: gateway API auth is not configured",
         )
 
 
@@ -797,13 +791,12 @@ async def upload_file(
     target = _resolve_or_403(root, f"{directory}/{name}")
 
     data = await file.read()
-    # Defence in depth against the request boundary, not a duplicate of it: the
-    # middleware caps the whole body under MAX_REQUEST_SIZE, while this bounds
-    # the file itself under its own limit. They are separate knobs, so an
-    # operator who raises the JSON cap does not silently widen what may be
-    # written into a workspace.
+    # Defence in depth against the request boundary: middleware bounds the raw
+    # multipart request with this same runtime file ceiling plus envelope room;
+    # this final check measures the actual file bytes, so boundary and route
+    # cannot disagree about the operator-configured limit.
     ceiling = _max_upload_bytes()
-    if len(data) > ceiling:
+    if ceiling == 0 or len(data) > ceiling:
         raise HTTPException(
             status_code=413,
             detail=f"file exceeds the upload limit of {ceiling} bytes",

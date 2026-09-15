@@ -847,86 +847,86 @@ def test_serve_hidden_file_is_404_when_enabled(client, workspace, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Upload ceiling: published, enforced, and honest at the boundary.
+# Upload ceiling: gateway runtime-config is the single source of truth.
 # ---------------------------------------------------------------------------
 
 
-def test_limits_reports_a_ceiling_below_the_request_cap(client):
-    """The published number must leave room for the multipart envelope.
+@pytest.fixture
+def upload_limit_override():
+    from src.runtime_config import runtime_config
 
-    A client sizes its own refusal off this value, so advertising the raw
-    request cap would reject a file of exactly the advertised size once the
-    boundary and part headers are added.
-    """
+    runtime_config.reset("workspace_upload_max_bytes")
+    try:
+        yield runtime_config
+    finally:
+        runtime_config.reset("workspace_upload_max_bytes")
+
+
+def test_limits_reports_gateway_runtime_upload_ceiling(client, upload_limit_override):
+    upload_limit_override.set("workspace_upload_max_bytes", 7 * 1024 * 1024)
+
     res = client.get("/files/limits", headers={**_AUTH, **_USER})
+
     assert res.status_code == 200
-    ceiling = res.json()["max_upload_bytes"]
-    assert 0 < ceiling < tf.MAX_REQUEST_SIZE
+    assert res.json()["max_upload_bytes"] == 7 * 1024 * 1024
 
 
-def test_upload_accepts_exactly_the_published_ceiling(client, workspace, monkeypatch):
-    monkeypatch.setattr(tf, "WORKSPACE_UPLOAD_MAX_BYTES", 1024)
-    ceiling = client.get("/files/limits", headers={**_AUTH, **_USER}).json()["max_upload_bytes"]
+def test_upload_accepts_exactly_the_published_ceiling(
+    client, workspace, upload_limit_override
+):
+    upload_limit_override.set("workspace_upload_max_bytes", 1024)
+    ceiling = client.get("/files/limits", headers={**_AUTH, **_USER}).json()[
+        "max_upload_bytes"
+    ]
     assert ceiling == 1024
+
     res = client.post(
         "/files/upload?directory=/",
         headers={**_AUTH, **_USER},
         files={"file": ("fits.bin", b"x" * ceiling, "application/octet-stream")},
     )
+
     assert res.status_code == 200
     assert (workspace / "fits.bin").stat().st_size == ceiling
 
 
-def test_upload_over_ceiling_is_413_and_writes_nothing(client, workspace, monkeypatch):
-    monkeypatch.setattr(tf, "WORKSPACE_UPLOAD_MAX_BYTES", 1024)
+def test_upload_over_ceiling_is_413_and_writes_nothing(
+    client, workspace, upload_limit_override
+):
+    upload_limit_override.set("workspace_upload_max_bytes", 1024)
+
     res = client.post(
         "/files/upload?directory=/",
         headers={**_AUTH, **_USER},
         files={"file": ("too-big.bin", b"x" * 1025, "application/octet-stream")},
     )
+
     assert res.status_code == 413
     assert "1024" in res.json()["detail"]
-    # A rejected upload must not leave a truncated file behind for the agent to read.
     assert not (workspace / "too-big.bin").exists()
-
-
-def test_upload_ceiling_follows_the_smaller_of_the_two_limits(client, monkeypatch):
-    """The JSON cap wins when it is the tighter one.
-
-    Every POST body is buffered whole under ``MAX_REQUEST_SIZE``, so an upload
-    limit above it could never be honoured — reporting it would send clients
-    into a request-boundary rejection they cannot explain.
-    """
-    monkeypatch.setattr(tf, "WORKSPACE_UPLOAD_MAX_BYTES", 100 * 1024 * 1024)
-    monkeypatch.setattr(tf, "MAX_REQUEST_SIZE", 64 * 1024)
-    ceiling = client.get("/files/limits", headers={**_AUTH, **_USER}).json()["max_upload_bytes"]
-    assert ceiling == 64 * 1024 - tf._MULTIPART_ENVELOPE_RESERVE
 
 
 def test_limits_requires_auth(client):
     assert client.get("/files/limits", headers=_USER).status_code in (401, 403)
 
 
-
 # ---------------------------------------------------------------------------
-# The published ceiling through the REAL request-size stack.
+# The same runtime ceiling through the REAL request-size stack.
 #
-# The `client` fixture mounts the router on a bare FastAPI app, so neither
-# RequestSizeLimitMiddleware nor ConcurrencyLimitMiddleware runs and the
-# request-cap-derived ceiling is never exercised. These build the same
-# middleware stack the server assembles, and drive WORKSPACE_UPLOAD_MAX_BYTES
-# ABOVE MAX_REQUEST_SIZE so the ceiling can only come from the request cap.
+# The generic API request cap remains independent. /files/upload gets exactly
+# the gateway-owned file ceiling plus multipart envelope room at the raw-body
+# boundary, then the route enforces the advertised file-byte ceiling itself.
 # ---------------------------------------------------------------------------
 
-_STACK_REQUEST_SIZE = 64 * 1024
+_STACK_UPLOAD_SIZE = 64 * 1024
 
 
 @pytest.fixture
 def guarded_client(workspace, monkeypatch):
     """The router behind both real body-size guards."""
-    from src import concurrency_middleware as cm
     from src import main as gateway_main
     from src.concurrency_middleware import ConcurrencyLimitMiddleware
+    from src.runtime_config import runtime_config
 
     _patch_api_key(monkeypatch, "testkey")
 
@@ -936,32 +936,26 @@ def guarded_client(workspace, monkeypatch):
         raise ValueError("bad user")
 
     monkeypatch.setattr(tf.workspace_manager, "resolve", _resolve)
-
-    # Every module reads the cap from its own namespace; move all three or the
-    # guards disagree about where the boundary is.
-    for module in (tf, cm, gateway_main):
-        monkeypatch.setattr(module, "MAX_REQUEST_SIZE", _STACK_REQUEST_SIZE)
-    # Far above the request cap: the ceiling must come from the cap alone.
-    monkeypatch.setattr(tf, "WORKSPACE_UPLOAD_MAX_BYTES", 1024 * 1024 * 1024)
+    runtime_config.reset("workspace_upload_max_bytes")
+    runtime_config.set("workspace_upload_max_bytes", _STACK_UPLOAD_SIZE)
 
     app = FastAPI()
     app.include_router(router)
-    app.add_middleware(gateway_main.RequestSizeLimitMiddleware)
+    # Same order as src.main: last-added middleware executes first, so the
+    # Content-Length fast guard sits outside the actual-byte ASGI guard.
     app.add_middleware(ConcurrencyLimitMiddleware)
-    return TestClient(app)
+    app.add_middleware(gateway_main.RequestSizeLimitMiddleware)
+    try:
+        yield TestClient(app)
+    finally:
+        runtime_config.reset("workspace_upload_max_bytes")
 
 
 def test_published_ceiling_survives_the_real_multipart_boundary(guarded_client, workspace):
-    """A file of exactly the advertised size must get through the whole stack.
-
-    This is the PR's actual claim. Publishing a number a real request cannot
-    carry is worse than publishing nothing: the client sizes its chip against
-    it, uploads, and gets a 413 it was told could not happen.
-    """
     ceiling = guarded_client.get("/files/limits", headers={**_AUTH, **_USER}).json()[
         "max_upload_bytes"
     ]
-    assert ceiling == _STACK_REQUEST_SIZE - tf._MULTIPART_ENVELOPE_RESERVE
+    assert ceiling == _STACK_UPLOAD_SIZE
 
     res = guarded_client.post(
         "/files/upload?directory=/",
@@ -976,7 +970,6 @@ def test_published_ceiling_survives_the_real_multipart_boundary(guarded_client, 
 def test_one_byte_over_the_published_ceiling_is_refused_by_the_stack(
     guarded_client, workspace
 ):
-    """The other side of the same boundary — and nothing half-written."""
     ceiling = guarded_client.get("/files/limits", headers={**_AUTH, **_USER}).json()[
         "max_upload_bytes"
     ]
@@ -992,16 +985,12 @@ def test_one_byte_over_the_published_ceiling_is_refused_by_the_stack(
 
 
 def test_the_reserve_covers_a_real_multipart_envelope(guarded_client, workspace):
-    """The 8 KiB reserve is a guess unless a real envelope fits inside it.
-
-    A ceiling-sized file plus its multipart headers must stay under the
-    request cap, or the guards reject what /files/limits promised.
-    """
+    """A ceiling-sized file with a long filename still fits its raw body cap."""
     ceiling = guarded_client.get("/files/limits", headers={**_AUTH, **_USER}).json()[
         "max_upload_bytes"
     ]
-    # A deliberately long filename — the envelope carries it twice.
     name = "a" * 200 + ".bin"
+
     res = guarded_client.post(
         "/files/upload?directory=/",
         headers={**_AUTH, **_USER},
@@ -1012,30 +1001,49 @@ def test_the_reserve_covers_a_real_multipart_envelope(guarded_client, workspace)
     assert (workspace / name).stat().st_size == ceiling
 
 
-def test_a_request_cap_below_the_envelope_reserve_publishes_zero(client, monkeypatch):
-    """Uploads are impossible here, and the published number says so.
+def test_upload_limit_can_exceed_generic_request_cap(workspace, monkeypatch):
+    """MAX_REQUEST_SIZE must not silently become a second file-upload setting."""
+    from src import concurrency_middleware as cm
+    from src import main as gateway_main
+    from src.concurrency_middleware import ConcurrencyLimitMiddleware
+    from src.runtime_config import runtime_config
 
-    Reporting anything above zero would hand a client a size it can never
-    actually send; zero lets it disable the control instead of offering one
-    whose every use ends in a 413.
-    """
-    monkeypatch.setattr(tf, "MAX_REQUEST_SIZE", tf._MULTIPART_ENVELOPE_RESERVE)
-    monkeypatch.setattr(tf, "WORKSPACE_UPLOAD_MAX_BYTES", 10 * 1024 * 1024)
+    _patch_api_key(monkeypatch, "testkey")
 
+    def _resolve(user, backend=None):
+        if user == "alice@corp.com":
+            return workspace
+        raise ValueError("bad user")
+
+    monkeypatch.setattr(tf.workspace_manager, "resolve", _resolve)
+    monkeypatch.setattr(cm, "MAX_REQUEST_SIZE", 4 * 1024)
+    runtime_config.reset("workspace_upload_max_bytes")
+    runtime_config.set("workspace_upload_max_bytes", 16 * 1024)
+
+    app = FastAPI()
+    app.include_router(router)
+    app.add_middleware(ConcurrencyLimitMiddleware)
+    app.add_middleware(gateway_main.RequestSizeLimitMiddleware)
+    c = TestClient(app)
+    try:
+        res = c.post(
+            "/files/upload?directory=/",
+            headers={**_AUTH, **_USER},
+            files={"file": ("larger-than-generic.bin", b"x" * (8 * 1024), "application/octet-stream")},
+        )
+        assert res.status_code == 200, res.text
+        assert (workspace / "larger-than-generic.bin").stat().st_size == 8 * 1024
+    finally:
+        runtime_config.reset("workspace_upload_max_bytes")
+
+
+def test_zero_ceiling_refuses_nonempty_file(
+    client, workspace, upload_limit_override
+):
+    upload_limit_override.set("workspace_upload_max_bytes", 0)
     assert client.get("/files/limits", headers={**_AUTH, **_USER}).json()[
         "max_upload_bytes"
     ] == 0
-    # Never negative — a smaller cap must not wrap into a permissive number.
-    monkeypatch.setattr(tf, "MAX_REQUEST_SIZE", 1)
-    assert client.get("/files/limits", headers={**_AUTH, **_USER}).json()[
-        "max_upload_bytes"
-    ] == 0
-
-
-def test_zero_ceiling_refuses_even_an_empty_file(client, workspace, monkeypatch):
-    """The published zero has to be enforced, not just advertised."""
-    monkeypatch.setattr(tf, "MAX_REQUEST_SIZE", tf._MULTIPART_ENVELOPE_RESERVE)
-    monkeypatch.setattr(tf, "WORKSPACE_UPLOAD_MAX_BYTES", 10 * 1024 * 1024)
 
     res = client.post(
         "/files/upload?directory=/",

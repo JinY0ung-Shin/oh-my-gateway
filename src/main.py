@@ -40,7 +40,7 @@ from src.constants import (
 from src import __version__
 from src import metrics
 from src.concurrency import SessionLimitExceeded
-from src.concurrency_middleware import ConcurrencyLimitMiddleware
+from src.concurrency_middleware import ConcurrencyLimitMiddleware, _request_body_limit
 from src.mcp_config import get_mcp_servers
 from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
@@ -413,16 +413,24 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 
 
 class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    """Limit request body size to prevent DoS attacks."""
+    """Limit request body size to prevent DoS attacks.
+
+    Authenticated workspace file uploads use the gateway-owned runtime upload
+    limit; unauthenticated/invalid callers and every other route keep the
+    existing ``MAX_REQUEST_SIZE`` ceiling. The inner pure ASGI middleware still
+    counts actual bytes (including chunked requests); this layer is only the
+    cheap declared-Content-Length fast rejection.
+    """
 
     async def dispatch(self, request: Request, call_next):
+        body_limit = _request_body_limit(request.scope)
         content_length = request.headers.get("content-length")
-        if content_length and int(content_length) > MAX_REQUEST_SIZE:
+        if content_length and int(content_length) > body_limit:
             return JSONResponse(
                 status_code=413,
                 content={
                     "error": {
-                        "message": f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes.",
+                        "message": f"Request body too large. Maximum size is {body_limit} bytes.",
                         "type": "request_too_large",
                         "code": 413,
                     }

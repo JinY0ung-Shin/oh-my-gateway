@@ -7,9 +7,12 @@ from unittest.mock import AsyncMock
 import pytest
 from fastapi import HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
+from starlette.requests import Request
+from starlette.responses import Response
 
 import src.auth as auth_module
 import src.concurrency_middleware as middleware_module
+import src.main as main_module
 import src.routes.sessions as sessions_route
 from src.concurrency_middleware import ConcurrencyLimitMiddleware
 from src.session_manager import SessionManager
@@ -71,6 +74,20 @@ def _scope(method, path, headers=None, query=b""):
     }
 
 
+def _protect_upload_limit(monkeypatch, *, generic=5, upload=20):
+    """Configure a protected gateway whose valid legacy key is ``good-key``."""
+    monkeypatch.setattr(middleware_module, "MAX_REQUEST_SIZE", generic)
+    monkeypatch.setattr(
+        middleware_module, "get_workspace_upload_request_max_bytes", lambda: upload
+    )
+    monkeypatch.setattr(middleware_module.auth_manager, "has_api_auth", lambda: True)
+    monkeypatch.setattr(
+        middleware_module.auth_manager,
+        "authenticate_gateway_key",
+        lambda token: (token == "good-key", None),
+    )
+
+
 @pytest.mark.asyncio
 async def test_chunked_body_is_rejected_by_actual_byte_count(monkeypatch):
     monkeypatch.setattr(middleware_module, "MAX_REQUEST_SIZE", 5)
@@ -93,6 +110,112 @@ async def test_chunked_body_is_rejected_by_actual_byte_count(monkeypatch):
 
     assert called is False
     assert sent[0]["status"] == 413
+
+
+@pytest.mark.parametrize(
+    "auth_header",
+    [None, b"Bearer bad-key"],
+    ids=["missing-auth", "invalid-auth"],
+)
+@pytest.mark.asyncio
+async def test_unauthenticated_chunked_upload_cannot_use_widened_limit(
+    monkeypatch, auth_header
+):
+    """Missing/invalid credentials must hit the generic cap before route auth.
+
+    There is deliberately no Content-Length here: this exercises the actual
+    received-byte guard and proves an unauthenticated client cannot stream up to
+    the larger admin-configured workspace upload allowance.
+    """
+    _protect_upload_limit(monkeypatch)
+    called = False
+
+    async def app(scope, receive, send):
+        nonlocal called
+        called = True
+
+    headers = [(b"transfer-encoding", b"chunked")]
+    if auth_header is not None:
+        headers.append((b"authorization", auth_header))
+    scope = _scope("POST", "/files/upload", headers)
+    sent = await _invoke(
+        ConcurrencyLimitMiddleware(app),
+        scope,
+        [
+            {"type": "http.request", "body": b"abc", "more_body": True},
+            {"type": "http.request", "body": b"def", "more_body": False},
+        ],
+    )
+
+    assert called is False
+    assert sent[0]["status"] == 413
+    assert b"5 bytes" in sent[1]["body"]
+
+
+@pytest.mark.asyncio
+async def test_valid_chunked_upload_can_use_widened_limit(monkeypatch):
+    """A valid bearer may cross the generic cap up to the upload-specific cap."""
+    _protect_upload_limit(monkeypatch)
+    captured = b""
+
+    async def app(scope, receive, send):
+        nonlocal captured
+        captured = (await receive())["body"]
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok", "more_body": False})
+
+    scope = _scope(
+        "POST",
+        "/files/upload",
+        [
+            (b"transfer-encoding", b"chunked"),
+            (b"authorization", b"Bearer good-key"),
+        ],
+    )
+    sent = await _invoke(
+        ConcurrencyLimitMiddleware(app),
+        scope,
+        [
+            {"type": "http.request", "body": b"abc", "more_body": True},
+            {"type": "http.request", "body": b"def", "more_body": False},
+        ],
+    )
+
+    assert sent[0]["status"] == 200
+    assert captured == b"abcdef"
+
+
+@pytest.mark.parametrize(
+    ("auth_header", "expected_status", "called"),
+    [
+        (None, 413, False),
+        (b"Bearer bad-key", 413, False),
+        (b"Bearer good-key", 200, True),
+    ],
+    ids=["missing-auth", "invalid-auth", "valid-auth"],
+)
+@pytest.mark.asyncio
+async def test_outer_content_length_guard_uses_same_auth_aware_upload_limit(
+    monkeypatch, auth_header, expected_status, called
+):
+    """The cheap Content-Length guard and inner byte counter must agree."""
+    _protect_upload_limit(monkeypatch)
+    headers = [(b"content-length", b"6")]
+    if auth_header is not None:
+        headers.append((b"authorization", auth_header))
+    request = Request(_scope("POST", "/files/upload", headers))
+    call_next_called = False
+
+    async def call_next(_request):
+        nonlocal call_next_called
+        call_next_called = True
+        return Response("ok", status_code=200)
+
+    guard = main_module.RequestSizeLimitMiddleware(lambda scope, receive, send: None)
+    response = await guard.dispatch(request, call_next)
+
+    assert response.status_code == expected_status
+    assert call_next_called is called
 
 
 @pytest.mark.asyncio

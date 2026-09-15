@@ -20,6 +20,12 @@ from typing import Any, Dict
 
 logger = logging.getLogger(__name__)
 
+# Multipart file uploads carry a small boundary/header envelope in addition to
+# file bytes. The request-boundary middleware and /files/upload route share this
+# one reserve so the advertised file ceiling and the accepted request body stay
+# in lockstep.
+WORKSPACE_UPLOAD_MULTIPART_RESERVE = 8192
+
 
 def _int_env(name: str) -> int:
     """Read an int env var, treating unset/junk as 0 ("not configured")."""
@@ -28,11 +34,12 @@ def _int_env(name: str) -> int:
     except ValueError:
         return 0
 
+
 # ---------------------------------------------------------------------------
 # Editable key definitions
 # ---------------------------------------------------------------------------
 
-# Each key maps to: (display_name, type, description, restart_required)
+# Each key maps to display metadata and type/validation information.
 EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
     "default_model": {
         "label": "Default Model",
@@ -91,6 +98,19 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
             "sessions; an override wins over the gateway process env."
         ),
     },
+    "workspace_upload_max_bytes": {
+        "label": "Workspace upload limit (bytes)",
+        "type": "int",
+        "min": 0,
+        "description": (
+            "Maximum size of one file accepted by POST /files/upload. This is the "
+            "single file-upload ceiling used by both request-boundary enforcement "
+            "and the workspace file route. Applies on the next upload request. "
+            "0 disables workspace uploads entirely: /files/limits then publishes 0 "
+            "so clients report 'uploads unavailable' instead of offering a control "
+            "whose every use ends in a 413."
+        ),
+    },
     "agent_teams_enabled": {
         "label": "Agent Teams",
         "type": "bool",
@@ -123,7 +143,7 @@ class RuntimeConfig:
         return self._get_original(key)
 
     def set(self, key: str, value: Any) -> None:
-        """Set a runtime override.  Raises ``KeyError`` for unknown keys."""
+        """Set a runtime override. Raises ``KeyError`` for unknown keys."""
         if key not in EDITABLE_KEYS:
             raise KeyError(f"Key '{key}' is not editable at runtime")
         coerced = self._coerce(key, value)
@@ -172,16 +192,15 @@ class RuntimeConfig:
             }
         return result
 
-    # ---- helpers ----
-
     @staticmethod
     def _get_original(key: str) -> Any:
         """Return the original startup value from constants."""
         from src.constants import (
-            DEFAULT_MODEL,
             DEFAULT_MAX_TURNS,
+            DEFAULT_MODEL,
             SESSION_EVICTION_POLICY,
             SESSION_MAX_AGE_MINUTES,
+            WORKSPACE_UPLOAD_MAX_BYTES,
         )
         from src.backends.claude.constants import (
             THINKING_MODE,
@@ -200,6 +219,7 @@ class RuntimeConfig:
             "thinking_mode": THINKING_MODE,
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
+            "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
             # Mirrors the CLI's own truthiness on the raw env string: any
             # non-empty value activates the gate, including "0".
             "agent_teams_enabled": bool(
@@ -234,7 +254,9 @@ class RuntimeConfig:
                     return True
                 if low in ("false", "0", "no", "off"):
                     return False
-                raise ValueError(f"{key} must be a boolean (true/false/yes/no/1/0), got {value!r}")
+                raise ValueError(
+                    f"{key} must be a boolean (true/false/yes/no/1/0), got {value!r}"
+                )
             if isinstance(value, (int, float)):
                 return bool(value)
             raise ValueError(f"{key} must be a boolean, got {type(value).__name__}")
@@ -266,3 +288,12 @@ def get_thinking_mode() -> str:
 
 def get_token_streaming() -> bool:
     return runtime_config.get("token_streaming")
+
+
+def get_workspace_upload_max_bytes() -> int:
+    return runtime_config.get("workspace_upload_max_bytes")
+
+
+def get_workspace_upload_request_max_bytes() -> int:
+    """Maximum raw multipart body accepted by POST /files/upload."""
+    return max(0, get_workspace_upload_max_bytes()) + WORKSPACE_UPLOAD_MULTIPART_RESERVE

@@ -13,8 +13,12 @@ slot on cancellation or error.
 This middleware also carries two request-boundary guards that need raw ASGI
 access before FastAPI parses the body:
 
-* enforce ``MAX_REQUEST_SIZE`` against the **actual received bytes**, including
-  ``Transfer-Encoding: chunked`` requests with no ``Content-Length``;
+* enforce a route-aware request body limit against the **actual received bytes**,
+  including ``Transfer-Encoding: chunked`` requests with no ``Content-Length``.
+  Normal requests use ``MAX_REQUEST_SIZE``; authenticated ``POST /files/upload``
+  requests use the runtime-editable workspace upload ceiling plus multipart
+  envelope room. A gateway with no API auth configured fails closed at the
+  generic cap because the workspace file routes themselves are disabled;
 * bind an optional ``USER_API_KEYS`` credential-derived principal to request
   state/body/query/header identity so caller-controlled ``user`` values cannot
   select another tenant workspace.
@@ -37,6 +41,7 @@ from src import metrics
 from src.auth import auth_manager
 from src.concurrency import turn_limiter
 from src.constants import MAX_REQUEST_SIZE
+from src.runtime_config import get_workspace_upload_request_max_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +122,24 @@ def _is_guarded(scope: Scope) -> bool:
     if scope.get("method") != "POST":
         return False
     return scope.get("path", "") in GUARDED_PATHS
+
+
+def _request_body_limit(scope: Scope) -> int:
+    """Return the raw-body ceiling for this request.
+
+    The larger workspace upload allowance is a privileged resource boundary:
+    only a request carrying a valid legacy or ``USER_API_KEYS`` bearer may use
+    it. Missing/invalid credentials stay under ``MAX_REQUEST_SIZE`` until
+    FastAPI returns the normal 401. If no gateway API auth is configured at all,
+    the workspace file routes are disabled and the generic cap still applies.
+    """
+    if (
+        scope.get("method") == "POST"
+        and scope.get("path") == "/files/upload"
+        and _gateway_credential_valid(scope)
+    ):
+        return get_workspace_upload_request_max_bytes()
+    return MAX_REQUEST_SIZE
 
 
 async def _buffer_body(receive: Receive) -> Tuple[bytes, Optional[Message]]:
@@ -224,6 +247,17 @@ def _bearer_token(scope: Scope) -> Optional[str]:
     return token.strip()
 
 
+def _gateway_credential_valid(scope: Scope) -> bool:
+    """Whether this request may consume auth-gated resource allowances."""
+    if not auth_manager.has_api_auth():
+        return False
+    token = _bearer_token(scope)
+    if token is None:
+        return False
+    valid, _principal = auth_manager.authenticate_gateway_key(token)
+    return valid
+
+
 def _credential_principal(scope: Scope) -> Optional[str]:
     """Return the user bound to a configured USER_API_KEYS token, if any."""
     token = _bearer_token(scope)
@@ -304,6 +338,7 @@ class ConcurrencyLimitMiddleware:
         original_receive = receive
         body: Optional[bytes] = None
         method = scope.get("method", "")
+        body_limit = _request_body_limit(scope)
 
         # Fast reject a declared oversized body, then still count the actual
         # bytes for accepted declarations. This closes the chunked/no-CL bypass
@@ -312,8 +347,8 @@ class ConcurrencyLimitMiddleware:
         raw_length = headers.get("content-length")
         if raw_length is not None:
             try:
-                if int(raw_length) > MAX_REQUEST_SIZE:
-                    await self._send_413(send)
+                if int(raw_length) > body_limit:
+                    await self._send_413(send, body_limit)
                     return
             except ValueError:
                 # Uvicorn normally rejects malformed Content-Length before ASGI;
@@ -322,10 +357,10 @@ class ConcurrencyLimitMiddleware:
 
         if method in _BODY_METHODS:
             body, disconnected, too_large = await _buffer_body_with_limit(
-                original_receive, MAX_REQUEST_SIZE
+                original_receive, body_limit
             )
             if too_large:
-                await self._send_413(send)
+                await self._send_413(send, body_limit)
                 return
             if disconnected is not None:
                 receive = _replay_message(disconnected, original_receive)
@@ -446,13 +481,11 @@ class ConcurrencyLimitMiddleware:
         user = parsed.get("user")
         return (user if isinstance(user, str) and user else None), replayed
 
-    async def _send_413(self, send: Send) -> None:
+    async def _send_413(self, send: Send, limit: int) -> None:
         payload = json.dumps(
             {
                 "error": {
-                    "message": (
-                        f"Request body too large. Maximum size is {MAX_REQUEST_SIZE} bytes."
-                    ),
+                    "message": f"Request body too large. Maximum size is {limit} bytes.",
                     "type": "request_too_large",
                     "code": 413,
                 }
