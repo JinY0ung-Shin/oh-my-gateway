@@ -2538,6 +2538,149 @@ async def test_stream_completed_output_drops_reasoning_item_without_text():
     message = completed["response"]["output"][0]
     assert message["content"][0]["text"] == "answer"
 
+    # The event history must agree with the terminal object: no reasoning item
+    # was ever announced, and the message streamed at the index it occupies in
+    # ``response.output`` (0), not at 1 behind a phantom reasoning item.
+    added = [p for t, p in events if t == "response.output_item.added"]
+    assert [p["item"]["type"] for p in added] == ["message"]
+    assert added[0]["output_index"] == 0
+    assert not [t for t, _ in events if t.startswith("response.reasoning")]
+    done = [p for t, p in events if t == "response.output_item.done"]
+    assert [(p["item"]["type"], p["output_index"]) for p in done] == [("message", 0)]
+    deltas = [p for t, p in events if t == "response.output_text.delta"]
+    assert deltas and all(p["output_index"] == 0 for p in deltas)
+
+
+async def test_stream_whitespace_only_thinking_block_emits_no_reasoning_item():
+    """Whitespace deltas are not text: the item stays closed, message is index 0."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "  \n"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "answer"},
+        }}
+        yield {"subtype": "success", "result": "answer"}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(), model="m", response_id="resp_1", output_item_id="msg_1",
+        chunks_buffer=[], logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    assert not [t for t, _ in events if t.startswith("response.reasoning")]
+    added = [p for t, p in events if t == "response.output_item.added"]
+    assert [(p["item"]["type"], p["output_index"]) for p in added] == [("message", 0)]
+    completed = next(p for t, p in events if t == "response.completed")
+    assert [i["type"] for i in completed["response"]["output"]] == ["message"]
+
+
+async def test_stream_reasoning_item_opens_late_and_keeps_leading_whitespace():
+    """Leading whitespace deltas are held back, then ride in the first emitted delta
+    so the ``done`` text equals the concatenated deltas."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        for piece in ("\n", "  ", "thou", "ghts"):
+            yield {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": 0,
+                "delta": {"type": "thinking_delta", "thinking": piece},
+            }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "answer"},
+        }}
+        yield {"subtype": "success", "result": "answer"}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(), model="m", response_id="resp_1", output_item_id="msg_1",
+        chunks_buffer=[], logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    added = [p for t, p in events if t == "response.output_item.added"]
+    assert [(p["item"]["type"], p["output_index"]) for p in added] == [
+        ("reasoning", 0),
+        ("message", 1),
+    ]
+    deltas = "".join(p["delta"] for t, p in events if t == "response.reasoning_text.delta")
+    assert deltas == "\n  thoughts"
+    done_text = next(p for t, p in events if t == "response.reasoning_text.done")["text"]
+    assert done_text == deltas
+    completed = next(p for t, p in events if t == "response.completed")
+    output = completed["response"]["output"]
+    assert [i["type"] for i in output] == ["reasoning", "message"]
+    assert output[0]["summary"][0]["text"] == "\n  thoughts"
+
+
+async def test_stream_blank_thinking_between_text_segments_does_not_split_message():
+    """think(text) → text → think(blank) → text: the blank block must not close the
+    open message item, so the second text run continues at the same index."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    def _think(idx, text):
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        if text:
+            yield {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": idx,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": idx}}
+
+    async def chunk_source():
+        for ev in _think(0, "plan"):
+            yield ev
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 1,
+            "delta": {"type": "text_delta", "text": "part one "},
+        }}
+        for ev in _think(2, ""):
+            yield ev
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 3,
+            "delta": {"type": "text_delta", "text": "part two"},
+        }}
+        yield {"subtype": "success", "result": "part one part two"}
+
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(), model="m", response_id="resp_1", output_item_id="msg_1",
+        chunks_buffer=[], logger=logging.getLogger("test"),
+    ):
+        events.append(_parse_response_sse(line))
+
+    added = [p for t, p in events if t == "response.output_item.added"]
+    assert [(p["item"]["type"], p["output_index"]) for p in added] == [
+        ("reasoning", 0),
+        ("message", 1),
+    ]
+    completed = next(p for t, p in events if t == "response.completed")
+    output = completed["response"]["output"]
+    assert [i["type"] for i in output] == ["reasoning", "message"]
+    assert output[1]["content"][0]["text"] == "part one part two"
+
 
 async def test_stream_completed_output_keeps_reasoning_item_with_text():
     import logging

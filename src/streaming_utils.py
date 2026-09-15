@@ -1026,29 +1026,6 @@ def _embedded_tool_events(
     return events
 
 
-def _without_blank_reasoning(items: list) -> list:
-    """Drop reasoning items whose summary AND content never got any text.
-
-    The stream must open a reasoning item as soon as the first thinking block
-    starts (the client renders it live), so a block whose text never
-    materialises — redacted/summarised reasoning, or a provider that reports
-    thinking tokens without text — still leaves an ``output_item.added/done``
-    pair on the wire.  The terminal ``response.completed/incomplete.output``
-    is the durable record OpenAI-shaped clients store, so mirror the
-    non-stream path (``_build_completed_response``) and keep it free of empty
-    reasoning items (#198).
-    """
-    kept = []
-    for item in items:
-        if getattr(item, "type", None) == "reasoning":
-            texts = [getattr(s, "text", "") for s in (getattr(item, "summary", None) or [])]
-            texts += [getattr(c, "text", "") for c in (getattr(item, "content", None) or [])]
-            if not any((t or "").strip() for t in texts):
-                continue
-        kept.append(item)
-    return kept
-
-
 async def stream_response_chunks(
     chunk_source,
     model: str,
@@ -1095,6 +1072,14 @@ async def stream_response_chunks(
     reasoning_open = False
     reasoning_item_id: Optional[str] = None
     reasoning_text_buf: list[str] = []
+    # A thinking block has started but its reasoning output item is not open
+    # yet. The item is opened lazily on the first NON-BLANK thinking text so a
+    # block whose text never materialises (redacted/summarised reasoning, a
+    # provider that reports thinking tokens without text — #198) leaves no
+    # ``output_item.added/done`` pair on the wire and does not consume an
+    # output_index the terminal ``response.output`` would then contradict.
+    reasoning_pending = False
+    reasoning_pending_buf: list[str] = []
     thinking_seen = False
     thinking_texts: list[str] = []
     thinking_capture_buf: list[str] = []
@@ -1410,7 +1395,7 @@ async def stream_response_chunks(
                     id=response_id,
                     model=model,
                     status="incomplete",
-                    output=_without_blank_reasoning(completed_output_items),
+                    output=list(completed_output_items),
                     usage=ResponseUsage(
                         input_tokens=prompt_tokens,
                         output_tokens=completion_tokens,
@@ -1456,7 +1441,7 @@ async def stream_response_chunks(
                     id=response_id,
                     model=model,
                     status="incomplete",
-                    output=_without_blank_reasoning(completed_output_items),
+                    output=list(completed_output_items),
                     usage=ResponseUsage(
                         input_tokens=prompt_tokens,
                         output_tokens=completion_tokens,
@@ -1607,14 +1592,52 @@ async def stream_response_chunks(
                 # interleaving reasoning and message items is valid — we open a
                 # new reasoning item, we never reopen the closed one — and the
                 # later thinking blocks are preserved instead of dropped.
+                #
+                # The item itself is opened lazily (below) on the first
+                # non-blank thinking text: a block that never yields text must
+                # not leave an empty reasoning item behind (#198).
                 if in_thinking and not was_thinking:
+                    reasoning_pending = True
+                    reasoning_pending_buf = []
+                    thinking_seen = True
+
+                # Drop synthetic markers, which are state-only.  When </think>
+                # arrives (content_block_stop while in_thinking), close the
+                # reasoning item immediately so any new thinking block that
+                # follows gets a fresh output_index.  A block that ended while
+                # still pending had no text: it leaves nothing on the wire.
+                if text_delta == "<think>":
+                    _close_thinking_capture()
+                    continue
+                if text_delta == "</think>":
+                    _close_thinking_capture()
+                    reasoning_pending = False
+                    reasoning_pending_buf = []
+                    if reasoning_open:
+                        for line in _close_reasoning():
+                            yield line
+                    continue
+
+                # Inside a reasoning block: emit summary_text + reasoning_text deltas.
+                if in_thinking:
+                    thinking_capture_buf.append(text_delta)
+                if reasoning_pending and in_thinking and not reasoning_open:
+                    reasoning_pending_buf.append(text_delta)
+                    if not "".join(reasoning_pending_buf).strip():
+                        # Only whitespace so far — keep holding the item back.
+                        continue
+                    # First real reasoning text: open the item now. Leading
+                    # whitespace deltas ride along in this first delta so the
+                    # done text still equals the concatenated deltas.
+                    text_delta = "".join(reasoning_pending_buf)
+                    reasoning_pending = False
+                    reasoning_pending_buf = []
                     if message_item_opened:
                         for line in _close_message_item():
                             yield line
                     reasoning_item_id = _generate_rs_id()
                     reasoning_open = True
                     reasoning_text_buf = []
-                    thinking_seen = True
                     reasoning_item = ReasoningOutputItem(id=reasoning_item_id, status="in_progress")
                     yield make_response_sse(
                         "response.output_item.added",
@@ -1630,24 +1653,6 @@ async def stream_response_chunks(
                         part={"type": "summary_text", "text": ""},
                         sequence_number=_next_seq(),
                     )
-
-                # Drop synthetic markers, which are state-only.  When </think>
-                # arrives (content_block_stop while in_thinking), close the
-                # reasoning item immediately so any new thinking block that
-                # follows gets a fresh output_index.
-                if text_delta == "<think>":
-                    _close_thinking_capture()
-                    continue
-                if text_delta == "</think>":
-                    _close_thinking_capture()
-                    if reasoning_open:
-                        for line in _close_reasoning():
-                            yield line
-                    continue
-
-                # Inside a reasoning block: emit summary_text + reasoning_text deltas.
-                if in_thinking:
-                    thinking_capture_buf.append(text_delta)
                 if reasoning_open and in_thinking:
                     reasoning_text_buf.append(text_delta)
                     if text_delta:
@@ -1676,6 +1681,9 @@ async def stream_response_chunks(
                 if in_thinking:
                     continue
                 # If reasoning was open and we just exited it, close it now.
+                if not in_thinking:
+                    reasoning_pending = False
+                    reasoning_pending_buf = []
                 if reasoning_open and not in_thinking:
                     for line in _close_reasoning():
                         yield line
@@ -1897,7 +1905,7 @@ async def stream_response_chunks(
         id=response_id,
         model=model,
         status="completed",
-        output=_without_blank_reasoning(completed_output_items),
+        output=list(completed_output_items),
         usage=ResponseUsage(
             input_tokens=prompt_tokens,
             output_tokens=completion_tokens,
