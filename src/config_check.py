@@ -560,6 +560,35 @@ def _check_sdk_buffer() -> List[ConfigIssue]:
     return []
 
 
+def _check_workspace_quota() -> List[ConfigIssue]:
+    """``USER_WORKSPACE_QUOTA_MB`` must be a non-negative integer (MiB).
+
+    ``src.workspace_quota.workspace_quota_limit_bytes`` raises on anything else,
+    and it is consulted on every Claude turn (the PreToolUse hook is installed
+    when a quota is configured) and on every quota-dependent ``/files/*`` call.
+    Left to runtime, a typo therefore fails every turn with an opaque error
+    instead of refusing to start with the reason. Mirrors that parser with
+    os.environ only (early-import rule).
+    """
+    raw = (os.getenv("USER_WORKSPACE_QUOTA_MB") or "").strip()
+    if not raw:
+        return []
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        return [
+            ConfigIssue(
+                "error",
+                f"USER_WORKSPACE_QUOTA_MB={raw!r} is not a non-negative integer "
+                "(MiB). Every Claude turn and quota-dependent /files/* call would "
+                "fail at runtime; unset it for no quota or set a whole number of MiB.",
+            )
+        ]
+    return []
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -577,6 +606,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_claude_settings_env())
     issues.extend(_check_stall_hierarchy())
     issues.extend(_check_sdk_buffer())
+    issues.extend(_check_workspace_quota())
     return issues
 
 

@@ -48,6 +48,8 @@ Config:
   listed nor accessible. Default **false**: hiding is a presentation choice that
   belongs to the client rendering the tree, and hiding them here also blocks
   writes to the workspace's agent-resource directories.
+- ``USER_WORKSPACE_QUOTA_MB`` — optional cumulative quota for a named user's whole
+  ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
 
 Concurrency:
 - Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
@@ -55,6 +57,10 @@ Concurrency:
   continuously for every connected user; done synchronously that I/O would
   block the gateway event loop and stall everything else it serves
   (``/v1/responses`` streams, terminal websockets).
+- When cumulative quota is enabled, quota-growing file-API mutations are
+  serialized per user within this process so concurrent uploads/copies cannot
+  both pass the same preflight. Agent subprocesses and other gateway workers are
+  outside that lock; this is a soft application quota, not a filesystem quota.
 
 Security:
 - Gateway API authentication (``API_KEY`` or ``USER_API_KEYS``) MUST be configured;
@@ -67,6 +73,7 @@ Security:
   ``~/.claude`` etc.).
 """
 
+import asyncio
 import ctypes
 import errno
 import hashlib
@@ -77,6 +84,8 @@ import os
 import shutil
 import stat as stat_module
 import zipfile
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
 
@@ -89,6 +98,13 @@ from pydantic import BaseModel
 from src.auth import auth_manager, security, verify_api_key
 from src.runtime_config import get_workspace_upload_max_bytes
 from src.workspace_manager import workspace_manager
+from src.workspace_quota import (
+    WorkspaceQuotaExceeded,
+    copy_growth_bytes,
+    ensure_growth_fits,
+    quota_snapshot,
+    workspace_quota_limit_bytes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -111,6 +127,7 @@ class _MoveBody(BaseModel):
 class _ArchiveBody(BaseModel):
     paths: List[str]
 
+
 router = APIRouter(tags=["workspace-files"])
 
 _BACKEND = "claude"
@@ -123,6 +140,36 @@ _MAX_READ_BYTES = 5 * 1024 * 1024
 # WHOLE, matching how ``/v1/responses`` keys ``body.user``. Default is deliberately
 # vendor-neutral.
 _DEFAULT_USER_HEADER = "X-User-Email"
+
+# Per-process serialization for quota-increasing file API mutations. This does
+# not turn the application quota into an OS/filesystem hard quota.
+#
+# Entries are reference-counted rather than cached: a gateway serves an unbounded
+# set of named users over its lifetime, so a plain dict keyed by user root only
+# ever grows. Counting is exact instead of policy-based (LRU, TTL) because the
+# only unsafe eviction is removing a lock someone still holds or awaits, and a
+# refcount answers that question directly — no tuning, and no window where two
+# callers hold different lock objects for the same user.
+_QUOTA_LOCKS: dict[str, "_QuotaLockEntry"] = {}
+
+
+@dataclass
+class _QuotaLockEntry:
+    """One user's mutation lock plus the number of callers holding or awaiting it."""
+
+    lock: asyncio.Lock
+    users: int = 0
+
+
+# Fail closed when the quota scope cannot be determined: charging a user for a
+# root we cannot identify is worse than refusing the quota-dependent call.
+_QUOTA_SCOPE_UNAVAILABLE = {
+    "error": {
+        "message": "Workspace storage quota scope could not be determined.",
+        "type": "service_unavailable",
+        "code": "workspace_quota_accounting_unavailable",
+    }
+}
 
 
 def _max_upload_bytes() -> int:
@@ -208,6 +255,65 @@ def _workspace_root(user: str) -> Path:
         return workspace_manager.resolve(user, backend=_BACKEND)
     except ValueError:
         raise HTTPException(status_code=400, detail="invalid user identity")
+
+
+def _user_root(workspace_root: Path) -> Path:
+    """Aggregate quota root for a named user (parent of the backend directory).
+
+    The shape is verified rather than assumed. ``workspace_manager.resolve``
+    returns ``<base>/<user>/<backend-dir>`` only while a backend name is passed;
+    without one it returns ``<base>/<user>``, and this function's ``parent``
+    would then be the shared base holding **every** user's workspace. Quota would
+    silently become a global figure charged to each user individually — a wrong
+    answer that no test would notice because the numbers stay plausible.
+
+    Today ``_BACKEND`` is a module constant so that cannot happen, which is
+    exactly why the coupling deserves a check rather than a comment: the failure
+    arrives whenever someone changes the caller, not when they change this line.
+    The agent-side hook (``workspace_sandbox._quota_user_root``) already
+    validates the same shape; this keeps the HTTP mutation path from being the
+    weaker of the two.
+    """
+    resolved = Path(workspace_root).resolve()
+    try:
+        relative = resolved.relative_to(workspace_manager.base_path.resolve())
+    except (OSError, ValueError):
+        raise HTTPException(status_code=503, detail=_QUOTA_SCOPE_UNAVAILABLE)
+    if len(relative.parts) != 2 or relative.parts[0].startswith("_tmp_"):
+        raise HTTPException(status_code=503, detail=_QUOTA_SCOPE_UNAVAILABLE)
+    return resolved.parent
+
+
+@asynccontextmanager
+async def _quota_lock(user_root: Path):
+    """Hold this user's quota-mutation lock, dropping the entry when idle.
+
+    The reference count is taken **before** awaiting the lock, so a second
+    caller arriving while the first holds it finds the same entry and shares the
+    same lock — the entry can only be removed once nobody is inside or waiting.
+    Everything here runs on one event loop and no ``await`` sits between the
+    lookup and the increment, so the count cannot be observed mid-update.
+    """
+    key = str(user_root.resolve())
+    entry = _QUOTA_LOCKS.get(key)
+    if entry is None:
+        entry = _QuotaLockEntry(lock=asyncio.Lock())
+        _QUOTA_LOCKS[key] = entry
+    entry.users += 1
+    try:
+        async with entry.lock:
+            yield
+    finally:
+        entry.users -= 1
+        # The identity check matters if a test (or a future caller) cleared the
+        # registry while this request was in flight: dropping a newer entry that
+        # other callers are already sharing would split the lock in two.
+        if entry.users <= 0 and _QUOTA_LOCKS.get(key) is entry:
+            del _QUOTA_LOCKS[key]
+
+
+def _raise_quota_http(exc: WorkspaceQuotaExceeded) -> None:
+    raise HTTPException(status_code=507, detail=exc.as_detail())
 
 
 def resolve_workspace_for_request(request: Request) -> Optional[Path]:
@@ -333,16 +439,33 @@ async def get_limits(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
-    """Publish the upload ceiling so clients can refuse a file before sending it.
+    """Publish upload and cumulative workspace limits for file-manager clients."""
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    return {
+        "max_upload_bytes": _max_upload_bytes(),
+        "workspace_quota_bytes": workspace_quota_limit_bytes(),
+    }
 
-    Without this the limit is only discoverable by hitting it, and what comes
-    back is the request-boundary 413 — shaped for the responses API and phrased
-    in whole-request bytes, which no file manager can turn into "this file is
-    too big". A client that reads this number can say so before the upload.
+
+@router.get("/files/quota")
+async def get_quota(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Return current aggregate quota usage for the authenticated named user.
+
+    Usage is measured even when no limit is configured. "How much am I using?"
+    is a real question without an enforced ceiling, and a client that renders a
+    workspace needs the answer either way; reporting 0 to save a scan would
+    publish a number that is simply wrong. The "no scan unless configured" rule
+    belongs to the mutation paths (upload/copy), where the walk buys nothing.
     """
     await verify_api_key(request, credentials)
     _ensure_api_key()
-    return {"max_upload_bytes": _max_upload_bytes()}
+    root = _workspace_root(_require_user(request))
+    snapshot = await run_in_threadpool(quota_snapshot, _user_root(root))
+    return snapshot.as_dict()
 
 
 @router.get("/files/cwd")
@@ -622,6 +745,22 @@ async def set_cwd(
     return {"cwd": body.path}
 
 
+async def _write_uploaded_file(target: Path, data: bytes, no_clobber: bool) -> None:
+    """Preserve the historical upload write/no-clobber semantics."""
+    if no_clobber:
+
+        def _write_exclusive() -> None:
+            with open(target, "xb") as f:
+                f.write(data)
+
+        try:
+            await run_in_threadpool(_write_exclusive)
+        except FileExistsError:
+            raise HTTPException(status_code=409, detail="destination already exists")
+    else:
+        await run_in_threadpool(target.write_bytes, data)
+
+
 @router.post("/files/upload")
 async def upload_file(
     request: Request,
@@ -662,18 +801,40 @@ async def upload_file(
             status_code=413,
             detail=f"file exceeds the upload limit of {ceiling} bytes",
         )
-    if no_clobber:
 
-        def _write_exclusive() -> None:
-            with open(target, "xb") as f:
-                f.write(data)
+    # Keep quota-disabled deployments on the exact historical mutation path:
+    # no extra tree scan, lock, or threadpool hop.
+    if workspace_quota_limit_bytes() <= 0:
+        await _write_uploaded_file(target, data, no_clobber)
+        return {"path": str(target), "size": len(data)}
 
-        try:
-            await run_in_threadpool(_write_exclusive)
-        except FileExistsError:
+    user_root = _user_root(root)
+    async with _quota_lock(user_root):
+        if no_clobber and target.exists():
+            # Preserve the historical conflict contract before quota accounting:
+            # an already-existing destination is a 409, not a quota-dependent 507.
+            # O_EXCL in _write_uploaded_file remains the race-proof final check if
+            # the destination appears after this fast path.
             raise HTTPException(status_code=409, detail="destination already exists")
-    else:
-        await run_in_threadpool(target.write_bytes, data)
+
+        reclaimed = 0
+        if not no_clobber:
+            try:
+                if target.is_file():
+                    reclaimed = target.stat().st_size
+            except OSError:
+                reclaimed = 0
+        try:
+            await run_in_threadpool(
+                lambda: ensure_growth_fits(
+                    user_root,
+                    added_bytes=len(data),
+                    reclaimed_bytes=reclaimed,
+                )
+            )
+        except WorkspaceQuotaExceeded as exc:
+            _raise_quota_http(exc)
+        await _write_uploaded_file(target, data, no_clobber)
     return {"path": str(target), "size": len(data)}
 
 
@@ -826,42 +987,8 @@ def _copy_file_exclusive(src: Path, dst: Path) -> None:
     shutil.copystat(str(src), str(dst))
 
 
-@router.post("/files/copy")
-async def copy_entry(
-    request: Request,
-    body: _MoveBody,
-    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
-):
-    """Duplicate a file or directory inside the workspace.
-
-    Unlike ``move``, the destination must not already exist: the file-manager
-    client resolves name conflicts itself (VS Code-style ``name copy.ext``), so
-    a collision reaching this endpoint is a race we refuse rather than resolve
-    by silently overwriting someone's file. The refusal is enforced at
-    creation time (O_EXCL for files, ``copytree``'s exclusive mkdir for
-    directories) — the early ``dst.exists()`` check below is only a fast path
-    for a clear error message.
-    """
-    await verify_api_key(request, credentials)
-    _ensure_api_key()
-    root = _workspace_root(_require_user(request))
-    src = _resolve_or_403(root, body.source)
-    dst = _resolve_or_403(root, body.destination)
-    if src == root.resolve() or dst == root.resolve():
-        raise HTTPException(status_code=400, detail="invalid path")
-    if not src.exists():
-        raise HTTPException(status_code=404, detail="source not found")
-    if dst.exists():
-        raise HTTPException(status_code=409, detail="destination already exists")
-    if not dst.parent.is_dir():
-        raise HTTPException(status_code=404, detail="destination directory not found")
-    is_dir = src.is_dir() and not src.is_symlink()
-    # Only regular files and directories are copyable — a FIFO/socket/device
-    # in the workspace must be a deterministic 4xx, not a blocked worker. This
-    # is a fast path for the error message; the race-proof check is the fstat
-    # on the opened fd inside _copy_file_exclusive.
-    if not is_dir and not src.is_file():
-        raise HTTPException(status_code=400, detail="unsupported file type")
+async def _perform_copy(src: Path, dst: Path, is_dir: bool) -> None:
+    """Perform the historical copy operation and preserve its error contract."""
     try:
         if is_dir:
             # Copying a directory into its own subtree would recurse forever.
@@ -892,6 +1019,66 @@ async def copy_entry(
         raise HTTPException(
             status_code=400, detail="directory contains entries that cannot be copied"
         )
+
+
+@router.post("/files/copy")
+async def copy_entry(
+    request: Request,
+    body: _MoveBody,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Duplicate a file or directory inside the workspace.
+
+    Unlike ``move``, the destination must not already exist: the file-manager
+    client resolves name conflicts itself (VS Code-style ``name copy.ext``), so
+    a collision reaching this endpoint is a race we refuse rather than resolve
+    by silently overwriting someone's file. The refusal is enforced at
+    creation time (O_EXCL for files, ``copytree``'s exclusive mkdir for
+    directories) — the early ``dst.exists()`` check below is only a fast path
+    for a clear error message.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    src = _resolve_or_403(root, body.source)
+    dst = _resolve_or_403(root, body.destination)
+    if src == root.resolve() or dst == root.resolve():
+        raise HTTPException(status_code=400, detail="invalid path")
+    if not src.exists():
+        raise HTTPException(status_code=404, detail="source not found")
+    if dst.exists():
+        raise HTTPException(status_code=409, detail="destination already exists")
+    if not dst.parent.is_dir():
+        raise HTTPException(status_code=404, detail="destination directory not found")
+    is_dir = src.is_dir() and not src.is_symlink()
+    # Preserve validation precedence before any quota/accounting work. An invalid
+    # self/subtree directory copy is a deterministic 400 regardless of whether
+    # cumulative quota is enabled or whether the workspace is near its limit.
+    if is_dir and (dst == src or src in dst.parents):
+        raise HTTPException(status_code=400, detail="cannot copy a directory into itself")
+    # Only regular files and directories are copyable — a FIFO/socket/device
+    # in the workspace must be a deterministic 4xx, not a blocked worker. This
+    # is a fast path for the error message; the race-proof check is the fstat
+    # on the opened fd inside _copy_file_exclusive.
+    if not is_dir and not src.is_file():
+        raise HTTPException(status_code=400, detail="unsupported file type")
+
+    # Quota-disabled deployments retain the exact historical path: no extra
+    # scan, lock, or threadpool call before the copy.
+    if workspace_quota_limit_bytes() <= 0:
+        await _perform_copy(src, dst, is_dir)
+    else:
+        user_root = _user_root(root)
+        async with _quota_lock(user_root):
+            added_bytes = await run_in_threadpool(copy_growth_bytes, src)
+            try:
+                await run_in_threadpool(
+                    lambda: ensure_growth_fits(user_root, added_bytes=added_bytes)
+                )
+            except WorkspaceQuotaExceeded as exc:
+                _raise_quota_http(exc)
+            await _perform_copy(src, dst, is_dir)
+
     return {
         "source": body.source,
         "destination": body.destination,
