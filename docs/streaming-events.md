@@ -55,7 +55,10 @@ response.completed
 ```
 
 Failures emit `response.failed`. Empty SDK output is also surfaced as
-`response.failed` so clients receive a definite terminal event.
+`response.failed` so clients receive a definite terminal event. A thinking
+block that never produces text counts as empty: no reasoning item is opened
+for it, so a stream holding only such a block fails with `empty_response`
+rather than completing with a synthesized empty message.
 
 An explicitly interrupted Claude response emits `response.incomplete`. Partial
 assistant text remains in the output, the turn is committed, and its response

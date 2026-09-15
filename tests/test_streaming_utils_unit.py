@@ -2721,3 +2721,88 @@ async def test_stream_completed_output_keeps_reasoning_item_with_text():
     completed = next(p for t, p in events if t == "response.completed")
     types = [item["type"] for item in completed["response"]["output"]]
     assert types == ["reasoning", "message"]
+
+
+async def test_stream_blank_thinking_only_turn_is_empty_not_a_phantom_completion():
+    """thinking start -> whitespace-only thinking -> stop -> EOF.
+
+    Nothing was emitted for the block (deferred open never fired), so the turn
+    must surface as ``stream_result["empty"]`` for the route to fail — not as a
+    synthesized empty message item plus a successful ``response.completed``.
+    """
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    async def chunk_source():
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": 0,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_delta", "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": " \n\t"},
+        }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": 0}}
+        yield {"subtype": "success", "result": ""}
+
+    stream_result: dict = {}
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(), model="m", response_id="resp_1", output_item_id="msg_1",
+        chunks_buffer=[], logger=logging.getLogger("test"), stream_result=stream_result,
+    ):
+        events.append(_parse_response_sse(line))
+
+    types = [t for t, _ in events]
+    assert not [t for t in types if t.startswith("response.reasoning")]
+    assert "response.output_item.added" not in types
+    assert "response.output_item.done" not in types
+    assert "response.completed" not in types
+    assert "response.failed" not in types  # the route decides how to fail
+    assert stream_result["success"] is False
+    assert stream_result["empty"] is True
+
+
+async def test_stream_blank_thinking_then_real_thinking_is_a_thinking_only_turn():
+    """A blank block followed by a real one is still a thinking-only turn: the
+    real block opens an item, so finalization closes with the trailing empty
+    message and completes instead of reporting empty."""
+    import logging
+    from src.streaming_utils import stream_response_chunks
+
+    def _think(idx, text):
+        yield {"type": "stream_event", "event": {
+            "type": "content_block_start", "index": idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }}
+        if text:
+            yield {"type": "stream_event", "event": {
+                "type": "content_block_delta", "index": idx,
+                "delta": {"type": "thinking_delta", "thinking": text},
+            }}
+        yield {"type": "stream_event", "event": {"type": "content_block_stop", "index": idx}}
+
+    async def chunk_source():
+        for ev in _think(0, ""):
+            yield ev
+        for ev in _think(1, "real"):
+            yield ev
+        yield {"subtype": "success", "result": ""}
+
+    stream_result: dict = {}
+    events = []
+    async for line in stream_response_chunks(
+        chunk_source(), model="m", response_id="resp_1", output_item_id="msg_1",
+        chunks_buffer=[], logger=logging.getLogger("test"), stream_result=stream_result,
+    ):
+        events.append(_parse_response_sse(line))
+
+    added = [p for t, p in events if t == "response.output_item.added"]
+    assert [(p["item"]["type"], p["output_index"]) for p in added] == [
+        ("reasoning", 0),
+        ("message", 1),
+    ]
+    completed = next(p for t, p in events if t == "response.completed")
+    assert [i["type"] for i in completed["response"]["output"]] == ["reasoning", "message"]
+    assert stream_result["success"] is True
+    assert not stream_result.get("empty")

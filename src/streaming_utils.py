@@ -1080,7 +1080,13 @@ async def stream_response_chunks(
     # output_index the terminal ``response.output`` would then contradict.
     reasoning_pending = False
     reasoning_pending_buf: list[str] = []
-    thinking_seen = False
+    # True once a reasoning output item has actually been OPENED on the wire
+    # (first non-blank thinking text). Finalization uses it to tell a
+    # thinking-only turn (reasoning emitted, needs a trailing empty message
+    # item) from an empty turn. A thinking block that started but never
+    # produced text is not output: it emits nothing, and a stream holding only
+    # such a block is an empty turn, not a phantom successful completion.
+    reasoning_emitted = False
     thinking_texts: list[str] = []
     thinking_capture_buf: list[str] = []
     # Every completed output item (reasoning and message) in emission order.
@@ -1599,7 +1605,6 @@ async def stream_response_chunks(
                 if in_thinking and not was_thinking:
                     reasoning_pending = True
                     reasoning_pending_buf = []
-                    thinking_seen = True
 
                 # Drop synthetic markers, which are state-only.  When </think>
                 # arrives (content_block_stop while in_thinking), close the
@@ -1637,6 +1642,7 @@ async def stream_response_chunks(
                             yield line
                     reasoning_item_id = _generate_rs_id()
                     reasoning_open = True
+                    reasoning_emitted = True
                     reasoning_text_buf = []
                     reasoning_item = ReasoningOutputItem(id=reasoning_item_id, status="in_progress")
                     yield make_response_sse(
@@ -1868,7 +1874,10 @@ async def stream_response_chunks(
     # (AskUserQuestion hook path).  Signal "empty" via stream_result and let
     # the route decide.  When reasoning was emitted (thinking-only response),
     # we still need to close the stream cleanly with an empty message item.
-    if not content_sent and not thinking_seen:
+    # A thinking block that never produced text does not count: nothing was
+    # put on the wire for it, so completing here would synthesize an empty
+    # message and a successful terminal event for a turn with no output.
+    if not content_sent and not reasoning_emitted:
         logger.info("Responses stream: no text content yielded")
         stream_result["success"] = False
         stream_result["empty"] = True
