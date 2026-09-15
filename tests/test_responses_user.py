@@ -469,29 +469,22 @@ def test_build_completed_response_uses_caller_supplied_visible_text():
     assert msg.content[0].text == "the answer"
 
 
-def _parse_sse_completed_id(sse_text: str) -> str:
-    """Pull the response id out of the response.completed SSE event."""
-    event = None
-    for line in sse_text.splitlines():
-        if line.startswith("event:"):
-            event = line.split(":", 1)[1].strip()
-        elif line.startswith("data:") and event == "response.completed":
-            payload = json.loads(line.split(":", 1)[1].strip())
-            return payload["response"]["id"]
-    raise AssertionError("no response.completed event in stream:\n" + sse_text)
+class TestStreamingBlankThinkingTurnIsEmpty:
+    """A streaming turn whose only output is a thinking block that never
+    produces text is an EMPTY turn, not a success.
 
-
-class TestStreamingEmptyThinkingTurnCommitted:
-    """A streaming turn that opens a thinking block but emits no thinking
-    deltas and no visible text still reports success (response.completed).
-    The turn MUST be committed so the resp_id the client already received
-    stays continuable — otherwise GET 404s and a follow-up sees a future
-    turn. Regression for the silently-dropped-turn bug."""
+    Nothing was emitted for the block (the reasoning item is opened lazily on
+    the first non-blank thinking text), so completing would synthesize an
+    empty message item and a successful ``response.completed`` for a turn
+    with no output — and commit that phantom turn into the session. Instead
+    the stream reports ``empty`` and the route fails it exactly like any other
+    empty SDK output (``response.failed`` / ``empty_response``); the session
+    client is torn down and the turn is not committed, so the next request
+    replays gateway history. Regression for the post-merge follow-up on #197.
+    """
 
     @staticmethod
-    async def _thinking_only_stream(client, prompt, session):
-        # content_block_start of type thinking sets thinking_seen=True, but
-        # no thinking_delta / text_delta ever arrives.
+    async def _blank_thinking_only_stream(client, prompt, session):
         yield {
             "type": "stream_event",
             "event": {
@@ -501,18 +494,25 @@ class TestStreamingEmptyThinkingTurnCommitted:
         }
         yield {
             "type": "stream_event",
+            "event": {
+                "type": "content_block_delta",
+                "delta": {"type": "thinking_delta", "thinking": "  \n"},
+            },
+        }
+        yield {
+            "type": "stream_event",
             "event": {"type": "content_block_stop"},
         }
         yield {"subtype": "success", "result": ""}
 
-    def test_empty_thinking_stream_leaves_resp_id_continuable(
+    def test_blank_thinking_stream_fails_as_empty_and_is_not_committed(
         self, isolated_session_manager
     ):
         mock_wm = MagicMock()
         mock_wm.resolve.return_value = Path("/tmp/ws/alice")
 
         with client_context_with_workspace(mock_wm) as (client, mock_cli):
-            mock_cli.run_completion_with_client = self._thinking_only_stream
+            mock_cli.run_completion_with_client = self._blank_thinking_only_stream
             resp = client.post(
                 "/v1/responses",
                 json={
@@ -523,34 +523,44 @@ class TestStreamingEmptyThinkingTurnCommitted:
                 },
             )
             assert resp.status_code == 200
-            resp_id = _parse_sse_completed_id(resp.text)
+            events = _sse_events(resp.text)
+            types = [t for t, _ in events]
+            assert "response.completed" not in types, resp.text
+            assert not [t for t in types if t.startswith("response.reasoning")]
+            assert "response.output_item.added" not in types
+            failed = next(p for t, p in events if t == "response.failed")
+            assert failed["response"]["error"]["code"] == "empty_response"
 
-            # Turn must have been committed: session advanced + GET works.
+            # Not committed: the session never advanced past turn 0.
+            resp_id = failed["response"]["id"]
             session_id = resp_id.rsplit("_", 2)[1]
             session = isolated_session_manager.peek_session(session_id)
-            assert session is not None
-            assert session.turn_counter == 1
+            assert session is None or session.turn_counter == 0
 
-            got = client.get(f"/v1/responses/{resp_id}", params={"user": "alice"})
-            assert got.status_code == 200
-
-            # And a follow-up using it must not be rejected as a future turn
-            # (the committed turn makes the resp_id a valid parent).
+            # The gateway keeps serving: a fresh turn on the same client works.
             async def _normal_stream(client, prompt, session):
-                yield {"subtype": "success", "result": "follow-up answer"}
+                yield {"subtype": "success", "result": "answer"}
 
             mock_cli.run_completion_with_client = _normal_stream
-            mock_cli.parse_message = MagicMock(return_value="follow-up answer")
+            mock_cli.parse_message = MagicMock(return_value="answer")
             followup = client.post(
                 "/v1/responses",
-                json={
-                    "model": DEFAULT_MODEL,
-                    "input": "again",
-                    "user": "alice",
-                    "previous_response_id": resp_id,
-                },
+                json={"model": DEFAULT_MODEL, "input": "again", "user": "alice"},
             )
             assert followup.status_code == 200
+
+
+def _sse_events(sse_text: str) -> list:
+    """(event_type, payload) pairs from a raw SSE body."""
+    out = []
+    event = None
+    for line in sse_text.splitlines():
+        if line.startswith("event:"):
+            event = line.split(":", 1)[1].strip()
+        elif line.startswith("data:") and event is not None:
+            out.append((event, json.loads(line.split(":", 1)[1].strip())))
+            event = None
+    return out
 
 
 def test_build_completed_response_drops_empty_thinking_texts():
