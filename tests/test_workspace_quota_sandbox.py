@@ -174,3 +174,102 @@ async def test_anonymous_workspace_is_not_charged_named_user_quota(
     )
 
     assert result == {}
+
+
+async def test_quota_preflight_io_runs_off_the_event_loop(managed_workspace, monkeypatch):
+    """The async hook must not execute the O(files) accounting scan on the loop.
+
+    A quota check blocked in a worker thread leaves the loop free: an
+    independent task keeps advancing while the hook is in flight, and the hook
+    is observably still pending at that moment. Run on the loop, the blocking
+    call would freeze every other coroutine — and the hook would already be
+    finished by the time this coroutine regained control.
+    """
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_ensure_growth_fits(*_args, **_kwargs):
+        started.set()
+        # Bounded so a regression fails instead of hanging the suite.
+        release.wait(timeout=5)
+
+    monkeypatch.setattr(sandbox, "ensure_growth_fits", blocking_ensure_growth_fits)
+    hook = sandbox.make_workspace_sandbox_hook(managed_workspace)
+
+    hook_task = asyncio.create_task(
+        _call(hook, "Write", {"file_path": str(managed_workspace / "a.txt"), "content": "x"})
+    )
+    ticks = 0
+    for _ in range(500):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+        ticks += 1
+    assert started.is_set(), "quota preflight never ran"
+    # The scan is blocked in a worker while this coroutine is running: the loop
+    # is responsive and the hook has not returned yet.
+    assert not hook_task.done(), "quota preflight ran synchronously on the event loop"
+
+    release.set()
+    assert await hook_task == {}
+
+
+async def test_edit_projection_read_runs_off_the_event_loop(managed_workspace, monkeypatch):
+    """The Edit/MultiEdit ``read_text`` projection is also blocking I/O."""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+    real_read_text = Path.read_text
+
+    target = managed_workspace / "doc.txt"
+    target.write_text("hello")
+
+    def slow_read_text(self, *args, **kwargs):
+        if self == target:
+            started.set()
+            release.wait(timeout=5)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", slow_read_text)
+    hook = sandbox.make_workspace_sandbox_hook(managed_workspace)
+
+    hook_task = asyncio.create_task(
+        _call(
+            hook,
+            "Edit",
+            {"file_path": str(target), "old_string": "hello", "new_string": "hello!"},
+        )
+    )
+    for _ in range(500):
+        if started.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert started.is_set()
+    assert not hook_task.done(), "Edit projection read ran synchronously on the event loop"
+
+    release.set()
+    assert await hook_task == {}
+
+
+async def test_accounting_failure_denies_growth_instead_of_raising(managed_workspace, monkeypatch):
+    """An unreadable subtree is never counted as zero: the hook fails closed."""
+    from src.workspace_quota import WorkspaceQuotaAccountingError
+
+    def failing_ensure_growth_fits(*_args, **_kwargs):
+        raise WorkspaceQuotaAccountingError(
+            managed_workspace / "blocked", PermissionError(13, "Permission denied")
+        )
+
+    monkeypatch.setattr(sandbox, "ensure_growth_fits", failing_ensure_growth_fits)
+    hook = sandbox.make_workspace_sandbox_hook(managed_workspace)
+
+    result = await _call(
+        hook, "Write", {"file_path": str(managed_workspace / "a.txt"), "content": "x"}
+    )
+
+    assert _is_deny(result)
+    reason = result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "could not be measured safely" in reason

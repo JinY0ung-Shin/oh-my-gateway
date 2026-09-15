@@ -16,6 +16,7 @@ implicitly turning on the otherwise opt-in path-boundary policy.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -26,6 +27,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from src.workspace_manager import workspace_manager
 from src.workspace_quota import (
+    WorkspaceQuotaAccountingError,
     WorkspaceQuotaExceeded,
     ensure_growth_fits,
     quota_snapshot,
@@ -331,49 +333,88 @@ def _quota_write_projection(
     return None
 
 
-def _quota_denial(
+def _quota_preflight_reason(
     workspace_root: Path,
-    user_root: Optional[Path],
+    user_root: Path,
     tool_name: str,
     tool_input: dict,
-    path: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    """Preflight deterministic Claude writes against the aggregate user quota."""
-    if user_root is None or not isinstance(path, str) or not path:
-        return None
+    path: str,
+) -> Optional[str]:
+    """Blocking half of the quota preflight: return a denial reason or ``None``.
+
+    Everything here touches the filesystem — ``Path.resolve``, ``stat``, the
+    ``read_text`` an Edit projection needs, and the recursive ``scandir`` walk
+    behind ``quota_snapshot``/``ensure_growth_fits`` — so it must run in a
+    worker thread (see :func:`_quota_denial`), never on the gateway event loop.
+    """
     target = _resolve_within_any([workspace_root], path)
     if target is None:
         return None
 
-    projection = _quota_write_projection(tool_name, tool_input, target)
-    if projection is None:
-        # NotebookEdit and un-decodable/racy edits cannot be predicted safely.
-        # If the workspace is already full, refuse another opaque write; below
-        # the limit the soft quota permits it and the next check observes usage.
-        snapshot = quota_snapshot(user_root)
-        if snapshot.enabled and snapshot.used_bytes >= snapshot.limit_bytes:
-            return _deny(
-                "Workspace quota: storage is full "
-                f"({snapshot.used_bytes}/{snapshot.limit_bytes} bytes). "
-                "Delete files before another write."
-            )
-        return None
-
-    added, reclaimed = projection
     try:
+        projection = _quota_write_projection(tool_name, tool_input, target)
+        if projection is None:
+            # NotebookEdit and un-decodable/racy edits cannot be predicted safely.
+            # If the workspace is already full, refuse another opaque write; below
+            # the limit the soft quota permits it and the next check observes usage.
+            snapshot = quota_snapshot(user_root)
+            if snapshot.enabled and snapshot.used_bytes >= snapshot.limit_bytes:
+                return (
+                    "Workspace quota: storage is full "
+                    f"({snapshot.used_bytes}/{snapshot.limit_bytes} bytes). "
+                    "Delete files before another write."
+                )
+            return None
+
+        added, reclaimed = projection
         ensure_growth_fits(
             user_root,
             added_bytes=added,
             reclaimed_bytes=reclaimed,
         )
     except WorkspaceQuotaExceeded as exc:
-        return _deny(
+        return (
             "Workspace quota exceeded: "
             f"used {exc.used_bytes} bytes, limit {exc.limit_bytes} bytes, "
             f"projected {exc.projected_bytes} bytes. Delete files or reduce "
             "the write before retrying."
         )
+    except WorkspaceQuotaAccountingError as exc:
+        # Same fail-closed rule as the file API: an unreadable or I/O-failed
+        # subtree is never counted as zero bytes, so a quota-growing write is
+        # refused rather than allowed on an undercounted total.
+        return (
+            "Workspace quota: storage usage could not be measured safely "
+            f"({exc.detail.get('error', {}).get('message', 'accounting failed')}). "
+            "The write was refused rather than allowed against an incomplete total."
+        )
     return None
+
+
+async def _quota_denial(
+    workspace_root: Path,
+    user_root: Optional[Path],
+    tool_name: str,
+    tool_input: dict,
+    path: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    """Preflight deterministic Claude writes against the aggregate user quota.
+
+    The projection/accounting work is O(files) filesystem I/O (recursive
+    ``scandir``/``stat``, plus ``read_text`` of an Edit target). The hook is
+    an ``async`` callback on the gateway's event loop — the same loop serving
+    every ``/v1/responses`` stream and websocket — so that work is offloaded
+    to a worker thread exactly like the file API's ``run_in_threadpool``
+    quota scans. Only the decision shaping happens on the loop.
+    """
+    if user_root is None or not isinstance(path, str) or not path:
+        return None
+    reason = await asyncio.to_thread(
+        _quota_preflight_reason, workspace_root, user_root, tool_name, tool_input, path
+    )
+    if reason is None:
+        return None
+    return _deny(reason)
 
 
 # Matches path-like substrings beginning with ``/`` (absolute), ``./`` or
@@ -499,7 +540,7 @@ def make_workspace_sandbox_hook(workspace_root: Path):
             path = tool_input.get(key)
 
             if category == "write":
-                quota_result = _quota_denial(
+                quota_result = await _quota_denial(
                     workspace_root,
                     quota_user_root,
                     tool_name,

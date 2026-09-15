@@ -10,9 +10,8 @@ USER_WORKSPACE_QUOTA_MB=500
 
 This is separate from the existing single-file upload controls:
 
-- `WORKSPACE_UPLOAD_MAX_BYTES` limits one `POST /files/upload` file. Its default is 10 MiB.
-- `MAX_REQUEST_SIZE` limits the whole HTTP request body. Its default is also 10 MiB.
-- Multipart overhead means the actual advertised per-file upload ceiling is `min(WORKSPACE_UPLOAD_MAX_BYTES, MAX_REQUEST_SIZE - 8192)`.
+- `WORKSPACE_UPLOAD_MAX_BYTES` seeds the runtime-configurable `workspace_upload_max_bytes` (admin `runtime-config`), which limits one `POST /files/upload` file. Its default is 10 MiB; `0` disables uploads.
+- `MAX_REQUEST_SIZE` limits the whole HTTP request body for ordinary API requests. Its default is also 10 MiB. An authenticated `POST /files/upload` uses the upload-specific ceiling plus multipart envelope room instead, so the advertised `max_upload_bytes` is exactly what the route accepts.
 - `USER_WORKSPACE_QUOTA_MB` limits the aggregate user workspace. It does not replace either request/upload limit.
 
 ## Scope
@@ -42,6 +41,8 @@ When the cumulative quota is disabled, the upload/copy path does not scan worksp
 ## Claude agent writes
 
 When the quota is enabled, the existing Claude `PreToolUse` hook transport is also installed for workspace writes whose projected final size can be estimated. `Write`, `Edit`, and `MultiEdit` receive a **best-effort projected-size preflight**. Enabling the quota does **not** implicitly enable `WORKSPACE_SANDBOX_ENABLED`; path-boundary policy remains a separate setting.
+
+The hook runs on the gateway's event loop, so its filesystem work (`read_text` of an Edit target, the recursive `scandir`/`stat` walk behind the usage scan) is executed in a worker thread — the same rule the file API follows with `run_in_threadpool` — and only the allow/deny decision is shaped on the loop. A large or slow (network-backed) workspace therefore delays that one tool call, not every other stream and websocket the process is serving. If accounting itself fails (unreadable or I/O-failed subtree), the hook denies the write with an explanatory reason rather than allowing it against an undercounted total, matching the file API's `503`.
 
 The Claude hook does **not** reserve bytes between `PreToolUse` approval and the later tool execution. Consequently, two concurrent sessions for the same named user can both inspect the same pre-write usage, each independently fit, and then together push the workspace above the configured limit. This is an intentional limitation of the soft quota, not a serialized guarantee for deterministic agent writes. Multiple gateway processes introduce the same class of race. Once the workspace is over quota, subsequent deterministic growth is denied by later preflight checks until usage is reduced; shrinking replacements remain allowed when their projected result fits.
 
