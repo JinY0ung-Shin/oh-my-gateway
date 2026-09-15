@@ -1112,17 +1112,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
     async def verify(self) -> bool:
         """Verify Claude Agent SDK is working and authenticated."""
+        # The CLI's structured error text. The pinned SDK replaces the
+        # trailing ProcessError with "Claude Code returned an error result:
+        # <subtype>" — for an API failure that subtype is literally
+        # "success", so the only actionable text ("API Error: 400 …") lives
+        # in the result message we saw just before the crash. Keep it.
+        #
+        # Initialised OUTSIDE the try: the except below reads it, and an early
+        # failure (``_build_sdk_options`` raising) must surface its own error,
+        # not an UnboundLocalError from the diagnostic bookkeeping.
+        last_error_result = ""
         try:
             logger.info("Testing Claude Agent SDK...")
 
             options = self._build_sdk_options(max_turns=1)
             messages = []
-            # The CLI's structured error text. The pinned SDK replaces the
-            # trailing ProcessError with "Claude Code returned an error result:
-            # <subtype>" — for an API failure that subtype is literally
-            # "success", so the only actionable text ("API Error: 400 …") lives
-            # in the result message we saw just before the crash. Keep it.
-            last_error_result = ""
             async for message in query(
                 prompt="Hello",
                 options=options,
