@@ -333,7 +333,13 @@ def _build_completed_response(
     structured_output: Any = None,
 ) -> ResponseObject:
     output_items: List[Any] = []
+    # A thinking block whose text never materialised (the SDK reports
+    # thinking_tokens but hands us no thinking text, e.g. redacted/summarised
+    # reasoning) would become a reasoning item with an empty summary AND empty
+    # content. That is pure noise for OpenAI-shaped clients — drop it.
     for t in thinking_texts or []:
+        if not (t or "").strip():
+            continue
         output_items.append(
             ReasoningOutputItem(
                 id=_generate_rs_id(),

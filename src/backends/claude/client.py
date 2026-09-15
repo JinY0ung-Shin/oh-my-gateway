@@ -287,6 +287,22 @@ class UnsupportedContinuationPolicy(ValueError):
     """
 
 
+
+def _error_result_text(message: Any) -> str:
+    """Return the CLI's ``result`` text when ``message`` is an error result.
+
+    Works for both the SDK's ``ResultMessage`` object and the raw dict shape so
+    the verify probe can surface "API Error: 400 …" instead of the subtype.
+    """
+    if isinstance(message, dict):
+        if message.get("type") != "result" or not message.get("is_error"):
+            return ""
+        return str(message.get("result") or "")
+    if getattr(message, "is_error", False) and hasattr(message, "result"):
+        return str(getattr(message, "result", "") or "")
+    return ""
+
+
 class ClaudeCodeCLI(TokenEstimateMixin):
     """Gateway for Claude Agent SDK queries.
 
@@ -1037,6 +1053,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     # Env vars from other backends that must be hidden during Claude SDK calls
     _ISOLATION_VARS = ["OPENAI_API_KEY"]
 
+    def _isolation_vars(self) -> List[str]:
+        """Class defaults merged with the auth provider's mode-specific list."""
+        merged = list(self._ISOLATION_VARS)
+        try:
+            for key in self.get_auth_provider().get_isolation_vars():
+                if key not in merged:
+                    merged.append(key)
+        except Exception:  # pragma: no cover - provider construction is env-only
+            logger.debug("auth provider isolation vars unavailable", exc_info=True)
+        return merged
+
     @contextlib.contextmanager
     def _sdk_env(self):
         """Temporarily inject auth env vars for an SDK call.
@@ -1057,8 +1084,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 original[key] = os.environ.get(key)
                 os.environ[key] = value
 
-            # Remove other backends' credentials (cross-isolation)
-            for key in self._ISOLATION_VARS:
+            # Remove other backends' credentials (cross-isolation) plus whatever
+            # the auth provider says must not reach the CLI in the chosen auth
+            # mode (api_key mode strips a leftover CLAUDE_CODE_OAUTH_TOKEN so the
+            # CLI cannot prefer it over ANTHROPIC_AUTH_TOKEN and leak it to a
+            # custom ANTHROPIC_BASE_URL).
+            for key in self._isolation_vars():
                 if key in os.environ:
                     removed[key] = os.environ.pop(key)
 
@@ -1081,6 +1112,16 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
     async def verify(self) -> bool:
         """Verify Claude Agent SDK is working and authenticated."""
+        # The CLI's structured error text. The pinned SDK replaces the
+        # trailing ProcessError with "Claude Code returned an error result:
+        # <subtype>" — for an API failure that subtype is literally
+        # "success", so the only actionable text ("API Error: 400 …") lives
+        # in the result message we saw just before the crash. Keep it.
+        #
+        # Initialised OUTSIDE the try: the except below reads it, and an early
+        # failure (``_build_sdk_options`` raising) must surface its own error,
+        # not an UnboundLocalError from the diagnostic bookkeeping.
+        last_error_result = ""
         try:
             logger.info("Testing Claude Agent SDK...")
 
@@ -1096,7 +1137,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
                 if msg_type == "assistant":
                     break
+                last_error_result = _error_result_text(message) or last_error_result
 
+            if last_error_result:
+                logger.error(
+                    "Claude Agent SDK verification failed: CLI reported an error "
+                    "result: %s",
+                    last_error_result,
+                )
+                return False
             if messages:
                 logger.info("Claude Agent SDK verified successfully")
                 return True
@@ -1105,7 +1154,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 return False
 
         except Exception as e:
-            logger.error(f"Claude Agent SDK verification failed: {e}")
+            detail = f"{e}"
+            if last_error_result and last_error_result not in detail:
+                detail = f"{detail} (CLI result: {last_error_result})"
+            logger.error(f"Claude Agent SDK verification failed: {detail}")
             logger.warning("Please ensure Claude Code is installed and authenticated:")
             logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
             logger.warning("  2. Set ANTHROPIC_AUTH_TOKEN environment variable")
