@@ -44,6 +44,7 @@ _CHECKED_VARS = [
     "BASH_MAX_TIMEOUT_MS",
     "BASH_DEFAULT_TIMEOUT_MS",
     "CLAUDE_MAX_BUFFER_SIZE",
+    "USER_WORKSPACE_QUOTA_MB",
 ]
 
 
@@ -537,3 +538,25 @@ async def test_lifespan_escape_hatch_allows_startup(clean_env):
             started = True
 
     assert started
+
+
+# ---------------------------------------------------------------------------
+# USER_WORKSPACE_QUOTA_MB — consulted on every Claude turn once configured
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", ["500", "0", " 12 "])
+def test_workspace_quota_valid_values_are_quiet(clean_env, value):
+    clean_env.setenv("USER_WORKSPACE_QUOTA_MB", value)
+    assert not [m for m in _messages(check_config(), "error") if "QUOTA" in m]
+    assert not [m for m in _messages(check_config(), "warning") if "QUOTA" in m]
+
+
+@pytest.mark.parametrize("value", ["abc", "-1", "1.5", "500MB"])
+def test_workspace_quota_invalid_value_is_startup_error(clean_env, value):
+    """A typo must refuse startup, not fail every turn at runtime."""
+    clean_env.setenv("USER_WORKSPACE_QUOTA_MB", value)
+    errors = [m for m in _messages(check_config(), "error") if "QUOTA" in m]
+    assert len(errors) == 1
+    assert "non-negative integer" in errors[0]
+    assert repr(value) in errors[0]
