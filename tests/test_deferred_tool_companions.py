@@ -179,3 +179,50 @@ def test_every_advertised_capability_names_the_tools_it_needs():
     # the rollup is derived, never declared as a required-tool entry
     assert "deferred_delivery_available" not in constants._DEFERRED_CAPABILITY_TOOLS
     assert "deferred_delivery_available" in constants.deferred_capabilities()
+
+
+@pytest.fixture
+def public_client():
+    """TestClient for the public catalog route (no admin credentials)."""
+    with patch.dict(os.environ, {"ADMIN_API_KEY": "test-admin-key"}):
+        from src.main import app
+
+        yield TestClient(app)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, False),  # shipped default blocks both schedulers
+        ("", True),
+        ("ScheduleWakeup", True),  # cron survives, so a payoff can still land
+        ("CronCreate,ScheduleWakeup", False),
+    ],
+)
+def test_catalog_endpoint_reports_the_scheduling_capability(
+    monkeypatch, public_client, raw, expected
+):
+    """A composer without admin credentials reads this off the catalog it already GETs.
+
+    `/loop` is in the catalog whichever way `BLOCKED_DEFERRED_TOOLS` is set — the
+    command exists, only its payoff tool may be gone. Before this the answer lived
+    on `/admin/api/server-info` alone, so a client surface could only discover a
+    blocked scheduler by running the turn (ChatDRAGON #397).
+    """
+    constants = _reload_constants(monkeypatch, raw)
+    from src.backends.claude import slash_commands as sc_module
+
+    async def fake_details(cwd=None, force=False):
+        return {"loop": {"description": "Repeat work", "argument_hint": "[interval]"}}
+
+    with patch.object(sc_module, "get_command_details", side_effect=fake_details):
+        body = public_client.get("/v1/slash-commands").json()
+
+    assert body["deferred_delivery_available"] is expected
+    # the command itself is never filtered by capability — that call belongs to the
+    # client that knows whether it can poll for the payoff at all
+    assert [c["name"] for c in body["commands"]] == ["loop"]
+    # and the flags agree with the admin endpoint, computed from the same tools
+    assert {
+        k: body[k] for k in constants.deferred_capabilities()
+    } == constants.deferred_capabilities()

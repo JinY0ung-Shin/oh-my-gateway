@@ -63,10 +63,21 @@ async def list_slash_commands(
     gateway agrees if it can see this list. Omitting the names does not hide
     anything: the rejection message already names the command, and the set is
     the operator's own configuration.
+
+    The deferred-scheduling capability flags ride along for the same reason.
+    Whether ``/loop`` can work here is not a property of the command — the name
+    is in the catalog either way — but of whether ``CronCreate``/
+    ``ScheduleWakeup`` survived ``BLOCKED_DEFERRED_TOOLS``. Until now that
+    answer lived only on ``/admin/api/server-info``, so a composer without
+    admin credentials could only find out by running the turn and watching the
+    model improvise a one-off reply (ChatDRAGON issue #397, measured). These
+    are the same values that endpoint reports, computed from the tools each
+    capability needs.
     """
     await verify_api_key(request, credentials)
 
     from src.backends.claude import slash_commands
+    from src.backends.claude.constants import deferred_capabilities
 
     try:
         details = await slash_commands.get_command_details()
@@ -85,6 +96,7 @@ async def list_slash_commands(
         "commands": allowed,
         "total": len(allowed),
         "blocked": sorted(slash_commands.BLOCKED_COMMANDS),
+        **deferred_capabilities(),
     }
 
 
