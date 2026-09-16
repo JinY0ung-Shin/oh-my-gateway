@@ -55,6 +55,14 @@ async def list_slash_commands(
     completion, so each entry carries the SDK's description/argument hint.
     Blocked names are excluded — sending one returns 400 blocked_command, so
     they must never be offered for completion.
+
+    ``blocked`` names them anyway (issue #203). A client that owns a multi-user
+    boundary
+    refuses host-scoped commands on its own turn path (it cannot rely on this
+    gateway's env being set), and it can only tell the operator whether the
+    gateway agrees if it can see this list. Omitting the names does not hide
+    anything: the rejection message already names the command, and the set is
+    the operator's own configuration.
     """
     await verify_api_key(request, credentials)
 
@@ -73,7 +81,11 @@ async def list_slash_commands(
         for name, meta in sorted(details.items())
         if name not in slash_commands.BLOCKED_COMMANDS
     ]
-    return {"commands": allowed, "total": len(allowed)}
+    return {
+        "commands": allowed,
+        "total": len(allowed),
+        "blocked": sorted(slash_commands.BLOCKED_COMMANDS),
+    }
 
 
 @router.get("/v1/mcp/servers")

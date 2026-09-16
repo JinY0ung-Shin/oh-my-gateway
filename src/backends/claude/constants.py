@@ -183,7 +183,61 @@ DISALLOWED_TOOLS = [t.strip() for t in _raw_disallowed_tools.split(",") if t.str
 FORCE_FOREGROUND_SUBAGENTS = parse_bool_env("FORCE_FOREGROUND_SUBAGENTS", "true")
 
 _raw_blocked_deferred = os.getenv("BLOCKED_DEFERRED_TOOLS", "ScheduleWakeup,CronCreate")
-BLOCKED_DEFERRED_TOOLS = [t.strip() for t in _raw_blocked_deferred.split(",") if t.strip()]
+_blocked_deferred = [t.strip() for t in _raw_blocked_deferred.split(",") if t.strip()]
+
+# Companions of a blocked scheduler. Blocking only the *create* half leaves the
+# rest of the family in the catalog, and the model reads that as "the feature is
+# here, I just have the wrong name": measured against ChatDRAGON, a ``/loop``
+# turn spent its budget reasoning "I don't see CronCreate available even though
+# CronDelete and CronList are listed. Let me try to invoke it directly…" before
+# giving up. Nothing can be scheduled, so nothing can be listed or deleted
+# either; drop the whole family together so the surface states one thing.
+# Operators who clear BLOCKED_DEFERRED_TOOLS get all of them back.
+_DEFERRED_COMPANIONS: dict[str, tuple[str, ...]] = {
+    "CronCreate": ("CronList", "CronDelete"),
+}
+
+
+def _with_companions(names: list[str]) -> list[str]:
+    out = list(names)
+    for name in names:
+        for companion in _DEFERRED_COMPANIONS.get(name, ()):
+            if companion not in out:
+                out.append(companion)
+    return out
+
+
+BLOCKED_DEFERRED_TOOLS = _with_companions(_blocked_deferred)
+
+# Which concrete tool each advertised deferred capability requires. A client
+# surface asks "can this gateway do X", so the answer has to come from the tool
+# X actually needs — not from whether the blocked set happens to be empty.
+# `BLOCKED_DEFERRED_TOOLS=ScheduleWakeup` leaves cron fully working, so a flag
+# derived from set-emptiness would tell a client to disable a scheduler that
+# works (review on #202). Add a capability here with the tool it needs, never a
+# broader check.
+_DEFERRED_CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
+    # Claude Code `/loop <interval>` schedules recurring work with CronCreate.
+    "cron_scheduling_available": ("CronCreate",),
+    # `/loop` without an interval self-paces with ScheduleWakeup.
+    "wakeup_scheduling_available": ("ScheduleWakeup",),
+}
+
+
+def deferred_capabilities() -> dict[str, bool]:
+    """Advertised deferred capabilities, each from the tool it requires.
+
+    `deferred_delivery_available` is the rollup a surface uses to decide whether
+    *any* payoff can land after the HTTP turn closes, so it is true when at
+    least one scheduling mechanism survives — not when nothing is blocked.
+    """
+    blocked = set(BLOCKED_DEFERRED_TOOLS)
+    caps = {
+        name: not (set(required) & blocked)
+        for name, required in _DEFERRED_CAPABILITY_TOOLS.items()
+    }
+    caps["deferred_delivery_available"] = any(caps.values())
+    return caps
 
 # Hidden Skills
 # Comma-separated skill names removed from the model's skill catalog. A
