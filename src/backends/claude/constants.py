@@ -209,6 +209,36 @@ def _with_companions(names: list[str]) -> list[str]:
 
 BLOCKED_DEFERRED_TOOLS = _with_companions(_blocked_deferred)
 
+# Which concrete tool each advertised deferred capability requires. A client
+# surface asks "can this gateway do X", so the answer has to come from the tool
+# X actually needs — not from whether the blocked set happens to be empty.
+# `BLOCKED_DEFERRED_TOOLS=ScheduleWakeup` leaves cron fully working, so a flag
+# derived from set-emptiness would tell a client to disable a scheduler that
+# works (review on #202). Add a capability here with the tool it needs, never a
+# broader check.
+_DEFERRED_CAPABILITY_TOOLS: dict[str, tuple[str, ...]] = {
+    # Claude Code `/loop <interval>` schedules recurring work with CronCreate.
+    "cron_scheduling_available": ("CronCreate",),
+    # `/loop` without an interval self-paces with ScheduleWakeup.
+    "wakeup_scheduling_available": ("ScheduleWakeup",),
+}
+
+
+def deferred_capabilities() -> dict[str, bool]:
+    """Advertised deferred capabilities, each from the tool it requires.
+
+    `deferred_delivery_available` is the rollup a surface uses to decide whether
+    *any* payoff can land after the HTTP turn closes, so it is true when at
+    least one scheduling mechanism survives — not when nothing is blocked.
+    """
+    blocked = set(BLOCKED_DEFERRED_TOOLS)
+    caps = {
+        name: not (set(required) & blocked)
+        for name, required in _DEFERRED_CAPABILITY_TOOLS.items()
+    }
+    caps["deferred_delivery_available"] = any(caps.values())
+    return caps
+
 # Hidden Skills
 # Comma-separated skill names removed from the model's skill catalog. A
 # ``Skill(<name>)`` deny in DISALLOWED_TOOLS blocks execution but leaves the
