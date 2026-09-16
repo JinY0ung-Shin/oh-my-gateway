@@ -258,6 +258,14 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
         round(time.time() - started_at, 1) if started_at is not None else None
     )
 
+    # Startup constants a client surface has to know about but cannot infer.
+    # `blocked_deferred_tools` decides whether a scheduled/repeating request
+    # (Claude Code `/loop`) can work at all on this gateway: the payoff fires
+    # after the HTTP turn closes, so it is blocked unless the embedding surface
+    # can poll `pending-events`. Without this field a surface only finds out by
+    # running the turn and reading the model improvise (ChatDRAGON issue #397).
+    from src.backends.claude.constants import BLOCKED_DEFERRED_TOOLS
+
     return {
         "version": __version__,
         "started_at": started_at,
@@ -265,6 +273,8 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
         "session_stats": session_manager.get_stats(),
         "cleanup_task_alive": session_manager._cleanup_task is not None
         and not session_manager._cleanup_task.done(),
+        "blocked_deferred_tools": list(BLOCKED_DEFERRED_TOOLS),
+        "deferred_delivery_available": not BLOCKED_DEFERRED_TOOLS,
     }
 
 
