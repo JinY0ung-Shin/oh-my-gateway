@@ -1,6 +1,6 @@
 # Per-user workspace storage quota
 
-`USER_WORKSPACE_QUOTA_MB` optionally limits the cumulative logical file bytes owned by one named user's workspace tree.
+`USER_WORKSPACE_QUOTA_MB` sets the startup limit for the cumulative logical file bytes owned by one named user's workspace tree.
 
 ```env
 # 500 MiB across every backend directory below <USER_WORKSPACES_DIR>/<user>/.
@@ -8,11 +8,13 @@
 USER_WORKSPACE_QUOTA_MB=500
 ```
 
+The admin runtime-config exposes the effective limit as `workspace_quota_bytes`. A non-negative byte value takes effect on the next quota-checked operation without restarting the gateway. `0` means unlimited. Resetting that runtime key, or restarting the gateway, returns to the `USER_WORKSPACE_QUOTA_MB` startup value. The environment remains MiB-based for backward compatibility while the runtime API uses bytes, matching `workspace_upload_max_bytes`.
+
 This is separate from the existing single-file upload controls:
 
 - `WORKSPACE_UPLOAD_MAX_BYTES` seeds the runtime-configurable `workspace_upload_max_bytes` (admin `runtime-config`), which limits one `POST /files/upload` file. Its default is 10 MiB; `0` disables uploads.
 - `MAX_REQUEST_SIZE` limits the whole HTTP request body for ordinary API requests. Its default is also 10 MiB. An authenticated `POST /files/upload` uses the upload-specific ceiling plus multipart envelope room instead, so the advertised `max_upload_bytes` is exactly what the route accepts.
-- `USER_WORKSPACE_QUOTA_MB` limits the aggregate user workspace. It does not replace either request/upload limit.
+- `USER_WORKSPACE_QUOTA_MB` / runtime `workspace_quota_bytes` limits the aggregate user workspace. It does not replace either request/upload limit.
 
 ## Scope
 
@@ -24,7 +26,7 @@ Quota accounting is fail-closed. An entry or directory that concurrently disappe
 
 ## File API behavior
 
-`GET /files/limits` exposes both `max_upload_bytes` and `workspace_quota_bytes`. `GET /files/quota` exposes current `used_bytes`, `limit_bytes`, `remaining_bytes`, `enabled`, and `over_quota` for the caller. If the usage scan is incomplete because of an unreadable or failed subtree, `/files/quota` returns the same `503 workspace_quota_accounting_unavailable` response instead of publishing a misleading partial total.
+`GET /files/limits` exposes both `max_upload_bytes` and the effective `workspace_quota_bytes`. `GET /files/quota` exposes current `used_bytes`, `limit_bytes`, `remaining_bytes`, `enabled`, and `over_quota` for the caller. If the usage scan is incomplete because of an unreadable or failed subtree, `/files/quota` returns the same `503 workspace_quota_accounting_unavailable` response instead of publishing a misleading partial total.
 
 `/files/quota` measures usage whether or not a limit is configured: with the quota off it reports `enabled: false`, `limit_bytes: 0` and the live `used_bytes`, because "how much am I using?" is a real question without an enforced ceiling. The scan is `O(files)` and occupies a worker from the shared threadpool, so a client should treat it as a deliberate, occasional read rather than a poll. The "no scan unless configured" rule belongs to `/files/upload` and `/files/copy`, where the walk would buy nothing.
 
@@ -46,4 +48,4 @@ The hook runs on the gateway's event loop, so its filesystem work (`read_text` o
 
 The Claude hook does **not** reserve bytes between `PreToolUse` approval and the later tool execution. Consequently, two concurrent sessions for the same named user can both inspect the same pre-write usage, each independently fit, and then together push the workspace above the configured limit. This is an intentional limitation of the soft quota, not a serialized guarantee for deterministic agent writes. Multiple gateway processes introduce the same class of race. Once the workspace is over quota, subsequent deterministic growth is denied by later preflight checks until usage is reduced; shrinking replacements remain allowed when their projected result fits.
 
-Arbitrary Bash commands, direct filesystem writers, and other opaque subprocess behavior are also outside a transactional accounting boundary. `USER_WORKSPACE_QUOTA_MB` is therefore a **soft application quota**, not a hard storage ceiling. Deployments that require an unbreakable byte ceiling or cross-process reservation semantics should enforce an OS/filesystem project quota in addition to this setting.
+Arbitrary Bash commands, direct filesystem writers, and other opaque subprocess behavior are also outside a transactional accounting boundary. The per-user workspace limit is therefore a **soft application quota**, not a hard storage ceiling. Deployments that require an unbreakable byte ceiling or cross-process reservation semantics should enforce an OS/filesystem project quota in addition to this setting.
