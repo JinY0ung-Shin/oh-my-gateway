@@ -3072,6 +3072,10 @@ def test_slash_commands_endpoint_lists_allowed_only():
         assert [c["name"] for c in body["commands"]] == ["context", "usage"]
         assert body["commands"][0]["description"] == "Context info"
         assert body["total"] == 2
+        # 이름은 응답에 남는다 — 다중 사용자 경계를 가진 클라이언트가 자기 차단
+        # 목록과 맞춰 보려면 gateway가 무엇을 막는지 알아야 한다.
+        assert set(body["blocked"]) >= {"compact", "init", "heapdump"}
+        assert not set(body["blocked"]) & {c["name"] for c in body["commands"]}
 
 
 def test_slash_commands_endpoint_degrades_to_empty():
@@ -3087,4 +3091,8 @@ def test_slash_commands_endpoint_degrades_to_empty():
     ):
         response = client.get("/v1/slash-commands")
         assert response.status_code == 200
-        assert response.json() == {"commands": [], "total": 0}
+        body = response.json()
+        assert body["commands"] == []
+        assert body["total"] == 0
+        # 카탈로그 조회가 죽어도 차단 목록은 설정에서 나오므로 그대로 보고한다.
+        assert set(body["blocked"]) >= {"compact", "init", "heapdump"}
