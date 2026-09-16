@@ -135,13 +135,13 @@ class WorkspaceQuotaExceeded(Exception):
         }
 
 
-def workspace_quota_limit_bytes() -> int:
-    """Return the configured per-user quota in bytes; ``0`` means unlimited.
+def workspace_quota_env_limit_bytes() -> int:
+    """Return the startup quota from ``USER_WORKSPACE_QUOTA_MB`` in bytes.
 
-    The environment uses MiB-sized units despite the conventional ``_MB`` spelling
-    used elsewhere in the project: ``500`` means ``500 * 1024 * 1024`` bytes.
-    Invalid or negative values are configuration errors rather than silently
-    disabling a resource guard.
+    Keep the strict environment validation separate from the effective getter so
+    runtime-config can use this exact value as its reset/restart baseline without
+    duplicating policy. The env uses MiB-sized units despite the conventional
+    ``_MB`` spelling: ``500`` means ``500 * 1024 * 1024`` bytes.
     """
 
     raw = os.getenv(_ENV_NAME, "").strip()
@@ -158,6 +158,20 @@ def workspace_quota_limit_bytes() -> int:
             f"{_ENV_NAME} must be a non-negative integer (MiB), got {raw!r}"
         )
     return value * _MIB
+
+
+def workspace_quota_limit_bytes() -> int:
+    """Return the effective per-user quota in bytes; ``0`` means unlimited.
+
+    ``USER_WORKSPACE_QUOTA_MB`` seeds the startup value. Admin runtime-config may
+    override it in bytes, matching the existing workspace upload-limit contract.
+    The local import avoids a module cycle while keeping every quota consumer on
+    one effective source of truth.
+    """
+
+    from src.runtime_config import get_workspace_quota_bytes
+
+    return max(0, get_workspace_quota_bytes())
 
 
 def _accounting_error(path: Path, exc: OSError) -> WorkspaceQuotaAccountingError:
