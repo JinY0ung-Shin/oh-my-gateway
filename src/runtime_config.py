@@ -111,6 +111,17 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
             "whose every use ends in a 413."
         ),
     },
+    "workspace_quota_bytes": {
+        "label": "Per-user workspace quota (bytes)",
+        "type": "int",
+        "min": 0,
+        "description": (
+            "Maximum cumulative logical file bytes owned by one named user's "
+            "workspace root across all backend directories. Applies to the next "
+            "quota-checked file or agent write. 0 means unlimited. The startup "
+            "default is USER_WORKSPACE_QUOTA_MB converted from MiB to bytes."
+        ),
+    },
     "agent_teams_enabled": {
         "label": "Agent Teams",
         "type": "bool",
@@ -207,9 +218,11 @@ class RuntimeConfig:
             TOKEN_STREAMING,
         )
 
-        # Lazy import to avoid a circular dependency: sanitizer.config imports
-        # back from runtime_config to honor admin overrides.
+        # Lazy imports avoid circular dependencies: sanitizer.config imports back
+        # from runtime_config, while workspace_quota asks this module for the
+        # effective hot-reload value only when quota policy is evaluated.
         from src.sanitizer.config import _env_enabled as _sanitizer_env_enabled
+        from src.workspace_quota import workspace_quota_env_limit_bytes
 
         _map = {
             "default_model": DEFAULT_MODEL,
@@ -220,6 +233,7 @@ class RuntimeConfig:
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
             "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
+            "workspace_quota_bytes": workspace_quota_env_limit_bytes(),
             # Mirrors the CLI's own truthiness on the raw env string: any
             # non-empty value activates the gate, including "0".
             "agent_teams_enabled": bool(
@@ -292,6 +306,10 @@ def get_token_streaming() -> bool:
 
 def get_workspace_upload_max_bytes() -> int:
     return runtime_config.get("workspace_upload_max_bytes")
+
+
+def get_workspace_quota_bytes() -> int:
+    return runtime_config.get("workspace_quota_bytes")
 
 
 def get_workspace_upload_request_max_bytes() -> int:
