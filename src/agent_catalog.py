@@ -209,10 +209,18 @@ def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
     cataloging.  Legacy workspaces with only the native directory still work.
 
     If both directories exist but the native one is *unmanaged*, migration was
-    intentionally skipped to avoid overwriting independently managed data. In
-    that conflict state Claude Code still discovers the native definition, so it
-    must win same-name catalog collisions; otherwise the picker would advertise a
-    different resource from the one the backend actually runs.
+    intentionally skipped to avoid overwriting independently managed data, and no
+    mirror is built (see ``_prepare_resource_dir``). In that conflict state the
+    only definitions Claude Code discovers are the native ones, so the catalog is
+    **exactly** the native directory — not a union with the canonical side.
+
+    A union would advertise a canonical-only entry the backend cannot run: a name
+    present under ``skills/`` but absent from the unmanaged ``.claude/skills/``
+    would appear in the picker and then fail to load, which is the opposite of
+    "the picker describes the definition Claude will actually execute". Same-name
+    collisions were already resolved in favour of native; this extends the same
+    reasoning to names that exist on one side only. The shadowed names are logged
+    once so an operator can see what the conflict is costing them.
     """
     visible_dir = workspace / kind
     native_dir = workspace / ".claude" / kind
@@ -223,7 +231,17 @@ def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
 
     legacy = _dir_entries(native_dir, "project", kind)
     if visible and legacy:
-        return _merge(legacy, visible)
+        shadowed = sorted({e["name"] for e in visible} - {e["name"] for e in legacy})
+        if shadowed:
+            logger.warning(
+                "Workspace %s has an unmanaged .claude/%s, so canonical-only %s "
+                "are not discoverable by Claude and are left out of the catalog: %s",
+                workspace,
+                kind,
+                kind,
+                ", ".join(shadowed),
+            )
+        return legacy
     return _merge(visible, legacy)
 
 

@@ -27,6 +27,8 @@ A legacy workspace that only contains `.claude/skills` or `.claude/agents` is mi
 
 If both the canonical and legacy native directories already contain independently managed data, oh-my-gateway leaves both untouched and logs a warning rather than choosing one side and risking data loss. Merge the two trees manually and remove the unmanaged `.claude/<kind>` directory; the next workspace resolve will recreate the managed mirror.
 
+While that conflict lasts, `GET /v1/agent-resources` reports the **native** directory alone. No mirror is built, so the native definitions are the only ones Claude Code discovers — a name that exists only on the canonical side would be a picker entry the backend cannot load. The canonical-only names are named in the warning log, so the cost of leaving the conflict in place is visible.
+
 ## Other scopes
 
 This change only affects project resources stored inside a named user workspace. Claude user-scope resources under `~/.claude/{skills,agents}` and plugin-provided resources continue to work through their existing Claude setting/plugin scopes.
