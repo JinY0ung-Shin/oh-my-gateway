@@ -63,6 +63,45 @@ CLAUDE_MODELS = [
     "haiku",
 ]
 
+# Effort support is a property of the CONCRETE model, not of the tier name.
+# ``output_config.effort`` is accepted by the Opus and Sonnet generations below;
+# Claude Haiku 4.5 has NO effort parameter and errors on one. So the tier name
+# cannot answer "is effort applied here" — only the model the tier currently
+# resolves to can, and that changes with every generation.
+#
+# Keyed by concrete model id, with ``False`` spelled out rather than left absent,
+# so the reason a tier does or does not carry the guarantee stays readable. A new
+# generation is one edit here plus its row below.
+EFFORT_CAPABLE_MODELS = {
+    "claude-opus-5": True,
+    "claude-sonnet-5": True,
+    "claude-haiku-4-5": False,
+}
+
+# What each bare tier resolves to on a FIRST-PARTY upstream with no
+# ``ANTHROPIC_DEFAULT_*_MODEL`` override. The Claude CLI owns the real
+# resolution — this is the gateway's record of it, used for nothing but reading
+# a concrete model's effort support off ``EFFORT_CAPABLE_MODELS``. An unlisted
+# tier, or one resolving to a model missing from that table, fails closed.
+FIRST_PARTY_TIER_MODELS = {
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def tier_applies_effort(tier: str) -> bool:
+    """Does the concrete model this bare tier resolves to apply ``effort``?
+
+    Fails closed: an unknown tier, or one whose resolved model is not in
+    ``EFFORT_CAPABLE_MODELS``, is treated as not applying effort.
+    """
+    resolved = FIRST_PARTY_TIER_MODELS.get(tier)
+    if resolved is None:
+        return False
+    return EFFORT_CAPABLE_MODELS.get(resolved, False)
+
+
 # Optional alias exposure via ANTHROPIC_DEFAULT_*_MODEL.
 # The Claude CLI maps the bare opus/sonnet/haiku aliases to a concrete model id
 # (or a custom upstream alias) through these env vars — see the pass-through in
