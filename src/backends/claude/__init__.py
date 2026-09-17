@@ -16,6 +16,7 @@ from src.backends.claude.constants import (
     CLAUDE_MODELS,
     configured_model_aliases,
     configured_public_models,
+    tier_applies_effort,
 )
 from src.backends.claude.model_discovery import discover_models, discovered_model_ids
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
@@ -106,10 +107,18 @@ def _claude_model_capabilities(model: str) -> dict:
 
     ``reasoning_effort`` is therefore true only where the guarantee holds:
 
-    - no custom ``ANTHROPIC_BASE_URL`` (first-party upstream), and
+    - no custom ``ANTHROPIC_BASE_URL`` (first-party upstream),
     - a bare tier alias the CLI's own registry resolves, with no
       ``ANTHROPIC_DEFAULT_*_MODEL`` override redirecting that tier to an id we
-      cannot vouch for.
+      cannot vouch for, **and**
+    - the concrete model that tier resolves to actually takes an effort.
+
+    That last condition is not the tier's name. ``output_config.effort`` is a
+    per-model parameter: Claude Haiku 4.5 — what bare ``haiku`` resolves to on a
+    first-party upstream — does not have it and errors on one, while the Opus and
+    Sonnet generations do. A tier is therefore asked about its resolved concrete
+    model (``tier_applies_effort``), so the answer moves with the generation
+    instead of being frozen into the string ``"haiku"``.
 
     Everything else fails closed. ``reasoning_effort_accepted`` stays true for
     the whole backend — the request is still accepted and still forwarded, so a
@@ -126,7 +135,8 @@ def _claude_model_capabilities(model: str) -> dict:
         # This tier is redirected to a configured concrete id; the CLI resolves
         # the alias to that id, so the guarantee is the id's, not the alias's.
         return {"reasoning_effort": False}
-    return {"reasoning_effort": True}
+    # First-party tier: the guarantee is the resolved model's to give.
+    return {"reasoning_effort": tier_applies_effort(model)}
 
 
 CLAUDE_DESCRIPTOR = BackendDescriptor(

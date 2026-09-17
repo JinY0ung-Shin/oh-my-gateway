@@ -6,6 +6,11 @@ import pytest
 
 from src.backend_registry import BackendDescriptor, BackendRegistry
 from src.backends.claude import CLAUDE_DESCRIPTOR, _claude_model_capabilities
+from src.backends.claude.constants import (
+    CLAUDE_MODELS,
+    EFFORT_CAPABLE_MODELS,
+    FIRST_PARTY_TIER_MODELS,
+)
 from src.backends.codex import CODEX_DESCRIPTOR
 from src.backends.opencode import OPENCODE_DESCRIPTOR
 
@@ -143,11 +148,36 @@ class TestReasoningEffortIsGuaranteedPerModel:
     keep for every id it lists (review blocker).
     """
 
-    def test_bare_tier_aliases_on_a_first_party_upstream_are_guaranteed(
+    def test_bare_tier_aliases_whose_model_takes_an_effort_are_guaranteed(
         self, first_party_upstream
     ):
-        for model in ("opus", "sonnet", "haiku"):
+        for model in ("opus", "sonnet"):
             assert _claude_model_capabilities(model) == {"reasoning_effort": True}
+
+    def test_a_tier_whose_model_has_no_effort_parameter_is_not_guaranteed(
+        self, first_party_upstream
+    ):
+        """First-party, no override — and still false, because of the model.
+
+        ``output_config.effort`` is per model, not per tier: bare ``haiku``
+        resolves to Claude Haiku 4.5, which has no effort parameter and errors
+        on one. A blanket true for every tier was a false positive on the most
+        ordinary deployment there is (review blocker).
+        """
+        assert _claude_model_capabilities("haiku") == {"reasoning_effort": False}
+
+    def test_every_tier_is_answered_by_its_resolved_concrete_model(self):
+        """The guarantee is read off the model, so the tier table must cover it.
+
+        A tier added to ``CLAUDE_MODELS`` without a row here silently fails
+        closed; that is safe but invisible, and this keeps it visible.
+        """
+        for tier in CLAUDE_MODELS:
+            resolved = FIRST_PARTY_TIER_MODELS.get(tier)
+            assert resolved is not None, f"{tier} resolves to no concrete model"
+            assert (
+                resolved in EFFORT_CAPABLE_MODELS
+            ), f"{resolved} has no effort-support row"
 
     def test_a_custom_upstream_withholds_the_guarantee_for_every_id(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
