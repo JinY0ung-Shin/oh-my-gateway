@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 _USER_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._@-]{0,126}$")
 _BACKEND_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
 
-# Every known backend owns its default directory name.  Keep these names reserved
+# Every known backend owns its default directory name. Keep these names reserved
 # even when a backend is disabled: workspaces persist across configuration changes,
 # and allowing Claude to claim (for example) ``codex`` today would make a later
 # ``BACKENDS=claude,codex`` deployment silently merge two backend workspaces.
@@ -77,7 +77,9 @@ class WorkspaceManager:
         Named Claude workspaces get top-level ``skills/`` and ``agents/`` resource
         directories. Claude's native ``.claude/{skills,agents}`` paths are an
         internal compatibility view maintained by the Claude backend, so file
-        manager users can work with backend-neutral paths.
+        manager users can work with backend-neutral paths. Resolve only prepares
+        those roots; recursive mirror refresh is deferred until an SDK operation
+        so polling file-browser calls do not repeatedly scan resource trees.
 
         ``WORKSPACE_LEGACY_LOCALPART_KEY=true`` is a migration-only compatibility
         mode. It is applied here rather than in an HTTP route so every consumer
@@ -107,9 +109,9 @@ class WorkspaceManager:
         if user is not None and backend_name == "claude":
             # Import lazily so this generic path manager does not import the Claude
             # SDK/backend stack for Codex/OpenCode or plain workspace callers.
-            from src.backends.claude.workspace_resources import ensure_workspace_resources
+            from src.backends.claude.workspace_resources import prepare_workspace_resources
 
-            ensure_workspace_resources(workspace)
+            prepare_workspace_resources(workspace)
 
         return workspace
 
