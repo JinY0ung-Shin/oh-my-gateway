@@ -1,18 +1,18 @@
 """What skills and subagents a user's session can actually see.
 
 ``/admin/api/plugins`` answers "what plugins are installed"; it says nothing
-about the ``.claude/skills`` and ``.claude/agents`` directories that live in the
-user's own workspace. The CLI reads those (``setting_sources`` includes
-``project``, and ``user`` under Docker), so a client that builds a selection UI
-from the plugin list alone shows an incomplete catalog — the model can run a
-skill the picker never listed.
+about skills and agents that live in the user's own workspace. ChatDRAGON exposes
+those project resources at backend-neutral ``skills/`` and ``agents/`` paths; the
+Claude workspace compatibility layer mirrors them into Claude Code's native
+``.claude/{skills,agents}`` discovery locations.
 
 This module answers the client's real question — *for this user, right now,
-which skills and subagents exist and where does each come from* — by walking
-the same three scopes the CLI does:
+which skills and subagents exist and where does each come from* — by walking the
+same three scopes the CLI does:
 
 ``plugin``   installed plugins (via :mod:`src.plugin_service`)
-``project``  the user's workspace ``.claude/{skills,agents}``
+``project``  the user's workspace ``skills/`` / ``agents/`` (with legacy
+             ``.claude/{skills,agents}`` fallback)
 ``user``     ``~/.claude/{skills,agents}`` (only when ``setting_sources``
              includes ``user``, i.e. the scope the CLI would read)
 
@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # huge file (or a non-markdown file with an .md name) can't stall a request.
 _MAX_FRONTMATTER_BYTES = 8 * 1024
 _MAX_DESCRIPTION_CHARS = 400
+_MANAGED_MARKER = ".oh-my-gateway-managed"
 
 
 def _parse_frontmatter(path: Path) -> Dict[str, Any]:
@@ -71,10 +72,13 @@ def _meta(path: Path, fallback_name: str) -> Dict[str, str]:
 
 
 def _skill_files(base: Path) -> List[Path]:
-    """Skill definition files under a ``.claude/skills``-style directory.
+    """Skill definition files under a project/user skill directory.
 
     Both layouts the CLI accepts: ``<dir>/<name>.md`` (flat) and
-    ``<dir>/<name>/SKILL.md`` (nested).
+    ``<dir>/<name>/SKILL.md`` (nested). The base directory itself must be real;
+    this keeps catalog reads from following an operator-created resource-root
+    symlink outside the expected scope. Individual symlinked entries are skipped
+    for the same reason.
     """
     files: List[Path] = []
     if not base.is_dir() or base.is_symlink():
@@ -96,7 +100,7 @@ def _skill_files(base: Path) -> List[Path]:
 
 
 def _agent_files(base: Path) -> List[Path]:
-    """Subagent definition files under a ``.claude/agents``-style directory."""
+    """Subagent definition files under a project/user agent directory."""
     files: List[Path] = []
     if not base.is_dir() or base.is_symlink():
         return files
@@ -123,7 +127,11 @@ def _dir_entries(base: Path, source: str, kind: str) -> List[Dict[str, str]]:
     files = _skill_files(base) if kind == "skills" else _agent_files(base)
     out: List[Dict[str, str]] = []
     for path in files:
-        fallback = path.parent.name if path.name in ("SKILL.md", "AGENT.md", "agent.md") else path.stem
+        fallback = (
+            path.parent.name
+            if path.name in ("SKILL.md", "AGENT.md", "agent.md")
+            else path.stem
+        )
         meta = _meta(path, fallback)
         out.append({**meta, "source": source, "plugin": ""})
     return out
@@ -184,17 +192,57 @@ def _plugin_entries(kind: str) -> List[Dict[str, str]]:
 
 
 def _merge(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """First occurrence wins, in scope precedence order, sorted by name.
-
-    Precedence matches the CLI: a project-scope definition shadows a same-named
-    user-scope or plugin one, so the catalog names the definition that would
-    actually run.
-    """
+    """First occurrence wins, in scope precedence order, sorted by name."""
     seen: Dict[str, Dict[str, str]] = {}
     for group in groups:
         for entry in group:
             seen.setdefault(entry["name"], entry)
     return sorted(seen.values(), key=lambda e: e["name"].lower())
+
+
+def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
+    """Read the project resource definition Claude will actually execute.
+
+    A normal gateway-managed workspace has a top-level canonical directory plus
+    a native ``.claude/<kind>`` mirror marked with ``.oh-my-gateway-managed``;
+    the canonical side is the user-facing source of truth and is sufficient for
+    cataloging.  Legacy workspaces with only the native directory still work.
+
+    If both directories exist but the native one is *unmanaged*, migration was
+    intentionally skipped to avoid overwriting independently managed data, and no
+    mirror is built (see ``_prepare_resource_dir``). In that conflict state the
+    only definitions Claude Code discovers are the native ones, so the catalog is
+    **exactly** the native directory — not a union with the canonical side.
+
+    A union would advertise a canonical-only entry the backend cannot run: a name
+    present under ``skills/`` but absent from the unmanaged ``.claude/skills/``
+    would appear in the picker and then fail to load, which is the opposite of
+    "the picker describes the definition Claude will actually execute". Same-name
+    collisions were already resolved in favour of native; this extends the same
+    reasoning to names that exist on one side only. The shadowed names are logged
+    once so an operator can see what the conflict is costing them.
+    """
+    visible_dir = workspace / kind
+    native_dir = workspace / ".claude" / kind
+    visible = _dir_entries(visible_dir, "project", kind)
+
+    if (native_dir / _MANAGED_MARKER).is_file():
+        return visible
+
+    legacy = _dir_entries(native_dir, "project", kind)
+    if visible and legacy:
+        shadowed = sorted({e["name"] for e in visible} - {e["name"] for e in legacy})
+        if shadowed:
+            logger.warning(
+                "Workspace %s has an unmanaged .claude/%s, so canonical-only %s "
+                "are not discoverable by Claude and are left out of the catalog: %s",
+                workspace,
+                kind,
+                kind,
+                ", ".join(shadowed),
+            )
+        return legacy
+    return _merge(visible, legacy)
 
 
 def list_agent_resources(workspace: Optional[Path]) -> Dict[str, List[Dict[str, str]]]:
@@ -206,9 +254,8 @@ def list_agent_resources(workspace: Optional[Path]) -> Dict[str, List[Dict[str, 
     project_skills: List[Dict[str, str]] = []
     project_agents: List[Dict[str, str]] = []
     if workspace is not None:
-        claude_dir = workspace / ".claude"
-        project_skills = _dir_entries(claude_dir / "skills", "project", "skills")
-        project_agents = _dir_entries(claude_dir / "agents", "project", "agents")
+        project_skills = _project_entries(workspace, "skills")
+        project_agents = _project_entries(workspace, "agents")
 
     user_dir = _user_scope_dir()
     user_skills = _dir_entries(user_dir / "skills", "user", "skills") if user_dir else []

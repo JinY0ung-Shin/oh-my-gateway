@@ -1,7 +1,7 @@
 """Slash-command validation for the Claude backend.
 
 The Claude Agent SDK interprets any user message whose first non-whitespace
-character is ``/`` as a slash-command invocation.  If the command name is
+character is ``/`` as a slash-command invocation. If the command name is
 registered (built-in or skill from ``.claude/skills/``), the SDK runs it and
 returns the command output *instead of* calling the model; if the name is not
 registered, the SDK returns ``"Unknown skill: <name>"`` with 0 tokens consumed.
@@ -23,9 +23,9 @@ This module validates the prompt before it reaches the SDK:
   ``blocked_command``.
 * For other (command-shaped) slash prompts, the name is checked against a
   **TTL-cached allowlist** pulled from ``ClaudeSDKClient.get_server_info()``.
-  Unknown names are rejected with ``unknown_command`` (the SDK would otherwise
-  silently return ``"Unknown skill: <name>"`` with 0 tokens); recognised names
-  are allowed through so that intentional skills (e.g. ``/dev-server``) work.
+  The cache is bound to the effective cwd so one user's project skills can
+  never validate another user's prompt. Unknown names are rejected with
+  ``unknown_command``; recognised names are allowed through.
 """
 
 from __future__ import annotations
@@ -82,21 +82,43 @@ class SlashCommandError(Exception):
         super().__init__(message)
 
 
+def _cwd_key(cwd: Optional[Path]) -> Optional[str]:
+    """Stable cache identity for a session cwd without requiring it to exist."""
+    if cwd is None:
+        return None
+    try:
+        return str(Path(cwd).resolve())
+    except (OSError, RuntimeError):
+        return str(cwd)
+
+
+def _materialize_project_resources(cwd: Optional[Path]) -> None:
+    """Refresh a prepared workspace's Claude-native project resource mirrors."""
+    if cwd is None:
+        return
+    from src.backends.claude.workspace_resources import materialize_workspace_resources
+
+    materialize_workspace_resources(Path(cwd))
+
+
 class _Cache:
     def __init__(self) -> None:
         self.commands: Optional[set[str]] = None
         self.fetched_at: float = 0.0
+        self.cwd_key: Optional[str] = None
         self.lock = asyncio.Lock()
 
-    def is_fresh(self) -> bool:
+    def is_fresh(self, cwd: Optional[Path] = None) -> bool:
         return (
             self.commands is not None
+            and self.cwd_key == _cwd_key(cwd)
             and (time.monotonic() - self.fetched_at) < CACHE_TTL_SECONDS
         )
 
     def reset(self) -> None:
         self.commands = None
         self.fetched_at = 0.0
+        self.cwd_key = None
 
 
 _cache = _Cache()
@@ -115,6 +137,7 @@ async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
         _get_setting_sources,
     )
 
+    _materialize_project_resources(cwd)
     opts = ClaudeAgentOptions(
         cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
     )
@@ -135,11 +158,12 @@ async def get_available_commands(
     cwd: Optional[Path] = None, force: bool = False
 ) -> set[str]:
     async with _cache.lock:
-        if not force and _cache.is_fresh():
+        if not force and _cache.is_fresh(cwd):
             assert _cache.commands is not None
             return _cache.commands
         _cache.commands = await _fetch_commands(cwd)
         _cache.fetched_at = time.monotonic()
+        _cache.cwd_key = _cwd_key(cwd)
         return _cache.commands
 
 
@@ -147,11 +171,13 @@ class _DetailsCache:
     def __init__(self) -> None:
         self.details: Optional[dict[str, dict[str, str]]] = None
         self.fetched_at: float = 0.0
+        self.cwd_key: Optional[str] = None
         self.lock = asyncio.Lock()
 
-    def is_fresh(self) -> bool:
+    def is_fresh(self, cwd: Optional[Path] = None) -> bool:
         return (
             self.details is not None
+            and self.cwd_key == _cwd_key(cwd)
             and (time.monotonic() - self.fetched_at) < CACHE_TTL_SECONDS
         )
 
@@ -167,6 +193,7 @@ async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str
         _get_setting_sources,
     )
 
+    _materialize_project_resources(cwd)
     opts = ClaudeAgentOptions(
         cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
     )
@@ -194,11 +221,12 @@ async def get_command_details(
 ) -> dict[str, dict[str, str]]:
     """Like :func:`get_available_commands` but with per-command metadata."""
     async with _details_cache.lock:
-        if not force and _details_cache.is_fresh():
+        if not force and _details_cache.is_fresh(cwd):
             assert _details_cache.details is not None
             return _details_cache.details
         _details_cache.details = await _fetch_command_details(cwd)
         _details_cache.fetched_at = time.monotonic()
+        _details_cache.cwd_key = _cwd_key(cwd)
         return _details_cache.details
 
 
