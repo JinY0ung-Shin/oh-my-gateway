@@ -20,9 +20,11 @@ def test_fresh_workspace_gets_visible_resources_and_real_claude_mirrors(tmp_path
     for name in ("skills", "agents"):
         visible = workspace / name
         native = workspace / ".claude" / name
+        marker = native / ".oh-my-gateway-managed"
         assert visible.is_dir() and not visible.is_symlink()
         assert native.is_dir() and not native.is_symlink()
-        assert (native / ".oh-my-gateway-managed").is_file()
+        assert marker.is_file()
+        assert marker.stat().st_size == 0  # gateway metadata must not consume user quota
 
 
 def test_visible_skill_is_materialized_under_claude_native_path(tmp_path):
