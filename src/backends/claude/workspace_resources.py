@@ -242,11 +242,11 @@ def _prepare_resource_dir(workspace: Path, claude_dir: Path, name: str) -> None:
         if not native_exists:
             native.mkdir(parents=False, exist_ok=False)
         marker = native / _MANAGED_MARKER
-        marker.write_text(
-            "Managed by oh-my-gateway. Edit the sibling workspace/%s directory instead.\n"
-            % name,
-            encoding="utf-8",
-        )
+        # The marker is gateway metadata, not user data.  Keep it zero bytes so
+        # the compatibility layer does not consume the user's workspace quota.
+        # write_bytes (rather than touch) also truncates markers created by an
+        # earlier version of this bridge that stored explanatory text.
+        marker.write_bytes(b"")
         _sync_managed_mirror(visible, native)
     except OSError:
         logger.warning("Failed to materialize Claude workspace resource %s", name, exc_info=True)
