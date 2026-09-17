@@ -3,12 +3,13 @@
 Re-exports the Claude backend client, auth provider, and registration helpers.
 
 NOTE: Heavy imports (ClaudeCodeCLI, ClaudeAuthProvider) are lazy to avoid
-circular imports.  ``src.constants`` imports ``src.backends.claude.constants``
-which triggers this ``__init__.py``.  If we eagerly import ``auth.py`` here,
+circular imports. ``src.constants`` imports ``src.backends.claude.constants``
+which triggers this ``__init__.py``. If we eagerly import ``auth.py`` here,
 it loops back to ``src.auth`` → ``src.backends.claude.auth`` (circular).
 """
 
 import logging
+from pathlib import Path
 from typing import Optional
 
 from src.backends.claude.constants import (
@@ -109,6 +110,27 @@ def __getattr__(name):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _install_workspace_resource_materializer(cli) -> None:
+    """Refresh backend-neutral project resources before SDK client creation.
+
+    WorkspaceManager deliberately avoids recursive mirror scans because file-manager
+    polling also calls ``resolve()``. Production Claude turns enter through the
+    registered client's ``create_client`` method, so this thin instance wrapper is
+    the narrow point where the native `.claude` view must be fresh.
+    """
+    original_create_client = cli.create_client
+
+    async def create_client_with_workspace_resources(*args, **kwargs):
+        cwd = kwargs.get("cwd")
+        if cwd:
+            from src.backends.claude.workspace_resources import materialize_workspace_resources
+
+            materialize_workspace_resources(Path(cwd))
+        return await original_create_client(*args, **kwargs)
+
+    cli.create_client = create_client_with_workspace_resources
+
+
 def register(registry_cls=None, cwd: Optional[str] = None) -> None:
     """Register Claude descriptor and client into the BackendRegistry.
 
@@ -128,6 +150,7 @@ def register(registry_cls=None, cwd: Optional[str] = None) -> None:
     # resolved per-user workspace.
     try:
         cli = ClaudeCodeCLI(cwd=cwd)
+        _install_workspace_resource_materializer(cli)
         registry_cls.register("claude", cli)
         logger.info("Registered backend: claude")
     except Exception as e:
