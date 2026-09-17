@@ -393,7 +393,7 @@ Primary endpoints:
 - `GET /v1/responses/{response_id}` (retrieve a stored turn; poll background turns)
 - `POST /v1/responses/{response_id}/cancel` (Claude streaming or background responses)
 - `POST /v1/agents/messages` (stateless Claude SDK event stream)
-- `GET /v1/models` (each entry carries `backend` + `capabilities`: `image_input`, `reasoning_effort` — whether the backend honors `reasoning.effort` on the session-creating turn)
+- `GET /v1/models` (each entry carries `backend` + `capabilities`: `image_input`, `reasoning_effort_accepted` — the gateway accepts `reasoning.effort` for this model instead of rejecting it with 400 — and `reasoning_effort` — the requested effort is guaranteed to reach the model on the session-creating turn. The second is narrower on purpose: against a custom `ANTHROPIC_BASE_URL`, or for a name configured through `ANTHROPIC_DEFAULT_*_MODEL` or discovered from the upstream, the CLI may retry without effort after a 400, so only first-party bare tier aliases report `true`. Hide a no-op control on `reasoning_effort`; offer effort as best-effort on `reasoning_effort_accepted`.)
 - `GET /v1/sessions`
 - `GET /v1/sessions/{session_id}/pending-events?after=<seq>&user=<name>` (between-turn outbox: background task lifecycle + assistant messages captured by the session's idle reader; cursor-paged, polling refreshes the session TTL)
 - `GET /v1/auth/status`

@@ -57,15 +57,30 @@ class BackendDescriptor:
     and auth status work even if a backend failed to start.
 
     ``capabilities`` carries feature flags surfaced in ``/v1/models``
-    (e.g. ``{"image_input": True}``). Two flags are always present on every
-    entry so clients can branch without a missing-key check: ``image_input``
-    (the backend accepts ``input_image`` parts) and ``reasoning_effort`` (the
-    backend honors ``reasoning.effort`` on the session-creating turn). A
-    descriptor that does not declare a flag reports it as ``False``.
+    (e.g. ``{"image_input": True}``). Three flags are always present on every
+    entry so clients can branch without a missing-key check:
+
+    - ``image_input`` — the backend accepts ``input_image`` parts.
+    - ``reasoning_effort_accepted`` — the gateway accepts ``reasoning.effort``
+      for this model at all: the request is not rejected with 400 by
+      ``_validate_reasoning_backend``.
+    - ``reasoning_effort`` — the requested effort is **guaranteed to reach the
+      model** on the session-creating turn. Accepting the field and applying it
+      are different claims: a backend can accept effort, forward it, and still
+      have the upstream drop it. A client that hides a control the runtime
+      cannot honor reads this flag, never the acceptance one.
+
+    A descriptor that does not declare a flag reports it as ``False``.
 
     ``model_meta_fn`` optionally adds per-model fields to the ``/v1/models``
     entry (e.g. alias bookkeeping so clients can tell a bare ``sonnet`` from
     the concrete id configured via ``ANTHROPIC_DEFAULT_SONNET_MODEL``).
+
+    ``model_capabilities_fn`` optionally narrows the capability map **per
+    model**. A descriptor-level flag is a claim about every id the backend
+    advertises, which over-promises when the same backend also exposes
+    arbitrary configured aliases or ids discovered from a custom upstream.
+    Values it returns override the descriptor's for that id.
 
     ``model_discovery_fn`` optionally returns additional model IDs from a live
     upstream. Discovery is best-effort: the registry preserves the static
@@ -79,6 +94,7 @@ class BackendDescriptor:
     resolve_fn: Callable[[str], Optional[ResolvedModel]]
     capabilities: Dict[str, bool] = field(default_factory=dict)
     model_meta_fn: Optional[Callable[[str], Dict[str, Any]]] = None
+    model_capabilities_fn: Optional[Callable[[str], Dict[str, bool]]] = None
     model_discovery_fn: Optional[Callable[[], Awaitable[List[str]]]] = None
 
 
@@ -248,16 +264,24 @@ class BackendRegistry:
 
     @staticmethod
     def _model_entry(desc: BackendDescriptor, model_id: str) -> Dict[str, Any]:
+        capabilities: Dict[str, bool] = {
+            "image_input": False,
+            "reasoning_effort": False,
+            "reasoning_effort_accepted": False,
+            **desc.capabilities,
+        }
+        # Per-model narrowing runs last. The descriptor-level flag is the
+        # backend's claim about the feature; this is what the gateway can
+        # actually promise for THIS id (a configured custom alias, an id
+        # discovered from a custom upstream, …).
+        if desc.model_capabilities_fn is not None:
+            capabilities.update(desc.model_capabilities_fn(model_id))
         entry: Dict[str, Any] = {
             "id": model_id,
             "object": "model",
             "owned_by": desc.owned_by,
             "backend": desc.name,
-            "capabilities": {
-                "image_input": False,
-                "reasoning_effort": False,
-                **desc.capabilities,
-            },
+            "capabilities": capabilities,
         }
         if desc.model_meta_fn is not None:
             entry.update(desc.model_meta_fn(model_id))
@@ -269,9 +293,11 @@ class BackendRegistry:
 
         Keeps the original ``id``/``object``/``owned_by`` fields for
         compatibility and adds ``backend`` plus a ``capabilities`` map
-        (``image_input`` and ``reasoning_effort`` are always present). A
-        descriptor's ``model_meta_fn``
-        may contribute extra per-model fields (alias bookkeeping).
+        (``image_input``, ``reasoning_effort`` and
+        ``reasoning_effort_accepted`` are always present). A descriptor's
+        ``model_meta_fn`` may contribute extra per-model fields (alias
+        bookkeeping), and its ``model_capabilities_fn`` may narrow a
+        capability for one id.
         """
         data: List[Dict[str, Any]] = []
 

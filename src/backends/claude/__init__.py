@@ -9,6 +9,7 @@ it loops back to ``src.auth`` → ``src.backends.claude.auth`` (circular).
 """
 
 import logging
+import os
 from typing import Optional
 
 from src.backends.claude.constants import (
@@ -83,6 +84,51 @@ def _claude_model_meta(model: str) -> dict:
     return {}
 
 
+def _claude_model_capabilities(model: str) -> dict:
+    """Narrow ``reasoning_effort`` to the ids where effort is actually applied.
+
+    Accepting ``reasoning.effort`` and having it reach the model are different
+    claims, and this backend advertises ids for which only the first holds.
+
+    The CLI decides whether a model supports effort from its own model registry
+    **and** whether the base URL is first-party. Against a custom
+    ``ANTHROPIC_BASE_URL`` (sanitizer / LiteLLM) with an id it does not know,
+    that judgment is false and it would send no effort at all;
+    ``CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1`` forces it to send anyway, and **if the
+    upstream answers 400 the CLI retries without effort** (see
+    ``create_client`` in ``client.py``). The turn then succeeds with the
+    requested effort silently dropped.
+
+    So a descriptor-level ``True`` would advertise a guarantee for every id,
+    including the arbitrary names configured through ``ANTHROPIC_DEFAULT_*_MODEL``
+    and every id discovered from a custom upstream. A client that hides a
+    no-op control would then still show one.
+
+    ``reasoning_effort`` is therefore true only where the guarantee holds:
+
+    - no custom ``ANTHROPIC_BASE_URL`` (first-party upstream), and
+    - a bare tier alias the CLI's own registry resolves, with no
+      ``ANTHROPIC_DEFAULT_*_MODEL`` override redirecting that tier to an id we
+      cannot vouch for.
+
+    Everything else fails closed. ``reasoning_effort_accepted`` stays true for
+    the whole backend — the request is still accepted and still forwarded, so a
+    client that wants to offer effort as best-effort can read that instead.
+    """
+    if model not in CLAUDE_MODELS:
+        # A configured override name or an id discovered from the upstream:
+        # an arbitrary string we cannot match against the CLI's registry.
+        return {"reasoning_effort": False}
+    if (os.getenv("ANTHROPIC_BASE_URL") or "").strip():
+        # Custom upstream — effort may be dropped on a 400 retry.
+        return {"reasoning_effort": False}
+    if model in configured_model_aliases().values():
+        # This tier is redirected to a configured concrete id; the CLI resolves
+        # the alias to that id, so the guarantee is the id's, not the alias's.
+        return {"reasoning_effort": False}
+    return {"reasoning_effort": True}
+
+
 CLAUDE_DESCRIPTOR = BackendDescriptor(
     name="claude",
     owned_by="anthropic",
@@ -90,13 +136,19 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     resolve_fn=_claude_resolve,
     # Image input is supported via the client's image_handler (see
     # validate_image_request in src/routes/deps.py).
-    # ``reasoning_effort``: this backend honors ``reasoning.effort`` on the
-    # session-creating turn (``_configure_thinking``); every other backend is
-    # rejected by ``_validate_reasoning_backend`` in src/routes/responses.py.
-    # Clients that build effort controls read this flag instead of hard-coding
-    # "claude": a control that the runtime cannot honor must not be offered.
-    capabilities={"image_input": True, "reasoning_effort": True},
+    # ``reasoning_effort_accepted``: this backend accepts ``reasoning.effort``
+    # on the session-creating turn (``_configure_thinking``); every other
+    # backend is rejected with 400 by ``_validate_reasoning_backend`` in
+    # src/routes/responses.py. Clients read this flag instead of hard-coding
+    # "claude".
+    #
+    # ``reasoning_effort`` is the stronger claim — the effort actually reaches
+    # the model — and it is **not** a property of the backend, so it is left to
+    # fail closed here and computed per model below. See
+    # ``_claude_model_capabilities``.
+    capabilities={"image_input": True, "reasoning_effort_accepted": True},
     model_meta_fn=_claude_model_meta,
+    model_capabilities_fn=_claude_model_capabilities,
     model_discovery_fn=discover_models,
 )
 
