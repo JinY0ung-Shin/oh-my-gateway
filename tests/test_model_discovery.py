@@ -336,7 +336,12 @@ async def test_registry_discovery_hook_is_generic(clean_registry):
         "dynamic-a",
         "dynamic-b",
     ]
-    assert all(item["capabilities"] == {"image_input": True} for item in entries)
+    # A generic descriptor that declares only image_input still reports the
+    # always-present reasoning_effort flag, failing closed.
+    assert all(
+        item["capabilities"] == {"image_input": True, "reasoning_effort": False}
+        for item in entries
+    )
 
 
 async def test_registry_discovery_error_keeps_static_models(clean_registry):

@@ -57,7 +57,11 @@ class BackendDescriptor:
     and auth status work even if a backend failed to start.
 
     ``capabilities`` carries feature flags surfaced in ``/v1/models``
-    (e.g. ``{"image_input": True}``).
+    (e.g. ``{"image_input": True}``). Two flags are always present on every
+    entry so clients can branch without a missing-key check: ``image_input``
+    (the backend accepts ``input_image`` parts) and ``reasoning_effort`` (the
+    backend honors ``reasoning.effort`` on the session-creating turn). A
+    descriptor that does not declare a flag reports it as ``False``.
 
     ``model_meta_fn`` optionally adds per-model fields to the ``/v1/models``
     entry (e.g. alias bookkeeping so clients can tell a bare ``sonnet`` from
@@ -249,7 +253,11 @@ class BackendRegistry:
             "object": "model",
             "owned_by": desc.owned_by,
             "backend": desc.name,
-            "capabilities": {"image_input": False, **desc.capabilities},
+            "capabilities": {
+                "image_input": False,
+                "reasoning_effort": False,
+                **desc.capabilities,
+            },
         }
         if desc.model_meta_fn is not None:
             entry.update(desc.model_meta_fn(model_id))
@@ -261,7 +269,8 @@ class BackendRegistry:
 
         Keeps the original ``id``/``object``/``owned_by`` fields for
         compatibility and adds ``backend`` plus a ``capabilities`` map
-        (``image_input`` is always present). A descriptor's ``model_meta_fn``
+        (``image_input`` and ``reasoning_effort`` are always present). A
+        descriptor's ``model_meta_fn``
         may contribute extra per-model fields (alias bookkeeping).
         """
         data: List[Dict[str, Any]] = []

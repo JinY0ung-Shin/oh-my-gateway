@@ -12,9 +12,20 @@ from tests.test_main_api_unit import client_context
 
 class TestDescriptorCapabilities:
     def test_all_backend_descriptors_declare_image_input(self):
-        assert CLAUDE_DESCRIPTOR.capabilities == {"image_input": True}
+        assert CLAUDE_DESCRIPTOR.capabilities == {
+            "image_input": True,
+            "reasoning_effort": True,
+        }
         assert CODEX_DESCRIPTOR.capabilities == {"image_input": True}
         assert OPENCODE_DESCRIPTOR.capabilities == {"image_input": True}
+
+    def test_only_claude_declares_reasoning_effort(self):
+        """``reasoning.effort`` is rejected for every non-claude backend by the
+        responses route preflight, so only claude may advertise it — a client
+        that reads the flag must never be led into a 400."""
+        assert CLAUDE_DESCRIPTOR.capabilities["reasoning_effort"] is True
+        assert "reasoning_effort" not in CODEX_DESCRIPTOR.capabilities
+        assert "reasoning_effort" not in OPENCODE_DESCRIPTOR.capabilities
 
     def test_capabilities_default_to_empty_dict(self):
         desc = BackendDescriptor(
@@ -40,7 +51,10 @@ class TestAvailableModelsMetadata:
             assert isinstance(entry["id"], str)
             # New metadata fields
             assert entry["backend"] == "claude"
-            assert entry["capabilities"] == {"image_input": True}
+            assert entry["capabilities"] == {
+                "image_input": True,
+                "reasoning_effort": True,
+            }
 
     def test_image_input_defaults_false_for_capability_less_descriptor(
         self, clean_registry
@@ -60,7 +74,12 @@ class TestAvailableModelsMetadata:
 
         assert len(entries) == 1
         assert entries[0]["backend"] == "textonly"
-        assert entries[0]["capabilities"] == {"image_input": False}
+        # Both always-present flags fail closed for a descriptor that declares
+        # nothing: a client must be able to branch without a missing-key check.
+        assert entries[0]["capabilities"] == {
+            "image_input": False,
+            "reasoning_effort": False,
+        }
 
     def test_unregistered_backend_models_stay_hidden(self, clean_registry):
         # Descriptors are registered by clean_registry, but no live clients —
@@ -79,3 +98,4 @@ def test_v1_models_endpoint_includes_new_fields():
     for entry in payload["data"]:
         assert set(entry) >= {"id", "object", "owned_by", "backend", "capabilities"}
         assert isinstance(entry["capabilities"]["image_input"], bool)
+        assert isinstance(entry["capabilities"]["reasoning_effort"], bool)

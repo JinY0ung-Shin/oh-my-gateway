@@ -90,7 +90,12 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     resolve_fn=_claude_resolve,
     # Image input is supported via the client's image_handler (see
     # validate_image_request in src/routes/deps.py).
-    capabilities={"image_input": True},
+    # ``reasoning_effort``: this backend honors ``reasoning.effort`` on the
+    # session-creating turn (``_configure_thinking``); every other backend is
+    # rejected by ``_validate_reasoning_backend`` in src/routes/responses.py.
+    # Clients that build effort controls read this flag instead of hard-coding
+    # "claude": a control that the runtime cannot honor must not be offered.
+    capabilities={"image_input": True, "reasoning_effort": True},
     model_meta_fn=_claude_model_meta,
     model_discovery_fn=discover_models,
 )

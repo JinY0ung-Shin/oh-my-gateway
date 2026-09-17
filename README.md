@@ -393,7 +393,7 @@ Primary endpoints:
 - `GET /v1/responses/{response_id}` (retrieve a stored turn; poll background turns)
 - `POST /v1/responses/{response_id}/cancel` (Claude streaming or background responses)
 - `POST /v1/agents/messages` (stateless Claude SDK event stream)
-- `GET /v1/models`
+- `GET /v1/models` (each entry carries `backend` + `capabilities`: `image_input`, `reasoning_effort` — whether the backend honors `reasoning.effort` on the session-creating turn)
 - `GET /v1/sessions`
 - `GET /v1/sessions/{session_id}/pending-events?after=<seq>&user=<name>` (between-turn outbox: background task lifecycle + assistant messages captured by the session's idle reader; cursor-paged, polling refreshes the session TTL)
 - `GET /v1/auth/status`
