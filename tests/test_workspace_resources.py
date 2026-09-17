@@ -36,11 +36,7 @@ def test_visible_skill_is_materialized_under_claude_native_path(tmp_path):
 
     mirror = workspace / ".claude" / "skills" / "review" / "SKILL.md"
     assert mirror.read_text(encoding="utf-8") == source.read_text(encoding="utf-8")
-    # Same-filesystem deployments use hard links; copy fallback is also supported.
-    try:
-        assert source.samefile(mirror)
-    except OSError:
-        pass
+    assert not mirror.is_symlink()
 
 
 def test_materialization_refreshes_replaced_file_and_removes_stale_entry(tmp_path):
