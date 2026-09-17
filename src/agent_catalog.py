@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 # huge file (or a non-markdown file with an .md name) can't stall a request.
 _MAX_FRONTMATTER_BYTES = 8 * 1024
 _MAX_DESCRIPTION_CHARS = 400
+_MANAGED_MARKER = ".oh-my-gateway-managed"
 
 
 def _parse_frontmatter(path: Path) -> Dict[str, Any]:
@@ -191,12 +192,7 @@ def _plugin_entries(kind: str) -> List[Dict[str, str]]:
 
 
 def _merge(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """First occurrence wins, in scope precedence order, sorted by name.
-
-    Precedence matches the CLI: a project-scope definition shadows a same-named
-    user-scope or plugin one, so the catalog names the definition that would
-    actually run.
-    """
+    """First occurrence wins, in scope precedence order, sorted by name."""
     seen: Dict[str, Dict[str, str]] = {}
     for group in groups:
         for entry in group:
@@ -205,16 +201,29 @@ def _merge(*groups: List[Dict[str, str]]) -> List[Dict[str, str]]:
 
 
 def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
-    """Read visible project resources first, then legacy native layout.
+    """Read the project resource definition Claude will actually execute.
 
-    ``WorkspaceManager`` normally migrates old ``.claude/{kind}`` directories to
-    top-level and replaces the native directory with a compatibility symlink. The
-    legacy read remains for direct callers/tests and for an operator-managed
-    workspace where migration could not safely run. A same-named visible entry
-    wins, matching the user-facing source of truth.
+    A normal gateway-managed workspace has a top-level canonical directory plus
+    a native ``.claude/<kind>`` mirror marked with ``.oh-my-gateway-managed``;
+    the canonical side is the user-facing source of truth and is sufficient for
+    cataloging.  Legacy workspaces with only the native directory still work.
+
+    If both directories exist but the native one is *unmanaged*, migration was
+    intentionally skipped to avoid overwriting independently managed data. In
+    that conflict state Claude Code still discovers the native definition, so it
+    must win same-name catalog collisions; otherwise the picker would advertise a
+    different resource from the one the backend actually runs.
     """
-    visible = _dir_entries(workspace / kind, "project", kind)
-    legacy = _dir_entries(workspace / ".claude" / kind, "project", kind)
+    visible_dir = workspace / kind
+    native_dir = workspace / ".claude" / kind
+    visible = _dir_entries(visible_dir, "project", kind)
+
+    if (native_dir / _MANAGED_MARKER).is_file():
+        return visible
+
+    legacy = _dir_entries(native_dir, "project", kind)
+    if visible and legacy:
+        return _merge(legacy, visible)
     return _merge(visible, legacy)
 
 
