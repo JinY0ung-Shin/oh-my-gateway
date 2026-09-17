@@ -11,19 +11,24 @@ user-facing paths are deliberately backend-neutral::
         agents/               # Claude compatibility mirror
 
 Claude Code still discovers project resources from ``.claude/skills`` and
-``.claude/agents``.  Rather than making those directories the source of truth, the
+``.claude/agents``. Rather than making those directories the source of truth, the
 gateway keeps real Claude-native directories as mirrors of the visible resource
-trees.  Regular files are hard-linked whenever the filesystem allows it (so edits
+trees. Regular files are hard-linked whenever the filesystem allows it (so edits
 through either path immediately address the same inode); a normal copy is the
-portable fallback.  Directories are real directories, avoiding Claude Code's
+portable fallback. Directories are real directories, avoiding Claude Code's
 historically inconsistent subagent discovery through directory symlinks.
 
-Existing workspaces are migrated lazily.  If only the legacy native directory
+Preparation and materialization are intentionally separate. Workspace resolution is
+also used by the polling file browser, so it only creates/migrates the resource
+roots. Recursive mirror synchronization happens immediately before Claude SDK
+catalog/query calls, where freshness actually matters.
+
+Existing workspaces are migrated lazily. If only the legacy native directory
 exists, it is moved to the visible location first and a managed mirror is created
-in its place.  If both locations contain unmanaged data, neither side is modified:
+in its place. If both locations contain unmanaged data, neither side is modified:
 choosing one would silently shadow or delete user data.
 
-The mirror is best-effort.  Canonical user data is never deleted by this module;
+The mirror is best-effort. Canonical user data is never deleted by this module;
 failures only make the Claude compatibility view stale and are logged.
 """
 
@@ -77,7 +82,7 @@ def _remove_native_entry(path: Path) -> None:
 def _iter_visible_entries(base: Path):
     """Yield safe canonical entries as ``(relative_path, source_path, is_dir)``.
 
-    Symlinks are deliberately skipped.  A user-visible resource symlink can point
+    Symlinks are deliberately skipped. A user-visible resource symlink can point
     outside the workspace, and mirroring it into a trusted ``.claude`` discovery
     path would turn that external target into project configuration.
     """
@@ -134,7 +139,7 @@ def _sync_managed_mirror(visible: Path, native: Path) -> None:
             desired_dirs.update(rel.parents)
     desired_dirs.discard(Path("."))
 
-    # Remove stale mirror entries from the leaves upward.  The marker is gateway
+    # Remove stale mirror entries from the leaves upward. The marker is gateway
     # metadata, not a canonical resource, and is always preserved.
     try:
         current = sorted(
@@ -170,6 +175,7 @@ def _sync_managed_mirror(visible: Path, native: Path) -> None:
 
 
 def _prepare_resource_dir(workspace: Path, claude_dir: Path, name: str) -> None:
+    """Create/migrate one canonical resource root without recursively syncing it."""
     visible = workspace / name
     native = claude_dir / name
     visible_exists = _exists(visible)
@@ -227,8 +233,8 @@ def _prepare_resource_dir(workspace: Path, claude_dir: Path, name: str) -> None:
             return
 
     if native_exists and not native_is_managed:
-        # Both locations contain real, independently-managed data.  Never delete
-        # or silently shadow either side.  Operators can merge once, then remove
+        # Both locations contain real, independently-managed data. Never delete
+        # or silently shadow either side. Operators can merge once, then remove
         # the legacy native directory; the next resolve will create the mirror.
         logger.warning(
             "Claude workspace has both canonical %s and unmanaged native %s; "
@@ -242,27 +248,17 @@ def _prepare_resource_dir(workspace: Path, claude_dir: Path, name: str) -> None:
         if not native_exists:
             native.mkdir(parents=False, exist_ok=False)
         marker = native / _MANAGED_MARKER
-        # The marker is gateway metadata, not user data.  Keep it zero bytes so
+        # The marker is gateway metadata, not user data. Keep it zero bytes so
         # the compatibility layer does not consume the user's workspace quota.
         # write_bytes (rather than touch) also truncates markers created by an
         # earlier version of this bridge that stored explanatory text.
         marker.write_bytes(b"")
-        _sync_managed_mirror(visible, native)
     except OSError:
-        logger.warning("Failed to materialize Claude workspace resource %s", name, exc_info=True)
+        logger.warning("Failed to prepare Claude workspace resource %s", name, exc_info=True)
 
 
-def ensure_workspace_resources(workspace: Path) -> None:
-    """Expose backend-neutral resources and maintain Claude-native mirrors.
-
-    The function is idempotent and non-raising.  It is cheap when nothing changed:
-    hard-linked files are detected by inode and left untouched.  It runs whenever a
-    named Claude workspace is resolved, so a legacy ``.claude`` layout migrates
-    lazily the first time that user returns after an upgrade.
-    """
-    workspace = Path(workspace)
+def _prepare_claude_dir(workspace: Path) -> Path | None:
     claude_dir = workspace / ".claude"
-
     try:
         if _exists(claude_dir):
             if not _real_directory(claude_dir, workspace):
@@ -270,12 +266,50 @@ def ensure_workspace_resources(workspace: Path) -> None:
                     "Cannot prepare Claude workspace resources: %s is not a safe directory",
                     claude_dir,
                 )
-                return
+                return None
         else:
             claude_dir.mkdir(parents=False, exist_ok=False)
     except OSError:
         logger.warning("Failed to prepare Claude workspace resource root %s", claude_dir, exc_info=True)
-        return
+        return None
+    return claude_dir
 
+
+def prepare_workspace_resources(workspace: Path) -> None:
+    """Prepare canonical roots and native mirror roots, but do not scan contents.
+
+    This is the cheap path used by :class:`WorkspaceManager`. It may run on every
+    file-browser poll, so it performs only constant-number filesystem operations
+    plus a one-time directory rename for legacy migration.
+    """
+    workspace = Path(workspace)
+    claude_dir = _prepare_claude_dir(workspace)
+    if claude_dir is None:
+        return
     for name in _RESOURCE_DIRS:
         _prepare_resource_dir(workspace, claude_dir, name)
+
+
+def materialize_workspace_resources(workspace: Path) -> None:
+    """Refresh managed Claude-native mirrors from canonical resource trees.
+
+    This is the recursive path and should run immediately before Claude SDK
+    discovery/query operations, not on generic workspace/file-browser access.
+    Unprepared or operator-managed layouts are left untouched.
+    """
+    workspace = Path(workspace)
+    for name in _RESOURCE_DIRS:
+        visible = workspace / name
+        native = workspace / ".claude" / name
+        if not _real_directory(visible, workspace) or not _managed(native):
+            continue
+        try:
+            _sync_managed_mirror(visible, native)
+        except OSError:
+            logger.warning("Failed to materialize Claude workspace resource %s", name, exc_info=True)
+
+
+def ensure_workspace_resources(workspace: Path) -> None:
+    """Prepare then materialize resources; convenient for migrations/tests."""
+    prepare_workspace_resources(workspace)
+    materialize_workspace_resources(workspace)
