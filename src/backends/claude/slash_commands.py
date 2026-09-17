@@ -1,7 +1,7 @@
 """Slash-command validation for the Claude backend.
 
 The Claude Agent SDK interprets any user message whose first non-whitespace
-character is ``/`` as a slash-command invocation.  If the command name is
+character is ``/`` as a slash-command invocation. If the command name is
 registered (built-in or skill from ``.claude/skills/``), the SDK runs it and
 returns the command output *instead of* calling the model; if the name is not
 registered, the SDK returns ``"Unknown skill: <name>"`` with 0 tokens consumed.
@@ -92,6 +92,15 @@ def _cwd_key(cwd: Optional[Path]) -> Optional[str]:
         return str(cwd)
 
 
+def _materialize_project_resources(cwd: Optional[Path]) -> None:
+    """Refresh a prepared workspace's Claude-native project resource mirrors."""
+    if cwd is None:
+        return
+    from src.backends.claude.workspace_resources import materialize_workspace_resources
+
+    materialize_workspace_resources(Path(cwd))
+
+
 class _Cache:
     def __init__(self) -> None:
         self.commands: Optional[set[str]] = None
@@ -128,6 +137,7 @@ async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
         _get_setting_sources,
     )
 
+    _materialize_project_resources(cwd)
     opts = ClaudeAgentOptions(
         cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
     )
@@ -183,6 +193,7 @@ async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str
         _get_setting_sources,
     )
 
+    _materialize_project_resources(cwd)
     opts = ClaudeAgentOptions(
         cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
     )
