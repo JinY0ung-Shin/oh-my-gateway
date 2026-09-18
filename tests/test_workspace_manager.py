@@ -141,6 +141,66 @@ class TestResolve:
         assert second == first
         assert (second / "keep.txt").read_text() == "user data"
 
+    def test_initial_dirs_seed_only_when_backend_workspace_is_first_created(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "WORKSPACE_INITIAL_DIRS",
+            "Documents, Projects/AI, .config, Documents",
+        )
+
+        workspace = manager.resolve("erin", backend="codex")
+
+        assert (workspace / "Documents").is_dir()
+        assert (workspace / "Projects" / "AI").is_dir()
+        assert (workspace / ".config").is_dir()
+
+        # Initial folders are onboarding defaults, not permanent invariants.
+        (workspace / "Documents").rmdir()
+        same = manager.resolve("erin", backend="codex")
+        assert same == workspace
+        assert not (workspace / "Documents").exists()
+
+    def test_initial_dirs_do_not_backfill_existing_workspace(
+        self, manager, monkeypatch
+    ):
+        workspace = manager.resolve("frank", backend="codex")
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects")
+
+        assert manager.resolve("frank", backend="codex") == workspace
+        assert not (workspace / "Documents").exists()
+        assert not (workspace / "Projects").exists()
+
+    def test_initial_dirs_do_not_seed_anonymous_or_user_aggregate_roots(
+        self, manager, monkeypatch
+    ):
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents")
+
+        anonymous = manager.resolve(None, backend="codex")
+        aggregate = manager.resolve("grace")
+
+        assert not (anonymous / "Documents").exists()
+        assert list(aggregate.iterdir()) == []
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "../escape",
+            "safe/../../escape",
+            "/absolute/path",
+            ".",
+        ],
+    )
+    def test_initial_dirs_reject_unsafe_paths_before_workspace_creation(
+        self, manager, tmp_base, monkeypatch, value
+    ):
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", value)
+
+        with pytest.raises(ValueError, match="WORKSPACE_INITIAL_DIRS"):
+            manager.resolve("heidi", backend="codex")
+
+        assert not (tmp_base / "heidi" / "codex").exists()
+
 
 class TestCleanupTempWorkspace:
     def test_removes_tmp_directory(self, manager, tmp_base):
