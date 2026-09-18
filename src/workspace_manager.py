@@ -8,6 +8,7 @@ vars). Named Claude workspaces additionally expose user-editable ``skills/`` and
 native ``.claude`` discovery paths wired to them.
 """
 
+import errno
 import logging
 import os
 import re
@@ -52,22 +53,35 @@ def _legacy_localpart_key_enabled() -> bool:
     return os.getenv("WORKSPACE_LEGACY_LOCALPART_KEY", "").strip().lower() == "true"
 
 
-# Marks a workspace whose creation-only seeding has not finished, and it lives
-# BESIDE the workspace rather than inside it so it can be published *before* the
-# root. That order is the whole point: the directory becomes visible before its
-# contents do, so a resolver that treats the directory as the evidence can hand
-# back an empty workspace while the creator is still working. Publishing the
-# claim first leaves no window in which a root exists without one.
+# Creation-only seeding has ONE publisher and publishes ATOMICALLY.
 #
-# With the claim in hand a resolver can tell three otherwise identical states
-# apart: no claim and no root (nobody has started -> initialize), a claim
-# (someone is initializing, or died partway -> finish it, idempotently), and a
-# root with no claim (a workspace from before this feature, or one already
-# seeded -> never seed, so a folder the user deletes stays deleted).
+# Every earlier shape of this protocol leaked a partial layout through some
+# interleaving, because more than one resolver was allowed to create state and
+# the root became visible before its contents did. Two rules remove the whole
+# class of bug rather than one instance of it:
 #
-# It is removed once seeding completes, so it is transient. A crash can leave
-# one behind; the next resolve of that user+backend consumes it and cleans up.
+# 1. An exclusive claim (``O_EXCL`` sibling file) picks a single publisher.
+#    Losers create nothing — they wait for the claim holder.
+# 2. The publisher builds the layout in a staging sibling and ``os.rename``s
+#    it into place. A rename is atomic, so the root either does not exist or
+#    is complete; there is no moment at which "root exists" can mean anything
+#    but "finished" (or "from before this feature").
+#
+# Together they make the states a resolver can observe unambiguous:
+# no root -> nobody has published yet (claim it, or wait for the holder);
+# root    -> complete or legacy, never in flight, so never ours to seed —
+#            which is also what keeps a starter folder the user deleted from
+#            coming back.
+#
+# Crash recovery: a holder that dies before publishing leaves its claim (and an
+# inert staging directory) behind. A waiter that sees the claim outlive
+# ``_STALE_CLAIM_SECONDS`` without a root appearing takes it over. Two
+# publishers are still safe: the second rename fails on the non-empty root and
+# that publisher discards its staging copy.
 _SEEDING_MARKER = ".oh-my-gateway-seeding"
+_STAGING_PREFIX = ".oh-my-gateway-staging"
+_STALE_CLAIM_SECONDS = 60.0
+_WAIT_POLL_SECONDS = 0.01
 
 
 def _seeding_claim(workspace: Path) -> Path:
@@ -88,24 +102,23 @@ def _initial_workspace_dirs() -> tuple[Path, ...]:
 
 
 def _claim_initialization(workspace: Path) -> bool:
-    """Try to publish the in-progress claim, before the workspace root exists.
+    """Try to become the single publisher for *workspace*.
 
-    Exclusive (``O_EXCL``): returns ``True`` only for the one caller that
-    created the file. A ``False`` means another resolver holds the claim, so an
-    initialization is in flight and the caller should finish it idempotently
-    rather than start its own.
+    Exclusive (``O_EXCL``): ``True`` only for the one caller that created the
+    claim file. ``False`` means another resolver holds it and will publish; the
+    caller must then wait for that and never build on its own — a second
+    creator is exactly what made every earlier version of this protocol racy.
 
-    Exclusivity matters for a race the claim alone does not close. Two
-    resolvers can both observe "no root" before either claims; the first then
-    initializes, releases the claim and returns, and only afterwards does the
-    second act on its stale observation. Without ``O_EXCL`` it would publish a
-    fresh claim over a *completed* workspace and seed it again — recreating a
-    starter directory the user may just have deleted. With it, the winner must
-    still re-check the root (see ``resolve``): a root that appeared since the
-    observation belongs to a completed initialization, not to this caller.
+    Exclusivity also closes a race the claim alone does not: two resolvers can
+    both observe "no root" before either claims. Without ``O_EXCL`` the second
+    would publish a fresh claim over the workspace the first just *completed*
+    and seed it again, recreating a starter folder the user may have deleted.
+    The winner still re-checks the root after claiming (see ``resolve``), and
+    because every root is published atomically, a root that appeared since the
+    observation is complete and not this caller's to touch.
 
     The claim's parent is the user's aggregate root, created here so the claim
-    can land before ``workspace.mkdir``.
+    can precede the workspace directory.
     """
     claim = _seeding_claim(workspace)
     claim.parent.mkdir(parents=True, exist_ok=True)
@@ -129,23 +142,69 @@ def _release_claim(workspace: Path) -> None:
         pass
 
 
-def _initialize_workspace(workspace: Path, initial_dirs: tuple[Path, ...]) -> None:
-    """Create the root and every configured directory, then drop the claim.
+def _publish_workspace(workspace: Path, initial_dirs: tuple[Path, ...]) -> None:
+    """Build the full layout beside the workspace, then rename it into place.
 
-    Idempotent on purpose, which is what removes the need for a lock. Every
-    caller — the resolver that published the claim, a concurrent one that found
-    it, and one recovering from a crash that left it — runs exactly this, so
-    none of them has to tell those cases apart and two of them running at once
-    converge on the same layout.
+    Only the claim holder calls this. The rename is what makes the protocol
+    sound: the root becomes visible complete, in one step, so no observer can
+    ever see a half-seeded workspace. If the rename finds a non-empty root
+    already there — possible only after a stale-claim takeover raced a slow
+    but live holder — someone else published a complete layout first, and the
+    staging copy is simply discarded.
 
-    The claim is released last. Until it is gone the layout is not promised, so
-    any resolve that arrives meanwhile completes it rather than returning a
-    half-seeded workspace.
+    The claim is released last, on every path, so a failed build never leaves
+    a claim that waiters would have to age out.
     """
-    workspace.mkdir(parents=True, exist_ok=True)
-    for relative_dir in initial_dirs:
-        (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
-    _release_claim(workspace)
+    staging = workspace.parent / (
+        f"{_STAGING_PREFIX}-{workspace.name}-{uuid.uuid4().hex}"
+    )
+    try:
+        staging.mkdir(parents=True, exist_ok=False)
+        for relative_dir in initial_dirs:
+            (staging / relative_dir).mkdir(parents=True, exist_ok=True)
+        try:
+            os.rename(staging, workspace)
+        except OSError as exc:
+            published_by_other = (
+                exc.errno in (errno.ENOTEMPTY, errno.EEXIST) and workspace.is_dir()
+            )
+            if not published_by_other:
+                raise
+            logger.info(
+                "Workspace %s was published by a concurrent resolver; "
+                "discarding this staging copy",
+                workspace,
+            )
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+        _release_claim(workspace)
+
+
+def _await_publication(workspace: Path) -> None:
+    """Wait, as a claim loser, for the holder to publish the root.
+
+    Returns once the root exists (complete, by construction), or once the claim
+    has gone away or gone stale without a root — the holder released after a
+    failed build, or died. The caller then re-observes and, if the root is
+    still missing, competes for the claim itself. A stale claim is removed here
+    so that competition can succeed.
+    """
+    claim = _seeding_claim(workspace)
+    while not workspace.exists():
+        try:
+            age = time.time() - claim.stat().st_mtime
+        except FileNotFoundError:
+            return  # released without publishing; caller re-observes
+        if age > _STALE_CLAIM_SECONDS:
+            logger.warning(
+                "Workspace seeding claim %s is %.0fs old with no root published; "
+                "treating its holder as gone",
+                claim,
+                age,
+            )
+            _release_claim(workspace)
+            return
+        time.sleep(_WAIT_POLL_SECONDS)
 
 
 class WorkspaceManager:
@@ -217,36 +276,28 @@ class WorkspaceManager:
 
         # Seeding is creation-only: configured starter folders are onboarding
         # defaults, not invariants, so one the user later deletes must not come
-        # back on the next resolve. That makes "has this workspace been
-        # initialized" load-bearing, and the directory cannot answer it — it is
-        # published before its contents exist. ``_SEEDING_MARKER`` answers it,
-        # from beside the workspace so it precedes the root; see its definition.
+        # back on the next resolve. "Has this workspace been initialized" is
+        # therefore load-bearing, and the protocol above makes the directory
+        # itself a truthful answer: a root is either absent or complete.
         if not initial_dirs:
             workspace.mkdir(parents=True, exist_ok=True)
-        elif not workspace.exists():
-            # Nobody has published a root yet — as far as this observation
-            # goes. It is only an observation, so the claim is exclusive and
-            # the winner re-checks the root before building: another resolver
-            # may have initialized, released and returned in between, and a
-            # root that appeared since is a *completed* workspace, not ours
-            # to seed (it would recreate a starter folder the user removed).
-            if not _claim_initialization(workspace):
-                # Someone else holds the claim: finish their in-flight
-                # initialization idempotently instead of starting a second.
-                _initialize_workspace(workspace, initial_dirs)
-            elif workspace.exists():
-                _release_claim(workspace)
-            else:
-                _initialize_workspace(workspace, initial_dirs)
-        elif _seeding_claim(workspace).exists():
-            # An initialization that is still running or died partway through.
-            # Finishing it idempotently is what stops a partial layout from
-            # hardening into "existing workspace, never seed".
-            _initialize_workspace(workspace, initial_dirs)
         else:
-            # A root with no claim: from before this feature, or already seeded.
-            # Either way it is not ours to touch.
-            workspace.mkdir(parents=True, exist_ok=True)
+            while not workspace.exists():
+                if not _claim_initialization(workspace):
+                    # Someone else is the publisher. Create nothing; wait for
+                    # the root to appear (complete) or the claim to lapse.
+                    _await_publication(workspace)
+                    continue
+                if workspace.exists():
+                    # Appeared between our observation and our claim. Published
+                    # atomically, so it is complete (or legacy) — not ours.
+                    _release_claim(workspace)
+                    break
+                _publish_workspace(workspace, initial_dirs)
+                break
+            if not workspace.is_dir():
+                # Preserve pathlib's behavior for a non-directory collision.
+                raise FileExistsError(f"{workspace} exists and is not a directory")
 
         if user is not None and backend_name == "claude":
             # Import lazily so this generic path manager does not import the Claude
