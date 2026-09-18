@@ -183,44 +183,81 @@ class TestResolve:
         assert not (anonymous / "Documents").exists()
         assert list(aggregate.iterdir()) == []
 
-    def test_a_concurrent_first_resolve_never_sees_a_half_seeded_workspace(
+    def test_a_second_resolver_cannot_return_before_the_root_is_claimed(
         self, manager, monkeypatch
     ):
-        """Both first resolves must return the whole configured layout.
+        """The narrow window: root published, claim not yet.
 
-        The workspace directory is published before its contents exist, so a
-        second resolver arriving in that window used to see a directory, call it
-        pre-existing, and hand back a partial layout. It is the in-progress
-        marker, not the directory, that answers "was this just created".
-
-        The creator is paused inside its own seeding — after the marker and the
-        first directory, before the rest — which is exactly the interleaving the
-        review described.
+        A previous version published the claim *inside* the workspace, so the
+        root became visible first. A resolver descheduled between those two
+        filesystem operations left a moment in which another resolver saw a
+        directory, called it pre-existing, and returned it empty. The claim now
+        precedes the root, so this test pauses at exactly that seam — claim
+        published, root not created — and the second resolve must still not
+        return an unseeded workspace.
         """
         seeded = ("Documents", "Projects", "Uploads")
         monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", ",".join(seeded))
         second: dict[str, object] = {}
 
-        real_seed = wm._seed_initial_dirs
+        real_claim = wm._claim_initialization
+
+        def _layout(workspace):
+            return sorted(name for name in seeded if (workspace / name).is_dir())
+
+        def _claim_then_let_the_other_resolver_in(workspace):
+            real_claim(workspace)
+            # The claim exists; the root does not. This is the seam.
+            assert not workspace.exists()
+            monkeypatch.setattr(wm, "_claim_initialization", real_claim)
+            second["path"] = manager.resolve("iris", backend="codex")
+            second["layout"] = _layout(second["path"])
+
+        monkeypatch.setattr(
+            wm, "_claim_initialization", _claim_then_let_the_other_resolver_in
+        )
+        first = manager.resolve("iris", backend="codex")
+
+        assert second["path"] == first
+        assert second["layout"] == sorted(seeded), "partial layout returned"
+        assert _layout(first) == sorted(seeded)
+
+    def test_a_concurrent_first_resolve_never_sees_a_half_seeded_workspace(
+        self, manager, monkeypatch
+    ):
+        """The wider window: root published, seeding part way through.
+
+        Here the creator is paused inside its own initialization — after the
+        root and the first directory, before the rest — and the second caller's
+        view is recorded AS IT RETURNS. Reading it after the creator finishes
+        would pass either way, which is what made an earlier version of this
+        test vacuous.
+        """
+        seeded = ("Documents", "Projects", "Uploads")
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", ",".join(seeded))
+        second: dict[str, object] = {}
+
+        real_init = wm._initialize_workspace
 
         def _layout(workspace):
             return sorted(name for name in seeded if (workspace / name).is_dir())
 
         def _seed_then_let_the_other_resolver_in(workspace, initial_dirs):
+            workspace.mkdir(parents=True, exist_ok=True)
             (workspace / initial_dirs[0]).mkdir(parents=True, exist_ok=True)
-            # Mid-initialization: the directory exists, the layout does not.
-            monkeypatch.setattr(wm, "_seed_initial_dirs", real_seed)
-            second["path"] = manager.resolve("iris", backend="codex")
-            # What the second caller could see AS IT RETURNED. Reading this
-            # after the creator finishes would pass either way.
+            # Mid-initialization: the root exists, the layout does not.
+            monkeypatch.setattr(wm, "_initialize_workspace", real_init)
+            second["path"] = manager.resolve("juno", backend="codex")
             second["layout"] = _layout(second["path"])
-            real_seed(workspace, initial_dirs)
+            real_init(workspace, initial_dirs)
 
-        monkeypatch.setattr(wm, "_seed_initial_dirs", _seed_then_let_the_other_resolver_in)
-        first = manager.resolve("iris", backend="codex")
+        monkeypatch.setattr(
+            wm, "_initialize_workspace", _seed_then_let_the_other_resolver_in
+        )
+        first = manager.resolve("juno", backend="codex")
 
         assert second["path"] == first
-        assert second["layout"] == sorted(seeded), "second caller returned a partial layout"
+        assert second["layout"] == sorted(seeded), "partial layout returned"
         assert _layout(first) == sorted(seeded)
 
     def test_a_crashed_first_seeding_is_finished_by_the_next_resolve(
@@ -228,19 +265,19 @@ class TestResolve:
     ):
         """A partial layout must not harden into "existing workspace, never seed".
 
-        Seeding can die after the directory is published — a filesystem error, a
+        Seeding can die after the root is published — a filesystem error, a
         quota or permission failure, the process going away. Before this, every
         later resolve classified the leftover as pre-existing and skipped
         seeding forever, so the workspace stayed permanently half built.
         """
         monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects,Uploads")
-        boom = OSError("disk went away")
 
         def _die_partway(workspace, initial_dirs):
+            workspace.mkdir(parents=True, exist_ok=True)
             (workspace / initial_dirs[0]).mkdir(parents=True, exist_ok=True)
-            raise boom
+            raise OSError("disk went away")
 
-        monkeypatch.setattr(wm, "_seed_initial_dirs", _die_partway)
+        monkeypatch.setattr(wm, "_initialize_workspace", _die_partway)
         with pytest.raises(OSError, match="disk went away"):
             manager.resolve("jack", backend="codex")
 
@@ -250,7 +287,28 @@ class TestResolve:
 
         for name in ("Documents", "Projects", "Uploads"):
             assert (workspace / name).is_dir(), name
-        assert not (workspace / wm._SEEDING_MARKER).exists(), "marker outlived seeding"
+        assert not wm._seeding_claim(workspace).exists(), "claim outlived seeding"
+
+    def test_a_claim_left_without_a_root_still_initializes(self, manager, monkeypatch):
+        """A crash between claim and root must not strand the workspace either."""
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects")
+
+        def _die_after_claiming(workspace):
+            wm._seeding_claim(workspace).parent.mkdir(parents=True, exist_ok=True)
+            wm._seeding_claim(workspace).touch()
+            raise OSError("died after claiming")
+
+        monkeypatch.setattr(wm, "_claim_initialization", _die_after_claiming)
+        with pytest.raises(OSError, match="died after claiming"):
+            manager.resolve("kira", backend="codex")
+
+        monkeypatch.undo()
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects")
+        workspace = manager.resolve("kira", backend="codex")
+
+        assert (workspace / "Documents").is_dir()
+        assert (workspace / "Projects").is_dir()
+        assert not wm._seeding_claim(workspace).exists()
 
     def test_a_completed_seed_is_not_redone_and_leaves_no_marker(
         self, manager, monkeypatch
@@ -259,7 +317,7 @@ class TestResolve:
         monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents")
 
         workspace = manager.resolve("kate", backend="codex")
-        assert not (workspace / wm._SEEDING_MARKER).exists()
+        assert not wm._seeding_claim(workspace).exists()
 
         (workspace / "Documents").rmdir()
         assert manager.resolve("kate", backend="codex") == workspace

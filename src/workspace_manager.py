@@ -52,15 +52,27 @@ def _legacy_localpart_key_enabled() -> bool:
     return os.getenv("WORKSPACE_LEGACY_LOCALPART_KEY", "").strip().lower() == "true"
 
 
-# Marks a workspace whose creation-only seeding has not finished. It exists only
-# between "the directory was published" and "every configured directory is
-# there", which is what lets a resolver tell three otherwise identical states
-# apart: a workspace from before this feature (no marker -> never seed), one
-# whose seeding completed (no marker -> never seed again, so a folder the user
-# deletes stays deleted), and one still being or half seeded (marker -> finish
-# it). Without that distinction the directory itself is the only evidence, and
-# it becomes visible before the layout does.
+# Marks a workspace whose creation-only seeding has not finished, and it lives
+# BESIDE the workspace rather than inside it so it can be published *before* the
+# root. That order is the whole point: the directory becomes visible before its
+# contents do, so a resolver that treats the directory as the evidence can hand
+# back an empty workspace while the creator is still working. Publishing the
+# claim first leaves no window in which a root exists without one.
+#
+# With the claim in hand a resolver can tell three otherwise identical states
+# apart: no claim and no root (nobody has started -> initialize), a claim
+# (someone is initializing, or died partway -> finish it, idempotently), and a
+# root with no claim (a workspace from before this feature, or one already
+# seeded -> never seed, so a folder the user deletes stays deleted).
+#
+# It is removed once seeding completes, so it is transient. A crash can leave
+# one behind; the next resolve of that user+backend consumes it and cleans up.
 _SEEDING_MARKER = ".oh-my-gateway-seeding"
+
+
+def _seeding_claim(workspace: Path) -> Path:
+    """The claim file for *workspace*, as a sibling so it can precede the root."""
+    return workspace.parent / f"{_SEEDING_MARKER}-{workspace.name}"
 
 
 def _initial_workspace_dirs() -> tuple[Path, ...]:
@@ -75,22 +87,45 @@ def _initial_workspace_dirs() -> tuple[Path, ...]:
         raise ValueError(f"Invalid WORKSPACE_INITIAL_DIRS: {exc}") from exc
 
 
-def _seed_initial_dirs(workspace: Path, initial_dirs: tuple[Path, ...]) -> None:
-    """Create every configured directory, then drop the in-progress marker.
+def _claim_initialization(workspace: Path) -> None:
+    """Publish the in-progress claim, before the workspace root exists.
 
-    Idempotent on purpose. Both callers — the process that created the
-    workspace and one that found the marker left behind — run exactly this, so a
-    concurrent second resolver and a resolver recovering from a crashed first
-    one need no locking and no distinction between the two cases. The marker is
-    removed last: until it is gone the layout is not promised, and any later
-    resolve will complete it.
+    The claim's parent is the user's aggregate root, which is created here so
+    the claim can land before ``workspace.mkdir``. Creating a claim that is
+    already there is fine — see :func:`_initialize_workspace` for why ownership
+    does not need to be exclusive.
     """
+    claim = _seeding_claim(workspace)
+    claim.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(claim, os.O_CREAT | os.O_WRONLY, 0o600))
+    except OSError:
+        logger.warning(
+            "Failed to publish workspace seeding claim %s", claim, exc_info=True
+        )
+        raise
+
+
+def _initialize_workspace(workspace: Path, initial_dirs: tuple[Path, ...]) -> None:
+    """Create the root and every configured directory, then drop the claim.
+
+    Idempotent on purpose, which is what removes the need for a lock. Every
+    caller — the resolver that published the claim, a concurrent one that found
+    it, and one recovering from a crash that left it — runs exactly this, so
+    none of them has to tell those cases apart and two of them running at once
+    converge on the same layout.
+
+    The claim is released last. Until it is gone the layout is not promised, so
+    any resolve that arrives meanwhile completes it rather than returning a
+    half-seeded workspace.
+    """
+    workspace.mkdir(parents=True, exist_ok=True)
     for relative_dir in initial_dirs:
         (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
     try:
-        (workspace / _SEEDING_MARKER).unlink()
+        _seeding_claim(workspace).unlink()
     except FileNotFoundError:
-        # A concurrent resolver finished the same seeding first.
+        # A concurrent resolver finished the same initialization first.
         pass
 
 
@@ -163,32 +198,25 @@ class WorkspaceManager:
 
         # Seeding is creation-only: configured starter folders are onboarding
         # defaults, not invariants, so one the user later deletes must not come
-        # back on the next resolve. That makes "was this workspace just created"
-        # load-bearing, and the directory alone cannot answer it — it is
-        # published before its contents exist. ``_SEEDING_MARKER`` carries the
-        # answer instead; see its definition.
-        created = False
-        try:
-            workspace.mkdir(parents=True, exist_ok=False)
-            created = True
-        except FileExistsError:
-            # Preserve pathlib's previous behavior for a non-directory collision
-            # while treating an already-created directory (including a concurrent
-            # creator) as an existing workspace.
-            if not workspace.is_dir():
-                raise
-
-        if created and initial_dirs:
-            # Claim first, seed second. A resolver that arrives in between finds
-            # the marker and finishes the job rather than returning a workspace
-            # whose configured layout is still half there.
-            (workspace / _SEEDING_MARKER).touch()
-            _seed_initial_dirs(workspace, initial_dirs)
-        elif not created and initial_dirs and (workspace / _SEEDING_MARKER).is_file():
-            # A first creation that is still running, or one that died partway
-            # through. Both are finished the same idempotent way, so a partial
-            # layout can never harden into "existing workspace, never seed".
-            _seed_initial_dirs(workspace, initial_dirs)
+        # back on the next resolve. That makes "has this workspace been
+        # initialized" load-bearing, and the directory cannot answer it — it is
+        # published before its contents exist. ``_SEEDING_MARKER`` answers it,
+        # from beside the workspace so it precedes the root; see its definition.
+        if not initial_dirs:
+            workspace.mkdir(parents=True, exist_ok=True)
+        elif not workspace.exists():
+            # Nobody has published a root yet. Claim first, then build.
+            _claim_initialization(workspace)
+            _initialize_workspace(workspace, initial_dirs)
+        elif _seeding_claim(workspace).exists():
+            # An initialization that is still running or died partway through.
+            # Finishing it idempotently is what stops a partial layout from
+            # hardening into "existing workspace, never seed".
+            _initialize_workspace(workspace, initial_dirs)
+        else:
+            # A root with no claim: from before this feature, or already seeded.
+            # Either way it is not ours to touch.
+            workspace.mkdir(parents=True, exist_ok=True)
 
         if user is not None and backend_name == "claude":
             # Import lazily so this generic path manager does not import the Claude
