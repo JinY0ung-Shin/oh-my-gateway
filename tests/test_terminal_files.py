@@ -360,6 +360,16 @@ def test_claude_dir_hide_is_narrow_and_blocks_direct_access(client, workspace, m
     # Other dot-prefixed paths remain accessible.
     assert client.get("/files/read?path=/.env", headers={**_AUTH, **_USER}).status_code == 200
 
+    # Match WORKSPACE_HIDE_DOTFILES semantics: hidden paths are not writable
+    # through the file API either.
+    write = client.post(
+        "/files/mkdir",
+        headers={**_AUTH, **_USER},
+        json={"path": "/.claude/new-project"},
+    )
+    assert write.status_code == 404
+    assert not (claude / "new-project").exists()
+
 
 def test_claude_dir_hide_blocks_nested_claude_component(client, workspace, monkeypatch):
     nested = workspace / "sub" / ".claude"
