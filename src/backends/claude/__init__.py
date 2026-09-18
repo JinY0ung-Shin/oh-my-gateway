@@ -15,10 +15,12 @@ from typing import Optional
 
 from src.backends.claude.constants import (
     CLAUDE_MODELS,
+    CUSTOM_UPSTREAM_EFFORT_ENV,
+    CUSTOM_UPSTREAM_EFFORT_WILDCARD,
     EFFORT_LEVELS,
-    certified_effort_levels,
     configured_model_aliases,
     configured_public_models,
+    parse_custom_upstream_effort_certification,
     tier_applies_effort,
 )
 from src.backends.claude.model_discovery import (
@@ -120,11 +122,26 @@ def _custom_upstream_effort_levels(model: str) -> tuple[str, ...] | None:
        each served model's set from the model's own 400s / a probe and publishes
        it there, so nothing has to be copied by hand.
 
-    ``None`` when neither says anything — fail closed, as before.
+    A nonblank but malformed manual override suppresses discovery fallback
+    entirely. Invalid operator input is a global fail-closed state, not the same
+    thing as "no override for this model": otherwise a typo in a narrowing
+    override could silently widen back to the upstream-discovered ladder.
     """
-    certified = certified_effort_levels(model)
-    if certified is not None:
-        return certified
+    raw = os.getenv(CUSTOM_UPSTREAM_EFFORT_ENV)
+    if raw is not None and raw.strip():
+        try:
+            certified = parse_custom_upstream_effort_certification(raw)
+        except ValueError as exc:
+            logger.warning(
+                "%s; certifying nothing and suppressing discovery fallback",
+                exc,
+            )
+            return None
+        if model in certified:
+            return certified[model]
+        wildcard = certified.get(CUSTOM_UPSTREAM_EFFORT_WILDCARD)
+        if wildcard is not None:
+            return wildcard
     return discovered_effort_levels().get(model)
 
 
