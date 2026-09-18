@@ -585,6 +585,35 @@ def test_workspace_initial_dirs_unsafe_value_is_startup_error(clean_env, value):
     assert repr(value) in errors[0]
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".claude/skills",
+        ".claude/skills/review",
+        ".claude/agents",
+        "Documents,.claude/agents/triage",
+    ],
+)
+def test_workspace_initial_dirs_reserved_namespace_is_startup_error(clean_env, value):
+    """The startup check must refuse what the workspace manager refuses.
+
+    ``.claude/{skills,agents}`` is the Claude backend's managed mirror of the
+    canonical resource roots. Both surfaces parse through
+    ``env_utils.parse_workspace_initial_dirs`` precisely so a reserved path
+    cannot pass startup and then be seeded at resolve time.
+    """
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", value)
+    errors = [m for m in _messages(check_config(), "error") if "WORKSPACE_INITIAL_DIRS" in m]
+    assert len(errors) == 1
+    assert "manages as a mirror" in errors[0]
+    assert "skills/ or agents/" in errors[0]
+
+
+def test_workspace_initial_dirs_allows_the_canonical_resource_roots(clean_env):
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", "skills/review,agents/triage,.claude")
+    assert not [m for m in _messages(check_config(), "error") if "WORKSPACE_INITIAL_DIRS" in m]
+
+
 # ---------------------------------------------------------------------------
 # USER_WORKSPACE_QUOTA_MB — consulted on every Claude turn once configured
 # ---------------------------------------------------------------------------

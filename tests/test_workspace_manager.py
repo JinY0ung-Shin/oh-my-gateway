@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 from src.session_manager import Session
+from src import workspace_manager as wm
 from src.workspace_manager import WorkspaceManager
 
 
@@ -181,6 +182,145 @@ class TestResolve:
 
         assert not (anonymous / "Documents").exists()
         assert list(aggregate.iterdir()) == []
+
+    def test_a_concurrent_first_resolve_never_sees_a_half_seeded_workspace(
+        self, manager, monkeypatch
+    ):
+        """Both first resolves must return the whole configured layout.
+
+        The workspace directory is published before its contents exist, so a
+        second resolver arriving in that window used to see a directory, call it
+        pre-existing, and hand back a partial layout. It is the in-progress
+        marker, not the directory, that answers "was this just created".
+
+        The creator is paused inside its own seeding — after the marker and the
+        first directory, before the rest — which is exactly the interleaving the
+        review described.
+        """
+        seeded = ("Documents", "Projects", "Uploads")
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", ",".join(seeded))
+        second: dict[str, object] = {}
+
+        real_seed = wm._seed_initial_dirs
+
+        def _layout(workspace):
+            return sorted(name for name in seeded if (workspace / name).is_dir())
+
+        def _seed_then_let_the_other_resolver_in(workspace, initial_dirs):
+            (workspace / initial_dirs[0]).mkdir(parents=True, exist_ok=True)
+            # Mid-initialization: the directory exists, the layout does not.
+            monkeypatch.setattr(wm, "_seed_initial_dirs", real_seed)
+            second["path"] = manager.resolve("iris", backend="codex")
+            # What the second caller could see AS IT RETURNED. Reading this
+            # after the creator finishes would pass either way.
+            second["layout"] = _layout(second["path"])
+            real_seed(workspace, initial_dirs)
+
+        monkeypatch.setattr(wm, "_seed_initial_dirs", _seed_then_let_the_other_resolver_in)
+        first = manager.resolve("iris", backend="codex")
+
+        assert second["path"] == first
+        assert second["layout"] == sorted(seeded), "second caller returned a partial layout"
+        assert _layout(first) == sorted(seeded)
+
+    def test_a_crashed_first_seeding_is_finished_by_the_next_resolve(
+        self, manager, monkeypatch
+    ):
+        """A partial layout must not harden into "existing workspace, never seed".
+
+        Seeding can die after the directory is published — a filesystem error, a
+        quota or permission failure, the process going away. Before this, every
+        later resolve classified the leftover as pre-existing and skipped
+        seeding forever, so the workspace stayed permanently half built.
+        """
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects,Uploads")
+        boom = OSError("disk went away")
+
+        def _die_partway(workspace, initial_dirs):
+            (workspace / initial_dirs[0]).mkdir(parents=True, exist_ok=True)
+            raise boom
+
+        monkeypatch.setattr(wm, "_seed_initial_dirs", _die_partway)
+        with pytest.raises(OSError, match="disk went away"):
+            manager.resolve("jack", backend="codex")
+
+        monkeypatch.undo()
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects,Uploads")
+        workspace = manager.resolve("jack", backend="codex")
+
+        for name in ("Documents", "Projects", "Uploads"):
+            assert (workspace / name).is_dir(), name
+        assert not (workspace / wm._SEEDING_MARKER).exists(), "marker outlived seeding"
+
+    def test_a_completed_seed_is_not_redone_and_leaves_no_marker(
+        self, manager, monkeypatch
+    ):
+        """The marker is initialization state, not a permanent workspace file."""
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents")
+
+        workspace = manager.resolve("kate", backend="codex")
+        assert not (workspace / wm._SEEDING_MARKER).exists()
+
+        (workspace / "Documents").rmdir()
+        assert manager.resolve("kate", backend="codex") == workspace
+        assert not (workspace / "Documents").exists(), "a deletion must stay deleted"
+
+    def test_a_workspace_from_before_this_feature_is_never_backfilled(
+        self, manager, tmp_base, monkeypatch
+    ):
+        """No marker on a directory nobody seeded means legacy, not partial."""
+        legacy = tmp_base / "liam" / "codex"
+        legacy.mkdir(parents=True)
+        (legacy / "existing.txt").write_text("mine")
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "Documents,Projects")
+
+        workspace = manager.resolve("liam", backend="codex")
+
+        assert workspace == legacy
+        assert (workspace / "existing.txt").read_text() == "mine"
+        assert sorted(p.name for p in workspace.iterdir()) == ["existing.txt"]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            ".claude/skills",
+            ".claude/skills/review",
+            ".claude/agents",
+            ".claude/agents/triage/nested",
+        ],
+    )
+    def test_initial_dirs_reject_the_claude_managed_mirror_namespace(
+        self, manager, tmp_base, monkeypatch, value
+    ):
+        """``.claude/{skills,agents}`` is the backend's, not the operator's.
+
+        The Claude resource bridge migrates a legacy native tree into the
+        canonical ``skills``/``agents`` roots and then keeps ``.claude/<kind>``
+        as a marked mirror of them. Seeding into it does not do what the
+        operator wrote: ``.claude/skills/review`` alone is migrated away to
+        ``skills/review``, and seeding both sides at once leaves an unmanaged
+        conflict that turns mirror management off for that workspace. The
+        canonical roots express the same intent, so this is refused rather than
+        quietly rewritten.
+        """
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", value)
+
+        with pytest.raises(ValueError, match="WORKSPACE_INITIAL_DIRS"):
+            manager.resolve("mia", backend="claude")
+
+        assert not (tmp_base / "mia").exists()
+
+    def test_initial_dirs_still_allow_the_canonical_resource_roots(
+        self, manager, monkeypatch
+    ):
+        """The intent behind a rejected entry stays expressible."""
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", "skills/review,agents/triage,.claude")
+
+        workspace = manager.resolve("noah", backend="claude")
+
+        assert (workspace / "skills" / "review").is_dir()
+        assert (workspace / "agents" / "triage").is_dir()
+        assert (workspace / ".claude").is_dir()
 
     @pytest.mark.parametrize(
         "value",

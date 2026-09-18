@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Optional
 
 from src.constants import USER_WORKSPACES_DIR
+from src.env_utils import parse_workspace_initial_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -51,36 +52,46 @@ def _legacy_localpart_key_enabled() -> bool:
     return os.getenv("WORKSPACE_LEGACY_LOCALPART_KEY", "").strip().lower() == "true"
 
 
+# Marks a workspace whose creation-only seeding has not finished. It exists only
+# between "the directory was published" and "every configured directory is
+# there", which is what lets a resolver tell three otherwise identical states
+# apart: a workspace from before this feature (no marker -> never seed), one
+# whose seeding completed (no marker -> never seed again, so a folder the user
+# deletes stays deleted), and one still being or half seeded (marker -> finish
+# it). Without that distinction the directory itself is the only evidence, and
+# it becomes visible before the layout does.
+_SEEDING_MARKER = ".oh-my-gateway-seeding"
+
+
 def _initial_workspace_dirs() -> tuple[Path, ...]:
-    """Parse safe relative directories to seed into a brand-new backend workspace.
+    """Safe relative directories to seed into a brand-new backend workspace.
 
-    ``WORKSPACE_INITIAL_DIRS`` is a comma-separated list of workspace-relative
-    directory paths. Nested paths and dot-directories are allowed, but absolute
-    paths and traversal components are rejected so deployment configuration can
-    never escape the workspace root.
+    Parsing and validation live in :func:`src.env_utils.parse_workspace_initial_dirs`
+    so the startup config check reaches the same verdict through the same code.
     """
-    raw = os.getenv("WORKSPACE_INITIAL_DIRS", "")
-    if not raw.strip():
-        return ()
+    try:
+        return parse_workspace_initial_dirs(os.getenv("WORKSPACE_INITIAL_DIRS"))
+    except ValueError as exc:
+        raise ValueError(f"Invalid WORKSPACE_INITIAL_DIRS: {exc}") from exc
 
-    result: list[Path] = []
-    seen: set[str] = set()
-    for item in raw.split(","):
-        value = item.strip()
-        if not value:
-            continue
-        path = Path(value)
-        if path.is_absolute() or not path.parts or any(part == ".." for part in path.parts):
-            raise ValueError(
-                f"Invalid WORKSPACE_INITIAL_DIRS entry: {value!r}. "
-                "Entries must be relative workspace paths without '..'."
-            )
-        normalized = Path(*path.parts)
-        key = normalized.as_posix()
-        if key not in seen:
-            result.append(normalized)
-            seen.add(key)
-    return tuple(result)
+
+def _seed_initial_dirs(workspace: Path, initial_dirs: tuple[Path, ...]) -> None:
+    """Create every configured directory, then drop the in-progress marker.
+
+    Idempotent on purpose. Both callers — the process that created the
+    workspace and one that found the marker left behind — run exactly this, so a
+    concurrent second resolver and a resolver recovering from a crashed first
+    one need no locking and no distinction between the two cases. The marker is
+    removed last: until it is gone the layout is not promised, and any later
+    resolve will complete it.
+    """
+    for relative_dir in initial_dirs:
+        (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
+    try:
+        (workspace / _SEEDING_MARKER).unlink()
+    except FileNotFoundError:
+        # A concurrent resolver finished the same seeding first.
+        pass
 
 
 class WorkspaceManager:
@@ -150,10 +161,12 @@ class WorkspaceManager:
             else ()
         )
 
-        # Only the process that creates the final backend directory seeds it.
-        # This matters semantically: configured starter folders are onboarding
-        # defaults, not invariants. If a user later deletes one, resolving the
-        # workspace again must not recreate it.
+        # Seeding is creation-only: configured starter folders are onboarding
+        # defaults, not invariants, so one the user later deletes must not come
+        # back on the next resolve. That makes "was this workspace just created"
+        # load-bearing, and the directory alone cannot answer it — it is
+        # published before its contents exist. ``_SEEDING_MARKER`` carries the
+        # answer instead; see its definition.
         created = False
         try:
             workspace.mkdir(parents=True, exist_ok=False)
@@ -166,8 +179,16 @@ class WorkspaceManager:
                 raise
 
         if created and initial_dirs:
-            for relative_dir in initial_dirs:
-                (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
+            # Claim first, seed second. A resolver that arrives in between finds
+            # the marker and finishes the job rather than returning a workspace
+            # whose configured layout is still half there.
+            (workspace / _SEEDING_MARKER).touch()
+            _seed_initial_dirs(workspace, initial_dirs)
+        elif not created and initial_dirs and (workspace / _SEEDING_MARKER).is_file():
+            # A first creation that is still running, or one that died partway
+            # through. Both are finished the same idempotent way, so a partial
+            # layout can never harden into "existing workspace, never seed".
+            _seed_initial_dirs(workspace, initial_dirs)
 
         if user is not None and backend_name == "claude":
             # Import lazily so this generic path manager does not import the Claude
