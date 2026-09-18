@@ -330,6 +330,180 @@ def test_hidden_path_not_accessible_when_enabled(client, monkeypatch):
     )
 
 
+def test_claude_prefix_hide_is_narrow_and_blocks_direct_access(client, workspace, monkeypatch):
+    claude = workspace / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text('{"hooks": []}')
+    claude_images = workspace / ".claude_images"
+    claude_images.mkdir()
+    (claude_images / "frame.png").write_bytes(b"png")
+    (workspace / ".claud").write_text("visible")
+
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
+    names = [e["name"] for e in r.json()["entries"]]
+    assert ".claude" not in names
+    assert ".claude_images" not in names
+    # This switch is deliberately narrower than WORKSPACE_HIDE_DOTFILES.
+    assert ".env" in names
+    assert ".secret_dir" in names
+    assert ".claud" in names
+
+    assert (
+        client.get(
+            "/files/read?path=/.claude/settings.json",
+            headers={**_AUTH, **_USER},
+        ).status_code
+        == 404
+    )
+    assert (
+        client.get("/files/list?directory=/.claude", headers={**_AUTH, **_USER}).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/files/read?path=/.claude_images/frame.png",
+            headers={**_AUTH, **_USER},
+        ).status_code
+        == 404
+    )
+    # Other dot-prefixed paths remain accessible.
+    assert client.get("/files/read?path=/.env", headers={**_AUTH, **_USER}).status_code == 200
+
+    # Match WORKSPACE_HIDE_DOTFILES semantics: hidden paths are not writable
+    # through the file API either.
+    write = client.post(
+        "/files/mkdir",
+        headers={**_AUTH, **_USER},
+        json={"path": "/.claude/new-project"},
+    )
+    assert write.status_code == 404
+    assert not (claude / "new-project").exists()
+
+
+def test_claude_prefix_hide_blocks_nested_claude_component(client, workspace, monkeypatch):
+    nested = workspace / "sub" / ".claude"
+    nested.mkdir()
+    (nested / "project.md").write_text("private project config")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    assert (
+        client.get(
+            "/files/read?path=/sub/.claude/project.md",
+            headers={**_AUTH, **_USER},
+        ).status_code
+        == 404
+    )
+
+
+@pytest.mark.parametrize(
+    ("env_name", "link_name"),
+    [
+        ("WORKSPACE_HIDE_CLAUDE_PREFIX", ".claude_link"),
+        ("WORKSPACE_HIDE_DOTFILES", ".hidden_link"),
+    ],
+)
+def test_hidden_lexical_component_cannot_escape_via_internal_symlink(
+    client, workspace, monkeypatch, env_name, link_name
+):
+    visible = workspace / "visible"
+    visible.mkdir()
+    (visible / "secret.txt").write_text("not for hidden path")
+    (workspace / link_name).symlink_to(visible, target_is_directory=True)
+    monkeypatch.setenv(env_name, "true")
+
+    # Path.resolve() maps this request to visible/secret.txt.  The requested
+    # hidden component must still make the file API return 404.
+    r = client.get(
+        f"/files/read?path=/{link_name}/secret.txt",
+        headers={**_AUTH, **_USER},
+    )
+    assert r.status_code == 404
+
+
+def test_claude_prefix_hide_keeps_canonical_agent_resources_editable(
+    client, workspace, monkeypatch
+):
+    """The switch hides the managed mirror, not the resources the user edits.
+
+    Since #206 a workspace keeps its skills/subagents at the canonical
+    ``skills/`` and ``agents/`` roots and the gateway maintains a managed
+    ``.claude/{skills,agents}`` mirror (hard-linked, marked with
+    ``.oh-my-gateway-managed``) purely for Claude Code's own discovery. That
+    split is what makes this switch the right one for the file manager: the
+    duplicate mirror leaves the surface while the user's own copy stays
+    listable, readable and writable.
+
+    ``WORKSPACE_HIDE_DOTFILES`` reaches the same mirror, but only as a side
+    effect of hiding every dotfile. Pinned here so a later narrowing of the
+    prefix (to exactly ``.claude``) or a widening onto the canonical roots
+    fails loudly instead of quietly changing which copy the operator hid.
+    """
+    (workspace / "skills" / "review").mkdir(parents=True)
+    (workspace / "skills" / "review" / "SKILL.md").write_text("---\nname: review\n---\n")
+    (workspace / "agents").mkdir()
+    mirror = workspace / ".claude" / "skills" / "review"
+    mirror.mkdir(parents=True)
+    (mirror / "SKILL.md").write_text("---\nname: review\n---\n")
+    (workspace / ".claude" / "skills" / ".oh-my-gateway-managed").write_bytes(b"")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    names = [
+        e["name"]
+        for e in client.get("/files/list?directory=/", headers={**_AUTH, **_USER}).json()[
+            "entries"
+        ]
+    ]
+    assert "skills" in names
+    assert "agents" in names
+    assert ".claude" not in names
+
+    # The canonical copy stays fully usable through the file API...
+    assert (
+        client.get(
+            "/files/read?path=/skills/review/SKILL.md", headers={**_AUTH, **_USER}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/skills/triage"}
+        ).status_code
+        == 200
+    )
+    assert (workspace / "skills" / "triage").is_dir()
+
+    # ...while the mirror of that same content is gone from every surface.
+    assert (
+        client.get(
+            "/files/read?path=/.claude/skills/review/SKILL.md",
+            headers={**_AUTH, **_USER},
+        ).status_code
+        == 404
+    )
+    search = client.get("/files/search?query=SKILL", headers={**_AUTH, **_USER}).json()
+    paths = [e["path"] for e in search["results"]]
+    assert any("/skills/review/SKILL.md" in q for q in paths)
+    assert not any(".claude" in q for q in paths)
+
+
+def test_resolved_hidden_target_is_still_blocked_through_visible_symlink(
+    client, workspace, monkeypatch
+):
+    hidden = workspace / ".claude_images"
+    hidden.mkdir()
+    (hidden / "frame.png").write_bytes(b"png")
+    (workspace / "visible-link").symlink_to(hidden, target_is_directory=True)
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    r = client.get(
+        "/files/read?path=/visible-link/frame.png",
+        headers={**_AUTH, **_USER},
+    )
+    assert r.status_code == 404
+
+
 # --- write operations ---------------------------------------------------------
 
 
@@ -747,6 +921,31 @@ def test_archive_includes_hidden_by_default(client):
     assert "notes.txt" in names
 
 
+def test_archive_excludes_claude_prefixed_paths_when_enabled(client, workspace, monkeypatch):
+    claude = workspace / ".claude"
+    claude.mkdir()
+    (claude / "settings.json").write_text("{}")
+    claude_images = workspace / ".claude_images"
+    claude_images.mkdir()
+    (claude_images / "frame.png").write_bytes(b"png")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    r = client.post(
+        "/files/archive",
+        headers={**_AUTH, **_USER},
+        json={"paths": ["/"]},
+    )
+    assert r.status_code == 200
+    import io as _io
+    import zipfile as _zip
+
+    names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
+    assert ".claude/settings.json" not in names
+    assert ".claude_images/frame.png" not in names
+    assert ".env" in names
+    assert ".secret_dir/k.txt" in names
+
+
 def test_search_finds_nested_files(client):
     r = client.get("/files/search?query=inner", headers={**_AUTH, **_USER})
     assert r.status_code == 200
@@ -777,6 +976,28 @@ def test_search_includes_hidden_by_default(client):
     r = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
     names = [e["name"] for e in r.json()["results"]]
     assert ".secret_dir" in names
+
+
+def test_search_prunes_claude_prefixed_paths_when_enabled(client, workspace, monkeypatch):
+    claude = workspace / ".claude"
+    claude.mkdir()
+    (claude / "claude-config.json").write_text("{}")
+    claude_images = workspace / ".claude_images"
+    claude_images.mkdir()
+    (claude_images / "claude-frame.png").write_bytes(b"png")
+    (workspace / ".claud-notes").write_text("visible")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    r = client.get("/files/search?query=claude", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    names = [e["name"] for e in r.json()["results"]]
+    assert ".claude" not in names
+    assert ".claude_images" not in names
+    assert "claude-config.json" not in names
+    assert "claude-frame.png" not in names
+
+    other = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
+    assert ".secret_dir" in [e["name"] for e in other.json()["results"]]
 
 
 def test_search_empty_query_returns_nothing(client):
@@ -843,6 +1064,16 @@ def test_serve_hidden_file_is_404_when_enabled(client, workspace, monkeypatch):
     monkeypatch.setenv("WORKSPACE_HIDE_DOTFILES", "true")
     d = str(workspace.resolve())
     r = client.get(f"/files/serve{d}/.env", headers={**_AUTH, **_USER})
+    assert r.status_code == 404
+
+
+def test_serve_claude_prefixed_file_is_404_when_enabled(client, workspace, monkeypatch):
+    claude = workspace / ".claude"
+    claude.mkdir()
+    (claude / "preview.html").write_text("<h1>hidden</h1>")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+    d = str(workspace.resolve())
+    r = client.get(f"/files/serve{d}/.claude/preview.html", headers={**_AUTH, **_USER})
     assert r.status_code == 404
 
 

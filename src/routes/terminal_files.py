@@ -46,8 +46,22 @@ Config:
   localpart as releases before this one did. Insecure (see above); migration only.
 - ``WORKSPACE_HIDE_DOTFILES`` — when true, dot-prefixed entries are neither
   listed nor accessible. Default **false**: hiding is a presentation choice that
-  belongs to the client rendering the tree, and hiding them here also blocks
-  writes to the workspace's agent-resource directories.
+  belongs to the client rendering the tree, and this switch reaches every
+  dotfile the user may legitimately want to edit (``.env``, ``.gitignore``, a
+  tool's own dotdir), writes included.
+- ``WORKSPACE_HIDE_CLAUDE_PREFIX`` — when true, path components whose names start
+  with ``.claude`` are hidden/blocked by the file API (for example ``.claude``,
+  ``.claude_images``, ``.claude-local``). Other dotfiles stay visible. Default **false**.
+
+Which one an operator wants follows from the workspace layout. A workspace keeps
+its skills and subagents at the canonical ``skills/`` and ``agents/`` roots, and
+the gateway maintains a managed ``.claude/{skills,agents}`` mirror of them for
+Claude Code's own discovery (see ``backends.claude.workspace_resources``). So
+``WORKSPACE_HIDE_CLAUDE_PREFIX`` removes the *duplicate* from the file manager
+while the copy the user actually edits stays listable and writable;
+``WORKSPACE_HIDE_DOTFILES`` reaches that mirror too, but only on its way to
+hiding everything else as well. Neither switch touches the agent process: it
+reads the workspace directly, not through this API.
 - ``USER_WORKSPACE_QUOTA_MB`` — optional cumulative quota for a named user's whole
   ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
 
@@ -207,6 +221,44 @@ def _hide_dotfiles() -> bool:
     for a deployment that wants it.
     """
     return os.getenv("WORKSPACE_HIDE_DOTFILES", "false").strip().lower() == "true"
+
+
+def _hide_claude_prefix() -> bool:
+    """Hide workspace path components whose names start with ``.claude``.
+
+    This is intentionally narrower than ``WORKSPACE_HIDE_DOTFILES``: deployments
+    can keep ordinary dotfiles visible/editable in the file manager while keeping
+    Claude-owned/project-scoped paths such as ``.claude`` and ``.claude_images``
+    out of that surface. In particular it hides the gateway's managed
+    ``.claude/{skills,agents}`` mirror without touching the canonical
+    ``skills/``/``agents/`` roots the user edits. The agent process itself is
+    unaffected — it reads the workspace directly, not through this API.
+
+    Prefix, not exact match: the sibling paths a deployment wants gone
+    (``.claude_images``, ``.claude-local``) are not under ``.claude/``.
+    """
+    return os.getenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "false").strip().lower() == "true"
+
+
+def _hidden_name(name: str, *, hide_dotfiles: bool, hide_claude_prefix: bool) -> bool:
+    """Whether one path component is hidden by the current workspace policy."""
+    return (hide_dotfiles and name.startswith(".")) or (
+        hide_claude_prefix and name.startswith(".claude")
+    )
+
+
+def _hidden_relative_path(
+    relative: Path, *, hide_dotfiles: bool, hide_claude_prefix: bool
+) -> bool:
+    """Whether any component of a workspace-relative path is hidden."""
+    return any(
+        _hidden_name(
+            part,
+            hide_dotfiles=hide_dotfiles,
+            hide_claude_prefix=hide_claude_prefix,
+        )
+        for part in relative.parts
+    )
 
 
 def _ensure_api_key() -> None:
@@ -377,13 +429,37 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
     return resolved if _is_under(resolved, root_resolved) else None
 
 
+def _lexical_relative_path(root: Path, rel: str) -> Path:
+    """Return the requested workspace-relative path without resolving symlinks.
+
+    Hidden-path policy is lexical as well as target-based.  A request such as
+    ``/.claude_link/file`` must not become visible merely because
+    ``.claude_link`` resolves to a non-hidden directory inside the workspace.
+
+    Absolute paths below the real workspace root are made relative to that root.
+    Other leading-slash paths use the same virtual-root interpretation as
+    ``_resolve_in_root``.  The caller still performs resolved containment
+    separately; this helper is policy input, not a security boundary.
+    """
+    p = rel or "/"
+    if p in ("/", ""):
+        return Path(".")
+    candidate = Path(p)
+    if not candidate.is_absolute():
+        return candidate
+    try:
+        return candidate.relative_to(root.resolve())
+    except ValueError:
+        return Path(p.lstrip("/"))
+
+
 def _resolve_or_403(root: Path, rel: str) -> Path:
     """Resolve within the workspace root or raise.
 
     - Outside the root -> **403** ("outside your workspace"), so the explorer can
       warn the user that navigation there isn't allowed.
-    - A dot-prefixed (hidden) component, when hiding is on -> **404**, so hidden
-      entries stay invisible rather than advertising that something is blocked.
+    - A component hidden by workspace policy -> **404**, so hidden entries stay
+      invisible rather than advertising that something is blocked.
 
     The returned path may not exist yet (callers that create paths check as
     needed); callers reading/listing must still verify existence.
@@ -394,9 +470,20 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
             status_code=403,
             detail="Access denied: this path is outside your workspace.",
         )
-    if _hide_dotfiles():
-        relative = target.relative_to(root.resolve())
-        if any(part.startswith(".") for part in relative.parts):
+    hide_dot = _hide_dotfiles()
+    hide_claude = _hide_claude_prefix()
+    if hide_dot or hide_claude:
+        requested_relative = _lexical_relative_path(root, rel)
+        resolved_relative = target.relative_to(root.resolve())
+        if _hidden_relative_path(
+            requested_relative,
+            hide_dotfiles=hide_dot,
+            hide_claude_prefix=hide_claude,
+        ) or _hidden_relative_path(
+            resolved_relative,
+            hide_dotfiles=hide_dot,
+            hide_claude_prefix=hide_claude,
+        ):
             raise HTTPException(status_code=404, detail="not found")
     return target
 
@@ -495,6 +582,7 @@ async def list_files(
         raise HTTPException(status_code=404, detail="directory not found")
 
     hide_dot = _hide_dotfiles()
+    hide_claude = _hide_claude_prefix()
 
     # Run the directory scan off the event loop: FileNav polls this endpoint
     # continuously across all users, and a synchronous scandir would stall
@@ -503,7 +591,11 @@ async def list_files(
         entries = []
         with os.scandir(target) as it:
             for entry in it:
-                if hide_dot and entry.name.startswith("."):
+                if _hidden_name(
+                    entry.name,
+                    hide_dotfiles=hide_dot,
+                    hide_claude_prefix=hide_claude,
+                ):
                     continue
                 try:
                     st = entry.stat()  # follow symlinks; broken links are skipped
@@ -535,8 +627,9 @@ async def search_files(
     """Recursive filename search under the workspace root.
 
     Case-insensitive substring match on entry names. Hidden entries follow
-    the same rule as listing (dot-prefixed components pruned while hiding is
-    on), symlinks are skipped like the archive walk, and results are capped
+    the same rule as listing (dot-prefixed components, or only names starting
+    with ``.claude`` when that narrower switch is enabled, are pruned), symlinks
+    are skipped like the archive walk, and results are capped
     at ``limit`` (1-200) with a ``truncated`` flag. Name-prefix matches sort
     before substring matches, shallower paths before deeper ones.
     """
@@ -551,6 +644,7 @@ async def search_files(
     limit = max(1, min(limit, 200))
 
     hide_dot = _hide_dotfiles()
+    hide_claude = _hide_claude_prefix()
     _SCAN_CAP = 1000  # stop collecting beyond this many matches
 
     # The recursive walk is the most expensive scan this router does — run it
@@ -561,15 +655,27 @@ async def search_files(
         scan_capped = False
 
         for dirpath, dirnames, filenames in os.walk(root_resolved):
-            if hide_dot:
-                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            if hide_dot or hide_claude:
+                dirnames[:] = [
+                    d
+                    for d in dirnames
+                    if not _hidden_name(
+                        d,
+                        hide_dotfiles=hide_dot,
+                        hide_claude_prefix=hide_claude,
+                    )
+                ]
             dirnames.sort()
             base = Path(dirpath)
             candidates = [(d, True) for d in dirnames] + [
                 (f, False) for f in sorted(filenames)
             ]
             for name, is_dir in candidates:
-                if hide_dot and name.startswith("."):
+                if _hidden_name(
+                    name,
+                    hide_dotfiles=hide_dot,
+                    hide_claude_prefix=hide_claude,
+                ):
                     continue
                 if q not in name.lower():
                     continue
@@ -1105,13 +1211,16 @@ async def archive_entries(
         targets.append(t)
 
     hide_dot = _hide_dotfiles()
+    hide_claude = _hide_claude_prefix()
 
     def _is_hidden(p: Path) -> bool:
-        # Same rule as listing/_resolve_or_403: any dot-prefixed component
-        # relative to the workspace root is hidden. Keeps downloads consistent
-        # with the browser view — e.g. ``.claude`` never ends up in the zip.
-        return hide_dot and any(
-            part.startswith(".") for part in p.relative_to(root_resolved).parts
+        # Same rule as listing/_resolve_or_403. Keeps downloads consistent with
+        # the browser view and prevents hidden ``.claude*`` subtrees from being
+        # swept back in through a recursive directory archive.
+        return _hidden_relative_path(
+            p.relative_to(root_resolved),
+            hide_dotfiles=hide_dot,
+            hide_claude_prefix=hide_claude,
         )
 
     # Walking the tree and deflating can take seconds on big workspaces — keep
