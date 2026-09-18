@@ -30,6 +30,7 @@ _CHECKED_VARS = [
     "API_KEY",
     "SANITIZER_ENABLED",
     "ANTHROPIC_BASE_URL",
+    "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
     "DEFAULT_MODEL",
     "SKIP_CONFIG_CHECK",
     "GATEWAY_MCP_MANIFEST",
@@ -560,3 +561,40 @@ def test_workspace_quota_invalid_value_is_startup_error(clean_env, value):
     assert len(errors) == 1
     assert "non-negative integer" in errors[0]
     assert repr(value) in errors[0]
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS
+# ---------------------------------------------------------------------------
+
+
+def _effort_issues():
+    return [i for i in check_config() if "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS" in i.message]
+
+
+def test_effort_certification_unset_is_quiet(clean_env):
+    assert _effort_issues() == []
+
+
+def test_effort_certification_valid_on_custom_upstream_is_quiet(clean_env, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+    monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium|xhigh,*")
+    assert _effort_issues() == []
+
+
+@pytest.mark.parametrize("raw", ["qwen3.6-27b=low|medium|xhi", "qwen3.6-27b=", "=low"])
+def test_effort_certification_typo_is_a_startup_error(clean_env, monkeypatch, raw):
+    """A bad declaration certifies nothing at runtime — the control it was meant to
+    enable would just stay hidden. Refuse to start rather than ship that."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+    monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raw)
+    issues = _effort_issues()
+    assert len(issues) == 1 and issues[0].severity == "error", issues
+    with pytest.raises(RuntimeError, match="CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS"):
+        run_startup_config_check()
+
+
+def test_effort_certification_without_custom_upstream_warns(clean_env, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "*")
+    issues = _effort_issues()
+    assert len(issues) == 1 and issues[0].severity == "warning", issues

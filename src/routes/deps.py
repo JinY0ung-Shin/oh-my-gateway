@@ -127,6 +127,45 @@ def validate_model_vision_support(request: Any, resolved: ResolvedModel) -> None
         )
 
 
+def validate_model_effort_support(effort: Any, resolved: ResolvedModel) -> None:
+    """Reject a ``reasoning.effort`` level the resolved model does not apply.
+
+    ``/v1/models`` advertises ``effort_levels`` for every id whose effort is
+    guaranteed (first-party: the whole ladder; certified custom upstream: what
+    the operator declared). A level outside that list would reach an upstream
+    that answers it with a 400 — vLLM rejects a level its chat template does not
+    know — and the CLI then retries WITHOUT effort, so the turn quietly runs at
+    the model's default. Fail fast with an OpenAI-style 400 that names the
+    accepted levels instead, exactly like ``validate_model_vision_support``.
+
+    A model without ``effort_levels`` (accepted-but-not-guaranteed) is left
+    alone: there the request is best-effort by contract. ``none`` is not a
+    level (it disables thinking) and is never rejected here.
+    """
+    if effort is None or effort == "none" or resolved.backend != "claude":
+        return
+    from src.backends.claude import claude_effort_levels
+
+    levels = claude_effort_levels(resolved.public_model)
+    if levels is None or effort in levels:
+        return
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "unsupported_reasoning_effort",
+                "param": "reasoning.effort",
+                "message": (
+                    f"Model '{resolved.public_model}' does not apply reasoning effort "
+                    f"'{effort}'; it accepts {', '.join(levels)}."
+                ),
+                "effort_levels": list(levels),
+            }
+        },
+    )
+
+
 def truncate_image_data(obj: Any) -> Any:
     """Deep-copy and truncate base64 image data for safe logging."""
     if isinstance(obj, dict):

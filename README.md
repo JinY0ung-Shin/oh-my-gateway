@@ -393,7 +393,7 @@ Primary endpoints:
 - `GET /v1/responses/{response_id}` (retrieve a stored turn; poll background turns)
 - `POST /v1/responses/{response_id}/cancel` (Claude streaming or background responses)
 - `POST /v1/agents/messages` (stateless Claude SDK event stream)
-- `GET /v1/models` (each entry carries `backend` + `capabilities`: `image_input`, `reasoning_effort_accepted` — the gateway accepts `reasoning.effort` for this model instead of rejecting it with 400 — and `reasoning_effort` — the requested effort is guaranteed to reach the model on the session-creating turn. The second is narrower on purpose: against a custom `ANTHROPIC_BASE_URL`, or for a name configured through `ANTHROPIC_DEFAULT_*_MODEL` or discovered from the upstream, the CLI may retry without effort after a 400, so only first-party bare tier aliases can report `true` — and only those whose resolved concrete model actually takes an effort: `output_config.effort` is a per-model parameter, and Claude Haiku 4.5 does not have it, so `haiku` reports `false` on a first-party upstream too. Hide a no-op control on `reasoning_effort`; offer effort as best-effort on `reasoning_effort_accepted`.)
+- `GET /v1/models` (each entry carries `backend` + `capabilities`: `image_input`, `reasoning_effort_accepted` — the gateway accepts `reasoning.effort` for this model instead of rejecting it with 400 — and `reasoning_effort` — the requested effort is guaranteed to reach the model on the session-creating turn. The second is narrower on purpose: against a custom `ANTHROPIC_BASE_URL`, or for a name configured through `ANTHROPIC_DEFAULT_*_MODEL` or discovered from the upstream, the CLI may retry without effort after a 400, so only first-party bare tier aliases can report `true` — and only those whose resolved concrete model actually takes an effort: `output_config.effort` is a per-model parameter, and Claude Haiku 4.5 does not have it, so `haiku` reports `false` on a first-party upstream too. Hide a no-op control on `reasoning_effort`; offer effort as best-effort on `reasoning_effort_accepted`. On a custom upstream the guarantee comes from the upstream itself: with `MODEL_DISCOVERY_ENABLED=true` the gateway reads `effort_levels` off each upstream `/v1/models` row (the litellm_serving sanitizer learns them from the served model's own 400s or a startup probe and publishes them there), and `CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS` — e.g. `qwen3.6-27b=low|medium|xhigh` — remains a manual override for an upstream that states nothing. A guaranteed entry then also carries `effort_levels` (weakest → strongest). Offer exactly those: a request for any other level is answered with `400 unsupported_reasoning_effort` naming the accepted list.)
 - `GET /v1/sessions`
 - `GET /v1/sessions/{session_id}/pending-events?after=<seq>&user=<name>` (between-turn outbox: background task lifecycle + assistant messages captured by the session's idle reader; cursor-paged, polling refreshes the session TTL)
 - `GET /v1/auth/status`
@@ -477,11 +477,18 @@ Effective `/v1/responses` request fields:
 - `reasoning.effort`: thinking effort for the session (`low|medium|high|xhigh|max`, Claude backend).
   Baked at session creation — a continuation keeps what its first turn set. The gateway also sets
   `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` for that subprocess, because the CLI otherwise skips the
-  field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id. **Whether it changes
-  anything is the upstream's business**: on the wire it is Anthropic's `output_config.effort`; the
-  sanitizer translates that to OpenAI `reasoning_effort` (`xhigh`/`max` clamp to `high`) for
+  field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id (measured with CLI
+  2.1.276: it now sends `output_config.effort` — default `high` — on every request either way).
+  **Whether it changes anything is the upstream's business**: on the wire it is Anthropic's
+  `output_config.effort`; the sanitizer translates that verbatim to OpenAI `reasoning_effort` for
   LiteLLM, and a model that does not take the field simply ignores it (LiteLLM's `drop_params`
-  discards it, and the CLI retries without effort if the upstream 400s on it).
+  discards it, and the CLI retries without effort if the upstream 400s on it). On a custom upstream
+  the levels come from the upstream's own `/v1/models` rows when discovery is on (the
+  litellm_serving sanitizer learns and publishes them), or from the operator override
+  `CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS` (e.g. `qwen3.6-27b=low|medium|xhigh,glm-5-fp8,*`); the
+  entry then carries `effort_levels`, and a request for a level outside that list is answered
+  with `400 unsupported_reasoning_effort` (naming the accepted levels) instead of reaching an
+  upstream that would fail the turn. `none` (disable thinking) is never rejected.
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key (see [Workspaces](#workspaces)); also injected

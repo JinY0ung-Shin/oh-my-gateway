@@ -9,6 +9,8 @@ import os
 
 from src.env_utils import parse_bool_env
 
+logger = _logging.getLogger(__name__)
+
 # Claude Agent SDK Tool Names
 # These are the built-in tools available in the Claude Agent SDK
 # See: https://docs.anthropic.com/en/docs/claude-code/sdk
@@ -100,6 +102,102 @@ def tier_applies_effort(tier: str) -> bool:
     if resolved is None:
         return False
     return EFFORT_CAPABLE_MODELS.get(resolved, False)
+
+
+# The effort ladder the CLI sends on the wire (``output_config.effort``). ``none``
+# is not a level — it disables extended thinking and rides ``thinking`` — so it is
+# absent here on purpose. Order is weakest → strongest; clients rely on it.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+
+# Operator certification for a CUSTOM upstream (``ANTHROPIC_BASE_URL`` set).
+#
+# The gateway cannot know whether a LiteLLM/sanitizer/vLLM chain applies the
+# effort it forwards, so the strong ``reasoning_effort`` capability fails closed
+# there. This env is the operator saying "it does" — per public model id, and
+# optionally naming the LEVELS that upstream accepts, because a served model's
+# chat template decides that subset (a Qwen3.x template takes ``low|medium|xhigh``
+# and answers ``high`` with a 400; see Kyutinium/litellm_serving#26)::
+#
+#     CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS=qwen3.6-27b=low|medium|xhigh,glm-5-fp8,*
+#
+# Grammar, comma-separated: ``<id>`` (every level), ``<id>=<lvl>|<lvl>…`` (that
+# subset), ``*`` / ``*=<lvls>`` (every model of this backend). An exact id wins
+# over ``*``. Validity is all-or-nothing: one unknown level or an empty subset
+# invalidates the WHOLE setting — a typo must never quietly become a narrower or
+# a wider promise (startup refuses it; a running process treats it as unset).
+CUSTOM_UPSTREAM_EFFORT_ENV = "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS"
+CUSTOM_UPSTREAM_EFFORT_WILDCARD = "*"
+
+
+def parse_custom_upstream_effort_certification(
+    raw: str | None,
+) -> dict[str, tuple[str, ...]]:
+    """Parse ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` into ``{id: levels}``.
+
+    ``None``/blank → ``{}`` (nothing certified). Raises ``ValueError`` on any
+    malformed entry so callers can fail closed or refuse to start.
+    """
+    if raw is None or not raw.strip():
+        return {}
+    out: dict[str, tuple[str, ...]] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        model, sep, levels_raw = item.partition("=")
+        model = model.strip()
+        if not model:
+            raise ValueError(f"{CUSTOM_UPSTREAM_EFFORT_ENV}: entry {item!r} has no model id")
+        if not sep:
+            levels: tuple[str, ...] = EFFORT_LEVELS
+        else:
+            parts = [p.strip().lower() for p in levels_raw.split("|") if p.strip()]
+            if not parts:
+                raise ValueError(
+                    f"{CUSTOM_UPSTREAM_EFFORT_ENV}: {model!r} declares no levels "
+                    f"(omit '=' to certify every level)"
+                )
+            unknown = sorted({p for p in parts if p not in EFFORT_LEVELS})
+            if unknown:
+                raise ValueError(
+                    f"{CUSTOM_UPSTREAM_EFFORT_ENV}: {model!r} names unknown level(s) "
+                    f"{', '.join(unknown)}; known: {', '.join(EFFORT_LEVELS)}"
+                )
+            levels = tuple(level for level in EFFORT_LEVELS if level in parts)
+        if model in out and out[model] != levels:
+            raise ValueError(
+                f"{CUSTOM_UPSTREAM_EFFORT_ENV}: {model!r} is declared twice with different levels"
+            )
+        out[model] = levels
+    return out
+
+
+def custom_upstream_effort_certification() -> dict[str, tuple[str, ...]]:
+    """The live certification, or ``{}`` when unset **or invalid**.
+
+    Invalid never certifies: a bad declaration is treated as no declaration, so
+    every custom-upstream id stays ``reasoning_effort: false``. The startup
+    config check is what turns a bad value into a hard failure for a fresh deploy.
+    """
+    try:
+        return parse_custom_upstream_effort_certification(
+            os.getenv(CUSTOM_UPSTREAM_EFFORT_ENV)
+        )
+    except ValueError as exc:
+        logger.warning("%s; certifying nothing", exc)
+        return {}
+
+
+def certified_effort_levels(model: str) -> tuple[str, ...] | None:
+    """Levels the operator certified for *model* on a custom upstream, else ``None``.
+
+    An exact id wins over the ``*`` wildcard. Only meaningful when
+    ``ANTHROPIC_BASE_URL`` is set — the caller checks that.
+    """
+    cert = custom_upstream_effort_certification()
+    if model in cert:
+        return cert[model]
+    return cert.get(CUSTOM_UPSTREAM_EFFORT_WILDCARD)
 
 
 # Optional alias exposure via ANTHROPIC_DEFAULT_*_MODEL.

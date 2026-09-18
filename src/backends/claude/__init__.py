@@ -15,11 +15,17 @@ from typing import Optional
 
 from src.backends.claude.constants import (
     CLAUDE_MODELS,
+    EFFORT_LEVELS,
+    certified_effort_levels,
     configured_model_aliases,
     configured_public_models,
     tier_applies_effort,
 )
-from src.backends.claude.model_discovery import discover_models, discovered_model_ids
+from src.backends.claude.model_discovery import (
+    discover_models,
+    discovered_effort_levels,
+    discovered_model_ids,
+)
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
 
 logger = logging.getLogger(__name__)
@@ -86,6 +92,56 @@ def _claude_model_meta(model: str) -> dict:
     return {}
 
 
+def _claude_model_entry_meta(model: str) -> dict:
+    """Per-entry metadata: alias bookkeeping plus the effort ladder.
+
+    ``effort_levels`` is present exactly when ``capabilities.reasoning_effort``
+    is true and lists the levels the model applies, weakest → strongest. On a
+    first-party upstream that is the whole ladder; on a certified custom
+    upstream it is what the operator declared (a served model's chat template
+    decides the subset — see ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS``). A client
+    offers exactly these levels; the request path rejects any other with a 400
+    instead of letting the upstream fail the turn (``validate_model_effort_support``).
+    """
+    meta = _claude_model_meta(model)
+    levels = claude_effort_levels(model)
+    if levels is not None:
+        meta["effort_levels"] = list(levels)
+    return meta
+
+
+def _custom_upstream_effort_levels(model: str) -> tuple[str, ...] | None:
+    """Levels a custom upstream applies for *model*, from the best source available.
+
+    1. ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` — the operator's word (exact id or
+       ``*``), kept as the override for an upstream that cannot state its own.
+    2. ``effort_levels`` the upstream itself put on its ``/v1/models`` row
+       (``MODEL_DISCOVERY_ENABLED=true``): the litellm_serving sanitizer learns
+       each served model's set from the model's own 400s / a probe and publishes
+       it there, so nothing has to be copied by hand.
+
+    ``None`` when neither says anything — fail closed, as before.
+    """
+    certified = certified_effort_levels(model)
+    if certified is not None:
+        return certified
+    return discovered_effort_levels().get(model)
+
+
+def claude_effort_levels(model: str) -> tuple[str, ...] | None:
+    """The effort levels *model* applies, or ``None`` when effort is not guaranteed.
+
+    Mirrors ``_claude_model_capabilities``: the answer is ``None`` wherever that
+    reports ``reasoning_effort: False``.
+    """
+    custom_upstream = bool((os.getenv("ANTHROPIC_BASE_URL") or "").strip())
+    if custom_upstream:
+        return _custom_upstream_effort_levels(model)
+    if _claude_model_capabilities(model).get("reasoning_effort"):
+        return EFFORT_LEVELS
+    return None
+
+
 def _claude_model_capabilities(model: str) -> dict:
     """Narrow ``reasoning_effort`` to the ids where effort is actually applied.
 
@@ -121,16 +177,34 @@ def _claude_model_capabilities(model: str) -> dict:
     model (``tier_applies_effort``), so the answer moves with the generation
     instead of being frozen into the string ``"haiku"``.
 
-    Everything else fails closed. ``reasoning_effort_accepted`` stays true for
-    the whole backend — the request is still accepted and still forwarded, so a
-    client that wants to offer effort as best-effort can read that instead.
+    Everything else fails closed. A custom-upstream deployment can explicitly
+    certify model ids with ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` — optionally
+    with the level subset that upstream accepts, surfaced as ``effort_levels``
+    on the ``/v1/models`` entry; this is an operator assertion that the upstream
+    applies the forwarded effort value, not a guess made by the gateway. An
+    invalid declaration certifies nothing (see ``custom_upstream_effort_certification``).
+    ``reasoning_effort_accepted`` stays true for the whole backend — the request
+    is still accepted and still forwarded, so a client that wants to offer effort
+    as best-effort can read that instead.
+
+    Measured with CLI 2.1.276: against a custom base URL and an unknown model id
+    the CLI sends ``output_config.effort`` (default ``high``) and
+    ``thinking: {"type": "adaptive"}`` on every request, with or without
+    ``CLAUDE_CODE_ALWAYS_ENABLE_EFFORT``. The env stays set for older CLIs; what
+    this flag certifies is the UPSTREAM side of that wire.
     """
+    custom_upstream = bool((os.getenv("ANTHROPIC_BASE_URL") or "").strip())
+    if custom_upstream and _custom_upstream_effort_levels(model) is not None:
+        # The upstream stated this model's levels (discovery), or the operator
+        # certified it — see ``_custom_upstream_effort_levels``.
+        return {"reasoning_effort": True}
     if model not in CLAUDE_MODELS:
         # A configured override name or an id discovered from the upstream:
         # an arbitrary string we cannot match against the CLI's registry.
         return {"reasoning_effort": False}
-    if (os.getenv("ANTHROPIC_BASE_URL") or "").strip():
-        # Custom upstream — effort may be dropped on a 400 retry.
+    if custom_upstream:
+        # Custom upstream without an explicit operator certification — effort
+        # may be dropped on a 400 retry, so the strong guarantee stays false.
         return {"reasoning_effort": False}
     if model in configured_model_aliases().values():
         # This tier is redirected to a configured concrete id; the CLI resolves
@@ -158,7 +232,7 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     # fail closed here and computed per model below. See
     # ``_claude_model_capabilities``.
     capabilities={"image_input": True, "reasoning_effort_accepted": True},
-    model_meta_fn=_claude_model_meta,
+    model_meta_fn=_claude_model_entry_meta,
     model_capabilities_fn=_claude_model_capabilities,
     model_discovery_fn=discover_models,
 )

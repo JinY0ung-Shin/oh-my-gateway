@@ -18,7 +18,7 @@ import logging
 import math
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 import httpx
@@ -40,6 +40,13 @@ class _DiscoveryCache:
     source: str = ""
     model_ids: tuple[str, ...] = ()
     expires_at: float = 0.0
+    # ``effort_levels`` per upstream id, when the upstream states them. The
+    # litellm_serving sanitizer learns each served model's accepted levels from
+    # the model's own 400s (or a startup probe) and publishes them on the
+    # relayed ``/v1/models``; reading them here is what lets a LiteLLM
+    # deployment advertise ``reasoning_effort`` + ``effort_levels`` with no
+    # operator-maintained list.
+    effort_levels: Dict[str, tuple[str, ...]] = field(default_factory=dict)
 
 
 _cache = _DiscoveryCache()
@@ -126,7 +133,14 @@ def _make_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(timeout=timeout, verify=get_tls_verify())
 
 
-def _parse_model_ids(payload: object) -> List[str]:
+def _parse_models(payload: object) -> tuple[List[str], Dict[str, tuple[str, ...]]]:
+    """Model ids plus any ``effort_levels`` the upstream states per id.
+
+    Unknown level names are dropped and a row whose list is empty after that
+    states nothing — a malformed statement must not become a promise.
+    """
+    from src.backends.claude.constants import EFFORT_LEVELS
+
     if not isinstance(payload, dict):
         raise ValueError("model discovery response must be a JSON object")
     rows = payload.get("data")
@@ -134,6 +148,7 @@ def _parse_model_ids(payload: object) -> List[str]:
         raise ValueError("model discovery response is missing a data list")
 
     out: List[str] = []
+    levels: Dict[str, tuple[str, ...]] = {}
     seen: set[str] = set()
     for row in rows:
         model_id = row.get("id") if isinstance(row, dict) else row
@@ -144,7 +159,26 @@ def _parse_model_ids(payload: object) -> List[str]:
             continue
         seen.add(model_id)
         out.append(model_id)
-    return out
+        stated = row.get("effort_levels") if isinstance(row, dict) else None
+        if isinstance(stated, list):
+            known = tuple(level for level in EFFORT_LEVELS if level in {str(v).lower() for v in stated})
+            if known:
+                levels[model_id] = known
+    return out, levels
+
+
+def _parse_model_ids(payload: object) -> List[str]:
+    return _parse_models(payload)[0]
+
+
+def discovered_effort_levels() -> Dict[str, tuple[str, ...]]:
+    """``effort_levels`` the current upstream stated per id (discovery on, same source)."""
+    if not discovery_enabled():
+        return {}
+    source = _upstream_base_url()
+    if not source or _cache.source != source:
+        return {}
+    return dict(_cache.effort_levels)
 
 
 def discovered_model_ids() -> frozenset[str]:
@@ -201,7 +235,7 @@ async def discover_models() -> List[str]:
                 headers=_request_headers(),
             )
             response.raise_for_status()
-            model_ids = _parse_model_ids(response.json())
+            model_ids, effort_levels = _parse_models(response.json())
         except Exception as exc:
             # Negative-cache the failure as well as retaining the same-source
             # stale snapshot. Without this, N concurrent readers serialize on
@@ -210,6 +244,7 @@ async def discover_models() -> List[str]:
                 source=source,
                 model_ids=tuple(stale),
                 expires_at=time.monotonic() + _failure_backoff_seconds(),
+                effort_levels=dict(_cache.effort_levels) if _cache.source == source else {},
             )
             logger.warning(
                 "upstream model discovery failed; using %s model snapshot: %s",
@@ -229,6 +264,7 @@ async def discover_models() -> List[str]:
             source=source,
             model_ids=tuple(model_ids),
             expires_at=time.monotonic() + ttl,
+            effort_levels=effort_levels,
         )
         return model_ids
 

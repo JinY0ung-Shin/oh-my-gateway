@@ -27,7 +27,11 @@ from src.auth import security, verify_api_key
 from src.constants import SSE_KEEPALIVE_INTERVAL
 from src.mcp_config import get_mcp_servers
 from src.rate_limiter import rate_limit_endpoint
-from src.routes.deps import resolve_and_get_backend, validate_backend_auth_or_raise
+from src.routes.deps import (
+    resolve_and_get_backend,
+    validate_backend_auth_or_raise,
+    validate_model_effort_support,
+)
 from src.session_manager import Session, _session_jsonl_path
 from src import streaming_utils
 from src.workspace_manager import workspace_manager
@@ -751,6 +755,7 @@ async def create_agent_message(
             detail="/v1/agents/messages v1 supports Claude models only",
         )
     validate_backend_auth_or_raise("claude")
+    validate_model_effort_support(body.effort, resolved)
 
     source = _stream_agent_messages(body, resolved, backend)
     stream = streaming_utils._keepalive_wrapper(source, SSE_KEEPALIVE_INTERVAL)

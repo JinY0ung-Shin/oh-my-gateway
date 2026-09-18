@@ -57,6 +57,7 @@ from src.routes.deps import (
     resolve_and_get_backend,
     validate_backend_auth_or_raise,
     validate_image_request,
+    validate_model_effort_support,
     validate_model_vision_support,
 )
 
@@ -2007,6 +2008,7 @@ async def create_response(
     validate_model_vision_support(body, resolved)
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
     _validate_reasoning_backend(_response_reasoning_effort(body), resolved.backend)
+    validate_model_effort_support(_response_reasoning_effort(body), resolved)
 
     # Per-request MCP context header (identity + caller-owned credentials).
     # Only the claude and codex backends consume it, so skip the env-read + JSON
