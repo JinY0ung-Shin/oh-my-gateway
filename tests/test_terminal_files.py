@@ -347,7 +347,10 @@ def test_claude_dir_hide_is_narrow_and_blocks_direct_access(client, workspace, m
     assert ".claude-notes" in names
 
     assert (
-        client.get("/files/read?path=/.claude/settings.json", headers={**_AUTH, **_USER}).status_code
+        client.get(
+            "/files/read?path=/.claude/settings.json",
+            headers={**_AUTH, **_USER},
+        ).status_code
         == 404
     )
     assert (
@@ -365,7 +368,10 @@ def test_claude_dir_hide_blocks_nested_claude_component(client, workspace, monke
     monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_DIR", "true")
 
     assert (
-        client.get("/files/read?path=/sub/.claude/project.md", headers={**_AUTH, **_USER}).status_code
+        client.get(
+            "/files/read?path=/sub/.claude/project.md",
+            headers={**_AUTH, **_USER},
+        ).status_code
         == 404
     )
 
