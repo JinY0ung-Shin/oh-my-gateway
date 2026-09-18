@@ -397,6 +397,47 @@ def test_claude_prefix_hide_blocks_nested_claude_component(client, workspace, mo
     )
 
 
+@pytest.mark.parametrize(
+    ("env_name", "link_name"),
+    [
+        ("WORKSPACE_HIDE_CLAUDE_PREFIX", ".claude_link"),
+        ("WORKSPACE_HIDE_DOTFILES", ".hidden_link"),
+    ],
+)
+def test_hidden_lexical_component_cannot_escape_via_internal_symlink(
+    client, workspace, monkeypatch, env_name, link_name
+):
+    visible = workspace / "visible"
+    visible.mkdir()
+    (visible / "secret.txt").write_text("not for hidden path")
+    (workspace / link_name).symlink_to(visible, target_is_directory=True)
+    monkeypatch.setenv(env_name, "true")
+
+    # Path.resolve() maps this request to visible/secret.txt.  The requested
+    # hidden component must still make the file API return 404.
+    r = client.get(
+        f"/files/read?path=/{link_name}/secret.txt",
+        headers={**_AUTH, **_USER},
+    )
+    assert r.status_code == 404
+
+
+def test_resolved_hidden_target_is_still_blocked_through_visible_symlink(
+    client, workspace, monkeypatch
+):
+    hidden = workspace / ".claude_images"
+    hidden.mkdir()
+    (hidden / "frame.png").write_bytes(b"png")
+    (workspace / "visible-link").symlink_to(hidden, target_is_directory=True)
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    r = client.get(
+        "/files/read?path=/visible-link/frame.png",
+        headers={**_AUTH, **_USER},
+    )
+    assert r.status_code == 404
+
+
 # --- write operations ---------------------------------------------------------
 
 
