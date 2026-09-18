@@ -422,6 +422,72 @@ def test_hidden_lexical_component_cannot_escape_via_internal_symlink(
     assert r.status_code == 404
 
 
+def test_claude_prefix_hide_keeps_canonical_agent_resources_editable(
+    client, workspace, monkeypatch
+):
+    """The switch hides the managed mirror, not the resources the user edits.
+
+    Since #206 a workspace keeps its skills/subagents at the canonical
+    ``skills/`` and ``agents/`` roots and the gateway maintains a managed
+    ``.claude/{skills,agents}`` mirror (hard-linked, marked with
+    ``.oh-my-gateway-managed``) purely for Claude Code's own discovery. That
+    split is what makes this switch the right one for the file manager: the
+    duplicate mirror leaves the surface while the user's own copy stays
+    listable, readable and writable.
+
+    ``WORKSPACE_HIDE_DOTFILES`` reaches the same mirror, but only as a side
+    effect of hiding every dotfile. Pinned here so a later narrowing of the
+    prefix (to exactly ``.claude``) or a widening onto the canonical roots
+    fails loudly instead of quietly changing which copy the operator hid.
+    """
+    (workspace / "skills" / "review").mkdir(parents=True)
+    (workspace / "skills" / "review" / "SKILL.md").write_text("---\nname: review\n---\n")
+    (workspace / "agents").mkdir()
+    mirror = workspace / ".claude" / "skills" / "review"
+    mirror.mkdir(parents=True)
+    (mirror / "SKILL.md").write_text("---\nname: review\n---\n")
+    (workspace / ".claude" / "skills" / ".oh-my-gateway-managed").write_bytes(b"")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
+
+    names = [
+        e["name"]
+        for e in client.get("/files/list?directory=/", headers={**_AUTH, **_USER}).json()[
+            "entries"
+        ]
+    ]
+    assert "skills" in names
+    assert "agents" in names
+    assert ".claude" not in names
+
+    # The canonical copy stays fully usable through the file API...
+    assert (
+        client.get(
+            "/files/read?path=/skills/review/SKILL.md", headers={**_AUTH, **_USER}
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
+            "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/skills/triage"}
+        ).status_code
+        == 200
+    )
+    assert (workspace / "skills" / "triage").is_dir()
+
+    # ...while the mirror of that same content is gone from every surface.
+    assert (
+        client.get(
+            "/files/read?path=/.claude/skills/review/SKILL.md",
+            headers={**_AUTH, **_USER},
+        ).status_code
+        == 404
+    )
+    search = client.get("/files/search?query=SKILL", headers={**_AUTH, **_USER}).json()
+    paths = [e["path"] for e in search["results"]]
+    assert any("/skills/review/SKILL.md" in q for q in paths)
+    assert not any(".claude" in q for q in paths)
+
+
 def test_resolved_hidden_target_is_still_blocked_through_visible_symlink(
     client, workspace, monkeypatch
 ):

@@ -46,11 +46,22 @@ Config:
   localpart as releases before this one did. Insecure (see above); migration only.
 - ``WORKSPACE_HIDE_DOTFILES`` — when true, dot-prefixed entries are neither
   listed nor accessible. Default **false**: hiding is a presentation choice that
-  belongs to the client rendering the tree, and hiding them here also blocks
-  writes to the workspace's agent-resource directories.
+  belongs to the client rendering the tree, and this switch reaches every
+  dotfile the user may legitimately want to edit (``.env``, ``.gitignore``, a
+  tool's own dotdir), writes included.
 - ``WORKSPACE_HIDE_CLAUDE_PREFIX`` — when true, path components whose names start
   with ``.claude`` are hidden/blocked by the file API (for example ``.claude``,
   ``.claude_images``, ``.claude-local``). Other dotfiles stay visible. Default **false**.
+
+Which one an operator wants follows from the workspace layout. A workspace keeps
+its skills and subagents at the canonical ``skills/`` and ``agents/`` roots, and
+the gateway maintains a managed ``.claude/{skills,agents}`` mirror of them for
+Claude Code's own discovery (see ``backends.claude.workspace_resources``). So
+``WORKSPACE_HIDE_CLAUDE_PREFIX`` removes the *duplicate* from the file manager
+while the copy the user actually edits stays listable and writable;
+``WORKSPACE_HIDE_DOTFILES`` reaches that mirror too, but only on its way to
+hiding everything else as well. Neither switch touches the agent process: it
+reads the workspace directly, not through this API.
 - ``USER_WORKSPACE_QUOTA_MB`` — optional cumulative quota for a named user's whole
   ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
 
@@ -218,7 +229,13 @@ def _hide_claude_prefix() -> bool:
     This is intentionally narrower than ``WORKSPACE_HIDE_DOTFILES``: deployments
     can keep ordinary dotfiles visible/editable in the file manager while keeping
     Claude-owned/project-scoped paths such as ``.claude`` and ``.claude_images``
-    out of that surface. The agent process itself is unaffected.
+    out of that surface. In particular it hides the gateway's managed
+    ``.claude/{skills,agents}`` mirror without touching the canonical
+    ``skills/``/``agents/`` roots the user edits. The agent process itself is
+    unaffected — it reads the workspace directly, not through this API.
+
+    Prefix, not exact match: the sibling paths a deployment wants gone
+    (``.claude_images``, ``.claude-local``) are not under ``.claude/``.
     """
     return os.getenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "false").strip().lower() == "true"
 
