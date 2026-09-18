@@ -583,7 +583,7 @@ async def search_files(
     Case-insensitive substring match on entry names. Hidden entries follow
     the same rule as listing (dot-prefixed components, or only names starting
     with ``.claude`` when that narrower switch is enabled, are pruned), symlinks
-    archive walk, and results are capped
+    are skipped like the archive walk, and results are capped
     at ``limit`` (1-200) with a ``truncated`` flag. Name-prefix matches sort
     before substring matches, shallower paths before deeper ones.
     """
