@@ -301,6 +301,44 @@ class TestReasoningEffortIsGuaranteedPerModel:
         assert by_id["sonnet"]["capabilities"]["reasoning_effort"] is False
         assert "effort_levels" not in by_id["sonnet"]
 
+    def test_levels_the_upstream_states_on_v1_models_certify_without_any_env(self, monkeypatch):
+        """The litellm_serving sanitizer learns each served model's levels from the
+        model's own 400s (or a probe) and publishes ``effort_levels`` on the relayed
+        ``/v1/models``. With discovery on, that statement IS the certification —
+        nothing for an operator to copy into a second config."""
+        from src.backends.claude import model_discovery as md
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "true")
+        monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
+        md._reset_cache_for_tests()
+        ids, levels = md._parse_models(
+            {
+                "data": [
+                    {"id": "qwen3.6-27b", "object": "model", "effort_levels": ["xhigh", "low", "medium", "bogus"]},
+                    {"id": "glm-5-fp8", "object": "model", "effort_levels": []},
+                    {"id": "gemma-4-31b-it", "object": "model"},
+                ]
+            }
+        )
+        assert ids == ["qwen3.6-27b", "glm-5-fp8", "gemma-4-31b-it"]
+        assert levels == {"qwen3.6-27b": ("low", "medium", "xhigh")}, "scale order; unknown names dropped; empty states nothing"
+        md._cache = md._DiscoveryCache(source="http://litellm.internal:4000", model_ids=tuple(ids), expires_at=1e12, effort_levels=levels)
+        try:
+            assert _claude_model_capabilities("qwen3.6-27b") == {"reasoning_effort": True}
+            assert _claude_model_entry_meta("qwen3.6-27b")["effort_levels"] == ["low", "medium", "xhigh"]
+            assert _claude_model_capabilities("gemma-4-31b-it") == {"reasoning_effort": False}
+            assert claude_effort_levels("glm-5-fp8") is None
+            # the operator's word still wins where both exist
+            monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium")
+            assert claude_effort_levels("qwen3.6-27b") == ("low", "medium")
+            # discovery off → the statement is not read (opt-in stays opt-in)
+            monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
+            monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
+            assert _claude_model_capabilities("qwen3.6-27b") == {"reasoning_effort": False}
+        finally:
+            md._reset_cache_for_tests()
+
     def test_a_configured_alias_name_is_never_guaranteed(
         self, first_party_upstream, monkeypatch
     ):

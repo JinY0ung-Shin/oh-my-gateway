@@ -21,7 +21,11 @@ from src.backends.claude.constants import (
     configured_public_models,
     tier_applies_effort,
 )
-from src.backends.claude.model_discovery import discover_models, discovered_model_ids
+from src.backends.claude.model_discovery import (
+    discover_models,
+    discovered_effort_levels,
+    discovered_model_ids,
+)
 from src.backends.base import BackendDescriptor, BackendRegistry, ResolvedModel
 
 logger = logging.getLogger(__name__)
@@ -106,6 +110,24 @@ def _claude_model_entry_meta(model: str) -> dict:
     return meta
 
 
+def _custom_upstream_effort_levels(model: str) -> tuple[str, ...] | None:
+    """Levels a custom upstream applies for *model*, from the best source available.
+
+    1. ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` — the operator's word (exact id or
+       ``*``), kept as the override for an upstream that cannot state its own.
+    2. ``effort_levels`` the upstream itself put on its ``/v1/models`` row
+       (``MODEL_DISCOVERY_ENABLED=true``): the litellm_serving sanitizer learns
+       each served model's set from the model's own 400s / a probe and publishes
+       it there, so nothing has to be copied by hand.
+
+    ``None`` when neither says anything — fail closed, as before.
+    """
+    certified = certified_effort_levels(model)
+    if certified is not None:
+        return certified
+    return discovered_effort_levels().get(model)
+
+
 def claude_effort_levels(model: str) -> tuple[str, ...] | None:
     """The effort levels *model* applies, or ``None`` when effort is not guaranteed.
 
@@ -114,7 +136,7 @@ def claude_effort_levels(model: str) -> tuple[str, ...] | None:
     """
     custom_upstream = bool((os.getenv("ANTHROPIC_BASE_URL") or "").strip())
     if custom_upstream:
-        return certified_effort_levels(model)
+        return _custom_upstream_effort_levels(model)
     if _claude_model_capabilities(model).get("reasoning_effort"):
         return EFFORT_LEVELS
     return None
@@ -172,9 +194,9 @@ def _claude_model_capabilities(model: str) -> dict:
     this flag certifies is the UPSTREAM side of that wire.
     """
     custom_upstream = bool((os.getenv("ANTHROPIC_BASE_URL") or "").strip())
-    if custom_upstream and certified_effort_levels(model) is not None:
-        # Operator-certified (exact id or ``*``), optionally with the level
-        # subset that upstream accepts — see ``certified_effort_levels``.
+    if custom_upstream and _custom_upstream_effort_levels(model) is not None:
+        # The upstream stated this model's levels (discovery), or the operator
+        # certified it — see ``_custom_upstream_effort_levels``.
         return {"reasoning_effort": True}
     if model not in CLAUDE_MODELS:
         # A configured override name or an id discovered from the upstream:
