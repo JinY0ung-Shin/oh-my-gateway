@@ -195,27 +195,41 @@ def _convert_tool_choice(tc: Any) -> Any:
     return None
 
 
-# Anthropic effort levels → OpenAI ``reasoning_effort``. The OpenAI field has no
-# level above "high", so the two Anthropic extremes clamp onto it rather than
-# being invented upstream.
-_EFFORT_TO_REASONING_EFFORT = {
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "xhigh": "high",
-    "max": "high",
-}
+# The Anthropic effort levels the CLI sends, carried through verbatim.
+#
+# This bridge does not know which model or serving build the request lands on,
+# so it is the wrong layer to normalize the level. vLLM and SGLang both accept
+# the full ``none|minimal|low|medium|high|xhigh|max`` string set, and the subset
+# that actually works is decided per model by its chat template — the upstream
+# in Kyutinium/litellm_serving#26 accepts ``low|medium|xhigh`` and answers
+# ``high`` with a 400.
+#
+# An earlier version collapsed ``xhigh`` and ``max`` onto ``high`` here, on the
+# theory that the OpenAI field defines nothing above ``high``. That cost twice:
+# it destroyed ``xhigh``, a level that upstream accepts, and it flattened three
+# distinct requests into one, so a caller choosing between ``high`` and ``max``
+# was choosing between identical turns. Clamping to what an upstream accepts
+# belongs to the layer that knows the upstream — the sanitizer sitting in front
+# of LiteLLM, which reads that vocabulary from its own config.
+_FORWARDED_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
 
 
 def _reasoning_effort(body: Dict[str, Any]) -> Optional[str]:
-    """Read ``output_config.effort`` and map it to an OpenAI reasoning effort."""
+    """Read ``output_config.effort`` and map it to an OpenAI reasoning effort.
+
+    A level this bridge recognizes is forwarded unchanged; anything else sends
+    no field at all rather than a guess. ``none`` is absent from the forwarded
+    set on purpose: on the Anthropic side it disables extended thinking instead
+    of naming a level, and it rides ``thinking``.
+    """
     output_config = body.get("output_config")
     if not isinstance(output_config, dict):
         return None
     effort = output_config.get("effort")
     if isinstance(effort, str):
-        return _EFFORT_TO_REASONING_EFFORT.get(effort.lower())
-    # Anthropic also accepts an integer effort; bucket it onto the three levels.
+        level = effort.strip().lower()
+        return level if level in _FORWARDED_EFFORTS else None
+    # Anthropic also accepts an integer effort; bucket it onto named levels.
     if isinstance(effort, bool) or not isinstance(effort, int):
         return None
     if effort <= 33:
@@ -234,10 +248,11 @@ def anthropic_request_to_openai_body(body: Dict[str, Any]) -> Dict[str, Any]:
 
     One deliberate translation: Anthropic's ``output_config.effort`` (what the
     CLI sends for a requested thinking effort) becomes OpenAI's
-    ``reasoning_effort``, which LiteLLM understands and forwards. Anthropic's
-    ``xhigh``/``max`` have no OpenAI counterpart and clamp to ``high``. Whether
-    it changes anything is the served model's business — LiteLLM's
-    ``drop_params`` will discard it for a model that does not take it.
+    ``reasoning_effort``, which LiteLLM understands and forwards. The level is
+    preserved, not normalized — see ``_reasoning_effort``. Whether it changes
+    anything is the served model's business: LiteLLM's ``drop_params`` discards
+    it for a model that does not take it, and an upstream whose accepted set is
+    narrower is the downstream sanitizer's to clamp for.
     """
     out: Dict[str, Any] = {}
 
