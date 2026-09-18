@@ -477,11 +477,17 @@ Effective `/v1/responses` request fields:
 - `reasoning.effort`: thinking effort for the session (`low|medium|high|xhigh|max`, Claude backend).
   Baked at session creation — a continuation keeps what its first turn set. The gateway also sets
   `CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1` for that subprocess, because the CLI otherwise skips the
-  field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id. **Whether it changes
-  anything is the upstream's business**: on the wire it is Anthropic's `output_config.effort`; the
-  sanitizer translates that to OpenAI `reasoning_effort` (`xhigh`/`max` clamp to `high`) for
+  field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id (measured with CLI
+  2.1.276: it now sends `output_config.effort` — default `high` — on every request either way).
+  **Whether it changes anything is the upstream's business**: on the wire it is Anthropic's
+  `output_config.effort`; the sanitizer translates that verbatim to OpenAI `reasoning_effort` for
   LiteLLM, and a model that does not take the field simply ignores it (LiteLLM's `drop_params`
-  discards it, and the CLI retries without effort if the upstream 400s on it).
+  discards it, and the CLI retries without effort if the upstream 400s on it). On a custom upstream
+  the operator declares which ids apply it, and which levels, with
+  `CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS` (e.g. `qwen3.6-27b=low|medium|xhigh,glm-5-fp8,*`); the
+  entry then carries `effort_levels`, and a request for a level outside that list is answered
+  with `400 unsupported_reasoning_effort` (naming the accepted levels) instead of reaching an
+  upstream that would fail the turn. `none` (disable thinking) is never rejected.
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key (see [Workspaces](#workspaces)); also injected

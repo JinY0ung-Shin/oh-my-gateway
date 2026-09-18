@@ -5,7 +5,12 @@ from unittest.mock import MagicMock
 import pytest
 
 from src.backend_registry import BackendDescriptor, BackendRegistry
-from src.backends.claude import CLAUDE_DESCRIPTOR, _claude_model_capabilities
+from src.backends.claude import (
+    CLAUDE_DESCRIPTOR,
+    _claude_model_capabilities,
+    _claude_model_entry_meta,
+    claude_effort_levels,
+)
 from src.backends.claude.constants import (
     CLAUDE_MODELS,
     EFFORT_CAPABLE_MODELS,
@@ -222,6 +227,79 @@ class TestReasoningEffortIsGuaranteedPerModel:
 
         assert _claude_model_capabilities("haiku") == {"reasoning_effort": False}
         assert _claude_model_capabilities("sonnet") == {"reasoning_effort": True}
+
+    def test_certification_can_declare_the_level_subset_the_upstream_accepts(
+        self, monkeypatch
+    ):
+        """A served model's chat template decides the subset (litellm_serving#26:
+        a Qwen3.x template takes low|medium|xhigh and 400s on high). The operator
+        declares it per id and the entry advertises exactly that list."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv(
+            "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
+            "qwen3.6-27b=xhigh|low|medium, glm-5-fp8",
+        )
+        assert _claude_model_capabilities("qwen3.6-27b") == {"reasoning_effort": True}
+        # scale order, not declaration order — clients render it as a ladder
+        assert claude_effort_levels("qwen3.6-27b") == ("low", "medium", "xhigh")
+        assert _claude_model_entry_meta("qwen3.6-27b") == {
+            "effort_levels": ["low", "medium", "xhigh"]
+        }
+        # certified without '=' → the whole ladder
+        assert _claude_model_entry_meta("glm-5-fp8") == {
+            "effort_levels": ["low", "medium", "high", "xhigh", "max"]
+        }
+        # not certified → no guarantee, no ladder
+        assert claude_effort_levels("sonnet") is None
+        assert "effort_levels" not in _claude_model_entry_meta("sonnet")
+
+    def test_an_exact_id_wins_over_the_wildcard_levels(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv(
+            "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "*=low|medium|high,qwen3.6-27b=low|medium|xhigh"
+        )
+        assert claude_effort_levels("qwen3.6-27b") == ("low", "medium", "xhigh")
+        assert claude_effort_levels("glm-5-fp8") == ("low", "medium", "high")
+
+    @pytest.mark.parametrize(
+        "raw",
+        [
+            "qwen3.6-27b=low|medium|xhi",  # typo
+            "qwen3.6-27b=",  # declares nothing
+            "=low|medium",  # no id
+            "qwen3.6-27b=low,qwen3.6-27b=high",  # contradicts itself
+        ],
+    )
+    def test_an_invalid_certification_certifies_nothing(self, monkeypatch, raw):
+        """Invalid never narrows and never widens: a typo must not become either a
+        stricter ladder or a blanket promise. The whole setting is ignored (the
+        startup config check is what refuses a fresh deploy)."""
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raw)
+        assert _claude_model_capabilities("qwen3.6-27b") == {"reasoning_effort": False}
+        assert claude_effort_levels("qwen3.6-27b") is None
+
+    def test_first_party_guarantee_carries_the_whole_ladder(self, first_party_upstream):
+        assert _claude_model_entry_meta("sonnet") == {
+            "alias": True,
+            "effort_levels": ["low", "medium", "high", "xhigh", "max"],
+        }
+        # haiku: no guarantee → no ladder, alias bookkeeping untouched
+        assert _claude_model_entry_meta("haiku") == {"alias": True}
+
+    def test_v1_models_entry_carries_effort_levels_iff_guaranteed(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "qwen3.6-27b")
+        monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium|xhigh")
+        by_id = {
+            e["id"]: e
+            for e in (BackendRegistry._model_entry(CLAUDE_DESCRIPTOR, m) for m in ("sonnet", "qwen3.6-27b"))
+        }
+        assert by_id["qwen3.6-27b"]["capabilities"]["reasoning_effort"] is True
+        assert by_id["qwen3.6-27b"]["effort_levels"] == ["low", "medium", "xhigh"]
+        assert by_id["qwen3.6-27b"]["alias_of"] == "sonnet"
+        assert by_id["sonnet"]["capabilities"]["reasoning_effort"] is False
+        assert "effort_levels" not in by_id["sonnet"]
 
     def test_a_configured_alias_name_is_never_guaranteed(
         self, first_party_upstream, monkeypatch

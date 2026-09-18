@@ -275,6 +275,47 @@ def _check_sanitizer() -> List[ConfigIssue]:
     return []
 
 
+def _check_effort_certification() -> List[ConfigIssue]:
+    """``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` must parse, and only means something
+    on a custom upstream.
+
+    An operator-declared capability with a typo in it must not go live as a
+    different promise: the claude backend treats an invalid value as "nothing
+    certified" (fail closed), which would silently hide the effort control it was
+    meant to enable — so a fresh deploy refuses to start instead. Setting it
+    without ``ANTHROPIC_BASE_URL`` is a no-op the operator probably did not mean.
+    """
+    from src.backends.claude.constants import (
+        CUSTOM_UPSTREAM_EFFORT_ENV,
+        parse_custom_upstream_effort_certification,
+    )
+
+    raw = os.getenv(CUSTOM_UPSTREAM_EFFORT_ENV)
+    if not (raw or "").strip():
+        return []
+    try:
+        parse_custom_upstream_effort_certification(raw)
+    except ValueError as exc:
+        return [
+            ConfigIssue(
+                "error",
+                f"{exc}. The claude backend certifies nothing under an invalid value, "
+                "so the effort control this setting was meant to enable stays hidden; "
+                "fix the entry (grammar: <id>[=<level>|<level>…][,…] or *).",
+            )
+        ]
+    if not _is_set("ANTHROPIC_BASE_URL"):
+        return [
+            ConfigIssue(
+                "warning",
+                f"{CUSTOM_UPSTREAM_EFFORT_ENV} is set but ANTHROPIC_BASE_URL is not: "
+                "the certification only applies to a custom upstream and is ignored "
+                "on a first-party deployment (per-model truth is used there).",
+            )
+        ]
+    return []
+
+
 def _check_default_model(backends: List[str]) -> List[ConfigIssue]:
     """DEFAULT_MODEL must be resolvable by an enabled backend, otherwise every
     request without an explicit model fails. Bare model names (sonnet/opus/…)
@@ -601,6 +642,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_api_key())
     issues.extend(_check_sanitizer())
     issues.extend(_check_default_model(backends))
+    issues.extend(_check_effort_certification())
     issues.extend(_check_mcp_manifest())
     issues.extend(_check_mcp_server_env())
     issues.extend(_check_claude_settings_env())

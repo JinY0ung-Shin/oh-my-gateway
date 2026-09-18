@@ -115,6 +115,100 @@ def test_responses_endpoint_rejects_reasoning_for_codex_backend():
     backend.create_client.assert_not_called()
 
 
+def test_responses_endpoint_rejects_a_level_the_certified_model_does_not_apply(monkeypatch):
+    """The operator certified qwen3.6-27b for low|medium|xhigh (its vLLM template
+    400s on ``high``). Forwarding ``high`` would let the upstream fail the turn
+    and the CLI retry WITHOUT effort — so the gateway answers 400 up front, naming
+    the ladder, before any client is created."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "qwen3.6-27b")
+    monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium|xhigh")
+
+    calls = {}
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    with client_context() as (client, mock_cli):
+        mock_cli.create_client = create_client
+        rejected = client.post(
+            "/v1/responses",
+            json={"model": "qwen3.6-27b", "input": "hi", "reasoning": {"effort": "high"}},
+        )
+    assert rejected.status_code == 400
+    err = rejected.json()["error"]
+    assert err["code"] == "unsupported_reasoning_effort"
+    assert err["effort_levels"] == ["low", "medium", "xhigh"]
+    assert "high" in err["message"] and "qwen3.6-27b" in err["message"]
+    assert "create_client" not in calls
+
+
+def test_responses_endpoint_forwards_a_certified_level(monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+    monkeypatch.setenv("ANTHROPIC_DEFAULT_SONNET_MODEL", "qwen3.6-27b")
+    monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium|xhigh")
+
+    calls = {}
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {"content": [{"type": "text", "text": "Hi"}]}
+        yield {"type": "result", "subtype": "success", "result": "Hi"}
+
+    with client_context() as (client, mock_cli):
+        mock_cli.create_client = create_client
+        mock_cli.run_completion_with_client = run_completion_with_client
+        mock_cli.parse_message.return_value = "Hi"
+        mock_cli.estimate_token_usage.return_value = {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+        }
+        ok = client.post(
+            "/v1/responses",
+            json={"model": "qwen3.6-27b", "input": "hi", "reasoning": {"effort": "xhigh"}},
+        )
+    assert ok.status_code == 200, ok.text
+    assert calls["create_client"]["effort"] == "xhigh"
+
+
+def test_an_uncertified_custom_upstream_model_stays_best_effort(monkeypatch):
+    """No ``effort_levels`` (accepted but not guaranteed) → nothing to reject against;
+    the level is forwarded as before."""
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+    monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
+
+    calls = {}
+
+    async def create_client(**kwargs):
+        calls["create_client"] = kwargs
+        return object()
+
+    async def run_completion_with_client(client, prompt, session):
+        yield {"content": [{"type": "text", "text": "Hi"}]}
+        yield {"type": "result", "subtype": "success", "result": "Hi"}
+
+    with client_context() as (client, mock_cli):
+        mock_cli.create_client = create_client
+        mock_cli.run_completion_with_client = run_completion_with_client
+        mock_cli.parse_message.return_value = "Hi"
+        mock_cli.estimate_token_usage.return_value = {
+            "prompt_tokens": 1,
+            "completion_tokens": 1,
+            "total_tokens": 2,
+        }
+        ok = client.post(
+            "/v1/responses",
+            json={"model": "sonnet", "input": "hi", "reasoning": {"effort": "max"}},
+        )
+    assert ok.status_code == 200, ok.text
+    assert calls["create_client"]["effort"] == "max"
+
+
 # ---------------------------------------------------------------------------
 # Option pass-through to the (mocked) SDK
 # ---------------------------------------------------------------------------
