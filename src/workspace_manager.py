@@ -141,6 +141,15 @@ class WorkspaceManager:
         else:
             workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
 
+        # Validate seed configuration before creating anything. Otherwise a bad
+        # entry could leave behind an empty workspace that subsequent resolves
+        # would treat as pre-existing and therefore never seed.
+        initial_dirs = (
+            _initial_workspace_dirs()
+            if user is not None and backend_name is not None
+            else ()
+        )
+
         # Only the process that creates the final backend directory seeds it.
         # This matters semantically: configured starter folders are onboarding
         # defaults, not invariants. If a user later deletes one, resolving the
@@ -156,8 +165,8 @@ class WorkspaceManager:
             if not workspace.is_dir():
                 raise
 
-        if created and user is not None and backend_name is not None:
-            for relative_dir in _initial_workspace_dirs():
+        if created and initial_dirs:
+            for relative_dir in initial_dirs:
                 (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
 
         if user is not None and backend_name == "claude":
