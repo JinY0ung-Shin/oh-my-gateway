@@ -153,7 +153,9 @@ class TestEffortBridge:
 
     The chat UI's "생각 강도" only means something if the value survives
     gateway → sanitizer → LiteLLM. The sanitizer's Anthropic→OpenAI converter is
-    an allowlist, so effort needs an explicit translation or it is dropped.
+    an allowlist, so effort needs an explicit translation or it is dropped — and
+    "surviving" means arriving as the level the caller picked, which is why this
+    bridge no longer normalizes it (see below).
     """
 
     def _convert(self, body):
@@ -166,10 +168,21 @@ class TestEffortBridge:
             out = self._convert({"output_config": {"effort": level}})
             assert out["reasoning_effort"] == expected
 
-    def test_anthropic_only_levels_clamp_to_high(self):
-        """OpenAI has nothing above "high" — clamp instead of inventing a level."""
+    def test_levels_above_high_survive_instead_of_clamping(self):
+        """This used to assert ``xhigh``/``max`` → ``high``. That was wrong.
+
+        The premise was "OpenAI has nothing above high". But the upstream on
+        this path is not OpenAI — it is vLLM/SGLang behind LiteLLM, whose schema
+        takes the whole ``low|medium|high|xhigh|max`` set and whose accepted
+        subset is the served model's chat template. The vLLM behind
+        ChatDRAGON-Medium accepts ``low|medium|xhigh`` and answers ``high`` with
+        a 400 (Kyutinium/litellm_serving#26), so the clamp did the opposite of
+        protecting the request: it replaced a level upstream accepts with one it
+        rejects, and flattened three distinct choices into one.
+        """
         for level in ("xhigh", "max"):
-            assert self._convert({"output_config": {"effort": level}})["reasoning_effort"] == "high"
+            out = self._convert({"output_config": {"effort": level}})
+            assert out["reasoning_effort"] == level
 
     def test_integer_effort_buckets(self):
         assert self._convert({"output_config": {"effort": 10}})["reasoning_effort"] == "low"

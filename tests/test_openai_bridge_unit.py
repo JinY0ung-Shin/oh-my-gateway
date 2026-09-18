@@ -603,3 +603,82 @@ class TestNonStreamingResponseConversion:
         out = openai_response_to_anthropic_body(body)
         tu = next(b for b in out["content"] if b["type"] == "tool_use")
         assert tu["input"] == {}
+
+
+class TestReasoningEffortIsPreservedNotCollapsed:
+    """The bridge forwards the requested level; it does not normalize it.
+
+    An earlier version mapped ``xhigh``/``max`` onto ``high``, reasoning that
+    the OpenAI field defines nothing above ``high``. Both halves of that cost
+    real behavior against a vLLM upstream whose accepted set is
+    ``low|medium|xhigh`` (Kyutinium/litellm_serving#26):
+
+    - ``xhigh`` — a level that upstream **accepts** — arrived as ``high``, which
+      it answers with a 400, so the clamp turned a working request into a
+      failing one.
+    - ``high``, ``xhigh`` and ``max`` became one value, so a caller choosing
+      between them was choosing between identical turns.
+
+    Clamping to an upstream's vocabulary belongs to the layer that knows the
+    upstream (the sanitizer in front of LiteLLM, from its own config), so this
+    one preserves.
+    """
+
+    @staticmethod
+    def _body(effort):
+        return {
+            "model": "ChatDRAGON-Medium",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": effort},
+        }
+
+    def test_every_level_reaches_the_openai_field_unchanged(self):
+        for level in ("minimal", "low", "medium", "high", "xhigh", "max"):
+            out = anthropic_request_to_openai_body(self._body(level))
+            assert out["reasoning_effort"] == level, level
+
+    def test_the_levels_above_high_stay_distinct(self):
+        efforts = [
+            anthropic_request_to_openai_body(self._body(level))["reasoning_effort"]
+            for level in ("high", "xhigh", "max")
+        ]
+        assert efforts == ["high", "xhigh", "max"]
+        assert len(set(efforts)) == 3, "collapsing these makes the control a no-op"
+
+    def test_case_and_padding_are_folded(self):
+        out = anthropic_request_to_openai_body(self._body("  XHIGH  "))
+        assert out["reasoning_effort"] == "xhigh"
+
+    def test_none_is_not_a_level_and_sends_nothing(self):
+        """``none`` disables extended thinking and rides ``thinking`` instead."""
+        out = anthropic_request_to_openai_body(self._body("none"))
+        assert "reasoning_effort" not in out
+
+    def test_an_unknown_level_is_dropped_not_guessed(self):
+        for bad in ("ultra", "bogus", "", "   "):
+            out = anthropic_request_to_openai_body(self._body(bad))
+            assert "reasoning_effort" not in out, bad
+
+    def test_a_non_string_non_int_effort_is_dropped(self):
+        for bad in (True, [], {}, None):
+            out = anthropic_request_to_openai_body(self._body(bad))
+            assert "reasoning_effort" not in out, repr(bad)
+
+    def test_an_integer_effort_still_buckets(self):
+        """Anthropic also accepts an integer; that mapping is unchanged."""
+        convert = anthropic_request_to_openai_body
+        assert convert(self._body(10))["reasoning_effort"] == "low"
+        assert convert(self._body(50))["reasoning_effort"] == "medium"
+        assert convert(self._body(90))["reasoning_effort"] == "high"
+
+    def test_no_output_config_sends_nothing(self):
+        body = {
+            "model": "m",
+            "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        assert "reasoning_effort" not in anthropic_request_to_openai_body(body)
+        for bad in ("high", ["high"], 3):
+            body["output_config"] = bad
+            assert "reasoning_effort" not in anthropic_request_to_openai_body(body)
