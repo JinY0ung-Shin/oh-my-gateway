@@ -181,12 +181,47 @@ class TestReasoningEffortIsGuaranteedPerModel:
 
     def test_a_custom_upstream_withholds_the_guarantee_for_every_id(self, monkeypatch):
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
         for name in _ALIAS_ENVS:
             monkeypatch.delenv(name, raising=False)
         for model in ("opus", "sonnet", "haiku"):
             assert _claude_model_capabilities(model) == {
                 "reasoning_effort": False
             }, "a custom upstream may answer 400 and make the CLI drop effort"
+
+    def test_custom_upstream_can_certify_exact_effort_capable_models(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv(
+            "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
+            "team-sonnet-v3, qwen-reasoner",
+        )
+
+        assert _claude_model_capabilities("team-sonnet-v3") == {
+            "reasoning_effort": True
+        }
+        assert _claude_model_capabilities("qwen-reasoner") == {
+            "reasoning_effort": True
+        }
+        assert _claude_model_capabilities("sonnet") == {"reasoning_effort": False}
+
+    def test_custom_upstream_effort_wildcard_is_explicit_global_certification(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "*")
+
+        for model in ("sonnet", "team-sonnet-v3", "vendor/reasoner"):
+            assert _claude_model_capabilities(model) == {
+                "reasoning_effort": True
+            }
+
+    def test_custom_upstream_certification_does_not_change_first_party_truth(
+        self, first_party_upstream, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "*")
+
+        assert _claude_model_capabilities("haiku") == {"reasoning_effort": False}
+        assert _claude_model_capabilities("sonnet") == {"reasoning_effort": True}
 
     def test_a_configured_alias_name_is_never_guaranteed(
         self, first_party_upstream, monkeypatch
