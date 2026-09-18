@@ -51,6 +51,38 @@ def _legacy_localpart_key_enabled() -> bool:
     return os.getenv("WORKSPACE_LEGACY_LOCALPART_KEY", "").strip().lower() == "true"
 
 
+def _initial_workspace_dirs() -> tuple[Path, ...]:
+    """Parse safe relative directories to seed into a brand-new backend workspace.
+
+    ``WORKSPACE_INITIAL_DIRS`` is a comma-separated list of workspace-relative
+    directory paths. Nested paths and dot-directories are allowed, but absolute
+    paths and traversal components are rejected so deployment configuration can
+    never escape the workspace root.
+    """
+    raw = os.getenv("WORKSPACE_INITIAL_DIRS", "")
+    if not raw.strip():
+        return ()
+
+    result: list[Path] = []
+    seen: set[str] = set()
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        path = Path(value)
+        if path.is_absolute() or not path.parts or any(part == ".." for part in path.parts):
+            raise ValueError(
+                f"Invalid WORKSPACE_INITIAL_DIRS entry: {value!r}. "
+                "Entries must be relative workspace paths without '..'."
+            )
+        normalized = Path(*path.parts)
+        key = normalized.as_posix()
+        if key not in seen:
+            result.append(normalized)
+            seen.add(key)
+    return tuple(result)
+
+
 class WorkspaceManager:
     """Manages per-user working directories.
 
@@ -73,6 +105,11 @@ class WorkspaceManager:
         used for the ``claude`` backend; the backend identifier itself remains
         unchanged. Anonymous workspaces remain session-scoped ``_tmp_{uuid}``
         directories.
+
+        On the first creation of a named backend workspace,
+        ``WORKSPACE_INITIAL_DIRS`` may seed configurable top-level or nested
+        directories. The seed is intentionally creation-only: deleting one later
+        does not make it reappear on the next resolve.
 
         Named Claude workspaces get top-level ``skills/`` and ``agents/`` resource
         directories. Claude's native ``.claude/{skills,agents}`` paths are an
@@ -104,7 +141,24 @@ class WorkspaceManager:
         else:
             workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
 
-        workspace.mkdir(parents=True, exist_ok=True)
+        # Only the process that creates the final backend directory seeds it.
+        # This matters semantically: configured starter folders are onboarding
+        # defaults, not invariants. If a user later deletes one, resolving the
+        # workspace again must not recreate it.
+        created = False
+        try:
+            workspace.mkdir(parents=True, exist_ok=False)
+            created = True
+        except FileExistsError:
+            # Preserve pathlib's previous behavior for a non-directory collision
+            # while treating an already-created directory (including a concurrent
+            # creator) as an existing workspace.
+            if not workspace.is_dir():
+                raise
+
+        if created and user is not None and backend_name is not None:
+            for relative_dir in _initial_workspace_dirs():
+                (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
 
         if user is not None and backend_name == "claude":
             # Import lazily so this generic path manager does not import the Claude
