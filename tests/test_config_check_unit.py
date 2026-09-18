@@ -541,6 +541,50 @@ async def test_lifespan_escape_hatch_allows_startup(clean_env):
 
 
 # ---------------------------------------------------------------------------
+# WORKSPACE_INITIAL_DIRS — creation-only starter directory configuration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Documents,Projects/AI,.config",
+        " Documents , Projects/AI ",
+        "",
+        ",,",
+    ],
+)
+def test_workspace_initial_dirs_valid_values_are_quiet(clean_env, value):
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", value)
+    assert not [
+        m
+        for m in _messages(check_config(), "error")
+        if "WORKSPACE_INITIAL_DIRS" in m
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../escape",
+        "safe/../../escape",
+        "/absolute/path",
+        ".",
+    ],
+)
+def test_workspace_initial_dirs_unsafe_value_is_startup_error(clean_env, value):
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", value)
+    errors = [
+        m
+        for m in _messages(check_config(), "error")
+        if "WORKSPACE_INITIAL_DIRS" in m
+    ]
+    assert len(errors) == 1
+    assert "relative workspace paths" in errors[0]
+    assert repr(value) in errors[0]
+
+
+# ---------------------------------------------------------------------------
 # USER_WORKSPACE_QUOTA_MB — consulted on every Claude turn once configured
 # ---------------------------------------------------------------------------
 
