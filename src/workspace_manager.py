@@ -87,23 +87,46 @@ def _initial_workspace_dirs() -> tuple[Path, ...]:
         raise ValueError(f"Invalid WORKSPACE_INITIAL_DIRS: {exc}") from exc
 
 
-def _claim_initialization(workspace: Path) -> None:
-    """Publish the in-progress claim, before the workspace root exists.
+def _claim_initialization(workspace: Path) -> bool:
+    """Try to publish the in-progress claim, before the workspace root exists.
 
-    The claim's parent is the user's aggregate root, which is created here so
-    the claim can land before ``workspace.mkdir``. Creating a claim that is
-    already there is fine — see :func:`_initialize_workspace` for why ownership
-    does not need to be exclusive.
+    Exclusive (``O_EXCL``): returns ``True`` only for the one caller that
+    created the file. A ``False`` means another resolver holds the claim, so an
+    initialization is in flight and the caller should finish it idempotently
+    rather than start its own.
+
+    Exclusivity matters for a race the claim alone does not close. Two
+    resolvers can both observe "no root" before either claims; the first then
+    initializes, releases the claim and returns, and only afterwards does the
+    second act on its stale observation. Without ``O_EXCL`` it would publish a
+    fresh claim over a *completed* workspace and seed it again — recreating a
+    starter directory the user may just have deleted. With it, the winner must
+    still re-check the root (see ``resolve``): a root that appeared since the
+    observation belongs to a completed initialization, not to this caller.
+
+    The claim's parent is the user's aggregate root, created here so the claim
+    can land before ``workspace.mkdir``.
     """
     claim = _seeding_claim(workspace)
     claim.parent.mkdir(parents=True, exist_ok=True)
     try:
-        os.close(os.open(claim, os.O_CREAT | os.O_WRONLY, 0o600))
+        os.close(os.open(claim, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+    except FileExistsError:
+        return False
     except OSError:
         logger.warning(
             "Failed to publish workspace seeding claim %s", claim, exc_info=True
         )
         raise
+    return True
+
+
+def _release_claim(workspace: Path) -> None:
+    """Drop the claim; absence means a concurrent resolver released it first."""
+    try:
+        _seeding_claim(workspace).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _initialize_workspace(workspace: Path, initial_dirs: tuple[Path, ...]) -> None:
@@ -122,11 +145,7 @@ def _initialize_workspace(workspace: Path, initial_dirs: tuple[Path, ...]) -> No
     workspace.mkdir(parents=True, exist_ok=True)
     for relative_dir in initial_dirs:
         (workspace / relative_dir).mkdir(parents=True, exist_ok=True)
-    try:
-        _seeding_claim(workspace).unlink()
-    except FileNotFoundError:
-        # A concurrent resolver finished the same initialization first.
-        pass
+    _release_claim(workspace)
 
 
 class WorkspaceManager:
@@ -205,9 +224,20 @@ class WorkspaceManager:
         if not initial_dirs:
             workspace.mkdir(parents=True, exist_ok=True)
         elif not workspace.exists():
-            # Nobody has published a root yet. Claim first, then build.
-            _claim_initialization(workspace)
-            _initialize_workspace(workspace, initial_dirs)
+            # Nobody has published a root yet — as far as this observation
+            # goes. It is only an observation, so the claim is exclusive and
+            # the winner re-checks the root before building: another resolver
+            # may have initialized, released and returned in between, and a
+            # root that appeared since is a *completed* workspace, not ours
+            # to seed (it would recreate a starter folder the user removed).
+            if not _claim_initialization(workspace):
+                # Someone else holds the claim: finish their in-flight
+                # initialization idempotently instead of starting a second.
+                _initialize_workspace(workspace, initial_dirs)
+            elif workspace.exists():
+                _release_claim(workspace)
+            else:
+                _initialize_workspace(workspace, initial_dirs)
         elif _seeding_claim(workspace).exists():
             # An initialization that is still running or died partway through.
             # Finishing it idempotently is what stops a partial layout from

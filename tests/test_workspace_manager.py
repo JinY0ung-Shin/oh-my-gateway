@@ -310,6 +310,76 @@ class TestResolve:
         assert (workspace / "Projects").is_dir()
         assert not wm._seeding_claim(workspace).exists()
 
+    def test_a_stale_absent_observation_cannot_reseed_a_completed_workspace(
+        self, manager, monkeypatch
+    ):
+        """Two callers observe "no root"; only the first may initialize.
+
+        The observation is not atomic with the claim. Resolver B observes no
+        root, is descheduled; resolver A observes the same, claims, initializes,
+        releases the claim and returns; the user deletes a starter folder; B
+        resumes and acts on its stale observation. Before this, B published a
+        fresh claim over the *completed* workspace and seeded it again, so the
+        deleted folder came back — the creation-only contract broken by a
+        second first-creation.
+
+        The claim is exclusive now and the winner re-checks the root, so B's
+        late claim either fails (A still holds it) or wins and finds a root that
+        is not B's to seed.
+        """
+        seeded = ("Documents", "Projects")
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", ",".join(seeded))
+        real_claim = wm._claim_initialization
+        state: dict[str, object] = {}
+
+        def _b_claims_after_a_finished_and_user_deleted(workspace):
+            # B is here because it observed no root. Between that observation
+            # and this claim, A runs to completion and the user deletes a dir.
+            monkeypatch.setattr(wm, "_claim_initialization", real_claim)
+            state["a"] = manager.resolve("olive", backend="codex")
+            assert (state["a"] / "Documents").is_dir(), "A must have seeded"
+            assert not wm._seeding_claim(state["a"]).exists(), "A released it"
+            (state["a"] / "Documents").rmdir()
+            return real_claim(workspace)  # B's own, late claim
+
+        monkeypatch.setattr(
+            wm, "_claim_initialization", _b_claims_after_a_finished_and_user_deleted
+        )
+        b = manager.resolve("olive", backend="codex")
+
+        assert b == state["a"]
+        assert not (b / "Documents").exists(), "B re-seeded a completed workspace"
+        assert (b / "Projects").is_dir()
+        assert not wm._seeding_claim(b).exists(), "B left its late claim behind"
+
+    def test_a_lost_exclusive_claim_finishes_the_in_flight_initialization(
+        self, manager, monkeypatch
+    ):
+        """Both observe no root; the loser of the claim completes the winner's work.
+
+        The idempotent finish is what makes exclusivity safe to lose: the loser
+        never returns a partial layout and never starts a second init.
+        """
+        seeded = ("Documents", "Projects")
+        monkeypatch.setenv("WORKSPACE_INITIAL_DIRS", ",".join(seeded))
+        real_claim = wm._claim_initialization
+
+        def _a_holds_the_claim_when_b_tries(workspace):
+            # A published its claim but has not built the root yet.
+            monkeypatch.setattr(wm, "_claim_initialization", real_claim)
+            assert real_claim(workspace) is True
+            assert not workspace.exists()
+            return real_claim(workspace)  # B: must lose
+
+        monkeypatch.setattr(
+            wm, "_claim_initialization", _a_holds_the_claim_when_b_tries
+        )
+        b = manager.resolve("pia", backend="codex")
+
+        for name in seeded:
+            assert (b / name).is_dir(), name
+        assert not wm._seeding_claim(b).exists()
+
     def test_a_completed_seed_is_not_redone_and_leaves_no_marker(
         self, manager, monkeypatch
     ):
