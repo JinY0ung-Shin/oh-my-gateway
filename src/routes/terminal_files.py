@@ -412,6 +412,30 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
     return resolved if _is_under(resolved, root_resolved) else None
 
 
+def _lexical_relative_path(root: Path, rel: str) -> Path:
+    """Return the requested workspace-relative path without resolving symlinks.
+
+    Hidden-path policy is lexical as well as target-based.  A request such as
+    ``/.claude_link/file`` must not become visible merely because
+    ``.claude_link`` resolves to a non-hidden directory inside the workspace.
+
+    Absolute paths below the real workspace root are made relative to that root.
+    Other leading-slash paths use the same virtual-root interpretation as
+    ``_resolve_in_root``.  The caller still performs resolved containment
+    separately; this helper is policy input, not a security boundary.
+    """
+    p = rel or "/"
+    if p in ("/", ""):
+        return Path(".")
+    candidate = Path(p)
+    if not candidate.is_absolute():
+        return candidate
+    try:
+        return candidate.relative_to(root.resolve())
+    except ValueError:
+        return Path(p.lstrip("/"))
+
+
 def _resolve_or_403(root: Path, rel: str) -> Path:
     """Resolve within the workspace root or raise.
 
@@ -432,9 +456,14 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
     hide_dot = _hide_dotfiles()
     hide_claude = _hide_claude_prefix()
     if hide_dot or hide_claude:
-        relative = target.relative_to(root.resolve())
+        requested_relative = _lexical_relative_path(root, rel)
+        resolved_relative = target.relative_to(root.resolve())
         if _hidden_relative_path(
-            relative,
+            requested_relative,
+            hide_dotfiles=hide_dot,
+            hide_claude_prefix=hide_claude,
+        ) or _hidden_relative_path(
+            resolved_relative,
             hide_dotfiles=hide_dot,
             hide_claude_prefix=hide_claude,
         ):
