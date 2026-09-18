@@ -20,6 +20,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Literal
 
 from src.env_utils import parse_bool_env
@@ -560,6 +561,31 @@ def _check_sdk_buffer() -> List[ConfigIssue]:
     return []
 
 
+def _check_workspace_initial_dirs() -> List[ConfigIssue]:
+    """Validate creation-only workspace seed directories at startup.
+
+    Mirrors src.workspace_manager._initial_workspace_dirs without importing
+    workspace/backend modules during the early startup config check.
+    """
+    raw = os.getenv("WORKSPACE_INITIAL_DIRS", "")
+    if not raw.strip():
+        return []
+
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        path = Path(value)
+        if path.is_absolute() or not path.parts or any(part == ".." for part in path.parts):
+            return [
+                ConfigIssue(
+                    "error",
+                    f"WORKSPACE_INITIAL_DIRS contains unsafe entry {value!r}. "
+                    "Entries must be relative workspace paths without '..'.",
+                )
+            ]
+    return []
+
 def _check_workspace_quota() -> List[ConfigIssue]:
     """``USER_WORKSPACE_QUOTA_MB`` must be a non-negative integer (MiB).
 
@@ -606,6 +632,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_claude_settings_env())
     issues.extend(_check_stall_hierarchy())
     issues.extend(_check_sdk_buffer())
+    issues.extend(_check_workspace_initial_dirs())
     issues.extend(_check_workspace_quota())
     return issues
 
