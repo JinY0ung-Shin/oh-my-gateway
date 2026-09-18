@@ -330,21 +330,25 @@ def test_hidden_path_not_accessible_when_enabled(client, monkeypatch):
     )
 
 
-def test_claude_dir_hide_is_narrow_and_blocks_direct_access(client, workspace, monkeypatch):
+def test_claude_prefix_hide_is_narrow_and_blocks_direct_access(client, workspace, monkeypatch):
     claude = workspace / ".claude"
     claude.mkdir()
     (claude / "settings.json").write_text('{"hooks": []}')
-    (workspace / ".claude-notes").write_text("visible")
+    claude_images = workspace / ".claude_images"
+    claude_images.mkdir()
+    (claude_images / "frame.png").write_bytes(b"png")
+    (workspace / ".claud").write_text("visible")
 
-    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_DIR", "true")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
 
     r = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
     names = [e["name"] for e in r.json()["entries"]]
     assert ".claude" not in names
+    assert ".claude_images" not in names
     # This switch is deliberately narrower than WORKSPACE_HIDE_DOTFILES.
     assert ".env" in names
     assert ".secret_dir" in names
-    assert ".claude-notes" in names
+    assert ".claud" in names
 
     assert (
         client.get(
@@ -355,6 +359,13 @@ def test_claude_dir_hide_is_narrow_and_blocks_direct_access(client, workspace, m
     )
     assert (
         client.get("/files/list?directory=/.claude", headers={**_AUTH, **_USER}).status_code
+        == 404
+    )
+    assert (
+        client.get(
+            "/files/read?path=/.claude_images/frame.png",
+            headers={**_AUTH, **_USER},
+        ).status_code
         == 404
     )
     # Other dot-prefixed paths remain accessible.
@@ -371,11 +382,11 @@ def test_claude_dir_hide_is_narrow_and_blocks_direct_access(client, workspace, m
     assert not (claude / "new-project").exists()
 
 
-def test_claude_dir_hide_blocks_nested_claude_component(client, workspace, monkeypatch):
+def test_claude_prefix_hide_blocks_nested_claude_component(client, workspace, monkeypatch):
     nested = workspace / "sub" / ".claude"
     nested.mkdir()
     (nested / "project.md").write_text("private project config")
-    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_DIR", "true")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
 
     assert (
         client.get(
@@ -803,11 +814,14 @@ def test_archive_includes_hidden_by_default(client):
     assert "notes.txt" in names
 
 
-def test_archive_excludes_only_claude_dir_when_enabled(client, workspace, monkeypatch):
+def test_archive_excludes_claude_prefixed_paths_when_enabled(client, workspace, monkeypatch):
     claude = workspace / ".claude"
     claude.mkdir()
     (claude / "settings.json").write_text("{}")
-    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_DIR", "true")
+    claude_images = workspace / ".claude_images"
+    claude_images.mkdir()
+    (claude_images / "frame.png").write_bytes(b"png")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
 
     r = client.post(
         "/files/archive",
@@ -820,6 +834,7 @@ def test_archive_excludes_only_claude_dir_when_enabled(client, workspace, monkey
 
     names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
     assert ".claude/settings.json" not in names
+    assert ".claude_images/frame.png" not in names
     assert ".env" in names
     assert ".secret_dir/k.txt" in names
 
@@ -856,19 +871,23 @@ def test_search_includes_hidden_by_default(client):
     assert ".secret_dir" in names
 
 
-def test_search_prunes_only_claude_dir_when_enabled(client, workspace, monkeypatch):
+def test_search_prunes_claude_prefixed_paths_when_enabled(client, workspace, monkeypatch):
     claude = workspace / ".claude"
     claude.mkdir()
     (claude / "claude-config.json").write_text("{}")
-    (workspace / ".claude-notes").write_text("visible")
-    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_DIR", "true")
+    claude_images = workspace / ".claude_images"
+    claude_images.mkdir()
+    (claude_images / "claude-frame.png").write_bytes(b"png")
+    (workspace / ".claud-notes").write_text("visible")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
 
     r = client.get("/files/search?query=claude", headers={**_AUTH, **_USER})
     assert r.status_code == 200
     names = [e["name"] for e in r.json()["results"]]
     assert ".claude" not in names
+    assert ".claude_images" not in names
     assert "claude-config.json" not in names
-    assert ".claude-notes" in names
+    assert "claude-frame.png" not in names
 
     other = client.get("/files/search?query=secret", headers={**_AUTH, **_USER})
     assert ".secret_dir" in [e["name"] for e in other.json()["results"]]
@@ -941,11 +960,11 @@ def test_serve_hidden_file_is_404_when_enabled(client, workspace, monkeypatch):
     assert r.status_code == 404
 
 
-def test_serve_claude_dir_file_is_404_when_enabled(client, workspace, monkeypatch):
+def test_serve_claude_prefixed_file_is_404_when_enabled(client, workspace, monkeypatch):
     claude = workspace / ".claude"
     claude.mkdir()
     (claude / "preview.html").write_text("<h1>hidden</h1>")
-    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_DIR", "true")
+    monkeypatch.setenv("WORKSPACE_HIDE_CLAUDE_PREFIX", "true")
     d = str(workspace.resolve())
     r = client.get(f"/files/serve{d}/.claude/preview.html", headers={**_AUTH, **_USER})
     assert r.status_code == 404
