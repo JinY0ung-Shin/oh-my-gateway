@@ -19,6 +19,7 @@ import src.routes.responses as responses_module
 from src.backend_registry import BackendDescriptor, BackendRegistry, ResolvedModel
 from src.constants import DEFAULT_MODEL
 from src.response_models import ResponseCreateRequest
+from src.routes.deps import validate_model_effort_support
 from src.routes.responses import (
     _response_reasoning_effort,
     _validate_continuation_reasoning,
@@ -174,6 +175,48 @@ def test_responses_endpoint_forwards_a_certified_level(monkeypatch):
         )
     assert ok.status_code == 200, ok.text
     assert calls["create_client"]["effort"] == "xhigh"
+
+
+def test_invalid_manual_override_suppresses_discovered_effort_guarantee(monkeypatch):
+    """Malformed operator input is a fail-closed state even when discovery has a ladder.
+
+    With no manual override, discovery guarantees the model and rejects a level
+    outside its advertised subset. Once a nonblank override is malformed, that
+    guarantee disappears entirely: request-time validation must fall back to the
+    backend's best-effort contract instead of enforcing the discovered ladder.
+    """
+    from src.backends.claude import model_discovery as md
+
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+    monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "true")
+    monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
+    md._reset_cache_for_tests()
+    md._cache = md._DiscoveryCache(
+        source="http://litellm.internal:4000",
+        model_ids=("qwen3.6-27b",),
+        expires_at=1e12,
+        effort_levels={"qwen3.6-27b": ("low", "medium", "xhigh")},
+    )
+    resolved = ResolvedModel(
+        public_model="qwen3.6-27b",
+        backend="claude",
+        provider_model="qwen3.6-27b",
+    )
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            validate_model_effort_support("high", resolved)
+        assert exc_info.value.status_code == 400
+        assert exc_info.value.detail["error"]["code"] == "unsupported_reasoning_effort"
+
+        monkeypatch.setenv(
+            "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
+            "qwen3.6-27b=low|medum",
+        )
+        # Invalid manual config certifies nothing and blocks discovery fallback,
+        # so there is no guaranteed ladder to enforce at request time.
+        validate_model_effort_support("high", resolved)
+    finally:
+        md._reset_cache_for_tests()
 
 
 def test_an_uncertified_custom_upstream_model_stays_best_effort(monkeypatch):
