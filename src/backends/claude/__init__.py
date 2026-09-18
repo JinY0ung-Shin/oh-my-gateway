@@ -86,6 +86,21 @@ def _claude_model_meta(model: str) -> dict:
     return {}
 
 
+def _custom_upstream_effort_models() -> set[str]:
+    """Operator-certified custom-upstream model ids that really apply effort.
+
+    The Claude backend can force the CLI to send effort to a custom upstream,
+    but only the operator knows whether the upstream actually honors it instead
+    of rejecting/dropping it. Keep the strong reasoning_effort capability
+    fail-closed unless the deployment explicitly certifies exact public model
+    ids via CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS.
+
+    ``*`` certifies every model exposed by this Claude backend and should only
+    be used when the entire custom upstream has one uniform contract.
+    """
+    raw = os.getenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
 def _claude_model_capabilities(model: str) -> dict:
     """Narrow ``reasoning_effort`` to the ids where effort is actually applied.
 
@@ -121,16 +136,24 @@ def _claude_model_capabilities(model: str) -> dict:
     model (``tier_applies_effort``), so the answer moves with the generation
     instead of being frozen into the string ``"haiku"``.
 
-    Everything else fails closed. ``reasoning_effort_accepted`` stays true for
-    the whole backend — the request is still accepted and still forwarded, so a
+    Everything else fails closed. A custom-upstream deployment can explicitly
+    certify model ids with ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS``; this is an
+    operator assertion that the upstream applies the forced effort value, not a
+    guess made by the gateway. ``reasoning_effort_accepted`` stays true for the
+    whole backend — the request is still accepted and still forwarded, so a
     client that wants to offer effort as best-effort can read that instead.
     """
+    custom_upstream = bool((os.getenv("ANTHROPIC_BASE_URL") or "").strip())
+    certified = _custom_upstream_effort_models()
+    if custom_upstream and ("*" in certified or model in certified):
+        return {"reasoning_effort": True}
     if model not in CLAUDE_MODELS:
         # A configured override name or an id discovered from the upstream:
         # an arbitrary string we cannot match against the CLI's registry.
         return {"reasoning_effort": False}
-    if (os.getenv("ANTHROPIC_BASE_URL") or "").strip():
-        # Custom upstream — effort may be dropped on a 400 retry.
+    if custom_upstream:
+        # Custom upstream without an explicit operator certification — effort
+        # may be dropped on a 400 retry, so the strong guarantee stays false.
         return {"reasoning_effort": False}
     if model in configured_model_aliases().values():
         # This tier is redirected to a configured concrete id; the CLI resolves
