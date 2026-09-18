@@ -332,6 +332,25 @@ class TestReasoningEffortIsGuaranteedPerModel:
             # the operator's word still wins where both exist
             monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium")
             assert claude_effort_levels("qwen3.6-27b") == ("low", "medium")
+
+            # A valid manual setting that does not cover this id is not a veto:
+            # discovery remains the source of truth for the other model.
+            monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "glm-5-fp8=low|medium")
+            assert _claude_model_capabilities("qwen3.6-27b") == {"reasoning_effort": True}
+            assert claude_effort_levels("qwen3.6-27b") == ("low", "medium", "xhigh")
+
+            # A malformed nonblank manual setting is different from "no matching
+            # override": the whole operator declaration is invalid, so runtime
+            # must fail closed and must NOT fall back to the discovered ladder.
+            monkeypatch.setenv(
+                "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
+                "qwen3.6-27b=low|medum",
+            )
+            entry = BackendRegistry._model_entry(CLAUDE_DESCRIPTOR, "qwen3.6-27b")
+            assert entry["capabilities"]["reasoning_effort"] is False
+            assert "effort_levels" not in entry
+            assert claude_effort_levels("qwen3.6-27b") is None
+
             # discovery off → the statement is not read (opt-in stays opt-in)
             monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
             monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")
