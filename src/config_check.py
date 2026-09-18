@@ -22,7 +22,7 @@ import os
 from dataclasses import dataclass
 from typing import List, Literal
 
-from src.env_utils import parse_bool_env
+from src.env_utils import parse_bool_env, parse_workspace_initial_dirs
 
 logger = logging.getLogger(__name__)
 
@@ -601,6 +601,22 @@ def _check_sdk_buffer() -> List[ConfigIssue]:
     return []
 
 
+def _check_workspace_initial_dirs() -> List[ConfigIssue]:
+    """Validate creation-only workspace seed directories at startup.
+
+    Shares ``src.env_utils.parse_workspace_initial_dirs`` with the workspace
+    manager, so the two surfaces cannot drift into disagreeing about which
+    entries are acceptable — a reserved path this check does not know about
+    would be one the manager happily seeds. ``env_utils`` has no intra-project
+    imports, so this keeps the early-startup import discipline.
+    """
+    try:
+        parse_workspace_initial_dirs(os.getenv("WORKSPACE_INITIAL_DIRS"))
+    except ValueError as exc:
+        return [ConfigIssue("error", f"WORKSPACE_INITIAL_DIRS {exc}.")]
+    return []
+
+
 def _check_workspace_quota() -> List[ConfigIssue]:
     """``USER_WORKSPACE_QUOTA_MB`` must be a non-negative integer (MiB).
 
@@ -648,6 +664,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_claude_settings_env())
     issues.extend(_check_stall_hierarchy())
     issues.extend(_check_sdk_buffer())
+    issues.extend(_check_workspace_initial_dirs())
     issues.extend(_check_workspace_quota())
     return issues
 

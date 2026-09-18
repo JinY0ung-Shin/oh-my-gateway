@@ -45,6 +45,7 @@ _CHECKED_VARS = [
     "BASH_MAX_TIMEOUT_MS",
     "BASH_DEFAULT_TIMEOUT_MS",
     "CLAUDE_MAX_BUFFER_SIZE",
+    "WORKSPACE_INITIAL_DIRS",
     "USER_WORKSPACE_QUOTA_MB",
 ]
 
@@ -539,6 +540,79 @@ async def test_lifespan_escape_hatch_allows_startup(clean_env):
             started = True
 
     assert started
+
+
+# ---------------------------------------------------------------------------
+# WORKSPACE_INITIAL_DIRS — creation-only starter directory configuration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "Documents,Projects/AI,.config",
+        " Documents , Projects/AI ",
+        "",
+        ",,",
+    ],
+)
+def test_workspace_initial_dirs_valid_values_are_quiet(clean_env, value):
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", value)
+    assert not [
+        m
+        for m in _messages(check_config(), "error")
+        if "WORKSPACE_INITIAL_DIRS" in m
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../escape",
+        "safe/../../escape",
+        "/absolute/path",
+        ".",
+    ],
+)
+def test_workspace_initial_dirs_unsafe_value_is_startup_error(clean_env, value):
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", value)
+    errors = [
+        m
+        for m in _messages(check_config(), "error")
+        if "WORKSPACE_INITIAL_DIRS" in m
+    ]
+    assert len(errors) == 1
+    assert "relative workspace paths" in errors[0]
+    assert repr(value) in errors[0]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        ".claude/skills",
+        ".claude/skills/review",
+        ".claude/agents",
+        "Documents,.claude/agents/triage",
+    ],
+)
+def test_workspace_initial_dirs_reserved_namespace_is_startup_error(clean_env, value):
+    """The startup check must refuse what the workspace manager refuses.
+
+    ``.claude/{skills,agents}`` is the Claude backend's managed mirror of the
+    canonical resource roots. Both surfaces parse through
+    ``env_utils.parse_workspace_initial_dirs`` precisely so a reserved path
+    cannot pass startup and then be seeded at resolve time.
+    """
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", value)
+    errors = [m for m in _messages(check_config(), "error") if "WORKSPACE_INITIAL_DIRS" in m]
+    assert len(errors) == 1
+    assert "manages as a mirror" in errors[0]
+    assert "skills/ or agents/" in errors[0]
+
+
+def test_workspace_initial_dirs_allows_the_canonical_resource_roots(clean_env):
+    clean_env.setenv("WORKSPACE_INITIAL_DIRS", "skills/review,agents/triage,.claude")
+    assert not [m for m in _messages(check_config(), "error") if "WORKSPACE_INITIAL_DIRS" in m]
 
 
 # ---------------------------------------------------------------------------
