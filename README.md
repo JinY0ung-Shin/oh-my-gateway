@@ -480,10 +480,10 @@ Effective `/v1/responses` request fields:
   field entirely on a custom `ANTHROPIC_BASE_URL` with an unfamiliar model id (measured with CLI
   2.1.276: it now sends `output_config.effort` — default `high` — on every request either way).
   **Whether it changes anything is the upstream's business**: on the wire it is Anthropic's
-  `output_config.effort`; the gateway's sanitizer bridge translates that to OpenAI
-  `reasoning_effort` for LiteLLM, clamped onto the `effort_levels` the gateway advertises for that
-  model (upward first: `high` on a `low|medium|xhigh` template goes out as `xhigh`), and a model
-  that does not take the field simply ignores it (LiteLLM's `drop_params` discards it). On a custom
+  `output_config.effort`; the sanitizer translates that verbatim to OpenAI `reasoning_effort` for
+  LiteLLM, and a model that does not take the field simply ignores it (LiteLLM's `drop_params`
+  discards it). Clamping a level onto what a served template accepts is the litellm_serving
+  sanitizer's job — the layer that learned that vocabulary — not this gateway's. On a custom
   upstream the levels come from the upstream's own `/v1/models` rows when discovery is on (the
   litellm_serving sanitizer learns and publishes them) — that statement is the source of truth —
   and `CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS` (e.g. `qwen3.6-27b=low|medium|xhigh,glm-5-fp8,*`)
