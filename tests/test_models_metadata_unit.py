@@ -329,9 +329,17 @@ class TestReasoningEffortIsGuaranteedPerModel:
             assert _claude_model_entry_meta("qwen3.6-27b")["effort_levels"] == ["low", "medium", "xhigh"]
             assert _claude_model_capabilities("gemma-4-31b-it") == {"reasoning_effort": False}
             assert claude_effort_levels("glm-5-fp8") is None
-            # the operator's word still wins where both exist
+            # the upstream's own statement wins where both exist: a leftover
+            # override (narrower OR wider) must not replace what the model says
             monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "qwen3.6-27b=low|medium")
-            assert claude_effort_levels("qwen3.6-27b") == ("low", "medium")
+            assert claude_effort_levels("qwen3.6-27b") == ("low", "medium", "xhigh")
+            monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "*")
+            assert claude_effort_levels("qwen3.6-27b") == ("low", "medium", "xhigh"), (
+                "a blanket '*' written before discovery existed would advertise "
+                "high/max that this template answers with a 400"
+            )
+            # ...and still fills in for an id the upstream said nothing about
+            assert claude_effort_levels("gemma-4-31b-it") == ("low", "medium", "high", "xhigh", "max")
             # discovery off → the statement is not read (opt-in stays opt-in)
             monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
             monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "false")

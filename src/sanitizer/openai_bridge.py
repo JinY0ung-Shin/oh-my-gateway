@@ -36,8 +36,11 @@ responsible for parsing and serialization.
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -208,10 +211,57 @@ def _convert_tool_choice(tc: Any) -> Any:
 # theory that the OpenAI field defines nothing above ``high``. That cost twice:
 # it destroyed ``xhigh``, a level that upstream accepts, and it flattened three
 # distinct requests into one, so a caller choosing between ``high`` and ``max``
-# was choosing between identical turns. Clamping to what an upstream accepts
-# belongs to the layer that knows the upstream — the sanitizer sitting in front
-# of LiteLLM, which reads that vocabulary from its own config.
+# was choosing between identical turns. So the bridge never normalizes on its
+# own theory of the ladder.
+#
+# The one thing it does clamp to is the ladder the gateway ITSELF advertises for
+# this model on ``/v1/models`` (``effort_levels`` — what the upstream stated via
+# discovery, or the operator certified). A level outside that list is a 400 that
+# takes the whole turn on a vLLM upstream ("Unexpected reasoning effort high.
+# Supported types are xhigh (default), medium, and low." — litellm_serving#26),
+# and the CLI sends its own default effort even when the client asked for none,
+# so the request path's ``validate_model_effort_support`` alone cannot keep such
+# a level off the wire. A model with no advertised ladder is forwarded verbatim,
+# exactly as before.
 _FORWARDED_EFFORTS = frozenset({"minimal", "low", "medium", "high", "xhigh", "max"})
+
+# Weakest → strongest, for the nearest-level search. ``minimal`` is not a level
+# the gateway advertises but the CLI/schemas define it, so it is placed.
+_EFFORT_SCALE: tuple[str, ...] = ("minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def _advertised_effort_levels(model: Any) -> Optional[tuple[str, ...]]:
+    """The ``effort_levels`` the gateway advertises for *model*, or ``None``."""
+    if not isinstance(model, str) or not model.strip():
+        return None
+    # Local import: this module is loaded by the sanitizer route at app assembly
+    # and the Claude backend package is deliberately kept out of early imports.
+    from src.backends.claude import claude_effort_levels
+
+    return claude_effort_levels(model.strip())
+
+
+def _clamp_to_advertised(level: str, model: Any) -> str:
+    """Map *level* onto the ladder advertised for *model*, upward first.
+
+    Same direction as the litellm_serving sanitizer's ``clamp_to_supported`` —
+    reasoning less than the caller asked for is the worse of the two misses:
+    ``high`` on a ``low|medium|xhigh`` model becomes ``xhigh``, not ``medium``.
+    Unchanged when nothing is advertised or the level is already on the list.
+    """
+    levels = _advertised_effort_levels(model)
+    if not levels or level in levels or level not in _EFFORT_SCALE:
+        return level
+    index = _EFFORT_SCALE.index(level)
+    for candidate in _EFFORT_SCALE[index + 1 :]:
+        if candidate in levels:
+            logger.info("clamping %s effort %r up to %r", model, level, candidate)
+            return candidate
+    for candidate in reversed(_EFFORT_SCALE[:index]):
+        if candidate in levels:
+            logger.info("clamping %s effort %r down to %r", model, level, candidate)
+            return candidate
+    return level
 
 
 def _reasoning_effort(body: Dict[str, Any]) -> Optional[str]:
@@ -249,10 +299,12 @@ def anthropic_request_to_openai_body(body: Dict[str, Any]) -> Dict[str, Any]:
     One deliberate translation: Anthropic's ``output_config.effort`` (what the
     CLI sends for a requested thinking effort) becomes OpenAI's
     ``reasoning_effort``, which LiteLLM understands and forwards. The level is
-    preserved, not normalized — see ``_reasoning_effort``. Whether it changes
-    anything is the served model's business: LiteLLM's ``drop_params`` discards
-    it for a model that does not take it, and an upstream whose accepted set is
-    narrower is the downstream sanitizer's to clamp for.
+    preserved, not normalized — see ``_reasoning_effort`` — except that it is
+    clamped onto the ladder the gateway advertises for this model
+    (``_clamp_to_advertised``), so a level the served template rejects never
+    reaches it. Whether it changes anything is otherwise the served model's
+    business: LiteLLM's ``drop_params`` discards it for a model that does not
+    take it.
     """
     out: Dict[str, Any] = {}
 
@@ -273,7 +325,7 @@ def anthropic_request_to_openai_body(body: Dict[str, Any]) -> Dict[str, Any]:
 
     effort = _reasoning_effort(body)
     if effort:
-        out["reasoning_effort"] = effort
+        out["reasoning_effort"] = _clamp_to_advertised(effort, model)
 
     messages: List[Dict[str, Any]] = []
 

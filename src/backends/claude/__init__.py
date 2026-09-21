@@ -97,9 +97,10 @@ def _claude_model_entry_meta(model: str) -> dict:
 
     ``effort_levels`` is present exactly when ``capabilities.reasoning_effort``
     is true and lists the levels the model applies, weakest → strongest. On a
-    first-party upstream that is the whole ladder; on a certified custom
-    upstream it is what the operator declared (a served model's chat template
-    decides the subset — see ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS``). A client
+    first-party upstream that is the whole ladder; on a custom upstream it is
+    what the upstream itself stated on its ``/v1/models`` row (a served model's
+    chat template decides the subset), or — only where it stated nothing — what
+    the operator declared in ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS``. A client
     offers exactly these levels; the request path rejects any other with a 400
     instead of letting the upstream fail the turn (``validate_model_effort_support``).
     """
@@ -110,22 +111,43 @@ def _claude_model_entry_meta(model: str) -> dict:
     return meta
 
 
+# (model, certified, stated) triples already logged — /v1/models is polled, so
+# the disagreement is reported once per distinct statement, not per poll.
+_precedence_logged: set[tuple[str, tuple[str, ...], tuple[str, ...]]] = set()
+
+
 def _custom_upstream_effort_levels(model: str) -> tuple[str, ...] | None:
     """Levels a custom upstream applies for *model*, from the best source available.
 
-    1. ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` — the operator's word (exact id or
-       ``*``), kept as the override for an upstream that cannot state its own.
-    2. ``effort_levels`` the upstream itself put on its ``/v1/models`` row
+    1. ``effort_levels`` the upstream itself put on its ``/v1/models`` row
        (``MODEL_DISCOVERY_ENABLED=true``): the litellm_serving sanitizer learns
        each served model's set from the model's own 400s / a probe and publishes
-       it there, so nothing has to be copied by hand.
+       it there. **The upstream's own statement is the source of truth** — it is
+       what the served chat template actually accepts, so nothing else may widen
+       it: a wider list is a promise of 400s.
+    2. ``CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS`` — the operator's word (exact id or
+       ``*``), used **only where the upstream states nothing** (an upstream that
+       neither names its levels in a 400 nor answers the probe). A leftover ``*``
+       written before discovery existed must not override what the model says.
 
     ``None`` when neither says anything — fail closed, as before.
     """
+    stated = discovered_effort_levels().get(model)
     certified = certified_effort_levels(model)
-    if certified is not None:
-        return certified
-    return discovered_effort_levels().get(model)
+    if stated is not None:
+        if certified is not None and certified != stated:
+            key = (model, certified, stated)
+            if key not in _precedence_logged:
+                _precedence_logged.add(key)
+                logger.info(
+                    "effort levels for %s: upstream states %s; ignoring "
+                    "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS=%s for this id",
+                    model,
+                    "|".join(stated),
+                    "|".join(certified),
+                )
+        return stated
+    return certified
 
 
 def claude_effort_levels(model: str) -> tuple[str, ...] | None:

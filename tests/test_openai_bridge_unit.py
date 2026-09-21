@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from typing import AsyncIterator, Iterable, List
 
+import pytest
+
 from src.sanitizer.openai_bridge import (
     anthropic_request_to_openai_body,
     openai_response_to_anthropic_body,
@@ -619,9 +621,10 @@ class TestReasoningEffortIsPreservedNotCollapsed:
     - ``high``, ``xhigh`` and ``max`` became one value, so a caller choosing
       between them was choosing between identical turns.
 
-    Clamping to an upstream's vocabulary belongs to the layer that knows the
-    upstream (the sanitizer in front of LiteLLM, from its own config), so this
-    one preserves.
+    The bridge therefore never normalizes on its own theory of the ladder. The
+    one list it clamps to is the ``effort_levels`` the gateway itself advertises
+    for the model (``TestReasoningEffortIsClampedToTheAdvertisedLadder``); a
+    model with no advertised ladder — every case in this class — is preserved.
     """
 
     @staticmethod
@@ -682,3 +685,84 @@ class TestReasoningEffortIsPreservedNotCollapsed:
         for bad in ("high", ["high"], 3):
             body["output_config"] = bad
             assert "reasoning_effort" not in anthropic_request_to_openai_body(body)
+
+
+class TestReasoningEffortIsClampedToTheAdvertisedLadder:
+    """A level outside the ladder the gateway advertises for a model never
+    reaches the upstream.
+
+    ``GET /v1/models`` promises ``effort_levels`` per model — what the upstream
+    stated through discovery (the litellm_serving sanitizer learns each served
+    template's set) or the operator certified. vLLM answers a level outside that
+    set with a 400 that takes the whole turn (litellm_serving#26), and the CLI
+    sends its own default effort even when the client asked for none, so the
+    request-path validation alone cannot keep such a level off the wire. The
+    bridge clamps onto the advertised ladder, upward first — the same direction
+    as the litellm_serving sanitizer's ``clamp_to_supported``.
+    """
+
+    @staticmethod
+    def _body(model, effort):
+        return {
+            "model": model,
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "output_config": {"effort": effort},
+        }
+
+    @pytest.fixture
+    def qwen_states_its_ladder(self, monkeypatch):
+        from src.backends.claude import model_discovery as md
+
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm.internal:4000")
+        monkeypatch.setenv("MODEL_DISCOVERY_ENABLED", "true")
+        monkeypatch.delenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", raising=False)
+        md._reset_cache_for_tests()
+        md._cache = md._DiscoveryCache(
+            source="http://litellm.internal:4000",
+            model_ids=("qwen3.6-27b", "glm-5-fp8"),
+            expires_at=1e12,
+            effort_levels={"qwen3.6-27b": ("low", "medium", "xhigh")},
+        )
+        yield
+        md._reset_cache_for_tests()
+
+    def test_a_level_the_model_rejects_moves_up_to_the_nearest_it_takes(
+        self, qwen_states_its_ladder
+    ):
+        out = anthropic_request_to_openai_body(self._body("qwen3.6-27b", "high"))
+        assert out["reasoning_effort"] == "xhigh", "high on a low|medium|xhigh template is a 400"
+
+    def test_above_the_ladder_comes_down_to_its_top(self, qwen_states_its_ladder):
+        out = anthropic_request_to_openai_body(self._body("qwen3.6-27b", "max"))
+        assert out["reasoning_effort"] == "xhigh"
+
+    def test_minimal_moves_up_to_the_weakest_advertised(self, qwen_states_its_ladder):
+        out = anthropic_request_to_openai_body(self._body("qwen3.6-27b", "minimal"))
+        assert out["reasoning_effort"] == "low"
+
+    def test_a_level_on_the_ladder_is_untouched(self, qwen_states_its_ladder):
+        for level in ("low", "medium", "xhigh"):
+            out = anthropic_request_to_openai_body(self._body("qwen3.6-27b", level))
+            assert out["reasoning_effort"] == level, level
+
+    def test_a_model_with_no_advertised_ladder_is_still_preserved(
+        self, qwen_states_its_ladder
+    ):
+        # discovered, but the upstream stated no levels → no guarantee, verbatim
+        out = anthropic_request_to_openai_body(self._body("glm-5-fp8", "max"))
+        assert out["reasoning_effort"] == "max"
+        # never discovered at all
+        out = anthropic_request_to_openai_body(self._body("ChatDRAGON-Medium", "high"))
+        assert out["reasoning_effort"] == "high"
+
+    def test_the_operator_ladder_clamps_where_the_upstream_stated_nothing(
+        self, qwen_states_its_ladder, monkeypatch
+    ):
+        monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "glm-5-fp8=low|medium|high")
+        out = anthropic_request_to_openai_body(self._body("glm-5-fp8", "max"))
+        assert out["reasoning_effort"] == "high"
+        # ...but never widens a ladder the upstream did state
+        monkeypatch.setenv("CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS", "*")
+        out = anthropic_request_to_openai_body(self._body("qwen3.6-27b", "high"))
+        assert out["reasoning_effort"] == "xhigh"
