@@ -75,6 +75,7 @@ CLAUDE_MODELS = [
 # so the reason a tier does or does not carry the guarantee stays readable. A new
 # generation is one edit here plus its row below.
 EFFORT_CAPABLE_MODELS = {
+    "claude-opus-5-5": True,
     "claude-opus-5": True,
     "claude-sonnet-5": True,
     "claude-haiku-4-5": False,
@@ -85,8 +86,11 @@ EFFORT_CAPABLE_MODELS = {
 # resolution — this is the gateway's record of it, used for nothing but reading
 # a concrete model's effort support off ``EFFORT_CAPABLE_MODELS``. An unlisted
 # tier, or one resolving to a model missing from that table, fails closed.
+# ``opus`` moved to Opus 5.5 with bundled CLI 2.1.280 (SDK 0.2.158+); verified
+# on 2.1.283: a bare ``opus`` and a model-less request both send
+# ``claude-opus-5-5`` upstream.
 FIRST_PARTY_TIER_MODELS = {
-    "opus": "claude-opus-5",
+    "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5",
 }

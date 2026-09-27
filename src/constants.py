@@ -289,6 +289,30 @@ def _ensure_mcp_tool_timeout_env() -> int:
 # the policy real at runtime, not merely a number used by the stall derivation.
 EFFECTIVE_MCP_TOOL_TIMEOUT_MS = _ensure_mcp_tool_timeout_env()
 
+# Cross-session messaging (Claude CLI 2.1.224+) binds a peer-inbox socket in
+# every CLI child and hands the model ListAgents plus cross-session SendMessage.
+# Peer discovery is scoped to the config dir (``$CLAUDE_CONFIG_DIR/sessions``),
+# and every gateway child shares the gateway's HOME whichever user it serves, so
+# one user's agent could list another user's live session and message it — the
+# receiver then runs a turn in its own workspace (verified on CLI 2.1.283). The
+# CLI's gate reads this env var: any value other than 1/true/yes/on turns the
+# feature off (no socket, no ListAgents, cross-session SendMessage refused);
+# teammate and subagent SendMessage are not gated by it. It is installed in the
+# process env rather than ``options.env`` so every spawn point inherits it
+# (turn clients, slash-command discovery, ``verify()``); an explicit operator
+# value wins. The name is an undocumented CLI codename —
+# tests/test_cli_cross_session_messaging.py pins it against the bundled CLI so
+# an SDK bump that renames it fails loudly.
+CROSS_SESSION_MESSAGING_ENV = "CLAUDE_CODE_HARBOR_KITE"
+
+
+def _ensure_cross_session_messaging_off() -> None:
+    """Default the CLI's cross-session messaging gate to off for every child."""
+    os.environ.setdefault(CROSS_SESSION_MESSAGING_ENV, "0")
+
+
+_ensure_cross_session_messaging_off()
+
 
 def cli_tool_watchdog_ms() -> int:
     """The longest a CLI tool call may legitimately stay silent, in milliseconds.

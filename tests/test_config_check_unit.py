@@ -47,6 +47,7 @@ _CHECKED_VARS = [
     "CLAUDE_MAX_BUFFER_SIZE",
     "WORKSPACE_INITIAL_DIRS",
     "USER_WORKSPACE_QUOTA_MB",
+    "CLAUDE_CODE_HARBOR_KITE",
 ]
 
 
@@ -466,6 +467,28 @@ def test_sdk_buffer_invalid_value_warns_about_fallback(clean_env, value):
     assert len(warnings) == 1
     assert "not a positive integer" in warnings[0]
     assert str(16 * 1024 * 1024) in warnings[0]
+
+
+# ---------------------------------------------------------------------------
+# CLAUDE_CODE_HARBOR_KITE — Claude cross-session messaging gate
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, "0", "", "false", "off"])
+def test_cross_session_messaging_off_is_quiet(clean_env, value):
+    if value is not None:
+        clean_env.setenv("CLAUDE_CODE_HARBOR_KITE", value)
+    assert not [m for m in _messages(check_config(), "warning") if "HARBOR" in m]
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_cross_session_messaging_opt_in_warns(clean_env, value):
+    """Opting back in lets users' agents message each other's sessions."""
+    clean_env.setenv("CLAUDE_CODE_HARBOR_KITE", value)
+    warnings = [m for m in _messages(check_config(), "warning") if "HARBOR" in m]
+    assert len(warnings) == 1
+    assert "ListAgents" in warnings[0] and "SendMessage" in warnings[0]
+    assert not _messages(check_config(), "error")
 
 
 def test_run_startup_check_raises_on_error_severity(clean_env):
