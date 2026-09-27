@@ -45,7 +45,10 @@ uv run pytest --cov=src                            # with coverage
 
 ## Code Style
 
-- Code is **black-88 formatted**, even though `pyproject.toml` carries a `[tool.ruff]` section with line-length 100. Do not run repo-wide `ruff format`; match surrounding style.
+- Write new code in black-88 style, even though `pyproject.toml` carries a `[tool.ruff]` section with
+  line-length 100 — but existing files are not formatter-clean at either width (`black --check` flags
+  `client.py`, `responses.py`, `agent_messages.py`, …), so never run black or `ruff format` over an
+  existing file; match surrounding style.
 - Gateway philosophy: pass SDK behavior through rather than hiding upstream breaking changes. The one
   deliberate adapter is the versioned, endpoint-local mapper in `src/routes/agent_messages.py`, because
   the Python SDK objects are not wire-compatible with Noah's JavaScript SDK handlers. Never move that
@@ -86,6 +89,29 @@ uv run pytest --cov=src                            # with coverage
   bytes, despite saying "bytes" (upstream #1165) — `tests/test_sdk_buffer_semantics.py` pins
   this against the real transport reader so an SDK upgrade that flips the unit fails loudly;
   update the docs/error text together with the pin when it does.
+- The bundled CLI (2.1.224+) ships cross-session messaging: a peer-inbox socket in every child plus
+  `ListAgents` / cross-session `SendMessage`. Peers are discovered through the config dir, which all
+  gateway children share (one HOME), so any user's agent could inject turns into another user's
+  live session. `src/constants.py` installs the undocumented gate `CLAUDE_CODE_HARBOR_KITE=0` into
+  the process env (every spawn point inherits it; an operator opt-in is a startup warning), and
+  `tests/test_cli_cross_session_messaging.py` pins it against the bundled CLI in both directions —
+  when an SDK bump breaks that test, find the new gate before shipping. Teammate and subagent
+  `SendMessage` are not gated by it.
+- The CLI expands `@<path>` in user text and inlines the file upstream — outside the workspace too,
+  and no hook sees it (it is not a tool call). `run_completion_with_client` therefore sends every
+  non-slash turn with `client_composed: true` (the per-message field SDK `verbatim_prompts` sets;
+  CLI ≥ 2.1.248 — an older `CLAUDE_CLI_PATH` silently ignores it), and
+  `slash_commands.validate_prompt` rejects @-mentions in slash-command arguments
+  (`unsupported_argument`). Keep the SDK-wide `verbatim_prompts` option off: its stamp would
+  override the per-turn slash exception.
+- SDK 0.2.129+ raises `ValueError` from `connect()` for skill names with parentheses, commas,
+  wildcards, control characters or a leading `/`. `src/backends/claude/skill_names.py` mirrors
+  those rules (parity-tested against the SDK's private validator): a request `allowed_tools` rule
+  fails as 400 `invalid_skill_rule` (`Skill(*)` means allow-all), and a catalog-derived name is
+  dropped with a warning, so a skill directory named `weird (v2)` cannot break every session.
+- A resumed session reuses the system prompt recorded on its first request (CLI 2.1.267
+  `--system-prompt-snapshot`, default on), so the resume path's `system_prompt=None` keeps the
+  original `instructions`; admin base-prompt edits reach only new sessions.
 
 ## API Compatibility Boundaries
 
@@ -96,7 +122,9 @@ uv run pytest --cov=src                            # with coverage
   normalized `sdk_message` events. Do not accept or expose continuation/session IDs.
 - Noah consumes these envelopes through the same `dispatchSdkMessage` used for its local SDK runs. A
   schema or SDK-event change must be coordinated with the Noah `avatar-chat` repository; do not fork a
-  second Noah-side event handler.
+  second Noah-side event handler. The mapper is fail-closed on purpose: system envelopes pass only
+  for subtypes in `_SYSTEM_SUBTYPES` (the set CLI 2.1.220 emitted) and new SDK fields such as
+  `origin` are stripped, so a CLI bump cannot widen Noah's wire — opening either is such a change.
 - Keep endpoint-specific partial messages, secret/path redaction, tool-result projection,
   `AskUserQuestion` denial, disconnect, and transcript/artifact cleanup isolated from `/v1/responses`.
 
@@ -110,6 +138,8 @@ uv run pytest --cov=src                            # with coverage
   default run reports only ~130 deselected — the dedicated stale files never collect at all).
   `RUN_STALE_BACKEND_TESTS=1` restores them. When a shared-code change breaks stale backend code or
   its tests, do not fix the backend — leave it frozen.
-- `claude-agent-sdk` is pinned exactly (`==0.2.128`); upgrades are deliberate, gap-analyzed events — do not bump casually.
+- `claude-agent-sdk` is pinned exactly (`==0.2.160`, bundled CLI 2.1.283); upgrades are deliberate,
+  gap-analyzed events — do not bump casually. `tests/fixtures/fake_anthropic_api.py` drives the real
+  bundled CLI at zero cost for pins like the cross-session and verbatim tests.
 - Changes to the stateless mapper must pass `uv run pytest tests/test_agent_messages.py -q` and the full
   gateway suite. If the schema/event shape changes, also run Noah's `tests/external-agent.test.ts`.

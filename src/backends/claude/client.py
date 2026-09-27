@@ -86,7 +86,8 @@ logger = logging.getLogger(__name__)
 # entries. For every gateway client that shadowing is deliberate — ordinary
 # tools are *meant* to auto-approve — and the one tool the callback exists for,
 # AskUserQuestion, still reaches it regardless (CLI exception; re-verified live
-# on SDK 0.2.128 / CLI 2.1.220 by tests/test_ask_user_question_live.py). The
+# on SDK 0.2.128 / CLI 2.1.220 by tests/test_ask_user_question_live.py, and on
+# SDK 0.2.160 / CLI 2.1.283 against a fake API under bypassPermissions). The
 # warning's "can_use_tool will not be invoked" would be a false alarm in every
 # worker's log, so it is filtered out for this process.
 warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
@@ -239,9 +240,10 @@ def _get_max_buffer_size() -> int:
     it in either direction; unset, empty or invalid (non-numeric / non-positive)
     values keep the gateway default, invalid ones with a warning.
 
-    Unit caveat: the pinned ``claude-agent-sdk`` (0.2.128) counts this limit in
-    Python ``str`` CHARACTERS of the decoded stdout text (``_LineFramer`` uses
-    ``len(chunk)`` on a ``TextReceiveStream``), although its own error text
+    Unit caveat: the pinned ``claude-agent-sdk`` (0.2.160; framing unchanged
+    since 0.2.128) counts this limit in Python ``str`` CHARACTERS of the
+    decoded stdout text (``_LineFramer`` uses ``len(chunk)`` on a
+    ``TextReceiveStream``), although its own error text
     says "bytes" (upstream anthropics/claude-agent-sdk-python#1165). ASCII and
     base64 payloads are 1 char = 1 byte, so the #183 case is unaffected, but
     multibyte UTF-8 text can occupy up to ~4x the nominal limit in real memory.
@@ -1392,7 +1394,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         AskUserQuestion always falls through to this callback, even under
         ``permission_mode=bypassPermissions`` where ordinary tools are
         auto-approved without it — verified against claude-agent-sdk==0.2.108,
-        re-verified live on 0.2.128 (CLI 2.1.220). The SDK's
+        re-verified live on 0.2.128 (CLI 2.1.220) and against a fake API on
+        0.2.160 (CLI 2.1.283). The SDK's
         ``CanUseToolShadowedWarning`` about this combination is a false
         positive for AskUserQuestion and is filtered at module import.
 
