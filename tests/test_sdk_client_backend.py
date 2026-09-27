@@ -281,6 +281,26 @@ async def test_run_completion_with_client_error_during_receive():
     assert session.client is None
 
 
+async def test_run_completion_with_client_error_resets_task_registry():
+    """The dropped client's tasks are gone with it: no zombie active_tasks."""
+    from src.session_outbox import get_outbox
+
+    cli = _make_cli()
+    session = Session(session_id="sess-err-tasks")
+    session.client = MagicMock()
+    outbox = get_outbox(session)
+    outbox.apply_task_event({"type": "task_started", "task_id": "t1"})
+
+    mock_client = AsyncMock()
+    mock_client.query.side_effect = RuntimeError("connection lost")
+
+    async for _ in cli.run_completion_with_client(mock_client, "fail", session):
+        pass
+
+    assert session.client is None
+    assert outbox.snapshot_active_tasks() == []
+
+
 # ---------------------------------------------------------------------------
 # _make_ask_user_can_use_tool (can_use_tool permission callback)
 # ---------------------------------------------------------------------------

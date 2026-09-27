@@ -31,10 +31,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import suppress
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+
+from src.backends.claude.constants import SUBAGENT_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +58,25 @@ _DRAIN_QUIET_S = 0.05
 # TERMINAL_TASK_STATUSES across both lifecycle vocabularies).
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
 
+# Agent-name lookups (spawn tool_use id → name, task id → name) live as long
+# as the session, so both are capped; the least recently used entry goes
+# first. Names are the model-chosen ``name`` input of an Agent/Task call,
+# which CLI 2.1.283 validates as a ≤ 64-char identifier; the length cap here
+# only bounds memory for calls the CLI would reject anyway.
+_AGENT_NAME_MAP_MAX = 256
+_AGENT_NAME_MAX_LEN = 256
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _bounded_put(mapping: "OrderedDict[str, str]", key: str, value: str) -> None:
+    """Insert or refresh *key*, evicting the least recently used overflow."""
+    mapping[key] = value
+    mapping.move_to_end(key)
+    while len(mapping) > _AGENT_NAME_MAP_MAX:
+        mapping.popitem(last=False)
 
 
 class SessionOutbox:
@@ -68,6 +86,16 @@ class SessionOutbox:
         self.events: deque = deque(maxlen=maxlen)
         self.next_seq = 1
         self.active_tasks: Dict[str, Dict[str, Any]] = {}
+        # Names given by Agent/Task calls, keyed by the call's tool_use id
+        # (its task_started carries the same id) and by task id: a task
+        # resumed via SendMessage is re-announced under the SendMessage
+        # call's id, so only the task id still finds its name.
+        self._spawn_names: "OrderedDict[str, str]" = OrderedDict()
+        self._task_names: "OrderedDict[str, str]" = OrderedDict()
+        # The tool call behind each task's first announcement. A resumed agent
+        # keeps it: its own messages still carry that call as their
+        # ``parent_tool_use_id``, not the SendMessage call it resumed under.
+        self._task_spawn_ids: "OrderedDict[str, str]" = OrderedDict()
 
     def append(self, event: Dict[str, Any]) -> Dict[str, Any]:
         """Stamp *event* with ``seq``/``ts`` and append it to the buffer."""
@@ -97,6 +125,8 @@ class SessionOutbox:
         if entry is None:
             entry = {
                 "task_id": task_id,
+                "name": None,
+                "tool_use_id": None,
                 "description": "",
                 "status": "running",
                 "task_type": None,
@@ -108,6 +138,28 @@ class SessionOutbox:
             }
             self.active_tasks[task_id] = entry
         return entry
+
+    def note_agent_spawn(self, tool_use_id: str, name: str) -> None:
+        """Remember the ``name`` an Agent/Task call gave the agent it spawns.
+
+        The call normally arrives before its ``task_started``; a task that is
+        already registered under the same tool_use id (out-of-order delivery)
+        is labelled right away.
+        """
+        _bounded_put(self._spawn_names, tool_use_id, name)
+        for entry in self.active_tasks.values():
+            if entry.get("tool_use_id") == tool_use_id and not entry.get("name"):
+                entry["name"] = name
+                _bounded_put(self._task_names, entry["task_id"], name)
+
+    def agent_name_for(
+        self, task_id: Optional[str], tool_use_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Name of the agent behind a task, when its spawning call named it."""
+        name = self._spawn_names.get(tool_use_id) if tool_use_id else None
+        if name is None and task_id:
+            name = self._task_names.get(task_id)
+        return name
 
     def apply_task_event(self, event: Dict[str, Any]) -> None:
         """Fold a task event into the active-task map."""
@@ -121,6 +173,17 @@ class SessionOutbox:
             return
         entry = self._task_entry(task_id)
         entry["updated_at"] = _utcnow_iso()
+        tool_use_id = event.get("tool_use_id")
+        spawn_id = self._task_spawn_ids.get(task_id)
+        if spawn_id is None and tool_use_id:
+            spawn_id = tool_use_id
+            _bounded_put(self._task_spawn_ids, task_id, spawn_id)
+        if spawn_id:
+            entry["tool_use_id"] = spawn_id
+        name = self.agent_name_for(task_id, tool_use_id)
+        if name:
+            entry["name"] = name
+            _bounded_put(self._task_names, task_id, name)
         if event.get("description"):
             entry["description"] = event["description"]
         if etype == "task_started":
@@ -137,6 +200,16 @@ class SessionOutbox:
     def snapshot_active_tasks(self) -> List[Dict[str, Any]]:
         return [dict(v) for v in self.active_tasks.values()]
 
+    def clear_active_tasks(self) -> int:
+        """Forget every running task; return how many were dropped.
+
+        Agent names and spawn ids are kept: a resumed conversation can
+        re-announce an old agent under the same task id.
+        """
+        dropped = len(self.active_tasks)
+        self.active_tasks.clear()
+        return dropped
+
 
 def get_outbox(session) -> SessionOutbox:
     """Return the session's outbox, creating it lazily."""
@@ -145,6 +218,33 @@ def get_outbox(session) -> SessionOutbox:
         outbox = SessionOutbox()
         session.outbox = outbox
     return outbox
+
+
+def reset_active_tasks(session, reason: str) -> None:
+    """Drop the task registry once the CLI that owned its tasks is gone.
+
+    Tasks live inside the session's CLI process, which reports their end only
+    on its own message stream. After the gateway drops that client (a failed
+    or cancelled turn, an SDK stream error, a fresh client replacing it) or
+    the idle reader loses the stream, no terminal event can arrive: a leftover
+    entry would read as running forever, and a stop request for it would be
+    accepted, because the CLI acknowledges ids it does not know. Never raises.
+    """
+    outbox = getattr(session, "outbox", None)
+    if outbox is None:
+        return
+    try:
+        dropped = outbox.clear_active_tasks()
+    except Exception:  # never let bookkeeping break a teardown path
+        logger.debug("task registry reset failed", exc_info=True)
+        return
+    if dropped:
+        logger.info(
+            "[task-registry] session=%s dropped %d task(s) after %s",
+            getattr(session, "session_id", "?"),
+            dropped,
+            reason,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -177,6 +277,7 @@ def _message_to_event(message: Any) -> Optional[Dict[str, Any]]:
         return {
             "type": "task_started",
             "task_id": message.task_id,
+            "tool_use_id": _message_tool_use_id(message),
             "description": message.description,
             "task_type": getattr(message, "task_type", None) or data.get("task_type"),
             "subagent_type": getattr(message, "subagent_type", None)
@@ -186,6 +287,7 @@ def _message_to_event(message: Any) -> Optional[Dict[str, Any]]:
         return {
             "type": "task_progress",
             "task_id": message.task_id,
+            "tool_use_id": _message_tool_use_id(message),
             "description": message.description,
             "last_tool_name": message.last_tool_name,
             "usage": dict(message.usage) if message.usage else None,
@@ -194,6 +296,7 @@ def _message_to_event(message: Any) -> Optional[Dict[str, Any]]:
         return {
             "type": "task_notification",
             "task_id": message.task_id,
+            "tool_use_id": _message_tool_use_id(message),
             "status": message.status,
             "summary": message.summary,
             "output_file": message.output_file,
@@ -204,6 +307,7 @@ def _message_to_event(message: Any) -> Optional[Dict[str, Any]]:
         return {
             "type": "task_updated",
             "task_id": message.task_id,
+            "tool_use_id": _message_tool_use_id(message),
             "status": message.status or patch.get("status"),
             "patch": patch,
         }
@@ -253,6 +357,69 @@ def _duck_typed_event(message: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _message_tool_use_id(message: Any) -> Optional[str]:
+    """The spawning tool call's id on an SDK task message, if the CLI sent one.
+
+    ``TaskUpdatedMessage`` has no such attribute, so fall back to the raw CLI
+    payload the SDK keeps under ``data``.
+    """
+    tool_use_id = getattr(message, "tool_use_id", None)
+    if not tool_use_id:
+        data = getattr(message, "data", None)
+        if isinstance(data, dict):
+            tool_use_id = data.get("tool_use_id")
+    return tool_use_id if isinstance(tool_use_id, str) and tool_use_id else None
+
+
+# ---------------------------------------------------------------------------
+# Agent identity: names from Agent/Task tool calls
+# ---------------------------------------------------------------------------
+
+
+def _agent_spawns(content: Any) -> List[Tuple[str, str]]:
+    """``(tool_use_id, name)`` for each named Agent/Task call in *content*.
+
+    Blocks are SDK ``ToolUseBlock`` objects on real messages (the Claude
+    client's ``_convert_message`` converts the message, not its blocks) and
+    plain dicts in raw chunks.
+    """
+    spawns: List[Tuple[str, str]] = []
+    if not isinstance(content, list):
+        return spawns
+    for block in content:
+        if isinstance(block, dict):
+            if block.get("type") != "tool_use":
+                continue
+            tool = block.get("name")
+            block_id = block.get("id")
+            tool_input = block.get("input")
+        else:
+            tool = getattr(block, "name", None)
+            block_id = getattr(block, "id", None)
+            tool_input = getattr(block, "input", None)
+        if tool not in SUBAGENT_TOOL_NAMES:
+            continue
+        if not isinstance(block_id, str) or not block_id:
+            continue
+        name = tool_input.get("name") if isinstance(tool_input, dict) else None
+        if isinstance(name, str) and 0 < len(name) <= _AGENT_NAME_MAX_LEN:
+            spawns.append((block_id, name))
+    return spawns
+
+
+def _note_agent_spawns(session, content: Any) -> None:
+    """Record the names of the Agent/Task calls in *content*. Never raises."""
+    try:
+        spawns = _agent_spawns(content)
+        if not spawns:
+            return
+        outbox = get_outbox(session)
+        for tool_use_id, name in spawns:
+            outbox.note_agent_spawn(tool_use_id, name)
+    except Exception:  # never let tracking break a stream
+        logger.debug("agent spawn tracking failed", exc_info=True)
+
+
 def apply_turn_task_chunk(session, chunk: Any) -> None:
     """Track task lifecycle chunks streamed *inside* a turn.
 
@@ -262,10 +429,17 @@ def apply_turn_task_chunk(session, chunk: Any) -> None:
     do before its terminal patch. The turn paths feed every chunk through
     here (via ``_capture_pending_tool_questions``) to keep the registry warm.
 
+    Assistant chunks are scanned too: a spawning Agent/Task call streams
+    before its ``task_started`` and carries the ``name`` the registry reports.
+
     Registry only: the turn's own stream already delivered these events to
     the client, so nothing is appended to the outbox event buffer.
     """
-    if not isinstance(chunk, dict) or chunk.get("subtype") not in _TASK_SUBTYPES:
+    if not isinstance(chunk, dict):
+        return
+    if chunk.get("subtype") not in _TASK_SUBTYPES:
+        if chunk.get("type") == "assistant":
+            _note_agent_spawns(session, chunk.get("content"))
         return
     event = _duck_typed_event(chunk)
     if event is None or not event.get("task_id"):
@@ -273,7 +447,7 @@ def apply_turn_task_chunk(session, chunk: Any) -> None:
     # Converted SDK chunks keep the raw CLI payload under ``data`` and may
     # carry terminal status only inside the ``task_updated`` patch.
     data = chunk.get("data") if isinstance(chunk.get("data"), dict) else {}
-    for key in ("task_type", "subagent_type"):
+    for key in ("task_type", "subagent_type", "tool_use_id"):
         if not event.get(key) and data.get(key):
             event[key] = data[key]
     if event["type"] == "task_updated" and not event.get("status"):
@@ -292,10 +466,21 @@ def apply_turn_task_chunk(session, chunk: Any) -> None:
 
 
 def _handle_idle_message(session, message: Any) -> None:
+    # Agent/Task calls name the tasks they spawn — including calls made
+    # inside a subagent, whose messages are otherwise not forwarded.
+    if isinstance(message, dict):
+        if message.get("type") == "assistant":
+            _note_agent_spawns(session, message.get("content"))
+    else:
+        _note_agent_spawns(session, getattr(message, "content", None))
     event = _message_to_event(message)
     if event is None:
         return
     outbox = get_outbox(session)
+    if event["type"] == "task_started":
+        event["name"] = outbox.agent_name_for(
+            event.get("task_id"), event.get("tool_use_id")
+        )
     stamped = outbox.append(event)
     if stamped["type"].startswith("task_"):
         outbox.apply_task_event(stamped)
@@ -309,6 +494,21 @@ def _handle_idle_message(session, message: Any) -> None:
         stamped["type"],
         stamped["seq"],
     )
+
+
+def _reader_failure_ends_stream(exc: BaseException) -> bool:
+    """Whether an idle-reader failure means the client's stream is dead.
+
+    The SDK re-raises its reader's fatal error — whatever type the transport
+    raised — and then ends the stream. ``MessageParseError`` is the exception:
+    it comes from the per-message parse layer above a stream that keeps
+    flowing (its CLI and tasks are fine, and a restarted reader resumes).
+    """
+    try:
+        from claude_agent_sdk._errors import MessageParseError
+    except Exception:  # pragma: no cover - SDK stubbed or reorganized
+        return True
+    return not isinstance(exc, MessageParseError)
 
 
 async def _idle_pump(session, client) -> None:
@@ -334,6 +534,9 @@ async def _idle_pump(session, client) -> None:
                 try:
                     message = get_next.result()
                 except StopAsyncIteration:
+                    # The SDK ends the stream once its reader is done (the CLI
+                    # exited): no task can report its end any more.
+                    reset_active_tasks(session, "client stream end")
                     return  # client stream closed
                 get_next = None
                 _handle_idle_message(session, message)
@@ -361,6 +564,9 @@ async def _idle_pump(session, client) -> None:
         )
         with suppress(Exception):
             get_outbox(session).append({"type": "reader_error", "message": str(exc)})
+        if _reader_failure_ends_stream(exc):
+            # Without the stream no task can report its end any more.
+            reset_active_tasks(session, "idle reader error")
     finally:
         for leftover in (get_next, stop_wait):
             if leftover is not None and not leftover.done():
@@ -478,6 +684,21 @@ def resume_idle_reader(session) -> bool:
         "[idle-reader] session=%s started", getattr(session, "session_id", "?")
     )
     return True
+
+
+def resume_idle_reader_between_turns(session) -> bool:
+    """:func:`resume_idle_reader` for callers outside the turn paths (HTTP).
+
+    A non-streaming turn reads the client while holding ``session.lock``
+    without publishing ``active_response_id``, so the base gates cannot see
+    it, and a reader started then would split that turn's message stream. The
+    turn paths themselves resume the reader while still holding the lock,
+    which is why this check lives here rather than in ``resume_idle_reader``.
+    """
+    lock = getattr(session, "lock", None)
+    if lock is not None and lock.locked():
+        return False
+    return resume_idle_reader(session)
 
 
 async def pause_idle_reader(session) -> None:

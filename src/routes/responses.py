@@ -541,9 +541,13 @@ async def _disconnect_session_client(session, reason: str, client=None) -> None:
     if client is None:
         client = getattr(session, "client", None)
     if client is None:
+        session_outbox.reset_active_tasks(session, reason)
         return
     if getattr(session, "client", None) is client:
         session.client = None
+    if getattr(session, "client", None) is None:
+        # The session's tasks lived in the CLI this client owned.
+        session_outbox.reset_active_tasks(session, reason)
     disconnect = getattr(client, "disconnect", None)
     if disconnect is None:
         return
@@ -1145,6 +1149,8 @@ async def _ensure_response_session_client(
     # the previous (dead) client and can never be answered — a teardown path
     # that skipped _disconnect_session_client may have left it behind.
     _clear_stale_pending_tool_call(session, "client replacement")
+    # Likewise its tasks: the new CLI knows none of them.
+    session_outbox.reset_active_tasks(session, "client replacement")
 
     from src.system_prompt import get_system_prompt, resolve_request_placeholders
 

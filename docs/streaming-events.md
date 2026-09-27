@@ -291,6 +291,80 @@ Subagent visibility is controlled by:
 | `SUBAGENT_STREAM_TOOL_BLOCKS` | `true` | Forward subagent tool events |
 | `SUBAGENT_STREAM_PROGRESS` | `true` | Forward subagent task progress |
 
+### Querying and stopping running tasks
+
+Clients other than the one reading a turn's stream can see what a session's
+subagents are doing by polling `GET /v1/sessions/{session_id}/pending-events`.
+Its `active_tasks` array is the gateway's live task registry: it is kept current
+mid-turn (from the turn's own task events) as well as between turns, and a task
+leaves it on a terminal status from either `task_updated` or
+`task_notification`. When the gateway drops the session's CLI client (a failed
+or cancelled turn, an SDK stream error, a replacement client) or the idle reader
+loses the stream, the registry is cleared: those tasks lived in that CLI.
+
+```json
+{
+  "task_id": "a4c840da8a32a40c6",
+  "name": "worker-a",
+  "tool_use_id": "toolu_01BLoaCTwNwNJxnGRcDjjgvW",
+  "description": "Running Count primes up to 10000, save and verify",
+  "status": "running",
+  "task_type": "local_agent",
+  "subagent_type": "general-purpose",
+  "last_tool_name": "Bash",
+  "usage": { "total_tokens": 12534, "tool_uses": 1, "duration_ms": 5066 },
+  "started_at": "2026-09-27T09:52:31.120000+00:00",
+  "updated_at": "2026-09-27T09:52:36.187000+00:00"
+}
+```
+
+- `name` is the `name` input of the `Agent`/`Task` call that spawned the task —
+  `null` for unnamed spawns and for tasks that are not agents. A named agent
+  resumed with `SendMessage` keeps its name. The CLI offers the `name`
+  parameter only while `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is on (admin
+  "Agent Teams" toggle), so expect `null` names with it off.
+- `tool_use_id` is the id of the tool call behind the task's first
+  announcement: the spawning `Agent`/`Task` call for an agent (the
+  `parent_tool_use_id` its own events carry), the `Bash` call for a shell. It
+  stays put when `SendMessage` resumes an agent: the CLI re-announces the task
+  under the `SendMessage` call's id (the `tool_use_id` of the resumed run's
+  task events), but the resumed run's messages still hang off the spawning
+  call.
+- The registry also lists the background shells and monitors agents start
+  (`task_type: "local_bash"`); filter on `task_type == "local_agent"` for a
+  per-agent view.
+- `description` starts as the spawning call's `description` input; once the
+  agent is working, the CLI replaces it with "Running " plus the description of
+  the agent's current tool call. It is a label, not a progress summary.
+- Outbox `task_*` events carry the CLI's own `tool_use_id` as well (as the SSE
+  events do), and outbox `task_started` events carry `name`.
+
+`POST /v1/sessions/{session_id}/tasks/{task_id}/stop` stops one task listed in
+`active_tasks` — a foreground subagent mid-turn, or a background agent or shell
+between turns — without ending the turn:
+
+| Status | Meaning |
+|--------|---------|
+| `202` | Stop sent: `{"session_id": …, "task_id": …, "status": "stop_requested"}` |
+| `404` | Unknown or foreign session, or `task_id` is not in `active_tasks` |
+| `409` | The session has no live CLI client, or the CLI refused the stop |
+| `400` | The session's backend cannot stop tasks |
+| `503` | The session's backend is unavailable |
+| `429` | Rate limited |
+| `504` | The CLI did not answer within 10 s — the outcome is unknown: the stop may still take effect, so re-poll `active_tasks` |
+| `502` | The stop failed for another reason |
+
+The task's end arrives asynchronously as `response.task_updated` with status
+`killed` (usually followed by a `stopped` `response.task_notification`) in the
+turn stream, or in the outbox between turns. A stopped foreground subagent hands
+the leader an error tool result ("[Request interrupted by user for tool use]")
+and the turn continues to its normal end; stopping a background task wakes the
+leader, whose reply lands in the outbox. The CLI acknowledges a stop for an id it
+does not know or that already ended, so the gateway's registry is the only "not
+found" signal. Scoping matches `pending-events` (credential-scoped callers are
+bound to their user; service-key callers may pass `?user=`). The endpoint is
+rate-limited at the `responses` rate, counted separately from turns.
+
 ### Teammate messages
 
 `response.teammate_message` carries a message an agent-team teammate sent back

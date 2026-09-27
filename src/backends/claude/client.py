@@ -18,7 +18,7 @@ import logging
 
 from claude_agent_sdk import query, ClaudeAgentOptions
 from src.constants import DEFAULT_MAX_TURNS, GATEWAY_MAX_BUFFER_SIZE_DEFAULT
-from claude_agent_sdk import CLIJSONDecodeError
+from claude_agent_sdk import CLIConnectionError, CLIJSONDecodeError, ClaudeSDKError
 from claude_agent_sdk.types import (
     CanUseToolShadowedWarning,
     StreamEvent,
@@ -319,6 +319,17 @@ class UnsupportedContinuationPolicy(ValueError):
     ``disallowed_tools``; route handlers should surface this as a 400 so the
     caller can either drop the tool change or start a fresh session.
     """
+
+
+class TaskStopRejected(RuntimeError):
+    """The CLI answered a ``stop_task`` control request with an error reply.
+
+    Route handlers surface this as a 409 carrying the CLI's message.
+    """
+
+
+class TaskStopClientUnavailable(RuntimeError):
+    """The SDK client that owns the task is not connected to a live CLI."""
 
 
 
@@ -1686,6 +1697,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             drain_backlog_to_outbox,
             idle_reader_running,
             pause_idle_reader,
+            reset_active_tasks,
         )
 
         if not idle_reader_running(session):
@@ -1761,6 +1773,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         except Exception as exc:
             logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
             session.client = None
+            reset_active_tasks(session, "SDK stream error")
             yield error_chunk(describe_sdk_stream_error(exc))
         finally:
             # A cancellation (consumer disconnected mid-turn) exits the loop
@@ -1777,6 +1790,39 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         """Interrupt the active turn without disconnecting the conversation."""
         await client.interrupt()
 
+    async def stop_task_client(self, client: ClaudeSDKClient, task_id: str) -> None:
+        """Stop one task (subagent, background shell) without ending the turn.
+
+        Sends the SDK's ``stop_task`` control request. The CLI confirms in the
+        message stream, not in the reply: a ``task_updated`` whose status is
+        ``killed``, usually followed by a ``stopped`` task_notification. It
+        also answers success for an id it does not know or that already
+        ended, so callers must validate the id against their own task
+        registry first.
+
+        The SDK flattens a CLI error reply into a bare ``Exception`` and its
+        own control timeout into a bare ``Exception`` chained from
+        ``TimeoutError``, while typed SDK errors (``ProcessError``, …) mean
+        the CLI itself failed. Classify by type, never by the CLI's wording:
+
+        * :class:`TaskStopRejected` — the CLI refused the request;
+        * :class:`TaskStopClientUnavailable` — the client is not connected;
+        * ``TimeoutError`` — the SDK gave up waiting for the CLI's reply;
+        * anything else propagates unchanged.
+        """
+        try:
+            await client.stop_task(task_id)
+        except CLIConnectionError as exc:
+            raise TaskStopClientUnavailable(str(exc)) from exc
+        except ClaudeSDKError:
+            raise
+        except Exception as exc:
+            if type(exc) is not Exception:
+                raise
+            if isinstance(exc.__cause__, TimeoutError):
+                raise TimeoutError(str(exc)) from exc
+            raise TaskStopRejected(str(exc)) from exc
+
     async def receive_response_from_client(
         self,
         client: ClaudeSDKClient,
@@ -1788,7 +1834,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         continues processing from where it left off.  A new ``query()``
         call is unnecessary because the original request is still active.
         """
-        from src.session_outbox import pause_idle_reader
+        from src.session_outbox import pause_idle_reader, reset_active_tasks
 
         await pause_idle_reader(session)
         try:
@@ -1798,6 +1844,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         except Exception as exc:
             logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
             session.client = None
+            reset_active_tasks(session, "SDK stream error")
             yield error_chunk(describe_sdk_stream_error(exc))
 
     # ------------------------------------------------------------------

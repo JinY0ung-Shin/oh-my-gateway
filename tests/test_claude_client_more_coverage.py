@@ -632,6 +632,31 @@ class TestReceiveResponseFromClient:
         assert "receive broken" in messages[0]["error_message"]
         assert session.client is None
 
+    async def test_receive_response_error_resets_task_registry(self):
+        """The dropped client's tasks are gone with it: no zombie active_tasks."""
+        from src.session_manager import Session
+        from src.session_outbox import get_outbox
+
+        cli = _make_cli()
+        session = Session(session_id="sess-recv-tasks")
+        session.client = MagicMock()
+        outbox = get_outbox(session)
+        outbox.apply_task_event({"type": "task_started", "task_id": "t1"})
+
+        mock_client = AsyncMock()
+
+        async def failing_receive():
+            raise RuntimeError("receive broken")
+            yield
+
+        mock_client.receive_response = failing_receive
+
+        async for _ in cli.receive_response_from_client(mock_client, session):
+            pass
+
+        assert session.client is None
+        assert outbox.snapshot_active_tasks() == []
+
     async def test_receive_response_yields_messages_normally(self):
         """receive_response_from_client() yields all messages on happy path (line 829-830)."""
         from src.session_manager import Session
