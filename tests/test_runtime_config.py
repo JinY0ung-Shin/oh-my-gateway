@@ -1,5 +1,7 @@
 """Tests for runtime_config module."""
 
+import os
+
 import pytest
 
 from src.runtime_config import (
@@ -126,15 +128,57 @@ class TestAgentTeamsOriginal:
         monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
         assert runtime_config.get("agent_teams_enabled") is True
 
-    def test_original_mirrors_cli_truthiness_for_zero(self, monkeypatch):
-        """The CLI gate is raw string truthiness — "0" still activates it."""
-        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "0")
-        assert runtime_config.get("agent_teams_enabled") is True
+    @pytest.mark.parametrize(
+        "value, expected",
+        [
+            ("1", True),
+            ("true", True),
+            (" TRUE ", True),
+            ("yes", True),
+            ("on", True),
+            ("0", False),
+            ("false", False),
+            ("off", False),
+            ("", False),
+            (" ", False),
+        ],
+    )
+    def test_original_mirrors_cli_gate_parse(self, monkeypatch, value, expected):
+        """CLI 2.1.283 reads the gate as 1/true/yes/on only ("0" is off).
+
+        tests/test_cli_task_identity.py pins that parse against the real CLI.
+        """
+        monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", value)
+        assert runtime_config.get("agent_teams_enabled") is expected
 
     def test_override_beats_env(self, monkeypatch):
         monkeypatch.setenv("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1")
         runtime_config.set("agent_teams_enabled", False)
         assert runtime_config.get("agent_teams_enabled") is False
+
+
+class TestAgentTeamsDefault:
+    """src/constants.py installs the gate ON unless the operator set a value."""
+
+    @pytest.mark.parametrize("value", [None, "", "  "])
+    def test_unset_or_blank_defaults_on(self, monkeypatch, value):
+        from src.constants import AGENT_TEAMS_ENV, _ensure_agent_teams_default_on
+
+        if value is None:
+            monkeypatch.delenv(AGENT_TEAMS_ENV, raising=False)
+        else:
+            monkeypatch.setenv(AGENT_TEAMS_ENV, value)
+        _ensure_agent_teams_default_on()
+        assert os.environ[AGENT_TEAMS_ENV] == "1"
+        assert runtime_config.get("agent_teams_enabled") is True
+
+    @pytest.mark.parametrize("value", ["0", "false", "true"])
+    def test_explicit_operator_value_wins(self, monkeypatch, value):
+        from src.constants import AGENT_TEAMS_ENV, _ensure_agent_teams_default_on
+
+        monkeypatch.setenv(AGENT_TEAMS_ENV, value)
+        _ensure_agent_teams_default_on()
+        assert os.environ[AGENT_TEAMS_ENV] == value
 
 
 class TestConvenienceGetters:

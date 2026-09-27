@@ -321,8 +321,9 @@ loses the stream, the registry is cleared: those tasks lived in that CLI.
 - `name` is the `name` input of the `Agent`/`Task` call that spawned the task —
   `null` for unnamed spawns and for tasks that are not agents. A named agent
   resumed with `SendMessage` keeps its name. The CLI offers the `name`
-  parameter only while `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is on (admin
-  "Agent Teams" toggle), so expect `null` names with it off.
+  parameter only while `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` is on — the
+  gateway's default; `=0` or the admin "Agent Teams" toggle turns it off — so
+  expect `null` names with it off.
 - `tool_use_id` is the id of the tool call behind the task's first
   announcement: the spawning `Agent`/`Task` call for an agent (the
   `parent_tool_use_id` its own events carry), the `Bash` call for a shell. It
@@ -368,8 +369,12 @@ rate-limited at the `responses` rate, counted separately from turns.
 ### Teammate messages
 
 `response.teammate_message` carries a message an agent-team teammate sent back
-to the leader session. Agent teams are experimental and gated behind the CLI's
-`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS`; with them off this event never fires.
+to the leader session. Agent teams are gated behind the CLI's
+`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS` (on by default in the gateway), but in SDK
+mode the pinned CLI (2.1.283) never starts a session team, so no in-process
+teammate exists and this event does not fire: named agents (`local_agent`) report
+back through their `SendMessage` tool events and `response.task_notification`
+summaries instead.
 
 The CLI delivers a teammate's `SendMessage` by injecting it into the leader's
 transcript as a plain `user` message rather than as a dedicated message type, so

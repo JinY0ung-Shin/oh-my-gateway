@@ -318,6 +318,27 @@ def _ensure_cross_session_messaging_off() -> None:
 
 _ensure_cross_session_messaging_off()
 
+# Agent teams default ON for every CLI child. In SDK (non-interactive) mode the
+# CLI never initializes a session team, so no in-process teammate starts; the
+# gate adds the Agent tool's ``name`` parameter (named agents SendMessage can
+# address and resume, and the name ``active_tasks`` reports) plus team text in
+# SendMessage's description (verified on CLI 2.1.283). The CLI parses it as
+# 1/true/yes/on (case- and whitespace-insensitive) = on, anything else = off,
+# so an explicit ``0``/``false`` turns it off; blank counts as unset (a compose
+# ``- VAR`` passthrough or an empty .env line) and gets the default. Installed
+# in the process env like the cross-session gate so every spawn point inherits
+# it; the admin "Agent Teams" toggle still overrides it for new sessions.
+AGENT_TEAMS_ENV = "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"
+
+
+def _ensure_agent_teams_default_on() -> None:
+    """Default the CLI's agent-teams gate to on for every child."""
+    if not (os.environ.get(AGENT_TEAMS_ENV) or "").strip():
+        os.environ[AGENT_TEAMS_ENV] = "1"
+
+
+_ensure_agent_teams_default_on()
+
 
 def cli_tool_watchdog_ms() -> int:
     """The longest a CLI tool call may legitimately stay silent, in milliseconds.

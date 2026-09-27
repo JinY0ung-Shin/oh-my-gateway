@@ -150,8 +150,9 @@ async def _cli(tmp_path, leader_tool: Dict[str, Any]) -> AsyncIterator[ClaudeSDK
                 **api.cli_env(tmp_path / "home"),
                 "XDG_RUNTIME_DIR": str(runtime_dir),
                 "CLAUDE_CODE_TMPDIR": str(cli_tmp),
-                # The gateway's process default (src/constants.py).
+                # The gateway's process defaults (src/constants.py).
                 "CLAUDE_CODE_HARBOR_KITE": "0",
+                "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
             },
             permission_mode="bypassPermissions",
             max_turns=4,

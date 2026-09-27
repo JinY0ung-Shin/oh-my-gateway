@@ -97,6 +97,12 @@ uv run pytest --cov=src                            # with coverage
   `tests/test_cli_cross_session_messaging.py` pins it against the bundled CLI in both directions —
   when an SDK bump breaks that test, find the new gate before shipping. Teammate and subagent
   `SendMessage` are not gated by it.
+- Agent teams default ON: `src/constants.py` installs `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`
+  when unset or blank (`=0` opts out; the CLI reads only 1/true/yes/on as on). In SDK mode CLI
+  2.1.283 never initializes a session team, so no `in_process_teammate` ever starts: the gate
+  only gives the Agent tool `name` — named `local_agent`s that `SendMessage` can address and
+  resume, reported as `active_tasks[].name` by pending-events. `tests/test_cli_task_identity.py`
+  pins the gate parse and the spawn/resume ids.
 - The CLI expands `@<path>` file mentions and inlines the file upstream — outside the workspace too,
   and the workspace sandbox hook never sees it (it is not a tool call). Covered: every non-slash
   turn goes out with `client_composed: true` (the per-message field SDK `verbatim_prompts` sets;

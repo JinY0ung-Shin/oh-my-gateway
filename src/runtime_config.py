@@ -115,9 +115,12 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
         "label": "Agent Teams",
         "type": "bool",
         "description": (
-            "Experimental CLI agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS) "
-            "for NEW Claude sessions; an override wins over the gateway process "
-            "env, and team tools also need the CLI's account-side feature gate"
+            "CLI agent teams (CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS, on by default) "
+            "for NEW Claude sessions: in SDK mode this gives the Agent tool its "
+            "`name` parameter (named agents SendMessage can address and resume); "
+            "it never starts in-process teammates. An override wins over the "
+            "gateway process env, and the CLI's account-side feature gate can "
+            "still veto it"
         ),
     },
 }
@@ -220,10 +223,14 @@ class RuntimeConfig:
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
             "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
-            # Mirrors the CLI's own truthiness on the raw env string: any
-            # non-empty value activates the gate, including "0".
-            "agent_teams_enabled": bool(
-                os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS")
+            # Mirrors the CLI's own parse of the gate (2.1.283): only
+            # 1/true/yes/on, case- and whitespace-insensitive, turn it on.
+            # src/constants.py defaults it to "1" when unset or blank.
+            "agent_teams_enabled": (
+                (os.environ.get("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS") or "")
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
             ),
             # 0 = not set — the CLI picks its own window from the model.
             # A junk value reads as 0 rather than crashing the config read;
