@@ -301,15 +301,18 @@ EFFECTIVE_MCP_TOOL_TIMEOUT_MS = _ensure_mcp_tool_timeout_env()
 # teammate and subagent SendMessage are not gated by it. It is installed in the
 # process env rather than ``options.env`` so every spawn point inherits it
 # (turn clients, slash-command discovery, ``verify()``); an explicit operator
-# value wins. The name is an undocumented CLI codename —
-# tests/test_cli_cross_session_messaging.py pins it against the bundled CLI so
-# an SDK bump that renames it fails loudly.
+# value wins, except a blank one: the CLI reads an empty value as unset and
+# turns the feature ON, and a blank is what a compose ``- VAR`` passthrough or
+# an empty .env line produces, so blank is normalized to off as well. The name
+# is an undocumented CLI codename — tests/test_cli_cross_session_messaging.py
+# pins it against the bundled CLI so an SDK bump that renames it fails loudly.
 CROSS_SESSION_MESSAGING_ENV = "CLAUDE_CODE_HARBOR_KITE"
 
 
 def _ensure_cross_session_messaging_off() -> None:
     """Default the CLI's cross-session messaging gate to off for every child."""
-    os.environ.setdefault(CROSS_SESSION_MESSAGING_ENV, "0")
+    if not (os.environ.get(CROSS_SESSION_MESSAGING_ENV) or "").strip():
+        os.environ[CROSS_SESSION_MESSAGING_ENV] = "0"
 
 
 _ensure_cross_session_messaging_off()
