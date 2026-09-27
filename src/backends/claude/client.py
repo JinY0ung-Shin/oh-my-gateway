@@ -1226,6 +1226,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         the CLI's silent auto-approve). Non-Skill tools are passed through
         untouched; the skill's own downstream tool calls keep their normal
         permissions and the workspace sandbox hook still applies to them.
+
+        A call whose ``skill`` or ``args`` contains ``@`` is denied instead: the
+        CLI expands ``@`` file mentions in skill arguments even on a verbatim
+        turn and inlines the file upstream — outside the workspace too, and the
+        workspace sandbox hook never sees it (verified on CLI 2.1.283 and
+        2.1.220). Mentions written into a skill's own body are still expanded;
+        that surface is not covered here.
         """
 
         async def hook(input_data, _tool_use_id, _context):
@@ -1234,6 +1241,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 return {}
             tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
             skill = tool_input.get("skill", "") if isinstance(tool_input, dict) else ""
+            args = tool_input.get("args", "") if isinstance(tool_input, dict) else ""
+            if "@" in f"{skill}{args}":
+                logger.warning("Denying Skill tool call with '@' in its input: skill=%s", skill)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Skill arguments cannot contain '@': the CLI would expand "
+                            "it as a file mention and inline the file. Retry without "
+                            "the '@' (pass a plain path or value)."
+                        ),
+                    }
+                }
             logger.info("Auto-approving Skill tool invocation: skill=%s", skill)
             return {
                 "hookSpecificOutput": {

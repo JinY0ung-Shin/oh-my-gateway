@@ -97,13 +97,17 @@ uv run pytest --cov=src                            # with coverage
   `tests/test_cli_cross_session_messaging.py` pins it against the bundled CLI in both directions —
   when an SDK bump breaks that test, find the new gate before shipping. Teammate and subagent
   `SendMessage` are not gated by it.
-- The CLI expands `@<path>` in user text and inlines the file upstream — outside the workspace too,
-  and no hook sees it (it is not a tool call). `run_completion_with_client` therefore sends every
-  non-slash turn with `client_composed: true` (the per-message field SDK `verbatim_prompts` sets;
-  CLI ≥ 2.1.248 — an older `CLAUDE_CLI_PATH` silently ignores it), and
-  `slash_commands.validate_prompt` rejects @-mentions in slash-command arguments
-  (`unsupported_argument`). Keep the SDK-wide `verbatim_prompts` option off: its stamp would
-  override the per-turn slash exception.
+- The CLI expands `@<path>` file mentions and inlines the file upstream — outside the workspace too,
+  and the workspace sandbox hook never sees it (it is not a tool call). Covered: every non-slash
+  turn goes out with `client_composed: true` (the per-message field SDK `verbatim_prompts` sets;
+  CLI ≥ 2.1.248 — an older `CLAUDE_CLI_PATH` silently ignores it), and any `@` in slash-command
+  arguments (`validate_prompt`, 400 `unsupported_argument`) or in the model's Skill-tool
+  `skill`/`args` (`_make_skill_allow_hook` denies) is refused — no regex, because the CLI's mention
+  grammar (CJK punctuation / U+FEFF prefixes, quoting, `@@`) out-ran one. **Not covered yet:**
+  mentions inside a skill's or command's own body (`@/path`, or `@$ARGUMENTS` fed a bare path)
+  are still expanded on every CLI version — with `WORKSPACE_SANDBOX_ENABLED` (on in production)
+  that is a sandbox bypass through user-writable workspace skills. Keep the SDK-wide
+  `verbatim_prompts` option off: its stamp would override the per-turn slash exception.
 - SDK 0.2.129+ raises `ValueError` from `connect()` for skill names with parentheses, commas,
   wildcards, control characters or a leading `/`. `src/backends/claude/skill_names.py` mirrors
   those rules (parity-tested against the SDK's private validator): a request `allowed_tools` rule
@@ -124,7 +128,8 @@ uv run pytest --cov=src                            # with coverage
   schema or SDK-event change must be coordinated with the Noah `avatar-chat` repository; do not fork a
   second Noah-side event handler. The mapper is fail-closed on purpose: system envelopes pass only
   for subtypes in `_SYSTEM_SUBTYPES` (the set CLI 2.1.220 emitted) and new SDK fields such as
-  `origin` are stripped, so a CLI bump cannot widen Noah's wire — opening either is such a change.
+  `origin` are stripped, so a CLI bump cannot add system envelopes or that field — opening either is
+  such a change. Other envelopes still pass unknown data keys through (e.g. `tool_progress.data`).
 - Keep endpoint-specific partial messages, secret/path redaction, tool-result projection,
   `AskUserQuestion` denial, disconnect, and transcript/artifact cleanup isolated from `/v1/responses`.
 

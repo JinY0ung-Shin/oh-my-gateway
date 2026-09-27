@@ -160,6 +160,15 @@ def known_x(monkeypatch):
         '/x @"quoted path.txt"',
         "/x summarize\n@notes.md",
         "  /x arg @./rel",
+        # Bypasses of the earlier regex screen, each expanded by CLI 2.1.283:
+        "/x \u3002@/etc/passwd",  # CJK full stop is a CLI mention prefix
+        "/x \ufeff@/etc/passwd",  # BOM is JavaScript whitespace
+        "/x @@/../../etc/passwd",
+        '/x "@/etc/passwd"',
+        # Every '@' is refused now, emails included.
+        "/x mail user@example.com",
+        "/x a@b c@d",
+        "/x @",
     ],
 )
 async def test_slash_argument_mention_is_rejected(known_x, prompt):
@@ -172,7 +181,7 @@ async def test_slash_argument_mention_is_rejected(known_x, prompt):
 
 @pytest.mark.parametrize(
     "prompt",
-    ["/x", "/x plain args", "/x mail user@example.com", "/x a@b c@d", "/x @"],
+    ["/x", "/x plain args", "/x under_score and-dash 42%"],
 )
 async def test_slash_arguments_without_mentions_pass(known_x, prompt):
     await sc.validate_prompt(prompt)
@@ -199,6 +208,36 @@ async def test_responses_route_maps_argument_guard_to_400(known_x):
         )
     assert exc.value.status_code == 400
     assert exc.value.detail["error"]["code"] == "unsupported_argument"
+
+
+# --- Skill tool arguments ---------------------------------------------------
+
+
+async def _skill_hook_decision(tool_input):
+    hook = _make_cli()._make_skill_allow_hook()
+    out = await hook({"tool_name": "Skill", "tool_input": tool_input}, "tu_1", None)
+    return out["hookSpecificOutput"]["permissionDecision"]
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [
+        {"skill": "dataviz", "args": "@/etc/passwd"},
+        {"skill": "dataviz", "args": "chart \u3002@/proc/self/environ"},
+        {"skill": "dataviz", "args": "send to user@example.com"},
+        {"skill": "x @/etc/passwd"},
+    ],
+)
+async def test_skill_call_with_at_in_input_is_denied(tool_input):
+    assert await _skill_hook_decision(tool_input) == "deny"
+
+
+@pytest.mark.parametrize(
+    "tool_input",
+    [{"skill": "dataviz"}, {"skill": "dataviz", "args": "plot sales by month"}],
+)
+async def test_skill_call_without_at_is_still_force_approved(tool_input):
+    assert await _skill_hook_decision(tool_input) == "allow"
 
 
 # --- real bundled CLI -------------------------------------------------------
@@ -271,3 +310,87 @@ async def test_real_cli_verbatim_turn_not_expanded_slash_still_dispatches(tmp_pa
             assert canary in json.dumps([r["body"] for r in api.requests[before:]])
         finally:
             await client.disconnect()
+
+
+@pytest.mark.integration
+async def test_real_cli_skill_args_mention_is_denied_by_gateway_hook(tmp_path):
+    """The model's Skill ``args`` are @-expanded even on a verbatim turn."""
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+    from src.backends.claude.sdk_client import GatewayClaudeSDKClient
+    from tests.fixtures.fake_anthropic_api import FakeAnthropicAPI
+
+    canary = "SKILL_ARGS_CANARY_" + uuid.uuid4().hex[:8]
+    outside = tmp_path / "outside.txt"
+    outside.write_text(canary + "\n")
+    workspace = tmp_path / "ws"
+    skill_dir = workspace / ".claude" / "skills" / "probe-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\nname: probe-skill\ndescription: probe skill\n---\n"
+        "Do the thing with the arguments.\n"
+    )
+
+    def plan(body):
+        for message in reversed(body.get("messages") or []):
+            if message.get("role") == "assistant":
+                break
+            content = message.get("content")
+            if isinstance(content, list) and any(
+                isinstance(b, dict) and b.get("type") == "tool_result" for b in content
+            ):
+                return {"text": "done"}
+        if "Skill" in {t.get("name") for t in body.get("tools") or []}:
+            skill_input = {"skill": "probe-skill", "args": f"@{outside}"}
+            return {"tool_use": {"name": "Skill", "input": skill_input}}
+        return {"text": "no skill tool"}
+
+    cli = _make_cli()
+
+    async def run(pre_tool_use, label):
+        session = Session(session_id=str(uuid.uuid4()))
+        with FakeAnthropicAPI(plan=plan) as api:
+            env = {
+                **api.cli_env(tmp_path / f"home-{label}"),
+                "CLAUDE_CODE_HARBOR_KITE": "0",
+            }
+            client = GatewayClaudeSDKClient(
+                options=ClaudeAgentOptions(
+                    cwd=str(workspace),
+                    model="claude-sonnet-5",
+                    env=env,
+                    setting_sources=["project"],
+                    skills="all",
+                    max_turns=3,
+                    permission_mode="bypassPermissions",
+                    hooks={"PreToolUse": pre_tool_use},
+                    session_id=session.session_id,
+                )
+            )
+            await client.connect(prompt=None)
+            try:
+
+                async def consume():
+                    async for _ in cli.run_completion_with_client(
+                        client, "please run the skill", session
+                    ):
+                        pass
+
+                await asyncio.wait_for(consume(), timeout=90)
+            finally:
+                await client.disconnect()
+            return json.dumps([r["body"] for r in api.requests])
+
+    assert canary not in await run(cli._pre_tool_use_hooks(str(workspace), None), "gw")
+
+    # Control: a hook that only approves lets the CLI inline the file, so the
+    # assertion above is not vacuous.
+    async def approve(_input, _tool_use_id, _context):
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            }
+        }
+
+    assert canary in await run([HookMatcher(matcher="Skill", hooks=[approve])], "ctl")

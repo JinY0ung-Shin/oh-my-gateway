@@ -21,9 +21,12 @@ This module validates the prompt before it reaches the SDK:
 * A small **blocklist** of destructive built-ins — plus any names in the
   ``BLOCKED_SLASH_COMMANDS`` env var — is always rejected with
   ``blocked_command``.
-* Arguments carrying an ``@`` file mention are rejected with
-  ``unsupported_argument``: a slash turn is the one turn the gateway sends
-  without verbatim delivery, so the CLI would inline the mentioned file.
+* Arguments containing any ``@`` are rejected with ``unsupported_argument``:
+  a slash turn is the one turn the gateway sends without verbatim delivery,
+  so the CLI would expand a file mention and inline the file. No pattern is
+  tried — the CLI's mention grammar (CJK sentence punctuation and JavaScript
+  whitespace such as U+FEFF as prefixes, quoting, expansion after
+  ``$ARGUMENTS`` substitution) is wider than any text pre-screen.
 * For other (command-shaped) slash prompts, the name is checked against a
   **TTL-cached allowlist** pulled from ``ClaudeSDKClient.get_server_info()``.
   The cache is bound to the effective cwd so one user's project skills can
@@ -75,12 +78,13 @@ CACHE_TTL_SECONDS: float = 60.0
 # through to that silent response.
 _COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9:_-]+$")
 
-# An ``@`` token at the start of the text or after whitespace is a file mention:
-# the CLI inlines the referenced file into the request — outside the workspace
-# too. Every other turn is sent verbatim (``client_composed``) so it is never
-# expanded, but a slash command must go unstamped for the CLI to dispatch it, so
-# its arguments are screened instead. ``user@example.com`` is not a mention.
-_AT_MENTION_RE = re.compile(r"(^|\s)@[^\s@]")
+# A slash command must go unstamped (no ``client_composed``) for the CLI to
+# dispatch it, so the CLI expands ``@`` file mentions in its arguments and
+# inlines the file — outside the workspace too, past the workspace sandbox hook.
+# Every ``@`` is refused rather than pattern-matched: the CLI treats CJK
+# sentence punctuation and JavaScript whitespace (e.g. U+FEFF) as mention
+# prefixes, unquotes ``"@path"``, and expands ``@@/../x``, so a regex screen
+# was bypassable (verified on CLI 2.1.283). Emails in arguments are the cost.
 
 
 class SlashCommandError(Exception):
@@ -287,13 +291,14 @@ async def validate_prompt(prompt: str, cwd: Optional[Path] = None) -> None:
         )
 
     arguments = prompt.lstrip()[1 + len(name) :]
-    if _AT_MENTION_RE.search(arguments):
+    if "@" in arguments:
         raise SlashCommandError(
             code="unsupported_argument",
             message=(
-                f"Slash command '/{name}' arguments cannot contain @-mentions: "
-                "the CLI would inline the referenced file. Remove the '@', or "
-                "send the text as a plain message without the leading '/'."
+                f"Slash command '/{name}' arguments cannot contain '@': the CLI "
+                "would expand it as a file mention and inline the file. Remove "
+                "the '@', or send the text as a plain message without the "
+                "leading '/'."
             ),
         )
 
