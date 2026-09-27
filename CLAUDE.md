@@ -104,10 +104,8 @@ uv run pytest --cov=src                            # with coverage
   arguments (`validate_prompt`, 400 `unsupported_argument`) or in the model's Skill-tool
   `skill`/`args` (`_make_skill_allow_hook` denies) is refused — no regex, because the CLI's mention
   grammar (CJK punctuation / U+FEFF prefixes, quoting, `@@`) out-ran one. **Not covered yet:**
-  mentions inside a skill's or command's own body (`@/path`, or `@$ARGUMENTS` fed a bare path)
-  are still expanded on every CLI version — with `WORKSPACE_SANDBOX_ENABLED` (on in production)
-  that is a sandbox bypass through user-writable workspace skills. Keep the SDK-wide
-  `verbatim_prompts` option off: its stamp would override the per-turn slash exception.
+  mentions inside a skill's or command's own body are still expanded by the CLI (#215). Keep the
+  SDK-wide `verbatim_prompts` option off: its stamp would override the per-turn slash exception.
 - SDK 0.2.129+ raises `ValueError` from `connect()` for skill names with parentheses, commas,
   wildcards, control characters or a leading `/`. `src/backends/claude/skill_names.py` mirrors
   those rules (parity-tested against the SDK's private validator): a request `allowed_tools` rule
