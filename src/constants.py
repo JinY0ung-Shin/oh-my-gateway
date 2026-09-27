@@ -296,8 +296,9 @@ EFFECTIVE_MCP_TOOL_TIMEOUT_MS = _ensure_mcp_tool_timeout_env()
 # and every gateway child shares the gateway's HOME whichever user it serves, so
 # one user's agent could list another user's live session and message it — the
 # receiver then runs a turn in its own workspace (verified on CLI 2.1.283). The
-# CLI's gate reads this env var: any value other than 1/true/yes/on turns the
-# feature off (no socket, no ListAgents, cross-session SendMessage refused);
+# CLI's gate reads this env var: unset or blank means ON; 1/true/yes/on (case-
+# and whitespace-insensitive) means ON; any other value turns the feature off
+# (no socket, no ListAgents, cross-session SendMessage refused);
 # teammate and subagent SendMessage are not gated by it. It is installed in the
 # process env rather than ``options.env`` so every spawn point inherits it
 # (turn clients, slash-command discovery, ``verify()``); an explicit operator

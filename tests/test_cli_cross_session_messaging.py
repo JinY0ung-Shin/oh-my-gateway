@@ -77,7 +77,9 @@ async def _first_turn(
 
 
 def test_gateway_process_env_defaults_the_gate_off():
-    assert os.environ.get(CROSS_SESSION_MESSAGING_ENV) == "0"
+    # Effectively off: the gateway default "0" or any explicit non-truthy value.
+    value = (os.environ.get(CROSS_SESSION_MESSAGING_ENV) or "").strip().lower()
+    assert value not in {"", "1", "true", "yes", "on"}
 
 
 @pytest.mark.parametrize("value", [None, "", "  "])
