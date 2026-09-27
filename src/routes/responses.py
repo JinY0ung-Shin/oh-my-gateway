@@ -22,6 +22,7 @@ from src.auth import verify_api_key, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, BackendRegistry, ResolvedModel
 from src.backends.claude.client import UnsupportedContinuationPolicy
+from src.backends.claude.skill_names import invalid_skill_rule
 from src.backends.claude.slash_commands import (
     SlashCommandError,
     validate_prompt as validate_slash_prompt,
@@ -868,6 +869,37 @@ def _validate_continuation_output_format(
 def _response_reasoning_effort(body: ResponseCreateRequest) -> Optional[str]:
     """Extract the requested ``reasoning.effort`` value, or ``None``."""
     return body.reasoning.effort if body.reasoning is not None else None
+
+
+def _validate_skill_rules(
+    allowed_tools: Optional[List[str]], backend_name: str
+) -> None:
+    """Reject ``Skill(<name>)`` rules naming a skill the Claude SDK refuses.
+
+    Since SDK 0.2.129 such a name makes ``connect()`` raise, which surfaced as
+    a retry-forever 503. Checked with the request validators, before any
+    client is created or updated, so new and continued sessions fail alike.
+    """
+    if backend_name != "claude":
+        return
+    bad = invalid_skill_rule(allowed_tools)
+    if bad is None:
+        return
+    rule, reason = bad
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "error": {
+                "type": "invalid_request_error",
+                "code": "invalid_skill_rule",
+                "message": (
+                    f"allowed_tools entry {rule!r} is not a usable skill rule: "
+                    f"{reason}. Use 'Skill' to allow every skill, or "
+                    "'Skill(<name>)' with the skill's exact name."
+                ),
+            }
+        },
+    )
 
 
 def _validate_reasoning_backend(effort: Optional[str], backend_name: str) -> None:
@@ -2009,6 +2041,7 @@ async def create_response(
     _validate_output_format_backend(_response_output_format(body), resolved.backend)
     _validate_reasoning_backend(_response_reasoning_effort(body), resolved.backend)
     validate_model_effort_support(_response_reasoning_effort(body), resolved)
+    _validate_skill_rules(body.allowed_tools, resolved.backend)
 
     # Per-request MCP context header (identity + caller-owned credentials).
     # Only the claude and codex backends consume it, so skip the env-read + JSON
