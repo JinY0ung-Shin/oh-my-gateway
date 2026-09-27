@@ -130,6 +130,67 @@ _RESULT_FIELDS = frozenset(
         "api_error_status",
     }
 )
+# System envelopes are forwarded by subtype, fail-closed: exactly the subtypes
+# the CLI bundled with claude-agent-sdk 0.2.128 (2.1.220) could put on the
+# stream-json wire (extracted from its binary: object literals + zod schemas).
+# A CLI upgrade therefore cannot add envelopes to Noah's wire; opening a new
+# subtype is a deliberate, Noah-coordinated edit here. ``commands_changed`` is
+# deliberately absent: 2.1.220 emitted it only after a mid-session command-list
+# change, while 2.1.283 emits it before ``init`` in every MCP-configured session,
+# and it carries no whitelisted data. Subtypes new in 2.1.283
+# (per_turn_effort_changed, peer_message_hold, cloud_session_*, …) are absent
+# by construction.
+_SYSTEM_SUBTYPES = frozenset(
+    {
+        "agents_killed",
+        "api_error",
+        "api_retry",
+        "away_summary",
+        "background_tasks_changed",
+        "bridge_state",
+        "bridge_status",
+        "code_change_published",
+        "compact_boundary",
+        "control_request_progress",
+        "elicitation_complete",
+        "file_snapshot",
+        "files_persisted",
+        "hook_progress",
+        "hook_response",
+        "hook_started",
+        "informational",
+        "init",
+        "local_command",
+        "local_command_output",
+        "memory_recall",
+        "memory_saved",
+        "mirror_error",
+        "model_consent_fallback",
+        "model_fallback",
+        "model_refusal_fallback",
+        "model_refusal_no_fallback",
+        "notification",
+        "permission_denied",
+        "permission_retry",
+        "plugin_install",
+        "post_turn_summary",
+        "scheduled_task_fire",
+        "session_state_changed",
+        "status",
+        "stop_hook_summary",
+        "task_notification",
+        "task_progress",
+        "task_started",
+        "task_summary",
+        "task_updated",
+        "thinking",
+        "thinking_tokens",
+        "turn_duration",
+        "turn_starting",
+        "vcs_state_changed",
+        "worker_shutting_down",
+    }
+)
 
 
 def _compact_key(key: object) -> str:
@@ -353,15 +414,27 @@ def _project_stream_event(value: Any) -> Dict[str, Any]:
     return projected
 
 
-def _prepare_sdk_message(message: Any) -> Dict[str, Any]:
-    """Build the versioned endpoint envelope without changing Responses data."""
+def _prepare_sdk_message(message: Any) -> Optional[Dict[str, Any]]:
+    """Build the versioned endpoint envelope without changing Responses data.
+
+    Returns ``None`` for a message this endpoint does not forward: a system
+    subtype outside ``_SYSTEM_SUBTYPES``, or a conversation reset.
+    """
     normalized = _normalize_sdk_value(message)
     if not isinstance(normalized, dict):
         raise ValueError("SDK message is not an object")
 
     message_type = normalized.get("type")
     if not isinstance(message_type, str):
+        # ConversationResetMessage (SDK 0.2.137+) is the one typeless SDK
+        # message. A reset is outside this contract: the transcript is sent
+        # verbatim, so ``/clear`` never dispatches here. Skip, don't fail.
+        if "new_conversation_id" in normalized:
+            return None
         raise ValueError("SDK message has no type")
+
+    if message_type == "system" and normalized.get("subtype") not in _SYSTEM_SUBTYPES:
+        return None
 
     # Python SDK AssistantMessage/UserMessage dataclasses keep content at the
     # root. The JS SDK envelopes consumed by Noah keep it in ``message.content``.
@@ -394,6 +467,8 @@ def _prepare_sdk_message(message: Any) -> Dict[str, Any]:
             user_inner["content"] = _project_user_content(user_inner.get("content"))
         normalized["content"] = _project_user_content(normalized.get("content"))
         normalized.pop("tool_use_result", None)
+        # SDK 0.2.137+ provenance field; not part of this envelope contract.
+        normalized.pop("origin", None)
 
     if message_type == "stream_event":
         normalized["event"] = _project_stream_event(normalized.get("event"))
@@ -671,6 +746,8 @@ async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):
                 return
 
             prepared = _prepare_sdk_message(message)
+            if prepared is None:
+                continue
             yield _sse("sdk_message", prepared)
             if prepared.get("type") == "result":
                 saw_result = True

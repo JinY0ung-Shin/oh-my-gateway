@@ -276,6 +276,7 @@ class TestRunCompletionWithBlockPrompt:
                 "type": "user",
                 "message": {"role": "user", "content": blocks},
                 "parent_tool_use_id": None,
+                "client_composed": True,
             }
         ]
 
@@ -296,4 +297,13 @@ class TestRunCompletionWithBlockPrompt:
         async for _ in cli.run_completion_with_client(mock_client, "plain text", session):
             pass
 
-        mock_client.query.assert_awaited_once_with("plain text")
+        mock_client.query.assert_awaited_once()
+        sent = [m async for m in mock_client.query.await_args.args[0]]
+        assert sent == [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "plain text"},
+                "parent_tool_use_id": None,
+                "client_composed": True,
+            }
+        ]

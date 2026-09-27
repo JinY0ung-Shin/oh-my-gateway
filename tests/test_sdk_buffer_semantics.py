@@ -9,11 +9,11 @@ stream so three facts stay executable rather than folklore:
    the gateway default and dies under the SDK's own 1 Mi default.
 2. An above-limit frame fails deterministically as `CLIJSONDecodeError`, which
    `describe_sdk_stream_error` turns into the actionable `sdk_error` text.
-3. The pinned SDK (0.2.128) counts decoded text CHARACTERS (`len(str)`), not
-   encoded UTF-8 bytes, even though its message says "bytes"
-   (anthropics/claude-agent-sdk-python#1165). If an SDK upgrade switches the
-   unit, `test_multibyte_*` fail on purpose: update the docs/error text in
-   `_get_max_buffer_size` / README / .env.example along with the pin.
+3. The pinned SDK (0.2.160; unchanged since 0.2.128) counts decoded text
+   CHARACTERS (`len(str)`), not encoded UTF-8 bytes, even though its message
+   says "bytes" (anthropics/claude-agent-sdk-python#1165). If an SDK upgrade
+   switches the unit, `test_multibyte_*` fail on purpose: update the docs/error
+   text in `_get_max_buffer_size` / README / .env.example along with the pin.
 """
 
 from __future__ import annotations

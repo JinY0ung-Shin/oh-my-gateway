@@ -60,6 +60,11 @@ from src.backends.claude.constants import (
 # seam tests patch to stub the SDK — keep that seam stable.
 from src.backends.claude.sdk_client import GatewayClaudeSDKClient as ClaudeSDKClient
 from src.backends.claude.sdk_client import ToolProgressMessage
+from src.backends.claude.skill_names import (
+    GRANULAR_SKILL_RULE_RE,
+    SKILL_WILDCARD_RULES,
+    skill_name_problem,
+)
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import ASK_USER_TIMEOUT_SECONDS
@@ -81,7 +86,8 @@ logger = logging.getLogger(__name__)
 # entries. For every gateway client that shadowing is deliberate — ordinary
 # tools are *meant* to auto-approve — and the one tool the callback exists for,
 # AskUserQuestion, still reaches it regardless (CLI exception; re-verified live
-# on SDK 0.2.128 / CLI 2.1.220 by tests/test_ask_user_question_live.py). The
+# on SDK 0.2.128 / CLI 2.1.220 by tests/test_ask_user_question_live.py, and on
+# SDK 0.2.160 / CLI 2.1.283 against a fake API under bypassPermissions). The
 # warning's "can_use_tool will not be invoked" would be a false alarm in every
 # worker's log, so it is filtered out for this process.
 warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
@@ -98,11 +104,38 @@ _VALID_SETTING_SOURCES = {"user", "project", "local"}
 # :meth:`ClaudeCodeCLI._set_allowed_tools`.
 SKILL_ALLOW_ALL_RULE = "Skill(:*)"
 
-# Granular per-skill rule: ``Skill(<name>)`` / ``Skill(<name>:*)``. The name may
-# be bare (``summarize``) or plugin-qualified (``docs-helper:summarize``) — the
-# form the CLI actually registers a plugin skill under — but must not START with
-# ``:`` so the ``Skill(:*)`` catch-all never matches.
-_GRANULAR_SKILL_RULE_RE = re.compile(r"^Skill\((?P<name>[^:)][^)]*?)(?::\*)?\)$")
+# Granular per-skill rule ``Skill(<name>)`` / ``Skill(<name>:*)``. Shared with
+# the Responses route's request check, so it lives in ``skill_names``.
+_GRANULAR_SKILL_RULE_RE = GRANULAR_SKILL_RULE_RE
+
+# Names already reported by ``_drop_unusable_skill_names``: a rejected catalog
+# name recurs on every session in that workspace, one warning is enough.
+_WARNED_UNUSABLE_SKILL_NAMES: set = set()
+
+
+def _drop_unusable_skill_names(names) -> List[str]:
+    """Sorted *names* minus those the SDK would reject as ``skills`` entries.
+
+    Since SDK 0.2.129 a single rejected name makes ``connect()`` raise, so it
+    must never reach ``options.skills``. Leaving it out hides that one skill
+    instead of failing the whole session; each name is warned about once.
+    """
+    usable = []
+    rejected = {}
+    for name in names:
+        problem = skill_name_problem(name)
+        if problem is None:
+            usable.append(name)
+        else:
+            rejected[name] = problem
+    fresh = sorted(set(rejected) - _WARNED_UNUSABLE_SKILL_NAMES)
+    if fresh:
+        _WARNED_UNUSABLE_SKILL_NAMES.update(fresh)
+        logger.warning(
+            "Leaving skills the Claude SDK cannot allowlist out of the catalog: %s",
+            "; ".join(f"{name!r} ({rejected[name]})" for name in fresh),
+        )
+    return sorted(usable)
 
 # Granular per-subagent rule: ``Task(<agent>)`` / ``Agent(<agent>)`` (the CLI
 # has used both names for this tool; DISALLOWED_SUBAGENT_TYPES denies with the
@@ -207,9 +240,10 @@ def _get_max_buffer_size() -> int:
     it in either direction; unset, empty or invalid (non-numeric / non-positive)
     values keep the gateway default, invalid ones with a warning.
 
-    Unit caveat: the pinned ``claude-agent-sdk`` (0.2.128) counts this limit in
-    Python ``str`` CHARACTERS of the decoded stdout text (``_LineFramer`` uses
-    ``len(chunk)`` on a ``TextReceiveStream``), although its own error text
+    Unit caveat: the pinned ``claude-agent-sdk`` (0.2.160; framing unchanged
+    since 0.2.128) counts this limit in Python ``str`` CHARACTERS of the
+    decoded stdout text (``_LineFramer`` uses ``len(chunk)`` on a
+    ``TextReceiveStream``), although its own error text
     says "bytes" (upstream anthropics/claude-agent-sdk-python#1165). ASCII and
     base64 payloads are 1 char = 1 byte, so the #183 case is unaffected, but
     multibyte UTF-8 text can occupy up to ~4x the nominal limit in real memory.
@@ -464,8 +498,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         An operator ``Skill`` entry in ``DISALLOWED_TOOLS`` is a kill-switch:
         every skill rule is stripped, granular and catch-all alike, so no
         skill surface survives for the deny list to have to catch.
+
+        ``Skill(*)`` / ``Skill(*:*)`` are read as a bare ``Skill``. A granular
+        name the SDK would reject never reaches ``options.skills`` or a
+        ``Skill(<name>:*)`` rule (the Responses route already turned request
+        ones into a 400); if every granular name was unusable the allowlist is
+        empty rather than wide open.
         """
         blocked = set(DISALLOWED_TOOLS) | set(BLOCKED_DEFERRED_TOOLS)
+        tools = ["Skill" if t in SKILL_WILDCARD_RULES else t for t in tools]
         filtered = [t for t in tools if t not in blocked]
         # Subagent selection: ``Task(<agent>)`` entries are the gateway's own
         # allowlist (enforced by a PreToolUse hook), not CLI rules — strip them
@@ -491,14 +532,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
         else:
-            granular = sorted(
-                {
-                    match.group("name")
-                    for t in filtered
-                    if (match := _GRANULAR_SKILL_RULE_RE.match(t)) is not None
-                }
-            )
-            if granular:
+            requested = {
+                match.group("name")
+                for t in filtered
+                if (match := _GRANULAR_SKILL_RULE_RE.match(t)) is not None
+            }
+            if requested:
+                granular = _drop_unusable_skill_names(requested)
                 options.skills = granular
                 filtered = [
                     t for t in filtered if _GRANULAR_SKILL_RULE_RE.match(t) is None
@@ -530,6 +570,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         plugin-qualified form too. Either way non-selected skills never appear
         and hidden ones never resurrect; builtin command names left in the
         remainder are inert — their ``Skill(<name>)`` rules match no skill.
+
+        Discovered names the SDK would reject (a skill directory such as
+        ``weird (v2)``, an MCP prompt command such as ``server:prompt (MCP)``)
+        are left out: one of them in the allowlist makes ``connect()`` raise.
         """
         granular = isinstance(options.skills, list)
         if not granular and not HIDDEN_SKILLS:
@@ -566,11 +610,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     "Skill discovery failed; using raw requested skill names",
                     exc_info=True,
                 )
-            options.skills = sorted(n for n in resolved if keep(n))
+            options.skills = _drop_unusable_skill_names(n for n in resolved if keep(n))
             return
 
         names = await slash_commands.get_available_commands(cwd)
-        options.skills = sorted(n for n in names if keep(n))
+        options.skills = _drop_unusable_skill_names(n for n in names if keep(n))
 
     def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
         """Grant the CLI extra working directories (``--add-dir``).
@@ -1182,6 +1226,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         the CLI's silent auto-approve). Non-Skill tools are passed through
         untouched; the skill's own downstream tool calls keep their normal
         permissions and the workspace sandbox hook still applies to them.
+
+        A call whose ``skill`` or ``args`` contains ``@`` is denied instead: the
+        CLI expands ``@`` file mentions in skill arguments even on a verbatim
+        turn and inlines the file upstream — outside the workspace too, and the
+        workspace sandbox hook never sees it (verified on CLI 2.1.283 and
+        2.1.220). Mentions written into a skill's own body are still expanded;
+        that surface is not covered here.
         """
 
         async def hook(input_data, _tool_use_id, _context):
@@ -1190,6 +1241,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 return {}
             tool_input = input_data.get("tool_input", {}) if isinstance(input_data, dict) else {}
             skill = tool_input.get("skill", "") if isinstance(tool_input, dict) else ""
+            args = tool_input.get("args", "") if isinstance(tool_input, dict) else ""
+            if "@" in f"{skill}{args}":
+                logger.warning("Denying Skill tool call with '@' in its input: skill=%s", skill)
+                return {
+                    "hookSpecificOutput": {
+                        "hookEventName": "PreToolUse",
+                        "permissionDecision": "deny",
+                        "permissionDecisionReason": (
+                            "Skill arguments cannot contain '@': the CLI would expand "
+                            "it as a file mention and inline the file. Retry without "
+                            "the '@' (pass a plain path or value)."
+                        ),
+                    }
+                }
             logger.info("Auto-approving Skill tool invocation: skill=%s", skill)
             return {
                 "hookSpecificOutput": {
@@ -1350,7 +1415,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         AskUserQuestion always falls through to this callback, even under
         ``permission_mode=bypassPermissions`` where ordinary tools are
         auto-approved without it — verified against claude-agent-sdk==0.2.108,
-        re-verified live on 0.2.128 (CLI 2.1.220). The SDK's
+        re-verified live on 0.2.128 (CLI 2.1.220) and against a fake API on
+        0.2.160 (CLI 2.1.283). The SDK's
         ``CanUseToolShadowedWarning`` about this combination is a false
         positive for AskUserQuestion and is filtered at module import.
 
@@ -1551,19 +1617,47 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
     @staticmethod
     async def _stream_user_content_blocks(
-        content_blocks: List[Dict[str, Any]],
+        content_blocks: Union[str, List[Dict[str, Any]]],
+        verbatim: bool = True,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Wrap Anthropic content blocks as a single SDK streaming-input message.
+        """Wrap a user turn as a single SDK streaming-input message.
 
         Mirrors the message shape ``ClaudeSDKClient.query()`` builds for plain
-        strings, but with block-list content so inline image blocks reach the
-        model directly (issue #140). ``query()`` fills in ``session_id``.
+        strings; block-list content lets inline image blocks reach the model
+        directly (issue #140). ``query()`` fills in ``session_id``.
+
+        ``verbatim`` stamps ``client_composed`` — the same field the SDK's
+        ``verbatim_prompts`` option sets — so the CLI (2.1.248+) delivers the
+        text as written: no ``@path`` file inlining, no slash dispatch.
         """
-        yield {
+        message: Dict[str, Any] = {
             "type": "user",
             "message": {"role": "user", "content": content_blocks},
             "parent_tool_use_id": None,
         }
+        if verbatim:
+            message["client_composed"] = True
+        yield message
+
+    @staticmethod
+    def _is_slash_command_turn(prompt: Union[str, List[Dict[str, Any]]]) -> bool:
+        """Is *prompt* a slash-command invocation (first text block for lists)?"""
+        from src.backends.claude.slash_commands import extract_command_name
+
+        if isinstance(prompt, str):
+            text = prompt
+        else:
+            text = next(
+                (
+                    block["text"]
+                    for block in prompt
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                ),
+                "",
+            )
+        return extract_command_name(text) is not None
 
     async def run_completion_with_client(
         self,
@@ -1575,8 +1669,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         Sends *prompt* via ``client.query()`` then yields converted
         message dicts from ``client.receive_response()``.  A list prompt is
-        a list of native Anthropic content blocks (multimodal turn) and is
-        sent as SDK streaming input.  On error the
+        a list of native Anthropic content blocks (multimodal turn).  Every
+        turn except a slash command goes out as a verbatim (``client_composed``)
+        streaming-input message.  On error the
         session's client reference is cleared so the caller can detect
         the broken connection and create a fresh client.
 
@@ -1611,10 +1706,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         get_next = None
         wait_break = None
         try:
-            if isinstance(prompt, str):
+            # Caller text is delivered verbatim: otherwise the CLI expands
+            # ``@<path>`` mentions and inlines the file upstream — outside the
+            # workspace too, and past the workspace sandbox hook (no tool call
+            # is involved). A slash-command turn is the one exception, sent
+            # unstamped so the CLI can dispatch it; slash_commands.validate_prompt
+            # rejects @-mentions in its arguments. The SDK-wide verbatim_prompts
+            # option stays off because its stamp would override this per turn.
+            if not self._is_slash_command_turn(prompt):
+                await client.query(self._stream_user_content_blocks(prompt))
+            elif isinstance(prompt, str):
                 await client.query(prompt)
             else:
-                await client.query(self._stream_user_content_blocks(prompt))
+                await client.query(
+                    self._stream_user_content_blocks(prompt, verbatim=False)
+                )
             response_iter = client.receive_response().__aiter__()
             while True:
                 # Race: next message vs hook-fired break signal

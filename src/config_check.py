@@ -646,6 +646,29 @@ def _check_workspace_quota() -> List[ConfigIssue]:
     return []
 
 
+def _check_cross_session_messaging() -> List[ConfigIssue]:
+    """Warn when an operator opts back into Claude cross-session messaging.
+
+    ``src.constants`` defaults ``CLAUDE_CODE_HARBOR_KITE`` to ``0`` because every
+    gateway CLI child shares one config dir, so with the gate on any user's
+    agent can list and message other users' live sessions. The CLI treats only
+    1/true/yes/on as on; mirrored here with os.environ only (early-import rule).
+    """
+    raw = (os.getenv("CLAUDE_CODE_HARBOR_KITE") or "").strip()
+    if raw.lower() not in {"1", "true", "yes", "on"}:
+        return []
+    return [
+        ConfigIssue(
+            "warning",
+            f"CLAUDE_CODE_HARBOR_KITE={raw!r} enables Claude cross-session "
+            "messaging. Every gateway session shares one Claude config dir, so "
+            "any user's agent can discover other users' live sessions with "
+            "ListAgents and inject turns into them with SendMessage. Unset it "
+            "unless this gateway serves a single user.",
+        )
+    ]
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -666,6 +689,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_sdk_buffer())
     issues.extend(_check_workspace_initial_dirs())
     issues.extend(_check_workspace_quota())
+    issues.extend(_check_cross_session_messaging())
     return issues
 
 

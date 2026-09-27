@@ -58,7 +58,8 @@ SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 
 # Cap on every awaited ClaudeSDKClient.disconnect(). Must sit ABOVE the SDK
 # transport's own worst-case close() sequence, not below it: close()
-# (claude-agent-sdk 0.2.128, subprocess_cli.py) bounds each of its awaits —
+# (claude-agent-sdk 0.2.160, subprocess_cli.py; unchanged since 0.2.128)
+# bounds each of its awaits —
 # stdin-lock 5s, graceful-exit wait 5s, SIGTERM + 5s, SIGKILL + 5s ≈ 20s —
 # inside a shielded scope whose shield does NOT survive a raw asyncio
 # cancellation. An asyncio.wait_for firing mid-close cancels the coroutine at
@@ -288,6 +289,34 @@ def _ensure_mcp_tool_timeout_env() -> int:
 # Claude Agent SDK subprocesses inherit the gateway process environment. Make
 # the policy real at runtime, not merely a number used by the stall derivation.
 EFFECTIVE_MCP_TOOL_TIMEOUT_MS = _ensure_mcp_tool_timeout_env()
+
+# Cross-session messaging (Claude CLI 2.1.224+) binds a peer-inbox socket in
+# every CLI child and hands the model ListAgents plus cross-session SendMessage.
+# Peer discovery is scoped to the config dir (``$CLAUDE_CONFIG_DIR/sessions``),
+# and every gateway child shares the gateway's HOME whichever user it serves, so
+# one user's agent could list another user's live session and message it — the
+# receiver then runs a turn in its own workspace (verified on CLI 2.1.283). The
+# CLI's gate reads this env var: unset or blank means ON; 1/true/yes/on (case-
+# and whitespace-insensitive) means ON; any other value turns the feature off
+# (no socket, no ListAgents, cross-session SendMessage refused);
+# teammate and subagent SendMessage are not gated by it. It is installed in the
+# process env rather than ``options.env`` so every spawn point inherits it
+# (turn clients, slash-command discovery, ``verify()``); an explicit operator
+# value wins, except a blank one: the CLI reads an empty value as unset and
+# turns the feature ON, and a blank is what a compose ``- VAR`` passthrough or
+# an empty .env line produces, so blank is normalized to off as well. The name
+# is an undocumented CLI codename — tests/test_cli_cross_session_messaging.py
+# pins it against the bundled CLI so an SDK bump that renames it fails loudly.
+CROSS_SESSION_MESSAGING_ENV = "CLAUDE_CODE_HARBOR_KITE"
+
+
+def _ensure_cross_session_messaging_off() -> None:
+    """Default the CLI's cross-session messaging gate to off for every child."""
+    if not (os.environ.get(CROSS_SESSION_MESSAGING_ENV) or "").strip():
+        os.environ[CROSS_SESSION_MESSAGING_ENV] = "0"
+
+
+_ensure_cross_session_messaging_off()
 
 
 def cli_tool_watchdog_ms() -> int:
