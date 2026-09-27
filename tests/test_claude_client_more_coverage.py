@@ -558,7 +558,9 @@ class TestRunCompletionWithClientHookBreak:
 
         # No messages yielded — just a clean break
         assert messages == []
-        mock_client.query.assert_awaited_once_with("test")
+        mock_client.query.assert_awaited_once()
+        sent = [m async for m in mock_client.query.await_args.args[0]]
+        assert [m["message"]["content"] for m in sent] == ["test"]
 
     async def test_run_yields_concurrent_message_on_break(self):
         """When break fires with a concurrent message available, that message is yielded (lines 796-800)."""

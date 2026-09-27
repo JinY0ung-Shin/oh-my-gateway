@@ -21,6 +21,9 @@ This module validates the prompt before it reaches the SDK:
 * A small **blocklist** of destructive built-ins — plus any names in the
   ``BLOCKED_SLASH_COMMANDS`` env var — is always rejected with
   ``blocked_command``.
+* Arguments carrying an ``@`` file mention are rejected with
+  ``unsupported_argument``: a slash turn is the one turn the gateway sends
+  without verbatim delivery, so the CLI would inline the mentioned file.
 * For other (command-shaped) slash prompts, the name is checked against a
   **TTL-cached allowlist** pulled from ``ClaudeSDKClient.get_server_info()``.
   The cache is bound to the effective cwd so one user's project skills can
@@ -71,6 +74,13 @@ CACHE_TTL_SECONDS: float = 60.0
 # such tokens on the validated path (→ a clear 400) rather than letting them
 # through to that silent response.
 _COMMAND_NAME_RE = re.compile(r"^[A-Za-z0-9:_-]+$")
+
+# An ``@`` token at the start of the text or after whitespace is a file mention:
+# the CLI inlines the referenced file into the request — outside the workspace
+# too. Every other turn is sent verbatim (``client_composed``) so it is never
+# expanded, but a slash command must go unstamped for the CLI to dispatch it, so
+# its arguments are screened instead. ``user@example.com`` is not a mention.
+_AT_MENTION_RE = re.compile(r"(^|\s)@[^\s@]")
 
 
 class SlashCommandError(Exception):
@@ -273,6 +283,17 @@ async def validate_prompt(prompt: str, cwd: Optional[Path] = None) -> None:
                 f"Slash command '/{name}' is blocked by this server. "
                 "Prefix your message with a non-slash character if you "
                 "intended a plain user message."
+            ),
+        )
+
+    arguments = prompt.lstrip()[1 + len(name) :]
+    if _AT_MENTION_RE.search(arguments):
+        raise SlashCommandError(
+            code="unsupported_argument",
+            message=(
+                f"Slash command '/{name}' arguments cannot contain @-mentions: "
+                "the CLI would inline the referenced file. Remove the '@', or "
+                "send the text as a plain message without the leading '/'."
             ),
         )
 

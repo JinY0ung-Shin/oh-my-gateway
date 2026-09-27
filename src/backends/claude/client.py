@@ -1551,19 +1551,47 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
     @staticmethod
     async def _stream_user_content_blocks(
-        content_blocks: List[Dict[str, Any]],
+        content_blocks: Union[str, List[Dict[str, Any]]],
+        verbatim: bool = True,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """Wrap Anthropic content blocks as a single SDK streaming-input message.
+        """Wrap a user turn as a single SDK streaming-input message.
 
         Mirrors the message shape ``ClaudeSDKClient.query()`` builds for plain
-        strings, but with block-list content so inline image blocks reach the
-        model directly (issue #140). ``query()`` fills in ``session_id``.
+        strings; block-list content lets inline image blocks reach the model
+        directly (issue #140). ``query()`` fills in ``session_id``.
+
+        ``verbatim`` stamps ``client_composed`` — the same field the SDK's
+        ``verbatim_prompts`` option sets — so the CLI (2.1.248+) delivers the
+        text as written: no ``@path`` file inlining, no slash dispatch.
         """
-        yield {
+        message: Dict[str, Any] = {
             "type": "user",
             "message": {"role": "user", "content": content_blocks},
             "parent_tool_use_id": None,
         }
+        if verbatim:
+            message["client_composed"] = True
+        yield message
+
+    @staticmethod
+    def _is_slash_command_turn(prompt: Union[str, List[Dict[str, Any]]]) -> bool:
+        """Is *prompt* a slash-command invocation (first text block for lists)?"""
+        from src.backends.claude.slash_commands import extract_command_name
+
+        if isinstance(prompt, str):
+            text = prompt
+        else:
+            text = next(
+                (
+                    block["text"]
+                    for block in prompt
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and isinstance(block.get("text"), str)
+                ),
+                "",
+            )
+        return extract_command_name(text) is not None
 
     async def run_completion_with_client(
         self,
@@ -1575,8 +1603,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         Sends *prompt* via ``client.query()`` then yields converted
         message dicts from ``client.receive_response()``.  A list prompt is
-        a list of native Anthropic content blocks (multimodal turn) and is
-        sent as SDK streaming input.  On error the
+        a list of native Anthropic content blocks (multimodal turn).  Every
+        turn except a slash command goes out as a verbatim (``client_composed``)
+        streaming-input message.  On error the
         session's client reference is cleared so the caller can detect
         the broken connection and create a fresh client.
 
@@ -1611,10 +1640,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         get_next = None
         wait_break = None
         try:
-            if isinstance(prompt, str):
+            # Caller text is delivered verbatim: otherwise the CLI expands
+            # ``@<path>`` mentions and inlines the file upstream — outside the
+            # workspace too, and past the workspace sandbox hook (no tool call
+            # is involved). A slash-command turn is the one exception, sent
+            # unstamped so the CLI can dispatch it; slash_commands.validate_prompt
+            # rejects @-mentions in its arguments. The SDK-wide verbatim_prompts
+            # option stays off because its stamp would override this per turn.
+            if not self._is_slash_command_turn(prompt):
+                await client.query(self._stream_user_content_blocks(prompt))
+            elif isinstance(prompt, str):
                 await client.query(prompt)
             else:
-                await client.query(self._stream_user_content_blocks(prompt))
+                await client.query(
+                    self._stream_user_content_blocks(prompt, verbatim=False)
+                )
             response_iter = client.receive_response().__aiter__()
             while True:
                 # Race: next message vs hook-fired break signal

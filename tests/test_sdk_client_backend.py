@@ -217,8 +217,17 @@ async def test_run_completion_with_client_yields_messages():
     async for msg in cli.run_completion_with_client(mock_client, "Hi there", session):
         messages.append(msg)
 
-    # query was called with prompt
-    mock_client.query.assert_awaited_once_with("Hi there")
+    # query was called with the prompt, as one verbatim streaming-input message
+    mock_client.query.assert_awaited_once()
+    sent = [m async for m in mock_client.query.await_args.args[0]]
+    assert sent == [
+        {
+            "type": "user",
+            "message": {"role": "user", "content": "Hi there"},
+            "parent_tool_use_id": None,
+            "client_composed": True,
+        }
+    ]
 
     # Two messages yielded
     assert len(messages) == 2
