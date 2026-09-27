@@ -60,6 +60,11 @@ from src.backends.claude.constants import (
 # seam tests patch to stub the SDK — keep that seam stable.
 from src.backends.claude.sdk_client import GatewayClaudeSDKClient as ClaudeSDKClient
 from src.backends.claude.sdk_client import ToolProgressMessage
+from src.backends.claude.skill_names import (
+    GRANULAR_SKILL_RULE_RE,
+    SKILL_WILDCARD_RULES,
+    skill_name_problem,
+)
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import ASK_USER_TIMEOUT_SECONDS
@@ -98,11 +103,38 @@ _VALID_SETTING_SOURCES = {"user", "project", "local"}
 # :meth:`ClaudeCodeCLI._set_allowed_tools`.
 SKILL_ALLOW_ALL_RULE = "Skill(:*)"
 
-# Granular per-skill rule: ``Skill(<name>)`` / ``Skill(<name>:*)``. The name may
-# be bare (``summarize``) or plugin-qualified (``docs-helper:summarize``) — the
-# form the CLI actually registers a plugin skill under — but must not START with
-# ``:`` so the ``Skill(:*)`` catch-all never matches.
-_GRANULAR_SKILL_RULE_RE = re.compile(r"^Skill\((?P<name>[^:)][^)]*?)(?::\*)?\)$")
+# Granular per-skill rule ``Skill(<name>)`` / ``Skill(<name>:*)``. Shared with
+# the Responses route's request check, so it lives in ``skill_names``.
+_GRANULAR_SKILL_RULE_RE = GRANULAR_SKILL_RULE_RE
+
+# Names already reported by ``_drop_unusable_skill_names``: a rejected catalog
+# name recurs on every session in that workspace, one warning is enough.
+_WARNED_UNUSABLE_SKILL_NAMES: set = set()
+
+
+def _drop_unusable_skill_names(names) -> List[str]:
+    """Sorted *names* minus those the SDK would reject as ``skills`` entries.
+
+    Since SDK 0.2.129 a single rejected name makes ``connect()`` raise, so it
+    must never reach ``options.skills``. Leaving it out hides that one skill
+    instead of failing the whole session; each name is warned about once.
+    """
+    usable = []
+    rejected = {}
+    for name in names:
+        problem = skill_name_problem(name)
+        if problem is None:
+            usable.append(name)
+        else:
+            rejected[name] = problem
+    fresh = sorted(set(rejected) - _WARNED_UNUSABLE_SKILL_NAMES)
+    if fresh:
+        _WARNED_UNUSABLE_SKILL_NAMES.update(fresh)
+        logger.warning(
+            "Leaving skills the Claude SDK cannot allowlist out of the catalog: %s",
+            "; ".join(f"{name!r} ({rejected[name]})" for name in fresh),
+        )
+    return sorted(usable)
 
 # Granular per-subagent rule: ``Task(<agent>)`` / ``Agent(<agent>)`` (the CLI
 # has used both names for this tool; DISALLOWED_SUBAGENT_TYPES denies with the
@@ -464,8 +496,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         An operator ``Skill`` entry in ``DISALLOWED_TOOLS`` is a kill-switch:
         every skill rule is stripped, granular and catch-all alike, so no
         skill surface survives for the deny list to have to catch.
+
+        ``Skill(*)`` / ``Skill(*:*)`` are read as a bare ``Skill``. A granular
+        name the SDK would reject never reaches ``options.skills`` or a
+        ``Skill(<name>:*)`` rule (the Responses route already turned request
+        ones into a 400); if every granular name was unusable the allowlist is
+        empty rather than wide open.
         """
         blocked = set(DISALLOWED_TOOLS) | set(BLOCKED_DEFERRED_TOOLS)
+        tools = ["Skill" if t in SKILL_WILDCARD_RULES else t for t in tools]
         filtered = [t for t in tools if t not in blocked]
         # Subagent selection: ``Task(<agent>)`` entries are the gateway's own
         # allowlist (enforced by a PreToolUse hook), not CLI rules — strip them
@@ -491,14 +530,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if SKILL_ALLOW_ALL_RULE not in filtered:
                 filtered.append(SKILL_ALLOW_ALL_RULE)
         else:
-            granular = sorted(
-                {
-                    match.group("name")
-                    for t in filtered
-                    if (match := _GRANULAR_SKILL_RULE_RE.match(t)) is not None
-                }
-            )
-            if granular:
+            requested = {
+                match.group("name")
+                for t in filtered
+                if (match := _GRANULAR_SKILL_RULE_RE.match(t)) is not None
+            }
+            if requested:
+                granular = _drop_unusable_skill_names(requested)
                 options.skills = granular
                 filtered = [
                     t for t in filtered if _GRANULAR_SKILL_RULE_RE.match(t) is None
@@ -530,6 +568,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         plugin-qualified form too. Either way non-selected skills never appear
         and hidden ones never resurrect; builtin command names left in the
         remainder are inert — their ``Skill(<name>)`` rules match no skill.
+
+        Discovered names the SDK would reject (a skill directory such as
+        ``weird (v2)``, an MCP prompt command such as ``server:prompt (MCP)``)
+        are left out: one of them in the allowlist makes ``connect()`` raise.
         """
         granular = isinstance(options.skills, list)
         if not granular and not HIDDEN_SKILLS:
@@ -566,11 +608,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     "Skill discovery failed; using raw requested skill names",
                     exc_info=True,
                 )
-            options.skills = sorted(n for n in resolved if keep(n))
+            options.skills = _drop_unusable_skill_names(n for n in resolved if keep(n))
             return
 
         names = await slash_commands.get_available_commands(cwd)
-        options.skills = sorted(n for n in names if keep(n))
+        options.skills = _drop_unusable_skill_names(n for n in names if keep(n))
 
     def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
         """Grant the CLI extra working directories (``--add-dir``).
