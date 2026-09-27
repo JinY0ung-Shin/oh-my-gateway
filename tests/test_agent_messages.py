@@ -619,6 +619,7 @@ _CLI_2_1_283_ONLY_SUBTYPES = {
     "cloud_session_status",
     "dev_intent",
     "feedback_draft_queued",
+    "init_milestone",
     "peer_message_hold",
     "per_turn_effort_changed",
     "session_metadata",

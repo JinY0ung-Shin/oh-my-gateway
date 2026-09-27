@@ -90,11 +90,14 @@ def _fresh_warning_memo(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    sdk_validate_skill_name is None, reason="SDK private skill-name validator moved"
-)
 @pytest.mark.parametrize("name", VALID_NAMES + INVALID_NAMES, ids=ascii)
 def test_rules_match_the_installed_sdk(name):
+    if sdk_validate_skill_name is None:
+        # Fail, don't skip: a silently skipped parity pin protects nothing.
+        pytest.fail(
+            "claude_agent_sdk no longer exposes _validate_skill_name; re-derive "
+            "src/backends/claude/skill_names.py from the new SDK and repoint this pin"
+        )
     try:
         sdk_validate_skill_name(name)
         sdk_accepts = True

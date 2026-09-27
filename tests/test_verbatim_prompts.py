@@ -11,6 +11,7 @@ unstamped so the CLI can dispatch it, and ``validate_prompt`` rejects
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from types import SimpleNamespace
@@ -242,8 +243,15 @@ async def test_real_cli_verbatim_turn_not_expanded_slash_still_dispatches(tmp_pa
 
             async def gateway_turn(prompt):
                 before = len(api.requests)
-                async for _ in cli.run_completion_with_client(client, prompt, session):
-                    pass
+
+                async def consume():
+                    async for _ in cli.run_completion_with_client(
+                        client, prompt, session
+                    ):
+                        pass
+
+                # No pytest-timeout in this repo: bound the real CLI ourselves.
+                await asyncio.wait_for(consume(), timeout=90)
                 return json.dumps([r["body"] for r in api.requests[before:]])
 
             assert canary not in await gateway_turn(f"summarize @{outside}")
@@ -254,8 +262,12 @@ async def test_real_cli_verbatim_turn_not_expanded_slash_still_dispatches(tmp_pa
             # assertion is not vacuous.
             before = len(api.requests)
             await client.query(f"summarize @{outside}")
-            async for _ in client.receive_response():
-                pass
+
+            async def drain():
+                async for _ in client.receive_response():
+                    pass
+
+            await asyncio.wait_for(drain(), timeout=90)
             assert canary in json.dumps([r["body"] for r in api.requests[before:]])
         finally:
             await client.disconnect()
