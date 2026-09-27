@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import src.main as main
@@ -538,3 +539,220 @@ async def test_cancelled_stream_interrupts_and_stops_the_turn(monkeypatch, tmp_p
     backend.client.interrupt.assert_awaited_once()
     backend.client.disconnect.assert_awaited_once()
     assert workspace.cleaned == [workspace.path]
+
+
+# Every system subtype the CLI bundled with claude-agent-sdk 0.2.128 (2.1.220)
+# could put on the stream-json wire, minus ``commands_changed``. Duplicated on
+# purpose: opening a subtype to Noah's wire must be a visible, deliberate edit.
+_CLI_2_1_220_SYSTEM_SUBTYPES = frozenset(
+    {
+        "agents_killed",
+        "api_error",
+        "api_retry",
+        "away_summary",
+        "background_tasks_changed",
+        "bridge_state",
+        "bridge_status",
+        "code_change_published",
+        "compact_boundary",
+        "control_request_progress",
+        "elicitation_complete",
+        "file_snapshot",
+        "files_persisted",
+        "hook_progress",
+        "hook_response",
+        "hook_started",
+        "informational",
+        "init",
+        "local_command",
+        "local_command_output",
+        "memory_recall",
+        "memory_saved",
+        "mirror_error",
+        "model_consent_fallback",
+        "model_fallback",
+        "model_refusal_fallback",
+        "model_refusal_no_fallback",
+        "notification",
+        "permission_denied",
+        "permission_retry",
+        "plugin_install",
+        "post_turn_summary",
+        "scheduled_task_fire",
+        "session_state_changed",
+        "status",
+        "stop_hook_summary",
+        "task_notification",
+        "task_progress",
+        "task_started",
+        "task_summary",
+        "task_updated",
+        "thinking",
+        "thinking_tokens",
+        "turn_duration",
+        "turn_starting",
+        "vcs_state_changed",
+        "worker_shutting_down",
+    }
+)
+
+# Subtypes Noah's sdkMessageHandlers.ts consumes — all must stay forwarded.
+_NOAH_SYSTEM_SUBTYPES = {
+    "task_started",
+    "task_progress",
+    "task_updated",
+    "task_notification",
+    "background_tasks_changed",
+    "init",
+    "plugin_install",
+    "permission_denied",
+    "compact_boundary",
+    "status",
+}
+
+# Emitted by CLI 2.1.283 (claude-agent-sdk 0.2.160) but never by 2.1.220 on
+# this endpoint; ``commands_changed`` now arrives before ``init`` whenever MCP
+# is configured.
+_CLI_2_1_283_ONLY_SUBTYPES = {
+    "commands_changed",
+    "cloud_session_delta",
+    "cloud_session_status",
+    "dev_intent",
+    "feedback_draft_queued",
+    "peer_message_hold",
+    "per_turn_effort_changed",
+    "session_metadata",
+    "tool_host_result",
+    "turn_handoff_available",
+    "turn_preempted",
+}
+
+
+def test_system_subtype_allowlist_is_pinned_to_cli_2_1_220():
+    assert agent_messages._SYSTEM_SUBTYPES == _CLI_2_1_220_SYSTEM_SUBTYPES
+    assert _NOAH_SYSTEM_SUBTYPES <= agent_messages._SYSTEM_SUBTYPES
+    assert not _CLI_2_1_283_ONLY_SUBTYPES & agent_messages._SYSTEM_SUBTYPES
+
+
+def test_stream_keeps_cli_2_1_220_wire_on_newer_cli(monkeypatch, tmp_path):
+    """Envelopes the 2.1.283 CLI adds never reach Noah; old ones are unchanged."""
+    heartbeat = {
+        "type": "tool_progress",
+        "tool_use_id": "tool-1",
+        "tool_name": "Bash",
+        "elapsed_time_seconds": 30.0,
+        "parent_tool_use_id": None,
+        "task_id": None,
+        "data": {"heartbeat": True},
+    }
+    # heartbeat / subagent_type / subagent_retry predate 2.1.283: the 2.1.220
+    # CLI already built them into tool_heartbeat / agent_api_retry frames.
+    agent_retry = {
+        "type": "tool_progress",
+        "tool_use_id": "agent_msg-1",
+        "tool_name": "Agent",
+        "elapsed_time_seconds": 0.0,
+        "parent_tool_use_id": None,
+        "task_id": None,
+        "data": {
+            "subagent_type": "Explore",
+            "subagent_retry": {
+                "agent_id": "agent-1",
+                "attempt": 1,
+                "max_retries": 3,
+                "retry_delay_ms": 500,
+                "error_status": 529,
+                "error_category": "overloaded",
+            },
+        },
+    }
+    messages = [
+        {
+            "type": "system",
+            "subtype": "commands_changed",
+            "data": {"commands": [{"name": "review"}], "session_id": "s"},
+        },
+        {
+            "type": "system",
+            "subtype": "init",
+            "data": {"model": "sonnet", "plugins": []},
+        },
+        {
+            "type": "system",
+            "subtype": "per_turn_effort_changed",
+            "data": {"effort": "high"},
+        },
+        {"type": "system", "subtype": "peer_message_hold", "data": {"name": "peer"}},
+        # ClaudeCodeCLI._convert_message of a ConversationResetMessage: no type.
+        {"new_conversation_id": "conv-2", "uuid": "reset-uuid", "session_id": "old"},
+        {
+            "type": "user",
+            "content": [
+                ToolResultBlock(tool_use_id="tool-1", content="ok", is_error=False)
+            ],
+            "origin": {"kind": "task-notification"},
+        },
+        heartbeat,
+        agent_retry,
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "ok",
+            "origin": {"kind": "human"},
+        },
+    ]
+    backend = _FakeBackend(messages)
+    _install_endpoint_fakes(monkeypatch, tmp_path, backend)
+
+    response = TestClient(main.app).post(
+        "/v1/agents/messages",
+        json={"messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    frames = _frames(response.text)
+    assert [event for event, _ in frames] == [
+        "message_start",
+        "sdk_message",
+        "sdk_message",
+        "sdk_message",
+        "sdk_message",
+        "sdk_message",
+        "message_stop",
+    ]
+    sdk = [data for event, data in frames if event == "sdk_message"]
+    assert [(item["type"], item.get("subtype")) for item in sdk] == [
+        ("system", "init"),
+        ("user", None),
+        ("tool_progress", None),
+        ("tool_progress", None),
+        ("result", "success"),
+    ]
+    assert "commands_changed" not in response.text
+    assert "conv-2" not in response.text
+    user = sdk[1]
+    assert "origin" not in user
+    assert user["message"]["content"] == [
+        {"type": "tool_result", "tool_use_id": "tool-1", "is_error": False}
+    ]
+    assert sdk[2] == heartbeat
+    assert sdk[3] == agent_retry
+    assert "origin" not in sdk[4]
+    assert frames[-1][1]["status"] == "completed"
+
+
+def test_conversation_reset_is_skipped_but_typeless_messages_still_fail():
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    from src.backends.claude.client import ClaudeCodeCLI
+
+    reset = ConversationResetMessage(
+        new_conversation_id="conv-2", uuid="reset-uuid", session_id="old-session"
+    )
+    converted = ClaudeCodeCLI.__new__(ClaudeCodeCLI)._convert_message(reset)
+    assert "type" not in converted  # the shape the endpoint actually receives
+
+    assert agent_messages._prepare_sdk_message(converted) is None
+    assert agent_messages._prepare_sdk_message(reset) is None
+    with pytest.raises(ValueError, match="no type"):
+        agent_messages._prepare_sdk_message({"payload": "unknown"})
