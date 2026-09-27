@@ -58,7 +58,8 @@ SESSION_MAX_AGE_MINUTES = parse_int_env("SESSION_MAX_AGE_MINUTES", 60)
 
 # Cap on every awaited ClaudeSDKClient.disconnect(). Must sit ABOVE the SDK
 # transport's own worst-case close() sequence, not below it: close()
-# (claude-agent-sdk 0.2.128, subprocess_cli.py) bounds each of its awaits —
+# (claude-agent-sdk 0.2.160, subprocess_cli.py; unchanged since 0.2.128)
+# bounds each of its awaits —
 # stdin-lock 5s, graceful-exit wait 5s, SIGTERM + 5s, SIGKILL + 5s ≈ 20s —
 # inside a shielded scope whose shield does NOT survive a raw asyncio
 # cancellation. An asyncio.wait_for firing mid-close cancels the coroutine at
