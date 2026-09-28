@@ -95,6 +95,9 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
 
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
+# Workspace-relative plan-mode directory (``plansDirectory``); see
+# ``_configure_plans_directory``.
+DEFAULT_PLANS_DIRECTORY = ".claude/plans"
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
 
 
@@ -701,7 +704,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         plugin/skill/marketplace roots plus any operator-specified
         ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. Writes to
         these stay confined by the sandbox hook (which keeps write tools to the
-        workspace + ``$HOME/.claude``).
+        workspace + the session's own ``$HOME/.claude/projects`` entry).
         """
         dirs: List[str] = []
         seen: set[str] = set()
@@ -759,6 +762,22 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             network=network_config,
             enableWeakerNestedSandbox=CLAUDE_SANDBOX_WEAKER_NESTED,
         )
+
+    def _configure_plans_directory(self, options: ClaudeAgentOptions) -> None:
+        """Keep plan-mode plan files inside the session workspace.
+
+        The CLI defaults ``plansDirectory`` to ``~/.claude/plans``, and every
+        gateway child shares one HOME, so every user's plans would land in one
+        shared directory (and the workspace sandbox no longer lets a session
+        read or write there). ``CLAUDE_PLANS_DIRECTORY`` overrides the
+        workspace-relative default; set it to an empty value to keep the CLI
+        default. The CLI rejects a path outside the project root.
+        """
+        plans_dir = os.getenv("CLAUDE_PLANS_DIRECTORY", DEFAULT_PLANS_DIRECTORY)
+        plans_dir = plans_dir.strip()
+        if not plans_dir:
+            return
+        options.settings = json.dumps({"plansDirectory": plans_dir})
 
     _UNSET = object()  # sentinel for _custom_base default
 
@@ -1034,6 +1053,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_thinking(options, effort)
         self._configure_sandbox(options)
         self._configure_add_dirs(options)
+        self._configure_plans_directory(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
 
         if model:

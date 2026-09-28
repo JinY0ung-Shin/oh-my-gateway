@@ -233,21 +233,84 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def _writable_extra_roots() -> List[Path]:
-    """Full-access (read + write + exec) roots outside the per-user workspace.
+# Shared assets under ``$HOME/.claude`` a session may only READ: skills, plugins,
+# subagents, commands, output styles and the user-scope CLAUDE.md. Every user's
+# session uses them, so writes stay denied.
+_SHARED_CLAUDE_ASSETS = (
+    "skills",
+    "plugins",
+    "agents",
+    "commands",
+    "output-styles",
+    "CLAUDE.md",
+)
+# The CLI names a project directory ``projects/<cwd with every non-alphanumeric
+# character replaced by '-'>``. Past 200 characters it appends a hash to the
+# first 200, which is not reproduced here: only existing directories match then.
+_PROJECT_NAME_MAX = 200
 
-    The Claude Code SDK keeps its own internal state under ``$HOME/.claude``
-    (e.g. ``projects/.../tool-results``) and reaches it via ``~/.claude/...``,
-    which expands outside the workspace root. That access must be permitted
-    explicitly or the sandbox breaks normal SDK operation. Only ``$HOME/.claude``
-    is added — not all of ``$HOME`` — so ``~/.ssh`` and other home paths stay
-    denied. Returns an empty list when ``$HOME`` is unset (issue #115).
+
+def _encode_project_dir(path: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+
+
+def _own_project_roots(
+    workspace_root: Path, claude_home: Optional[Path]
+) -> List[Path]:
+    """This session's own ``$HOME/.claude/projects/<encoded cwd>``.
+
+    That directory holds the session's tool results, auto memory and
+    transcripts. Only the entry named after **this** workspace is returned,
+    never ``projects/`` itself, whose siblings are other users' sessions. Both
+    the given and the resolved workspace path are encoded, because the CLI
+    names the directory after the cwd it was started with.
     """
+    if claude_home is None:
+        return []
+    projects = claude_home / "projects"
     roots: List[Path] = []
     seen: Set[Path] = set()
-    claude_home = _claude_home()
-    if claude_home is not None:
-        _add_root(roots, seen, claude_home)
+    for variant in {str(workspace_root), str(Path(workspace_root).resolve())}:
+        name = _encode_project_dir(variant)
+        if len(name) <= _PROJECT_NAME_MAX:
+            _add_root(roots, seen, projects / name)
+            continue
+        prefix = f"{name[:_PROJECT_NAME_MAX]}-"
+        try:
+            for entry in projects.iterdir():
+                if entry.is_dir() and entry.name.startswith(prefix):
+                    _add_root(roots, seen, entry)
+        except OSError:
+            continue
+    return roots
+
+
+def _writable_extra_roots(workspace_root: Path) -> List[Path]:
+    """Full-access (read + write + exec) roots outside the per-user workspace.
+
+    The CLI keeps this session's own state under
+    ``$HOME/.claude/projects/<encoded cwd>`` (large tool results the model is
+    told to Read, auto memory), which the model reaches via ``~/.claude/...``,
+    outside the workspace. Only that one directory is granted, not
+    ``$HOME/.claude`` as a whole: every user's CLI child shares one HOME, so
+    ``~/.claude/plans`` and the other ``projects/*`` directories hold **other
+    users'** plans and transcripts. Returns an empty list when ``$HOME`` is
+    unset (issue #115).
+    """
+    return _own_project_roots(workspace_root, _claude_home())
+
+
+def _shared_asset_roots(claude_home: Optional[Path]) -> List[Path]:
+    """Read-only shared assets under ``$HOME/.claude``.
+
+    See ``_SHARED_CLAUDE_ASSETS``.
+    """
+    if claude_home is None:
+        return []
+    roots: List[Path] = []
+    seen: Set[Path] = set()
+    for name in _SHARED_CLAUDE_ASSETS:
+        _add_root(roots, seen, claude_home / name)
     return roots
 
 
@@ -506,24 +569,29 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     Quota preflight is independent of the path sandbox. When the sandbox is
     enabled, the historical two-tier roots remain unchanged:
 
-    * ``write_roots`` — workspace plus SDK-owned ``$HOME/.claude``;
-    * ``read_roots`` — write roots plus shared plugin resource roots.
+    * ``write_roots`` — workspace plus this session's own
+      ``$HOME/.claude/projects/<encoded cwd>``;
+    * ``read_roots`` — write roots plus the read-only shared assets under
+      ``$HOME/.claude`` (skills, plugins, agents, …) and plugin resource
+      roots. The rest of ``$HOME/.claude`` (``plans/``, other ``projects/*``)
+      belongs to other users.
 
     Direct callers historically receive a boundary-enforcing hook even when the
     env flag is off; preserve that behavior when quota is disabled. The special
     quota-only mode (quota on, sandbox flag off) is the only case where boundary
     checks are intentionally skipped.
     """
-    workspace_root = Path(workspace_root).resolve()
+    given_root = Path(workspace_root)
+    workspace_root = given_root.resolve()
     quota_enabled = workspace_quota_limit_bytes() > 0
     quota_user_root = _quota_user_root(workspace_root)
     boundary_enabled = _boundary_enabled() or not quota_enabled
 
     claude_home = _claude_home()
-    write_roots = [workspace_root] + _writable_extra_roots()
+    write_roots = [workspace_root] + _writable_extra_roots(given_root)
     read_roots = list(write_roots)
     seen: Set[Path] = set(read_roots)
-    for root in _plugin_resource_roots(claude_home):
+    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
         if root not in seen:
             seen.add(root)
             read_roots.append(root)

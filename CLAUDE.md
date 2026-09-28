@@ -120,6 +120,12 @@ uv run pytest --cov=src                            # with coverage
 - A resumed session reuses the system prompt recorded on its first request (CLI 2.1.267
   `--system-prompt-snapshot`, default on), so the resume path's `system_prompt=None` keeps the
   original `instructions`; admin base-prompt edits reach only new sessions.
+- Every Claude child shares one HOME, so `~/.claude` is shared across users. The workspace
+  sandbox (`WORKSPACE_SANDBOX_ENABLED`, opt-in) therefore allows only the session's own
+  `projects/<encoded cwd>` entry plus read-only shared assets (skills, plugins, agents, commands,
+  output-styles, `CLAUDE.md`) — never other users' `plans/` or transcripts. Plan files are moved
+  into the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY`;
+  empty keeps the CLI default); `tests/test_cli_plans_directory.py` pins it against the bundled CLI.
 
 ## API Compatibility Boundaries
 

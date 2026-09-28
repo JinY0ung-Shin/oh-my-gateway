@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -323,8 +324,10 @@ class TestAllowOutside:
 
 
 class TestHomeClaudeRoot:
-    """The Claude Code SDK's own ``$HOME/.claude`` state dir is always allowed
-    (issue #115), while the rest of ``$HOME`` stays denied."""
+    """This session's own SDK state under ``$HOME/.claude/projects/<encoded
+    cwd>`` is always allowed (issue #115), while the rest of ``$HOME`` — and
+    the rest of the shared ``$HOME/.claude`` — stays denied (see
+    ``TestHomeClaudeIsolation``)."""
 
     @pytest.fixture
     def home(self, tmp_path: Path, monkeypatch) -> Path:
@@ -333,26 +336,47 @@ class TestHomeClaudeRoot:
         monkeypatch.setenv("HOME", str(home))
         return home
 
+    @staticmethod
+    def _own(workspace: Path) -> str:
+        return re.sub(r"[^a-zA-Z0-9]", "-", str(workspace.resolve()))
+
     async def test_bash_home_claude_tilde_allowed(self, workspace, home):
         hook = make_workspace_sandbox_hook(workspace)
         result = await _call(
-            hook, "Bash", {"command": "cat ~/.claude/projects/x/tool-results/y.json"}
+            hook,
+            "Bash",
+            {
+                "command": (
+                    f"cat ~/.claude/projects/{self._own(workspace)}"
+                    "/s/tool-results/y.json"
+                )
+            },
         )
         assert result == {}
 
     async def test_bash_home_claude_absolute_allowed(self, workspace, home):
         hook = make_workspace_sandbox_hook(workspace)
         result = await _call(
-            hook, "Bash", {"command": f"cat {home}/.claude/projects/x/y.json"}
+            hook,
+            "Bash",
+            {"command": f"cat {home}/.claude/projects/{self._own(workspace)}/y.json"},
         )
         assert result == {}
 
     async def test_read_home_claude_allowed(self, workspace, home):
         hook = make_workspace_sandbox_hook(workspace)
-        result = await _call(
-            hook, "Read", {"file_path": str(home / ".claude" / "state.json")}
+        projects = home / ".claude" / "projects"
+        own = projects / self._own(workspace) / "s" / "tool-results" / "y.json"
+        assert await _call(hook, "Read", {"file_path": str(own)}) == {}
+        # The rest of the shared HOME (other sessions' projects/*, root state
+        # files) is not this session's.
+        other = projects / "x" / "tool-results" / "y.json"
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(other)}))
+        assert _is_deny(
+            await _call(
+                hook, "Read", {"file_path": str(home / ".claude" / "state.json")}
+            )
         )
-        assert result == {}
 
     async def test_other_home_paths_still_denied(self, workspace, home):
         # Only $HOME/.claude is added, not all of $HOME — ~/.ssh stays denied.
@@ -465,10 +489,10 @@ class TestPluginResourceRoots:
         plugins = home / ".claude" / "plugins"
         (plugins / "known_marketplaces.json").write_text("{ not json")
         (plugins / "installed_plugins.json").write_text("[]")
-        # Building the hook must not raise; ~/.claude itself stays allowed.
+        # Building the hook must not raise; the shared plugin dir stays readable.
         hook = make_workspace_sandbox_hook(workspace)
         ok = await _call(
-            hook, "Read", {"file_path": str(home / ".claude" / "state.json")}
+            hook, "Read", {"file_path": str(plugins / "cache" / "x" / "SKILL.md")}
         )
         assert ok == {}
 
@@ -529,3 +553,84 @@ class TestUnknownTool:
     async def test_mcp_tools_pass_through(self, workspace):
         hook = make_workspace_sandbox_hook(workspace)
         assert await _call(hook, "mcp__server__fetch", {"url": "..."}) == {}
+
+
+class TestHomeClaudeIsolation:
+    """``$HOME/.claude`` is shared by every user's CLI child (one HOME).
+
+    The sandbox must not turn it into a cross-user side channel: another
+    session's plans and transcripts stay denied, while this session keeps its
+    own project state (tool-results, auto memory) and read-only shared assets
+    (skills, plugins, agents).
+    """
+
+    @pytest.fixture
+    def home(self, tmp_path: Path, monkeypatch) -> Path:
+        home = tmp_path / "home" / "app"
+        (home / ".claude" / "projects").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("CLAUDE_PLUGIN_CLONE_ROOT", raising=False)
+        return home
+
+    @staticmethod
+    def _project_dir(home: Path, ws: Path) -> Path:
+        name = re.sub(r"[^a-zA-Z0-9]", "-", str(ws.resolve()))
+        return home / ".claude" / "projects" / name
+
+    async def test_other_users_plans_and_transcripts_are_denied(
+        self, workspace, other_workspace, home
+    ):
+        plan = home / ".claude" / "plans" / "someone-elses-plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# someone else's plan")
+        transcript = self._project_dir(home, other_workspace) / "sess.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}")
+        hook = make_workspace_sandbox_hook(workspace)
+        for tool, key, target in [
+            ("Read", "file_path", plan),
+            ("Read", "file_path", transcript),
+            ("Grep", "path", home / ".claude" / "projects"),
+            ("Glob", "path", home / ".claude" / "plans"),
+            ("Write", "file_path", plan),
+        ]:
+            assert _is_deny(await _call(hook, tool, {key: str(target)})), (tool, target)
+        for command in (
+            "cat ~/.claude/plans/someone-elses-plan.md",
+            f"cat {transcript}",
+            "grep -r token ~/.claude/projects",
+            "ls ~/.claude",
+        ):
+            assert _is_deny(await _call(hook, "Bash", {"command": command})), command
+
+    async def test_own_project_state_stays_readable_and_writable(
+        self, workspace, home
+    ):
+        own = self._project_dir(home, workspace)
+        result = own / "sess" / "tool-results" / "big.json"
+        memory = own / "memory" / "MEMORY.md"
+        hook = make_workspace_sandbox_hook(workspace)
+        assert await _call(hook, "Read", {"file_path": str(result)}) == {}
+        write = {"file_path": str(memory), "content": "x"}
+        assert await _call(hook, "Write", write) == {}
+        assert await _call(hook, "Bash", {"command": f"cat {result}"}) == {}
+
+    async def test_shared_assets_are_read_only(self, workspace, home):
+        skill = home / ".claude" / "skills" / "demo" / "SKILL.md"
+        agent = home / ".claude" / "agents" / "reviewer.md"
+        hook = make_workspace_sandbox_hook(workspace)
+        assert await _call(hook, "Read", {"file_path": str(skill)}) == {}
+        assert await _call(hook, "Read", {"file_path": str(agent)}) == {}
+        assert await _call(hook, "Bash", {"command": f"cat {skill}"}) == {}
+        write = {"file_path": str(skill), "content": "x"}
+        edit = {"file_path": str(agent), "old_string": "a", "new_string": "b"}
+        assert _is_deny(await _call(hook, "Write", write))
+        assert _is_deny(await _call(hook, "Edit", edit))
+
+    async def test_a_sibling_project_with_a_longer_name_is_not_ours(
+        self, workspace, home
+    ):
+        """``projects/<ours>-evil`` is not ``projects/<ours>``: no prefix leak."""
+        sibling = Path(str(self._project_dir(home, workspace)) + "-evil") / "s.jsonl"
+        hook = make_workspace_sandbox_hook(workspace)
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(sibling)}))
