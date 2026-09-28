@@ -245,13 +245,47 @@ _SHARED_CLAUDE_ASSETS = (
     "CLAUDE.md",
 )
 # The CLI names a project directory ``projects/<cwd with every non-alphanumeric
-# character replaced by '-'>``. Past 200 characters it appends a hash to the
-# first 200, which is not reproduced here: only existing directories match then.
+# UTF-16 code unit replaced by '-'>``; past 200 units it keeps the first 200 and
+# appends ``-<hash of the raw cwd>`` (CLI 2.1.283 ``qx``/``Le``, reproduced by
+# ``_project_dir_name`` and pinned by ``tests/test_cli_project_dir_name.py``).
 _PROJECT_NAME_MAX = 200
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
+
+
+def _utf16_units(value: str) -> List[int]:
+    data = value.encode("utf-16-le", "surrogatepass")
+    return [int.from_bytes(data[i : i + 2], "little") for i in range(0, len(data), 2)]
 
 
 def _encode_project_dir(path: str) -> str:
-    return re.sub(r"[^a-zA-Z0-9]", "-", path)
+    return "".join(
+        chr(u) if u < 128 and chr(u).isalnum() else "-" for u in _utf16_units(path)
+    )
+
+
+def _cli_path_hash(value: str) -> str:
+    """The CLI's short hash: the 31-multiplier string hash over UTF-16 units,
+    wrapped to a signed 32-bit int, absolute value, in base 36."""
+    h = 0
+    for unit in _utf16_units(value):
+        h = (h * 31 + unit) & 0xFFFFFFFF
+    if h >= 0x80000000:
+        h -= 0x100000000
+    n = abs(h)
+    digits = ""
+    while True:
+        n, r = divmod(n, 36)
+        digits = _BASE36[r] + digits
+        if n == 0:
+            return digits
+
+
+def _project_dir_name(path: str) -> str:
+    """The exact ``projects/`` entry name the CLI uses for cwd *path*."""
+    name = _encode_project_dir(path)
+    if len(name) <= _PROJECT_NAME_MAX:
+        return name
+    return f"{name[:_PROJECT_NAME_MAX]}-{_cli_path_hash(path)}"
 
 
 def _own_project_roots(
@@ -260,28 +294,19 @@ def _own_project_roots(
     """This session's own ``$HOME/.claude/projects/<encoded cwd>``.
 
     That directory holds the session's tool results, auto memory and
-    transcripts. Only the entry named after **this** workspace is returned,
-    never ``projects/`` itself, whose siblings are other users' sessions. Both
-    the given and the resolved workspace path are encoded, because the CLI
-    names the directory after the cwd it was started with.
+    transcripts. Exactly the entry named after **this** workspace is returned,
+    never ``projects/`` itself or a prefix match, since its siblings are other
+    users' sessions. Both the given and the resolved workspace path are
+    encoded, because the CLI names the directory after the cwd it was started
+    with.
     """
     if claude_home is None:
         return []
     projects = claude_home / "projects"
     roots: List[Path] = []
     seen: Set[Path] = set()
-    for variant in {str(workspace_root), str(Path(workspace_root).resolve())}:
-        name = _encode_project_dir(variant)
-        if len(name) <= _PROJECT_NAME_MAX:
-            _add_root(roots, seen, projects / name)
-            continue
-        prefix = f"{name[:_PROJECT_NAME_MAX]}-"
-        try:
-            for entry in projects.iterdir():
-                if entry.is_dir() and entry.name.startswith(prefix):
-                    _add_root(roots, seen, entry)
-        except OSError:
-            continue
+    for variant in (str(workspace_root), str(Path(workspace_root).resolve())):
+        _add_root(roots, seen, projects / _project_dir_name(variant))
     return roots
 
 
@@ -644,6 +669,116 @@ def make_workspace_sandbox_hook(workspace_root: Path):
                 return _deny(reason)
             return {}
 
+        return {}
+
+    return hook
+
+
+# Characters that make a path a pattern the shell or Glob expands later.
+_GLOB_CHARS = "*?["
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def make_claude_home_guard_hook(workspace_root: Path):
+    """Build the always-on PreToolUse guard for the shared ``$HOME/.claude``.
+
+    Every gateway CLI child shares one HOME, so ``~/.claude/projects/*`` holds
+    every user's transcripts, tool results and auto memory, and ``plans/`` the
+    CLI's default plan files. That is cross-user confidentiality, not the
+    opt-in workspace policy, so this guard is installed for every session
+    regardless of ``WORKSPACE_SANDBOX_ENABLED`` / ``WORKSPACE_SANDBOX_ALLOW_OUTSIDE``
+    and whatever the permission mode (PreToolUse hooks run under
+    ``bypassPermissions`` too). Inside ``$HOME/.claude`` it allows:
+
+    * read + write: this session's own ``projects/<encoded cwd>``;
+    * read only: the shared assets (skills, plugins, agents, commands,
+      output styles, ``CLAUDE.md``) and plugin resource roots under it.
+
+    Everything else under ``$HOME/.claude`` is denied. Paths outside it are
+    left to the workspace sandbox. Bash is checked statically like the
+    sandbox, plus ``$VAR`` expansion and glob prefixes (``~/.cl*``) that could
+    reach into ``$HOME/.claude``; command substitution and a ``cd`` followed by
+    a relative path cannot be resolved here.
+    """
+    workspace = Path(workspace_root).resolve()
+    claude_home = _claude_home()
+    own = _own_project_roots(Path(workspace_root), claude_home)
+    readable = list(own)
+    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
+        if root not in readable:
+            readable.append(root)
+
+    def _absolute(candidate: str) -> str:
+        expanded = os.path.expandvars(os.path.expanduser(candidate))
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(str(workspace), expanded)
+        return expanded
+
+    def violation(candidate: str, write: bool) -> Optional[str]:
+        if claude_home is None or not candidate:
+            return None
+        allowed = own if write else readable
+        absolute = _absolute(candidate)
+        cut = min((absolute.find(c) for c in _GLOB_CHARS if c in absolute), default=-1)
+        if cut >= 0:
+            # A pattern: deny when its fixed prefix could expand into
+            # $HOME/.claude outside the allowed roots.
+            prefix = os.path.normpath(absolute[:cut]) if cut else "/"
+            fixed = absolute[:cut]
+            home = str(claude_home)
+            reaches = home.startswith(fixed) or _is_within(Path(prefix), claude_home)
+            if not reaches:
+                return None
+            if any(_is_within(Path(prefix), root) for root in allowed):
+                return None
+            return candidate
+        try:
+            resolved = Path(absolute).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return candidate
+        if not _is_within(resolved, claude_home):
+            return None
+        if any(_is_within(resolved, root) for root in allowed):
+            return None
+        return candidate
+
+    def deny(tool: str, path: str) -> Dict[str, Any]:
+        return _deny(
+            f"{tool} target {path!r} is in the shared Claude state directory "
+            f"({claude_home}), which holds other users' sessions and plans. Only "
+            "this session's own project directory is available there (shared "
+            "skills and plugins are read-only)."
+        )
+
+    async def hook(input_data, _tool_use_id, _context):
+        if claude_home is None or not isinstance(input_data, dict):
+            return {}
+        tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input", {}) or {}
+        if tool_name in _TOOL_TABLE:
+            category, key, _optional = _TOOL_TABLE[tool_name]
+            write = category == "write"
+            candidates = [tool_input.get(key)]
+            if tool_name == "Glob":
+                candidates.append(tool_input.get("pattern"))
+            for candidate in candidates:
+                if isinstance(candidate, str) and violation(candidate, write):
+                    return deny(tool_name, candidate)
+            return {}
+        if tool_name == "Bash":
+            command = tool_input.get("command", "")
+            if not isinstance(command, str):
+                return {}
+            for candidate in _bash_path_candidates(command):
+                if violation(candidate, write=False):
+                    return deny("Bash", candidate)
         return {}
 
     return hook

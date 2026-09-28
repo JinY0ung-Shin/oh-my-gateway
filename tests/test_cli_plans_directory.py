@@ -60,10 +60,12 @@ class TestPlansDirectoryOption:
         options = _make_cli()._build_sdk_options()
         assert json.loads(options.settings) == {"plansDirectory": "docs/plans"}
 
-    def test_empty_env_keeps_cli_default(self, monkeypatch):
-        monkeypatch.setenv("CLAUDE_PLANS_DIRECTORY", "")
+    @pytest.mark.parametrize("raw", ["", "  ", "/home/app/.claude/plans", "../x"])
+    def test_no_value_reopens_the_shared_default(self, monkeypatch, raw):
+        """Empty, absolute or ``..`` never falls back to the shared ~/.claude/plans."""
+        monkeypatch.setenv("CLAUDE_PLANS_DIRECTORY", raw)
         options = _make_cli()._build_sdk_options()
-        assert options.settings is None
+        assert json.loads(options.settings) == {"plansDirectory": ".claude/plans"}
 
 
 @pytest.fixture
