@@ -137,4 +137,4 @@ async def test_guard_denies_other_users_state_under_bypass(tmp_path):
     assert results, "the Read never produced a tool result"
     text = json.dumps(results)
     assert canary not in text
-    assert "shared Claude state directory" in text
+    assert "is shared Claude state" in text

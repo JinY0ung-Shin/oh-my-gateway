@@ -699,10 +699,12 @@ def make_claude_home_guard_hook(workspace_root: Path):
 
     * read + write: this session's own ``projects/<encoded cwd>``;
     * read only: the shared assets (skills, plugins, agents, commands,
-      output styles, ``CLAUDE.md``) and plugin resource roots under it.
+      output styles, ``CLAUDE.md``) and the plugin resource roots, including
+      the ones outside ``$HOME/.claude`` (``CLAUDE_PLUGIN_CLONE_ROOT``, a
+      marketplace ``installLocation``, an ``installPath`` outside the cache).
 
-    Everything else under ``$HOME/.claude`` is denied. Paths outside it are
-    left to the workspace sandbox.
+    Everything else under ``$HOME/.claude`` is denied. Other paths outside it
+    are left to the workspace sandbox.
 
     The guarantee covers the file tools (Read, Grep, Glob, Write, Edit,
     MultiEdit, NotebookEdit), whose target is a structured path. For Bash
@@ -724,6 +726,16 @@ def make_claude_home_guard_hook(workspace_root: Path):
     for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
         if root not in readable:
             readable.append(root)
+    # Shared, read-only for the write tools wherever they live: plugin resource
+    # roots may sit outside $HOME/.claude (CLAUDE_PLUGIN_CLONE_ROOT, a
+    # marketplace installLocation, an installPath outside the cache). A root
+    # that contains the workspace itself is left out so the session can still
+    # write its own files.
+    shared_read_only = [
+        root
+        for root in readable
+        if root not in own and not _is_within(workspace, root)
+    ]
 
     def _absolute(candidate: str) -> str:
         expanded = os.path.expandvars(os.path.expanduser(candidate))
@@ -753,6 +765,9 @@ def make_claude_home_guard_hook(workspace_root: Path):
             resolved = Path(absolute).resolve()
         except (OSError, RuntimeError, ValueError):
             return candidate
+        if write and not any(_is_within(resolved, root) for root in own):
+            if any(_is_within(resolved, root) for root in shared_read_only):
+                return candidate
         if not _is_within(resolved, claude_home):
             return None
         if any(_is_within(resolved, root) for root in allowed):
@@ -761,10 +776,10 @@ def make_claude_home_guard_hook(workspace_root: Path):
 
     def deny(tool: str, path: str) -> Dict[str, Any]:
         return _deny(
-            f"{tool} target {path!r} is in the shared Claude state directory "
-            f"({claude_home}), which holds other users' sessions and plans. Only "
-            "this session's own project directory is available there (shared "
-            "skills and plugins are read-only)."
+            f"{tool} target {path!r} is shared Claude state ({claude_home} or a "
+            "shared plugin root), which holds other users' sessions and plans. "
+            "Only this session's own project directory is available there; "
+            "shared skills and plugins are read-only."
         )
 
     async def hook(input_data, _tool_use_id, _context):

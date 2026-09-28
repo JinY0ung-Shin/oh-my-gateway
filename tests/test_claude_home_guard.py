@@ -127,6 +127,69 @@ async def test_own_state_and_shared_assets_stay_usable(tmp_path, home):
     assert _is_deny(await _call(hook, "Write", write_skill))
 
 
+@pytest.mark.parametrize("allow_outside", [None, "write", "read,write,bash"])
+async def test_external_plugin_roots_are_read_only(
+    tmp_path, home, monkeypatch, allow_outside
+):
+    """Plugin roots outside ~/.claude are shared too: readable, never writable."""
+    if allow_outside:
+        monkeypatch.setenv("WORKSPACE_SANDBOX_ALLOW_OUTSIDE", allow_outside)
+    clone_root = tmp_path / "shared" / "plugin-clone"
+    skill = clone_root / "mkt" / "skills" / "demo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("---\nname: demo\n---\n")
+    monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(clone_root))
+    hook = make_claude_home_guard_hook(_workspace(tmp_path, "alice"))
+    for tool, key in [("Read", "file_path"), ("Grep", "path"), ("Glob", "path")]:
+        target = skill if key == "file_path" else skill.parent
+        assert await _call(hook, tool, {key: str(target)}) == {}, tool
+    edits = [
+        ("Write", {"file_path": str(skill), "content": "x"}),
+        ("Edit", {"file_path": str(skill), "old_string": "a", "new_string": "b"}),
+        ("MultiEdit", {"file_path": str(skill), "edits": []}),
+        ("NotebookEdit", {"notebook_path": str(clone_root / "n.ipynb")}),
+    ]
+    for tool, tool_input in edits:
+        assert _is_deny(await _call(hook, tool, tool_input)), tool
+
+
+async def test_registry_install_paths_outside_claude_home_are_read_only(
+    tmp_path, home, monkeypatch
+):
+    """A marketplace installLocation / plugin installPath outside ~/.claude."""
+    import json
+
+    location = tmp_path / "local-mkt"
+    install = tmp_path / "plugin-install"
+    for d in (location, install):
+        d.mkdir()
+        (d / "SKILL.md").write_text("x")
+    plugins = home / ".claude" / "plugins"
+    plugins.mkdir(parents=True)
+    (plugins / "known_marketplaces.json").write_text(
+        json.dumps({"mkt": {"installLocation": str(location)}})
+    )
+    (plugins / "installed_plugins.json").write_text(
+        json.dumps({"plugins": {"p@mkt": [{"installPath": str(install)}]}})
+    )
+    hook = make_claude_home_guard_hook(_workspace(tmp_path, "alice"))
+    for root in (location, install):
+        target = str(root / "SKILL.md")
+        assert await _call(hook, "Read", {"file_path": target}) == {}
+        write = {"file_path": target, "content": "x"}
+        assert _is_deny(await _call(hook, "Write", write)), root
+
+
+async def test_a_plugin_root_that_contains_the_workspace_keeps_it_writable(
+    tmp_path, home, monkeypatch
+):
+    monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(tmp_path))
+    ws = _workspace(tmp_path, "alice")
+    hook = make_claude_home_guard_hook(ws)
+    write = {"file_path": str(ws / "notes.md"), "content": "x"}
+    assert await _call(hook, "Write", write) == {}
+
+
 async def test_paths_outside_claude_home_are_left_to_the_sandbox(tmp_path, home):
     hook = make_claude_home_guard_hook(_workspace(tmp_path, "alice"))
     assert await _call(hook, "Read", {"file_path": "/etc/hostname"}) == {}
