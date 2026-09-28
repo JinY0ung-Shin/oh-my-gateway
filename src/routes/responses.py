@@ -506,6 +506,22 @@ async def _shielded_stream_teardown(coro, description: str) -> None:
         raise
 
 
+def _reject_while_human_decision_pending(session) -> None:
+    """409 when the session is parked on a human decision (see create_response)."""
+    pending = getattr(session, "pending_tool_call", None) if session else None
+    if pending is None:
+        return
+    name = pending.get("name") or "a tool call"
+    raise HTTPException(
+        status_code=409,
+        detail=(
+            f"This session is waiting for the user's decision on {name} "
+            f"(call_id '{pending.get('call_id', '')}'). Answer it with a "
+            "function_call_output before sending another turn."
+        ),
+    )
+
+
 def _clear_stale_pending_tool_call(session, reason: str) -> None:
     """Release an AskUserQuestion pause whose owning client is going away.
 
@@ -2086,6 +2102,15 @@ async def create_response(
         return await _handle_function_call_output(
             body, resolved, backend, session, session_id, workspace_str, fc_output
         )
+
+    # A paused human decision (AskUserQuestion, ExitPlanMode) accepts exactly one
+    # continuation: the matching function_call_output above. Anything else would
+    # move the parked SDK client past the decision — a policy refresh
+    # (set_permission_mode) or a new query on it before the user answered, which
+    # for ExitPlanMode means leaving plan mode unreviewed. Refuse it before any
+    # policy refresh or client call. Timeout and client teardown clear the pause,
+    # so this never wedges a session.
+    _reject_while_human_decision_pending(session)
 
     # Codex carries multimodal turns as a list of input items rather than a
     # single collapsed text prompt. Build the list directly from the request
