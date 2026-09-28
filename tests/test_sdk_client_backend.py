@@ -9,6 +9,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
+
 from claude_agent_sdk.types import PermissionResultAllow, PermissionResultDeny
 
 from src.session_manager import Session
@@ -421,6 +423,74 @@ async def test_can_use_tool_intercepts_ask_user_question():
     # After completion, input_response and input_event are reset
     assert session.input_response is None
     assert session.input_event is None
+
+
+async def _park_and_answer(tool_name, input_data, answer, call_id="tu_plan_1"):
+    cli = _make_cli()
+    session = Session(session_id=f"sess-{call_id}")
+    can_use_tool = cli._make_ask_user_can_use_tool(session)
+    task = asyncio.create_task(can_use_tool(tool_name, input_data, _ctx(call_id)))
+    await asyncio.sleep(0.05)
+    parked = dict(session.pending_tool_call or {})
+    session.input_response = answer
+    session.input_event.set()
+    return parked, await task, session
+
+
+async def test_exit_plan_mode_parks_for_human_review():
+    """ExitPlanMode is a human decision, not an auto-approved tool.
+
+    Without this park the callback approved it and a permission_mode=plan turn went
+    straight on to execute its own plan (verified live on the unmodified gateway:
+    ExitPlanMode → approved → Bash ran in the same turn).
+    """
+    plan = {"plan": "## 계획\n1. 읽는다\n2. 고친다"}
+    parked, result, session = await _park_and_answer(
+        "ExitPlanMode", plan, '{"approved": true}'
+    )
+    assert parked == {"call_id": "tu_plan_1", "name": "ExitPlanMode", "arguments": plan}
+    assert isinstance(result, PermissionResultAllow)
+    # Approval leaves plan mode for the rest of the session — the same turn executes.
+    [update] = result.updated_permissions
+    assert (update.type, update.mode, update.destination) == (
+        "setMode",
+        "default",
+        "session",
+    )
+    # pending_tool_call is cleared by the route (_commit_pending_tool_call_locked)
+    assert session.input_event is None and session.input_response is None
+
+
+async def test_exit_plan_mode_approval_restores_the_operator_default(monkeypatch):
+    monkeypatch.setenv("PERMISSION_MODE", "acceptEdits")
+    _, result, _ = await _park_and_answer("ExitPlanMode", {"plan": "p"}, "approved")
+    assert result.updated_permissions[0].mode == "acceptEdits"
+    # plan itself is never the execution mode
+    monkeypatch.setenv("PERMISSION_MODE", "plan")
+    _, result, _ = await _park_and_answer(
+        "ExitPlanMode", {"plan": "p"}, "approve", "tu_2"
+    )
+    assert result.updated_permissions[0].mode == "default"
+
+
+@pytest.mark.parametrize(
+    "answer, feedback",
+    [
+        ('{"approved": false, "feedback": "백업부터"}', "백업부터"),
+        ('{"approved": false}', ""),
+        ("테스트를 먼저 추가해 주세요", "테스트를 먼저 추가해 주세요"),
+        ('{"approved": "yes"}', ""),  # only a real true approves
+    ],
+)
+async def test_exit_plan_mode_keep_planning_never_executes(answer, feedback):
+    _, result, _ = await _park_and_answer("ExitPlanMode", {"plan": "p"}, answer)
+    assert isinstance(result, PermissionResultDeny)
+    assert (
+        "keep planning" in result.message and "Do not start executing" in result.message
+    )
+    if feedback:
+        assert feedback in result.message
+    assert result.interrupt is False  # the model stays in the turn and revises
 
 
 async def test_can_use_tool_times_out_when_client_does_not_respond():

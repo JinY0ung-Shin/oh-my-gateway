@@ -268,6 +268,10 @@ class BackendRegistry:
             "image_input": False,
             "reasoning_effort": False,
             "reasoning_effort_accepted": False,
+            # A permission_mode=plan turn pauses on the plan for the user's
+            # approval before anything runs. Only a backend that implements
+            # that pause may claim it; everything else fails closed.
+            "plan_approval": False,
             **desc.capabilities,
         }
         # Per-model narrowing runs last. The descriptor-level flag is the

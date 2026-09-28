@@ -27,9 +27,39 @@ class TestDescriptorCapabilities:
         assert CLAUDE_DESCRIPTOR.capabilities == {
             "image_input": True,
             "reasoning_effort_accepted": True,
+            "plan_approval": True,
         }
         assert CODEX_DESCRIPTOR.capabilities == {"image_input": True}
         assert OPENCODE_DESCRIPTOR.capabilities == {"image_input": True}
+
+    def test_plan_approval_is_claimed_per_backend_and_only_by_claude(self):
+        """A "plan first" client gates on the model it will use (ChatDRAGON #453).
+
+        Only the Claude backend parks ExitPlanMode for the user's decision; Codex
+        maps ``plan`` to per-action on-request approval and OpenCode ignores
+        ``permission_mode``, so a gateway-wide flag would open plan mode on models
+        that run the plan unreviewed. Every model entry carries the key and it
+        defaults to False.
+        """
+        from src.backends.appserver.client import DESCRIPTOR as APPSERVER_DESCRIPTOR
+        from src.backends.claude.client import (
+            EXIT_PLAN_MODE_TOOL_NAME,
+            HUMAN_DECISION_TOOLS,
+        )
+
+        assert EXIT_PLAN_MODE_TOOL_NAME in HUMAN_DECISION_TOOLS
+        claude = BackendRegistry._model_entry(CLAUDE_DESCRIPTOR, "sonnet")
+        assert claude["capabilities"]["plan_approval"] is True
+        for desc in (CODEX_DESCRIPTOR, OPENCODE_DESCRIPTOR, APPSERVER_DESCRIPTOR):
+            entry = BackendRegistry._model_entry(desc, "some-model")
+            assert entry["capabilities"]["plan_approval"] is False, desc.name
+
+    def test_the_catalog_carries_no_gateway_wide_plan_flag(self):
+        """A gateway-wide bool is too coarse on a multi-backend gateway; the only
+        signal is the per-model capability above."""
+        with client_context() as (client, _mock_cli):
+            body = client.get("/v1/slash-commands").json()
+        assert "plan_approval_available" not in body
 
     def test_only_claude_accepts_reasoning_effort(self):
         """``reasoning.effort`` is rejected for every non-claude backend by the
@@ -103,6 +133,7 @@ class TestAvailableModelsMetadata:
             "image_input": False,
             "reasoning_effort": False,
             "reasoning_effort_accepted": False,
+            "plan_approval": False,
         }
 
     def test_unregistered_backend_models_stay_hidden(self, clean_registry):
@@ -406,4 +437,5 @@ class TestReasoningEffortIsGuaranteedPerModel:
             "image_input": True,
             "reasoning_effort": False,
             "reasoning_effort_accepted": False,
+            "plan_approval": False,
         }

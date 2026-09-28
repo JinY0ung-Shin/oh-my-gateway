@@ -539,6 +539,67 @@ class TestIntegrationFunctionCallOutput:
         assert r2.status_code == 400
         assert "no pending tool call" in r2.json()["error"]["message"]
 
+    @pytest.mark.parametrize("tool", ["AskUserQuestion", "ExitPlanMode"])
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_plain_turn_while_a_decision_is_pending_is_refused(
+        self, isolated_session_manager, tool, stream
+    ):
+        """A parked human decision accepts only its matching function_call_output.
+
+        A plain continuation (here also flipping ``permission_mode``) must be refused
+        before the route touches the parked client: no policy refresh (that would be
+        ``set_permission_mode`` leaving plan mode unreviewed) and no new query. The
+        pause itself stays intact so the real answer can still land.
+        """
+        from src.routes.responses import _parse_response_id
+
+        runs: list = []
+
+        async def fake_run_completion(client, prompt, session):
+            runs.append(prompt)
+            yield {"subtype": "success", "result": "Hello"}
+
+        with _integration_client_context() as (client, mock_cli):
+            mock_cli.run_completion_with_client = fake_run_completion
+            mock_cli.parse_message = MagicMock(return_value="Hello")
+            mock_cli.update_request_policy = AsyncMock()
+
+            r1 = client.post(
+                "/v1/responses",
+                json={"model": DEFAULT_MODEL, "input": "plan it", "stream": False},
+                headers={"Authorization": "Bearer test"},
+            )
+            assert r1.status_code == 200
+            resp_id = r1.json()["id"]
+            session_id, _turn = _parse_response_id(resp_id)
+            session = isolated_session_manager.peek_session(session_id)
+            event = asyncio.Event()
+            pending = {"call_id": "toolu_decide", "name": tool, "arguments": {}}
+            session.pending_tool_call = dict(pending)
+            session.input_event = event
+            runs.clear()
+            mock_cli.update_request_policy.reset_mock()
+
+            r2 = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "never mind, just do it",
+                    "previous_response_id": resp_id,
+                    "permission_mode": "default",
+                    "stream": stream,
+                },
+                headers={"Authorization": "Bearer test"},
+            )
+
+        assert r2.status_code == 409, r2.text
+        assert tool in r2.json()["error"]["message"]
+        assert "function_call_output" in r2.json()["error"]["message"]
+        mock_cli.update_request_policy.assert_not_called()
+        assert runs == []
+        assert session.pending_tool_call == pending
+        assert session.input_event is event and not event.is_set()
+
     def test_removed_chat_completions_returns_404(self):
         """Removed /v1/chat/completions returns 404 or 405."""
         with _integration_client_context() as (client, _mock_cli):

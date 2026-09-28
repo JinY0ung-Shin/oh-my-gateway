@@ -226,3 +226,4 @@ def test_catalog_endpoint_reports_the_scheduling_capability(
     assert {
         k: body[k] for k in constants.deferred_capabilities()
     } == constants.deferred_capabilities()
+
