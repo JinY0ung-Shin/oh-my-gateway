@@ -82,6 +82,8 @@ async def test_other_users_state_is_denied_with_the_sandbox_off(
     ]:
         result = await _call(hook, tool, {key: str(target)})
         assert _is_deny(result), (tool, target)
+    # Bash is static defense in depth, not a boundary (see the guard's
+    # docstring): these are the statically visible forms it does catch.
     for command in (
         "cat ~/.claude/plans/bobs-plan.md",
         f"cat {transcript}",

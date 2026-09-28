@@ -126,7 +126,12 @@ uv run pytest --cov=src                            # with coverage
   the session's own `projects/<name>` entry plus read-only shared assets (skills, plugins, agents,
   commands, output-styles, `CLAUDE.md`) — never other users' `plans/` or transcripts. `<name>` is
   the CLI's exact naming (`_project_dir_name`: 200 UTF-16 units + `-<base36 hash>` beyond that),
-  pinned in `tests/test_cli_project_dir_name.py`; never grant by prefix. Plan files are moved into
+  pinned in `tests/test_cli_project_dir_name.py`; never grant by prefix. That guarantee holds for the
+  file tools only: for **Bash the guard is static defense in depth, not a boundary** (shell-local vars,
+  `cd` + relative paths, command substitution and Bash writes to shared assets get through). Bash is
+  not isolated across users today: the CLI's OS bash sandbox only restricts reads via `Read` deny
+  rules, which the gateway does not set (#218). Don't describe the guard as covering Bash. Plan files are
+  moved into
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
   `tests/test_cli_plans_directory.py` pins it against the bundled CLI.

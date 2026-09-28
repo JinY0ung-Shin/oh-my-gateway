@@ -702,10 +702,20 @@ def make_claude_home_guard_hook(workspace_root: Path):
       output styles, ``CLAUDE.md``) and plugin resource roots under it.
 
     Everything else under ``$HOME/.claude`` is denied. Paths outside it are
-    left to the workspace sandbox. Bash is checked statically like the
-    sandbox, plus ``$VAR`` expansion and glob prefixes (``~/.cl*``) that could
-    reach into ``$HOME/.claude``; command substitution and a ``cd`` followed by
-    a relative path cannot be resolved here.
+    left to the workspace sandbox.
+
+    The guarantee covers the file tools (Read, Grep, Glob, Write, Edit,
+    MultiEdit, NotebookEdit), whose target is a structured path. For Bash
+    this is **defense in depth only**, not a security boundary: it catches the
+    statically visible paths (plus ``$VAR`` expansion and glob prefixes such
+    as ``~/.cl*``), but shell semantics defeat any static parse. Shell-local
+    variables (``H=$HOME; cat $H/.claude/...``), a ``cd`` followed by a
+    relative path, and command substitution all get through, and Bash is not
+    split into read and write intent, so it can also modify the shared
+    assets. The gateway does not isolate Bash across users today: even the
+    CLI's OS-level bash sandbox (``CLAUDE_SANDBOX_ENABLED``) only restricts
+    reads through ``Read`` deny rules, which are not configured (#218). Do not
+    describe this guard as covering Bash.
     """
     workspace = Path(workspace_root).resolve()
     claude_home = _claude_home()
