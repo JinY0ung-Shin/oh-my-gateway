@@ -5,6 +5,7 @@ implementation registered as the ``claude`` backend.
 """
 
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -30,6 +31,7 @@ from claude_agent_sdk.types import (
     HookMatcher,
     PermissionResultAllow,
     PermissionResultDeny,
+    PermissionUpdate,
 )
 from claude_agent_sdk.types import (
     SandboxSettings,
@@ -310,6 +312,66 @@ def describe_sdk_stream_error(exc: BaseException) -> str:
         "tool call (fewer results, no inline images) or raise "
         "CLAUDE_MAX_BUFFER_SIZE on the gateway."
     )
+
+
+EXIT_PLAN_MODE_TOOL_NAME = "ExitPlanMode"
+# Tools whose permission request is a human decision the client must answer
+# (function_call → requires_action → function_call_output), never auto-approved.
+HUMAN_DECISION_TOOLS = frozenset({"AskUserQuestion", EXIT_PLAN_MODE_TOOL_NAME})
+_EXECUTION_MODES = ("default", "acceptEdits", "bypassPermissions")
+
+
+def plan_execution_mode() -> str:
+    """The mode an approved plan continues in: the operator default, never ``plan``."""
+    configured = (os.getenv("PERMISSION_MODE") or "").strip()
+    return configured if configured in _EXECUTION_MODES else "default"
+
+
+def plan_decision_result(output: str):
+    """Map the client's ExitPlanMode answer onto the CLI permission result.
+
+    The ``function_call_output`` is JSON ``{"approved": true}`` or
+    ``{"approved": false, "feedback": "..."}``; a bare ``approve``/``approved``
+    string is accepted too. Anything else is "keep planning" with the text as
+    feedback — an unreadable answer must never start execution.
+
+    Approval allows the tool and moves the session out of plan mode (``setMode``
+    to :func:`plan_execution_mode`) so the same turn carries on executing. Keep
+    planning denies it; the CLI hands the message back to the model, which stays
+    in plan mode and revises.
+    """
+    approved = False
+    feedback = ""
+    text = (output or "").strip()
+    try:
+        parsed = json.loads(text) if text else {}
+    except ValueError:
+        parsed = None
+    if isinstance(parsed, dict):
+        approved = parsed.get("approved") is True
+        feedback = str(parsed.get("feedback") or "").strip()
+    elif text.lower() in ("approve", "approved"):
+        approved = True
+    else:
+        feedback = text
+    if approved:
+        return PermissionResultAllow(
+            updated_permissions=[
+                PermissionUpdate(
+                    type="setMode",
+                    mode=cast(Any, plan_execution_mode()),
+                    destination="session",
+                )
+            ]
+        )
+    message = (
+        "The user reviewed the plan and wants to keep planning. Do not start executing."
+    )
+    if feedback:
+        message += f" Their feedback: {feedback}"
+    else:
+        message += " Ask what they would like changed."
+    return PermissionResultDeny(message=message)
 
 
 class UnsupportedContinuationPolicy(ValueError):
@@ -1437,18 +1499,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         (the same contract the old PreToolUse hook used). Every other tool that
         reaches this callback is approved; hooks (workspace sandbox, Skill) run
         before it, so this does not weaken those gates.
+
+        ExitPlanMode (plan mode's "I am done planning") parks the same way, so a
+        human reviews the plan before anything runs; see :func:`plan_decision_result`.
+        Without this the callback would auto-approve it and a ``permission_mode=plan``
+        turn would start executing its own plan unreviewed.
+        (Verified live on CLI 2.1.220: ExitPlanMode reaches this callback in plan
+        mode even when ``allowed_tools`` lists it, so a client cannot opt out of
+        the review by allow-listing the tool.)
         """
 
-        async def can_use_tool(tool_name, input_data, context):
-            if tool_name != "AskUserQuestion":
-                return PermissionResultAllow()
-
-            tool_input = input_data if isinstance(input_data, dict) else {}
-            call_id = getattr(context, "tool_use_id", None) or ""
-
+        async def park(tool_name: str, tool_input: dict, call_id: str) -> Optional[str]:
+            """Pause the turn on a human decision; the answer text, or None on timeout."""
             session.pending_tool_call = {
                 "call_id": call_id,
-                "name": "AskUserQuestion",
+                "name": tool_name,
                 "arguments": tool_input,
             }
             session.input_event = asyncio.Event()
@@ -1466,21 +1531,36 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
             except asyncio.TimeoutError:
                 logger.warning(
-                    "AskUserQuestion timed out after %ds for session %s",
+                    "%s timed out after %ds for session %s",
+                    tool_name,
                     ASK_USER_TIMEOUT_SECONDS,
                     session.session_id,
                 )
                 session.input_response = None
                 session.input_event = None
                 session.pending_tool_call = None
-                return PermissionResultDeny(
-                    message="User did not respond within the timeout period."
-                )
+                return None
 
             # Capture response before clearing state
             user_response = session.input_response or ""
             session.input_response = None
             session.input_event = None
+            return user_response
+
+        async def can_use_tool(tool_name, input_data, context):
+            if tool_name not in HUMAN_DECISION_TOOLS:
+                return PermissionResultAllow()
+
+            tool_input = input_data if isinstance(input_data, dict) else {}
+            call_id = getattr(context, "tool_use_id", None) or ""
+            user_response = await park(tool_name, tool_input, call_id)
+            if user_response is None:
+                return PermissionResultDeny(
+                    message="User did not respond within the timeout period."
+                )
+
+            if tool_name == EXIT_PLAN_MODE_TOOL_NAME:
+                return plan_decision_result(user_response)
 
             # Deny with the user's response as the message — the CLI converts
             # this to a tool_result that Claude reads as the user's answer.

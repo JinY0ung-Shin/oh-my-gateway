@@ -135,7 +135,7 @@ Most settings are environment variables. Start with `.env.example`.
 | `USER_WORKSPACES_DIR` | Workspace base directory (system temp dir if unset; see Workspaces) |
 | `MCP_CONFIG` | Shared MCP server config |
 | `METADATA_ENV_ALLOWLIST` | Request metadata keys forwarded as env vars to Claude |
-| `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion wait time before denying the tool call |
+| `ASK_USER_TIMEOUT_SECONDS` | AskUserQuestion / plan-approval (`ExitPlanMode`) wait time before denying the tool call |
 | `BLOCKED_DEFERRED_TOOLS` | Post-turn schedulers to deny; default `ScheduleWakeup,CronCreate` (see below) |
 | `OPENCODE_BASE_URL` | Enables OpenCode external mode (stale backend) |
 | `OPENCODE_MODELS` | Gateway allowlist for OpenCode models (stale backend) |
@@ -493,6 +493,13 @@ Effective `/v1/responses` request fields:
   (naming the accepted levels) instead of reaching an upstream that would fail the turn. `none`
   (disable thinking) is never rejected.
 - `permission_mode`: set or update the session permission mode (`default`, `acceptEdits`, `bypassPermissions`, or `plan`); omitted continuation requests keep the current session mode.
+  In `plan` mode the model's `ExitPlanMode` ("the plan is ready") is a human decision, like
+  `AskUserQuestion`: the turn pauses with `status: "requires_action"` and a `function_call` named
+  `ExitPlanMode` whose `arguments` carry `{"plan": "<markdown>"}`. Answer with a
+  `function_call_output` of `{"approved": true}` to leave plan mode and let the same turn execute
+  (the session continues in `PERMISSION_MODE`, or `default`), or `{"approved": false, "feedback":
+  "..."}` to keep planning — any other answer also keeps planning, so an unreadable reply never
+  starts execution. The pause holds even when `allowed_tools` lists `ExitPlanMode`.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key (see [Workspaces](#workspaces)); also injected
   into the session's system prompt as `Current user: {user}` on the Claude
@@ -540,7 +547,7 @@ Semantics:
   `incomplete` turn (`incomplete_details.reason: "user_cancelled"`); a backend
   failure leaves the turn uncommitted — the response id stays retrievable with
   `status: "failed"` and retrying the same `previous_response_id` reuses it.
-- A paused `AskUserQuestion` surfaces as `status: "requires_action"`; answer it
+- A paused `AskUserQuestion` or plan approval (`ExitPlanMode`) surfaces as `status: "requires_action"`; answer it
   with a normal (non-background) `function_call_output` POST.
 - One turn per session at a time (the session lock applies to background turns
   too); `BACKGROUND_RESPONSE_TIMEOUT_S` (default 3600) bounds a wedged turn.
