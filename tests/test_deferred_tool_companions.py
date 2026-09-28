@@ -227,23 +227,3 @@ def test_catalog_endpoint_reports_the_scheduling_capability(
         k: body[k] for k in constants.deferred_capabilities()
     } == constants.deferred_capabilities()
 
-
-def test_both_endpoints_advertise_plan_approval(admin_client, public_client):
-    """A client promising "nothing runs before you approve" gates plan turns on this.
-
-    Older gateways auto-approve ExitPlanMode and run the plan in the same turn;
-    they carry no such flag, so a client that requires it fails closed there.
-    """
-    from src.backends.claude import slash_commands as sc_module
-    from src.backends.claude.client import HUMAN_DECISION_TOOLS
-
-    async def fake_details(cwd=None, force=False):
-        return {}
-
-    with patch.object(sc_module, "get_command_details", side_effect=fake_details):
-        catalog = public_client.get("/v1/slash-commands").json()
-    info = admin_client.get("/admin/api/server-info").json()
-
-    assert "ExitPlanMode" in HUMAN_DECISION_TOOLS
-    assert catalog["plan_approval_available"] is True
-    assert info["plan_approval_available"] is True

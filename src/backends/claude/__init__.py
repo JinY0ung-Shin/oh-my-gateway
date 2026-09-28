@@ -253,7 +253,17 @@ CLAUDE_DESCRIPTOR = BackendDescriptor(
     # the model — and it is **not** a property of the backend, so it is left to
     # fail closed here and computed per model below. See
     # ``_claude_model_capabilities``.
-    capabilities={"image_input": True, "reasoning_effort_accepted": True},
+    #
+    # ``plan_approval``: a ``permission_mode=plan`` turn parks on ExitPlanMode
+    # for the user's decision (``HUMAN_DECISION_TOOLS`` in client.py) instead of
+    # running the plan. It is per backend: Codex maps ``plan`` to per-action
+    # ``on-request`` approval and OpenCode ignores ``permission_mode``, so a
+    # client offering "plan first" must read this on the model it will use.
+    capabilities={
+        "image_input": True,
+        "reasoning_effort_accepted": True,
+        "plan_approval": True,
+    },
     model_meta_fn=_claude_model_entry_meta,
     model_capabilities_fn=_claude_model_capabilities,
     model_discovery_fn=discover_models,
