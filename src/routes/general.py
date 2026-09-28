@@ -77,6 +77,7 @@ async def list_slash_commands(
     await verify_api_key(request, credentials)
 
     from src.backends.claude import slash_commands
+    from src.backends.claude.client import human_decision_capabilities
     from src.backends.claude.constants import deferred_capabilities
 
     try:
@@ -97,6 +98,9 @@ async def list_slash_commands(
         "total": len(allowed),
         "blocked": sorted(slash_commands.BLOCKED_COMMANDS),
         **deferred_capabilities(),
+        # Same reason: a composer offering "plan first" has to know the plan will
+        # wait for approval here, before it sends the turn.
+        **human_decision_capabilities(),
     }
 
 

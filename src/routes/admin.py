@@ -264,6 +264,7 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
     # after the HTTP turn closes, so it is blocked unless the embedding surface
     # can poll `pending-events`. Without this field a surface only finds out by
     # running the turn and reading the model improvise (ChatDRAGON issue #397).
+    from src.backends.claude.client import human_decision_capabilities
     from src.backends.claude.constants import (
         BLOCKED_DEFERRED_TOOLS,
         deferred_capabilities,
@@ -280,6 +281,7 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
         # Each capability comes from the tool it needs, so a client never hides a
         # working scheduler nor advertises a blocked one (review on #202).
         **deferred_capabilities(),
+        **human_decision_capabilities(),
     }
 
 

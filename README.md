@@ -500,6 +500,9 @@ Effective `/v1/responses` request fields:
   (the session continues in `PERMISSION_MODE`, or `default`), or `{"approved": false, "feedback":
   "..."}` to keep planning — any other answer also keeps planning, so an unreadable reply never
   starts execution. The pause holds even when `allowed_tools` lists `ExitPlanMode`.
+  `GET /v1/slash-commands` and `/admin/api/server-info` report `plan_approval_available: true`
+  so a client can confirm the pause before offering a "plan first" mode — gateways without the
+  flag auto-approve the plan and run it in the same turn.
 - `temperature` and `max_output_tokens`: forwarded to Codex as generation controls; accepted for compatibility elsewhere.
 - `user`: per-user workspace key (see [Workspaces](#workspaces)); also injected
   into the session's system prompt as `Current user: {user}` on the Claude

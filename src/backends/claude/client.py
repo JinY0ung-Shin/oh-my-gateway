@@ -321,6 +321,20 @@ HUMAN_DECISION_TOOLS = frozenset({"AskUserQuestion", EXIT_PLAN_MODE_TOOL_NAME})
 _EXECUTION_MODES = ("default", "acceptEdits", "bypassPermissions")
 
 
+def human_decision_capabilities() -> dict[str, bool]:
+    """Advertised human-decision capabilities for client surfaces.
+
+    ``plan_approval_available`` tells a client that a ``permission_mode=plan``
+    turn parks on ``ExitPlanMode`` for the user's decision instead of executing
+    the plan in the same turn. A client that promises "nothing runs before you
+    approve" must see this before it sends a plan turn: a gateway without the
+    flag (older builds) auto-approves the plan and runs it.
+    """
+    return {
+        "plan_approval_available": EXIT_PLAN_MODE_TOOL_NAME in HUMAN_DECISION_TOOLS
+    }
+
+
 def plan_execution_mode() -> str:
     """The mode an approved plan continues in: the operator default, never ``plan``."""
     configured = (os.getenv("PERMISSION_MODE") or "").strip()
