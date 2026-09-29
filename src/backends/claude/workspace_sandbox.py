@@ -728,14 +728,10 @@ def make_claude_home_guard_hook(workspace_root: Path):
             readable.append(root)
     # Shared, read-only for the write tools wherever they live: plugin resource
     # roots may sit outside $HOME/.claude (CLAUDE_PLUGIN_CLONE_ROOT, a
-    # marketplace installLocation, an installPath outside the cache). A root
-    # that contains the workspace itself is left out so the session can still
-    # write its own files.
-    shared_read_only = [
-        root
-        for root in readable
-        if root not in own and not _is_within(workspace, root)
-    ]
+    # marketplace installLocation, an installPath outside the cache). Even a
+    # root that contains the workspace stays read-only; the exception is per
+    # target (the workspace and the own project dir), never per root.
+    shared_read_only = [root for root in readable if root not in own]
 
     def _absolute(candidate: str) -> str:
         expanded = os.path.expandvars(os.path.expanduser(candidate))
@@ -765,8 +761,13 @@ def make_claude_home_guard_hook(workspace_root: Path):
             resolved = Path(absolute).resolve()
         except (OSError, RuntimeError, ValueError):
             return candidate
-        if write and not any(_is_within(resolved, root) for root in own):
-            if any(_is_within(resolved, root) for root in shared_read_only):
+        if write:
+            writable = _is_within(resolved, workspace) or any(
+                _is_within(resolved, root) for root in own
+            )
+            if not writable and any(
+                _is_within(resolved, root) for root in shared_read_only
+            ):
                 return candidate
         if not _is_within(resolved, claude_home):
             return None

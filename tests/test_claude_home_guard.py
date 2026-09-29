@@ -180,14 +180,35 @@ async def test_registry_install_paths_outside_claude_home_are_read_only(
         assert _is_deny(await _call(hook, "Write", write)), root
 
 
-async def test_a_plugin_root_that_contains_the_workspace_keeps_it_writable(
-    tmp_path, home, monkeypatch
+@pytest.mark.parametrize("allow_outside", [None, "write"])
+async def test_a_plugin_root_that_contains_the_workspace_stays_read_only(
+    tmp_path, home, monkeypatch, allow_outside
 ):
+    """The workspace exception is per target: its siblings stay read-only."""
+    if allow_outside:
+        monkeypatch.setenv("WORKSPACE_SANDBOX_ALLOW_OUTSIDE", allow_outside)
     monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(tmp_path))
     ws = _workspace(tmp_path, "alice")
     hook = make_claude_home_guard_hook(ws)
-    write = {"file_path": str(ws / "notes.md"), "content": "x"}
-    assert await _call(hook, "Write", write) == {}
+    for tool, tool_input in [
+        ("Write", {"file_path": str(ws / "notes.md"), "content": "x"}),
+        ("Edit", {"file_path": "notes.md", "old_string": "a", "new_string": "b"}),
+    ]:
+        assert await _call(hook, tool, tool_input) == {}, tool
+    sibling = tmp_path / "plugins" / "shared" / "SKILL.md"
+    other = tmp_path / "workspaces" / "bob" / "agent.md"
+    for target in (sibling, other):
+        for tool, tool_input in [
+            ("Write", {"file_path": str(target), "content": "x"}),
+            (
+                "Edit",
+                {"file_path": str(target), "old_string": "a", "new_string": "b"},
+            ),
+            ("MultiEdit", {"file_path": str(target), "edits": []}),
+            ("NotebookEdit", {"notebook_path": str(target.with_suffix(".ipynb"))}),
+        ]:
+            assert _is_deny(await _call(hook, tool, tool_input)), (tool, target)
+        assert await _call(hook, "Read", {"file_path": str(target)}) == {}
 
 
 async def test_paths_outside_claude_home_are_left_to_the_sandbox(tmp_path, home):
