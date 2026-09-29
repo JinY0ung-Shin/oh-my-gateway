@@ -62,12 +62,18 @@ class CollabJsonStreamFilter:
     deltas.  When a ``{`` is encountered, this filter buffers subsequent
     characters until it can determine whether the block is a collab_tool_call
     JSON object.  Non-collab content is flushed with minimal delay.
+
+    With ``enabled=False`` the filter is a pass-through: ``feed`` returns each
+    delta unchanged and never buffers.  Callers use that for backends that
+    cannot emit collab JSON (Claude), where holding text back after every
+    ``{"`` would stall a streamed JSON code block and then burst it out whole.
     """
 
     _COLLAB_MARKERS = ('"collab_tool_call"', '"collab_tool"')
     _MAX_BUFFER = 8192
 
-    def __init__(self):
+    def __init__(self, enabled: bool = True):
+        self._enabled = enabled
         self._buf = ""
         self._depth = 0
         self._in_string = False
@@ -82,6 +88,8 @@ class CollabJsonStreamFilter:
 
     def feed(self, text: str) -> str:
         """Process a text delta, returning cleaned text (collab JSON removed)."""
+        if not self._enabled:
+            return text
         output: list[str] = []
 
         for ch in text:

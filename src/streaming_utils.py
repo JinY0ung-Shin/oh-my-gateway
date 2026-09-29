@@ -1026,6 +1026,18 @@ def _embedded_tool_events(
     return events
 
 
+def _backend_may_emit_collab_json(request_context: Optional[Dict[str, Any]]) -> bool:
+    """Whether the stream's backend can emit Codex collab_tool_call JSON.
+
+    Only the Claude backend is known not to: its answer text is passed through
+    unfiltered so a JSON code block streams delta by delta.  Any other or
+    unknown backend keeps the collab filter (fail-safe default).
+    """
+    if not isinstance(request_context, dict):
+        return True
+    return request_context.get("backend") != "claude"
+
+
 async def stream_response_chunks(
     chunk_source,
     model: str,
@@ -1053,7 +1065,9 @@ async def stream_response_chunks(
     token_streaming = False
     in_thinking = False
     tool_acc = ToolUseAccumulator()
-    collab_filter = CollabJsonStreamFilter()
+    collab_filter = CollabJsonStreamFilter(
+        enabled=_backend_may_emit_collab_json(request_context)
+    )
     full_text = []
     # Accumulates *all* visible text across every message segment.  ``full_text``
     # is reset at each segment boundary (think→text→think), so this is the

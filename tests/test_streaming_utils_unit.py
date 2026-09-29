@@ -1072,6 +1072,89 @@ async def test_stream_response_chunks_strips_collab_from_token_deltas():
     assert stream_result["success"] is True
 
 
+def _text_delta_chunk(text):
+    return {
+        "type": "stream_event",
+        "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": text},
+        },
+    }
+
+
+async def _collect_text_deltas(pieces, request_context):
+    async def source():
+        for piece in pieces:
+            yield _text_delta_chunk(piece)
+
+    stream_result = {}
+    lines = [
+        line
+        async for line in stream_response_chunks(
+            chunk_source=source(),
+            model="test-model",
+            response_id="resp-collab-backend",
+            output_item_id="msg-collab-backend",
+            chunks_buffer=[],
+            logger=logging.getLogger("test-collab-backend"),
+            stream_result=stream_result,
+            request_context=request_context,
+        )
+    ]
+    assert stream_result["success"] is True
+    parsed = [_parse_response_sse(line) for line in lines]
+    return [p["delta"] for et, p in parsed if et == "response.output_text.delta"]
+
+
+# A Claude answer with a JSON code block, split the way token streaming splits it.
+_JSON_BLOCK_PIECES = [
+    "Here is the config:\n```json\n",
+    "{",
+    '"name"',
+    ': "demo",',
+    ' "nested": {',
+    '"enabled": true',
+    "}",
+    "}",
+    "\n```\nDone.",
+]
+
+
+async def test_claude_backend_streams_json_block_without_holding():
+    """Claude text never goes through the collab filter: each delta is
+    emitted as it arrives instead of stalling until the closing brace."""
+    deltas = await _collect_text_deltas(_JSON_BLOCK_PIECES, {"backend": "claude"})
+    assert deltas == _JSON_BLOCK_PIECES
+
+
+async def test_claude_backend_does_not_strip_collab_shaped_text():
+    collab = json.dumps({"collab_tool_call": {"type": "spawn_agent"}})
+    pieces = [f"Hello {collab} World"]
+    deltas = await _collect_text_deltas(pieces, {"backend": "claude"})
+    assert "".join(deltas) == f"Hello {collab} World"
+
+
+async def test_collab_backend_still_strips_collab_json():
+    collab = json.dumps({"collab_tool_call": {"type": "spawn_agent", "prompt": "t"}})
+    pieces = list(f"Hello {collab} World")
+    deltas = await _collect_text_deltas(pieces, {"backend": "codex"})
+    assert "".join(deltas) == "Hello  World"
+
+
+async def test_collab_backend_keeps_non_collab_json_block():
+    deltas = await _collect_text_deltas(_JSON_BLOCK_PIECES, {"backend": "codex"})
+    assert "".join(deltas) == "".join(_JSON_BLOCK_PIECES)
+
+
+def test_disabled_collab_filter_is_pass_through():
+    f = CollabJsonStreamFilter(enabled=False)
+    collab = json.dumps({"collab_tool_call": {"type": "spawn_agent"}})
+    assert f.feed('{"incomplete') == '{"incomplete'
+    assert f.feed(collab) == collab
+    assert not f.buffering
+    assert f.flush() == ""
+
+
 # ===========================================================================
 # resolve_token_usage tests
 # ===========================================================================
