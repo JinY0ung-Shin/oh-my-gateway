@@ -233,21 +233,109 @@ def _read_json(path: Path) -> Any:
         return None
 
 
-def _writable_extra_roots() -> List[Path]:
-    """Full-access (read + write + exec) roots outside the per-user workspace.
+# Shared assets under ``$HOME/.claude`` a session may only READ: skills, plugins,
+# subagents, commands, output styles and the user-scope CLAUDE.md. Every user's
+# session uses them, so writes stay denied.
+_SHARED_CLAUDE_ASSETS = (
+    "skills",
+    "plugins",
+    "agents",
+    "commands",
+    "output-styles",
+    "CLAUDE.md",
+)
+# The CLI names a project directory ``projects/<cwd with every non-alphanumeric
+# UTF-16 code unit replaced by '-'>``; past 200 units it keeps the first 200 and
+# appends ``-<hash of the raw cwd>`` (CLI 2.1.283 ``qx``/``Le``, reproduced by
+# ``_project_dir_name`` and pinned by ``tests/test_cli_project_dir_name.py``).
+_PROJECT_NAME_MAX = 200
+_BASE36 = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-    The Claude Code SDK keeps its own internal state under ``$HOME/.claude``
-    (e.g. ``projects/.../tool-results``) and reaches it via ``~/.claude/...``,
-    which expands outside the workspace root. That access must be permitted
-    explicitly or the sandbox breaks normal SDK operation. Only ``$HOME/.claude``
-    is added — not all of ``$HOME`` — so ``~/.ssh`` and other home paths stay
-    denied. Returns an empty list when ``$HOME`` is unset (issue #115).
+
+def _utf16_units(value: str) -> List[int]:
+    data = value.encode("utf-16-le", "surrogatepass")
+    return [int.from_bytes(data[i : i + 2], "little") for i in range(0, len(data), 2)]
+
+
+def _encode_project_dir(path: str) -> str:
+    return "".join(
+        chr(u) if u < 128 and chr(u).isalnum() else "-" for u in _utf16_units(path)
+    )
+
+
+def _cli_path_hash(value: str) -> str:
+    """The CLI's short hash: the 31-multiplier string hash over UTF-16 units,
+    wrapped to a signed 32-bit int, absolute value, in base 36."""
+    h = 0
+    for unit in _utf16_units(value):
+        h = (h * 31 + unit) & 0xFFFFFFFF
+    if h >= 0x80000000:
+        h -= 0x100000000
+    n = abs(h)
+    digits = ""
+    while True:
+        n, r = divmod(n, 36)
+        digits = _BASE36[r] + digits
+        if n == 0:
+            return digits
+
+
+def _project_dir_name(path: str) -> str:
+    """The exact ``projects/`` entry name the CLI uses for cwd *path*."""
+    name = _encode_project_dir(path)
+    if len(name) <= _PROJECT_NAME_MAX:
+        return name
+    return f"{name[:_PROJECT_NAME_MAX]}-{_cli_path_hash(path)}"
+
+
+def _own_project_roots(
+    workspace_root: Path, claude_home: Optional[Path]
+) -> List[Path]:
+    """This session's own ``$HOME/.claude/projects/<encoded cwd>``.
+
+    That directory holds the session's tool results, auto memory and
+    transcripts. Exactly the entry named after **this** workspace is returned,
+    never ``projects/`` itself or a prefix match, since its siblings are other
+    users' sessions. Both the given and the resolved workspace path are
+    encoded, because the CLI names the directory after the cwd it was started
+    with.
     """
+    if claude_home is None:
+        return []
+    projects = claude_home / "projects"
     roots: List[Path] = []
     seen: Set[Path] = set()
-    claude_home = _claude_home()
-    if claude_home is not None:
-        _add_root(roots, seen, claude_home)
+    for variant in (str(workspace_root), str(Path(workspace_root).resolve())):
+        _add_root(roots, seen, projects / _project_dir_name(variant))
+    return roots
+
+
+def _writable_extra_roots(workspace_root: Path) -> List[Path]:
+    """Full-access (read + write + exec) roots outside the per-user workspace.
+
+    The CLI keeps this session's own state under
+    ``$HOME/.claude/projects/<encoded cwd>`` (large tool results the model is
+    told to Read, auto memory), which the model reaches via ``~/.claude/...``,
+    outside the workspace. Only that one directory is granted, not
+    ``$HOME/.claude`` as a whole: every user's CLI child shares one HOME, so
+    ``~/.claude/plans`` and the other ``projects/*`` directories hold **other
+    users'** plans and transcripts. Returns an empty list when ``$HOME`` is
+    unset (issue #115).
+    """
+    return _own_project_roots(workspace_root, _claude_home())
+
+
+def _shared_asset_roots(claude_home: Optional[Path]) -> List[Path]:
+    """Read-only shared assets under ``$HOME/.claude``.
+
+    See ``_SHARED_CLAUDE_ASSETS``.
+    """
+    if claude_home is None:
+        return []
+    roots: List[Path] = []
+    seen: Set[Path] = set()
+    for name in _SHARED_CLAUDE_ASSETS:
+        _add_root(roots, seen, claude_home / name)
     return roots
 
 
@@ -506,24 +594,29 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     Quota preflight is independent of the path sandbox. When the sandbox is
     enabled, the historical two-tier roots remain unchanged:
 
-    * ``write_roots`` — workspace plus SDK-owned ``$HOME/.claude``;
-    * ``read_roots`` — write roots plus shared plugin resource roots.
+    * ``write_roots`` — workspace plus this session's own
+      ``$HOME/.claude/projects/<encoded cwd>``;
+    * ``read_roots`` — write roots plus the read-only shared assets under
+      ``$HOME/.claude`` (skills, plugins, agents, …) and plugin resource
+      roots. The rest of ``$HOME/.claude`` (``plans/``, other ``projects/*``)
+      belongs to other users.
 
     Direct callers historically receive a boundary-enforcing hook even when the
     env flag is off; preserve that behavior when quota is disabled. The special
     quota-only mode (quota on, sandbox flag off) is the only case where boundary
     checks are intentionally skipped.
     """
-    workspace_root = Path(workspace_root).resolve()
+    given_root = Path(workspace_root)
+    workspace_root = given_root.resolve()
     quota_enabled = workspace_quota_limit_bytes() > 0
     quota_user_root = _quota_user_root(workspace_root)
     boundary_enabled = _boundary_enabled() or not quota_enabled
 
     claude_home = _claude_home()
-    write_roots = [workspace_root] + _writable_extra_roots()
+    write_roots = [workspace_root] + _writable_extra_roots(given_root)
     read_roots = list(write_roots)
     seen: Set[Path] = set(read_roots)
-    for root in _plugin_resource_roots(claude_home):
+    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
         if root not in seen:
             seen.add(root)
             read_roots.append(root)
@@ -576,6 +669,142 @@ def make_workspace_sandbox_hook(workspace_root: Path):
                 return _deny(reason)
             return {}
 
+        return {}
+
+    return hook
+
+
+# Characters that make a path a pattern the shell or Glob expands later.
+_GLOB_CHARS = "*?["
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def make_claude_home_guard_hook(workspace_root: Path):
+    """Build the always-on PreToolUse guard for the shared ``$HOME/.claude``.
+
+    Every gateway CLI child shares one HOME, so ``~/.claude/projects/*`` holds
+    every user's transcripts, tool results and auto memory, and ``plans/`` the
+    CLI's default plan files. That is cross-user confidentiality, not the
+    opt-in workspace policy, so this guard is installed for every session
+    regardless of ``WORKSPACE_SANDBOX_ENABLED`` / ``WORKSPACE_SANDBOX_ALLOW_OUTSIDE``
+    and whatever the permission mode (PreToolUse hooks run under
+    ``bypassPermissions`` too). Inside ``$HOME/.claude`` it allows:
+
+    * read + write: this session's own ``projects/<encoded cwd>``;
+    * read only: the shared assets (skills, plugins, agents, commands,
+      output styles, ``CLAUDE.md``) and the plugin resource roots, including
+      the ones outside ``$HOME/.claude`` (``CLAUDE_PLUGIN_CLONE_ROOT``, a
+      marketplace ``installLocation``, an ``installPath`` outside the cache).
+
+    Everything else under ``$HOME/.claude`` is denied. Other paths outside it
+    are left to the workspace sandbox.
+
+    The guarantee covers the file tools (Read, Grep, Glob, Write, Edit,
+    MultiEdit, NotebookEdit), whose target is a structured path. For Bash
+    this is **defense in depth only**, not a security boundary: it catches the
+    statically visible paths (plus ``$VAR`` expansion and glob prefixes such
+    as ``~/.cl*``), but shell semantics defeat any static parse. Shell-local
+    variables (``H=$HOME; cat $H/.claude/...``), a ``cd`` followed by a
+    relative path, and command substitution all get through, and Bash is not
+    split into read and write intent, so it can also modify the shared
+    assets. The gateway does not isolate Bash across users today: even the
+    CLI's OS-level bash sandbox (``CLAUDE_SANDBOX_ENABLED``) only restricts
+    reads through ``Read`` deny rules, which are not configured (#218). Do not
+    describe this guard as covering Bash.
+    """
+    workspace = Path(workspace_root).resolve()
+    claude_home = _claude_home()
+    own = _own_project_roots(Path(workspace_root), claude_home)
+    readable = list(own)
+    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
+        if root not in readable:
+            readable.append(root)
+    # Shared, read-only for the write tools wherever they live: plugin resource
+    # roots may sit outside $HOME/.claude (CLAUDE_PLUGIN_CLONE_ROOT, a
+    # marketplace installLocation, an installPath outside the cache). Even a
+    # root that contains the workspace stays read-only; the exception is per
+    # target (the workspace and the own project dir), never per root.
+    shared_read_only = [root for root in readable if root not in own]
+
+    def _absolute(candidate: str) -> str:
+        expanded = os.path.expandvars(os.path.expanduser(candidate))
+        if not os.path.isabs(expanded):
+            expanded = os.path.join(str(workspace), expanded)
+        return expanded
+
+    def violation(candidate: str, write: bool) -> Optional[str]:
+        if claude_home is None or not candidate:
+            return None
+        allowed = own if write else readable
+        absolute = _absolute(candidate)
+        cut = min((absolute.find(c) for c in _GLOB_CHARS if c in absolute), default=-1)
+        if cut >= 0:
+            # A pattern: deny when its fixed prefix could expand into
+            # $HOME/.claude outside the allowed roots.
+            prefix = os.path.normpath(absolute[:cut]) if cut else "/"
+            fixed = absolute[:cut]
+            home = str(claude_home)
+            reaches = home.startswith(fixed) or _is_within(Path(prefix), claude_home)
+            if not reaches:
+                return None
+            if any(_is_within(Path(prefix), root) for root in allowed):
+                return None
+            return candidate
+        try:
+            resolved = Path(absolute).resolve()
+        except (OSError, RuntimeError, ValueError):
+            return candidate
+        if write:
+            writable = _is_within(resolved, workspace) or any(
+                _is_within(resolved, root) for root in own
+            )
+            if not writable and any(
+                _is_within(resolved, root) for root in shared_read_only
+            ):
+                return candidate
+        if not _is_within(resolved, claude_home):
+            return None
+        if any(_is_within(resolved, root) for root in allowed):
+            return None
+        return candidate
+
+    def deny(tool: str, path: str) -> Dict[str, Any]:
+        return _deny(
+            f"{tool} target {path!r} is shared Claude state ({claude_home} or a "
+            "shared plugin root), which holds other users' sessions and plans. "
+            "Only this session's own project directory is available there; "
+            "shared skills and plugins are read-only."
+        )
+
+    async def hook(input_data, _tool_use_id, _context):
+        if claude_home is None or not isinstance(input_data, dict):
+            return {}
+        tool_name = input_data.get("tool_name", "")
+        tool_input = input_data.get("tool_input", {}) or {}
+        if tool_name in _TOOL_TABLE:
+            category, key, _optional = _TOOL_TABLE[tool_name]
+            write = category == "write"
+            candidates = [tool_input.get(key)]
+            if tool_name == "Glob":
+                candidates.append(tool_input.get("pattern"))
+            for candidate in candidates:
+                if isinstance(candidate, str) and violation(candidate, write):
+                    return deny(tool_name, candidate)
+            return {}
+        if tool_name == "Bash":
+            command = tool_input.get("command", "")
+            if not isinstance(command, str):
+                return {}
+            for candidate in _bash_path_candidates(command):
+                if violation(candidate, write=False):
+                    return deny("Bash", candidate)
         return {}
 
     return hook

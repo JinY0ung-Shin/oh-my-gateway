@@ -76,6 +76,7 @@ from src.mcp_config import get_mcp_tool_patterns, resolve_mcp_servers
 from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
 from src.backends.claude.workspace_sandbox import (
+    make_claude_home_guard_hook,
     make_workspace_sandbox_hook,
     plugin_resource_roots,
     sandbox_enabled,
@@ -95,6 +96,9 @@ logger = logging.getLogger(__name__)
 warnings.filterwarnings("ignore", category=CanUseToolShadowedWarning)
 
 _DEFAULT_SETTING_SOURCES = ["project", "local"]
+# Workspace-relative plan-mode directory (``plansDirectory``); see
+# ``_configure_plans_directory``.
+DEFAULT_PLANS_DIRECTORY = ".claude/plans"
 _VALID_SETTING_SOURCES = {"user", "project", "local"}
 
 
@@ -701,7 +705,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         plugin/skill/marketplace roots plus any operator-specified
         ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. Writes to
         these stay confined by the sandbox hook (which keeps write tools to the
-        workspace + ``$HOME/.claude``).
+        workspace + the session's own ``$HOME/.claude/projects`` entry).
         """
         dirs: List[str] = []
         seen: set[str] = set()
@@ -759,6 +763,33 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             network=network_config,
             enableWeakerNestedSandbox=CLAUDE_SANDBOX_WEAKER_NESTED,
         )
+
+    def _configure_plans_directory(self, options: ClaudeAgentOptions) -> None:
+        """Keep plan-mode plan files inside the session workspace.
+
+        The CLI defaults ``plansDirectory`` to ``~/.claude/plans``, and every
+        gateway child shares one HOME, so every user's plans would land in one
+        shared directory (which the always-on ``~/.claude`` guard denies).
+        ``CLAUDE_PLANS_DIRECTORY`` may pick another workspace-relative
+        directory. There is no way back to the shared default: an empty,
+        absolute or ``..`` value is ignored with a warning and the default is
+        used. The CLI itself rejects a path outside the project root.
+        """
+        raw = os.getenv("CLAUDE_PLANS_DIRECTORY")
+        plans_dir = DEFAULT_PLANS_DIRECTORY
+        if raw is not None:
+            candidate = raw.strip()
+            parts = Path(candidate).parts
+            if candidate and not Path(candidate).is_absolute() and ".." not in parts:
+                plans_dir = candidate
+            else:
+                logger.warning(
+                    "Ignoring CLAUDE_PLANS_DIRECTORY=%r: it must be a relative path "
+                    "inside the workspace; using %s",
+                    raw,
+                    DEFAULT_PLANS_DIRECTORY,
+                )
+        options.settings = json.dumps({"plansDirectory": plans_dir})
 
     _UNSET = object()  # sentinel for _custom_base default
 
@@ -1034,6 +1065,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_thinking(options, effort)
         self._configure_sandbox(options)
         self._configure_add_dirs(options)
+        self._configure_plans_directory(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
 
         if model:
@@ -1471,6 +1503,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             matchers.extend(
                 HookMatcher(matcher=name, hooks=[deferred_hook])
                 for name in BLOCKED_DEFERRED_TOOLS
+            )
+        # Other users' transcripts and plans live in the shared ~/.claude: that
+        # guard is always on, independent of the opt-in workspace sandbox.
+        if cwd:
+            matchers.append(
+                HookMatcher(matcher="", hooks=[make_claude_home_guard_hook(Path(cwd))])
             )
         if cwd and sandbox_enabled():
             matchers.append(
