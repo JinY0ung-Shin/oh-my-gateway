@@ -832,13 +832,25 @@ async def get_system_prompt_endpoint(_=Depends(require_admin)):
 @router.put("/api/system-prompt")
 async def set_system_prompt_endpoint(
     body: SystemPromptUpdate,
+    request: Request,
     _=Depends(require_admin),
 ):
-    """Set a custom system prompt. Only affects new sessions."""
+    """Set a custom system prompt (untracked by the prompt library). New sessions only."""
+    from src.prompt_library import record_direct_edit
+    from src.routes.admin_prompt_library import _actor
     from src.system_prompt import get_prompt_mode, set_system_prompt
 
+    from src.system_prompt import mutation_lock
+
     try:
-        set_system_prompt(body.prompt)
+        # Same mutation boundary as deploy/reset: a deploy's expected_live check
+        # can never interleave with this direct edit.
+        from src.system_prompt import get_live_ref
+
+        with mutation_lock:
+            before = get_live_ref()
+            set_system_prompt(body.prompt, deployed_by=_actor(request))
+            record_direct_edit(_actor(request), len(body.prompt.strip()), before=before)
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
@@ -853,12 +865,14 @@ async def set_system_prompt_endpoint(
 
 
 @router.delete("/api/system-prompt")
-async def reset_system_prompt_endpoint(_=Depends(require_admin)):
+async def reset_system_prompt_endpoint(request: Request, _=Depends(require_admin)):
     """Reset to file default or claude_code preset."""
-    from src.system_prompt import get_prompt_mode, reset_system_prompt
+    from src.prompt_library import reset_to_default
+    from src.routes.admin_prompt_library import _actor
+    from src.system_prompt import get_prompt_mode
 
     try:
-        reset_system_prompt()
+        reset_to_default(author=_actor(request))
     except OSError as e:
         return JSONResponse(
             status_code=500, content={"error": f"Failed to persist: {e}"}
@@ -899,12 +913,15 @@ def get_prompt_endpoint(name: str, _=Depends(require_admin)):
 
 
 @router.put("/api/prompts/{name}")
-def save_prompt_endpoint(name: str, body: NamedPromptWrite, _=Depends(require_admin)):
-    """Create or update a named prompt."""
+def save_prompt_endpoint(
+    name: str, body: NamedPromptWrite, request: Request, _=Depends(require_admin)
+):
+    """Create or update a named prompt (an update appends a version)."""
+    from src.routes.admin_prompt_library import _actor
     from src.system_prompt import save_named_prompt
 
     try:
-        data = save_named_prompt(name, body.content)
+        data = save_named_prompt(name, body.content, author=_actor(request))
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
@@ -913,12 +930,13 @@ def save_prompt_endpoint(name: str, body: NamedPromptWrite, _=Depends(require_ad
 
 
 @router.delete("/api/prompts/{name}")
-def delete_prompt_endpoint(name: str, _=Depends(require_admin)):
-    """Delete a named prompt."""
+def delete_prompt_endpoint(name: str, request: Request, _=Depends(require_admin)):
+    """Delete a named prompt (resets live, logged, when it was the live one)."""
+    from src.routes.admin_prompt_library import _actor
     from src.system_prompt import delete_named_prompt
 
     try:
-        deleted = delete_named_prompt(name)
+        deleted = delete_named_prompt(name, author=_actor(request))
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
@@ -933,12 +951,13 @@ def delete_prompt_endpoint(name: str, _=Depends(require_admin)):
 
 
 @router.post("/api/prompts/{name}/activate")
-def activate_prompt_endpoint(name: str, _=Depends(require_admin)):
-    """Activate a named prompt as the current system prompt."""
+def activate_prompt_endpoint(name: str, request: Request, _=Depends(require_admin)):
+    """Activate (deploy) the latest version of a named prompt."""
+    from src.routes.admin_prompt_library import _actor
     from src.system_prompt import activate_named_prompt, get_prompt_mode
 
     try:
-        activate_named_prompt(name)
+        activate_named_prompt(name, author=_actor(request))
     except ValueError as e:
         return JSONResponse(status_code=404, content={"error": str(e)})
     except OSError as e:

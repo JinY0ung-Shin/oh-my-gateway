@@ -700,6 +700,7 @@ def get_session_detail(session_id: str) -> Optional[Dict[str, Any]]:
         "expires_at": session.expires_at.isoformat() if session.expires_at else None,
         "message_count": len(session.messages),
         "has_system_prompt": session.base_system_prompt is not None,
+        "prompt_ref": session.base_prompt_ref,
     }
 
 

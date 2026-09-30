@@ -145,6 +145,26 @@ def _isolate_claude_settings_env(tmp_path_factory):
     mp.undo()
 
 
+@pytest.fixture(scope="session", autouse=True)
+def _isolate_prompt_data(tmp_path_factory):
+    """Keep the live system prompt, named prompts and deploy log out of ``data/``.
+
+    Admin route tests set and reset the live prompt through the real endpoints;
+    without this they rewrite the checkout's ``data/system_prompt.json`` and
+    append to its prompt deploy log. Tests that patch these paths themselves
+    (``patch("src.system_prompt._PROMPTS_DIR", ...)``) still override it.
+    """
+    from src import system_prompt
+
+    base = tmp_path_factory.mktemp("prompt-data")
+    mp = pytest.MonkeyPatch()
+    mp.setattr(system_prompt, "_DATA_DIR", base)
+    mp.setattr(system_prompt, "_PERSIST_FILE", base / "system_prompt.json")
+    mp.setattr(system_prompt, "_PROMPTS_DIR", base / "prompts")
+    yield
+    mp.undo()
+
+
 @pytest.fixture(autouse=True)
 def reset_main_state():
     """Restore mutable module state and clean shared session state between tests."""
