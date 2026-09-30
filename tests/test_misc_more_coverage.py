@@ -1761,18 +1761,20 @@ class TestSystemPromptRemainingGaps:
     # save_named_prompt  lines 342-343  — OSError reading existing file
     # ------------------------------------------------------------------
 
-    def test_save_named_prompt_oserror_reading_existing_preserved_gracefully(self, _isolate):
-        """Lines 342-343: if reading the existing file raises, created_at falls back to now."""
+    def test_save_named_prompt_oserror_reading_existing_refuses_to_overwrite(self, _isolate):
+        """An existing prompt that cannot be read is never replaced by a fresh v1.
+
+        Prompts are versioned: overwriting an unreadable file would erase its
+        whole history on what may be a transient read error. The save fails
+        (the route maps ``OSError`` to 500) and the file is left untouched.
+        """
         sp = _isolate
         sp._PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-        # Create the file first
         sp.save_named_prompt("test-prompt", "Initial content")
+        before = sp._prompt_path("test-prompt").read_bytes()
 
-        # Simulate OSError when reading existing content
         with patch.object(Path, "read_text", side_effect=OSError("disk error")):
-            result = sp.save_named_prompt("test-prompt", "New content")
+            with pytest.raises(OSError):
+                sp.save_named_prompt("test-prompt", "New content")
 
-        # created_at should be a fresh timestamp (not None, no crash)
-        assert result["name"] == "test-prompt"
-        assert result["content"] == "New content"
-        assert result["created_at"] is not None
+        assert sp._prompt_path("test-prompt").read_bytes() == before

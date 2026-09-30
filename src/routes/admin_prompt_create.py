@@ -5,7 +5,7 @@ the same resource path is the create contract used by admin UIs that must never
 silently replace an existing saved prompt.
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from src.admin_auth import require_admin
@@ -19,11 +19,14 @@ router = APIRouter()
 def create_prompt_endpoint(
     name: str,
     body: NamedPromptWrite,
+    request: Request,
     _=Depends(require_admin),
 ):
     """Create a named prompt, returning 409 when the name already exists."""
     try:
-        return create_named_prompt(name, body.content)
+        from src.routes.admin_prompt_library import _actor
+
+        return create_named_prompt(name, body.content, author=_actor(request))
     except FileExistsError:
         return JSONResponse(
             status_code=409,

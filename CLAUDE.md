@@ -33,6 +33,16 @@ uv run pytest --cov=src                            # with coverage
   `/v1/agents/messages`.
 - `src/backends/` — `base.py` defines the `BackendClient`/`SessionHandle` protocols and `BackendRegistry`; `claude/` implements them. `codex/` (JSON-RPC to a local `codex app-server`) and `opencode/` (managed subprocess / external HTTP modes) are frozen stale code — do not extend them.
 - `src/backends/appserver/` — the direct `codex app-server` stdio transport (C0 core, #163/#170) plus the Codex compatibility adapter on top of it (#173). `transport.py`: one reader per process, id→waiter routing, generation-bound `PendingInteraction`, fail-closed unsupported server requests, EOF/parse/death fanout, process-group teardown; topology-agnostic (no session↔process placement, pooling, or resume policy — gated on #165). `events.py` (`TurnMapper`): maps native Codex thread/turn/item notifications into the canonical `/v1/responses` chunk contract so the same ChatDRAGON reducer renders Claude and Codex — conservative (translate only where semantics match; never fake absent fields). `client.py` (`AppServerCodexClient`/`AppServerSessionClient`): `BackendClient`/`SessionHandle` with 1-process-per-handle placement, `create_client`/`run_completion_with_client`/`interrupt_client`; records `session.codex_thread_id` as durable **only after a turn completes** (#165). Modules: `events.py` (`TurnMapper`, basic events + reasoning + subagent→`task_*` mapping), `interactions.py` (human-interaction bridge → AskUserQuestion UX), `subagents.py` (child-thread normalization), `isolation.py` (per-user `CODEX_HOME` + secret stripping), `policy.py` (canonical capability → sandbox/approval, fail-closed). `BACKENDS=codex` runs this adapter via `discover_backends` (rollback: `CODEX_BACKEND=frozen`); the adapter never reaches into the frozen `src/backends/codex/`. Acceptance corpus: `tests/test_appserver_{transport,events,client,interactions,subagents,isolation,cutover}.py` against `tests/fixtures/fake_app_server.py` + `env_probe_app_server.py`.
+- `src/system_prompt.py` / `src/prompt_library.py` — the live base system prompt and its versioned
+  library. Prompts keep immutable, numbered versions (author + change note, append-only; a legacy
+  file without `versions` reads as v1); **deploying** points the live override at one
+  `name@version` and appends to `data/prompt_deployments.jsonl` (deploy/rollback/reset/direct);
+  saving never changes what new sessions receive. Admin API `/admin/api/prompt-library`
+  (`src/routes/admin_prompt_library.py`: optimistic `base_version` / `expected_live` 409s, a
+  throwaway `try` run in a temp workspace); `X-Admin-Actor` (percent-encoded) attributes admin
+  front-end actions. Each session records the version it snapshotted in `base_prompt_ref`. The legacy
+  `/api/prompts` + `/api/system-prompt` endpoints stay and route through the library (an upsert
+  appends a version; a direct `PUT` is logged as an untracked override the studio can import).
 - `src/sanitizer/` — stream sanitization + OpenAI-format bridge.
 - `src/agent_catalog.py` / `src/mcp_health.py` — client-facing read models behind
   `GET /v1/agent-resources` (skills/subagents across plugin + workspace + user scope, described

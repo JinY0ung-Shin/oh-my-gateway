@@ -110,12 +110,13 @@ async def acquire_session_preflight(
         # --- First-turn tagging ---
         if is_new:
             session.backend = resolved.backend
-            from src.system_prompt import get_system_prompt, resolve_request_placeholders
+            from src.system_prompt import get_live_snapshot, resolve_request_placeholders
 
-            base = get_system_prompt()
+            base, ref = get_live_snapshot()
             if workspace:
                 base = resolve_request_placeholders(base, workspace)
             session.base_system_prompt = base
+            session.base_prompt_ref = ref
 
         # --- Commit messages (chat flow) ---
         if messages is not None:
