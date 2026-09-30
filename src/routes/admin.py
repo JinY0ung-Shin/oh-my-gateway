@@ -845,9 +845,12 @@ async def set_system_prompt_endpoint(
     try:
         # Same mutation boundary as deploy/reset: a deploy's expected_live check
         # can never interleave with this direct edit.
+        from src.system_prompt import get_live_ref
+
         with mutation_lock:
+            before = get_live_ref()
             set_system_prompt(body.prompt, deployed_by=_actor(request))
-            record_direct_edit(_actor(request), len(body.prompt.strip()))
+            record_direct_edit(_actor(request), len(body.prompt.strip()), before=before)
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
@@ -910,12 +913,15 @@ def get_prompt_endpoint(name: str, _=Depends(require_admin)):
 
 
 @router.put("/api/prompts/{name}")
-def save_prompt_endpoint(name: str, body: NamedPromptWrite, _=Depends(require_admin)):
-    """Create or update a named prompt."""
+def save_prompt_endpoint(
+    name: str, body: NamedPromptWrite, request: Request, _=Depends(require_admin)
+):
+    """Create or update a named prompt (an update appends a version)."""
+    from src.routes.admin_prompt_library import _actor
     from src.system_prompt import save_named_prompt
 
     try:
-        data = save_named_prompt(name, body.content)
+        data = save_named_prompt(name, body.content, author=_actor(request))
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:
@@ -924,12 +930,13 @@ def save_prompt_endpoint(name: str, body: NamedPromptWrite, _=Depends(require_ad
 
 
 @router.delete("/api/prompts/{name}")
-def delete_prompt_endpoint(name: str, _=Depends(require_admin)):
-    """Delete a named prompt."""
+def delete_prompt_endpoint(name: str, request: Request, _=Depends(require_admin)):
+    """Delete a named prompt (resets live, logged, when it was the live one)."""
+    from src.routes.admin_prompt_library import _actor
     from src.system_prompt import delete_named_prompt
 
     try:
-        deleted = delete_named_prompt(name)
+        deleted = delete_named_prompt(name, author=_actor(request))
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:

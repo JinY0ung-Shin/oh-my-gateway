@@ -430,3 +430,65 @@ def test_legacy_delete_of_the_live_prompt_resets_under_the_boundary_and_logs(lib
     assert system_prompt.delete_named_prompt("ops") is True
     assert system_prompt.get_live_ref()["mode"] == "preset"
     assert prompt_library.list_deployments()[0]["action"] == "reset"
+
+
+# ---------------------------------------------------------------------------
+# CAS identity: the revision, not the display label
+# ---------------------------------------------------------------------------
+
+
+def test_two_direct_edits_share_a_label_but_never_a_revision(lib):
+    system_prompt.set_system_prompt("direct A")
+    a = system_prompt.get_live_ref()
+    system_prompt.set_system_prompt("direct B")
+    b = system_prompt.get_live_ref()
+    assert prompt_library._ref_label(a) == prompt_library._ref_label(b) == "untracked"
+    assert a["revision"] != b["revision"]
+    assert system_prompt.get_live_ref()["revision"] == b["revision"], "stable while nothing changes"
+
+
+def test_api_deploy_and_reset_refuse_a_stale_revision_across_untracked_edits(client):
+    client.post(f"{BASE}/prompts", json={"name": "ops", "content": "v1"})
+    client.put("/admin/api/system-prompt", json={"prompt": "direct A"})
+    seen = client.get(BASE).json()["live"]  # admin A opens the confirm dialog here
+    client.put("/admin/api/system-prompt", json={"prompt": "direct B"})  # admin B
+
+    r = client.post(
+        f"{BASE}/prompts/ops/deploy",
+        json={"version": 1, "expected_live": seen["label"], "expected_revision": seen["revision"]},
+    )
+    assert r.status_code == 409 and r.json()["code"] == "live_changed"
+    assert r.json()["revision"] != seen["revision"]
+    r = client.post(f"{BASE}/reset", json={"expected_revision": seen["revision"]})
+    assert r.status_code == 409
+    assert system_prompt.get_system_prompt() == "direct B", "B's edit must survive"
+
+    fresh = client.get(BASE).json()["live"]
+    r = client.post(f"{BASE}/prompts/ops/deploy", json={"version": 1, "expected_revision": fresh["revision"]})
+    assert r.status_code == 200
+
+
+def test_revision_survives_restart(lib):
+    prompt_library.create_prompt("ops", "text")
+    prompt_library.deploy("ops", 1)
+    before = system_prompt.get_live_ref()["revision"]
+    with patch.object(system_prompt, "_runtime_prompt", None), patch.object(system_prompt, "_active_meta", {}):
+        system_prompt.load_default_prompt("")
+        assert system_prompt.get_live_ref()["revision"] == before
+
+
+def test_legacy_writes_and_deletes_are_attributed(client):
+    actor = {"X-Admin-Actor": "legacy-admin"}
+    assert client.post("/admin/api/prompts/ops", json={"content": "v1"}, headers=actor).status_code == 200
+    assert client.put("/admin/api/prompts/ops", json={"content": "v2"}, headers=actor).status_code == 200
+    versions = client.get(f"{BASE}/prompts/ops").json()["versions"]
+    assert [v["author"] for v in versions] == ["legacy-admin", "legacy-admin"]
+
+    client.put("/admin/api/system-prompt", json={"prompt": "direct"}, headers=actor)
+    client.post("/admin/api/prompts/ops/activate", headers=actor)
+    assert client.delete("/admin/api/prompts/ops", headers=actor).status_code == 200
+    log = client.get(f"{BASE}/deployments").json()["deployments"]
+    reset, deploy, direct = log[0], log[1], log[2]
+    assert reset["action"] == "reset" and reset["by"] == "legacy-admin" and reset["from"] == "ops@v2"
+    assert deploy["action"] == "deploy" and deploy["from"] == "untracked"
+    assert direct["action"] == "direct" and direct["from"] == "preset", "a direct edit records what it replaced"

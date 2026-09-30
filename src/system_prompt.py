@@ -10,6 +10,7 @@ The admin override is persisted to a JSON file in the project data
 directory so it survives server restarts.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -339,7 +340,31 @@ def _live_ref_locked() -> dict:
         ref["version"] = _active_meta.get("version") if _active_prompt_name else None
         ref["deployed_at"] = _active_meta.get("deployed_at")
         ref["deployed_by"] = _active_meta.get("deployed_by")
+    ref["revision"] = _revision_locked(mode, ref)
     return ref
+
+
+def _revision_locked(mode: str, ref: dict) -> str:
+    """Opaque identity of the live state — the compare-and-swap token.
+
+    Unlike the display label (every direct edit reads ``untracked``), two different
+    live states never share a revision: it covers the text, the library ref and
+    the publish time, which every live change stamps anew (and which persists, so
+    the token survives a restart).
+    """
+    if mode == "custom":
+        parts = [
+            "custom",
+            _runtime_prompt_raw or "",
+            str(ref.get("name") or ""),
+            str(ref.get("version") or ""),
+            str(ref.get("deployed_at") or ""),
+        ]
+    elif mode == "file":
+        parts = ["file", _default_prompt_raw or ""]
+    else:
+        parts = ["preset"]
+    return hashlib.sha1("\0".join(parts).encode("utf-8")).hexdigest()[:16]
 
 
 def get_live_ref() -> dict:
@@ -452,7 +477,7 @@ def save_named_prompt(name: str, content: str, *, author: Optional[str] = None) 
             return prompt_library.get_prompt(name)
 
 
-def delete_named_prompt(name: str) -> bool:
+def delete_named_prompt(name: str, *, author: Optional[str] = None) -> bool:
     """Delete a named prompt by name. Returns ``True`` if deleted.
 
     Raises ``ValueError`` on invalid name.
@@ -471,7 +496,7 @@ def delete_named_prompt(name: str) -> bool:
 
             # Legacy contract: deleting the live prompt resets live — logged
             # like any other live change so the deploy history stays whole.
-            prompt_library.reset_to_default(note=f"legacy delete of {name}")
+            prompt_library.reset_to_default(author=author, note=f"legacy delete of {name}")
     return True
 
 

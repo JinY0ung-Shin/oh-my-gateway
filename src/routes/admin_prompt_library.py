@@ -51,9 +51,12 @@ class VersionBody(BaseModel):
 class DeployBody(BaseModel):
     version: int
     note: str = ""
-    # The live ref the operator confirmed against ("name@vN", "untracked", "file",
-    # "preset"). A mismatch means someone else changed live meanwhile → 409.
+    # The live state the operator confirmed against. ``expected_revision`` (the
+    # opaque ``live.revision``) is the real compare-and-swap token; the display
+    # label ``expected_live`` is kept for older callers but cannot tell two
+    # untracked edits apart. A mismatch means live changed meanwhile → 409.
     expected_live: Optional[str] = None
+    expected_revision: Optional[str] = None
 
 
 class DescriptionBody(BaseModel):
@@ -63,6 +66,7 @@ class DescriptionBody(BaseModel):
 class ResetBody(BaseModel):
     note: str = ""
     expected_live: Optional[str] = None
+    expected_revision: Optional[str] = None
 
 
 class ImportBody(BaseModel):
@@ -238,19 +242,33 @@ def library_commit(name: str, body: VersionBody, request: Request, _=Depends(req
         return _err(500, "io", f"Failed to save: {exc}")
 
 
-def _live_changed(expected: Optional[str]) -> Optional[JSONResponse]:
-    if expected is None:
+def _live_changed(
+    expected_label: Optional[str], expected_revision: Optional[str]
+) -> Optional[JSONResponse]:
+    """Compare-and-swap check; callers hold ``mutation_lock``."""
+    ref = system_prompt.get_live_ref()
+    current = _live_label(ref)
+    if expected_revision is not None:
+        stale = expected_revision != ref["revision"]
+    elif expected_label is not None:
+        stale = expected_label != current
+    else:
         return None
-    current = _live_label(system_prompt.get_live_ref())
-    if current != expected:
-        return _err(409, "live_changed", f"Live prompt changed to {current}.", live=current)
+    if stale:
+        return _err(
+            409,
+            "live_changed",
+            f"Live prompt changed to {current}.",
+            live=current,
+            revision=ref["revision"],
+        )
     return None
 
 
 @router.post(f"{_PREFIX}/prompts/{{name}}/deploy")
 def library_deploy(name: str, body: DeployBody, request: Request, _=Depends(require_admin)):
     with prompt_library._lock:
-        conflict = _live_changed(body.expected_live)
+        conflict = _live_changed(body.expected_live, body.expected_revision)
         if conflict is not None:
             return conflict
         try:
@@ -269,7 +287,7 @@ def library_deploy(name: str, body: DeployBody, request: Request, _=Depends(requ
 @router.post(f"{_PREFIX}/reset")
 def library_reset(body: ResetBody, request: Request, _=Depends(require_admin)):
     with prompt_library._lock:
-        conflict = _live_changed(body.expected_live)
+        conflict = _live_changed(body.expected_live, body.expected_revision)
         if conflict is not None:
             return conflict
         try:

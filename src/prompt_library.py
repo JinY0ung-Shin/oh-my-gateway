@@ -456,8 +456,13 @@ def reset_to_default(*, author: Optional[str] = None, note: str = "") -> dict:
     return entry
 
 
-def record_direct_edit(author: Optional[str], char_count: int) -> None:
-    """Log a legacy untracked edit of the live prompt (``PUT /api/system-prompt``)."""
+def record_direct_edit(
+    author: Optional[str], char_count: int, before: Optional[dict] = None
+) -> None:
+    """Log a legacy untracked edit of the live prompt (``PUT /api/system-prompt``).
+
+    ``before`` is the live ref the edit replaced (read under ``mutation_lock``).
+    """
     try:
         _log_deploy(
             {
@@ -467,7 +472,7 @@ def record_direct_edit(author: Optional[str], char_count: int) -> None:
                 "version": None,
                 "by": _actor(author),
                 "note": "",
-                "from": None,
+                "from": _ref_label(before) if before else None,
                 "char_count": char_count,
             }
         )
