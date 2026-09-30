@@ -29,6 +29,10 @@ _runtime_prompt: Optional[str] = None  # admin override (resolved)
 _runtime_prompt_raw: Optional[str] = None  # admin override (original)
 _preset_text: Optional[str] = None  # cached preset reference text
 _active_prompt_name: Optional[str] = None  # name of the currently active named prompt
+# Version/deploy metadata of the live override (``prompt_library`` deploys):
+# ``{"version": int, "deployed_at": iso, "deployed_by": str}``; empty for a
+# legacy/direct override that no library version backs.
+_active_meta: dict = {}
 
 _DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 _PERSIST_FILE = _DATA_DIR / "system_prompt.json"
@@ -37,7 +41,7 @@ _PROMPTS_DIR = _DATA_DIR / "prompts"
 
 def _load_persisted() -> Optional[str]:
     """Load the persisted admin override from disk."""
-    global _active_prompt_name
+    global _active_prompt_name, _active_meta
     if not _PERSIST_FILE.is_file():
         return None
     try:
@@ -47,6 +51,7 @@ def _load_persisted() -> Optional[str]:
             return None
         with _lock:
             _active_prompt_name = data.get("active_name")
+            _active_meta = _clean_meta(data)
         value = data.get("prompt")
         if not isinstance(value, str) or not value.strip():
             logger.warning("Persisted system prompt has invalid value, ignoring")
@@ -57,7 +62,23 @@ def _load_persisted() -> Optional[str]:
         return None
 
 
-def _save_persisted(text: Optional[str], *, active_name: Optional[str] = None) -> None:
+def _clean_meta(data: dict) -> dict:
+    meta: dict = {}
+    version = data.get("active_version")
+    if isinstance(version, int) and not isinstance(version, bool) and version > 0:
+        meta["version"] = version
+    for key in ("deployed_at", "deployed_by"):
+        if isinstance(data.get(key), str) and data[key]:
+            meta[key] = data[key]
+    return meta
+
+
+def _save_persisted(
+    text: Optional[str],
+    *,
+    active_name: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> None:
     """Save or delete the persisted admin override.
 
     Raises ``OSError`` on failure so callers can avoid in-memory/disk divergence.
@@ -66,24 +87,40 @@ def _save_persisted(text: Optional[str], *, active_name: Optional[str] = None) -
     a memory/disk mismatch, and ``_active_prompt_name`` is only updated after
     the file mutation succeeds (file becomes the source of truth).
     """
-    global _active_prompt_name
+    global _active_prompt_name, _active_meta
     if text is None:
         with _lock:
             if _PERSIST_FILE.is_file():
                 _PERSIST_FILE.unlink()
                 logger.info("System prompt: persisted file removed")
             _active_prompt_name = None
+            _active_meta = {}
     else:
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
         payload: dict = {"prompt": text}
         if active_name:
             payload["active_name"] = active_name
+        clean = _clean_meta(
+            {
+                "active_version": (meta or {}).get("version"),
+                "deployed_at": (meta or {}).get("deployed_at"),
+                "deployed_by": (meta or {}).get("deployed_by"),
+            }
+        )
+        if clean.get("version") and active_name:
+            payload["active_version"] = clean["version"]
+        else:
+            clean.pop("version", None)
+        for key in ("deployed_at", "deployed_by"):
+            if key in clean:
+                payload[key] = clean[key]
         with _lock:
             _PERSIST_FILE.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             _active_prompt_name = active_name
+            _active_meta = clean
             logger.info("System prompt: persisted to %s", _PERSIST_FILE)
 
 
@@ -189,8 +226,17 @@ def get_raw_system_prompt() -> Optional[str]:
     return _default_prompt_raw
 
 
-def set_system_prompt(text: str, *, active_name: Optional[str] = None) -> None:
+def set_system_prompt(
+    text: str,
+    *,
+    active_name: Optional[str] = None,
+    active_version: Optional[int] = None,
+    deployed_by: Optional[str] = None,
+) -> None:
     """Set a runtime override for the system prompt and persist to disk.
+
+    *active_name*/*active_version* record which library version backs the
+    override (``prompt_library.deploy``); a direct edit leaves both unset.
 
     Raises ``ValueError`` if *text* is empty or whitespace-only.
     Raises ``OSError`` if the persist file cannot be written.
@@ -199,7 +245,12 @@ def set_system_prompt(text: str, *, active_name: Optional[str] = None) -> None:
     stripped = text.strip()
     if not stripped:
         raise ValueError("System prompt cannot be empty. Use reset to revert to default.")
-    _save_persisted(stripped, active_name=active_name)
+    meta = {
+        "version": active_version,
+        "deployed_at": datetime.now(timezone.utc).isoformat(),
+        "deployed_by": deployed_by,
+    }
+    _save_persisted(stripped, active_name=active_name, meta=meta)
     resolved = _resolve_placeholders(stripped)
     with _lock:
         _runtime_prompt_raw = stripped
@@ -257,6 +308,39 @@ def get_active_prompt_name() -> Optional[str]:
     """Return the name of the currently active named prompt, or ``None``."""
     with _lock:
         return _active_prompt_name
+
+
+def _live_ref_locked() -> dict:
+    if _runtime_prompt is not None:
+        mode = "custom"
+    elif _default_prompt is not None:
+        mode = "file"
+    else:
+        mode = "preset"
+    ref: dict = {"mode": mode, "name": None, "version": None}
+    if mode == "custom":
+        ref["name"] = _active_prompt_name
+        ref["version"] = _active_meta.get("version") if _active_prompt_name else None
+        ref["deployed_at"] = _active_meta.get("deployed_at")
+        ref["deployed_by"] = _active_meta.get("deployed_by")
+    return ref
+
+
+def get_live_ref() -> dict:
+    """Which prompt is live: ``{mode, name, version, deployed_at?, deployed_by?}``.
+
+    ``name``/``version`` are set only when a library version backs the live
+    override; ``mode`` is ``custom`` (override), ``file`` or ``preset``.
+    """
+    with _lock:
+        return _live_ref_locked()
+
+
+def get_live_snapshot() -> tuple[Optional[str], dict]:
+    """The resolved live prompt and its ref, read together (no deploy in between)."""
+    with _lock:
+        text = _runtime_prompt if _runtime_prompt is not None else _default_prompt
+        return text, _live_ref_locked()
 
 
 # ---------------------------------------------------------------------------
@@ -321,37 +405,35 @@ def get_named_prompt(name: str) -> Optional[dict]:
         return None
 
 
-def save_named_prompt(name: str, content: str) -> dict:
-    """Create or update a named prompt. Returns the saved data dict.
+def save_named_prompt(name: str, content: str, *, author: Optional[str] = None) -> dict:
+    """Create or update a named prompt (legacy upsert). Returns the saved data dict.
+
+    An update appends a new version through ``prompt_library`` instead of
+    overwriting, so the legacy API can never destroy history; saving identical
+    content is a no-op.
 
     Raises ``ValueError`` on invalid name or empty content.
     Raises ``OSError`` on write failure.
     """
+    from src import prompt_library
+
     name = _validate_prompt_name(name)
-    content = content.strip()
-    if not content:
+    if not content.strip():
         raise ValueError("Prompt content cannot be empty")
-
-    _PROMPTS_DIR.mkdir(parents=True, exist_ok=True)
-    path = _prompt_path(name)
-
-    existing = None
-    if path.is_file():
+    try:
+        return prompt_library.commit_version(name, content, author=author)
+    except prompt_library.NoChange:
+        return prompt_library.get_prompt(name)
+    except prompt_library.PromptNotFound:
+        pass
+    try:
+        return prompt_library.create_prompt(name, content, author=author)
+    except prompt_library.PromptExists:
+        # Lost a create race: the winner's file exists now, so append to it.
         try:
-            existing = json.loads(path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    now = datetime.now(timezone.utc).isoformat()
-    data = {
-        "name": name,
-        "content": content,
-        "created_at": existing["created_at"] if existing else now,
-        "updated_at": now,
-    }
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("Named prompt saved: %s (%d chars)", name, len(content))
-    return data
+            return prompt_library.commit_version(name, content, author=author)
+        except prompt_library.NoChange:
+            return prompt_library.get_prompt(name)
 
 
 def delete_named_prompt(name: str) -> bool:
@@ -373,13 +455,16 @@ def delete_named_prompt(name: str) -> bool:
     return True
 
 
-def activate_named_prompt(name: str) -> None:
-    """Activate a named prompt as the current system prompt.
+def activate_named_prompt(name: str, *, author: Optional[str] = None) -> None:
+    """Activate (deploy) the latest version of a named prompt.
 
     Raises ``ValueError`` if the prompt does not exist or has invalid name.
     Raises ``OSError`` on persist failure.
     """
+    from src import prompt_library
+
     data = get_named_prompt(name)
     if data is None:
         raise ValueError(f"Named prompt not found: {name}")
-    set_system_prompt(data["content"], active_name=data["name"])
+    latest = prompt_library.get_prompt(name)["versions"][-1]["version"]
+    prompt_library.deploy(name, latest, author=author)

@@ -224,6 +224,9 @@ class Session:
     expires_at: Optional[datetime] = field(default=None)
     turn_counter: int = 0
     base_system_prompt: Optional[str] = None
+    # Which live prompt the snapshot above came from (``system_prompt.get_live_ref``):
+    # lets the admin prompt library say how many sessions still run an old version.
+    base_prompt_ref: Optional[Dict[str, Any]] = field(default=None, compare=False)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
     user: Optional[str] = None
     workspace: Optional[str] = None
