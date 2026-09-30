@@ -411,3 +411,117 @@ async def test_real_listener_on_all_interfaces_relays_when_first_reached_on_its_
         await asyncio.gather(*tasks, return_exceptions=True)
         if relay._http is not None:
             await relay._http.aclose()
+
+
+# ---------------------------------------------------------------------------
+# readOnlyTools (ChatDRAGON #471) — see tests/test_cli_mcp_readonly.py for the real-CLI pin
+# ---------------------------------------------------------------------------
+
+
+def test_read_only_key_is_stripped_for_every_server_type_and_parsed():
+    servers = {
+        "docs": {"type": "http", "url": "https://d/mcp", relay.READ_ONLY_KEY: ["search_internal_docs", "basic_knowledge"]},
+        "all": {"type": "http", "url": "https://a/mcp", relay.READ_ONLY_KEY: "*"},
+        "local": {"type": "stdio", "command": "x", relay.READ_ONLY_KEY: ["t"]},
+        "bad": {"type": "http", "url": "https://b/mcp", relay.READ_ONLY_KEY: 3},
+        "plain": {"type": "http", "url": "https://p/mcp"},
+    }
+    cleaned, rules = relay.split_read_only(servers)
+    assert all(relay.READ_ONLY_KEY not in c for c in cleaned.values()), "the CLI never sees the key"
+    assert rules == {
+        "docs": frozenset({"search_internal_docs", "basic_knowledge"}),
+        "all": frozenset({"*"}),
+        "local": frozenset({"t"}),
+    }
+    assert servers["docs"][relay.READ_ONLY_KEY], "the shared config object is not mutated"
+    assert cleaned["plain"] is servers["plain"]
+
+
+def test_attach_keeps_rules_only_for_relayed_servers():
+    servers, rules = relay.split_read_only(
+        {
+            "docs": {"type": "http", "url": "https://d/mcp", relay.READ_ONLY_KEY: "*"},
+            "local": {"type": "stdio", "command": "x", relay.READ_ONLY_KEY: "*"},
+        }
+    )
+    _, handle = relay.attach(servers, rules)
+    assert handle.read_only == {"docs": frozenset({"*"})}
+
+
+def _tools_reply(tools, rid=1):
+    return {"jsonrpc": "2.0", "id": rid, "result": {"tools": tools}}
+
+
+def test_tools_list_rewrite_marks_only_the_listed_tools_json_and_sse():
+    tools = [
+        {"name": "search_internal_docs", "inputSchema": {}},
+        {"name": "basic_knowledge", "annotations": {"title": "용어"}, "inputSchema": {}},
+        {"name": "write_note", "inputSchema": {}},
+    ]
+    ids = {json.dumps(1)}
+    want = frozenset({"search_internal_docs", "basic_knowledge"})
+    out = json.loads(relay.rewrite_tools_list(json.dumps(_tools_reply(tools)).encode(), False, ids, want))
+    by_name = {t["name"]: t for t in out["result"]["tools"]}
+    assert by_name["search_internal_docs"]["annotations"] == {"readOnlyHint": True}
+    assert by_name["basic_knowledge"]["annotations"] == {"title": "용어", "readOnlyHint": True}
+    assert "annotations" not in by_name["write_note"], "an unlisted tool is never claimed read-only"
+
+    for newline in ("\n", "\r\n"):
+        sse = f"event: message{newline}data: {json.dumps(_tools_reply(tools), ensure_ascii=False)}{newline}{newline}".encode()
+        rewritten = relay.rewrite_tools_list(sse, True, ids, frozenset({"*"}))
+        text = rewritten.decode()
+        assert text.startswith(f"event: message{newline}data: ") and text.endswith(newline * 2)
+        payload = json.loads(text.split("data: ", 1)[1].split(newline)[0])
+        assert all(t["annotations"]["readOnlyHint"] is True for t in payload["result"]["tools"])
+
+
+def test_tools_list_rewrite_leaves_other_replies_byte_identical():
+    ids = {json.dumps(7)}
+    other = json.dumps({"jsonrpc": "2.0", "id": 8, "result": {"tools": [{"name": "x"}]}}).encode()
+    assert relay.rewrite_tools_list(other, False, ids, frozenset({"*"})) == other
+    already = json.dumps(_tools_reply([{"name": "x", "annotations": {"readOnlyHint": True}}], 7)).encode()
+    assert relay.rewrite_tools_list(already, False, ids, frozenset({"*"})) == already
+    assert relay._tools_list_ids(b'[{"jsonrpc":"2.0","id":"a","method":"tools/list"},{"jsonrpc":"2.0","method":"notifications/initialized"}]') == {json.dumps("a")}
+
+
+async def test_relay_applies_read_only_to_tools_list_and_streams_everything_else(monkeypatch):
+    servers, rules = relay.split_read_only({"docs": {"type": "http", "url": "https://d/mcp", relay.READ_ONLY_KEY: ["fast"]}})
+    _, handle = relay.attach(servers, rules)
+    call_reply = b'event: message\ndata: {"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"fast"}]}}\n\n'
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        method = json.loads(request.content)["method"]
+        if method == "tools/list":
+            body = f"event: message\ndata: {json.dumps(_tools_reply([{'name': 'fast'}, {'name': 'other'}]))}\n\n".encode()
+        else:
+            body = call_reply
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=httpx.ByteStream(body))
+
+    monkeypatch.setattr(relay, "_http", httpx.AsyncClient(transport=httpx.MockTransport(upstream)))
+    path = f"/internal/mcp-relay/{handle.relay_id}/docs"
+    listed = await _call("127.0.0.1", path, json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode())
+    payload = json.loads(listed.text.split("data: ", 1)[1].split("\n")[0])
+    by_name = {t["name"]: t for t in payload["result"]["tools"]}
+    assert by_name["fast"]["annotations"] == {"readOnlyHint": True} and "annotations" not in by_name["other"]
+    assert listed.headers.get("content-length") in (None, str(len(listed.content))), "length matches the rewrite"
+
+    # Not a tools/list request (even with a reply that looks like one): bytes untouched.
+    called = await _call("127.0.0.1", path, json.dumps({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "fast"}}).encode())
+    assert called.content == call_reply
+
+
+def test_every_options_build_strips_read_only_and_keeps_the_rules():
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    from src.backends.claude.client import ClaudeCodeCLI
+
+    cli = ClaudeCodeCLI.__new__(ClaudeCodeCLI)
+    options = ClaudeAgentOptions()
+    with patch("src.backends.claude.client.resolve_mcp_servers", side_effect=lambda s: s), patch.object(
+        ClaudeCodeCLI, "_set_allowed_tools", lambda self, o, tools: setattr(o, "allowed_tools", tools)
+    ):
+        cli._configure_mcp_servers(
+            options, {"docs": {"type": "http", "url": "https://d/mcp", relay.READ_ONLY_KEY: "*"}}, None, None
+        )
+    assert relay.READ_ONLY_KEY not in options.mcp_servers["docs"]
+    assert options._gateway_read_only_tools == {"docs": frozenset({"*"})}

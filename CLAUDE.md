@@ -89,6 +89,15 @@ uv run pytest --cov=src                            # with coverage
   loopback-only check 403'd every HTTP MCP server), loopback joins the child's `NO_PROXY`, and a
   once-per-base self-probe (`reachable()`) keeps servers direct when the relay is unreachable. `tests/test_cli_mcp_progress.py` pins both halves against the
   bundled CLI — when a CLI bump starts forwarding the text itself, prefer that and retire the relay.
+- The CLI runs the MCP tools of one parallel batch **sequentially unless every tool in it declares
+  `annotations.readOnlyHint: true`** (one marked is not enough), so an unannotated 2-minute research
+  tool makes a 300 ms lookup in the same batch wait for it (ChatDRAGON #471). For servers we don't
+  own, an MCP server entry may carry the gateway-only key `"readOnlyTools": [...tool names]` or
+  `"*"`: `_configure_mcp_servers` strips it on every options build (the CLI never sees it) and the
+  progress relay adds `readOnlyHint: true` to exactly those tools in the server's `tools/list`
+  reply — the relay's one byte rewrite, and only for HTTP servers routed through it (stdio or an
+  unreachable relay logs "not applied"). Only list tools that are truly side-effect free.
+  `tests/test_cli_mcp_readonly.py` pins sequential / concurrent / one-marked against the bundled CLI.
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
   turn fails with `sdk_error` — when one message exceeds `max_buffer_size`. A tool result is one
   message, so an MCP tool returning inline base64 images tripped the SDK's 1 MiB default (#183).
