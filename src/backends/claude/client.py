@@ -917,6 +917,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # only as plaintext in the MCP manifest. Does not mutate the shared
         # get_mcp_servers() singleton.
         mcp_servers = resolve_mcp_servers(mcp_servers) or mcp_servers
+        # ``readOnlyTools`` is gateway-only (#471): every options build strips it so no CLI
+        # spawn ever sees it; the rules ride on the options for the progress relay to apply.
+        from src.mcp_progress_relay import split_read_only
+
+        mcp_servers, read_only = split_read_only(mcp_servers)
+        options._gateway_read_only_tools = read_only  # type: ignore[attr-defined]
 
         if allowed_tools is not None:
             allowed_set = set(allowed_tools)
@@ -1760,11 +1766,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         previous = getattr(session, "mcp_progress_relay", None)
         mcp_progress_relay.detach(previous)
         session.mcp_progress_relay = None
+        # ``readOnlyTools`` was stripped when the options were built (#471); its rules ride
+        # on the options. A second split is a no-op safety net for any other config source.
+        options.mcp_servers, extra = mcp_progress_relay.split_read_only(options.mcp_servers)
+        read_only = {**getattr(options, "_gateway_read_only_tools", {}), **extra}
         # Progress is a nicety; the MCP call is the work. An unreachable relay keeps every
         # server direct instead of pointing the CLI at a URL it cannot use.
         if not mcp_progress_relay.relay_enabled() or not await mcp_progress_relay.reachable():
+            if read_only:
+                logger.warning(
+                    "MCP readOnlyTools for %s not applied: the progress relay is off or unreachable",
+                    sorted(read_only),
+                )
             return
-        options.mcp_servers, handle = mcp_progress_relay.attach(options.mcp_servers)
+        options.mcp_servers, handle = mcp_progress_relay.attach(options.mcp_servers, read_only)
         session.mcp_progress_relay = handle
         if handle is not None:
             if options.env is None:

@@ -8,7 +8,9 @@ Everything else returns 404, which the CLI tolerates for its side requests.
 A ``plan`` callable picks each reply from the request body:
 
 * ``{"text": "..."}`` — one text block, ``end_turn``;
-* ``{"tool_use": {"name": "...", "input": {...}}}`` — one tool call.
+* ``{"tool_use": {"name": "...", "input": {...}}}`` — one tool call;
+* ``{"tool_uses": [{"name": ...}, ...]}`` — several tool calls in ONE assistant
+  message (a parallel batch), in that order.
 
 The default plan answers ``"ok"`` to everything. Use :meth:`cli_env` for the
 ``ClaudeAgentOptions.env`` that points a CLI child at this server with an
@@ -117,16 +119,22 @@ class FakeAnthropicAPI:
                 self._reply(body, api.plan(body))
 
             def _reply(self, body: Dict[str, Any], reply: Reply) -> None:
-                if "tool_use" in reply:
-                    block = {
-                        "type": "tool_use",
-                        "id": "toolu_" + uuid.uuid4().hex[:12],
-                        "name": reply["tool_use"]["name"],
-                        "input": reply["tool_use"].get("input", {}),
-                    }
+                calls = reply.get("tool_uses") or (
+                    [reply["tool_use"]] if "tool_use" in reply else []
+                )
+                if calls:
+                    blocks = [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_" + uuid.uuid4().hex[:12],
+                            "name": call["name"],
+                            "input": call.get("input", {}),
+                        }
+                        for call in calls
+                    ]
                     stop = "tool_use"
                 else:
-                    block = {"type": "text", "text": reply.get("text", "ok")}
+                    blocks = [{"type": "text", "text": reply.get("text", "ok")}]
                     stop = "end_turn"
                 message = {
                     "id": "msg_" + uuid.uuid4().hex[:12],
@@ -144,7 +152,7 @@ class FakeAnthropicAPI:
                 }
                 if not body.get("stream"):
                     return self._json(
-                        200, {**message, "content": [block], "stop_reason": stop}
+                        200, {**message, "content": blocks, "stop_reason": stop}
                     )
 
                 self.send_response(200)
@@ -163,24 +171,25 @@ class FakeAnthropicAPI:
                     "message_start",
                     {"type": "message_start", "message": {**message, "content": []}},
                 )
-                if block["type"] == "text":
-                    start = {"type": "text", "text": ""}
-                    delta = {"type": "text_delta", "text": block["text"]}
-                else:
-                    start = {**block, "input": {}}
-                    delta = {
-                        "type": "input_json_delta",
-                        "partial_json": json.dumps(block["input"]),
-                    }
-                event(
-                    "content_block_start",
-                    {"type": "content_block_start", "index": 0, "content_block": start},
-                )
-                event(
-                    "content_block_delta",
-                    {"type": "content_block_delta", "index": 0, "delta": delta},
-                )
-                event("content_block_stop", {"type": "content_block_stop", "index": 0})
+                for index, block in enumerate(blocks):
+                    if block["type"] == "text":
+                        start = {"type": "text", "text": ""}
+                        delta = {"type": "text_delta", "text": block["text"]}
+                    else:
+                        start = {**block, "input": {}}
+                        delta = {
+                            "type": "input_json_delta",
+                            "partial_json": json.dumps(block["input"]),
+                        }
+                    event(
+                        "content_block_start",
+                        {"type": "content_block_start", "index": index, "content_block": start},
+                    )
+                    event(
+                        "content_block_delta",
+                        {"type": "content_block_delta", "index": index, "delta": delta},
+                    )
+                    event("content_block_stop", {"type": "content_block_stop", "index": index})
                 event(
                     "message_delta",
                     {

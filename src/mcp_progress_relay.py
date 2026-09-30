@@ -21,6 +21,19 @@ rewritten — the relay only reads. It is not an open proxy: a relay id is a ran
 token bound to the exact server URLs of that session's config, and only same-host callers (the
 CLI child) are served. ``MCP_PROGRESS_RELAY=false`` turns it off (servers go direct again).
 
+One opt-in exception to "bytes are never rewritten": ``readOnlyTools`` (ChatDRAGON #471). The
+CLI runs the tools of one parallel batch **sequentially unless every one carries
+``annotations.readOnlyHint: true``** (pinned in ``tests/test_cli_mcp_readonly.py``), so a
+server that never declares the hint makes a 300 ms lookup wait behind a 2-minute research
+call in the same batch. An operator who knows a server's tools are side-effect free lists them
+on the server entry — ``"readOnlyTools": ["search_internal_docs", "basic_knowledge"]`` or
+``"*"`` (exactly that string; ``true`` or any other shape is rejected with a warning) — and the
+relay adds ``readOnlyHint: true`` to exactly those tools in the server's ``tools/list`` reply. A
+tool the server itself declares ``readOnlyHint: false`` or ``destructiveHint: true`` is never
+overridden. The key is gateway-only: it is always stripped before the CLI sees the
+config, and it needs the relay (a stdio server, or an unreachable relay, logs that the hint
+cannot be applied). Nothing else in any reply is touched.
+
 The relay must never cost the MCP tools themselves — progress is a nicety, the tool call is the
 work. So the child always dials the gateway on loopback (never the interface address a request
 happened to arrive on: behind Docker port publishing that is the container IP, the child's call
@@ -35,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -82,8 +96,14 @@ class RelayHandle:
 
     relay_id: str
     targets: Dict[str, str]
+    # server name → tool names to mark read-only ({"*"} = every tool of that server)
+    read_only: Dict[str, frozenset] = field(default_factory=dict)
     queue: "asyncio.Queue[Dict[str, Any]]" = field(default_factory=lambda: asyncio.Queue(_QUEUE_SIZE))
     tokens: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
+    # server name → tools/list ids whose reply has not been seen yet. A spec-valid
+    # Streamable HTTP server may close the POST's SSE stream before the response and
+    # deliver it on a GET resume (Last-Event-ID); the rewrite follows it there.
+    pending_lists: Dict[str, set] = field(default_factory=dict)
 
     def remember(self, token: Any, tool_use_id: str) -> None:
         self.tokens[str(token)] = tool_use_id
@@ -222,7 +242,48 @@ def with_loopback_no_proxy(env: Dict[str, str]) -> None:
         env[key] = ",".join(entries)
 
 
-def attach(mcp_servers: Any) -> Tuple[Any, Optional[RelayHandle]]:
+READ_ONLY_KEY = "readOnlyTools"
+
+
+def split_read_only(mcp_servers: Any) -> Tuple[Any, Dict[str, frozenset]]:
+    """Strip the gateway-only ``readOnlyTools`` key; return (servers for the CLI, rules).
+
+    Always called before the config reaches the CLI — relay on or off — so the CLI never
+    sees a key it does not know. Invalid values are dropped with a warning.
+    """
+    if not isinstance(mcp_servers, dict):
+        return mcp_servers, {}
+    rules: Dict[str, frozenset] = {}
+    cleaned: Dict[str, Any] = {}
+    for name, config in mcp_servers.items():
+        if not isinstance(config, dict) or READ_ONLY_KEY not in config:
+            cleaned[name] = config
+            continue
+        value = config[READ_ONLY_KEY]
+        cleaned[name] = {k: v for k, v in config.items() if k != READ_ONLY_KEY}
+        # Fail closed: only the exact string "*" is the wildcard. ``true`` (a common JSON
+        # slip), numbers, objects or a list with non-names are NOT read — widening every
+        # tool of a server to "safe to run concurrently" must never happen by accident.
+        if isinstance(value, str) and value == "*":
+            rules[name] = frozenset({"*"})
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(v, str) and v and v != "*" for v in value)
+        ):
+            rules[name] = frozenset(value)
+        else:
+            logger.warning(
+                "MCP server %r: %s must be \"*\" or a list of tool names; ignored",
+                name,
+                READ_ONLY_KEY,
+            )
+    return cleaned, rules
+
+
+def attach(
+    mcp_servers: Any, read_only: Optional[Dict[str, frozenset]] = None
+) -> Tuple[Any, Optional[RelayHandle]]:
     """Point this client's HTTP MCP servers at the relay. Returns (servers for the CLI, handle|None)."""
     if not isinstance(mcp_servers, dict) or not mcp_servers or not relay_enabled():
         return mcp_servers, None
@@ -245,7 +306,14 @@ def attach(mcp_servers: Any) -> Tuple[Any, Optional[RelayHandle]]:
             rewritten[name] = config
     if not targets:
         return mcp_servers, None
-    handle = RelayHandle(relay_id=relay_id, targets=targets)
+    rules = {name: tools for name, tools in (read_only or {}).items() if name in targets}
+    for name in set(read_only or {}) - set(rules):
+        logger.warning(
+            "MCP server %r: %s needs an HTTP server routed through the relay; not applied",
+            name,
+            READ_ONLY_KEY,
+        )
+    handle = RelayHandle(relay_id=relay_id, targets=targets, read_only=rules)
     _registry[relay_id] = handle
     return rewritten, handle
 
@@ -290,6 +358,141 @@ def _scan_events(handle: RelayHandle, text: str) -> str:
                 if isinstance(params, dict):
                     handle.publish(params)
     return tail if len(tail) <= _MAX_SSE_BUFFER else ""
+
+
+def _tools_list_ids(body: bytes) -> set:
+    """JSON-RPC ids of the ``tools/list`` requests in a request body."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return set()
+    ids = set()
+    for message in payload if isinstance(payload, list) else [payload]:
+        if isinstance(message, dict) and message.get("method") == "tools/list" and "id" in message:
+            ids.add(json.dumps(message["id"]))
+    return ids
+
+
+def _mark_read_only(message: Any, ids: set, tools: frozenset, seen: Optional[set] = None) -> bool:
+    """Add ``readOnlyHint: true`` to matching tools of one ``tools/list`` result."""
+    if not isinstance(message, dict) or json.dumps(message.get("id")) not in ids:
+        return False
+    if seen is not None and ("result" in message or "error" in message):
+        seen.add(json.dumps(message.get("id")))
+    result = message.get("result")
+    listed = result.get("tools") if isinstance(result, dict) else None
+    if not isinstance(listed, list):
+        return False
+    changed = False
+    for tool in listed:
+        if not isinstance(tool, dict):
+            continue
+        if "*" in tools or tool.get("name") in tools:
+            annotations = tool.get("annotations")
+            annotations = dict(annotations) if isinstance(annotations, dict) else {}
+            # The server's own explicit claim wins: a tool it marks not read-only or
+            # destructive stays that way, whatever the operator's list says.
+            if annotations.get("readOnlyHint") is False or annotations.get("destructiveHint") is True:
+                logger.warning(
+                    "mcp relay: %s declares itself not read-only/destructive; readOnlyTools ignored for it",
+                    tool.get("name"),
+                )
+                continue
+            if annotations.get("readOnlyHint") is not True:
+                annotations["readOnlyHint"] = True
+                tool["annotations"] = annotations
+                changed = True
+    return changed
+
+
+def _rewrite_payload(text: str, ids: set, tools: frozenset, seen: Optional[set] = None) -> Optional[str]:
+    try:
+        payload = json.loads(text)
+    except ValueError:
+        return None
+    messages = payload if isinstance(payload, list) else [payload]
+    changed = False
+    for m in messages:
+        changed = _mark_read_only(m, ids, tools, seen) or changed
+    return json.dumps(payload, ensure_ascii=False) if changed else None
+
+
+def rewrite_tools_list(
+    content: bytes, is_sse: bool, ids: set, tools: frozenset, seen: Optional[set] = None
+) -> bytes:
+    """The ``tools/list`` reply with ``readOnlyHint`` added; unchanged bytes otherwise.
+
+    ``seen`` (when given) collects the ids whose response was in *content*, so a caller
+    can tell a reply that is still owed (resumable SSE) from one that arrived.
+    """
+    text = content.decode("utf-8", errors="strict")
+    if not is_sse:
+        rewritten = _rewrite_payload(text, ids, tools, seen)
+        return rewritten.encode("utf-8") if rewritten is not None else content
+    newline = "\r\n" if "\r\n" in text else "\n"
+    sep = newline * 2
+    out_events = []
+    changed = False
+    for event in text.split(sep):
+        lines = event.split(newline)
+        data_idx = [i for i, line in enumerate(lines) if line.startswith("data:")]
+        if not data_idx:
+            out_events.append(event)
+            continue
+        data = "\n".join(lines[i][5:].lstrip() for i in data_idx)
+        rewritten = _rewrite_payload(data, ids, tools, seen)
+        if rewritten is None:
+            out_events.append(event)
+            continue
+        changed = True
+        # Same event, same non-data lines in place; the data lines become one.
+        rebuilt = []
+        for i, line in enumerate(lines):
+            if i == data_idx[0]:
+                rebuilt.append(f"data: {rewritten}")
+            elif i not in data_idx:
+                rebuilt.append(line)
+        out_events.append(newline.join(rebuilt))
+    return sep.join(out_events).encode("utf-8") if changed else content
+
+
+_MAX_PENDING_LISTS = 16
+_SSE_EVENT_END = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+
+
+def _remember_pending(handle: RelayHandle, server: str, ids: set) -> None:
+    owed = handle.pending_lists.setdefault(server, set())
+    owed.update(ids)
+    while len(owed) > _MAX_PENDING_LISTS:
+        owed.pop()
+
+
+def _complete_events(buffer: bytes) -> Tuple[list, bytes]:
+    """Split *buffer* into complete SSE events (terminator included) and the rest."""
+    events, start = [], 0
+    for match in _SSE_EVENT_END.finditer(buffer):
+        events.append(buffer[start : match.end()])
+        start = match.end()
+    rest = buffer[start:]
+    if len(rest) > _MAX_SSE_BUFFER:
+        # Not an event stream we can frame; stop holding bytes back.
+        events.append(rest)
+        rest = b""
+    return events, rest
+
+
+def _rewrite_owed(handle: RelayHandle, server: str, event: bytes, tools: frozenset) -> bytes:
+    owed = handle.pending_lists.get(server)
+    if not owed or b'"id"' not in event:
+        return event
+    seen: set = set()
+    try:
+        rewritten = rewrite_tools_list(event, True, owed, tools, seen)
+    except Exception:  # noqa: BLE001 — an event we cannot parse goes through as it came
+        logger.warning("mcp relay: could not apply readOnlyTools to %s", server, exc_info=True)
+        return event
+    owed.difference_update(seen)
+    return rewritten
 
 
 _http: Optional[httpx.AsyncClient] = None
@@ -340,9 +543,33 @@ async def relay(relay_id: str, server: str, request: Request) -> StreamingRespon
     is_sse = "text/event-stream" in upstream.headers.get("content-type", "")
     out_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_HEADERS}
 
+    read_only = handle.read_only.get(server)
+    list_ids = _tools_list_ids(body) if read_only and request.method == "POST" and body else set()
+    if list_ids:
+        # A tools/list reply is small and finite: read it whole, add the operator-declared
+        # readOnlyHint, and answer in one piece. Every other exchange streams untouched.
+        try:
+            content = await upstream.aread()
+        finally:
+            await upstream.aclose()
+        seen: set = set()
+        try:
+            content = rewrite_tools_list(content, is_sse, list_ids, read_only, seen)
+        except Exception:  # noqa: BLE001 — a reply we cannot parse goes through as it came
+            logger.warning("mcp relay: could not apply readOnlyTools to %s", server, exc_info=True)
+            seen = set(list_ids)
+        if is_sse and list_ids - seen:
+            # The server closed this stream before answering; the reply comes on a GET resume.
+            _remember_pending(handle, server, list_ids - seen)
+        return Response(content=content, status_code=upstream.status_code, headers=out_headers)
+
+    # A GET resume may carry a tools/list reply an earlier POST stream still owed.
+    owed = handle.pending_lists.get(server) if read_only and is_sse and request.method == "GET" else None
+
     async def stream() -> AsyncIterator[bytes]:
         tail = ""
         decoder = None
+        pending = b""
         if is_sse:
             import codecs
 
@@ -355,7 +582,18 @@ async def relay(relay_id: str, server: str, request: Request) -> StreamingRespon
                     except Exception:  # noqa: BLE001 — reading must never break the relayed bytes
                         logger.debug("mcp relay: progress scan failed", exc_info=True)
                         tail = ""
+                if owed:
+                    # Only while a reply is owed: pass complete events one at a time, the
+                    # tools/list one with its hint; everything else keeps its exact bytes.
+                    events, pending = _complete_events(pending + chunk)
+                    for event in events:
+                        yield _rewrite_owed(handle, server, event, read_only)
+                    continue
+                if pending:
+                    chunk, pending = pending + chunk, b""
                 yield chunk
+            if pending:
+                yield pending
         finally:
             await upstream.aclose()
 
