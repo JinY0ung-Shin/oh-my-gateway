@@ -93,7 +93,8 @@ uv run pytest --cov=src                            # with coverage
   `annotations.readOnlyHint: true`** (one marked is not enough), so an unannotated 2-minute research
   tool makes a 300 ms lookup in the same batch wait for it (ChatDRAGON #471). For servers we don't
   own, an MCP server entry may carry the gateway-only key `"readOnlyTools": [...tool names]` or
-  `"*"`: `_configure_mcp_servers` strips it on every options build (the CLI never sees it) and the
+  exactly `"*"` (fail closed: `true`/numbers/objects are rejected with a warning, and a tool the server
+  itself marks `readOnlyHint: false` or `destructiveHint: true` is never overridden): `_configure_mcp_servers` strips it on every options build (the CLI never sees it) and the
   progress relay adds `readOnlyHint: true` to exactly those tools in the server's `tools/list`
   reply — the relay's one byte rewrite, and only for HTTP servers routed through it (stdio or an
   unreachable relay logs "not applied"). Only list tools that are truly side-effect free.

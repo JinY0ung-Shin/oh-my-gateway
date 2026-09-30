@@ -525,3 +525,28 @@ def test_every_options_build_strips_read_only_and_keeps_the_rules():
         )
     assert relay.READ_ONLY_KEY not in options.mcp_servers["docs"]
     assert options._gateway_read_only_tools == {"docs": frozenset({"*"})}
+
+
+
+@pytest.mark.parametrize("value", [True, False, 1, 0, {"*": True}, {}, [], ["ok", 3], ["*"], "all", "", None])
+def test_read_only_values_other_than_star_or_names_fail_closed(value, caplog):
+    """Only the exact string "*" widens a whole server; a slip like ``true`` must not."""
+    cleaned, rules = relay.split_read_only(
+        {"docs": {"type": "http", "url": "https://d/mcp", relay.READ_ONLY_KEY: value}}
+    )
+    assert rules == {} and relay.READ_ONLY_KEY not in cleaned["docs"]
+    assert any(relay.READ_ONLY_KEY in r.getMessage() for r in caplog.records)
+
+
+def test_server_declared_not_read_only_or_destructive_is_never_overridden():
+    tools = [
+        {"name": "writer", "annotations": {"readOnlyHint": False}},
+        {"name": "wiper", "annotations": {"destructiveHint": True}},
+        {"name": "reader"},
+    ]
+    ids = {json.dumps(1)}
+    out = json.loads(relay.rewrite_tools_list(json.dumps(_tools_reply(tools)).encode(), False, ids, frozenset({"*"})))
+    by_name = {t["name"]: t for t in out["result"]["tools"]}
+    assert by_name["writer"]["annotations"] == {"readOnlyHint": False}
+    assert by_name["wiper"]["annotations"] == {"destructiveHint": True}
+    assert by_name["reader"]["annotations"] == {"readOnlyHint": True}

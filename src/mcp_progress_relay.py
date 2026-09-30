@@ -27,8 +27,10 @@ CLI runs the tools of one parallel batch **sequentially unless every one carries
 server that never declares the hint makes a 300 ms lookup wait behind a 2-minute research
 call in the same batch. An operator who knows a server's tools are side-effect free lists them
 on the server entry — ``"readOnlyTools": ["search_internal_docs", "basic_knowledge"]`` or
-``"*"`` — and the relay adds ``readOnlyHint: true`` to exactly those tools in the server's
-``tools/list`` reply. The key is gateway-only: it is always stripped before the CLI sees the
+``"*"`` (exactly that string; ``true`` or any other shape is rejected with a warning) — and the
+relay adds ``readOnlyHint: true`` to exactly those tools in the server's ``tools/list`` reply. A
+tool the server itself declares ``readOnlyHint: false`` or ``destructiveHint: true`` is never
+overridden. The key is gateway-only: it is always stripped before the CLI sees the
 config, and it needs the relay (a stdio server, or an unreachable relay, logs that the hint
 cannot be applied). Nothing else in any reply is touched.
 
@@ -254,11 +256,17 @@ def split_read_only(mcp_servers: Any) -> Tuple[Any, Dict[str, frozenset]]:
             continue
         value = config[READ_ONLY_KEY]
         cleaned[name] = {k: v for k, v in config.items() if k != READ_ONLY_KEY}
-        if value == "*" or value is True:
+        # Fail closed: only the exact string "*" is the wildcard. ``true`` (a common JSON
+        # slip), numbers, objects or a list with non-names are NOT read — widening every
+        # tool of a server to "safe to run concurrently" must never happen by accident.
+        if isinstance(value, str) and value == "*":
             rules[name] = frozenset({"*"})
-        elif isinstance(value, list) and all(isinstance(v, str) and v for v in value):
-            if value:
-                rules[name] = frozenset(value)
+        elif (
+            isinstance(value, list)
+            and value
+            and all(isinstance(v, str) and v and v != "*" for v in value)
+        ):
+            rules[name] = frozenset(value)
         else:
             logger.warning(
                 "MCP server %r: %s must be \"*\" or a list of tool names; ignored",
@@ -375,6 +383,14 @@ def _mark_read_only(message: Any, ids: set, tools: frozenset) -> bool:
         if "*" in tools or tool.get("name") in tools:
             annotations = tool.get("annotations")
             annotations = dict(annotations) if isinstance(annotations, dict) else {}
+            # The server's own explicit claim wins: a tool it marks not read-only or
+            # destructive stays that way, whatever the operator's list says.
+            if annotations.get("readOnlyHint") is False or annotations.get("destructiveHint") is True:
+                logger.warning(
+                    "mcp relay: %s declares itself not read-only/destructive; readOnlyTools ignored for it",
+                    tool.get("name"),
+                )
+                continue
             if annotations.get("readOnlyHint") is not True:
                 annotations["readOnlyHint"] = True
                 tool["annotations"] = annotations
