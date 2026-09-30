@@ -79,11 +79,15 @@ uv run pytest --cov=src                            # with coverage
   `_meta["claudecode/toolUseId"]`) but in SDK mode **never writes `notifications/progress` to its
   output** — its `tool_progress` frames cover Bash/REPL/heartbeat/agent-retry only. So HTTP
   (streamable-http) MCP servers are routed through `src/mcp_progress_relay.py`
-  (`/internal/mcp-relay/<relay_id>/<server>`, loopback-only, bound to the session's configured
-  URLs, bytes relayed verbatim): it reads the progress off the wire and the turn loop emits it as
-  `response.tool_progress` with `source: "mcp"`, `message`, `progress`, `total`.
+  (`/internal/mcp-relay/<relay_id>/<server>`, same-host callers only, bound to the session's
+  configured URLs, bytes relayed verbatim): it reads the progress off the wire and the turn loop
+  emits it as `response.tool_progress` with `source: "mcp"`, `message`, `progress`, `total`.
   `MCP_PROGRESS_RELAY=false` sends servers direct again; `MCP_RELAY_BASE_URL` overrides the
-  self-address the CLI child dials. `tests/test_cli_mcp_progress.py` pins both halves against the
+  self-address the CLI child dials. **The relay must never cost the MCP call itself:** the child
+  dials the served port on loopback (never `scope["server"]`'s host — behind Docker port
+  publishing that is the container IP, the child's call then came from it too and the old
+  loopback-only check 403'd every HTTP MCP server), loopback joins the child's `NO_PROXY`, and a
+  once-per-base self-probe (`reachable()`) keeps servers direct when the relay is unreachable. `tests/test_cli_mcp_progress.py` pins both halves against the
   bundled CLI — when a CLI bump starts forwarding the text itself, prefer that and retire the relay.
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
   turn fails with `sdk_error` — when one message exceeds `max_buffer_size`. A tool result is one

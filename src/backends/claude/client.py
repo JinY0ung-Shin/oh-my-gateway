@@ -1732,7 +1732,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.effort = effort
             options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
         await self._apply_skills_allowlist(options)
-        self._attach_mcp_progress_relay(options, session)
+        await self._attach_mcp_progress_relay(options, session)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
         # model as a callable tool when a permission callback is present.
@@ -1747,7 +1747,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         return client
 
     @staticmethod
-    def _attach_mcp_progress_relay(options: ClaudeAgentOptions, session) -> None:
+    async def _attach_mcp_progress_relay(options: ClaudeAgentOptions, session) -> None:
         """Route this client's HTTP MCP servers through the gateway's progress relay.
 
         The CLI receives MCP ``notifications/progress`` but never writes them to its SDK
@@ -1759,9 +1759,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         previous = getattr(session, "mcp_progress_relay", None)
         mcp_progress_relay.detach(previous)
+        session.mcp_progress_relay = None
+        # Progress is a nicety; the MCP call is the work. An unreachable relay keeps every
+        # server direct instead of pointing the CLI at a URL it cannot use.
+        if not mcp_progress_relay.relay_enabled() or not await mcp_progress_relay.reachable():
+            return
         options.mcp_servers, handle = mcp_progress_relay.attach(options.mcp_servers)
         session.mcp_progress_relay = handle
         if handle is not None:
+            if options.env is None:
+                options.env = {}
+            mcp_progress_relay.with_loopback_no_proxy(options.env)
             weakref.finalize(session, mcp_progress_relay.detach, handle)
 
     @staticmethod

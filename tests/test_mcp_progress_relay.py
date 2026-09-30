@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace
+from typing import Any, Optional
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -203,3 +204,210 @@ async def test_turn_loop_interleaves_relayed_progress_without_losing_sdk_message
         {"type": "tool_progress", "source": "mcp", "tool_use_id": "toolu_1", "tool_name": "", "elapsed_time_seconds": 0, "progress": 5, "total": 50, "message": "mid"},
         {"tag": "second"},
     ], "stale progress is dropped, live progress rides between messages, no SDK message is lost"
+
+
+# ---------------------------------------------------------------------------
+# #220 regression: the relay took down every HTTP MCP server behind Docker.
+#
+# ``scope["server"]`` is the address a connection was *accepted on*. A ``--host 0.0.0.0`` gateway
+# reached through port publishing reports its container IP, the CLI child was told to dial that IP,
+# its call then came *from* that IP, and the loopback-only check refused every MCP request (403).
+
+
+@pytest.fixture
+def _fresh_origin(monkeypatch):
+    monkeypatch.delenv("MCP_RELAY_BASE_URL", raising=False)
+    monkeypatch.setattr(relay, "_origin", None)
+    monkeypatch.setattr(relay, "_probe_ok", {}, raising=False)
+    monkeypatch.setattr(relay, "_probe_failed_at", {}, raising=False)
+
+
+@pytest.mark.parametrize(
+    ("server", "origin"),
+    [
+        (("172.17.0.3", 8000), "http://127.0.0.1:8000"),
+        (("0.0.0.0", 8000), "http://127.0.0.1:8000"),
+        (("127.0.0.1", 17995), "http://127.0.0.1:17995"),
+        (("fd00::5", 8000), "http://[::1]:8000"),
+        (("::ffff:10.0.0.4", 8000), "http://127.0.0.1:8000"),
+    ],
+)
+def test_origin_always_dials_the_served_port_on_loopback(_fresh_origin, server, origin):
+    relay.note_origin({"type": "http", "server": server})
+    assert relay.local_base_url() == origin
+
+
+def _scope_app():
+    """Relay router behind an app whose ``scope["server"]`` we control (the accepting address)."""
+    inner = _relay_app()
+
+    async def app(scope, receive, send):
+        if scope["type"] == "http":
+            scope = {**scope, "server": ("172.17.0.3", 8000)}
+        await inner(scope, receive, send)
+
+    return app
+
+
+async def _call_on(client_host: str, path: str, method: str = "GET"):
+    transport = httpx.ASGITransport(app=_scope_app(), client=(client_host, 5555))
+    async with httpx.AsyncClient(transport=transport, base_url="http://gw") as client:
+        return await client.request(method, path, content=b"{}" if method == "POST" else None)
+
+
+async def test_a_caller_on_this_hosts_own_interface_address_is_served():
+    _servers_out, handle = relay.attach({"docs": {"type": "http", "url": "https://docs.internal/mcp"}})
+    assert (await _call_on("172.17.0.3", relay.PROBE_PATH)).status_code == 204
+    # A remote peer (the Docker bridge gateway, another host) is still refused.
+    assert (await _call_on("172.17.0.1", relay.PROBE_PATH)).status_code == 403
+    assert (await _call_on("172.17.0.1", f"/internal/mcp-relay/{handle.relay_id}/docs", "POST")).status_code == 403
+
+
+class _ProbeClient:
+    """Stands in for the probe's httpx.AsyncClient; records calls and answers from ``outcome``."""
+
+    calls: list = []
+    outcome: Any = 204
+
+    def __init__(self, **kwargs):
+        assert kwargs.get("trust_env") is False, "the probe must not go through HTTP(S)_PROXY"
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def get(self, url):
+        _ProbeClient.calls.append(url)
+        if isinstance(_ProbeClient.outcome, Exception):
+            raise _ProbeClient.outcome
+        return httpx.Response(_ProbeClient.outcome)
+
+
+@pytest.fixture
+def probe_client(monkeypatch, _fresh_origin):
+    _ProbeClient.calls = []
+    _ProbeClient.outcome = 204
+    monkeypatch.setattr(relay.httpx, "AsyncClient", _ProbeClient)
+    relay.note_origin({"type": "http", "server": ("172.17.0.3", 8000)})
+    return _ProbeClient
+
+
+async def test_reachable_probes_once_and_caches_success(probe_client):
+    assert await relay.reachable() and await relay.reachable()
+    assert probe_client.calls == ["http://127.0.0.1:8000" + relay.PROBE_PATH]
+
+
+@pytest.mark.parametrize("outcome", [403, httpx.ConnectError("refused")])
+async def test_an_unreachable_relay_is_reported_and_retried_only_after_a_while(probe_client, outcome):
+    probe_client.outcome = outcome
+    assert not await relay.reachable()
+    assert not await relay.reachable(), "a failure is not re-probed on every client"
+    assert len(probe_client.calls) == 1
+
+
+def test_loopback_joins_the_childs_no_proxy_without_losing_existing_entries(monkeypatch):
+    monkeypatch.setenv("NO_PROXY", "corp.internal,localhost")
+    monkeypatch.delenv("no_proxy", raising=False)
+    env = {"no_proxy": ".intra"}
+    relay.with_loopback_no_proxy(env)
+    assert env["NO_PROXY"] == "corp.internal,localhost,127.0.0.1,::1"
+    assert env["no_proxy"] == ".intra,127.0.0.1,localhost,::1"
+
+
+async def test_client_keeps_mcp_servers_direct_when_the_relay_is_unreachable(probe_client):
+    from src.backends.claude.client import ClaudeCodeCLI
+    from src.session_manager import Session
+
+    servers = {"docs": {"type": "http", "url": "https://docs.internal/mcp"}}
+    probe_client.outcome = 403
+    options = SimpleNamespace(mcp_servers=dict(servers), env={})
+    session = Session(session_id="sess-direct")
+    await ClaudeCodeCLI._attach_mcp_progress_relay(options, session)
+    assert options.mcp_servers == servers, "MCP tools must keep working without the relay"
+    assert session.mcp_progress_relay is None and options.env == {}
+
+    relay._probe_failed_at.clear()
+    probe_client.outcome = 204
+    await ClaudeCodeCLI._attach_mcp_progress_relay(options, session)
+    assert options.mcp_servers["docs"]["url"].startswith("http://127.0.0.1:8000/internal/mcp-relay/")
+    assert session.mcp_progress_relay is not None
+    assert "127.0.0.1" in options.env["NO_PROXY"].split(",")
+
+
+def _non_loopback_ipv4() -> Optional[str]:
+    import socket
+
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("192.0.2.1", 9))  # TEST-NET-1: no packet is sent for a UDP connect
+        address = probe.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        probe.close()
+    return None if address.startswith("127.") else address
+
+
+async def test_real_listener_on_all_interfaces_relays_when_first_reached_on_its_interface(_fresh_origin, monkeypatch):
+    """End to end on a real uvicorn socket — the exact topology that broke (Docker port publish)."""
+    import socket
+
+    import uvicorn
+
+    address = _non_loopback_ipv4()
+    if address is None:
+        pytest.skip("no non-loopback IPv4 address on this host")
+
+    upstream_calls = []
+
+    async def upstream_mcp(scope, receive, send):  # a minimal HTTP MCP server
+        upstream_calls.append(scope["path"])
+        await send({"type": "http.response.start", "status": 200, "headers": [(b"content-type", b"application/json")]})
+        await send({"type": "http.response.body", "body": b'{"jsonrpc":"2.0","id":1,"result":{}}'})
+
+    def free_port() -> int:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            return s.getsockname()[1]
+
+    gateway_app = FastAPI()
+    gateway_app.add_middleware(relay.RelayOriginMiddleware)
+    gateway_app.include_router(relay.router)
+
+    @gateway_app.get("/first")
+    async def first():
+        return {}
+
+    gw_port, mcp_port = free_port(), free_port()
+    # The relay's pooled client is process-global; one left by an earlier test belongs to that
+    # test's (closed) event loop.
+    monkeypatch.setattr(relay, "_http", None)
+    servers = [
+        uvicorn.Server(uvicorn.Config(gateway_app, host="0.0.0.0", port=gw_port, log_level="warning")),
+        uvicorn.Server(uvicorn.Config(upstream_mcp, host="127.0.0.1", port=mcp_port, log_level="warning")),
+    ]
+    tasks = [asyncio.create_task(server.serve()) for server in servers]
+    try:
+        for server in servers:
+            for _ in range(200):
+                if server.started:
+                    break
+                await asyncio.sleep(0.02)
+        async with httpx.AsyncClient(trust_env=False) as client:
+            # The first request arrives on the interface address, like a published Docker port.
+            assert (await client.get(f"http://{address}:{gw_port}/first")).status_code == 200
+            rewritten, handle = relay.attach({"docs": {"type": "http", "url": f"http://127.0.0.1:{mcp_port}/mcp"}})
+            # What the CLI child does: dial the URL it was given.
+            res = await client.post(rewritten["docs"]["url"], json={"jsonrpc": "2.0", "id": 1, "method": "initialize"})
+            assert res.status_code == 200, res.text
+            assert upstream_calls == ["/mcp"]
+            assert relay.local_base_url() == f"http://127.0.0.1:{gw_port}"
+            assert await relay.reachable()
+    finally:
+        for server in servers:
+            server.should_exit = True
+        await asyncio.gather(*tasks, return_exceptions=True)
+        if relay._http is not None:
+            await relay._http.aclose()

@@ -18,8 +18,15 @@ request verbatim to the configured URL and streams the reply back unbuffered. Wh
 
 which the turn loop turns into ``response.tool_progress`` (``source="mcp"``). Bytes are never
 rewritten — the relay only reads. It is not an open proxy: a relay id is a random per-client
-token bound to the exact server URLs of that session's config, and only loopback callers (the
+token bound to the exact server URLs of that session's config, and only same-host callers (the
 CLI child) are served. ``MCP_PROGRESS_RELAY=false`` turns it off (servers go direct again).
+
+The relay must never cost the MCP tools themselves — progress is a nicety, the tool call is the
+work. So the child always dials the gateway on loopback (never the interface address a request
+happened to arrive on: behind Docker port publishing that is the container IP, the child's call
+then comes *from* that IP too, and a loopback-only check refused every MCP request), loopback is
+added to the child's ``NO_PROXY``, and a one-time self-probe falls back to direct connections if
+the relay is not reachable from this process.
 """
 
 from __future__ import annotations
@@ -36,7 +43,7 @@ from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import Response, StreamingResponse
 
 logger = logging.getLogger(__name__)
 
@@ -126,6 +133,12 @@ def local_base_url() -> Optional[str]:
 
 
 def note_origin(scope: Dict[str, Any]) -> None:
+    """Remember the served PORT and dial it back on loopback.
+
+    ``scope["server"]`` is the local address the connection was accepted on, not the bind
+    address: a ``--host 0.0.0.0`` gateway reached through Docker port publishing reports its
+    container IP. The CLI child runs on this host, so loopback always reaches the listener.
+    """
     global _origin
     if _origin is not None or scope.get("type") != "http":
         return
@@ -133,11 +146,17 @@ def note_origin(scope: Dict[str, Any]) -> None:
     if not server or len(server) != 2 or server[1] is None:
         return
     host, port = server
-    if host in {"0.0.0.0", "::", "", None}:
-        host = "127.0.0.1"
-    if ":" in str(host):
-        host = f"[{host}]"
-    _origin = f"http://{host}:{port}"
+    ipv6 = ":" in str(host or "") and not str(host).startswith("::ffff:")
+    _origin = f"http://{'[::1]' if ipv6 else '127.0.0.1'}:{port}"
+
+
+def _same_host(request: Request) -> bool:
+    """Loopback, or a caller whose address IS the address it reached us on (this host)."""
+    client_host = request.client.host if request.client else ""
+    if client_host in _LOOPBACK:
+        return True
+    server = request.scope.get("server")
+    return bool(client_host) and bool(server) and client_host == server[0]
 
 
 class RelayOriginMiddleware:
@@ -149,6 +168,58 @@ class RelayOriginMiddleware:
     async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
         note_origin(scope)
         await self.app(scope, receive, send)
+
+
+PROBE_PATH = f"{RELAY_PREFIX}/_probe"
+_PROBE_RETRY_SECONDS = 60.0
+_probe_ok: Dict[str, bool] = {}
+_probe_failed_at: Dict[str, float] = {}
+
+
+async def reachable() -> bool:
+    """Can a same-host caller reach the relay at ``local_base_url()``? Probed once per base.
+
+    A failure is re-probed after a minute (a gateway still starting, a transient refusal);
+    meanwhile the servers stay direct so MCP tools keep working.
+    """
+    base = local_base_url()
+    if not base:
+        return False
+    if _probe_ok.get(base):
+        return True
+    loop = asyncio.get_running_loop()
+    failed_at = _probe_failed_at.get(base)
+    if failed_at is not None and loop.time() - failed_at < _PROBE_RETRY_SECONDS:
+        return False
+    try:
+        # trust_env=False: this asks "is the listener reachable on this host", not "does the
+        # corporate proxy route loopback" — the child gets loopback in NO_PROXY for that.
+        async with httpx.AsyncClient(timeout=3.0, trust_env=False) as client:
+            ok = (await client.get(f"{base}{PROBE_PATH}")).status_code == 204
+    except httpx.HTTPError:
+        ok = False
+    if ok:
+        _probe_ok[base] = True
+        _probe_failed_at.pop(base, None)
+    else:
+        _probe_failed_at[base] = loop.time()
+        logger.warning(
+            "mcp relay: %s is not reachable from this host; HTTP MCP servers stay direct "
+            "(no MCP progress). Set MCP_RELAY_BASE_URL to an address the CLI child can dial.",
+            base,
+        )
+    return ok
+
+
+def with_loopback_no_proxy(env: Dict[str, str]) -> None:
+    """Keep the child's relay calls off any HTTP(S)_PROXY: add loopback to NO_PROXY/no_proxy."""
+    for key in ("NO_PROXY", "no_proxy"):
+        current = env.get(key, os.environ.get(key, ""))
+        entries = [part.strip() for part in current.split(",") if part.strip()]
+        for host in ("127.0.0.1", "localhost", "::1"):
+            if host not in entries:
+                entries.append(host)
+        env[key] = ",".join(entries)
 
 
 def attach(mcp_servers: Any) -> Tuple[Any, Optional[RelayHandle]]:
@@ -236,11 +307,18 @@ def _client() -> httpx.AsyncClient:
 router = APIRouter(include_in_schema=False)
 
 
+@router.get(PROBE_PATH, status_code=204)
+async def probe(request: Request) -> Response:
+    """Self-probe target for ``reachable()`` — applies exactly the relay's caller rule."""
+    if not _same_host(request):
+        raise HTTPException(status_code=403, detail="relay is same-host only")
+    return Response(status_code=204)
+
+
 @router.api_route(f"{RELAY_PREFIX}/{{relay_id}}/{{server}}", methods=["GET", "POST", "DELETE"])
 async def relay(relay_id: str, server: str, request: Request) -> StreamingResponse:
-    client_host = request.client.host if request.client else ""
-    if client_host not in _LOOPBACK:
-        raise HTTPException(status_code=403, detail="relay is loopback-only")
+    if not _same_host(request):
+        raise HTTPException(status_code=403, detail="relay is same-host only")
     handle = _registry.get(relay_id)
     target = handle.targets.get(server) if handle else None
     if handle is None or target is None:
