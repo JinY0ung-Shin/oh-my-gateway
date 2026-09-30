@@ -48,6 +48,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import secrets
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -99,6 +100,10 @@ class RelayHandle:
     read_only: Dict[str, frozenset] = field(default_factory=dict)
     queue: "asyncio.Queue[Dict[str, Any]]" = field(default_factory=lambda: asyncio.Queue(_QUEUE_SIZE))
     tokens: "OrderedDict[str, str]" = field(default_factory=OrderedDict)
+    # server name → tools/list ids whose reply has not been seen yet. A spec-valid
+    # Streamable HTTP server may close the POST's SSE stream before the response and
+    # deliver it on a GET resume (Last-Event-ID); the rewrite follows it there.
+    pending_lists: Dict[str, set] = field(default_factory=dict)
 
     def remember(self, token: Any, tool_use_id: str) -> None:
         self.tokens[str(token)] = tool_use_id
@@ -368,10 +373,12 @@ def _tools_list_ids(body: bytes) -> set:
     return ids
 
 
-def _mark_read_only(message: Any, ids: set, tools: frozenset) -> bool:
+def _mark_read_only(message: Any, ids: set, tools: frozenset, seen: Optional[set] = None) -> bool:
     """Add ``readOnlyHint: true`` to matching tools of one ``tools/list`` result."""
     if not isinstance(message, dict) or json.dumps(message.get("id")) not in ids:
         return False
+    if seen is not None and ("result" in message or "error" in message):
+        seen.add(json.dumps(message.get("id")))
     result = message.get("result")
     listed = result.get("tools") if isinstance(result, dict) else None
     if not isinstance(listed, list):
@@ -398,7 +405,7 @@ def _mark_read_only(message: Any, ids: set, tools: frozenset) -> bool:
     return changed
 
 
-def _rewrite_payload(text: str, ids: set, tools: frozenset) -> Optional[str]:
+def _rewrite_payload(text: str, ids: set, tools: frozenset, seen: Optional[set] = None) -> Optional[str]:
     try:
         payload = json.loads(text)
     except ValueError:
@@ -406,15 +413,21 @@ def _rewrite_payload(text: str, ids: set, tools: frozenset) -> Optional[str]:
     messages = payload if isinstance(payload, list) else [payload]
     changed = False
     for m in messages:
-        changed = _mark_read_only(m, ids, tools) or changed
+        changed = _mark_read_only(m, ids, tools, seen) or changed
     return json.dumps(payload, ensure_ascii=False) if changed else None
 
 
-def rewrite_tools_list(content: bytes, is_sse: bool, ids: set, tools: frozenset) -> bytes:
-    """The ``tools/list`` reply with ``readOnlyHint`` added; unchanged bytes otherwise."""
+def rewrite_tools_list(
+    content: bytes, is_sse: bool, ids: set, tools: frozenset, seen: Optional[set] = None
+) -> bytes:
+    """The ``tools/list`` reply with ``readOnlyHint`` added; unchanged bytes otherwise.
+
+    ``seen`` (when given) collects the ids whose response was in *content*, so a caller
+    can tell a reply that is still owed (resumable SSE) from one that arrived.
+    """
     text = content.decode("utf-8", errors="strict")
     if not is_sse:
-        rewritten = _rewrite_payload(text, ids, tools)
+        rewritten = _rewrite_payload(text, ids, tools, seen)
         return rewritten.encode("utf-8") if rewritten is not None else content
     newline = "\r\n" if "\r\n" in text else "\n"
     sep = newline * 2
@@ -427,7 +440,7 @@ def rewrite_tools_list(content: bytes, is_sse: bool, ids: set, tools: frozenset)
             out_events.append(event)
             continue
         data = "\n".join(lines[i][5:].lstrip() for i in data_idx)
-        rewritten = _rewrite_payload(data, ids, tools)
+        rewritten = _rewrite_payload(data, ids, tools, seen)
         if rewritten is None:
             out_events.append(event)
             continue
@@ -441,6 +454,45 @@ def rewrite_tools_list(content: bytes, is_sse: bool, ids: set, tools: frozenset)
                 rebuilt.append(line)
         out_events.append(newline.join(rebuilt))
     return sep.join(out_events).encode("utf-8") if changed else content
+
+
+_MAX_PENDING_LISTS = 16
+_SSE_EVENT_END = re.compile(rb"\r\n\r\n|\n\n|\r\r")
+
+
+def _remember_pending(handle: RelayHandle, server: str, ids: set) -> None:
+    owed = handle.pending_lists.setdefault(server, set())
+    owed.update(ids)
+    while len(owed) > _MAX_PENDING_LISTS:
+        owed.pop()
+
+
+def _complete_events(buffer: bytes) -> Tuple[list, bytes]:
+    """Split *buffer* into complete SSE events (terminator included) and the rest."""
+    events, start = [], 0
+    for match in _SSE_EVENT_END.finditer(buffer):
+        events.append(buffer[start : match.end()])
+        start = match.end()
+    rest = buffer[start:]
+    if len(rest) > _MAX_SSE_BUFFER:
+        # Not an event stream we can frame; stop holding bytes back.
+        events.append(rest)
+        rest = b""
+    return events, rest
+
+
+def _rewrite_owed(handle: RelayHandle, server: str, event: bytes, tools: frozenset) -> bytes:
+    owed = handle.pending_lists.get(server)
+    if not owed or b'"id"' not in event:
+        return event
+    seen: set = set()
+    try:
+        rewritten = rewrite_tools_list(event, True, owed, tools, seen)
+    except Exception:  # noqa: BLE001 — an event we cannot parse goes through as it came
+        logger.warning("mcp relay: could not apply readOnlyTools to %s", server, exc_info=True)
+        return event
+    owed.difference_update(seen)
+    return rewritten
 
 
 _http: Optional[httpx.AsyncClient] = None
@@ -500,15 +552,24 @@ async def relay(relay_id: str, server: str, request: Request) -> StreamingRespon
             content = await upstream.aread()
         finally:
             await upstream.aclose()
+        seen: set = set()
         try:
-            content = rewrite_tools_list(content, is_sse, list_ids, read_only)
+            content = rewrite_tools_list(content, is_sse, list_ids, read_only, seen)
         except Exception:  # noqa: BLE001 — a reply we cannot parse goes through as it came
             logger.warning("mcp relay: could not apply readOnlyTools to %s", server, exc_info=True)
+            seen = set(list_ids)
+        if is_sse and list_ids - seen:
+            # The server closed this stream before answering; the reply comes on a GET resume.
+            _remember_pending(handle, server, list_ids - seen)
         return Response(content=content, status_code=upstream.status_code, headers=out_headers)
+
+    # A GET resume may carry a tools/list reply an earlier POST stream still owed.
+    owed = handle.pending_lists.get(server) if read_only and is_sse and request.method == "GET" else None
 
     async def stream() -> AsyncIterator[bytes]:
         tail = ""
         decoder = None
+        pending = b""
         if is_sse:
             import codecs
 
@@ -521,7 +582,18 @@ async def relay(relay_id: str, server: str, request: Request) -> StreamingRespon
                     except Exception:  # noqa: BLE001 — reading must never break the relayed bytes
                         logger.debug("mcp relay: progress scan failed", exc_info=True)
                         tail = ""
+                if owed:
+                    # Only while a reply is owed: pass complete events one at a time, the
+                    # tools/list one with its hint; everything else keeps its exact bytes.
+                    events, pending = _complete_events(pending + chunk)
+                    for event in events:
+                        yield _rewrite_owed(handle, server, event, read_only)
+                    continue
+                if pending:
+                    chunk, pending = pending + chunk, b""
                 yield chunk
+            if pending:
+                yield pending
         finally:
             await upstream.aclose()
 

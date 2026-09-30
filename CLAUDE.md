@@ -106,7 +106,7 @@ uv run pytest --cov=src                            # with coverage
   exactly `"*"` (fail closed: `true`/numbers/objects are rejected with a warning, and a tool the server
   itself marks `readOnlyHint: false` or `destructiveHint: true` is never overridden): `_configure_mcp_servers` strips it on every options build (the CLI never sees it) and the
   progress relay adds `readOnlyHint: true` to exactly those tools in the server's `tools/list`
-  reply — the relay's one byte rewrite, and only for HTTP servers routed through it (stdio or an
+  reply (also when a resumable server delivers it on a `Last-Event-ID` GET resume) — the relay's one byte rewrite, and only for HTTP servers routed through it (stdio or an
   unreachable relay logs "not applied"). Only list tools that are truly side-effect free.
   `tests/test_cli_mcp_readonly.py` pins sequential / concurrent / one-marked against the bundled CLI.
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
