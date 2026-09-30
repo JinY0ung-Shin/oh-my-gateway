@@ -100,6 +100,13 @@ def _live_view() -> Dict[str, Any]:
     view = dict(ref)
     view["label"] = _live_label(ref)
     view["char_count"] = len(system_prompt.get_raw_system_prompt() or "")
+    if ref.get("name") and ref.get("version"):
+        try:
+            prompt = prompt_library.get_prompt(ref["name"])
+            match = next((v for v in prompt["versions"] if v["version"] == ref["version"]), None)
+            view["sha"] = match["sha"] if match else None
+        except (prompt_library.PromptNotFound, ValueError):
+            view["sha"] = None
     if ref.get("mode") == "custom" and not ref.get("name"):
         # Untracked override (legacy direct edit): expose the text so it can be
         # imported into the library instead of lost on the next deploy.

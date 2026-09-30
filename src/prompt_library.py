@@ -19,6 +19,7 @@ first turn (``session_guard``) and the CLI replays it on resume.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -98,6 +99,12 @@ def _deploy_log_path() -> Path:
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
+    if isinstance(data.get("versions"), list):
+        # ``parent`` is derived on read; store only what a version is.
+        data = {
+            **data,
+            "versions": [{k: v for k, v in e.items() if k != "parent"} for e in data["versions"]],
+        }
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.stem}.", suffix=".tmp")
     try:
@@ -112,6 +119,26 @@ def _write_json_atomic(path: Path, data: dict) -> None:
         except OSError:
             pass
         raise
+
+
+def version_sha(name: str, version: dict) -> str:
+    """A git-style commit id for one version (40 hex; the UI shows the first 7).
+
+    Content-addressed over what the version *is* — prompt, number, text, author,
+    time, note — so the id is stable across reads and a legacy file without a
+    stored id gets the same one every time.
+    """
+    payload = "\0".join(
+        [
+            name,
+            str(version.get("version")),
+            str(version.get("content") or ""),
+            str(version.get("author") or ""),
+            str(version.get("created_at") or ""),
+            str(version.get("message") or ""),
+        ]
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
 def _normalize(data: dict, name: str) -> dict:
@@ -131,16 +158,23 @@ def _normalize(data: dict, name: str) -> dict:
     clean: List[dict] = []
     for v in versions:
         if isinstance(v, dict) and isinstance(v.get("version"), int):
-            clean.append(
-                {
-                    "version": v["version"],
-                    "content": str(v.get("content") or ""),
-                    "message": str(v.get("message") or ""),
-                    "author": v.get("author"),
-                    "created_at": v.get("created_at"),
-                }
+            entry = {
+                "version": v["version"],
+                "content": str(v.get("content") or ""),
+                "message": str(v.get("message") or ""),
+                "author": v.get("author"),
+                "created_at": v.get("created_at"),
+            }
+            stored = v.get("sha")
+            entry["sha"] = (
+                stored
+                if isinstance(stored, str) and re.fullmatch(r"[0-9a-f]{40}", stored)
+                else version_sha(data.get("name") or name, entry)
             )
+            clean.append(entry)
     clean.sort(key=lambda v: v["version"])
+    for i, entry in enumerate(clean):
+        entry["parent"] = clean[i - 1]["sha"] if i else None
     latest = clean[-1]
     return {
         "name": data.get("name") or name,
@@ -189,6 +223,7 @@ def _summary(data: dict, ref: dict) -> dict:
         "name": data["name"],
         "description": data["description"],
         "latest_version": latest["version"],
+        "latest_sha": latest["sha"],
         "version_count": len(data["versions"]),
         "updated_at": latest["created_at"],
         "updated_by": latest["author"],
@@ -250,6 +285,7 @@ def create_prompt(
             }
         ],
     }
+    data["versions"][0]["sha"] = version_sha(name, data["versions"][0])
     path = system_prompt._prompt_path(name)
     with _lock:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -303,15 +339,15 @@ def commit_version(
             raise NoChange(f"identical to version {latest['version']}")
         version = latest["version"] + 1
         now = _now()
-        data["versions"].append(
-            {
-                "version": version,
-                "content": content,
-                "message": _clip(message, MAX_MESSAGE_CHARS),
-                "author": _actor(author),
-                "created_at": now,
-            }
-        )
+        entry = {
+            "version": version,
+            "content": content,
+            "message": _clip(message, MAX_MESSAGE_CHARS),
+            "author": _actor(author),
+            "created_at": now,
+        }
+        entry["sha"] = version_sha(name, entry)
+        data["versions"].append(entry)
         data["content"] = content
         data["updated_at"] = now
         _write_json_atomic(system_prompt._prompt_path(name), data)
@@ -379,6 +415,7 @@ def deploy(
             "action": action,
             "name": data["name"],
             "version": version,
+            "sha": match["sha"],
             "by": _actor(author),
             "note": _clip(note, MAX_MESSAGE_CHARS),
             "from": _ref_label(before),

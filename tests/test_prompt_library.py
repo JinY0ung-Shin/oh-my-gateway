@@ -50,6 +50,24 @@ def test_versions_are_append_only_with_author_and_note(lib):
     assert system_prompt.get_named_prompt("ops")["content"] == "v2 text"
 
 
+def test_versions_carry_stable_git_style_commit_ids(lib):
+    (lib / "prompts").mkdir(parents=True)
+    (lib / "prompts" / "old.json").write_text(json.dumps({"name": "old", "content": "legacy", "updated_at": "t1"}))
+    legacy = prompt_library.get_prompt("old")["versions"][0]["sha"]
+    assert len(legacy) == 40 and prompt_library.get_prompt("old")["versions"][0]["sha"] == legacy
+
+    prompt_library.create_prompt("ops", "a", author="kim")
+    prompt_library.commit_version("ops", "b", author="lee")
+    v1, v2 = prompt_library.get_prompt("ops")["versions"]
+    assert v1["sha"] != v2["sha"] and v1["parent"] is None and v2["parent"] == v1["sha"]
+    stored = json.loads((lib / "prompts" / "ops.json").read_text())["versions"]
+    assert [v["sha"] for v in stored] == [v1["sha"], v2["sha"]]
+    assert all("parent" not in v for v in stored), "parent is derived on read, never stored"
+    summary = next(p for p in prompt_library.list_prompts() if p["name"] == "ops")
+    assert summary["latest_sha"] == v2["sha"]
+    assert prompt_library.deploy("ops", 1)["sha"] == v1["sha"]
+
+
 def test_identical_content_is_no_change(lib):
     prompt_library.create_prompt("ops", "same")
     with pytest.raises(prompt_library.NoChange):
@@ -193,6 +211,7 @@ def test_api_create_commit_deploy_flow_is_attributed(client):
     r = client.post(f"{BASE}/prompts/ops/deploy", json={"version": 2, "expected_live": "preset"}, headers=actor)
     assert r.status_code == 200, r.text
     assert r.json()["live"]["label"] == "ops@v2"
+    assert r.json()["live"]["sha"] == client.get(f"{BASE}/prompts/ops").json()["versions"][1]["sha"]
 
     overview = client.get(BASE).json()
     assert overview["live"]["deployed_by"] == "Kim Admin"
