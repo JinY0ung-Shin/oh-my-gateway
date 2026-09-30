@@ -840,9 +840,14 @@ async def set_system_prompt_endpoint(
     from src.routes.admin_prompt_library import _actor
     from src.system_prompt import get_prompt_mode, set_system_prompt
 
+    from src.system_prompt import mutation_lock
+
     try:
-        set_system_prompt(body.prompt, deployed_by=_actor(request))
-        record_direct_edit(_actor(request), len(body.prompt.strip()))
+        # Same mutation boundary as deploy/reset: a deploy's expected_live check
+        # can never interleave with this direct edit.
+        with mutation_lock:
+            set_system_prompt(body.prompt, deployed_by=_actor(request))
+            record_direct_edit(_actor(request), len(body.prompt.strip()))
     except ValueError as e:
         return JSONResponse(status_code=422, content={"error": str(e)})
     except OSError as e:

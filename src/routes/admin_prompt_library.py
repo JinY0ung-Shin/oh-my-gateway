@@ -119,7 +119,11 @@ def _session_usage() -> Dict[str, Any]:
 
     counts: Dict[str, int] = {}
     total = 0
-    for session in list(session_manager.sessions.values()):
+    # Copy under the manager's lock: cleanup/eviction mutate the dict under it,
+    # and this sync route runs in the threadpool alongside them.
+    with session_manager.lock:
+        sessions = list(session_manager.sessions.values())
+    for session in sessions:
         if session.is_expired():
             continue
         total += 1

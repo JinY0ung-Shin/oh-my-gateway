@@ -27,14 +27,16 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import RLock
 from typing import Any, Dict, List, Optional
 
 from src import system_prompt
 
 logger = logging.getLogger(__name__)
 
-_lock = RLock()
+# The same re-entrant lock serializes prompt-file writes and every live change,
+# so a check-then-act (``expected_live``, import's "still untracked?") holds
+# against deploys, resets, direct edits and legacy activate/delete alike.
+_lock = system_prompt.mutation_lock
 MAX_MESSAGE_CHARS = 200
 MAX_DESCRIPTION_CHARS = 500
 MAX_ACTOR_CHARS = 120
@@ -504,26 +506,44 @@ def list_deployments(limit: int = 50) -> List[dict]:
 
 def import_live(name: str, *, description: str = "", author: Optional[str] = None) -> dict:
     """Adopt the current untracked live override as ``name`` v1 without changing it."""
-    text = system_prompt.get_raw_system_prompt()
-    ref = system_prompt.get_live_ref()
-    if ref.get("mode") != "custom" or not text:
-        raise ValueError("Live prompt is not a custom override")
-    if ref.get("name") and ref.get("version"):
-        raise ValueError("Live prompt already belongs to a library prompt")
-    created = create_prompt(
-        name,
-        text,
-        description=description,
-        message="적용 중이던 프롬프트를 가져옴",
-        author=author,
-    )
     with _lock:
-        # Same text, now pointed at its library version — the live prompt new
-        # sessions receive is unchanged, so this is not logged as a deploy.
-        meta_by = ref.get("deployed_by")
-        system_prompt.set_system_prompt(
-            text, active_name=created["name"], active_version=1, deployed_by=meta_by
+        # One transaction under the mutation lock: read the live override, create
+        # v1 from it and re-point live at it. No deploy can land in between and be
+        # silently overwritten by the older text read here.
+        text = system_prompt.get_raw_system_prompt()
+        ref = system_prompt.get_live_ref()
+        if ref.get("mode") != "custom" or not text:
+            raise ValueError("Live prompt is not a custom override")
+        if ref.get("name") and ref.get("version"):
+            raise ValueError("Live prompt already belongs to a library prompt")
+        created = create_prompt(
+            name,
+            text,
+            description=description,
+            message="적용 중이던 프롬프트를 가져옴",
+            author=author,
         )
+        # Same text, now pointed at its library version — what new sessions
+        # receive is unchanged, but the live ref moved, so it is logged.
+        system_prompt.set_system_prompt(
+            text, active_name=created["name"], active_version=1, deployed_by=ref.get("deployed_by")
+        )
+        try:
+            _log_deploy(
+                {
+                    "at": _now(),
+                    "action": "import",
+                    "name": created["name"],
+                    "version": 1,
+                    "sha": created["versions"][0]["sha"],
+                    "by": _actor(author),
+                    "note": "",
+                    "from": "untracked",
+                    "char_count": len(text),
+                }
+            )
+        except OSError:
+            logger.warning("Prompt deploy log write failed", exc_info=True)
     return get_prompt(created["name"])
 
 

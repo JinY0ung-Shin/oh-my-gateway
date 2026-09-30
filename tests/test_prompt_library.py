@@ -140,7 +140,8 @@ def test_import_live_adopts_untracked_override_without_changing_it(lib):
     ref = system_prompt.get_live_ref()
     assert (ref["name"], ref["version"]) == ("current", 1)
     assert system_prompt.get_system_prompt() == "hand edited"
-    assert prompt_library.list_deployments() == []  # not a deploy: nothing new sessions see changed
+    # Not a deploy (new sessions get the same text), but the live ref moved: logged.
+    assert [e["action"] for e in prompt_library.list_deployments()] == ["import"]
 
 
 def test_legacy_save_appends_a_version_instead_of_overwriting(lib):
@@ -248,7 +249,7 @@ def test_api_legacy_direct_edit_shows_as_untracked_and_can_be_imported(client):
     r = client.post(f"{BASE}/import-live", json={"name": "current"})
     assert r.status_code == 200 and r.json()["live"]["label"] == "current@v1"
     actions = [e["action"] for e in client.get(f"{BASE}/deployments").json()["deployments"]]
-    assert actions == ["direct"]
+    assert actions == ["import", "direct"]
 
 
 class _FakeBackend:
@@ -295,3 +296,137 @@ def test_api_try_runs_the_draft_as_the_base_prompt(client, tmp_path):
     base = backend.kwargs["_custom_base"]
     assert base.startswith("Draft in ") and str(tmp_path / "ws") in base and "{{" not in base
     assert backend.kwargs["disallowed_tools"] == ["AskUserQuestion"]
+
+
+# ---------------------------------------------------------------------------
+# Concurrency: one publish unit, one mutation boundary
+# ---------------------------------------------------------------------------
+
+import threading  # noqa: E402
+
+
+class _PausingPath:
+    """Stand-in for ``_PERSIST_FILE`` whose write blocks until released."""
+
+    def __init__(self, real, entered, release):
+        self._real, self._entered, self._release = real, entered, release
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def write_text(self, *args, **kwargs):
+        self._entered.set()
+        assert self._release.wait(5)
+        return self._real.write_text(*args, **kwargs)
+
+
+def test_snapshot_never_pairs_one_deploys_text_with_anothers_ref(lib):
+    prompt_library.create_prompt("ops", "one")
+    prompt_library.commit_version("ops", "two")
+    prompt_library.deploy("ops", 1)
+    entered, release = threading.Event(), threading.Event()
+    real = system_prompt._PERSIST_FILE
+    with patch.object(system_prompt, "_PERSIST_FILE", _PausingPath(real, entered, release)):
+        writer = threading.Thread(target=prompt_library.deploy, args=("ops", 2))
+        writer.start()
+        assert entered.wait(5)  # the writer is mid-publish, inside the lock
+        seen = []
+        reader = threading.Thread(target=lambda: seen.append(system_prompt.get_live_snapshot()))
+        reader.start()
+        reader.join(0.2)
+        assert reader.is_alive(), "a reader must wait for the publish, not see half of it"
+        release.set()
+        writer.join(5)
+        reader.join(5)
+    text, ref = seen[0]
+    assert (text, ref["version"]) == ("two", 2)
+
+
+def test_snapshot_pairs_stay_consistent_under_deploy_and_reset_churn(lib):
+    prompt_library.create_prompt("ops", "one")
+    prompt_library.commit_version("ops", "two")
+    expected = {1: "one", 2: "two"}
+    stop = threading.Event()
+    bad = []
+
+    def read():
+        while not stop.is_set():
+            text, ref = system_prompt.get_live_snapshot()
+            if ref["mode"] == "custom":
+                if expected.get(ref["version"]) != text:
+                    bad.append((text, ref))
+            elif text is not None:
+                bad.append((text, ref))
+
+    readers = [threading.Thread(target=read) for _ in range(3)]
+    for t in readers:
+        t.start()
+    for i in range(150):
+        if i % 5 == 4:
+            prompt_library.reset_to_default()
+        else:
+            prompt_library.deploy("ops", 1 + i % 2)
+    stop.set()
+    for t in readers:
+        t.join(5)
+    assert bad == []
+
+
+def test_direct_edit_waits_on_the_mutation_boundary(lib):
+    done = threading.Event()
+    with system_prompt.mutation_lock:  # e.g. a deploy mid expected_live check
+        t = threading.Thread(target=lambda: (system_prompt.set_system_prompt("direct"), done.set()))
+        t.start()
+        assert not done.wait(0.2), "a direct edit must not slip between check and deploy"
+    t.join(5)
+    assert done.is_set() and system_prompt.get_system_prompt() == "direct"
+
+
+def test_import_cannot_overwrite_a_deploy_that_lands_meanwhile(lib):
+    system_prompt.set_system_prompt("hand edited")
+    prompt_library.create_prompt("other", "newer prompt")
+    entered, release = threading.Event(), threading.Event()
+    real_create = prompt_library.create_prompt
+
+    def slow_create(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        return real_create(*args, **kwargs)
+
+    with patch.object(prompt_library, "create_prompt", slow_create):
+        importer = threading.Thread(target=prompt_library.import_live, args=("current",))
+        importer.start()
+        assert entered.wait(5)
+        deployer = threading.Thread(target=prompt_library.deploy, args=("other", 1))
+        deployer.start()
+        deployer.join(0.2)
+        assert deployer.is_alive(), "the deploy must wait for the import transaction"
+        release.set()
+        importer.join(5)
+        deployer.join(5)
+    ref = system_prompt.get_live_ref()
+    assert (ref["name"], ref["version"]) == ("other", 1), "the later deploy wins, never the import"
+    assert system_prompt.get_system_prompt() == "newer prompt"
+    assert [e["action"] for e in prompt_library.list_deployments()] == ["deploy", "import"]
+
+
+def test_session_usage_copies_sessions_under_the_manager_lock(lib):
+    from src.routes.admin_prompt_library import _session_usage
+    from src.session_manager import session_manager
+
+    out = []
+    with session_manager.lock:
+        t = threading.Thread(target=lambda: out.append(_session_usage()))
+        t.start()
+        t.join(0.2)
+        assert t.is_alive(), "session usage must read the dict under SessionManager.lock"
+    t.join(5)
+    assert out and "total" in out[0]
+
+
+def test_legacy_delete_of_the_live_prompt_resets_under_the_boundary_and_logs(lib):
+    prompt_library.create_prompt("ops", "text")
+    prompt_library.deploy("ops", 1)
+    assert system_prompt.delete_named_prompt("ops") is True
+    assert system_prompt.get_live_ref()["mode"] == "preset"
+    assert prompt_library.list_deployments()[0]["action"] == "reset"
