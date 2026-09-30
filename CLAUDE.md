@@ -75,6 +75,16 @@ uv run pytest --cov=src                            # with coverage
   startup `ConfigIssue(error)` and `run_startup_config_check()` refuses to start unless
   the operator explicitly sets `SKIP_CONFIG_CHECK=true`. Delete the subclass the day the
   SDK grows its own type.
+- The bundled CLI opts in to MCP progress (`tools/call` carries `_meta.progressToken` and
+  `_meta["claudecode/toolUseId"]`) but in SDK mode **never writes `notifications/progress` to its
+  output** — its `tool_progress` frames cover Bash/REPL/heartbeat/agent-retry only. So HTTP
+  (streamable-http) MCP servers are routed through `src/mcp_progress_relay.py`
+  (`/internal/mcp-relay/<relay_id>/<server>`, loopback-only, bound to the session's configured
+  URLs, bytes relayed verbatim): it reads the progress off the wire and the turn loop emits it as
+  `response.tool_progress` with `source: "mcp"`, `message`, `progress`, `total`.
+  `MCP_PROGRESS_RELAY=false` sends servers direct again; `MCP_RELAY_BASE_URL` overrides the
+  self-address the CLI child dials. `tests/test_cli_mcp_progress.py` pins both halves against the
+  bundled CLI — when a CLI bump starts forwarding the text itself, prefer that and retire the relay.
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
   turn fails with `sdk_error` — when one message exceeds `max_buffer_size`. A tool result is one
   message, so an MCP tool returning inline base64 images tripped the SDK's 1 MiB default (#183).

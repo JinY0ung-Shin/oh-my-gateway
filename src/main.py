@@ -42,6 +42,7 @@ from src import metrics
 from src.concurrency import SessionLimitExceeded
 from src.concurrency_middleware import ConcurrencyLimitMiddleware, _request_body_limit
 from src.mcp_config import get_mcp_servers
+from src.mcp_progress_relay import RelayOriginMiddleware, router as mcp_progress_relay_router
 from src.request_logger import request_logger, RequestLogEntry
 from src.routes.deps import truncate_image_data
 
@@ -611,6 +612,8 @@ app.add_middleware(DebugLoggingMiddleware)
 
 # Add request logging middleware (for admin observability)
 app.add_middleware(RequestLoggingMiddleware)
+# Records the address this gateway serves on so the CLI child can reach the MCP progress relay.
+app.add_middleware(RelayOriginMiddleware)
 
 
 # ==================== Exception Handlers ====================
@@ -701,6 +704,7 @@ from src.routes import (  # noqa: E402
 )
 
 app.include_router(responses_router)
+app.include_router(mcp_progress_relay_router)
 app.include_router(agent_messages_router)
 app.include_router(sessions_router)
 app.include_router(general_router)

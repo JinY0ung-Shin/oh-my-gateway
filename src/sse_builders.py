@@ -504,6 +504,8 @@ def make_tool_progress_response_sse(
     sequence_number: int = 0,
     parent_tool_use_id: Optional[str] = None,
     message: Optional[str] = None,
+    progress: Optional[float] = None,
+    total: Optional[float] = None,
 ) -> str:
     """Build an SSE line saying a tool call is still running.
 
@@ -516,6 +518,11 @@ def make_tool_progress_response_sse(
       keepalive tick while a tool_use has no tool_result yet. It tells the
       client the silence is a tool running, not a dead stream, and how long it
       has been running (gateway-observed).
+
+    * ``source="mcp"`` — the MCP server's own ``notifications/progress``, read off the
+      wire by the gateway relay (``src/mcp_progress_relay.py``) because the CLI does not
+      forward it. ``message`` is the server's text; ``progress``/``total`` its counters
+      (``total`` may be absent — the MCP spec makes it optional).
 
     ``elapsed_seconds`` is an integer so clients can show it as-is; ``message``
     is optional progress text the CLI attached (kept verbatim, may be absent).
@@ -533,6 +540,10 @@ def make_tool_progress_response_sse(
         data["parent_tool_use_id"] = parent_tool_use_id
     if message:
         data["message"] = message
+    if progress is not None:
+        data["progress"] = progress
+    if total is not None:
+        data["total"] = total
     return f"event: {event_type}\ndata: {_sse_dumps(data)}\n\n"
 
 
