@@ -72,6 +72,9 @@ class ResetBody(BaseModel):
 class ImportBody(BaseModel):
     name: str
     description: str = ""
+    # The live revision whose text the operator chose to import. Without it a stale
+    # screen could adopt a different direct edit than the one it showed → 409.
+    expected_revision: Optional[str] = None
 
 
 class AnalyzeBody(BaseModel):
@@ -122,6 +125,9 @@ def _session_usage() -> Dict[str, Any]:
     from src.session_manager import session_manager
 
     counts: Dict[str, int] = {}
+    # Per live revision too: every untracked edit shares the label "untracked", so the
+    # label alone cannot tell sessions of an older direct edit from the live one.
+    by_revision: Dict[str, int] = {}
     total = 0
     # Copy under the manager's lock: cleanup/eviction mutate the dict under it,
     # and this sync route runs in the threadpool alongside them.
@@ -134,7 +140,10 @@ def _session_usage() -> Dict[str, Any]:
         ref = session.base_prompt_ref
         label = _live_label(ref) if isinstance(ref, dict) else "unknown"
         counts[label] = counts.get(label, 0) + 1
-    return {"total": total, "by_ref": counts}
+        revision = ref.get("revision") if isinstance(ref, dict) else None
+        key = revision if isinstance(revision, str) and revision else "unknown"
+        by_revision[key] = by_revision.get(key, 0) + 1
+    return {"total": total, "by_ref": counts, "by_revision": by_revision}
 
 
 @router.get(_PREFIX)
@@ -300,9 +309,14 @@ def library_reset(body: ResetBody, request: Request, _=Depends(require_admin)):
 @router.post(f"{_PREFIX}/import-live")
 def library_import_live(body: ImportBody, request: Request, _=Depends(require_admin)):
     try:
-        prompt = prompt_library.import_live(
-            body.name, description=body.description, author=_actor(request)
-        )
+        with prompt_library._lock:
+            # Same CAS as deploy/reset, inside the same boundary as the import itself.
+            conflict = _live_changed(None, body.expected_revision)
+            if conflict is not None:
+                return conflict
+            prompt = prompt_library.import_live(
+                body.name, description=body.description, author=_actor(request)
+            )
     except prompt_library.PromptExists:
         return _err(409, "exists", f"Prompt already exists: {body.name}")
     except ValueError as exc:

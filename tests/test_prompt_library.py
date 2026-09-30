@@ -492,3 +492,40 @@ def test_legacy_writes_and_deletes_are_attributed(client):
     assert reset["action"] == "reset" and reset["by"] == "legacy-admin" and reset["from"] == "ops@v2"
     assert deploy["action"] == "deploy" and deploy["from"] == "untracked"
     assert direct["action"] == "direct" and direct["from"] == "preset", "a direct edit records what it replaced"
+
+
+def test_api_import_refuses_a_stale_revision_and_creates_nothing(client):
+    client.put("/admin/api/system-prompt", json={"prompt": "direct A"})
+    seen = client.get(BASE).json()["live"]  # admin A reads A and opens "import"
+    client.put("/admin/api/system-prompt", json={"prompt": "direct B"})  # admin B
+    r = client.post(f"{BASE}/import-live", json={"name": "current", "expected_revision": seen["revision"]})
+    assert r.status_code == 409 and r.json()["code"] == "live_changed"
+    assert client.get(f"{BASE}/prompts/current").status_code == 404, "no prompt file for a stale import"
+    assert system_prompt.get_live_ref()["name"] is None
+
+    fresh = client.get(BASE).json()["live"]
+    r = client.post(f"{BASE}/import-live", json={"name": "current", "expected_revision": fresh["revision"]})
+    assert r.status_code == 200 and r.json()["prompt"]["content"] == "direct B"
+
+
+def test_session_usage_tells_sessions_of_an_older_direct_edit_apart(lib):
+    from src.routes.admin_prompt_library import _session_usage
+    from src.session_manager import Session, session_manager
+
+    system_prompt.set_system_prompt("direct A")
+    _, ref_a = system_prompt.get_live_snapshot()
+    system_prompt.set_system_prompt("direct B")
+    _, ref_b = system_prompt.get_live_snapshot()
+    with session_manager.lock:
+        for sid, ref in (("sa", ref_a), ("sb", ref_b)):
+            session = Session(session_id=sid)
+            session.base_prompt_ref = ref
+            session_manager.sessions[sid] = session
+    try:
+        usage = _session_usage()
+    finally:
+        with session_manager.lock:
+            session_manager.sessions.pop("sa", None)
+            session_manager.sessions.pop("sb", None)
+    assert usage["by_ref"]["untracked"] == 2, "the label cannot tell them apart"
+    assert usage["by_revision"][ref_a["revision"]] == 1 and usage["by_revision"][ref_b["revision"]] == 1
