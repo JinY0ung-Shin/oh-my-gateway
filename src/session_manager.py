@@ -234,6 +234,8 @@ class Session:
     input_response: Optional[str] = None
     pending_tool_call: Optional[Dict[str, Any]] = None
     stream_break_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
+    # MCP progress relay registration of the current client (src.mcp_progress_relay).
+    mcp_progress_relay: Optional[Any] = field(default=None, repr=False, compare=False)
 
     # Between-turn idle reader + captured-event outbox (src.session_outbox).
     # ``outbox`` is a SessionOutbox created lazily by the reader/endpoint.

@@ -848,7 +848,9 @@ def _tool_heartbeat_events(
 
 
 def _cli_tool_progress_events(
-    chunk: Dict[str, Any], next_seq: Callable[[], int]
+    chunk: Dict[str, Any],
+    next_seq: Callable[[], int],
+    tool_stats: Optional[ToolStatsCollector] = None,
 ) -> list[str]:
     """Forward a CLI ``tool_progress`` chunk as ``response.tool_progress``.
 
@@ -868,15 +870,35 @@ def _cli_tool_progress_events(
     if isinstance(elapsed, bool) or not isinstance(elapsed, (int, float)):
         elapsed = 0
     message = chunk.get("message")
+    name = str(chunk.get("tool_name") or "")
+    source = "mcp" if chunk.get("source") == "mcp" else "cli"
+    if source == "mcp":
+        # Relayed MCP progress knows only the tool_use_id — take the name, elapsed time
+        # and subagent parent from the gateway's own in-flight record of that call. A
+        # call that already finished (late notification) is not re-announced.
+        in_flight = next(
+            (t for t in (tool_stats.in_flight() if tool_stats else []) if t.get("tool_use_id") == tool_use_id),
+            None,
+        )
+        if in_flight is None:
+            return []
+        name = name or str(in_flight.get("name") or "")
+        elapsed = in_flight.get("elapsed_seconds") or elapsed
+        parent = in_flight.get("parent_tool_use_id")
+        if parent is not None and not SUBAGENT_STREAM_PROGRESS:
+            return []
+    progress, total = chunk.get("progress"), chunk.get("total")
     return [
         make_tool_progress_response_sse(
             tool_use_id,
-            str(chunk.get("tool_name") or ""),
+            name,
             int(elapsed),
-            source="cli",
+            source=source,
             sequence_number=next_seq(),
             parent_tool_use_id=parent if isinstance(parent, str) else None,
             message=message if isinstance(message, str) and message else None,
+            progress=progress if isinstance(progress, (int, float)) and not isinstance(progress, bool) else None,
+            total=total if isinstance(total, (int, float)) and not isinstance(total, bool) else None,
         )
     ]
 
@@ -1388,7 +1410,7 @@ async def stream_response_chunks(
             # surfaced by the gateway SDK client — the pinned SDK drops it.
             # Real SDK output: it already reset the stall clock above.
             if isinstance(chunk, dict) and chunk.get("type") == "tool_progress":
-                for event in _cli_tool_progress_events(chunk, _next_seq):
+                for event in _cli_tool_progress_events(chunk, _next_seq, tool_stats):
                     yield event
                 continue
 

@@ -5,6 +5,7 @@ implementation registered as the ``claude`` backend.
 """
 
 import asyncio
+import weakref
 import json
 import os
 import re
@@ -1731,6 +1732,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.effort = effort
             options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
         await self._apply_skills_allowlist(options)
+        self._attach_mcp_progress_relay(options, session)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
         # model as a callable tool when a permission callback is present.
@@ -1743,6 +1745,24 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             await client.connect(prompt=None)
 
         return client
+
+    @staticmethod
+    def _attach_mcp_progress_relay(options: ClaudeAgentOptions, session) -> None:
+        """Route this client's HTTP MCP servers through the gateway's progress relay.
+
+        The CLI receives MCP ``notifications/progress`` but never writes them to its SDK
+        output (``src/mcp_progress_relay.py``), so the relay reads them off the wire and the
+        turn loop forwards them as ``response.tool_progress``. One registration per client:
+        a recreated client drops the previous one; a collected session drops its own.
+        """
+        from src import mcp_progress_relay
+
+        previous = getattr(session, "mcp_progress_relay", None)
+        mcp_progress_relay.detach(previous)
+        options.mcp_servers, handle = mcp_progress_relay.attach(options.mcp_servers)
+        session.mcp_progress_relay = handle
+        if handle is not None:
+            weakref.finalize(session, mcp_progress_relay.detach, handle)
 
     @staticmethod
     async def _stream_user_content_blocks(
@@ -1835,6 +1855,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         session.stream_break_event = break_event
         get_next = None
         wait_break = None
+        get_progress = None
+        # MCP progress read off the wire by the relay (src.mcp_progress_relay) — the CLI
+        # itself never writes it to the SDK stream. A new turn starts with an empty queue.
+        relay = getattr(session, "mcp_progress_relay", None)
+        progress_queue = relay.queue if relay is not None else None
+        if relay is not None:
+            relay.drain()
         try:
             # Caller text is delivered verbatim: otherwise the CLI expands
             # ``@<path>`` mentions and inlines the file upstream — outside the
@@ -1853,19 +1880,32 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
             response_iter = client.receive_response().__aiter__()
             while True:
-                # Race: next message vs hook-fired break signal
-                get_next = asyncio.ensure_future(response_iter.__anext__())
+                # Race: next message vs hook-fired break signal vs relayed MCP progress.
+                # A pending SDK read survives a progress wake-up: cancelling __anext__
+                # mid-read could drop a message, so it is only cancelled on a break.
+                if get_next is None:
+                    get_next = asyncio.ensure_future(response_iter.__anext__())
                 wait_break = asyncio.ensure_future(break_event.wait())
-                done, pending = await asyncio.wait(
-                    [get_next, wait_break],
+                waiters = [get_next, wait_break]
+                if progress_queue is not None:
+                    if get_progress is None:
+                        get_progress = asyncio.ensure_future(progress_queue.get())
+                    waiters.append(get_progress)
+                done, _pending = await asyncio.wait(
+                    waiters,
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                for task in pending:
-                    task.cancel()
+                if wait_break not in done:
+                    wait_break.cancel()
                     try:
-                        await task
-                    except (asyncio.CancelledError, StopAsyncIteration):
+                        await wait_break
+                    except asyncio.CancelledError:
                         pass
+
+                if get_progress is not None and get_progress in done:
+                    progress_event = get_progress.result()
+                    get_progress = None
+                    yield progress_event
 
                 if wait_break in done:
                     # Hook fired — yield any message that arrived concurrently,
@@ -1875,6 +1915,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                             yield self._convert_message(get_next.result())
                         except StopAsyncIteration:
                             pass
+                    else:
+                        get_next.cancel()
+                        try:
+                            await get_next
+                        except (asyncio.CancelledError, StopAsyncIteration):
+                            pass
+                    get_next = None
                     break
 
                 # Normal message arrived
@@ -1882,7 +1929,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     try:
                         message = get_next.result()
                     except StopAsyncIteration:
+                        get_next = None
                         break  # Stream ended normally (ResultMessage received)
+                    get_next = None
                     converted = self._convert_message(message)
                     # The SDK reports user interrupts as an error result. Mark
                     # only one paired with an explicit gateway cancel request
@@ -1899,7 +1948,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             # Cancel the leftovers: an orphaned __anext__ would log "Task
             # exception was never retrieved" and, on a persistent session,
             # could steal the first message of the next turn.
-            for leftover in (get_next, wait_break):
+            for leftover in (get_next, wait_break, get_progress):
                 if leftover is not None and not leftover.done():
                     leftover.cancel()
             session.stream_break_event = None
