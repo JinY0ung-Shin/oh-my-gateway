@@ -108,6 +108,70 @@ class TestTaskHook:
         assert out == {}
 
 
+class TestOmittedSubagentType:
+    """An omitted ``subagent_type`` runs the CLI's default (``general-purpose``).
+
+    Selection has to judge the subagent that will actually run: with the old
+    ``agent and agent not in allowed`` check, leaving the field out walked a
+    disabled ``general-purpose`` past an allowlist that held only ``Explore``.
+    """
+
+    async def _decide(self, cli, tool_name, tool_input, allowed=None, denied=frozenset()):
+        hook = cli._make_task_hook(allowed, denied)
+        return await hook({"tool_name": tool_name, "tool_input": tool_input}, None, None)
+
+    @pytest.mark.parametrize("tool_name", ["Agent", "Task"])
+    @pytest.mark.parametrize("missing", [{}, {"subagent_type": ""}, {"subagent_type": "  "}, {"subagent_type": None}])
+    async def test_omitted_type_outside_the_allowlist_is_denied(self, cli, tool_name, missing):
+        out = await self._decide(
+            cli, tool_name, {"description": "조사", "prompt": "p", **missing}, allowed={"Explore"}
+        )
+        decision = out["hookSpecificOutput"]
+        assert decision["permissionDecision"] == "deny"
+        reason = decision["permissionDecisionReason"]
+        assert "general-purpose" in reason and "omitted" in reason and "Explore" in reason
+
+    @pytest.mark.parametrize("tool_name", ["Agent", "Task"])
+    async def test_omitted_type_allowed_when_general_purpose_is(self, cli, tool_name):
+        out = await self._decide(
+            cli, tool_name, {"prompt": "p", "run_in_background": False},
+            allowed={"Explore", "general-purpose"},
+        )
+        assert out == {}
+
+    @pytest.mark.parametrize("tool_name", ["Agent", "Task"])
+    async def test_bare_task_fallback_still_enforces_switched_off_subagents(self, cli, tool_name):
+        """No catalog to narrow by: bare ``Task`` allows all, and the caller switches
+        individual subagents off with ``Agent(<name>)`` in ``disallowed_tools``."""
+        denied = client_mod.agent_denylist(["Agent(general-purpose)", "Agent(Plan)", "Bash"])
+        assert denied == frozenset({"general-purpose", "Plan"})
+        for tool_input in ({"prompt": "p"}, {"prompt": "p", "subagent_type": "general-purpose"}):
+            out = await self._decide(cli, tool_name, tool_input, allowed=None, denied=denied)
+            decision = out["hookSpecificOutput"]
+            assert decision["permissionDecision"] == "deny", tool_input
+            assert "general-purpose" in decision["permissionDecisionReason"]
+        out = await self._decide(cli, tool_name, {"subagent_type": "Plan"}, denied=denied)
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+        out = await self._decide(
+            cli, tool_name, {"subagent_type": "Explore", "run_in_background": False}, denied=denied
+        )
+        assert out == {}
+
+    async def test_denylist_also_wins_inside_an_allowlist(self, cli):
+        out = await self._decide(
+            cli, "Agent", {"subagent_type": "Explore"},
+            allowed={"Explore"}, denied=frozenset({"Explore"}),
+        )
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    async def test_session_hooks_carry_the_disallowed_entries(self, cli):
+        """The wiring: ``create_client`` hands ``disallowed_tools`` to the subagent hook."""
+        matchers = cli._pre_tool_use_hooks(None, ["Read", "Task"], ["Agent(general-purpose)"])
+        hook = next(m for m in matchers if m.matcher == "Agent").hooks[0]
+        out = await hook({"tool_name": "Agent", "tool_input": {"prompt": "p"}}, None, None)
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
 class TestForegroundForcing:
     """A background subagent's payoff lands after the HTTP turn closes."""
 
