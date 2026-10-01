@@ -182,6 +182,30 @@ def agent_allowlist(tools: Optional[List[str]]) -> Optional[set]:
     return names or None
 
 
+# The subagent the CLI runs when a call omits ``subagent_type`` (the Agent
+# tool's own description: "If omitted, the general-purpose agent is used").
+# Selection must judge the subagent that will actually run, so an omitted type
+# is this one — otherwise a disabled ``general-purpose`` runs anyway by leaving
+# the field out.
+DEFAULT_SUBAGENT_TYPE = "general-purpose"
+
+
+def agent_denylist(tools: Optional[List[str]]) -> frozenset:
+    """Subagents a caller switched off via ``Agent(<agent>)`` / ``Task(<agent>)``
+    entries in ``disallowed_tools``.
+
+    The CLI's own rule matcher is not a dependable gate across builds (see
+    ``_make_task_hook``), and a caller that keeps the bare ``Task`` allow-all
+    (no catalog to narrow by) can only switch individual subagents off this
+    way — so the hook enforces these too.
+    """
+    return frozenset(
+        match.group("name")
+        for t in tools or []
+        if (match := _GRANULAR_AGENT_RULE_RE.match(t)) is not None
+    )
+
+
 def _get_cli_path() -> Optional[str]:
     """Resolve the operator CLI override, or ``None`` for the SDK's bundled CLI.
 
@@ -1414,14 +1438,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
-    def _make_task_hook(self, allowed: Optional[set]):
+    def _make_task_hook(self, allowed: Optional[set], denied: frozenset = frozenset()):
         """PreToolUse hook governing the subagent tool (``Agent``/``Task``).
 
         Two jobs, both about the gateway's headless single-turn shape:
 
         1. **Selection** — when the client narrowed subagents via
            ``Task(<agent>)`` entries, an unlisted ``subagent_type`` is denied
-           with a reason the model reads back as a tool result. The SDK's
+           with a reason the model reads back as a tool result; so is one the
+           client switched off via ``Agent(<agent>)`` in ``disallowed_tools``.
+           An omitted ``subagent_type`` is judged as ``DEFAULT_SUBAGENT_TYPE``,
+           the agent the CLI will actually run. The SDK's
            ``agents`` option only *defines* programmatic subagents (it cannot
            hide plugin/filesystem ones) and the CLI's rule matcher is not a
            dependable gate across builds, so the gateway enforces it here.
@@ -1446,16 +1473,22 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if not isinstance(tool_input, dict):
                 return {}
 
-            agent = tool_input.get("subagent_type", "")
-            if allowed and agent and agent not in allowed:
+            raw = tool_input.get("subagent_type")
+            agent = raw.strip() if isinstance(raw, str) and raw.strip() else DEFAULT_SUBAGENT_TYPE
+            if (allowed and agent not in allowed) or agent in denied:
                 logger.info("Denying subagent outside allowlist: %s", agent)
+                omitted = "" if isinstance(raw, str) and raw.strip() else " (subagent_type omitted)"
+                if allowed:
+                    enabled = ", ".join(sorted(allowed - denied)) or "none"
+                    hint = f"Enabled subagents: {enabled}."
+                else:
+                    hint = f"Do not use: {', '.join(sorted(denied))}."
                 return {
                     "hookSpecificOutput": {
                         "hookEventName": "PreToolUse",
                         "permissionDecision": "deny",
                         "permissionDecisionReason": (
-                            f"Subagent '{agent}' is not enabled for this session. "
-                            f"Enabled subagents: {', '.join(sorted(allowed)) or 'none'}."
+                            f"Subagent '{agent}'{omitted} is not enabled for this session. {hint}"
                         ),
                     }
                 }
@@ -1478,7 +1511,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         return hook
 
-    def _pre_tool_use_hooks(self, cwd: Optional[str], allowed_tools: Optional[List[str]]):
+    def _pre_tool_use_hooks(
+        self,
+        cwd: Optional[str],
+        allowed_tools: Optional[List[str]],
+        disallowed_tools: Optional[List[str]] = None,
+    ):
         """Assemble the PreToolUse hook matchers for a session.
 
         Order is meaningful only in that every matcher runs; each hook is
@@ -1499,7 +1537,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # client narrowed subagents: forcing foreground delivery is needed on
         # its own. One matcher per name — matcher strings are compared against
         # the tool's real name, and current CLI builds call it "Agent".
-        task_hook = self._make_task_hook(agent_allowlist(allowed_tools))
+        task_hook = self._make_task_hook(
+            agent_allowlist(allowed_tools), agent_denylist(disallowed_tools)
+        )
         matchers.extend(
             HookMatcher(matcher=name, hooks=[task_hook]) for name in SUBAGENT_TOOL_NAMES
         )
@@ -1744,7 +1784,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # model as a callable tool when a permission callback is present.
         options.can_use_tool = self._make_ask_user_can_use_tool(session)
 
-        options.hooks = {"PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools)}
+        options.hooks = {
+            "PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools, disallowed_tools)
+        }
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
