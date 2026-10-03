@@ -90,6 +90,7 @@ Security:
 import asyncio
 import ctypes
 import errno
+import fcntl
 import hashlib
 import io
 import logging
@@ -97,6 +98,7 @@ import mimetypes
 import os
 import shutil
 import stat as stat_module
+import time
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -533,10 +535,6 @@ async def get_limits(
     return {
         "max_upload_bytes": _max_upload_bytes(),
         "workspace_quota_bytes": workspace_quota_limit_bytes(),
-        # Capability flag: ``/files/upload`` honours ``expected_sha256``. Clients
-        # that need conditional saves check this instead of trusting that an
-        # older gateway would not silently ignore the parameter.
-        "conditional_write": "sha256",
     }
 
 
@@ -856,107 +854,8 @@ async def set_cwd(
     return {"cwd": body.path}
 
 
-# --- conditional write (ChatDRAGON #213) --------------------------------------
-# The workspace is written by more than this API: the agent's tools and the
-# terminal write files directly. A client that saves a draft it started from an
-# older body must not silently replace a change made underneath it, so a save
-# may carry ``expected_sha256`` -- the SHA-256 of the body the draft started
-# from -- and the compare and the write happen HERE, next to the file, as one
-# step:
-#
-# - every conditional write of a path is serialised by a per-path lock, so two
-#   saves with the same expected version (two tabs, two BFF instances) can never
-#   both pass: exactly one replaces the file, the other sees the new hash;
-# - the new body is written to a temp file beside the target and the target's
-#   hash is checked again immediately before the atomic ``os.replace``, so an
-#   external write that lands after the first compare is still a conflict.
-#
-# POSIX offers no compare-and-swap on file contents against writers that take no
-# lock, so a write landing between that last check and ``os.replace`` (two
-# syscalls apart) cannot be detected; every window a caller can observe is
-# closed. "Create only if still absent" is the existing ``no_clobber`` (O_EXCL).
-_CAS_LOCKS: dict = {}
-_SHA256_HEX = frozenset("0123456789abcdef")
-
-
-class _WriteConflict(Exception):
-    def __init__(self, exists: bool):
-        super().__init__("conditional write conflict")
-        self.exists = exists
-
-
-def _cas_after_compare(target: Path) -> None:
-    """Test seam: runs right after the first compare (an external write here must
-    still be detected)."""
-
-
-def _sha256_of(path: Path) -> Optional[str]:
-    digest = hashlib.sha256()
-    try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                digest.update(chunk)
-    except FileNotFoundError:
-        return None
-    return digest.hexdigest()
-
-
-def _replace_if_unchanged(target: Path, data: bytes, expected: str) -> None:
-    current = _sha256_of(target)
-    if current != expected:
-        raise _WriteConflict(exists=current is not None)
-    _cas_after_compare(target)
-    tmp = target.with_name(f".{target.name}.cas-{uuid.uuid4().hex}.tmp")
-    try:
-        with open(tmp, "xb") as f:
-            f.write(data)
-        try:
-            shutil.copymode(target, tmp)
-        except OSError:
-            pass
-        current = _sha256_of(target)
-        if current != expected:
-            raise _WriteConflict(exists=current is not None)
-        os.replace(tmp, target)
-    finally:
-        try:
-            tmp.unlink()
-        except FileNotFoundError:
-            pass
-
-
-@asynccontextmanager
-async def _cas_lock(target: Path):
-    key = str(target)
-    entry = _CAS_LOCKS.get(key)
-    if entry is None:
-        entry = _CAS_LOCKS[key] = [asyncio.Lock(), 0]
-    entry[1] += 1
-    try:
-        async with entry[0]:
-            yield
-    finally:
-        entry[1] -= 1
-        if entry[1] == 0 and _CAS_LOCKS.get(key) is entry:
-            del _CAS_LOCKS[key]
-
-
-async def _write_uploaded_file(
-    target: Path, data: bytes, no_clobber: bool, expected_sha256: Optional[str] = None
-) -> None:
+async def _write_uploaded_file(target: Path, data: bytes, no_clobber: bool) -> None:
     """Preserve the historical upload write/no-clobber semantics."""
-    if expected_sha256 is not None:
-        try:
-            async with _cas_lock(target):
-                await run_in_threadpool(
-                    _replace_if_unchanged, target, data, expected_sha256
-                )
-        except _WriteConflict as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={"code": "save_conflict", "exists": exc.exists},
-            )
-        return
     if no_clobber:
 
         def _write_exclusive() -> None:
@@ -976,15 +875,10 @@ async def upload_file(
     request: Request,
     directory: str = "/",
     no_clobber: bool = False,
-    expected_sha256: Optional[str] = None,
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Write one uploaded file into the workspace.
-
-    ``expected_sha256`` makes it a conditional replace: the file must exist and
-    hash to exactly that value at write time, else 409 ``save_conflict`` and the
-    file is untouched (see "conditional write" above).
 
     Default keeps the historical contract: same name overwrites (this is how
     "save" works through the proxy chain). ``no_clobber=true`` is the opt-in
@@ -1004,15 +898,6 @@ async def upload_file(
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
     target = _resolve_or_403(root, f"{directory}/{name}")
-    if expected_sha256 is not None:
-        expected_sha256 = expected_sha256.lower()
-        if len(expected_sha256) != 64 or not set(expected_sha256) <= _SHA256_HEX:
-            raise HTTPException(status_code=400, detail="invalid expected_sha256")
-        if no_clobber:
-            raise HTTPException(
-                status_code=400,
-                detail="expected_sha256 and no_clobber are mutually exclusive",
-            )
 
     data = await file.read()
     # Defence in depth against the request boundary: middleware bounds the raw
@@ -1029,7 +914,7 @@ async def upload_file(
     # Keep quota-disabled deployments on the exact historical mutation path:
     # no extra tree scan, lock, or threadpool hop.
     if workspace_quota_limit_bytes() <= 0:
-        await _write_uploaded_file(target, data, no_clobber, expected_sha256)
+        await _write_uploaded_file(target, data, no_clobber)
         return {"path": str(target), "size": len(data)}
 
     user_root = _user_root(root)
@@ -1058,8 +943,234 @@ async def upload_file(
             )
         except WorkspaceQuotaExceeded as exc:
             _raise_quota_http(exc)
-        await _write_uploaded_file(target, data, no_clobber, expected_sha256)
+        await _write_uploaded_file(target, data, no_clobber)
     return {"path": str(target), "size": len(data)}
+
+
+# --- conditional write (ChatDRAGON #213) --------------------------------------
+# The workspace is written by more than this API: the agent's tools and the
+# terminal write files directly, and the gateway may run as several processes.
+# A client saving a draft it started from an older body must never silently
+# replace a change made underneath it. ``POST /files/write_if`` is a separate,
+# versioned endpoint on purpose: a gateway that predates it answers 404 before
+# touching anything, so a caller can fail closed instead of having an
+# unconditional upload ignore an unknown parameter.
+#
+# Protocol, for ``expected_sha256`` (the SHA-256 of the body the draft started
+# from):
+#
+# 1. A per-path ``flock`` on a lock file under the user root serialises every
+#    conditional writer across gateway processes (and hosts sharing the
+#    volume).
+# 2. The new body is written to a hidden temp file beside the target.
+# 3. Compare: the target must hash to the expected value.
+# 4. Claim: ``rename(target -> .claim)`` atomically takes the current inode off
+#    the path. The claimed bytes are hashed again -- a write that landed between
+#    the compare and the claim is detected here, and the claimed file is put
+#    back (or, if the path was already recreated, kept as a visible conflict
+#    copy) -> 409.
+# 5. Install: ``link(tmp -> target)`` never replaces an existing path, so a
+#    writer that recreated the path after the claim wins and we answer 409.
+# 6. A writer that opened the file before the claim and keeps writing through
+#    its descriptor writes into the claimed inode; if the claimed bytes no
+#    longer match after install, they are kept as a visible conflict copy and
+#    the response names it. Nothing an external writer produced is discarded.
+_CAS_LOCK_DIR = ".gateway-cas-locks"
+
+
+class _WriteConflict(Exception):
+    def __init__(self, exists: bool, preserved: Optional[Path] = None):
+        super().__init__("conditional write conflict")
+        self.exists = exists
+        self.preserved = preserved
+
+
+def _cas_after_compare(target: Path) -> None:
+    """Test seam: right after the compare, before the claim."""
+
+
+def _cas_before_install(target: Path) -> None:
+    """Test seam: after the claim, right before the new body is linked in."""
+
+
+def _sha256_of(path: Path) -> Optional[str]:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return None
+    return digest.hexdigest()
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _preserve_copy(claim: Path, target: Path) -> Path:
+    """Keep a claimed external version under a visible, non-clobbering name."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(100):
+        tag = f".conflict-{stamp}" + (f"-{n}" if n else "")
+        dest = target.with_name(f"{target.stem}{tag}{target.suffix}")
+        try:
+            os.link(claim, dest)
+        except FileExistsError:
+            continue
+        _unlink_quietly(claim)
+        return dest
+    raise OSError("could not preserve the conflicting version")
+
+
+def _cas_write_locked(target: Path, data: bytes, expected: str) -> Optional[Path]:
+    token = uuid.uuid4().hex
+    tmp = target.with_name(f".{target.name}.cas-{token}.tmp")
+    claim = target.with_name(f".{target.name}.cas-{token}.claim")
+    with open(tmp, "xb") as f:
+        f.write(data)
+    try:
+        current = _sha256_of(target)
+        if current != expected:
+            raise _WriteConflict(exists=current is not None)
+        try:
+            shutil.copymode(target, tmp)
+        except OSError:
+            pass
+        _cas_after_compare(target)
+        try:
+            os.rename(target, claim)
+        except FileNotFoundError:
+            raise _WriteConflict(exists=False)
+        if _sha256_of(claim) != expected:
+            # Changed between the compare and the claim: put the external
+            # version back where it was.
+            try:
+                os.link(claim, target)
+            except FileExistsError:
+                raise _WriteConflict(exists=True, preserved=_preserve_copy(claim, target))
+            _unlink_quietly(claim)
+            raise _WriteConflict(exists=True)
+        _cas_before_install(target)
+        try:
+            os.link(tmp, target)
+        except FileExistsError:
+            # Recreated after the claim: that writer wins. The claimed inode is
+            # the expected version unless a descriptor kept writing into it.
+            if _sha256_of(claim) != expected:
+                raise _WriteConflict(exists=True, preserved=_preserve_copy(claim, target))
+            _unlink_quietly(claim)
+            raise _WriteConflict(exists=True)
+        if _sha256_of(claim) != expected:
+            return _preserve_copy(claim, target)
+        _unlink_quietly(claim)
+        return None
+    finally:
+        _unlink_quietly(tmp)
+        if claim.exists() and not target.exists():
+            # An unexpected error between claim and install: never leave the
+            # path empty because of us. (A claim is otherwise never deleted on
+            # an error path -- losing nothing beats tidiness.)
+            try:
+                os.link(claim, target)
+                _unlink_quietly(claim)
+            except FileExistsError:
+                pass
+
+
+def _cas_write(lock_root: Path, target: Path, data: bytes, expected: str) -> Optional[Path]:
+    lock_dir = lock_root / _CAS_LOCK_DIR
+    lock_dir.mkdir(exist_ok=True)
+    lock_path = lock_dir / (hashlib.sha256(str(target).encode()).hexdigest() + ".lock")
+    with open(lock_path, "a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return _cas_write_locked(target, data, expected)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+@router.post("/files/write_if")
+async def write_if_unchanged(
+    request: Request,
+    expected_sha256: str,
+    directory: str = "/",
+    file: UploadFile = File(...),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Replace one file only if it still hashes to ``expected_sha256``.
+
+    409 ``{"code": "save_conflict", "exists", "preserved"}`` leaves the file
+    as the other writer left it; a 200 may carry ``preserved`` when an
+    external version written through an already-open descriptor was kept
+    beside the file. See "conditional write" above for the protocol.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    dest_dir = _resolve_or_403(root, directory)
+    if not dest_dir.is_dir():
+        raise HTTPException(status_code=404, detail="directory not found")
+    name = os.path.basename(file.filename or "")
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    target = _resolve_or_403(root, f"{directory}/{name}")
+    expected = expected_sha256.lower()
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise HTTPException(status_code=400, detail="invalid expected_sha256")
+    data = await file.read()
+    ceiling = _max_upload_bytes()
+    if ceiling == 0 or len(data) > ceiling:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file exceeds the upload limit of {ceiling} bytes",
+        )
+    # Lock files live under the user root (beside the backend directories, not
+    # inside the agent's workspace). A workspace outside the standard layout falls
+    # back to its own root rather than refusing the save.
+    try:
+        lock_root = _user_root(root)
+    except HTTPException:
+        lock_root = root
+
+    def _rel(path: Optional[Path]) -> Optional[str]:
+        return "/" + str(path.relative_to(root)) if path is not None else None
+
+    async def _write() -> Optional[Path]:
+        try:
+            return await run_in_threadpool(_cas_write, lock_root, target, data, expected)
+        except _WriteConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "save_conflict",
+                    "exists": exc.exists,
+                    "preserved": _rel(exc.preserved),
+                },
+            )
+
+    if workspace_quota_limit_bytes() <= 0:
+        preserved = await _write()
+    else:
+        user_root = _user_root(root)
+        async with _quota_lock(user_root):
+            try:
+                reclaimed = target.stat().st_size if target.is_file() else 0
+            except OSError:
+                reclaimed = 0
+            try:
+                await run_in_threadpool(
+                    lambda: ensure_growth_fits(
+                        user_root, added_bytes=len(data), reclaimed_bytes=reclaimed
+                    )
+                )
+            except WorkspaceQuotaExceeded as exc:
+                _raise_quota_http(exc)
+            preserved = await _write()
+    return {"path": str(target), "size": len(data), "preserved": _rel(preserved)}
 
 
 @router.post("/files/mkdir")
