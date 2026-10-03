@@ -1542,23 +1542,39 @@ async def archive_entries(
             hide_claude_prefix=hide_claude,
         )
 
+    # Admission covers the archive's whole expensive lifecycle -- the recursive
+    # walk, the producer thread and the response -- and comes right after the
+    # cheap checks above (auth, sandbox, top-level existence), so a 401/403/404
+    # never holds a slot and an over-limit request is refused before it walks a
+    # single directory.
+    _, party = _ARCHIVE_ADMISSION.try_acquire(_workspace_key(request))
+    # The walk thread holds its own claim: if this request is cancelled while
+    # the walk runs, the slot is only freed once the walk has actually stopped.
+    walk_party = party._slot.party()
+
     # Walk the selection BEFORE the response starts (off the event loop): a walk
     # failure is still a plain error response, never a 200 with a broken zip.
     def _collect() -> List[tuple]:
-        entries = []
-        for t in targets:
-            if t.is_dir():
-                for sub in t.rglob("*"):
-                    if sub.is_file() and not sub.is_symlink() and not _is_hidden(sub):
-                        entries.append((sub, str(sub.relative_to(root_resolved))))
-            elif t.is_file() and not t.is_symlink():
-                entries.append((t, str(t.relative_to(root_resolved))))
-        return entries
+        try:
+            entries = []
+            for t in targets:
+                if t.is_dir():
+                    for sub in t.rglob("*"):
+                        if sub.is_file() and not sub.is_symlink() and not _is_hidden(sub):
+                            entries.append((sub, str(sub.relative_to(root_resolved))))
+                elif t.is_file() and not t.is_symlink():
+                    entries.append((t, str(t.relative_to(root_resolved))))
+            return entries
+        finally:
+            walk_party.release()
 
-    entries = await run_in_threadpool(_collect)
-    # Admission comes after every validation step (a 401/403/404 never holds a
-    # slot) and before the producer thread or any response byte exists.
-    _, party = _ARCHIVE_ADMISSION.try_acquire(_workspace_key(request))
+    try:
+        entries = await run_in_threadpool(_collect)
+    except BaseException:
+        # Walk failed or the request was cancelled: nothing will stream, so the
+        # response's claim goes too (the walk thread drops its own on exit).
+        party.release()
+        raise
     body_iter = _stream_zip(entries, party)
     # A body Starlette never iterates (client gone before streaming starts)
     # never runs its ``finally``; the finalizer returns the slot instead.

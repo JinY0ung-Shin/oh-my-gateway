@@ -1853,3 +1853,134 @@ def test_archive_limits_fall_back_to_defaults_on_invalid_env(monkeypatch, raw):
     monkeypatch.setenv("ARCHIVE_MAX_PER_USER", raw)
     assert tf._archive_max_concurrent() == 4
     assert tf._archive_max_per_user() == 2
+
+
+class _BlockingWalk:
+    """Patch ``Path.rglob`` so every recursive walk parks at a barrier, and
+    count how many walks are inside it at once."""
+
+    def __init__(self, monkeypatch):
+        import threading as _threading
+
+        self.lock = _threading.Lock()
+        self.inside = 0
+        self.peak = 0
+        self.started = 0
+        self.release = _threading.Event()
+        self.fail = False
+        real = Path.rglob
+        walk = self
+
+        def rglob(path_self, pattern):
+            with walk.lock:
+                walk.inside += 1
+                walk.started += 1
+                walk.peak = max(walk.peak, walk.inside)
+            try:
+                walk.release.wait(5)
+                if walk.fail:
+                    raise OSError("walk failed")
+                yield from real(path_self, pattern)
+            finally:
+                with walk.lock:
+                    walk.inside -= 1
+
+        monkeypatch.setattr(Path, "rglob", rglob)
+
+
+def test_archive_admission_bounds_concurrent_tree_walks(
+    big_workspace, archive_admission, monkeypatch
+):
+    """#225 review: admission covers the recursive walk too. With every walk
+    parked at a barrier and limit+N requests in flight, at most `limit` walks
+    ever start; the rest get 429 without walking."""
+    import asyncio as _asyncio
+
+    from fastapi import HTTPException as _HTTPException
+
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "2")
+    monkeypatch.setenv("ARCHIVE_MAX_PER_USER", "10")
+    walk = _BlockingWalk(monkeypatch)
+    limit, extra = 2, 3
+
+    async def _run():
+        tasks = [
+            _asyncio.create_task(_open_archive(f"u{i}@corp.com"))
+            for i in range(limit + extra)
+        ]
+        assert await _wait_for(lambda: walk.started == limit)
+        refused = 0
+        for _ in range(extra):
+            done, _pending = await _asyncio.wait(
+                [t for t in tasks if not t.done()] or tasks,
+                timeout=2,
+                return_when=_asyncio.FIRST_COMPLETED,
+            )
+            refused = sum(
+                1
+                for t in tasks
+                if t.done()
+                and isinstance(t.exception(), _HTTPException)
+                and t.exception().status_code == 429
+            )
+            if refused == extra:
+                break
+        assert refused == extra, "over-limit requests must be refused while walks run"
+        assert walk.started == limit and walk.peak == limit, "no walk beyond the limit"
+        walk.release.set()
+        results = await _asyncio.gather(*tasks, return_exceptions=True)
+        bodies = [r for r in results if not isinstance(r, BaseException)]
+        assert len(bodies) == limit
+        for body in bodies:
+            await body.aclose()
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+
+    _asyncio.run(_run())
+
+
+def test_archive_slot_released_when_walk_fails(
+    big_workspace, archive_admission, monkeypatch
+):
+    import asyncio as _asyncio
+
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
+    walk = _BlockingWalk(monkeypatch)
+    walk.fail = True
+    walk.release.set()
+
+    async def _run():
+        with pytest.raises(OSError):
+            await _open_archive("alice@corp.com")
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+        # the next request is admitted at once
+        walk.fail = False
+        body = await _open_archive("bob@corp.com")
+        await body.aclose()
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+
+    _asyncio.run(_run())
+
+
+def test_archive_cancelled_during_walk_keeps_slot_until_walk_stops(
+    big_workspace, archive_admission, monkeypatch
+):
+    """A request cancelled mid-walk must not free its slot while the walk
+    thread is still running -- otherwise cancelled requests could stack walks
+    past the limit."""
+    import asyncio as _asyncio
+
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
+    walk = _BlockingWalk(monkeypatch)
+
+    async def _run():
+        task = _asyncio.create_task(_open_archive("alice@corp.com"))
+        assert await _wait_for(lambda: walk.started == 1)
+        task.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await task
+        await _asyncio.sleep(0.05)
+        assert archive_admission.snapshot()[0] == 1, "slot held while the walk runs"
+        walk.release.set()
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+
+    _asyncio.run(_run())
