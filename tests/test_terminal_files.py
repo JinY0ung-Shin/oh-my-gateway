@@ -2266,3 +2266,136 @@ def test_archive_refuses_a_workspace_root_swapped_after_the_walk(
 
     with pytest.raises(tf._UnsafeArchiveMember):
         _archive_with_swap(client, monkeypatch, ["/notes.txt"], _swap)
+
+
+# --- every route opens beneath the pinned root, never by path ----------------
+# Same class as the archive TOCTOU (#225 review): the path is checked by
+# ``_resolve_or_403``, then the workspace changes before the route opens it.
+# ``_swap_before_open`` runs the swap at the exact point between the check and
+# the first open beneath the root.
+
+
+def _swap_before_open(monkeypatch, swap):
+    ran = []
+    real_pinned, real_pin = tf._pinned_root, tf._pin_root
+
+    def _once():
+        if not ran:
+            ran.append(True)
+            swap()
+
+    def _pinned(*a, **kw):
+        _once()
+        return real_pinned(*a, **kw)
+
+    def _pin(*a, **kw):
+        _once()
+        return real_pin(*a, **kw)
+
+    monkeypatch.setattr(tf, "_pinned_root", _pinned)
+    monkeypatch.setattr(tf, "_pin_root", _pin)
+    return ran
+
+
+@pytest.fixture
+def outside(tmp_path):
+    d = tmp_path / "outside-area"
+    (d / "deeper").mkdir(parents=True)
+    (d / "inner.md").write_bytes(_OUTSIDE_SECRET)
+    (d / "deeper" / "x.txt").write_bytes(_OUTSIDE_SECRET)
+    (tmp_path / "outside-file.txt").write_bytes(_OUTSIDE_SECRET)
+    return d
+
+
+def _swap_file(workspace, rel, target):
+    def _swap():
+        p = workspace / rel
+        p.unlink()
+        p.symlink_to(target)
+
+    return _swap
+
+
+def _swap_dir(workspace, tmp_path, rel, target):
+    def _swap():
+        p = workspace / rel
+        p.rename(tmp_path / ("moved-" + p.name))
+        p.symlink_to(target, target_is_directory=True)
+
+    return _swap
+
+
+@pytest.mark.parametrize(
+    "route", ["/files/read?path=/sub/inner.md", "/files/digest?path=/sub/inner.md",
+              "/files/view?path=/sub/inner.md", "/files/serve/sub/inner.md"],
+)
+def test_read_routes_refuse_a_file_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, route
+):
+    ran = _swap_before_open(
+        monkeypatch, _swap_file(workspace, "sub/inner.md", tmp_path / "outside-file.txt")
+    )
+    r = client.get(route, headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code == 404
+    assert _OUTSIDE_SECRET not in r.content
+    assert hashlib.sha256(_OUTSIDE_SECRET).hexdigest() not in r.text
+
+
+@pytest.mark.parametrize(
+    "route", ["/files/read?path=/sub/inner.md", "/files/digest?path=/sub/inner.md",
+              "/files/view?path=/sub/inner.md", "/files/serve/sub/inner.md"],
+)
+def test_read_routes_refuse_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, route
+):
+    ran = _swap_before_open(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    r = client.get(route, headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code == 404
+    assert _OUTSIDE_SECRET not in r.content
+    assert hashlib.sha256(_OUTSIDE_SECRET).hexdigest() not in r.text
+
+
+@pytest.mark.parametrize(
+    "route", ["/files/read?path=/sub/inner.md", "/files/digest?path=/sub/inner.md",
+              "/files/view?path=/sub/inner.md"],
+)
+def test_read_routes_refuse_a_file_swapped_for_a_fifo_without_blocking(
+    client, workspace, monkeypatch, route
+):
+    def _swap():
+        (workspace / "sub" / "inner.md").unlink()
+        os.mkfifo(workspace / "sub" / "inner.md")
+
+    _swap_before_open(monkeypatch, _swap)
+    r = client.get(route, headers={**_AUTH, **_USER})
+    assert r.status_code == 404
+
+
+def test_view_keeps_serving_the_checked_file_after_a_later_swap(
+    client, workspace, tmp_path, outside, monkeypatch
+):
+    """The response body comes from the file opened at check time, even if the
+    path is swapped between opening and sending."""
+    real = tf._read_beneath
+
+    def _read_then_swap(root, target):
+        opened = real(root, target)
+        _swap_file(workspace, "sub/inner.md", tmp_path / "outside-file.txt")()
+        return opened
+
+    monkeypatch.setattr(tf, "_read_beneath", _read_then_swap)
+    r = client.get("/files/view?path=/sub/inner.md", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.content == b"# inner"
+
+
+def test_list_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch
+):
+    ran = _swap_before_open(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    r = client.get("/files/list?directory=/sub", headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code == 404
+    assert "deeper" not in r.text

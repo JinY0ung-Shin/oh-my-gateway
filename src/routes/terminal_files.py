@@ -115,7 +115,7 @@ import time
 import uuid
 import weakref
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional
@@ -124,6 +124,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, Request, Response, 
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials
+from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from src.auth import auth_manager, security, verify_api_key
@@ -505,6 +506,159 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
     return target
 
 
+# --- opening workspace paths without following a swapped symlink -------------
+# ``_resolve_or_403`` checks a path, but the agent and the terminal keep
+# changing the workspace while a request runs: a file or a directory above it
+# swapped for a symlink after the check would make a later open-by-path follow
+# it out of the workspace. So the routes never open, create, rename or delete a
+# workspace path by its full path. They pin the workspace root as a directory fd
+# and descend from it one component at a time with ``O_NOFOLLOW``, using the
+# components of the already-resolved path (a legitimate in-workspace symlink was
+# resolved away by ``_resolve_or_403``, so any symlink met on the way down is a
+# swap and is refused with ``_PathChanged``).
+
+
+class _PathChanged(Exception):
+    """A path stopped leading to what was checked: a symlink, or another type."""
+
+
+# Kept for the archive code and its tests.
+_UnsafeArchiveMember = _PathChanged
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: a file swapped for a FIFO must not park a worker in open(); it is
+# refused by the S_ISREG check right after.
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+# What openat() reports when O_NOFOLLOW meets a symlink, or a directory on the
+# way down is no longer a directory.
+_SWAPPED_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EMLINK)
+
+
+def _pin_root(root: Path, identity: Optional[tuple] = None) -> int:
+    """Open the (already resolved) workspace root as a directory fd.
+
+    ``O_NOFOLLOW`` refuses a root that became a symlink since it was resolved;
+    ``identity`` (``(st_dev, st_ino)`` taken earlier) refuses one that was
+    replaced by another directory.
+    """
+    try:
+        fd = os.open(root, _DIR_FLAGS)
+    except OSError as exc:
+        if exc.errno in _SWAPPED_ERRNOS:
+            raise _PathChanged("workspace root changed during the request") from exc
+        raise
+    try:
+        st = os.fstat(fd)
+        if identity is not None and (st.st_dev, st.st_ino) != identity:
+            raise _PathChanged("workspace root changed during the request")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+@contextmanager
+def _pinned_root(root: Path, target: Path):
+    """Yield ``(root_fd, parts)``: the pinned root and ``target``'s components.
+
+    ``target`` is a ``_resolve_or_403`` result, i.e. a real path under the root.
+    """
+    real_root = root.resolve()
+    try:
+        parts = list(target.relative_to(real_root).parts)
+    except ValueError as exc:
+        raise _PathChanged("workspace root changed during the request") from exc
+    fd = _pin_root(real_root)
+    try:
+        yield fd, parts
+    finally:
+        os.close(fd)
+
+
+def _openat_checked(name: str, flags: int, dir_fd: int, mode: int = 0o777) -> int:
+    try:
+        return os.open(name, flags, mode, dir_fd=dir_fd)
+    except OSError as exc:
+        if exc.errno in _SWAPPED_ERRNOS:
+            raise _PathChanged(name) from exc
+        raise
+
+
+def _open_dir_beneath(root_fd: int, parts: List[str]) -> int:
+    """A new fd for the directory ``parts`` beneath ``root_fd``; caller closes."""
+    fd = os.dup(root_fd)
+    try:
+        for name in parts:
+            next_fd = _openat_checked(name, _DIR_FLAGS, fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_file_beneath(root_fd: int, parts: List[str]):
+    """Open the regular file ``parts`` beneath ``root_fd`` for reading.
+
+    Returns ``(file, stat)``. Raises ``_PathChanged`` for a symlink anywhere on
+    the way or a non-regular file, ``FileNotFoundError`` when something is gone.
+    """
+    if not parts:
+        raise _PathChanged("not a file")
+    dir_fd = _open_dir_beneath(root_fd, parts[:-1])
+    try:
+        fd = _openat_checked(parts[-1], _FILE_FLAGS, dir_fd)
+    finally:
+        os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise _PathChanged(parts[-1])
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb"), st
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _read_beneath(root: Path, target: Path):
+    """``_open_file_beneath`` for a request: ``(file, stat)`` or a 404."""
+    try:
+        with _pinned_root(root, target) as (root_fd, parts):
+            return _open_file_beneath(root_fd, parts)
+    except (_PathChanged, FileNotFoundError):
+        raise HTTPException(status_code=404, detail="file not found")
+
+
+async def _file_response_beneath(root: Path, target: Path, **kwargs) -> FileResponse:
+    """A ``FileResponse`` for the file opened by ``_read_beneath``.
+
+    ``FileResponse`` opens its path again when it sends (and per Range request).
+    Pointing it at ``/proc/self/fd/<n>`` re-opens the already-checked open file
+    instead of whatever the workspace path names by then; the descriptor is
+    closed once the response is done.
+    """
+    fh, st = await run_in_threadpool(_read_beneath, root, target)
+    try:
+        return FileResponse(
+            f"/proc/self/fd/{fh.fileno()}",
+            stat_result=st,
+            background=BackgroundTask(fh.close),
+            **kwargs,
+        )
+    except BaseException:
+        fh.close()
+        raise
+
+
+def _path_changed_409() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail="the path changed while the request ran; try again",
+    )
+
+
 @router.get("/api/config")
 async def terminal_config(
     request: Request,
@@ -606,28 +760,39 @@ async def list_files(
     # every other request (chat streams, terminal websockets) on the loop.
     def _scan() -> list:
         entries = []
-        with os.scandir(target) as it:
-            for entry in it:
-                if _hidden_name(
-                    entry.name,
-                    hide_dotfiles=hide_dot,
-                    hide_claude_prefix=hide_claude,
-                ):
-                    continue
-                try:
-                    st = entry.stat()  # follow symlinks; broken links are skipped
-                except OSError:
-                    continue
-                entries.append(
-                    {
-                        "name": entry.name,
-                        "type": (
-                            "directory" if stat_module.S_ISDIR(st.st_mode) else "file"
-                        ),
-                        "size": st.st_size,
-                        "modified": int(st.st_mtime),
-                    }
-                )
+        # Scan the directory fd reached beneath the root, not the path: a
+        # directory swapped for a symlink after the check is refused (404)
+        # instead of listing wherever it points.
+        try:
+            with _pinned_root(root, target) as (root_fd, parts):
+                dir_fd = _open_dir_beneath(root_fd, parts)
+        except (_PathChanged, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="directory not found")
+        try:
+            with os.scandir(dir_fd) as it:
+                for entry in it:
+                    if _hidden_name(
+                        entry.name,
+                        hide_dotfiles=hide_dot,
+                        hide_claude_prefix=hide_claude,
+                    ):
+                        continue
+                    try:
+                        st = entry.stat()  # follow symlinks; broken links are skipped
+                    except OSError:
+                        continue
+                    entries.append(
+                        {
+                            "name": entry.name,
+                            "type": (
+                                "directory" if stat_module.S_ISDIR(st.st_mode) else "file"
+                            ),
+                            "size": st.st_size,
+                            "modified": int(st.st_mtime),
+                        }
+                    )
+        finally:
+            os.close(dir_fd)
         entries.sort(key=lambda e: (e["type"] != "directory", e["name"].lower()))
         return entries
 
@@ -763,7 +928,8 @@ async def file_digest(
         h = hashlib.sha256()
         size = 0
         # Streamed: pinning a revision must not depend on the file fitting in memory.
-        with target.open("rb") as fh:
+        fh, _ = _read_beneath(root, target)
+        with fh:
             while chunk := fh.read(1024 * 1024):
                 h.update(chunk)
                 size += len(chunk)
@@ -786,13 +952,25 @@ async def read_file(
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
-    if target.stat().st_size > _MAX_READ_BYTES:
+    def _read() -> bytes:
+        fh, st = _read_beneath(root, target)
+        with fh:
+            if st.st_size > _MAX_READ_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"file too large to preview (> {_MAX_READ_BYTES} bytes); "
+                        "use download"
+                    ),
+                )
+            return fh.read(_MAX_READ_BYTES + 1)
+
+    data = await run_in_threadpool(_read)
+    if len(data) > _MAX_READ_BYTES:  # grew after the fstat
         raise HTTPException(
             status_code=413,
             detail=f"file too large to preview (> {_MAX_READ_BYTES} bytes); use download",
         )
-
-    data = await run_in_threadpool(target.read_bytes)
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
@@ -817,7 +995,9 @@ async def view_file(
         raise HTTPException(status_code=404, detail="file not found")
 
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media, filename=target.name)
+    return await _file_response_beneath(
+        root, target, media_type=media, filename=target.name
+    )
 
 
 @router.get("/files/serve/{path:path}")
@@ -844,7 +1024,9 @@ async def serve_file(
         raise HTTPException(status_code=404, detail="file not found")
 
     media = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-    return FileResponse(target, media_type=media, content_disposition_type="inline")
+    return await _file_response_beneath(
+        root, target, media_type=media, content_disposition_type="inline"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1667,74 +1849,17 @@ class _ZipStreamSink:
                 raise _ZipCancelled() from exc
 
 
-class _UnsafeArchiveMember(Exception):
-    """A member path no longer leads to a regular file without a symlink."""
-
-
-_ARCHIVE_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-# O_NONBLOCK: a member swapped for a FIFO must not park the producer in open();
-# it is refused by the S_ISREG check right after.
-_ARCHIVE_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-# What openat() reports when O_NOFOLLOW meets a symlink, or a directory on the
-# way down is no longer a directory.
-_ARCHIVE_SWAPPED_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EMLINK)
-
-
 def _open_archive_root(root: Path, identity: Optional[tuple]) -> int:
     """Open the workspace root as a directory fd, refusing a swapped root."""
-    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    try:
-        st = os.fstat(fd)
-        if identity is not None and (st.st_dev, st.st_ino) != identity:
-            raise _UnsafeArchiveMember("workspace root changed during archive")
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+    return _pin_root(root, identity)
 
 
 def _open_archive_member(root_fd: int, arcname: str):
-    """Open ``arcname`` beneath ``root_fd`` without following any symlink.
-
-    Each directory component is opened with ``O_NOFOLLOW`` relative to the one
-    above it, and so is the member itself, so no swap of the member or of a
-    directory on its way can lead outside ``root_fd``. Returns ``(file, stat)``
-    for a regular file; raises ``_UnsafeArchiveMember`` otherwise and
-    ``FileNotFoundError`` when something on the way is gone.
-    """
+    """Open one archive member beneath ``root_fd`` (see ``_open_file_beneath``)."""
     parts = arcname.split("/")
     if any(part in ("", ".", "..") for part in parts):
         raise _UnsafeArchiveMember(arcname)
-    dir_fd = root_fd
-    try:
-        for name in parts[:-1]:
-            try:
-                next_fd = os.open(name, _ARCHIVE_DIR_FLAGS, dir_fd=dir_fd)
-            except OSError as exc:
-                if exc.errno in _ARCHIVE_SWAPPED_ERRNOS:
-                    raise _UnsafeArchiveMember(arcname) from exc
-                raise
-            if dir_fd != root_fd:
-                os.close(dir_fd)
-            dir_fd = next_fd
-        try:
-            fd = os.open(parts[-1], _ARCHIVE_FILE_FLAGS, dir_fd=dir_fd)
-        except OSError as exc:
-            if exc.errno in _ARCHIVE_SWAPPED_ERRNOS:
-                raise _UnsafeArchiveMember(arcname) from exc
-            raise
-    finally:
-        if dir_fd != root_fd:
-            os.close(dir_fd)
-    try:
-        st = os.fstat(fd)
-        if not stat_module.S_ISREG(st.st_mode):
-            raise _UnsafeArchiveMember(arcname)
-        os.set_blocking(fd, True)
-        return os.fdopen(fd, "rb"), st
-    except BaseException:
-        os.close(fd)
-        raise
+    return _open_file_beneath(root_fd, parts)
 
 
 def _archive_zipinfo(arcname: str, st: os.stat_result) -> zipfile.ZipInfo:
