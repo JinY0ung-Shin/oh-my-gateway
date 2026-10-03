@@ -1389,3 +1389,174 @@ def test_digest_refuses_a_directory(client, workspace):
     assert (
         client.get("/files/digest?path=/adir", headers={**_AUTH, **_USER}).status_code == 404
     )
+
+
+
+# --- conditional write (ChatDRAGON #213) -------------------------------------
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _write_if(client, name: str, body: bytes, expected: str):
+    return client.post(
+        f"/files/write_if?directory=/&expected_sha256={expected}",
+        headers={**_AUTH, **_USER},
+        files={"file": (name, body, "text/plain")},
+    )
+
+
+def _leftovers(workspace: Path):
+    return sorted(p.name for p in workspace.iterdir() if ".cas-" in p.name)
+
+
+def test_write_if_replaces_when_unchanged(client, workspace):
+    (workspace / "doc.txt").write_text("v1")
+    r = _write_if(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 200
+    assert r.json()["preserved"] is None
+    assert (workspace / "doc.txt").read_text() == "v1 + mine"
+    assert _leftovers(workspace) == []
+
+
+def test_write_if_refuses_changed_and_deleted_files(client, workspace):
+    (workspace / "doc.txt").write_text("v2 from agent")
+    r = _write_if(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 409
+    assert r.json()["detail"] == {"code": "save_conflict", "exists": True, "preserved": None}
+    assert (workspace / "doc.txt").read_text() == "v2 from agent"
+    r = _write_if(client, "gone.txt", b"mine", _sha("v1"))
+    assert r.status_code == 409 and r.json()["detail"]["exists"] is False
+    assert not (workspace / "gone.txt").exists()
+    # the whole folder is gone: still a conflict, never a 404 (404 means "no write_if")
+    r = client.post(
+        f"/files/write_if?directory=/nope&expected_sha256={_sha('v1')}",
+        headers={**_AUTH, **_USER},
+        files={"file": ("a.txt", b"x", "text/plain")},
+    )
+    assert r.status_code == 409 and r.json()["detail"]["exists"] is False
+    assert _leftovers(workspace) == []
+
+
+def test_upload_does_not_take_expected_sha256(client, workspace):
+    """The conditional write is a separate endpoint: a gateway without it answers
+    404 instead of an unconditional upload silently ignoring the parameter, so
+    callers fail closed (#541 review)."""
+    (workspace / "doc.txt").write_text("v1")
+    r = client.post(
+        "/files/write_if_v0?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("doc.txt", b"x", "text/plain")},
+    )
+    assert r.status_code == 404
+    assert (workspace / "doc.txt").read_text() == "v1"
+
+
+def test_write_if_external_write_between_compare_and_claim(client, workspace, monkeypatch):
+    """An agent/terminal write lands right after the compare: the claimed bytes
+    no longer match, the external version is put back, 409."""
+    (workspace / "doc.txt").write_text("v1")
+    monkeypatch.setattr(tf, "_cas_after_compare", lambda t: t.write_text("v2 from agent"))
+    r = _write_if(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 409
+    assert (workspace / "doc.txt").read_text() == "v2 from agent"
+    assert _leftovers(workspace) == []
+
+
+def test_write_if_path_writer_right_before_install(client, workspace, monkeypatch):
+    """The reviewer's last-syscall case: a direct writer recreates the path
+    immediately before the new body would be installed. link() never replaces
+    an existing path, so that writer wins and nothing is lost."""
+    (workspace / "doc.txt").write_text("v1")
+    monkeypatch.setattr(tf, "_cas_before_install", lambda t: t.write_text("v2 from terminal"))
+    r = _write_if(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 409
+    assert (workspace / "doc.txt").read_text() == "v2 from terminal"
+    assert _leftovers(workspace) == []
+
+
+def test_write_if_descriptor_writer_is_preserved_not_lost(client, workspace, monkeypatch):
+    """A writer that opened the file before the save and keeps writing through
+    its descriptor writes into the claimed inode. Its version is kept beside the
+    file and named in the response instead of being silently discarded."""
+    target = workspace / "doc.txt"
+    target.write_text("v1")
+    fd = open(target, "r+")
+    monkeypatch.setattr(
+        tf, "_cas_before_install", lambda t: (fd.seek(0), fd.write("v2 via fd"), fd.flush())
+    )
+    try:
+        r = _write_if(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    finally:
+        fd.close()
+    assert r.status_code == 200
+    preserved = r.json()["preserved"]
+    assert preserved and preserved.startswith("/doc.conflict-")
+    assert (workspace / preserved.lstrip("/")).read_text() == "v2 via fd"
+    assert target.read_text() == "v1 + mine"
+    assert _leftovers(workspace) == []
+
+
+def _cas_in_process(args):
+    """Child process: run the real conditional write with a barrier right after
+    its compare (held for up to a second for the other process)."""
+    import time as _time
+
+    from src.routes import terminal_files as child_tf
+
+    lock_root, target, body, expected, flag_dir, me = args
+
+    def barrier(_t):
+        (Path(flag_dir) / me).write_text("compared")
+        deadline = _time.monotonic() + 1.0
+        while _time.monotonic() < deadline and len(list(Path(flag_dir).iterdir())) < 2:
+            _time.sleep(0.01)
+
+    child_tf._cas_after_compare = barrier
+    try:
+        child_tf._cas_write(Path(lock_root), Path(target), body, expected)
+        return "ok"
+    except child_tf._WriteConflict:
+        return "conflict"
+
+
+def test_write_if_two_gateway_processes_exactly_one_wins(tmp_path):
+    """Two independent processes (not one event loop) save against the same
+    expected version, each pausing at a barrier right after its compare: exactly
+    one succeeds and the file holds that body."""
+    import multiprocessing
+
+    root = tmp_path / "u" / "claude"
+    root.mkdir(parents=True)
+    target = root / "doc.txt"
+    target.write_text("v1")
+    flags = tmp_path / "flags"
+    flags.mkdir()
+    ctx = multiprocessing.get_context("spawn")
+    with ctx.Pool(2) as pool:
+        results = pool.map(
+            _cas_in_process,
+            [
+                (str(tmp_path / "u"), str(target), b"from A", _sha("v1"), str(flags), "a"),
+                (str(tmp_path / "u"), str(target), b"from B", _sha("v1"), str(flags), "b"),
+            ],
+        )
+    assert sorted(results) == ["conflict", "ok"]
+    assert target.read_text() == ("from A" if results[0] == "ok" else "from B")
+    assert _leftovers(root) == []
+
+
+def test_write_if_rejects_bad_hash(client, workspace):
+    r = _write_if(client, "doc.txt", b"x", "not-a-hash")
+    assert r.status_code == 400
+
+
+def test_write_if_keeps_file_mode(client, workspace):
+    target = workspace / "run.sh"
+    target.write_text("echo 1")
+    target.chmod(0o750)
+    r = _write_if(client, "run.sh", b"echo 2", _sha("echo 1"))
+    assert r.status_code == 200
+    assert target.read_text() == "echo 2"
+    assert target.stat().st_mode & 0o777 == 0o750

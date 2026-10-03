@@ -90,6 +90,7 @@ Security:
 import asyncio
 import ctypes
 import errno
+import fcntl
 import hashlib
 import io
 import logging
@@ -97,6 +98,8 @@ import mimetypes
 import os
 import shutil
 import stat as stat_module
+import time
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -942,6 +945,238 @@ async def upload_file(
             _raise_quota_http(exc)
         await _write_uploaded_file(target, data, no_clobber)
     return {"path": str(target), "size": len(data)}
+
+
+# --- conditional write (ChatDRAGON #213) --------------------------------------
+# The workspace is written by more than this API: the agent's tools and the
+# terminal write files directly, and the gateway may run as several processes.
+# A client saving a draft it started from an older body must never silently
+# replace a change made underneath it. ``POST /files/write_if`` is a separate,
+# versioned endpoint on purpose: a gateway that predates it answers 404 before
+# touching anything, so a caller can fail closed instead of having an
+# unconditional upload ignore an unknown parameter.
+#
+# Protocol, for ``expected_sha256`` (the SHA-256 of the body the draft started
+# from):
+#
+# 1. A per-path ``flock`` on a lock file under the user root serialises every
+#    conditional writer across gateway processes (and hosts sharing the
+#    volume).
+# 2. The new body is written to a hidden temp file beside the target.
+# 3. Compare: the target must hash to the expected value.
+# 4. Claim: ``rename(target -> .claim)`` atomically takes the current inode off
+#    the path. The claimed bytes are hashed again -- a write that landed between
+#    the compare and the claim is detected here, and the claimed file is put
+#    back (or, if the path was already recreated, kept as a visible conflict
+#    copy) -> 409.
+# 5. Install: ``link(tmp -> target)`` never replaces an existing path, so a
+#    writer that recreated the path after the claim wins and we answer 409.
+# 6. A writer that opened the file before the claim and keeps writing through
+#    its descriptor writes into the claimed inode; if the claimed bytes no
+#    longer match after install, they are kept as a visible conflict copy and
+#    the response names it. Nothing an external writer produced is discarded.
+_CAS_LOCK_DIR = ".gateway-cas-locks"
+
+
+class _WriteConflict(Exception):
+    def __init__(self, exists: bool, preserved: Optional[Path] = None):
+        super().__init__("conditional write conflict")
+        self.exists = exists
+        self.preserved = preserved
+
+
+def _cas_after_compare(target: Path) -> None:
+    """Test seam: right after the compare, before the claim."""
+
+
+def _cas_before_install(target: Path) -> None:
+    """Test seam: after the claim, right before the new body is linked in."""
+
+
+def _sha256_of(path: Path) -> Optional[str]:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return None
+    return digest.hexdigest()
+
+
+def _unlink_quietly(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _preserve_copy(claim: Path, target: Path) -> Path:
+    """Keep a claimed external version under a visible, non-clobbering name."""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for n in range(100):
+        tag = f".conflict-{stamp}" + (f"-{n}" if n else "")
+        dest = target.with_name(f"{target.stem}{tag}{target.suffix}")
+        try:
+            os.link(claim, dest)
+        except FileExistsError:
+            continue
+        _unlink_quietly(claim)
+        return dest
+    raise OSError("could not preserve the conflicting version")
+
+
+def _cas_write_locked(target: Path, data: bytes, expected: str) -> Optional[Path]:
+    token = uuid.uuid4().hex
+    tmp = target.with_name(f".{target.name}.cas-{token}.tmp")
+    claim = target.with_name(f".{target.name}.cas-{token}.claim")
+    with open(tmp, "xb") as f:
+        f.write(data)
+    try:
+        current = _sha256_of(target)
+        if current != expected:
+            raise _WriteConflict(exists=current is not None)
+        try:
+            shutil.copymode(target, tmp)
+        except OSError:
+            pass
+        _cas_after_compare(target)
+        try:
+            os.rename(target, claim)
+        except FileNotFoundError:
+            raise _WriteConflict(exists=False)
+        if _sha256_of(claim) != expected:
+            # Changed between the compare and the claim: put the external
+            # version back where it was.
+            try:
+                os.link(claim, target)
+            except FileExistsError:
+                raise _WriteConflict(exists=True, preserved=_preserve_copy(claim, target))
+            _unlink_quietly(claim)
+            raise _WriteConflict(exists=True)
+        _cas_before_install(target)
+        try:
+            os.link(tmp, target)
+        except FileExistsError:
+            # Recreated after the claim: that writer wins. The claimed inode is
+            # the expected version unless a descriptor kept writing into it.
+            if _sha256_of(claim) != expected:
+                raise _WriteConflict(exists=True, preserved=_preserve_copy(claim, target))
+            _unlink_quietly(claim)
+            raise _WriteConflict(exists=True)
+        if _sha256_of(claim) != expected:
+            return _preserve_copy(claim, target)
+        _unlink_quietly(claim)
+        return None
+    finally:
+        _unlink_quietly(tmp)
+        if claim.exists() and not target.exists():
+            # An unexpected error between claim and install: never leave the
+            # path empty because of us. (A claim is otherwise never deleted on
+            # an error path -- losing nothing beats tidiness.)
+            try:
+                os.link(claim, target)
+                _unlink_quietly(claim)
+            except FileExistsError:
+                pass
+
+
+def _cas_write(lock_root: Path, target: Path, data: bytes, expected: str) -> Optional[Path]:
+    lock_dir = lock_root / _CAS_LOCK_DIR
+    lock_dir.mkdir(exist_ok=True)
+    lock_path = lock_dir / (hashlib.sha256(str(target).encode()).hexdigest() + ".lock")
+    with open(lock_path, "a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            return _cas_write_locked(target, data, expected)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+@router.post("/files/write_if")
+async def write_if_unchanged(
+    request: Request,
+    expected_sha256: str,
+    directory: str = "/",
+    file: UploadFile = File(...),
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Replace one file only if it still hashes to ``expected_sha256``.
+
+    409 ``{"code": "save_conflict", "exists", "preserved"}`` leaves the file
+    as the other writer left it; a 200 may carry ``preserved`` when an
+    external version written through an already-open descriptor was kept
+    beside the file. See "conditional write" above for the protocol.
+    """
+    await verify_api_key(request, credentials)
+    _ensure_api_key()
+    root = _workspace_root(_require_user(request))
+    dest_dir = _resolve_or_403(root, directory)
+    if not dest_dir.is_dir():
+        # The file's folder is gone, so the file the draft started from is gone:
+        # that is a conflict, not a 404 -- callers read 404/405 from this route
+        # as "this gateway has no conditional write" and fail closed.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "save_conflict", "exists": False, "preserved": None},
+        )
+    name = os.path.basename(file.filename or "")
+    if not name or name in (".", ".."):
+        raise HTTPException(status_code=400, detail="invalid filename")
+    target = _resolve_or_403(root, f"{directory}/{name}")
+    expected = expected_sha256.lower()
+    if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
+        raise HTTPException(status_code=400, detail="invalid expected_sha256")
+    data = await file.read()
+    ceiling = _max_upload_bytes()
+    if ceiling == 0 or len(data) > ceiling:
+        raise HTTPException(
+            status_code=413,
+            detail=f"file exceeds the upload limit of {ceiling} bytes",
+        )
+    # Lock files live under the user root (beside the backend directories, not
+    # inside the agent's workspace). A workspace outside the standard layout falls
+    # back to its own root rather than refusing the save.
+    try:
+        lock_root = _user_root(root)
+    except HTTPException:
+        lock_root = root
+
+    def _rel(path: Optional[Path]) -> Optional[str]:
+        return "/" + str(path.relative_to(root)) if path is not None else None
+
+    async def _write() -> Optional[Path]:
+        try:
+            return await run_in_threadpool(_cas_write, lock_root, target, data, expected)
+        except _WriteConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "save_conflict",
+                    "exists": exc.exists,
+                    "preserved": _rel(exc.preserved),
+                },
+            )
+
+    if workspace_quota_limit_bytes() <= 0:
+        preserved = await _write()
+    else:
+        user_root = _user_root(root)
+        async with _quota_lock(user_root):
+            try:
+                reclaimed = target.stat().st_size if target.is_file() else 0
+            except OSError:
+                reclaimed = 0
+            try:
+                await run_in_threadpool(
+                    lambda: ensure_growth_fits(
+                        user_root, added_bytes=len(data), reclaimed_bytes=reclaimed
+                    )
+                )
+            except WorkspaceQuotaExceeded as exc:
+                _raise_quota_http(exc)
+            preserved = await _write()
+    return {"path": str(target), "size": len(data), "preserved": _rel(preserved)}
 
 
 @router.post("/files/mkdir")
