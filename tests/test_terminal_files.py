@@ -2275,6 +2275,26 @@ def test_archive_refuses_a_workspace_root_swapped_after_the_walk(
 # the first open beneath the root.
 
 
+def _arm_swap(monkeypatch, swap, when):
+    """Run ``swap`` once: ``before`` the root is pinned, or ``after`` the first
+    directory fd beneath it is open (so only fd-relative operations can still
+    reach what was checked)."""
+    if when == "before":
+        return _swap_before_open(monkeypatch, swap)
+    ran = []
+    real = tf._open_dir_beneath
+
+    def _open(*a, **kw):
+        fd = real(*a, **kw)
+        if not ran:
+            ran.append(True)
+            swap()
+        return fd
+
+    monkeypatch.setattr(tf, "_open_dir_beneath", _open)
+    return ran
+
+
 def _swap_before_open(monkeypatch, swap):
     ran = []
     real_pinned, real_pin = tf._pinned_root, tf._pin_root
@@ -2325,41 +2345,53 @@ def _swap_dir(workspace, tmp_path, rel, target):
     return _swap
 
 
-@pytest.mark.parametrize(
-    "route", ["/files/read?path=/sub/inner.md", "/files/digest?path=/sub/inner.md",
-              "/files/view?path=/sub/inner.md", "/files/serve/sub/inner.md"],
-)
+_READ_ROUTES = [
+    "/files/read?path=/sub/inner.md",
+    "/files/digest?path=/sub/inner.md",
+    "/files/view?path=/sub/inner.md",
+    "/files/serve/sub/inner.md",
+]
+_SECRET_SHA = hashlib.sha256(_OUTSIDE_SECRET).hexdigest()
+_WHEN = ["before", "after"]
+
+
+def _assert_no_outside_bytes_in(r) -> None:
+    assert _OUTSIDE_SECRET not in r.content
+    assert _SECRET_SHA not in r.text
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("route", _READ_ROUTES)
 def test_read_routes_refuse_a_file_swapped_for_a_symlink(
-    client, workspace, tmp_path, outside, monkeypatch, route
+    client, workspace, tmp_path, outside, monkeypatch, route, when
 ):
-    ran = _swap_before_open(
-        monkeypatch, _swap_file(workspace, "sub/inner.md", tmp_path / "outside-file.txt")
+    ran = _arm_swap(
+        monkeypatch,
+        _swap_file(workspace, "sub/inner.md", tmp_path / "outside-file.txt"),
+        when,
     )
     r = client.get(route, headers={**_AUTH, **_USER})
     assert ran == [True]
     assert r.status_code == 404
-    assert _OUTSIDE_SECRET not in r.content
-    assert hashlib.sha256(_OUTSIDE_SECRET).hexdigest() not in r.text
+    _assert_no_outside_bytes_in(r)
 
 
-@pytest.mark.parametrize(
-    "route", ["/files/read?path=/sub/inner.md", "/files/digest?path=/sub/inner.md",
-              "/files/view?path=/sub/inner.md", "/files/serve/sub/inner.md"],
-)
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("route", _READ_ROUTES)
 def test_read_routes_refuse_a_directory_swapped_for_a_symlink(
-    client, workspace, tmp_path, outside, monkeypatch, route
+    client, workspace, tmp_path, outside, monkeypatch, route, when
 ):
-    ran = _swap_before_open(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
     r = client.get(route, headers={**_AUTH, **_USER})
     assert ran == [True]
-    assert r.status_code == 404
-    assert _OUTSIDE_SECRET not in r.content
-    assert hashlib.sha256(_OUTSIDE_SECRET).hexdigest() not in r.text
+    # Before the pin the swap is refused; after it, the fd still leads to the
+    # directory that was checked, so the original file is served.
+    assert r.status_code in (404, 200)
+    _assert_no_outside_bytes_in(r)
 
 
 @pytest.mark.parametrize(
-    "route", ["/files/read?path=/sub/inner.md", "/files/digest?path=/sub/inner.md",
-              "/files/view?path=/sub/inner.md"],
+    "route", _READ_ROUTES[:3]
 )
 def test_read_routes_refuse_a_file_swapped_for_a_fifo_without_blocking(
     client, workspace, monkeypatch, route
@@ -2391,11 +2423,162 @@ def test_view_keeps_serving_the_checked_file_after_a_later_swap(
     assert r.content == b"# inner"
 
 
+@pytest.mark.parametrize("when", _WHEN)
 def test_list_refuses_a_directory_swapped_for_a_symlink(
-    client, workspace, tmp_path, outside, monkeypatch
+    client, workspace, tmp_path, outside, monkeypatch, when
 ):
-    ran = _swap_before_open(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
     r = client.get("/files/list?directory=/sub", headers={**_AUTH, **_USER})
     assert ran == [True]
-    assert r.status_code == 404
+    assert r.status_code in (404, 200)
     assert "deeper" not in r.text
+
+
+# --- write routes create/rename/delete beneath the pinned root ---------------
+
+
+def _outside_tree(outside: Path) -> dict:
+    return {
+        p.relative_to(outside).as_posix(): (p.read_bytes() if p.is_file() else None)
+        for p in outside.rglob("*")
+    }
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_upload_refuses_a_destination_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    victim = tmp_path / "outside-file.txt"
+    ran = _arm_swap(monkeypatch, _swap_file(workspace, "sub/inner.md", victim), when)
+    r = client.post(
+        "/files/upload?directory=/sub",
+        headers={**_AUTH, **_USER},
+        files={"file": ("inner.md", b"PAYLOAD", "text/plain")},
+    )
+    assert ran == [True]
+    assert r.status_code == 409
+    assert victim.read_bytes() == _OUTSIDE_SECRET
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_upload_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post(
+        "/files/upload?directory=/sub",
+        headers={**_AUTH, **_USER},
+        files={"file": ("inner.md", b"PAYLOAD", "text/plain")},
+    )
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+
+
+def test_upload_onto_an_existing_fifo_is_refused_without_blocking(client, workspace):
+    os.mkfifo(workspace / "pipe")
+    r = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("pipe", b"PAYLOAD", "text/plain")},
+    )
+    assert r.status_code == 409
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_write_if_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    """``expected`` is the OUTSIDE file's digest: a write that followed the
+    symlink would match it and replace the outside file."""
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post(
+        f"/files/write_if?directory=/sub&expected_sha256={_SECRET_SHA}",
+        headers={**_AUTH, **_USER},
+        files={"file": ("inner.md", b"PAYLOAD", "text/plain")},
+    )
+    assert ran == [True]
+    assert r.status_code == 409
+    assert _outside_tree(outside) == before
+
+
+def test_mkdir_refuses_a_parent_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch
+):
+    before = _outside_tree(outside)
+    ran = _swap_before_open(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    r = client.post(
+        "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/sub/made/deep"}
+    )
+    assert ran == [True]
+    assert r.status_code == 409
+    assert _outside_tree(outside) == before
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("victim", ["deeper/x.txt", "deeper"])
+def test_delete_refuses_a_parent_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, victim, when
+):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.delete(f"/files/delete?path=/sub/{victim}", headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("no_clobber", [False, True])
+@pytest.mark.parametrize("side", ["source", "destination"])
+def test_move_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, side, no_clobber, when
+):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    (workspace / "other").mkdir()
+    before = _outside_tree(outside)
+    body = (
+        {"source": "/sub/deeper/x.txt", "destination": "/other/x.txt"}
+        if side == "source"
+        else {"source": "/notes.txt", "destination": "/sub/deeper/x.txt"}
+    )
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={**body, "no_clobber": no_clobber},
+    )
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+    for p in workspace.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            assert _OUTSIDE_SECRET not in p.read_bytes(), p
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"source": "/sub/inner.md", "destination": "/copied.md"},
+        {"source": "/sub", "destination": "/copied"},
+        {"source": "/notes.txt", "destination": "/sub/notes.txt"},
+    ],
+)
+def test_copy_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, body, when
+):
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post("/files/copy", headers={**_AUTH, **_USER}, json=body)
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+    for p in workspace.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            assert _OUTSIDE_SECRET not in p.read_bytes(), p

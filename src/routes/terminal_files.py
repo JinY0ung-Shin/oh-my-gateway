@@ -90,13 +90,17 @@ Security:
   before the containment check); anything above/outside the root is a 403.
   Uploaded filenames are reduced to a basename. No extra roots (never
   ``~/.claude`` etc.).
-- ``/files/archive`` checks paths when it walks the selection but reads them
-  later, from the producer thread, so a path check alone would race a symlink
-  swap. The producer therefore never opens a path: it pins the workspace root
-  as a directory fd (identity checked against the walk) and descends to every
-  member one component at a time with ``O_NOFOLLOW`` (``_open_archive_member``),
-  so a member or any directory above it that became a symlink is skipped, never
-  followed out of the workspace.
+- A path check alone races the agent and the terminal, which keep changing the
+  workspace: a file or a directory above it swapped for a symlink after
+  ``_resolve_or_403`` would be followed out of the workspace by a later
+  open-by-path. So no route opens, creates, renames or deletes a workspace path
+  by its full path. Each pins the resolved root as an ``O_NOFOLLOW`` directory
+  fd and works from it one component at a time with ``O_NOFOLLOW``
+  (``_open_file_beneath``, ``_parent_beneath``, ``*at`` syscalls via
+  ``dir_fd=``); a symlink met on the way is a swap and is refused (404 for a
+  read, 409 for a write), and a non-regular file is refused without blocking.
+  ``/files/archive`` reads its members the same way, from the producer thread,
+  with the root's identity checked against the walk.
 """
 
 import asyncio
@@ -659,6 +663,49 @@ def _path_changed_409() -> HTTPException:
     )
 
 
+@contextmanager
+def _parent_beneath(root: Path, target: Path):
+    """Yield ``(dir_fd, name)``: ``target``'s directory opened beneath the root.
+
+    Every write route creates, renames or deletes ``name`` relative to this fd
+    (``dir_fd=``), never through the full path.
+    """
+    with _pinned_root(root, target) as (root_fd, parts):
+        if not parts:
+            raise _PathChanged("the workspace root itself")
+        dir_fd = _open_dir_beneath(root_fd, parts[:-1])
+    try:
+        yield dir_fd, parts[-1]
+    finally:
+        os.close(dir_fd)
+
+
+def _open_new_or_regular(dir_fd: int, name: str, flags: int) -> int:
+    """``openat`` for writing that refuses symlinks, FIFOs and devices."""
+    try:
+        fd = _openat_checked(
+            name, flags | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd, 0o666
+        )
+    except OSError as exc:
+        if exc.errno == errno.ENXIO:  # a FIFO without a reader, a socket
+            raise _PathChanged(name) from exc
+        raise
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            raise _PathChanged(name)
+        os.set_blocking(fd, True)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view) :]
+
+
 @router.get("/api/config")
 async def terminal_config(
     request: Request,
@@ -1050,20 +1097,35 @@ async def set_cwd(
     return {"cwd": body.path}
 
 
-async def _write_uploaded_file(target: Path, data: bytes, no_clobber: bool) -> None:
-    """Preserve the historical upload write/no-clobber semantics."""
-    if no_clobber:
+async def _write_uploaded_file(
+    root: Path, target: Path, data: bytes, no_clobber: bool
+) -> None:
+    """Preserve the historical upload write/no-clobber semantics.
 
-        def _write_exclusive() -> None:
-            with open(target, "xb") as f:
-                f.write(data)
+    The file is created (``O_EXCL`` for no-clobber) or truncated beneath the
+    pinned root, so a destination or a directory above it swapped for a
+    symlink is refused rather than written through.
+    """
 
+    def _write() -> None:
+        flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if no_clobber else 0)
+        with _parent_beneath(root, target) as (dir_fd, name):
+            fd = _open_new_or_regular(dir_fd, name, flags)
         try:
-            await run_in_threadpool(_write_exclusive)
-        except FileExistsError:
-            raise HTTPException(status_code=409, detail="destination already exists")
-    else:
-        await run_in_threadpool(target.write_bytes, data)
+            if not no_clobber:
+                os.ftruncate(fd, 0)
+            _write_all(fd, data)
+        finally:
+            os.close(fd)
+
+    try:
+        await run_in_threadpool(_write)
+    except FileExistsError:
+        raise HTTPException(status_code=409, detail="destination already exists")
+    except _PathChanged:
+        raise _path_changed_409()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="directory not found")
 
 
 @router.post("/files/upload")
@@ -1110,7 +1172,7 @@ async def upload_file(
     # Keep quota-disabled deployments on the exact historical mutation path:
     # no extra tree scan, lock, or threadpool hop.
     if workspace_quota_limit_bytes() <= 0:
-        await _write_uploaded_file(target, data, no_clobber)
+        await _write_uploaded_file(root, target, data, no_clobber)
         return {"path": str(target), "size": len(data)}
 
     user_root = _user_root(root)
@@ -1139,7 +1201,7 @@ async def upload_file(
             )
         except WorkspaceQuotaExceeded as exc:
             _raise_quota_http(exc)
-        await _write_uploaded_file(target, data, no_clobber)
+        await _write_uploaded_file(root, target, data, no_clobber)
     return {"path": str(target), "size": len(data)}
 
 
@@ -1189,102 +1251,166 @@ def _cas_before_install(target: Path) -> None:
     """Test seam: after the claim, right before the new body is linked in."""
 
 
-def _sha256_of(path: Path) -> Optional[str]:
+_NOT_REGULAR = "not-a-regular-file"
+
+
+def _sha256_at(dir_fd: int, name: str) -> Optional[str]:
+    """SHA-256 of ``name`` in ``dir_fd``; ``None`` if absent.
+
+    Never follows a symlink and never blocks on a FIFO: anything but a regular
+    file hashes to a value no expected digest can match.
+    """
     digest = hashlib.sha256()
     try:
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                digest.update(chunk)
+        fd = _openat_checked(name, _FILE_FLAGS, dir_fd)
     except FileNotFoundError:
         return None
+    except (_PathChanged, OSError):
+        return _NOT_REGULAR
+    try:
+        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
+            return _NOT_REGULAR
+        os.set_blocking(fd, True)
+        while chunk := os.read(fd, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(fd)
     return digest.hexdigest()
 
 
-def _unlink_quietly(path: Path) -> None:
+def _exists_at(dir_fd: int, name: str) -> bool:
     try:
-        path.unlink()
+        os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _unlink_quietly(dir_fd: int, name: str) -> None:
+    try:
+        os.unlink(name, dir_fd=dir_fd)
     except FileNotFoundError:
         pass
 
 
-def _preserve_copy(claim: Path, target: Path) -> Path:
+def _link_at(dir_fd: int, src: str, dst: str) -> None:
+    os.link(src, dst, src_dir_fd=dir_fd, dst_dir_fd=dir_fd, follow_symlinks=False)
+
+
+def _preserve_copy(dir_fd: int, claim: str, target: Path) -> Path:
     """Keep a claimed external version under a visible, non-clobbering name."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
     for n in range(100):
         tag = f".conflict-{stamp}" + (f"-{n}" if n else "")
         dest = target.with_name(f"{target.stem}{tag}{target.suffix}")
         try:
-            os.link(claim, dest)
+            _link_at(dir_fd, claim, dest.name)
         except FileExistsError:
             continue
-        _unlink_quietly(claim)
+        _unlink_quietly(dir_fd, claim)
         return dest
     raise OSError("could not preserve the conflicting version")
 
 
-def _cas_write_locked(target: Path, data: bytes, expected: str) -> Optional[Path]:
+def _cas_write_locked(
+    dir_fd: int, target: Path, data: bytes, expected: str
+) -> Optional[Path]:
+    """The conditional write, entirely relative to the target's directory fd."""
+    name = target.name
     token = uuid.uuid4().hex
-    tmp = target.with_name(f".{target.name}.cas-{token}.tmp")
-    claim = target.with_name(f".{target.name}.cas-{token}.claim")
-    with open(tmp, "xb") as f:
-        f.write(data)
+    tmp = f".{name}.cas-{token}.tmp"
+    claim = f".{name}.cas-{token}.claim"
+    fd = os.open(
+        tmp,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o666,
+        dir_fd=dir_fd,
+    )
     try:
-        current = _sha256_of(target)
+        _write_all(fd, data)
+    finally:
+        os.close(fd)
+    try:
+        current = _sha256_at(dir_fd, name)
         if current != expected:
             raise _WriteConflict(exists=current is not None)
         try:
-            shutil.copymode(target, tmp)
+            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+            os.chmod(tmp, stat_module.S_IMODE(mode), dir_fd=dir_fd)
         except OSError:
             pass
         _cas_after_compare(target)
         try:
-            os.rename(target, claim)
+            os.rename(name, claim, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
         except FileNotFoundError:
             raise _WriteConflict(exists=False)
-        if _sha256_of(claim) != expected:
+        if _sha256_at(dir_fd, claim) != expected:
             # Changed between the compare and the claim: put the external
             # version back where it was.
             try:
-                os.link(claim, target)
+                _link_at(dir_fd, claim, name)
             except FileExistsError:
-                raise _WriteConflict(exists=True, preserved=_preserve_copy(claim, target))
-            _unlink_quietly(claim)
+                raise _WriteConflict(
+                    exists=True, preserved=_preserve_copy(dir_fd, claim, target)
+                )
+            _unlink_quietly(dir_fd, claim)
             raise _WriteConflict(exists=True)
         _cas_before_install(target)
         try:
-            os.link(tmp, target)
+            _link_at(dir_fd, tmp, name)
         except FileExistsError:
             # Recreated after the claim: that writer wins. The claimed inode is
             # the expected version unless a descriptor kept writing into it.
-            if _sha256_of(claim) != expected:
-                raise _WriteConflict(exists=True, preserved=_preserve_copy(claim, target))
-            _unlink_quietly(claim)
+            if _sha256_at(dir_fd, claim) != expected:
+                raise _WriteConflict(
+                    exists=True, preserved=_preserve_copy(dir_fd, claim, target)
+                )
+            _unlink_quietly(dir_fd, claim)
             raise _WriteConflict(exists=True)
-        if _sha256_of(claim) != expected:
-            return _preserve_copy(claim, target)
-        _unlink_quietly(claim)
+        if _sha256_at(dir_fd, claim) != expected:
+            return _preserve_copy(dir_fd, claim, target)
+        _unlink_quietly(dir_fd, claim)
         return None
     finally:
-        _unlink_quietly(tmp)
-        if claim.exists() and not target.exists():
+        _unlink_quietly(dir_fd, tmp)
+        if _exists_at(dir_fd, claim) and not _exists_at(dir_fd, name):
             # An unexpected error between claim and install: never leave the
             # path empty because of us. (A claim is otherwise never deleted on
             # an error path -- losing nothing beats tidiness.)
             try:
-                os.link(claim, target)
-                _unlink_quietly(claim)
+                _link_at(dir_fd, claim, name)
+                _unlink_quietly(dir_fd, claim)
             except FileExistsError:
                 pass
 
 
-def _cas_write(lock_root: Path, target: Path, data: bytes, expected: str) -> Optional[Path]:
+def _cas_write(
+    lock_root: Path,
+    target: Path,
+    data: bytes,
+    expected: str,
+    root: Optional[Path] = None,
+) -> Optional[Path]:
+    """Lock, then write relative to ``target``'s directory.
+
+    With ``root`` (the route), that directory is reached beneath the pinned
+    workspace root, so a directory swapped for a symlink is refused instead of
+    written into; without it (direct callers) the directory is opened by path.
+    """
     lock_dir = lock_root / _CAS_LOCK_DIR
     lock_dir.mkdir(exist_ok=True)
     lock_path = lock_dir / (hashlib.sha256(str(target).encode()).hexdigest() + ".lock")
     with open(lock_path, "a+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
         try:
-            return _cas_write_locked(target, data, expected)
+            if root is not None:
+                with _parent_beneath(root, target) as (dir_fd, _):
+                    return _cas_write_locked(dir_fd, target, data, expected)
+            dir_fd = os.open(target.parent, _DIR_FLAGS)
+            try:
+                return _cas_write_locked(dir_fd, target, data, expected)
+            finally:
+                os.close(dir_fd)
         finally:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
@@ -1343,7 +1469,11 @@ async def write_if_unchanged(
 
     async def _write() -> Optional[Path]:
         try:
-            return await run_in_threadpool(_cas_write, lock_root, target, data, expected)
+            return await run_in_threadpool(
+                _cas_write, lock_root, target, data, expected, root
+            )
+        except _PathChanged:
+            raise _path_changed_409()
         except _WriteConflict as exc:
             raise HTTPException(
                 status_code=409,
@@ -1387,7 +1517,28 @@ async def make_dir(
     target = _resolve_or_403(root, body.path)
     if target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
-    target.mkdir(parents=True, exist_ok=True)
+
+    def _mkdirs() -> None:
+        # mkdir -p one component at a time beneath the pinned root: a
+        # component swapped for a symlink is refused, never created through.
+        with _pinned_root(root, target) as (root_fd, parts):
+            fd = os.dup(root_fd)
+        try:
+            for name in parts:
+                try:
+                    os.mkdir(name, 0o777, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                next_fd = _openat_checked(name, _DIR_FLAGS, fd)
+                os.close(fd)
+                fd = next_fd
+        finally:
+            os.close(fd)
+
+    try:
+        await run_in_threadpool(_mkdirs)
+    except _PathChanged:
+        raise _path_changed_409()
     return {"path": str(target)}
 
 
@@ -1405,12 +1556,27 @@ async def delete_entry(
         raise HTTPException(status_code=400, detail="invalid path")
     if not target.exists():
         raise HTTPException(status_code=404, detail="not found")
-    is_dir = target.is_dir() and not target.is_symlink()
+
+    def _delete() -> bool:
+        # Unlink/rmtree the entry relative to its directory fd beneath the
+        # root, so a directory above it swapped for a symlink cannot redirect
+        # the delete outside the workspace. rmtree(dir_fd=) is the fd-based,
+        # symlink-safe walk.
+        with _parent_beneath(root, target) as (dir_fd, name):
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if stat_module.S_ISDIR(st.st_mode):
+                shutil.rmtree(name, dir_fd=dir_fd)
+                return True
+            os.unlink(name, dir_fd=dir_fd)
+            return False
+
     # rmtree over a large workspace subtree can take seconds — keep it off the loop.
-    if is_dir:
-        await run_in_threadpool(shutil.rmtree, target)
-    else:
-        await run_in_threadpool(target.unlink)
+    try:
+        is_dir = await run_in_threadpool(_delete)
+    except _PathChanged:
+        raise _path_changed_409()
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="not found")
     return {"path": path, "type": "directory" if is_dir else "file"}
 
 
@@ -1436,33 +1602,93 @@ async def move_entry(
     # shutil.Error (500) instead of a precise 400.
     if src.is_dir() and not src.is_symlink() and (dst == src or src in dst.parents):
         raise HTTPException(status_code=400, detail="cannot move a directory into itself")
-    if body.no_clobber:
-        # No check-then-move: rename(2) replaces an existing destination by
-        # design, so only the kernel can enforce no-replace atomically.
-        # _rename_noreplace is renameat2(RENAME_NOREPLACE); when the primitive
-        # is unavailable we fail closed (501) instead of silently falling back
-        # to a replace-capable move.
+    def _move() -> None:
+        # Both ends are renamed relative to their directory fds beneath the
+        # pinned root (renameat/renameat2), never through full paths: a
+        # directory on either side swapped for a symlink cannot take the
+        # entry, or the overwrite, outside the workspace.
+        with _parent_beneath(root, src) as (src_dir, src_name), _parent_beneath(
+            root, dst
+        ) as (dst_dir, dst_name):
+            if body.no_clobber:
+                # No check-then-move: rename(2) replaces an existing destination
+                # by design, so only the kernel can enforce no-replace
+                # atomically. _rename_noreplace is renameat2(RENAME_NOREPLACE);
+                # when the primitive is unavailable we fail closed (501)
+                # instead of silently falling back to a replace-capable move.
+                _rename_noreplace((src_dir, src_name), (dst_dir, dst_name))
+                return
+            _move_at(src_dir, src_name, dst_dir, dst_name, src, dst)
+
+    try:
+        await run_in_threadpool(_move)
+    except NotImplementedError:
+        raise HTTPException(
+            status_code=501,
+            detail="atomic no-replace move is unavailable on this system",
+        )
+    except _PathChanged:
+        raise _path_changed_409()
+    except OSError as exc:
+        if body.no_clobber and exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
+            raise HTTPException(status_code=409, detail="destination already exists")
+        raise
+    return {"source": body.source, "destination": body.destination}
+
+
+def _move_at(
+    src_dir: int, src_name: str, dst_dir: int, dst_name: str, src: Path, dst: Path
+) -> None:
+    """``shutil.move`` semantics on directory fds.
+
+    An existing destination directory receives the source inside it (unless it
+    is the source itself); anything else is replaced by the rename. A
+    cross-device move (a mount inside the workspace) keeps the historical
+    ``shutil.move`` copy fallback.
+    """
+    src_st = os.stat(src_name, dir_fd=src_dir, follow_symlinks=False)
+    try:
+        dst_st = os.stat(dst_name, dir_fd=dst_dir, follow_symlinks=False)
+    except FileNotFoundError:
+        dst_st = None
+    into = None
+    if (
+        dst_st is not None
+        and stat_module.S_ISDIR(dst_st.st_mode)
+        and (dst_st.st_dev, dst_st.st_ino) != (src_st.st_dev, src_st.st_ino)
+    ):
+        into = _openat_checked(dst_name, _DIR_FLAGS, dst_dir)
+    try:
+        if into is not None:
+            try:
+                os.stat(src_name, dir_fd=into, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise shutil.Error(
+                    f"Destination path '{dst / src_name}' already exists"
+                )
+            target_dir, target_name = into, src_name
+        else:
+            target_dir, target_name = dst_dir, dst_name
         try:
-            await run_in_threadpool(_rename_noreplace, src, dst)
-        except NotImplementedError:
-            raise HTTPException(
-                status_code=501,
-                detail="atomic no-replace move is unavailable on this system",
+            os.rename(
+                src_name, target_name, src_dir_fd=src_dir, dst_dir_fd=target_dir
             )
         except OSError as exc:
-            if exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
-                raise HTTPException(status_code=409, detail="destination already exists")
-            raise
-    else:
-        await run_in_threadpool(shutil.move, str(src), str(dst))
-    return {"source": body.source, "destination": body.destination}
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.move(str(src), str(dst))
+    finally:
+        if into is not None:
+            os.close(into)
 
 
 _RENAME_NOREPLACE = 1
 _AT_FDCWD = -100
 
 
-def _rename_noreplace(src: Path, dst: Path) -> None:
+def _rename_noreplace(src, dst) -> None:
     """Atomic no-replace rename via Linux ``renameat2(RENAME_NOREPLACE)``.
 
     ``os.rename``/``shutil.move`` replace an existing destination by design,
@@ -1470,61 +1696,140 @@ def _rename_noreplace(src: Path, dst: Path) -> None:
     window. Raises ``NotImplementedError`` when the primitive cannot give the
     guarantee (missing symbol, unsupported filesystem, cross-device) — callers
     must fail closed, never fall back to a replace-capable move.
+
+    Each side is a path, or a ``(dir_fd, name)`` pair resolved relative to
+    that directory fd.
     """
+    src_dir, src_name = src if isinstance(src, tuple) else (_AT_FDCWD, str(src))
+    dst_dir, dst_name = dst if isinstance(dst, tuple) else (_AT_FDCWD, str(dst))
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         renameat2 = libc.renameat2
     except (OSError, AttributeError) as exc:  # pragma: no cover — non-Linux
         raise NotImplementedError("renameat2 unavailable") from exc
     ret = renameat2(
-        ctypes.c_int(_AT_FDCWD),
-        os.fsencode(str(src)),
-        ctypes.c_int(_AT_FDCWD),
-        os.fsencode(str(dst)),
+        ctypes.c_int(src_dir),
+        os.fsencode(src_name),
+        ctypes.c_int(dst_dir),
+        os.fsencode(dst_name),
         ctypes.c_uint(_RENAME_NOREPLACE),
     )
     if ret != 0:
         err = ctypes.get_errno()
         if err in (errno.ENOSYS, errno.EINVAL, errno.EXDEV):
             raise NotImplementedError(os.strerror(err))
-        raise OSError(err, os.strerror(err), str(src), None, str(dst))
+        raise OSError(err, os.strerror(err), src_name, None, dst_name)
 
 
 class _UnsupportedSourceError(Exception):
     """Copy source is not a regular file (FIFO/socket/device) — refused."""
 
 
-def _copy_file_exclusive(src: Path, dst: Path) -> None:
+def _copy_meta(src_fd: int, dst_fd: int, st: os.stat_result) -> None:
+    """``shutil.copystat`` between open descriptors: mode, times, xattrs."""
+    os.fchmod(dst_fd, stat_module.S_IMODE(st.st_mode))
+    for name in getattr(os, "listxattr", lambda _fd: [])(src_fd):
+        try:
+            os.setxattr(dst_fd, name, os.getxattr(src_fd, name))
+        except OSError as exc:
+            if exc.errno not in (errno.EPERM, errno.ENOTSUP, errno.EACCES):
+                raise
+    os.utime(dst_fd, ns=(st.st_atime_ns, st.st_mtime_ns))
+
+
+def _copy_file_at(src_dir: int, src_name: str, dst_dir: int, dst_name: str) -> None:
     """Copy a REGULAR file, failing with ``FileExistsError`` if ``dst`` exists.
 
-    ``open(dst, "xb")`` (O_CREAT|O_EXCL) makes the no-clobber promise a
-    filesystem guarantee instead of a check-then-copy: a destination that
-    appears after validation loses the race to us or we lose it to them, but
-    nobody's file is overwritten either way.
+    ``O_CREAT|O_EXCL`` makes the no-clobber promise a filesystem guarantee
+    instead of a check-then-copy: a destination that appears after validation
+    loses the race to us or we lose it to them, but nobody's file is
+    overwritten either way.
 
-    The source is opened with ``O_NONBLOCK`` and validated via ``fstat`` on
-    the open fd: a plain ``open(src, "rb")`` on a FIFO would block the worker
-    until a writer appears (exhausting the shared threadpool), and checking
-    the type before opening would just be another TOCTOU.
+    Both ends are opened relative to directory fds beneath the pinned root,
+    with ``O_NOFOLLOW``. The source is opened with ``O_NONBLOCK`` and validated
+    via ``fstat`` on the open fd: a plain open of a FIFO would block the worker
+    until a writer appears (exhausting the shared threadpool), and checking the
+    type before opening would just be another TOCTOU.
     """
     try:
-        fd = os.open(str(src), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_CLOEXEC", 0))
+        fd = _openat_checked(src_name, _FILE_FLAGS, src_dir)
     except OSError as exc:
         if exc.errno == errno.ENXIO:  # e.g. a socket file
-            raise _UnsupportedSourceError(str(src)) from exc
+            raise _UnsupportedSourceError(src_name) from exc
         raise
     try:
-        if not stat_module.S_ISREG(os.fstat(fd).st_mode):
-            raise _UnsupportedSourceError(str(src))
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise _UnsupportedSourceError(src_name)
         os.set_blocking(fd, True)
-        with open(dst, "xb") as fdst, os.fdopen(os.dup(fd), "rb") as fsrc:
-            shutil.copyfileobj(fsrc, fdst)
+        out = os.open(
+            dst_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o666,
+            dir_fd=dst_dir,
+        )
+        try:
+            while chunk := os.read(fd, 1024 * 1024):
+                _write_all(out, chunk)
+            _copy_meta(fd, out, st)
+        finally:
+            os.close(out)
     finally:
         os.close(fd)
-    shutil.copystat(str(src), str(dst))
 
 
-async def _perform_copy(src: Path, dst: Path, is_dir: bool) -> None:
+def _copytree_at(src_fd: int, dst_dir: int, dst_name: str, errors: list) -> None:
+    """``shutil.copytree(symlinks=True)`` between directory fds.
+
+    The destination directory is created exclusively (an existing one is a
+    ``FileExistsError``); symlinks are copied as links; every directory is
+    entered with ``O_NOFOLLOW``, so a subdirectory swapped for a symlink during
+    the copy is recorded as an error instead of being copied through. Entries
+    that cannot be copied are collected in ``errors`` like ``copytree`` does.
+    """
+    os.mkdir(dst_name, 0o777, dir_fd=dst_dir)
+    out_fd = _openat_checked(dst_name, _DIR_FLAGS, dst_dir)
+    try:
+        with os.scandir(src_fd) as it:
+            names = [entry.name for entry in it]
+        for name in names:
+            try:
+                st = os.stat(name, dir_fd=src_fd, follow_symlinks=False)
+                if stat_module.S_ISLNK(st.st_mode):
+                    os.symlink(os.readlink(name, dir_fd=src_fd), name, dir_fd=out_fd)
+                elif stat_module.S_ISDIR(st.st_mode):
+                    sub = _openat_checked(name, _DIR_FLAGS, src_fd)
+                    try:
+                        _copytree_at(sub, out_fd, name, errors)
+                    finally:
+                        os.close(sub)
+                else:
+                    _copy_file_at(src_fd, name, out_fd, name)
+            except (OSError, _PathChanged, _UnsupportedSourceError) as why:
+                errors.append((name, name, str(why)))
+        _copy_meta(src_fd, out_fd, os.fstat(src_fd))
+    finally:
+        os.close(out_fd)
+
+
+def _copy_beneath(root: Path, src: Path, dst: Path, is_dir: bool) -> None:
+    with _parent_beneath(root, src) as (src_dir, src_name), _parent_beneath(
+        root, dst
+    ) as (dst_dir, dst_name):
+        if not is_dir:
+            _copy_file_at(src_dir, src_name, dst_dir, dst_name)
+            return
+        src_fd = _openat_checked(src_name, _DIR_FLAGS, src_dir)
+        try:
+            errors: list = []
+            _copytree_at(src_fd, dst_dir, dst_name, errors)
+        finally:
+            os.close(src_fd)
+        if errors:
+            raise shutil.Error(errors)
+
+
+async def _perform_copy(root: Path, src: Path, dst: Path, is_dir: bool) -> None:
     """Perform the historical copy operation and preserve its error contract."""
     try:
         if is_dir:
@@ -1533,14 +1838,16 @@ async def _perform_copy(src: Path, dst: Path, is_dir: bool) -> None:
                 raise HTTPException(
                     status_code=400, detail="cannot copy a directory into itself"
                 )
-            # symlinks=True copies links as links instead of following them — a
-            # link inside the tree may point outside the workspace root, and
+            # Links are copied as links instead of being followed — a link
+            # inside the tree may point outside the workspace root, and
             # following it here would duplicate foreign content into the
-            # workspace. dirs_exist_ok stays False, so copytree's own mkdir
-            # refuses a destination that appeared after validation.
-            await run_in_threadpool(shutil.copytree, str(src), str(dst), symlinks=True)
+            # workspace. The destination directory is created exclusively, so
+            # one that appeared after validation is refused.
+            await run_in_threadpool(_copy_beneath, root, src, dst, True)
         else:
-            await run_in_threadpool(_copy_file_exclusive, src, dst)
+            await run_in_threadpool(_copy_beneath, root, src, dst, False)
+    except _PathChanged:
+        raise _path_changed_409()
     except FileExistsError:
         raise HTTPException(status_code=409, detail="destination already exists")
     except _UnsupportedSourceError:
@@ -1596,14 +1903,14 @@ async def copy_entry(
     # Only regular files and directories are copyable — a FIFO/socket/device
     # in the workspace must be a deterministic 4xx, not a blocked worker. This
     # is a fast path for the error message; the race-proof check is the fstat
-    # on the opened fd inside _copy_file_exclusive.
+    # on the opened fd inside _copy_file_at.
     if not is_dir and not src.is_file():
         raise HTTPException(status_code=400, detail="unsupported file type")
 
     # Quota-disabled deployments retain the exact historical path: no extra
     # scan, lock, or threadpool call before the copy.
     if workspace_quota_limit_bytes() <= 0:
-        await _perform_copy(src, dst, is_dir)
+        await _perform_copy(root, src, dst, is_dir)
     else:
         user_root = _user_root(root)
         async with _quota_lock(user_root):
@@ -1614,7 +1921,7 @@ async def copy_entry(
                 )
             except WorkspaceQuotaExceeded as exc:
                 _raise_quota_http(exc)
-            await _perform_copy(src, dst, is_dir)
+            await _perform_copy(root, src, dst, is_dir)
 
     return {
         "source": body.source,
