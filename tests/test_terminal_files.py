@@ -1577,3 +1577,279 @@ def test_digest_refuses_a_directory(client, workspace):
     assert (
         client.get("/files/digest?path=/adir", headers={**_AUTH, **_USER}).status_code == 404
     )
+
+
+# --- archive admission control (ChatDRAGON #543 review) ----------------------
+
+
+@pytest.fixture
+def archive_admission(monkeypatch):
+    """A fresh admission pool per test so slots never leak across tests."""
+    fresh = tf._ArchiveAdmission()
+    monkeypatch.setattr(tf, "_ARCHIVE_ADMISSION", fresh)
+    return fresh
+
+
+@pytest.fixture
+def big_workspace(workspace, monkeypatch):
+    big = workspace / "big"
+    big.mkdir()
+    for i in range(6):
+        (big / f"part{i}.bin").write_bytes(os.urandom(512 * 1024))
+    _patch_api_key(monkeypatch, "testkey")
+    monkeypatch.setattr(
+        tf.workspace_manager, "resolve", lambda u, backend=None: workspace
+    )
+    monkeypatch.setattr(tf, "verify_api_key", _noop_verify)
+    # Small chunks: a consumer that stops reading leaves the producer blocked
+    # on a full queue, i.e. a live thread pinned by a slow client.
+    monkeypatch.setattr(tf, "_ZIP_CHUNK_BYTES", 16 * 1024)
+    return workspace
+
+
+def _live_producers() -> set:
+    import threading as _threading
+
+    return {
+        t
+        for t in _threading.enumerate()
+        if t.name == "archive-zip-producer" and t.is_alive()
+    }
+
+
+def _req_for(user: str):
+    class _Req:
+        headers = {**_AUTH, "X-User-Email": user}
+
+    return _Req()
+
+
+async def _open_archive(user: str, paths=("/big",)):
+    """Call the route like Starlette would and pull the first chunk only."""
+    resp = await tf.archive_entries(
+        _req_for(user), tf._ArchiveBody(paths=list(paths)), credentials=None
+    )
+    body = resp.body_iterator
+    first = await body.__anext__()
+    assert first
+    return body
+
+
+async def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    import asyncio as _asyncio
+    import time as _time
+
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if predicate():
+            return True
+        await _asyncio.sleep(0.01)
+    return predicate()
+
+
+def test_archive_admission_caps_live_producer_threads(
+    big_workspace, archive_admission, monkeypatch
+):
+    import asyncio as _asyncio
+
+    from fastapi import HTTPException as _HTTPException
+
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "2")
+    monkeypatch.setenv("ARCHIVE_MAX_PER_USER", "10")
+    before = _live_producers()
+    limit, extra = 2, 3
+
+    async def _run():
+        held = []
+        for i in range(limit):
+            held.append(await _open_archive(f"u{i}@corp.com"))
+        assert len(_live_producers() - before) == limit
+        for i in range(extra):
+            with pytest.raises(_HTTPException) as exc:
+                await _open_archive(f"x{i}@corp.com")
+            assert exc.value.status_code == 429
+            assert exc.value.headers["Retry-After"]
+            assert exc.value.detail["scope"] == "global"
+            # Refused without a thread: still exactly `limit` producers.
+            assert len(_live_producers() - before) == limit
+        assert archive_admission.snapshot()[0] == limit
+
+        # Disconnect one client: its slot frees as soon as its producer exits,
+        # and the very next request is admitted and starts streaming.
+        await held.pop(0).aclose()
+        assert await _wait_for(lambda: archive_admission.snapshot()[0] == limit - 1)
+        assert len(_live_producers() - before) == limit - 1
+        held.append(await _open_archive("next@corp.com"))
+        assert len(_live_producers() - before) == limit
+        for body in held:
+            await body.aclose()
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+
+    _asyncio.run(_run())
+    assert not (_live_producers() - before)
+
+
+def test_archive_per_user_limit_is_independent_of_global(
+    big_workspace, archive_admission, monkeypatch
+):
+    import asyncio as _asyncio
+
+    from fastapi import HTTPException as _HTTPException
+
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "4")
+    monkeypatch.setenv("ARCHIVE_MAX_PER_USER", "1")
+    before = _live_producers()
+
+    async def _run():
+        alice = await _open_archive("alice@corp.com")
+        with pytest.raises(_HTTPException) as exc:
+            await _open_archive("alice@corp.com")
+        assert exc.value.status_code == 429
+        assert exc.value.detail["scope"] == "user"
+        assert len(_live_producers() - before) == 1
+        # Global capacity remains for other users.
+        bob = await _open_archive("bob@corp.com")
+        assert archive_admission.snapshot() == (
+            2,
+            {"alice@corp.com": 1, "bob@corp.com": 1},
+        )
+        await alice.aclose()
+        assert await _wait_for(
+            lambda: "alice@corp.com" not in archive_admission.snapshot()[1]
+        )
+        again = await _open_archive("alice@corp.com")
+        await again.aclose()
+        await bob.aclose()
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+
+    _asyncio.run(_run())
+
+
+def test_archive_over_limit_http_response_is_429_json_without_thread(
+    client, archive_admission, monkeypatch
+):
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
+    _, held = archive_admission.try_acquire("someone@corp.com")
+    before = _live_producers()
+    r = client.post(
+        "/files/archive", headers={**_AUTH, **_USER}, json={"paths": ["/notes.txt"]}
+    )
+    assert r.status_code == 429
+    assert r.headers["content-type"].startswith("application/json")
+    assert int(r.headers["Retry-After"]) > 0
+    assert r.json()["detail"]["code"] == "archive_concurrency_limit"
+    assert _live_producers() == before
+    held.release()
+    r = client.post(
+        "/files/archive", headers={**_AUTH, **_USER}, json={"paths": ["/notes.txt"]}
+    )
+    assert r.status_code == 200
+    assert archive_admission.snapshot() == (0, {})
+
+
+def test_archive_slot_released_on_normal_completion(client, archive_admission):
+    for _ in range(5):
+        r = client.post(
+            "/files/archive", headers={**_AUTH, **_USER}, json={"paths": ["/sub"]}
+        )
+        assert r.status_code == 200
+    assert archive_admission.snapshot() == (0, {})
+
+
+def test_archive_slot_released_on_producer_error(
+    big_workspace, archive_admission, monkeypatch
+):
+    import asyncio as _asyncio
+    import zipfile as _zipmod
+
+    def _boom(*a, **kw):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(_zipmod, "open", _boom, raising=False)
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
+
+    async def _run():
+        resp = await tf.archive_entries(
+            _req_for("alice@corp.com"),
+            tf._ArchiveBody(paths=["/notes.txt"]),
+            credentials=None,
+        )
+        with pytest.raises(PermissionError):
+            async for _ in resp.body_iterator:
+                pass
+        assert await _wait_for(lambda: archive_admission.snapshot() == (0, {}))
+
+    _asyncio.run(_run())
+
+
+def test_archive_slot_released_when_body_is_never_iterated(
+    big_workspace, archive_admission, monkeypatch
+):
+    import asyncio as _asyncio
+    import gc
+
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
+    before = _live_producers()
+
+    async def _run():
+        resp = await tf.archive_entries(
+            _req_for("alice@corp.com"),
+            tf._ArchiveBody(paths=["/big"]),
+            credentials=None,
+        )
+        assert archive_admission.snapshot()[0] == 1
+        # The client vanished before Starlette began streaming: the body is
+        # dropped without a single __anext__, so no ``finally`` ever runs.
+        del resp
+        gc.collect()
+        assert archive_admission.snapshot() == (0, {})
+        assert _live_producers() == before
+        body = await _open_archive("alice@corp.com")
+        await body.aclose()
+
+    _asyncio.run(_run())
+
+
+@pytest.mark.parametrize(
+    "headers,paths,status",
+    [
+        ({**_AUTH, **_USER}, ["/nope.txt"], 404),
+        ({**_AUTH, **_USER}, ["/../secret.txt"], 403),
+        (_USER, ["/notes.txt"], 401),
+    ],
+)
+def test_archive_validation_errors_do_not_consume_slots(
+    client, archive_admission, monkeypatch, headers, paths, status
+):
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
+    monkeypatch.setenv("ARCHIVE_MAX_PER_USER", "1")
+    for _ in range(3):
+        r = client.post("/files/archive", headers=headers, json={"paths": paths})
+        assert r.status_code == status
+    assert archive_admission.snapshot() == (0, {})
+    r = client.post(
+        "/files/archive", headers={**_AUTH, **_USER}, json={"paths": ["/notes.txt"]}
+    )
+    assert r.status_code == 200
+
+
+def test_archive_slot_release_is_idempotent(archive_admission):
+    slot, first = archive_admission.try_acquire("a@corp.com")
+    second = slot.party()
+    first.release()
+    first.release()
+    assert archive_admission.snapshot() == (1, {"a@corp.com": 1})
+    second.release()
+    second.release()
+    assert slot.freed
+    assert archive_admission.snapshot() == (0, {})
+    with pytest.raises(RuntimeError):
+        slot.party()
+
+
+@pytest.mark.parametrize("raw", ["0", "-3", "abc", ""])
+def test_archive_limits_fall_back_to_defaults_on_invalid_env(monkeypatch, raw):
+    monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", raw)
+    monkeypatch.setenv("ARCHIVE_MAX_PER_USER", raw)
+    assert tf._archive_max_concurrent() == 4
+    assert tf._archive_max_per_user() == 2

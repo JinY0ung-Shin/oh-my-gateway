@@ -64,6 +64,10 @@ hiding everything else as well. Neither switch touches the agent process: it
 reads the workspace directly, not through this API.
 - ``USER_WORKSPACE_QUOTA_MB`` — optional cumulative quota for a named user's whole
   ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
+- ``ARCHIVE_MAX_CONCURRENT`` (default 4) / ``ARCHIVE_MAX_PER_USER`` (default 2) —
+  concurrent ``/files/archive`` streams gateway-wide and per user; over either
+  limit the request is refused with 429 + ``Retry-After`` before any producer
+  thread starts.
 
 Concurrency:
 - Filesystem work (directory scans, file reads/writes, deletes, the archive
@@ -99,6 +103,7 @@ import os
 import shutil
 import stat as stat_module
 import threading
+import weakref
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -1210,6 +1215,147 @@ _ZIP_PUT_POLL_SECONDS = 0.1
 _ZIP_DONE = object()
 
 
+# --- archive admission control -----------------------------------------------
+# Each streaming archive owns one producer thread plus up to
+# ``_ZIP_QUEUE_DEPTH`` buffered chunks for as long as its consumer lingers, and
+# that thread lives outside ``run_in_threadpool``'s capacity limiter. Without a
+# cap, N slow (or never-read) archive connections pin N compression threads and
+# ~N MiB of queue. A request therefore takes a slot -- one global, one per
+# user -- after its validation succeeds and before any thread exists or any
+# response byte is sent; over the limit it is refused with 429 and no thread.
+#
+# A slot is held by two parties: the response body (the async generator) and,
+# once started, the producer thread. It frees when both have let go, so the
+# number of live producer threads -- and of queues still holding chunks -- never
+# exceeds the configured limits. Every party release is idempotent: the
+# generator's ``finally``, the producer's ``finally``, and a ``weakref.finalize``
+# on the generator (a body that is never iterated never runs its ``finally``).
+_DEFAULT_ARCHIVE_MAX_CONCURRENT = 4
+_DEFAULT_ARCHIVE_MAX_PER_USER = 2
+_ARCHIVE_RETRY_AFTER_SECONDS = 5
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("%s=%r is not a positive integer; using %d", name, raw, default)
+        return default
+    return value
+
+
+def _archive_max_concurrent() -> int:
+    return _positive_int_env("ARCHIVE_MAX_CONCURRENT", _DEFAULT_ARCHIVE_MAX_CONCURRENT)
+
+
+def _archive_max_per_user() -> int:
+    return _positive_int_env("ARCHIVE_MAX_PER_USER", _DEFAULT_ARCHIVE_MAX_PER_USER)
+
+
+class _ArchiveSlotParty:
+    """One holder's claim on a slot; releasing it twice is a no-op."""
+
+    def __init__(self, slot: "_ArchiveSlot"):
+        self._slot = slot
+        self._released = False
+
+    def release(self) -> None:
+        self._slot._drop_party(self)
+
+
+class _ArchiveSlot:
+    """A granted admission. Returns itself to the pool when every party is gone."""
+
+    def __init__(self, admission: "_ArchiveAdmission", user: str):
+        self._admission = admission
+        self._user = user
+        self._parties: set = set()
+        self._freed = False
+
+    def party(self) -> _ArchiveSlotParty:
+        with self._admission._lock:
+            if self._freed:
+                raise RuntimeError("archive slot already released")
+            p = _ArchiveSlotParty(self)
+            self._parties.add(p)
+            return p
+
+    @property
+    def freed(self) -> bool:
+        return self._freed
+
+    def _drop_party(self, p: _ArchiveSlotParty) -> None:
+        with self._admission._lock:
+            if p._released:
+                return
+            p._released = True
+            self._parties.discard(p)
+            if self._parties or self._freed:
+                return
+            self._freed = True
+            self._admission._free_locked(self._user)
+
+
+class _ArchiveAdmission:
+    """Global + per-user counters of archive streams currently holding a slot."""
+
+    def __init__(self) -> None:
+        # A threading lock, not an asyncio one: producer threads and GC
+        # finalizers release slots off the event loop.
+        self._lock = threading.Lock()
+        self._total = 0
+        self._per_user: dict[str, int] = {}
+
+    def try_acquire(self, user: str):
+        """Return ``(slot, first_party)`` or raise a 429 ``HTTPException``."""
+        max_total = _archive_max_concurrent()
+        max_user = _archive_max_per_user()
+        with self._lock:
+            if self._per_user.get(user, 0) >= max_user:
+                scope, limit = "user", max_user
+            elif self._total >= max_total:
+                scope, limit = "global", max_total
+            else:
+                self._total += 1
+                self._per_user[user] = self._per_user.get(user, 0) + 1
+                slot = _ArchiveSlot(self, user)
+                first = _ArchiveSlotParty(slot)
+                slot._parties.add(first)
+                return slot, first
+        logger.info("archive: refused (%s limit %d reached)", scope, limit)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Too many archive downloads in progress; retry shortly.",
+                "type": "rate_limit",
+                "code": "archive_concurrency_limit",
+                "scope": scope,
+                "limit": limit,
+            },
+            headers={"Retry-After": str(_ARCHIVE_RETRY_AFTER_SECONDS)},
+        )
+
+    def _free_locked(self, user: str) -> None:
+        self._total -= 1
+        left = self._per_user.get(user, 0) - 1
+        if left > 0:
+            self._per_user[user] = left
+        else:
+            self._per_user.pop(user, None)
+
+    def snapshot(self) -> tuple[int, dict]:
+        with self._lock:
+            return self._total, dict(self._per_user)
+
+
+_ARCHIVE_ADMISSION = _ArchiveAdmission()
+
+
 class _ZipCancelled(Exception):
     """Raised inside the producer once the consumer has gone away."""
 
@@ -1279,7 +1425,11 @@ class _ZipStreamSink:
                 raise _ZipCancelled() from exc
 
 
-def _produce_zip(entries: List[tuple], sink: _ZipStreamSink) -> None:
+def _produce_zip(
+    entries: List[tuple],
+    sink: _ZipStreamSink,
+    party: Optional[_ArchiveSlotParty] = None,
+) -> None:
     zf = None
     try:
         zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED)
@@ -1310,36 +1460,55 @@ def _produce_zip(entries: List[tuple], sink: _ZipStreamSink) -> None:
                 zf.close()
             except Exception:  # best effort; the stream is already gone
                 pass
+        if party is not None:
+            party.release()
 
 
-async def _stream_zip(entries: List[tuple]):
-    """Yield the zip of ``entries`` (``(path, arcname)`` pairs) chunk by chunk."""
-    loop = asyncio.get_running_loop()
-    queue: asyncio.Queue = asyncio.Queue(maxsize=_ZIP_QUEUE_DEPTH)
-    cancel = threading.Event()
-    sink = _ZipStreamSink(loop, queue, cancel)
-    worker = threading.Thread(
-        target=_produce_zip,
-        args=(entries, sink),
-        name="archive-zip-producer",
-        daemon=True,
-    )
-    worker.start()
+async def _stream_zip(
+    entries: List[tuple], party: Optional[_ArchiveSlotParty] = None
+):
+    """Yield the zip of ``entries`` (``(path, arcname)`` pairs) chunk by chunk.
+
+    ``party`` is the response body's claim on an admission slot; the producer
+    thread takes its own claim before it starts, and each releases on exit.
+    """
     try:
-        while True:
-            item = await queue.get()
-            if item is _ZIP_DONE:
-                return
-            if isinstance(item, BaseException):
-                # Headers are already sent; raising aborts the response so the
-                # client sees a truncated (invalid) download, not a "good" zip.
-                raise item
-            yield item
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_ZIP_QUEUE_DEPTH)
+        cancel = threading.Event()
+        sink = _ZipStreamSink(loop, queue, cancel)
+        worker_party = party._slot.party() if party is not None else None
+        worker = threading.Thread(
+            target=_produce_zip,
+            args=(entries, sink, worker_party),
+            name="archive-zip-producer",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            if worker_party is not None:
+                worker_party.release()
+            raise
+        try:
+            while True:
+                item = await queue.get()
+                if item is _ZIP_DONE:
+                    return
+                if isinstance(item, BaseException):
+                    # Headers are already sent; raising aborts the response so
+                    # the client sees a truncated (invalid) download, not a
+                    # "good" zip.
+                    raise item
+                yield item
+        finally:
+            cancel.set()
+            # Free a producer blocked on a full queue so it sees the flag at once.
+            while not queue.empty():
+                queue.get_nowait()
     finally:
-        cancel.set()
-        # Free a producer blocked on a full queue so it sees the flag at once.
-        while not queue.empty():
-            queue.get_nowait()
+        if party is not None:
+            party.release()
 
 
 @router.post("/files/archive")
@@ -1387,8 +1556,15 @@ async def archive_entries(
         return entries
 
     entries = await run_in_threadpool(_collect)
+    # Admission comes after every validation step (a 401/403/404 never holds a
+    # slot) and before the producer thread or any response byte exists.
+    _, party = _ARCHIVE_ADMISSION.try_acquire(_workspace_key(request))
+    body_iter = _stream_zip(entries, party)
+    # A body Starlette never iterates (client gone before streaming starts)
+    # never runs its ``finally``; the finalizer returns the slot instead.
+    weakref.finalize(body_iter, party.release)
     return StreamingResponse(
-        _stream_zip(entries),
+        body_iter,
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
     )
