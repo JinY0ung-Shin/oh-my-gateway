@@ -64,10 +64,15 @@ hiding everything else as well. Neither switch touches the agent process: it
 reads the workspace directly, not through this API.
 - ``USER_WORKSPACE_QUOTA_MB`` — optional cumulative quota for a named user's whole
   ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
+- ``ARCHIVE_MAX_CONCURRENT`` (default 4) / ``ARCHIVE_MAX_PER_USER`` (default 2) —
+  concurrent ``/files/archive`` streams gateway-wide and per user; over either
+  limit the request is refused with 429 + ``Retry-After`` before any producer
+  thread starts.
 
 Concurrency:
-- Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
-  in the threadpool via ``run_in_threadpool``. FileNav polls ``/files/list``
+- Filesystem work (directory scans, file reads/writes, deletes, the archive
+  walk) runs in the threadpool via ``run_in_threadpool``; ``/files/archive``
+  deflates in a dedicated producer thread and streams the zip (``_stream_zip``). FileNav polls ``/files/list``
   continuously for every connected user; done synchronously that I/O would
   block the gateway event loop and stall everything else it serves
   (``/v1/responses`` streams, terminal websockets).
@@ -85,21 +90,30 @@ Security:
   before the containment check); anything above/outside the root is a 403.
   Uploaded filenames are reduced to a basename. No extra roots (never
   ``~/.claude`` etc.).
+- ``/files/archive`` checks paths when it walks the selection but reads them
+  later, from the producer thread, so a path check alone would race a symlink
+  swap. The producer therefore never opens a path: it pins the workspace root
+  as a directory fd (identity checked against the walk) and descends to every
+  member one component at a time with ``O_NOFOLLOW`` (``_open_archive_member``),
+  so a member or any directory above it that became a symlink is skipped, never
+  followed out of the workspace.
 """
 
 import asyncio
+import concurrent.futures
 import ctypes
 import errno
 import fcntl
 import hashlib
-import io
 import logging
 import mimetypes
 import os
 import shutil
 import stat as stat_module
+import threading
 import time
 import uuid
+import weakref
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -1427,6 +1441,424 @@ async def copy_entry(
     }
 
 
+# --- streaming zip (issue #188 stage 3) --------------------------------------
+# ``/files/archive`` used to deflate the whole selection into one in-memory
+# buffer, so gateway RSS grew with the archive. The zip is now produced by a
+# worker thread writing to an unseekable sink (``zipfile`` then emits data
+# descriptors instead of seeking back to patch local headers) and handed to the
+# response a chunk at a time through a bounded queue: at most
+# ``_ZIP_QUEUE_DEPTH`` chunks of ~``_ZIP_CHUNK_BYTES`` are ever buffered. A
+# client disconnect sets the cancel flag; the producer checks it on every write
+# and while waiting for queue space, so it stops promptly and the ``with
+# open(...)`` inside ``ZipFile.write`` closes the file being read.
+_ZIP_CHUNK_BYTES = 256 * 1024
+_ZIP_QUEUE_DEPTH = 4
+_ZIP_PUT_POLL_SECONDS = 0.1
+_ZIP_DONE = object()
+
+
+# --- archive admission control -----------------------------------------------
+# Each streaming archive owns one producer thread plus up to
+# ``_ZIP_QUEUE_DEPTH`` buffered chunks for as long as its consumer lingers, and
+# that thread lives outside ``run_in_threadpool``'s capacity limiter. Without a
+# cap, N slow (or never-read) archive connections pin N compression threads and
+# ~N MiB of queue. A request therefore takes a slot -- one global, one per
+# user -- after its validation succeeds and before any thread exists or any
+# response byte is sent; over the limit it is refused with 429 and no thread.
+#
+# A slot is held by two parties: the response body (the async generator) and,
+# once started, the producer thread. It frees when both have let go, so the
+# number of live producer threads -- and of queues still holding chunks -- never
+# exceeds the configured limits. Every party release is idempotent: the
+# generator's ``finally``, the producer's ``finally``, and a ``weakref.finalize``
+# on the generator (a body that is never iterated never runs its ``finally``).
+_DEFAULT_ARCHIVE_MAX_CONCURRENT = 4
+_DEFAULT_ARCHIVE_MAX_PER_USER = 2
+_ARCHIVE_RETRY_AFTER_SECONDS = 5
+
+
+def _positive_int_env(name: str, default: int) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value < 1:
+        logger.warning("%s=%r is not a positive integer; using %d", name, raw, default)
+        return default
+    return value
+
+
+def _archive_max_concurrent() -> int:
+    return _positive_int_env("ARCHIVE_MAX_CONCURRENT", _DEFAULT_ARCHIVE_MAX_CONCURRENT)
+
+
+def _archive_max_per_user() -> int:
+    return _positive_int_env("ARCHIVE_MAX_PER_USER", _DEFAULT_ARCHIVE_MAX_PER_USER)
+
+
+class _ArchiveSlotParty:
+    """One holder's claim on a slot; releasing it twice is a no-op."""
+
+    def __init__(self, slot: "_ArchiveSlot"):
+        self._slot = slot
+        self._released = False
+
+    def release(self) -> None:
+        self._slot._drop_party(self)
+
+
+class _ArchiveSlot:
+    """A granted admission. Returns itself to the pool when every party is gone."""
+
+    def __init__(self, admission: "_ArchiveAdmission", user: str):
+        self._admission = admission
+        self._user = user
+        self._parties: set = set()
+        self._freed = False
+
+    def party(self) -> _ArchiveSlotParty:
+        with self._admission._lock:
+            if self._freed:
+                raise RuntimeError("archive slot already released")
+            p = _ArchiveSlotParty(self)
+            self._parties.add(p)
+            return p
+
+    @property
+    def freed(self) -> bool:
+        return self._freed
+
+    def _drop_party(self, p: _ArchiveSlotParty) -> None:
+        with self._admission._lock:
+            if p._released:
+                return
+            p._released = True
+            self._parties.discard(p)
+            if self._parties or self._freed:
+                return
+            self._freed = True
+            self._admission._free_locked(self._user)
+
+
+class _ArchiveAdmission:
+    """Global + per-user counters of archive streams currently holding a slot."""
+
+    def __init__(self) -> None:
+        # A threading lock, not an asyncio one: producer threads and GC
+        # finalizers release slots off the event loop.
+        self._lock = threading.Lock()
+        self._total = 0
+        self._per_user: dict[str, int] = {}
+
+    def try_acquire(self, user: str):
+        """Return ``(slot, first_party)`` or raise a 429 ``HTTPException``."""
+        max_total = _archive_max_concurrent()
+        max_user = _archive_max_per_user()
+        with self._lock:
+            if self._per_user.get(user, 0) >= max_user:
+                scope, limit = "user", max_user
+            elif self._total >= max_total:
+                scope, limit = "global", max_total
+            else:
+                self._total += 1
+                self._per_user[user] = self._per_user.get(user, 0) + 1
+                slot = _ArchiveSlot(self, user)
+                first = _ArchiveSlotParty(slot)
+                slot._parties.add(first)
+                return slot, first
+        logger.info("archive: refused (%s limit %d reached)", scope, limit)
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Too many archive downloads in progress; retry shortly.",
+                "type": "rate_limit",
+                "code": "archive_concurrency_limit",
+                "scope": scope,
+                "limit": limit,
+            },
+            headers={"Retry-After": str(_ARCHIVE_RETRY_AFTER_SECONDS)},
+        )
+
+    def _free_locked(self, user: str) -> None:
+        self._total -= 1
+        left = self._per_user.get(user, 0) - 1
+        if left > 0:
+            self._per_user[user] = left
+        else:
+            self._per_user.pop(user, None)
+
+    def snapshot(self) -> tuple[int, dict]:
+        with self._lock:
+            return self._total, dict(self._per_user)
+
+
+_ARCHIVE_ADMISSION = _ArchiveAdmission()
+
+
+class _ZipCancelled(Exception):
+    """Raised inside the producer once the consumer has gone away."""
+
+
+class _ZipStreamSink:
+    """Unseekable, write-only file object feeding zip bytes to the event loop.
+
+    Deliberately has no ``tell``/``seek`` so ``zipfile`` takes its streaming
+    path (data descriptors).
+    """
+
+    def __init__(self, loop, queue: "asyncio.Queue", cancel: threading.Event):
+        self._loop = loop
+        self._queue = queue
+        self._cancel = cancel
+        self._buf = bytearray()
+        self._dead = False
+
+    def abandon(self) -> None:
+        """Swallow further writes so the producer can close ``ZipFile`` quietly."""
+        self._dead = True
+        self._buf.clear()
+
+    def write(self, data) -> int:
+        if self._dead:
+            return len(data)
+        if self._cancel.is_set():
+            raise _ZipCancelled()
+        self._buf += data
+        if len(self._buf) >= _ZIP_CHUNK_BYTES:
+            self._emit()
+        return len(data)
+
+    def flush(self) -> None:
+        # zipfile flushes after every member; batching continues regardless so
+        # chunks stay ~_ZIP_CHUNK_BYTES instead of one tiny chunk per file.
+        if not self._dead and self._cancel.is_set():
+            raise _ZipCancelled()
+
+    def finish(self) -> None:
+        if self._buf:
+            self._emit()
+        self.put(_ZIP_DONE)
+
+    def _emit(self) -> None:
+        chunk = bytes(self._buf)
+        self._buf.clear()
+        self.put(chunk)
+
+    def put(self, item) -> None:
+        """Blocking, cancellable put onto the bounded asyncio queue."""
+        if self._cancel.is_set():
+            raise _ZipCancelled()
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._queue.put(item), self._loop)
+        except RuntimeError as exc:  # event loop closed under us
+            raise _ZipCancelled() from exc
+        while True:
+            try:
+                fut.result(timeout=_ZIP_PUT_POLL_SECONDS)
+                return
+            except concurrent.futures.TimeoutError:
+                if self._cancel.is_set():
+                    fut.cancel()
+                    raise _ZipCancelled()
+            except concurrent.futures.CancelledError as exc:
+                raise _ZipCancelled() from exc
+
+
+class _UnsafeArchiveMember(Exception):
+    """A member path no longer leads to a regular file without a symlink."""
+
+
+_ARCHIVE_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: a member swapped for a FIFO must not park the producer in open();
+# it is refused by the S_ISREG check right after.
+_ARCHIVE_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+# What openat() reports when O_NOFOLLOW meets a symlink, or a directory on the
+# way down is no longer a directory.
+_ARCHIVE_SWAPPED_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EMLINK)
+
+
+def _open_archive_root(root: Path, identity: Optional[tuple]) -> int:
+    """Open the workspace root as a directory fd, refusing a swapped root."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if identity is not None and (st.st_dev, st.st_ino) != identity:
+            raise _UnsafeArchiveMember("workspace root changed during archive")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_archive_member(root_fd: int, arcname: str):
+    """Open ``arcname`` beneath ``root_fd`` without following any symlink.
+
+    Each directory component is opened with ``O_NOFOLLOW`` relative to the one
+    above it, and so is the member itself, so no swap of the member or of a
+    directory on its way can lead outside ``root_fd``. Returns ``(file, stat)``
+    for a regular file; raises ``_UnsafeArchiveMember`` otherwise and
+    ``FileNotFoundError`` when something on the way is gone.
+    """
+    parts = arcname.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise _UnsafeArchiveMember(arcname)
+    dir_fd = root_fd
+    try:
+        for name in parts[:-1]:
+            try:
+                next_fd = os.open(name, _ARCHIVE_DIR_FLAGS, dir_fd=dir_fd)
+            except OSError as exc:
+                if exc.errno in _ARCHIVE_SWAPPED_ERRNOS:
+                    raise _UnsafeArchiveMember(arcname) from exc
+                raise
+            if dir_fd != root_fd:
+                os.close(dir_fd)
+            dir_fd = next_fd
+        try:
+            fd = os.open(parts[-1], _ARCHIVE_FILE_FLAGS, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in _ARCHIVE_SWAPPED_ERRNOS:
+                raise _UnsafeArchiveMember(arcname) from exc
+            raise
+    finally:
+        if dir_fd != root_fd:
+            os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise _UnsafeArchiveMember(arcname)
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb"), st
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _archive_zipinfo(arcname: str, st: os.stat_result) -> zipfile.ZipInfo:
+    """``ZipInfo.from_file`` for an already-open member (from its fstat)."""
+    date_time = time.localtime(st.st_mtime)[0:6]
+    if date_time[0] < 1980:  # the zip format cannot express earlier dates
+        date_time = (1980, 1, 1, 0, 0, 0)
+    zinfo = zipfile.ZipInfo(arcname, date_time)
+    zinfo.external_attr = (st.st_mode & 0xFFFF) << 16
+    zinfo.file_size = st.st_size
+    zinfo.compress_type = zipfile.ZIP_DEFLATED
+    return zinfo
+
+
+def _produce_zip(
+    root: Path,
+    arcnames: List[str],
+    sink: _ZipStreamSink,
+    party: Optional[_ArchiveSlotParty] = None,
+    root_identity: Optional[tuple] = None,
+) -> None:
+    zf = None
+    root_fd = None
+    try:
+        root_fd = _open_archive_root(root, root_identity)
+        zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED)
+        for arcname in arcnames:
+            # Open (and fstat) before the member header goes out, so a skip
+            # leaves the archive well-formed.
+            try:
+                src, st = _open_archive_member(root_fd, arcname)
+            except FileNotFoundError:
+                # Removed between the pre-stream walk and now.
+                logger.info("archive: skipping vanished file %s", arcname)
+                continue
+            except _UnsafeArchiveMember:
+                logger.warning(
+                    "archive: skipping %s, it is no longer a plain file inside "
+                    "the workspace",
+                    arcname,
+                )
+                continue
+            with src:
+                # Same size hint as ``ZipFile.write`` so zip64 is chosen up front.
+                with zf.open(_archive_zipinfo(arcname, st), "w") as dest:
+                    shutil.copyfileobj(src, dest, 1024 * 8)
+        zf.close()
+        sink.finish()
+    except _ZipCancelled:
+        logger.debug("archive: producer stopped, client went away")
+    except BaseException as exc:  # surface to the consumer, then stop
+        logger.warning("archive: zip stream failed mid-response: %s", exc)
+        try:
+            sink.put(exc)
+        except _ZipCancelled:
+            pass
+    finally:
+        # On the abort paths, close the half-written ZipFile into a dead sink so
+        # its ``__del__`` does not later try to write a central directory.
+        sink.abandon()
+        if zf is not None:
+            try:
+                zf.close()
+            except Exception:  # best effort; the stream is already gone
+                pass
+        if root_fd is not None:
+            os.close(root_fd)
+        if party is not None:
+            party.release()
+
+
+async def _stream_zip(
+    root: Path,
+    arcnames: List[str],
+    party: Optional[_ArchiveSlotParty] = None,
+    root_identity: Optional[tuple] = None,
+):
+    """Yield the zip of ``arcnames`` (paths relative to ``root``) chunk by chunk.
+
+    Members are opened beneath ``root`` by ``_open_archive_member``, never by
+    path; ``root_identity`` (``(st_dev, st_ino)`` from the walk) refuses a root
+    that was swapped since. ``party`` is the response body's claim on an
+    admission slot; the producer thread takes its own claim before it starts,
+    and each releases on exit.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=_ZIP_QUEUE_DEPTH)
+        cancel = threading.Event()
+        sink = _ZipStreamSink(loop, queue, cancel)
+        worker_party = party._slot.party() if party is not None else None
+        worker = threading.Thread(
+            target=_produce_zip,
+            args=(root, arcnames, sink, worker_party, root_identity),
+            name="archive-zip-producer",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            if worker_party is not None:
+                worker_party.release()
+            raise
+        try:
+            while True:
+                item = await queue.get()
+                if item is _ZIP_DONE:
+                    return
+                if isinstance(item, BaseException):
+                    # Headers are already sent; raising aborts the response so
+                    # the client sees a truncated (invalid) download, not a
+                    # "good" zip.
+                    raise item
+                yield item
+        finally:
+            cancel.set()
+            # Free a producer blocked on a full queue so it sees the flag at once.
+            while not queue.empty():
+                queue.get_nowait()
+    finally:
+        if party is not None:
+            party.release()
+
+
 @router.post("/files/archive")
 async def archive_entries(
     request: Request,
@@ -1458,27 +1890,49 @@ async def archive_entries(
             hide_claude_prefix=hide_claude,
         )
 
-    # Walking the tree and deflating can take seconds on big workspaces — keep
-    # the whole zip build off the event loop.
-    def _build_zip() -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+    # Admission covers the archive's whole expensive lifecycle -- the recursive
+    # walk, the producer thread and the response -- and comes right after the
+    # cheap checks above (auth, sandbox, top-level existence), so a 401/403/404
+    # never holds a slot and an over-limit request is refused before it walks a
+    # single directory.
+    _, party = _ARCHIVE_ADMISSION.try_acquire(_workspace_key(request))
+    # The walk thread holds its own claim: if this request is cancelled while
+    # the walk runs, the slot is only freed once the walk has actually stopped.
+    walk_party = party._slot.party()
+
+    # Walk the selection BEFORE the response starts (off the event loop): a walk
+    # failure is still a plain error response, never a 200 with a broken zip.
+    # These checks only choose what to archive; the producer re-opens every
+    # member beneath the root fd without following symlinks, so a swap after
+    # the walk cannot pull in anything outside the workspace.
+    def _collect() -> tuple:
+        try:
+            root_st = os.stat(root_resolved)
+            arcnames = []
             for t in targets:
                 if t.is_dir():
                     for sub in t.rglob("*"):
-                        if (
-                            sub.is_file()
-                            and not sub.is_symlink()
-                            and not _is_hidden(sub)
-                        ):
-                            zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
+                        if sub.is_file() and not sub.is_symlink() and not _is_hidden(sub):
+                            arcnames.append(sub.relative_to(root_resolved).as_posix())
                 elif t.is_file() and not t.is_symlink():
-                    zf.write(t, arcname=str(t.relative_to(root_resolved)))
-        return buf.getvalue()
+                    arcnames.append(t.relative_to(root_resolved).as_posix())
+            return arcnames, (root_st.st_dev, root_st.st_ino)
+        finally:
+            walk_party.release()
 
-    payload = await run_in_threadpool(_build_zip)
+    try:
+        arcnames, root_identity = await run_in_threadpool(_collect)
+    except BaseException:
+        # Walk failed or the request was cancelled: nothing will stream, so the
+        # response's claim goes too (the walk thread drops its own on exit).
+        party.release()
+        raise
+    body_iter = _stream_zip(root_resolved, arcnames, party, root_identity)
+    # A body Starlette never iterates (client gone before streaming starts)
+    # never runs its ``finally``; the finalizer returns the slot instead.
+    weakref.finalize(body_iter, party.release)
     return StreamingResponse(
-        iter([payload]),
+        body_iter,
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
     )
