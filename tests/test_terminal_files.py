@@ -1429,6 +1429,13 @@ def test_write_if_refuses_changed_and_deleted_files(client, workspace):
     r = _write_if(client, "gone.txt", b"mine", _sha("v1"))
     assert r.status_code == 409 and r.json()["detail"]["exists"] is False
     assert not (workspace / "gone.txt").exists()
+    # the whole folder is gone: still a conflict, never a 404 (404 means "no write_if")
+    r = client.post(
+        f"/files/write_if?directory=/nope&expected_sha256={_sha('v1')}",
+        headers={**_AUTH, **_USER},
+        files={"file": ("a.txt", b"x", "text/plain")},
+    )
+    assert r.status_code == 409 and r.json()["detail"]["exists"] is False
     assert _leftovers(workspace) == []
 
 

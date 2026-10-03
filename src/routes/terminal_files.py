@@ -1113,7 +1113,13 @@ async def write_if_unchanged(
     root = _workspace_root(_require_user(request))
     dest_dir = _resolve_or_403(root, directory)
     if not dest_dir.is_dir():
-        raise HTTPException(status_code=404, detail="directory not found")
+        # The file's folder is gone, so the file the draft started from is gone:
+        # that is a conflict, not a 404 -- callers read 404/405 from this route
+        # as "this gateway has no conditional write" and fail closed.
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "save_conflict", "exists": False, "preserved": None},
+        )
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
