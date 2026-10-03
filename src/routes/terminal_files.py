@@ -66,8 +66,9 @@ reads the workspace directly, not through this API.
   ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
 
 Concurrency:
-- Filesystem work (directory scans, file reads/writes, deletes, zip builds) runs
-  in the threadpool via ``run_in_threadpool``. FileNav polls ``/files/list``
+- Filesystem work (directory scans, file reads/writes, deletes, the archive
+  walk) runs in the threadpool via ``run_in_threadpool``; ``/files/archive``
+  deflates in a dedicated producer thread and streams the zip (``_stream_zip``). FileNav polls ``/files/list``
   continuously for every connected user; done synchronously that I/O would
   block the gateway event loop and stall everything else it serves
   (``/v1/responses`` streams, terminal websockets).
@@ -88,15 +89,16 @@ Security:
 """
 
 import asyncio
+import concurrent.futures
 import ctypes
 import errno
 import hashlib
-import io
 import logging
 import mimetypes
 import os
 import shutil
 import stat as stat_module
+import threading
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -1192,6 +1194,154 @@ async def copy_entry(
     }
 
 
+# --- streaming zip (issue #188 stage 3) --------------------------------------
+# ``/files/archive`` used to deflate the whole selection into one in-memory
+# buffer, so gateway RSS grew with the archive. The zip is now produced by a
+# worker thread writing to an unseekable sink (``zipfile`` then emits data
+# descriptors instead of seeking back to patch local headers) and handed to the
+# response a chunk at a time through a bounded queue: at most
+# ``_ZIP_QUEUE_DEPTH`` chunks of ~``_ZIP_CHUNK_BYTES`` are ever buffered. A
+# client disconnect sets the cancel flag; the producer checks it on every write
+# and while waiting for queue space, so it stops promptly and the ``with
+# open(...)`` inside ``ZipFile.write`` closes the file being read.
+_ZIP_CHUNK_BYTES = 256 * 1024
+_ZIP_QUEUE_DEPTH = 4
+_ZIP_PUT_POLL_SECONDS = 0.1
+_ZIP_DONE = object()
+
+
+class _ZipCancelled(Exception):
+    """Raised inside the producer once the consumer has gone away."""
+
+
+class _ZipStreamSink:
+    """Unseekable, write-only file object feeding zip bytes to the event loop.
+
+    Deliberately has no ``tell``/``seek`` so ``zipfile`` takes its streaming
+    path (data descriptors).
+    """
+
+    def __init__(self, loop, queue: "asyncio.Queue", cancel: threading.Event):
+        self._loop = loop
+        self._queue = queue
+        self._cancel = cancel
+        self._buf = bytearray()
+        self._dead = False
+
+    def abandon(self) -> None:
+        """Swallow further writes so the producer can close ``ZipFile`` quietly."""
+        self._dead = True
+        self._buf.clear()
+
+    def write(self, data) -> int:
+        if self._dead:
+            return len(data)
+        if self._cancel.is_set():
+            raise _ZipCancelled()
+        self._buf += data
+        if len(self._buf) >= _ZIP_CHUNK_BYTES:
+            self._emit()
+        return len(data)
+
+    def flush(self) -> None:
+        # zipfile flushes after every member; batching continues regardless so
+        # chunks stay ~_ZIP_CHUNK_BYTES instead of one tiny chunk per file.
+        if not self._dead and self._cancel.is_set():
+            raise _ZipCancelled()
+
+    def finish(self) -> None:
+        if self._buf:
+            self._emit()
+        self.put(_ZIP_DONE)
+
+    def _emit(self) -> None:
+        chunk = bytes(self._buf)
+        self._buf.clear()
+        self.put(chunk)
+
+    def put(self, item) -> None:
+        """Blocking, cancellable put onto the bounded asyncio queue."""
+        if self._cancel.is_set():
+            raise _ZipCancelled()
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._queue.put(item), self._loop)
+        except RuntimeError as exc:  # event loop closed under us
+            raise _ZipCancelled() from exc
+        while True:
+            try:
+                fut.result(timeout=_ZIP_PUT_POLL_SECONDS)
+                return
+            except concurrent.futures.TimeoutError:
+                if self._cancel.is_set():
+                    fut.cancel()
+                    raise _ZipCancelled()
+            except concurrent.futures.CancelledError as exc:
+                raise _ZipCancelled() from exc
+
+
+def _produce_zip(entries: List[tuple], sink: _ZipStreamSink) -> None:
+    zf = None
+    try:
+        zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED)
+        for path, arcname in entries:
+            try:
+                zf.write(path, arcname=arcname)
+            except FileNotFoundError:
+                # Removed between the pre-stream walk and now. ``ZipFile.write``
+                # stats and opens the source before emitting the member header,
+                # so skipping leaves the archive well-formed.
+                logger.info("archive: skipping vanished file %s", arcname)
+        zf.close()
+        sink.finish()
+    except _ZipCancelled:
+        logger.debug("archive: producer stopped, client went away")
+    except BaseException as exc:  # surface to the consumer, then stop
+        logger.warning("archive: zip stream failed mid-response: %s", exc)
+        try:
+            sink.put(exc)
+        except _ZipCancelled:
+            pass
+    finally:
+        # On the abort paths, close the half-written ZipFile into a dead sink so
+        # its ``__del__`` does not later try to write a central directory.
+        sink.abandon()
+        if zf is not None:
+            try:
+                zf.close()
+            except Exception:  # best effort; the stream is already gone
+                pass
+
+
+async def _stream_zip(entries: List[tuple]):
+    """Yield the zip of ``entries`` (``(path, arcname)`` pairs) chunk by chunk."""
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue(maxsize=_ZIP_QUEUE_DEPTH)
+    cancel = threading.Event()
+    sink = _ZipStreamSink(loop, queue, cancel)
+    worker = threading.Thread(
+        target=_produce_zip,
+        args=(entries, sink),
+        name="archive-zip-producer",
+        daemon=True,
+    )
+    worker.start()
+    try:
+        while True:
+            item = await queue.get()
+            if item is _ZIP_DONE:
+                return
+            if isinstance(item, BaseException):
+                # Headers are already sent; raising aborts the response so the
+                # client sees a truncated (invalid) download, not a "good" zip.
+                raise item
+            yield item
+    finally:
+        cancel.set()
+        # Free a producer blocked on a full queue so it sees the flag at once.
+        while not queue.empty():
+            queue.get_nowait()
+
+
 @router.post("/files/archive")
 async def archive_entries(
     request: Request,
@@ -1223,27 +1373,22 @@ async def archive_entries(
             hide_claude_prefix=hide_claude,
         )
 
-    # Walking the tree and deflating can take seconds on big workspaces — keep
-    # the whole zip build off the event loop.
-    def _build_zip() -> bytes:
-        buf = io.BytesIO()
-        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for t in targets:
-                if t.is_dir():
-                    for sub in t.rglob("*"):
-                        if (
-                            sub.is_file()
-                            and not sub.is_symlink()
-                            and not _is_hidden(sub)
-                        ):
-                            zf.write(sub, arcname=str(sub.relative_to(root_resolved)))
-                elif t.is_file() and not t.is_symlink():
-                    zf.write(t, arcname=str(t.relative_to(root_resolved)))
-        return buf.getvalue()
+    # Walk the selection BEFORE the response starts (off the event loop): a walk
+    # failure is still a plain error response, never a 200 with a broken zip.
+    def _collect() -> List[tuple]:
+        entries = []
+        for t in targets:
+            if t.is_dir():
+                for sub in t.rglob("*"):
+                    if sub.is_file() and not sub.is_symlink() and not _is_hidden(sub):
+                        entries.append((sub, str(sub.relative_to(root_resolved))))
+            elif t.is_file() and not t.is_symlink():
+                entries.append((t, str(t.relative_to(root_resolved))))
+        return entries
 
-    payload = await run_in_threadpool(_build_zip)
+    entries = await run_in_threadpool(_collect)
     return StreamingResponse(
-        iter([payload]),
+        _stream_zip(entries),
         media_type="application/zip",
         headers={"Content-Disposition": 'attachment; filename="archive.zip"'},
     )

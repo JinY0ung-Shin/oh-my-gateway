@@ -946,6 +946,194 @@ def test_archive_excludes_claude_prefixed_paths_when_enabled(client, workspace, 
     assert ".secret_dir/k.txt" in names
 
 
+
+def _legacy_zip_members(root: Path, rel_paths) -> dict:
+    """The pre-streaming ``_build_zip`` walk: arcname -> bytes."""
+    root = root.resolve()
+    out = {}
+    for rel in rel_paths:
+        t = (root / rel.lstrip("/")).resolve()
+        if t.is_dir():
+            for sub in t.rglob("*"):
+                if sub.is_file() and not sub.is_symlink():
+                    out[str(sub.relative_to(root))] = sub.read_bytes()
+        elif t.is_file() and not t.is_symlink():
+            out[str(t.relative_to(root))] = t.read_bytes()
+    return out
+
+
+def test_archive_stream_matches_legacy_zip_for_nested_folders(client, workspace):
+    import io as _io
+    import zipfile as _zip
+
+    deep = workspace / "sub" / "a" / "b"
+    deep.mkdir(parents=True)
+    (deep / "deep.bin").write_bytes(os.urandom(300_000))
+    (workspace / "sub" / "a" / "mid.txt").write_text("mid\n" * 1000)
+    (workspace / "sub" / "empty").mkdir()
+
+    r = client.post(
+        "/files/archive",
+        headers={**_AUTH, **_USER},
+        json={"paths": ["/notes.txt", "/sub", "/blob.bin"]},
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/zip"
+    assert r.headers["content-disposition"] == 'attachment; filename="archive.zip"'
+    zf = _zip.ZipFile(_io.BytesIO(r.content))
+    assert zf.testzip() is None
+    got = {n: zf.read(n) for n in zf.namelist()}
+    expected = _legacy_zip_members(workspace, ["/notes.txt", "/sub", "/blob.bin"])
+    assert sorted(got) == sorted(expected)
+    assert got == expected
+    assert "sub/a/b/deep.bin" in got
+
+
+def test_archive_route_returns_streaming_response_in_multiple_chunks(
+    workspace, monkeypatch
+):
+    import asyncio as _asyncio
+    import io as _io
+    import zipfile as _zip
+
+    from fastapi.responses import StreamingResponse as _SR
+
+    big = workspace / "big"
+    big.mkdir()
+    for i in range(3):
+        (big / f"part{i}.bin").write_bytes(os.urandom(1024 * 1024))
+    _patch_api_key(monkeypatch, "testkey")
+    monkeypatch.setattr(
+        tf.workspace_manager, "resolve", lambda u, backend=None: workspace
+    )
+
+    class _Req:
+        headers = {**_AUTH, **_USER}
+
+    async def _run():
+        monkeypatch.setattr(tf, "verify_api_key", _noop_verify)
+        resp = await tf.archive_entries(
+            _Req(), tf._ArchiveBody(paths=["/big"]), credentials=None
+        )
+        assert isinstance(resp, _SR)
+        assert resp.media_type == "application/zip"
+        chunks = [c async for c in resp.body_iterator]
+        return chunks
+
+    chunks = _asyncio.run(_run())
+    assert len(chunks) > 1
+    assert max(len(c) for c in chunks) <= tf._ZIP_CHUNK_BYTES + 64 * 1024
+    zf = _zip.ZipFile(_io.BytesIO(b"".join(chunks)))
+    assert sorted(zf.namelist()) == [f"big/part{i}.bin" for i in range(3)]
+    for i in range(3):
+        assert zf.read(f"big/part{i}.bin") == (big / f"part{i}.bin").read_bytes()
+
+
+async def _noop_verify(request, credentials):
+    return True
+
+
+@pytest.mark.parametrize(
+    "paths,status",
+    [
+        (["/nope.txt"], 404),
+        (["/notes.txt", "/missing/dir"], 404),
+        (["/../secret.txt"], 403),
+        (["/../../etc"], 403),
+    ],
+)
+def test_archive_pre_stream_errors_keep_status(client, paths, status):
+    r = client.post(
+        "/files/archive", headers={**_AUTH, **_USER}, json={"paths": paths}
+    )
+    assert r.status_code == status
+    assert r.headers["content-type"].startswith("application/json")
+    assert "detail" in r.json()
+
+
+def test_archive_pre_stream_auth_errors_keep_status(client):
+    r = client.post("/files/archive", headers=_USER, json={"paths": ["/notes.txt"]})
+    assert r.status_code == 401
+    r = client.post("/files/archive", headers=_AUTH, json={"paths": ["/notes.txt"]})
+    assert r.status_code in (400, 401, 403)
+    assert r.headers["content-type"].startswith("application/json")
+
+
+def test_archive_producer_stops_and_closes_files_on_early_close(
+    workspace, monkeypatch
+):
+    import asyncio as _asyncio
+    import builtins
+    import threading as _threading
+    import time as _time
+    import zipfile as _zipmod
+
+    big = workspace / "big"
+    big.mkdir()
+    for i in range(8):
+        (big / f"part{i}.bin").write_bytes(os.urandom(512 * 1024))
+    entries = [(f, f"big/{f.name}") for f in sorted(big.iterdir())]
+
+    opened = []
+    real_open = builtins.open
+
+    def _tracking_open(*a, **kw):
+        fh = real_open(*a, **kw)
+        opened.append(fh)
+        return fh
+
+    monkeypatch.setattr(_zipmod, "open", _tracking_open, raising=False)
+    monkeypatch.setattr(tf, "_ZIP_CHUNK_BYTES", 16 * 1024)
+
+    def _producers():
+        return [
+            t
+            for t in _threading.enumerate()
+            if t.name == "archive-zip-producer" and t.is_alive()
+        ]
+
+    before = set(_producers())
+
+    async def _run():
+        agen = tf._stream_zip(entries)
+        first = await agen.__anext__()
+        assert first
+        await agen.aclose()
+
+    _asyncio.run(_run())
+
+    deadline = _time.monotonic() + 5
+    while _time.monotonic() < deadline and set(_producers()) - before:
+        _time.sleep(0.02)
+    assert not (set(_producers()) - before), "producer thread still running"
+    assert opened, "producer never opened a source file"
+    assert all(fh.closed for fh in opened)
+    # Stopped early: not every member was read.
+    assert len(opened) < len(entries)
+
+
+
+def test_archive_mid_stream_read_error_aborts_instead_of_finishing(
+    workspace, monkeypatch
+):
+    """A read failure after headers are sent must abort the body, never end it
+    as if the (incomplete) zip were complete."""
+    import asyncio as _asyncio
+    import zipfile as _zipmod
+
+    def _boom(*a, **kw):
+        raise PermissionError("denied")
+
+    monkeypatch.setattr(_zipmod, "open", _boom, raising=False)
+    entries = [(workspace / "notes.txt", "notes.txt")]
+
+    async def _run():
+        return [c async for c in tf._stream_zip(entries)]
+
+    with pytest.raises(PermissionError):
+        _asyncio.run(_run())
+
+
 def test_search_finds_nested_files(client):
     r = client.get("/files/search?query=inner", headers={**_AUTH, **_USER})
     assert r.status_code == 200
