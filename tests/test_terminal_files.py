@@ -1063,26 +1063,24 @@ def test_archive_producer_stops_and_closes_files_on_early_close(
     workspace, monkeypatch
 ):
     import asyncio as _asyncio
-    import builtins
     import threading as _threading
     import time as _time
-    import zipfile as _zipmod
 
     big = workspace / "big"
     big.mkdir()
     for i in range(8):
         (big / f"part{i}.bin").write_bytes(os.urandom(512 * 1024))
-    entries = [(f, f"big/{f.name}") for f in sorted(big.iterdir())]
+    entries = [f"big/{f.name}" for f in sorted(big.iterdir())]
 
     opened = []
-    real_open = builtins.open
+    real_open = tf._open_archive_member
 
     def _tracking_open(*a, **kw):
-        fh = real_open(*a, **kw)
+        fh, st = real_open(*a, **kw)
         opened.append(fh)
-        return fh
+        return fh, st
 
-    monkeypatch.setattr(_zipmod, "open", _tracking_open, raising=False)
+    monkeypatch.setattr(tf, "_open_archive_member", _tracking_open)
     monkeypatch.setattr(tf, "_ZIP_CHUNK_BYTES", 16 * 1024)
 
     def _producers():
@@ -1095,7 +1093,7 @@ def test_archive_producer_stops_and_closes_files_on_early_close(
     before = set(_producers())
 
     async def _run():
-        agen = tf._stream_zip(entries)
+        agen = tf._stream_zip(workspace.resolve(), entries)
         first = await agen.__anext__()
         assert first
         await agen.aclose()
@@ -1119,16 +1117,15 @@ def test_archive_mid_stream_read_error_aborts_instead_of_finishing(
     """A read failure after headers are sent must abort the body, never end it
     as if the (incomplete) zip were complete."""
     import asyncio as _asyncio
-    import zipfile as _zipmod
 
     def _boom(*a, **kw):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(_zipmod, "open", _boom, raising=False)
-    entries = [(workspace / "notes.txt", "notes.txt")]
+    monkeypatch.setattr(tf, "_open_archive_member", _boom)
+    entries = ["notes.txt"]
 
     async def _run():
-        return [c async for c in tf._stream_zip(entries)]
+        return [c async for c in tf._stream_zip(workspace.resolve(), entries)]
 
     with pytest.raises(PermissionError):
         _asyncio.run(_run())
@@ -1760,12 +1757,11 @@ def test_archive_slot_released_on_producer_error(
     big_workspace, archive_admission, monkeypatch
 ):
     import asyncio as _asyncio
-    import zipfile as _zipmod
 
     def _boom(*a, **kw):
         raise PermissionError("denied")
 
-    monkeypatch.setattr(_zipmod, "open", _boom, raising=False)
+    monkeypatch.setattr(tf, "_open_archive_member", _boom)
     monkeypatch.setenv("ARCHIVE_MAX_CONCURRENT", "1")
 
     async def _run():
@@ -2154,3 +2150,119 @@ def test_write_if_keeps_file_mode(client, workspace):
     assert r.status_code == 200
     assert target.read_text() == "echo 2"
     assert target.stat().st_mode & 0o777 == 0o750
+
+
+# --- archive members are opened beneath the root, never by path (#225 review) --
+
+_OUTSIDE_SECRET = b"OUTSIDE-WORKSPACE-SECRET-7f3a"
+
+
+def _archive_with_swap(client, monkeypatch, paths, swap):
+    """POST /files/archive with ``swap()`` run after the walk has chosen the
+    members and before the producer opens any of them: the exact window a
+    path check cannot cover."""
+    real = tf._produce_zip
+    swapped = []
+
+    def _produce(*a, **kw):
+        swap()
+        swapped.append(True)
+        return real(*a, **kw)
+
+    monkeypatch.setattr(tf, "_produce_zip", _produce)
+    r = client.post("/files/archive", headers={**_AUTH, **_USER}, json={"paths": paths})
+    assert swapped == [True], "the swap must run between walk and producer"
+    return r
+
+
+def _zip_members(content: bytes) -> dict:
+    import io as _io
+    import zipfile as _zip
+
+    zf = _zip.ZipFile(_io.BytesIO(content))
+    assert zf.testzip() is None
+    return {n: zf.read(n) for n in zf.namelist()}
+
+
+def _assert_no_outside_bytes(members: dict) -> None:
+    for name, data in members.items():
+        assert _OUTSIDE_SECRET not in data, f"{name} carries bytes from outside"
+
+
+def test_archive_member_swapped_for_symlink_is_skipped(
+    client, workspace, tmp_path, monkeypatch
+):
+    secret = tmp_path / "outside-secret.txt"
+    secret.write_bytes(_OUTSIDE_SECRET)
+    d = workspace / "dir"
+    d.mkdir()
+    (d / "item.txt").write_text("item")
+    (d / "keep.txt").write_text("keep")
+    (d / "gone.txt").write_text("gone")
+
+    def _swap():
+        (d / "item.txt").unlink()
+        (d / "item.txt").symlink_to(secret)
+        (d / "gone.txt").unlink()
+
+    r = _archive_with_swap(client, monkeypatch, ["/dir"], _swap)
+    assert r.status_code == 200
+    members = _zip_members(r.content)
+    _assert_no_outside_bytes(members)
+    assert members == {"dir/keep.txt": b"keep"}
+
+
+def test_archive_directory_swapped_for_symlink_is_skipped(
+    client, workspace, tmp_path, monkeypatch
+):
+    outside = tmp_path / "outside-dir"
+    (outside / "deeper").mkdir(parents=True)
+    (outside / "x.txt").write_bytes(_OUTSIDE_SECRET)
+    (outside / "deeper" / "y.txt").write_bytes(_OUTSIDE_SECRET)
+    nested = workspace / "dir" / "nested"
+    (nested / "deeper").mkdir(parents=True)
+    (nested / "x.txt").write_text("x")
+    (nested / "deeper" / "y.txt").write_text("y")
+    (workspace / "dir" / "keep.txt").write_text("keep")
+
+    def _swap():
+        nested.rename(tmp_path / "moved-away")
+        nested.symlink_to(outside, target_is_directory=True)
+
+    r = _archive_with_swap(client, monkeypatch, ["/dir", "/notes.txt"], _swap)
+    assert r.status_code == 200
+    members = _zip_members(r.content)
+    _assert_no_outside_bytes(members)
+    assert members == {"dir/keep.txt": b"keep", "notes.txt": b"hello\nworld\n"}
+
+
+def test_archive_member_swapped_for_fifo_is_skipped_without_blocking(
+    client, workspace, monkeypatch
+):
+    d = workspace / "dir"
+    d.mkdir()
+    (d / "pipe").write_text("was a file")
+    (d / "keep.txt").write_text("keep")
+
+    def _swap():
+        (d / "pipe").unlink()
+        os.mkfifo(d / "pipe")
+
+    r = _archive_with_swap(client, monkeypatch, ["/dir"], _swap)
+    assert r.status_code == 200
+    assert _zip_members(r.content) == {"dir/keep.txt": b"keep"}
+
+
+def test_archive_refuses_a_workspace_root_swapped_after_the_walk(
+    client, workspace, tmp_path, monkeypatch
+):
+    outside = tmp_path / "outside-root"
+    outside.mkdir()
+    (outside / "notes.txt").write_bytes(_OUTSIDE_SECRET)
+
+    def _swap():
+        workspace.rename(tmp_path / "real-root")
+        workspace.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(tf._UnsafeArchiveMember):
+        _archive_with_swap(client, monkeypatch, ["/notes.txt"], _swap)

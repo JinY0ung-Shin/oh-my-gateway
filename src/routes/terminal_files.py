@@ -90,6 +90,13 @@ Security:
   before the containment check); anything above/outside the root is a 403.
   Uploaded filenames are reduced to a basename. No extra roots (never
   ``~/.claude`` etc.).
+- ``/files/archive`` checks paths when it walks the selection but reads them
+  later, from the producer thread, so a path check alone would race a symlink
+  swap. The producer therefore never opens a path: it pins the workspace root
+  as a directory fd (identity checked against the walk) and descends to every
+  member one component at a time with ``O_NOFOLLOW`` (``_open_archive_member``),
+  so a member or any directory above it that became a symlink is skipped, never
+  followed out of the workspace.
 """
 
 import asyncio
@@ -1660,22 +1667,120 @@ class _ZipStreamSink:
                 raise _ZipCancelled() from exc
 
 
+class _UnsafeArchiveMember(Exception):
+    """A member path no longer leads to a regular file without a symlink."""
+
+
+_ARCHIVE_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+# O_NONBLOCK: a member swapped for a FIFO must not park the producer in open();
+# it is refused by the S_ISREG check right after.
+_ARCHIVE_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+# What openat() reports when O_NOFOLLOW meets a symlink, or a directory on the
+# way down is no longer a directory.
+_ARCHIVE_SWAPPED_ERRNOS = (errno.ELOOP, errno.ENOTDIR, errno.EMLINK)
+
+
+def _open_archive_root(root: Path, identity: Optional[tuple]) -> int:
+    """Open the workspace root as a directory fd, refusing a swapped root."""
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        st = os.fstat(fd)
+        if identity is not None and (st.st_dev, st.st_ino) != identity:
+            raise _UnsafeArchiveMember("workspace root changed during archive")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _open_archive_member(root_fd: int, arcname: str):
+    """Open ``arcname`` beneath ``root_fd`` without following any symlink.
+
+    Each directory component is opened with ``O_NOFOLLOW`` relative to the one
+    above it, and so is the member itself, so no swap of the member or of a
+    directory on its way can lead outside ``root_fd``. Returns ``(file, stat)``
+    for a regular file; raises ``_UnsafeArchiveMember`` otherwise and
+    ``FileNotFoundError`` when something on the way is gone.
+    """
+    parts = arcname.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        raise _UnsafeArchiveMember(arcname)
+    dir_fd = root_fd
+    try:
+        for name in parts[:-1]:
+            try:
+                next_fd = os.open(name, _ARCHIVE_DIR_FLAGS, dir_fd=dir_fd)
+            except OSError as exc:
+                if exc.errno in _ARCHIVE_SWAPPED_ERRNOS:
+                    raise _UnsafeArchiveMember(arcname) from exc
+                raise
+            if dir_fd != root_fd:
+                os.close(dir_fd)
+            dir_fd = next_fd
+        try:
+            fd = os.open(parts[-1], _ARCHIVE_FILE_FLAGS, dir_fd=dir_fd)
+        except OSError as exc:
+            if exc.errno in _ARCHIVE_SWAPPED_ERRNOS:
+                raise _UnsafeArchiveMember(arcname) from exc
+            raise
+    finally:
+        if dir_fd != root_fd:
+            os.close(dir_fd)
+    try:
+        st = os.fstat(fd)
+        if not stat_module.S_ISREG(st.st_mode):
+            raise _UnsafeArchiveMember(arcname)
+        os.set_blocking(fd, True)
+        return os.fdopen(fd, "rb"), st
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _archive_zipinfo(arcname: str, st: os.stat_result) -> zipfile.ZipInfo:
+    """``ZipInfo.from_file`` for an already-open member (from its fstat)."""
+    date_time = time.localtime(st.st_mtime)[0:6]
+    if date_time[0] < 1980:  # the zip format cannot express earlier dates
+        date_time = (1980, 1, 1, 0, 0, 0)
+    zinfo = zipfile.ZipInfo(arcname, date_time)
+    zinfo.external_attr = (st.st_mode & 0xFFFF) << 16
+    zinfo.file_size = st.st_size
+    zinfo.compress_type = zipfile.ZIP_DEFLATED
+    return zinfo
+
+
 def _produce_zip(
-    entries: List[tuple],
+    root: Path,
+    arcnames: List[str],
     sink: _ZipStreamSink,
     party: Optional[_ArchiveSlotParty] = None,
+    root_identity: Optional[tuple] = None,
 ) -> None:
     zf = None
+    root_fd = None
     try:
+        root_fd = _open_archive_root(root, root_identity)
         zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_DEFLATED)
-        for path, arcname in entries:
+        for arcname in arcnames:
+            # Open (and fstat) before the member header goes out, so a skip
+            # leaves the archive well-formed.
             try:
-                zf.write(path, arcname=arcname)
+                src, st = _open_archive_member(root_fd, arcname)
             except FileNotFoundError:
-                # Removed between the pre-stream walk and now. ``ZipFile.write``
-                # stats and opens the source before emitting the member header,
-                # so skipping leaves the archive well-formed.
+                # Removed between the pre-stream walk and now.
                 logger.info("archive: skipping vanished file %s", arcname)
+                continue
+            except _UnsafeArchiveMember:
+                logger.warning(
+                    "archive: skipping %s, it is no longer a plain file inside "
+                    "the workspace",
+                    arcname,
+                )
+                continue
+            with src:
+                # Same size hint as ``ZipFile.write`` so zip64 is chosen up front.
+                with zf.open(_archive_zipinfo(arcname, st), "w") as dest:
+                    shutil.copyfileobj(src, dest, 1024 * 8)
         zf.close()
         sink.finish()
     except _ZipCancelled:
@@ -1695,17 +1800,25 @@ def _produce_zip(
                 zf.close()
             except Exception:  # best effort; the stream is already gone
                 pass
+        if root_fd is not None:
+            os.close(root_fd)
         if party is not None:
             party.release()
 
 
 async def _stream_zip(
-    entries: List[tuple], party: Optional[_ArchiveSlotParty] = None
+    root: Path,
+    arcnames: List[str],
+    party: Optional[_ArchiveSlotParty] = None,
+    root_identity: Optional[tuple] = None,
 ):
-    """Yield the zip of ``entries`` (``(path, arcname)`` pairs) chunk by chunk.
+    """Yield the zip of ``arcnames`` (paths relative to ``root``) chunk by chunk.
 
-    ``party`` is the response body's claim on an admission slot; the producer
-    thread takes its own claim before it starts, and each releases on exit.
+    Members are opened beneath ``root`` by ``_open_archive_member``, never by
+    path; ``root_identity`` (``(st_dev, st_ino)`` from the walk) refuses a root
+    that was swapped since. ``party`` is the response body's claim on an
+    admission slot; the producer thread takes its own claim before it starts,
+    and each releases on exit.
     """
     try:
         loop = asyncio.get_running_loop()
@@ -1715,7 +1828,7 @@ async def _stream_zip(
         worker_party = party._slot.party() if party is not None else None
         worker = threading.Thread(
             target=_produce_zip,
-            args=(entries, sink, worker_party),
+            args=(root, arcnames, sink, worker_party, root_identity),
             name="archive-zip-producer",
             daemon=True,
         )
@@ -1789,28 +1902,32 @@ async def archive_entries(
 
     # Walk the selection BEFORE the response starts (off the event loop): a walk
     # failure is still a plain error response, never a 200 with a broken zip.
-    def _collect() -> List[tuple]:
+    # These checks only choose what to archive; the producer re-opens every
+    # member beneath the root fd without following symlinks, so a swap after
+    # the walk cannot pull in anything outside the workspace.
+    def _collect() -> tuple:
         try:
-            entries = []
+            root_st = os.stat(root_resolved)
+            arcnames = []
             for t in targets:
                 if t.is_dir():
                     for sub in t.rglob("*"):
                         if sub.is_file() and not sub.is_symlink() and not _is_hidden(sub):
-                            entries.append((sub, str(sub.relative_to(root_resolved))))
+                            arcnames.append(sub.relative_to(root_resolved).as_posix())
                 elif t.is_file() and not t.is_symlink():
-                    entries.append((t, str(t.relative_to(root_resolved))))
-            return entries
+                    arcnames.append(t.relative_to(root_resolved).as_posix())
+            return arcnames, (root_st.st_dev, root_st.st_ino)
         finally:
             walk_party.release()
 
     try:
-        entries = await run_in_threadpool(_collect)
+        arcnames, root_identity = await run_in_threadpool(_collect)
     except BaseException:
         # Walk failed or the request was cancelled: nothing will stream, so the
         # response's claim goes too (the walk thread drops its own on exit).
         party.release()
         raise
-    body_iter = _stream_zip(entries, party)
+    body_iter = _stream_zip(root_resolved, arcnames, party, root_identity)
     # A body Starlette never iterates (client gone before streaming starts)
     # never runs its ``finally``; the finalizer returns the slot instead.
     weakref.finalize(body_iter, party.release)
