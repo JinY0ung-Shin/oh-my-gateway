@@ -150,3 +150,30 @@ def test_readonly_base_dir_falls_back_to_temp(tmp_path, monkeypatch):
     # Saving should still work
     path = handler.save_base64_image(TINY_PNG, "image/png")
     assert path.exists()
+
+
+def test_symlinked_image_dir_never_receives_uploads(tmp_path):
+    """A ``.claude_images`` the agent replaced with a symlink must not make the
+    gateway write uploaded images wherever it points."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    (workspace / ".claude_images").symlink_to(elsewhere, target_is_directory=True)
+    handler = ImageHandler(workspace)
+    path = handler.save_base64_image(TINY_PNG, "image/png")
+    assert path.exists()
+    assert list(elsewhere.iterdir()) == []
+
+
+def test_image_dir_swapped_for_a_symlink_after_init_is_refused(tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    handler = ImageHandler(workspace)
+    (workspace / ".claude_images").rename(tmp_path / "moved")
+    (workspace / ".claude_images").symlink_to(elsewhere, target_is_directory=True)
+    with pytest.raises(OSError):
+        handler.save_base64_image(TINY_PNG, "image/png")
+    assert list(elsewhere.iterdir()) == []

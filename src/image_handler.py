@@ -11,6 +11,7 @@ import base64
 import binascii
 import hashlib
 import logging
+import os
 import tempfile
 import time
 from pathlib import Path
@@ -35,6 +36,10 @@ class ImageHandler:
         self.image_dir = base_dir / ".claude_images"
         try:
             self.image_dir.mkdir(parents=True, exist_ok=True)
+            if self.image_dir.is_symlink():
+                # The workspace is the agent's: a ``.claude_images`` symlink
+                # would have the gateway write uploads wherever it points.
+                raise PermissionError(f"{self.image_dir} is a symlink")
         except PermissionError:
             fallback = Path(tempfile.mkdtemp(prefix="claude_images_"))
             logger.warning(
@@ -74,11 +79,41 @@ class ImageHandler:
         ext = EXTENSION_MAP[media_type]
         filepath = self.image_dir / f"img_{content_hash}{ext}"
 
-        if not filepath.exists():
-            filepath.write_bytes(image_bytes)
+        if self._write_new(filepath.name, image_bytes):
             logger.debug("Saved image (%d bytes): %s", len(image_bytes), filepath.name)
 
         return filepath.resolve()
+
+    def _write_new(self, name: str, data: bytes) -> bool:
+        """Create ``name`` in the image dir unless it exists; never via a symlink.
+
+        The directory and the file are both opened with ``O_NOFOLLOW``, so a
+        ``.claude_images`` (or file) swapped for a symlink after ``__init__``
+        is refused instead of written through. Content-addressed names make an
+        existing file the same image, so ``EEXIST`` means already saved.
+        """
+        dir_fd = os.open(
+            self.image_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        )
+        try:
+            try:
+                fd = os.open(
+                    name,
+                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    0o666,  # same as write_bytes; the umask applies
+                    dir_fd=dir_fd,
+                )
+            except FileExistsError:
+                return False
+            try:
+                view = memoryview(data)
+                while view:
+                    view = view[os.write(fd, view) :]
+            finally:
+                os.close(fd)
+            return True
+        finally:
+            os.close(dir_fd)
 
     # ------------------------------------------------------------------
     # Data-URL parsing
