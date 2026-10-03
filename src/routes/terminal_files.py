@@ -97,6 +97,7 @@ import mimetypes
 import os
 import shutil
 import stat as stat_module
+import uuid
 import zipfile
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -532,6 +533,10 @@ async def get_limits(
     return {
         "max_upload_bytes": _max_upload_bytes(),
         "workspace_quota_bytes": workspace_quota_limit_bytes(),
+        # Capability flag: ``/files/upload`` honours ``expected_sha256``. Clients
+        # that need conditional saves check this instead of trusting that an
+        # older gateway would not silently ignore the parameter.
+        "conditional_write": "sha256",
     }
 
 
@@ -851,8 +856,107 @@ async def set_cwd(
     return {"cwd": body.path}
 
 
-async def _write_uploaded_file(target: Path, data: bytes, no_clobber: bool) -> None:
+# --- conditional write (ChatDRAGON #213) --------------------------------------
+# The workspace is written by more than this API: the agent's tools and the
+# terminal write files directly. A client that saves a draft it started from an
+# older body must not silently replace a change made underneath it, so a save
+# may carry ``expected_sha256`` -- the SHA-256 of the body the draft started
+# from -- and the compare and the write happen HERE, next to the file, as one
+# step:
+#
+# - every conditional write of a path is serialised by a per-path lock, so two
+#   saves with the same expected version (two tabs, two BFF instances) can never
+#   both pass: exactly one replaces the file, the other sees the new hash;
+# - the new body is written to a temp file beside the target and the target's
+#   hash is checked again immediately before the atomic ``os.replace``, so an
+#   external write that lands after the first compare is still a conflict.
+#
+# POSIX offers no compare-and-swap on file contents against writers that take no
+# lock, so a write landing between that last check and ``os.replace`` (two
+# syscalls apart) cannot be detected; every window a caller can observe is
+# closed. "Create only if still absent" is the existing ``no_clobber`` (O_EXCL).
+_CAS_LOCKS: dict = {}
+_SHA256_HEX = frozenset("0123456789abcdef")
+
+
+class _WriteConflict(Exception):
+    def __init__(self, exists: bool):
+        super().__init__("conditional write conflict")
+        self.exists = exists
+
+
+def _cas_after_compare(target: Path) -> None:
+    """Test seam: runs right after the first compare (an external write here must
+    still be detected)."""
+
+
+def _sha256_of(path: Path) -> Optional[str]:
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except FileNotFoundError:
+        return None
+    return digest.hexdigest()
+
+
+def _replace_if_unchanged(target: Path, data: bytes, expected: str) -> None:
+    current = _sha256_of(target)
+    if current != expected:
+        raise _WriteConflict(exists=current is not None)
+    _cas_after_compare(target)
+    tmp = target.with_name(f".{target.name}.cas-{uuid.uuid4().hex}.tmp")
+    try:
+        with open(tmp, "xb") as f:
+            f.write(data)
+        try:
+            shutil.copymode(target, tmp)
+        except OSError:
+            pass
+        current = _sha256_of(target)
+        if current != expected:
+            raise _WriteConflict(exists=current is not None)
+        os.replace(tmp, target)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@asynccontextmanager
+async def _cas_lock(target: Path):
+    key = str(target)
+    entry = _CAS_LOCKS.get(key)
+    if entry is None:
+        entry = _CAS_LOCKS[key] = [asyncio.Lock(), 0]
+    entry[1] += 1
+    try:
+        async with entry[0]:
+            yield
+    finally:
+        entry[1] -= 1
+        if entry[1] == 0 and _CAS_LOCKS.get(key) is entry:
+            del _CAS_LOCKS[key]
+
+
+async def _write_uploaded_file(
+    target: Path, data: bytes, no_clobber: bool, expected_sha256: Optional[str] = None
+) -> None:
     """Preserve the historical upload write/no-clobber semantics."""
+    if expected_sha256 is not None:
+        try:
+            async with _cas_lock(target):
+                await run_in_threadpool(
+                    _replace_if_unchanged, target, data, expected_sha256
+                )
+        except _WriteConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "save_conflict", "exists": exc.exists},
+            )
+        return
     if no_clobber:
 
         def _write_exclusive() -> None:
@@ -872,10 +976,15 @@ async def upload_file(
     request: Request,
     directory: str = "/",
     no_clobber: bool = False,
+    expected_sha256: Optional[str] = None,
     file: UploadFile = File(...),
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ):
     """Write one uploaded file into the workspace.
+
+    ``expected_sha256`` makes it a conditional replace: the file must exist and
+    hash to exactly that value at write time, else 409 ``save_conflict`` and the
+    file is untouched (see "conditional write" above).
 
     Default keeps the historical contract: same name overwrites (this is how
     "save" works through the proxy chain). ``no_clobber=true`` is the opt-in
@@ -895,6 +1004,15 @@ async def upload_file(
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
     target = _resolve_or_403(root, f"{directory}/{name}")
+    if expected_sha256 is not None:
+        expected_sha256 = expected_sha256.lower()
+        if len(expected_sha256) != 64 or not set(expected_sha256) <= _SHA256_HEX:
+            raise HTTPException(status_code=400, detail="invalid expected_sha256")
+        if no_clobber:
+            raise HTTPException(
+                status_code=400,
+                detail="expected_sha256 and no_clobber are mutually exclusive",
+            )
 
     data = await file.read()
     # Defence in depth against the request boundary: middleware bounds the raw
@@ -911,7 +1029,7 @@ async def upload_file(
     # Keep quota-disabled deployments on the exact historical mutation path:
     # no extra tree scan, lock, or threadpool hop.
     if workspace_quota_limit_bytes() <= 0:
-        await _write_uploaded_file(target, data, no_clobber)
+        await _write_uploaded_file(target, data, no_clobber, expected_sha256)
         return {"path": str(target), "size": len(data)}
 
     user_root = _user_root(root)
@@ -940,7 +1058,7 @@ async def upload_file(
             )
         except WorkspaceQuotaExceeded as exc:
             _raise_quota_http(exc)
-        await _write_uploaded_file(target, data, no_clobber)
+        await _write_uploaded_file(target, data, no_clobber, expected_sha256)
     return {"path": str(target), "size": len(data)}
 
 

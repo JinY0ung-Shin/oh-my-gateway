@@ -1389,3 +1389,132 @@ def test_digest_refuses_a_directory(client, workspace):
     assert (
         client.get("/files/digest?path=/adir", headers={**_AUTH, **_USER}).status_code == 404
     )
+
+
+# --- conditional write (ChatDRAGON #213) -------------------------------------
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _conditional_save(client, name: str, body: bytes, expected: str):
+    return client.post(
+        f"/files/upload?directory=/&expected_sha256={expected}",
+        headers={**_AUTH, **_USER},
+        files={"file": (name, body, "text/plain")},
+    )
+
+
+def test_limits_advertise_conditional_write(client):
+    r = client.get("/files/limits", headers=_AUTH)
+    assert r.json()["conditional_write"] == "sha256"
+
+
+def test_conditional_write_replaces_when_unchanged(client, workspace):
+    (workspace / "doc.txt").write_text("v1")
+    r = _conditional_save(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 200
+    assert (workspace / "doc.txt").read_text() == "v1 + mine"
+    # no temp file is left behind
+    assert [p.name for p in workspace.iterdir() if ".cas-" in p.name] == []
+
+
+def test_conditional_write_refuses_a_changed_file(client, workspace):
+    (workspace / "doc.txt").write_text("v2 from agent")
+    r = _conditional_save(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 409
+    assert r.json()["detail"] == {"code": "save_conflict", "exists": True}
+    assert (workspace / "doc.txt").read_text() == "v2 from agent"
+
+
+def test_conditional_write_refuses_a_deleted_file(client, workspace):
+    r = _conditional_save(client, "gone.txt", b"mine", _sha("v1"))
+    assert r.status_code == 409
+    assert r.json()["detail"] == {"code": "save_conflict", "exists": False}
+    assert not (workspace / "gone.txt").exists()
+
+
+def test_conditional_write_detects_external_write_after_compare(
+    client, workspace, monkeypatch
+):
+    """The reviewer's barrier: an external writer (agent/terminal) lands right
+    after the compare. The re-check before the atomic replace still refuses, and
+    the external body survives."""
+    (workspace / "doc.txt").write_text("v1")
+    monkeypatch.setattr(
+        tf, "_cas_after_compare", lambda target: target.write_text("v2 from agent")
+    )
+    r = _conditional_save(client, "doc.txt", b"v1 + mine", _sha("v1"))
+    assert r.status_code == 409
+    assert (workspace / "doc.txt").read_text() == "v2 from agent"
+    assert [p.name for p in workspace.iterdir() if ".cas-" in p.name] == []
+
+
+async def test_conditional_writes_with_the_same_expected_version_one_wins(
+    workspace, monkeypatch
+):
+    """Two callers (two tabs, two BFF instances) saving against the same version
+    concurrently: exactly one replaces the file, the other gets 409."""
+    import asyncio
+
+    import httpx
+
+    app = FastAPI()
+    app.include_router(router)
+    _patch_api_key(monkeypatch, "testkey")
+    monkeypatch.setattr(
+        tf.workspace_manager, "resolve", lambda user, backend=None: workspace
+    )
+    (workspace / "doc.txt").write_text("v1")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real = tf.run_in_threadpool
+
+    async def slow(fn, *args, **kwargs):
+        if fn is tf._replace_if_unchanged:
+            entered.set()
+            await release.wait()
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(tf, "run_in_threadpool", slow)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+
+        async def save(body: bytes):
+            return await c.post(
+                f"/files/upload?directory=/&expected_sha256={_sha('v1')}",
+                headers={**_AUTH, **_USER},
+                files={"file": ("doc.txt", body, "text/plain")},
+            )
+
+        first = asyncio.create_task(save(b"from A"))
+        await entered.wait()
+        second = asyncio.create_task(save(b"from B"))
+        await asyncio.sleep(0.05)
+        release.set()
+        results = await asyncio.gather(first, second)
+    statuses = sorted(r.status_code for r in results)
+    assert statuses == [200, 409]
+    assert (workspace / "doc.txt").read_text() == "from A"
+
+
+def test_conditional_write_rejects_bad_hash_and_no_clobber_combo(client, workspace):
+    r = _conditional_save(client, "doc.txt", b"x", "not-a-hash")
+    assert r.status_code == 400
+    r = client.post(
+        f"/files/upload?directory=/&no_clobber=true&expected_sha256={_sha('v1')}",
+        headers={**_AUTH, **_USER},
+        files={"file": ("doc.txt", b"x", "text/plain")},
+    )
+    assert r.status_code == 400
+
+
+def test_conditional_write_keeps_file_mode(client, workspace):
+    target = workspace / "run.sh"
+    target.write_text("echo 1")
+    target.chmod(0o750)
+    r = _conditional_save(client, "run.sh", b"echo 2", _sha("echo 1"))
+    assert r.status_code == 200
+    assert target.read_text() == "echo 2"
+    assert target.stat().st_mode & 0o777 == 0o750
