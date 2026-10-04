@@ -1629,6 +1629,8 @@ async def move_entry(
         )
     except _PathChanged:
         raise _path_changed_409()
+    except _UnsupportedSourceError:
+        raise HTTPException(status_code=400, detail="unsupported file type")
     except OSError as exc:
         if body.no_clobber and exc.errno in (errno.EEXIST, errno.ENOTEMPTY):
             raise HTTPException(status_code=409, detail="destination already exists")
@@ -1643,8 +1645,9 @@ def _move_at(
 
     An existing destination directory receives the source inside it (unless it
     is the source itself); anything else is replaced by the rename. A
-    cross-device move (a mount inside the workspace) keeps the historical
-    ``shutil.move`` copy fallback.
+    cross-device move (a mount inside the workspace) copies and unlinks through
+    the same pinned directory fds (``_move_across_devices_at``) — never through
+    ``src``/``dst`` again, which may name something else by now.
     """
     src_st = os.stat(src_name, dir_fd=src_dir, follow_symlinks=False)
     try:
@@ -1672,16 +1675,74 @@ def _move_at(
         else:
             target_dir, target_name = dst_dir, dst_name
         try:
-            os.rename(
-                src_name, target_name, src_dir_fd=src_dir, dst_dir_fd=target_dir
-            )
+            _rename_at(src_dir, src_name, target_dir, target_name)
         except OSError as exc:
             if exc.errno != errno.EXDEV:
                 raise
-            shutil.move(str(src), str(dst))
+            _move_across_devices_at(src_dir, src_name, target_dir, target_name)
     finally:
         if into is not None:
             os.close(into)
+
+
+def _rename_at(src_dir: int, src_name: str, dst_dir: int, dst_name: str) -> None:
+    """``renameat(2)`` between directory fds (a seam for EXDEV tests)."""
+    os.rename(src_name, dst_name, src_dir_fd=src_dir, dst_dir_fd=dst_dir)
+
+
+def _remove_at(dir_fd: int, name: str) -> None:
+    """Remove ``name`` beneath ``dir_fd`` without following a symlink."""
+    st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    if stat_module.S_ISDIR(st.st_mode):
+        shutil.rmtree(name, dir_fd=dir_fd)
+    else:
+        os.unlink(name, dir_fd=dir_fd)
+
+
+def _move_across_devices_at(
+    src_dir: int, src_name: str, dst_dir: int, dst_name: str
+) -> None:
+    """The ``shutil.move`` copy fallback, on the pinned directory fds only.
+
+    ``renameat`` cannot cross a mount, so the entry is copied into a temporary
+    name next to the destination, renamed into place there (same directory, so
+    the ordinary replace semantics apply), and only then is the source removed.
+    Every step is relative to ``src_dir``/``dst_dir``, with ``O_NOFOLLOW``: a
+    parent swapped for a symlink after it was pinned cannot make the move read,
+    write or delete anything outside the workspace. Links are moved as links;
+    a source that changed type or identity mid-move fails with
+    ``_PathChanged`` and keeps the source.
+    """
+    st = os.stat(src_name, dir_fd=src_dir, follow_symlinks=False)
+    tmp = f".gw-move-{uuid.uuid4().hex}"
+    try:
+        if stat_module.S_ISLNK(st.st_mode):
+            os.symlink(os.readlink(src_name, dir_fd=src_dir), tmp, dir_fd=dst_dir)
+        elif stat_module.S_ISDIR(st.st_mode):
+            src_fd = _openat_checked(src_name, _DIR_FLAGS, src_dir)
+            try:
+                opened = os.fstat(src_fd)
+                if (opened.st_dev, opened.st_ino) != (st.st_dev, st.st_ino):
+                    raise _PathChanged(src_name)
+                errors: list = []
+                _copytree_at(src_fd, dst_dir, tmp, errors)
+            finally:
+                os.close(src_fd)
+            if errors:
+                raise shutil.Error(errors)
+        else:
+            _copy_file_at(src_dir, src_name, dst_dir, tmp)
+        now = os.stat(src_name, dir_fd=src_dir, follow_symlinks=False)
+        if (now.st_dev, now.st_ino) != (st.st_dev, st.st_ino):
+            raise _PathChanged(src_name)
+        os.rename(tmp, dst_name, src_dir_fd=dst_dir, dst_dir_fd=dst_dir)
+    except BaseException:
+        try:
+            _remove_at(dst_dir, tmp)
+        except OSError:
+            pass
+        raise
+    _remove_at(src_dir, src_name)
 
 
 _RENAME_NOREPLACE = 1

@@ -1,5 +1,6 @@
 """Tests for the Open Terminal-compatible read-only workspace file server."""
 
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -2582,3 +2583,165 @@ def test_copy_refuses_a_directory_swapped_for_a_symlink(
     for p in workspace.rglob("*"):
         if p.is_file() and not p.is_symlink():
             assert _OUTSIDE_SECRET not in p.read_bytes(), p
+
+
+# --- a cross-device move never reopens the checked pathnames ------------------
+# renameat() fails with EXDEV across a mount inside the workspace. The fallback
+# must copy + unlink through the pinned parent fds, not ``shutil.move`` on the
+# early-resolved paths: a parent swapped for a symlink after the pin would
+# otherwise take the move outside the workspace.
+
+
+def _exdev_rename(monkeypatch, swap=None):
+    """Make ``_rename_at`` fail with EXDEV, running ``swap`` first (after both
+    parents are pinned)."""
+    calls = []
+
+    def _rename(*a, **kw):
+        calls.append(a)
+        if swap is not None:
+            swap()
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+    monkeypatch.setattr(tf, "_rename_at", _rename)
+    return calls
+
+
+def _no_move_leftovers(workspace: Path) -> None:
+    assert not [p for p in workspace.rglob(".gw-move-*")]
+
+
+def _move(client, source, destination):
+    return client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": source, "destination": destination},
+    )
+
+
+def test_move_across_devices_renames_a_file(client, workspace, monkeypatch):
+    calls = _exdev_rename(monkeypatch)
+    r = _move(client, "/notes.txt", "/renamed.txt")
+    assert r.status_code == 200
+    assert calls
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "renamed.txt").read_text() == "hello\nworld\n"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_replaces_an_existing_file(client, workspace, monkeypatch):
+    _exdev_rename(monkeypatch)
+    r = _move(client, "/notes.txt", "/blob.bin")
+    assert r.status_code == 200
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "blob.bin").read_text() == "hello\nworld\n"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_into_an_existing_directory(client, workspace, monkeypatch):
+    _exdev_rename(monkeypatch)
+    r = _move(client, "/notes.txt", "/sub")
+    assert r.status_code == 200
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "sub" / "notes.txt").read_text() == "hello\nworld\n"
+    assert (workspace / "sub" / "inner.md").read_text() == "# inner"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_moves_a_directory_tree(client, workspace, monkeypatch):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    (workspace / "sub" / "link").symlink_to("inner.md")
+    _exdev_rename(monkeypatch)
+    r = _move(client, "/sub", "/moved")
+    assert r.status_code == 200
+    assert not (workspace / "sub").exists()
+    assert (workspace / "moved" / "inner.md").read_text() == "# inner"
+    assert (workspace / "moved" / "deeper" / "x.txt").read_text() == "mine"
+    assert os.readlink(workspace / "moved" / "link") == "inner.md"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_failed_copy_keeps_the_source(
+    client, workspace, monkeypatch
+):
+    _exdev_rename(monkeypatch)
+
+    def _boom(*a, **kw):
+        raise OSError(errno.ENOSPC, "no space")
+
+    monkeypatch.setattr(tf, "_write_all", _boom)
+    with pytest.raises(OSError):
+        _move(client, "/notes.txt", "/renamed.txt")
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"
+    assert not (workspace / "renamed.txt").exists()
+    _no_move_leftovers(workspace)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # (source, destination, gone, landed, content) — gone/landed relative
+        # to tmp_path, where the pinned (pre-swap) ``sub`` now lives at moved-sub.
+        # source parent swapped: a file, and a whole directory
+        (
+            "/sub/deeper/x.txt",
+            "/other/x.txt",
+            "moved-sub/deeper/x.txt",
+            "alice/claude/other/x.txt",
+            "mine",
+        ),
+        (
+            "/sub/deeper",
+            "/other/deeper",
+            "moved-sub/deeper",
+            "alice/claude/other/deeper/x.txt",
+            "mine",
+        ),
+        # destination parent swapped: replace, move into a directory, a tree
+        (
+            "/notes.txt",
+            "/sub/deeper/x.txt",
+            "alice/claude/notes.txt",
+            "moved-sub/deeper/x.txt",
+            "hello\nworld\n",
+        ),
+        (
+            "/notes.txt",
+            "/sub/deeper",
+            "alice/claude/notes.txt",
+            "moved-sub/deeper/notes.txt",
+            "hello\nworld\n",
+        ),
+        (
+            "/other/dir",
+            "/sub/deeper/dir",
+            "alice/claude/other/dir",
+            "moved-sub/deeper/dir/f.txt",
+            "mine too",
+        ),
+    ],
+)
+def test_move_across_devices_refuses_a_parent_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, body
+):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    (workspace / "other" / "dir").mkdir(parents=True)
+    (workspace / "other" / "dir" / "f.txt").write_text("mine too")
+    before = _outside_tree(outside)
+    calls = _exdev_rename(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    source, destination, gone, landed, content = body
+    r = _move(client, source, destination)
+    assert calls
+    # Nothing outside was read into the workspace, created, replaced or deleted.
+    assert _outside_tree(outside) == before
+    for p in workspace.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            assert _OUTSIDE_SECRET not in p.read_bytes(), p
+    # The move completed on the entries that were pinned, wherever they are now.
+    assert r.status_code == 200
+    assert not (tmp_path / gone).exists()
+    assert (tmp_path / landed).read_text() == content
+    _no_move_leftovers(workspace)
+    _no_move_leftovers(tmp_path / "moved-sub")
