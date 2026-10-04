@@ -1,0 +1,1092 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<style>:root{color-scheme:light;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}body{margin:0}img{max-width:100%}[hidden]{display:none!important}</style>
+<title>불량 분석 에이전트 설계</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: 통제 문서(controlled document) — 왼쪽 고정 목차 + 본문 한 단(약 72자). 그림과 표는 본문 칸 전체 폭을 쓴다. */
+:root{
+  --bg:#F3F5F7; --surface:#FFFFFF; --ink:#16202B; --muted:#566273; --line:#D3DAE2;
+  --accent:#1C5BC9; --accent-soft:#E2EBFA;
+  --warn:#B3261E; --warn-soft:#FCE8E6;
+  --caution:#8A5300; --caution-soft:#FDF0D9;
+  --note:#33557F; --note-soft:#E7EDF5;
+  --ok:#1D6F45; --ok-soft:#E1F2E8;
+  --code:#ECF0F4;
+  --font-body:"IBM Plex Sans KR","Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif;
+  --font-mono:"IBM Plex Mono","IBM Plex Sans KR",ui-monospace,"SFMono-Regular",Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --bg:#0E1318; --surface:#151C24; --ink:#E4E9EF; --muted:#9BA8B7; --line:#2A3542;
+    --accent:#7EA8FF; --accent-soft:#1A2A45;
+    --warn:#FF8B80; --warn-soft:#3A1916;
+    --caution:#F0B54E; --caution-soft:#33260C;
+    --note:#A3BCDD; --note-soft:#1A2533;
+    --ok:#73D3A0; --ok-soft:#122E20;
+    --code:#1A222C;
+    color-scheme:dark;
+  }
+}
+:root[data-theme="dark"]{
+  --bg:#0E1318; --surface:#151C24; --ink:#E4E9EF; --muted:#9BA8B7; --line:#2A3542;
+  --accent:#7EA8FF; --accent-soft:#1A2A45;
+  --warn:#FF8B80; --warn-soft:#3A1916;
+  --caution:#F0B54E; --caution-soft:#33260C;
+  --note:#A3BCDD; --note-soft:#1A2533;
+  --ok:#73D3A0; --ok-soft:#122E20;
+  --code:#1A222C;
+  color-scheme:dark;
+}
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--ink);font-family:var(--font-body);font-size:15px;line-height:1.75;-webkit-text-size-adjust:100%}
+a{color:var(--accent);text-underline-offset:3px}
+a:focus-visible,button:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+code,.mono{font-family:var(--font-mono);font-size:.88em}
+code{background:var(--code);padding:1px 5px;border-radius:3px;word-break:break-word}
+.page{max-width:1200px;margin:0 auto;padding-inline:clamp(16px,4vw,40px);padding-block:36px 72px}
+
+/* ---------- header ---------- */
+.doc-head{display:grid;gap:18px;margin-bottom:36px}
+.eyebrow{font-family:var(--font-mono);font-size:12px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase}
+h1{font-size:clamp(28px,4.2vw,42px);line-height:1.2;font-weight:700;letter-spacing:-.015em;margin:0;text-wrap:balance}
+.lede{font-size:17px;color:var(--ink);max-width:68ch;margin:0}
+.control{display:grid;grid-template-columns:max-content minmax(0,1fr);border:1px solid var(--line);background:var(--surface);margin:0}
+.control dt,.control dd{margin:0;padding:9px 14px;border-top:1px solid var(--line)}
+.control dt:first-of-type,.control dd:first-of-type{border-top:0}
+.control dt{font-family:var(--font-mono);font-size:12px;letter-spacing:.04em;color:var(--muted);background:var(--code);white-space:nowrap}
+.control dd{min-width:0}
+.legend-row{display:flex;flex-wrap:wrap;gap:8px 18px;align-items:center;font-size:13.5px;color:var(--muted)}
+.legend-row span{display:inline-flex;align-items:center;gap:6px}
+
+/* ---------- layout ---------- */
+.layout{display:grid;grid-template-columns:210px minmax(0,1fr);gap:52px;align-items:start}
+.toc{position:sticky;top:calc(env(safe-area-inset-top,0px) + 20px);max-height:calc(100vh - 40px);overflow:auto;font-size:13.5px}
+.toc summary{display:none}
+.toc ol{list-style:none;margin:0;padding:0;display:grid;gap:2px}
+.toc a{display:grid;grid-template-columns:26px minmax(0,1fr);gap:4px;padding:5px 8px;color:var(--muted);text-decoration:none;border-radius:4px}
+.toc a .n{font-family:var(--font-mono);font-size:12px;padding-top:1px}
+.toc a:hover{color:var(--ink);background:var(--code)}
+.toc a[aria-current="true"]{color:var(--accent);background:var(--accent-soft)}
+main{min-width:0}
+section{scroll-margin-top:20px;padding-top:8px;margin-bottom:44px}
+h2{font-size:23px;line-height:1.35;font-weight:700;margin:0 0 16px;display:flex;gap:12px;align-items:baseline;text-wrap:balance;padding-bottom:10px;border-bottom:1px solid var(--line)}
+h2 .num{font-family:var(--font-mono);font-size:15px;color:var(--accent);font-weight:600;min-width:1.6em}
+h3{font-size:17px;font-weight:600;margin:28px 0 10px;text-wrap:balance}
+h3 .num{font-family:var(--font-mono);font-size:13px;color:var(--muted);margin-right:8px;font-weight:500}
+h4{font-size:14.5px;font-weight:600;margin:0 0 6px}
+p,ul,ol{max-width:72ch}
+p{margin:0 0 12px}
+ul,ol{margin:0 0 14px;padding-left:22px}
+li{margin:3px 0}
+li::marker{color:var(--muted)}
+.steps{list-style:none;padding:0;counter-reset:st;display:grid;gap:10px;max-width:none}
+.steps li{display:grid;grid-template-columns:34px minmax(0,1fr);gap:10px;margin:0}
+.steps li::before{counter-increment:st;content:counter(st);font-family:var(--font-mono);font-size:13px;font-weight:600;color:var(--accent);border:1px solid var(--accent);border-radius:50%;width:26px;height:26px;display:grid;place-items:center;margin-top:1px}
+.steps b{font-weight:600}
+
+/* ---------- tags, callouts ---------- */
+.tag{font-family:var(--font-mono);font-size:11.5px;letter-spacing:.03em;padding:1px 8px;border:1px solid currentColor;border-radius:999px;white-space:nowrap;line-height:1.6;display:inline-block}
+.tag.ok{color:var(--ok);background:var(--ok-soft)}
+.tag.doc{color:var(--note);background:var(--note-soft)}
+.tag.todo{color:var(--caution);background:var(--caution-soft)}
+.tag.ex{color:var(--muted);background:var(--code)}
+.callout{display:grid;grid-template-columns:58px minmax(0,1fr);gap:12px;padding:12px 16px;margin:16px 0;max-width:80ch;border:1px solid var(--line)}
+.callout p:last-child,.callout ul:last-child{margin-bottom:0}
+.callout .lbl{font-weight:700;font-size:13px;letter-spacing:.06em;text-align:center;padding:2px 0;align-self:start;border:1.5px solid currentColor}
+.callout.warn{background:var(--warn-soft)} .callout.warn .lbl{color:var(--warn)}
+.callout.caution{background:var(--caution-soft)} .callout.caution .lbl{color:var(--caution)}
+.callout.note{background:var(--note-soft)} .callout.note .lbl{color:var(--note)}
+
+/* ---------- tables ---------- */
+.table-wrap{overflow-x:auto;margin:14px 0 18px;border:1px solid var(--line);background:var(--surface)}
+table{border-collapse:collapse;width:100%;font-size:14px;line-height:1.6}
+th,td{text-align:left;vertical-align:top;padding:9px 12px;border-top:1px solid var(--line)}
+thead th{border-top:0;font-size:12px;font-family:var(--font-mono);letter-spacing:.04em;color:var(--muted);background:var(--code);font-weight:500;white-space:nowrap}
+td.k{font-weight:600;white-space:nowrap}
+td.ref{font-family:var(--font-mono);font-size:12.5px;color:var(--muted);white-space:nowrap}
+td.num{font-variant-numeric:tabular-nums;white-space:nowrap}
+.table-wrap.wide table{min-width:760px}
+
+/* ---------- code ---------- */
+.code-wrap{position:relative;margin:14px 0 18px;max-width:86ch}
+.code-wrap .cap{font-family:var(--font-mono);font-size:12px;color:var(--muted);margin-bottom:6px;display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+pre{margin:0;background:var(--code);border:1px solid var(--line);padding:14px 16px;overflow-x:auto;font-family:var(--font-mono);font-size:13px;line-height:1.65;color:var(--ink);white-space:pre}
+button.copy{position:absolute;top:30px;right:8px;font-family:var(--font-body);font-size:12px;padding:3px 10px;background:var(--surface);color:var(--ink);border:1px solid var(--line);border-radius:4px;cursor:pointer}
+button.copy:hover{border-color:var(--accent);color:var(--accent)}
+
+/* ---------- figures ---------- */
+figure{margin:22px 0 26px}
+.fig-scroll{overflow-x:auto;border:1px solid var(--line);background:var(--surface);padding:14px}
+.fig-scroll svg{display:block;width:100%;height:auto}
+.fig-scroll.w svg{min-width:760px}
+figcaption{font-size:13.5px;color:var(--muted);margin-top:8px;max-width:86ch}
+figcaption b{color:var(--ink);font-weight:600}
+.panels{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px}
+.panel{border:1px solid var(--line);background:var(--surface);padding:12px 12px 10px;min-width:0}
+.panel svg{display:block;width:100%;height:auto;max-width:340px;margin:4px auto 6px}
+.panel p{font-size:13px;margin:0;color:var(--muted)}
+.panel p strong{color:var(--ink);font-weight:600}
+.fig-legend{display:flex;flex-wrap:wrap;gap:6px 18px;font-size:12.5px;color:var(--muted);margin-top:8px}
+.fig-legend i{display:inline-block;width:22px;height:10px;vertical-align:middle;margin-right:6px}
+.lg-run{background:var(--accent)} .lg-sub{background:var(--accent-soft);border:1px solid var(--accent)} .lg-wait{border:1px dashed var(--muted)} .lg-mcp{background:var(--muted);width:12px!important}
+
+/* SVG diagram styling (class-based so both themes apply) */
+.dg{color:var(--ink)}
+.dg text{fill:currentColor;font-family:var(--font-body);font-size:13px}
+.dg .sub{fill:var(--muted);font-size:11.5px}
+.dg .mono{font-family:var(--font-mono);font-size:11.5px}
+.dg .ttl{font-weight:700;font-size:14px}
+.dg .box{fill:var(--surface);stroke:currentColor;stroke-width:1.2}
+.dg .box-hl{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.6}
+.dg .box-err{fill:var(--warn-soft);stroke:var(--warn);stroke-width:1.3}
+.dg .zone{fill:none;stroke:var(--muted);stroke-width:1.1;stroke-dasharray:6 4}
+.dg .zone2{fill:var(--code);stroke:var(--line);stroke-width:1}
+.dg .edge{stroke:currentColor;stroke-width:1.3;fill:none}
+.dg .edge-acc{stroke:var(--accent);stroke-width:1.7;fill:none}
+.dg .edge-warn{stroke:var(--warn);stroke-width:1.3;fill:none}
+.dg .dash{stroke-dasharray:5 4}
+.dg .lblbg{fill:var(--surface)}
+.dg .lblbg2{fill:var(--code)}
+.dg .lane{stroke:var(--line);stroke-width:1}
+.dg .guide{stroke:var(--line);stroke-width:1;stroke-dasharray:2 4}
+.dg .bar{fill:var(--accent)}
+.dg .bar-sub{fill:var(--accent-soft);stroke:var(--accent);stroke-width:1.2}
+.dg .bar-wait{fill:none;stroke:var(--muted);stroke-width:1;stroke-dasharray:3 3}
+.dg .bar-mcp{fill:var(--muted)}
+.dg .tick{fill:var(--ink)}
+.dg .t-warn{fill:var(--warn);font-weight:600}
+.dg .t-ok{fill:var(--ok);font-weight:600}
+.dg .t-acc{fill:var(--accent);font-weight:600}
+.dg .mk{fill:currentColor}
+.dg .mk-acc{fill:var(--accent)}
+.dg .mk-warn{fill:var(--warn)}
+
+/* ---------- filter ---------- */
+.filter{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:6px 0 4px}
+.filter button{font-family:var(--font-body);font-size:13px;padding:4px 12px;border:1px solid var(--line);background:var(--surface);color:var(--ink);border-radius:999px;cursor:pointer}
+.filter button[aria-pressed="true"]{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.filter .count{font-family:var(--font-mono);font-size:12px;color:var(--muted);margin-left:4px}
+details.raw{margin:12px 0;border:1px solid var(--line);background:var(--surface);max-width:none}
+details.raw summary{cursor:pointer;padding:9px 14px;font-size:14px;font-weight:600}
+details.raw ul{padding:4px 16px 12px 34px;max-width:none}
+details.raw li{font-size:13px}
+details.raw code{font-size:12.5px}
+
+/* ---------- responsive ---------- */
+@media (max-width:960px){
+  .layout{grid-template-columns:minmax(0,1fr);gap:20px}
+  .toc{position:static;max-height:none;border:1px solid var(--line);background:var(--surface)}
+  .toc summary{display:block;cursor:pointer;padding:10px 14px;font-weight:600}
+  .toc ol{padding:0 8px 10px}
+  .panels{grid-template-columns:minmax(0,1fr)}
+}
+@media (max-width:560px){
+  .control{grid-template-columns:minmax(0,1fr)}
+  .control dt{border-top:1px solid var(--line)}
+  .control dd{border-top:0;padding-top:2px}
+  .callout{grid-template-columns:minmax(0,1fr);gap:6px}
+  .callout .lbl{justify-self:start;padding:1px 10px}
+  h2{font-size:20px}
+}
+@media (prefers-reduced-motion: reduce){*{scroll-behavior:auto!important;transition:none!important}}
+</style>
+</head>
+<body>
+<div class="page">
+
+<header class="doc-head">
+  <div class="eyebrow">설계 문서 · 초안</div>
+  <h1>불량 분석 에이전트 설계</h1>
+  <p class="lede">oh-my-gateway 위에서 오케스트레이터 하나와 관점 에이전트 여러 개로 불량 원인을 분석한다. 이 문서는 구조, 규칙, 근거, 단계별 계획을 정한다.</p>
+  <dl class="control">
+    <dt>개정</dt><dd>1 · 2026-10-03</dd>
+    <dt>상태</dt><dd>초안. 아직 검토하지 않았다.</dd>
+    <dt>기준 버전</dt><dd>oh-my-gateway <code>main 956a65c</code> · claude-agent-sdk <code>0.2.160</code> · 번들 CLI <code>2.1.283</code></dd>
+    <dt>작성 규칙</dt><dd>ASD-STE100의 원칙을 약 80% 적용한다. 한 문장에 정보 하나를 쓴다. 문장을 짧게 쓴다. 능동형으로 쓴다. §2에서 정의한 용어만 쓴다. 결론을 먼저 쓴다.</dd>
+    <dt>근거 표기</dt><dd><span class="tag ok">확인됨</span> 실제 CLI로 시험했다 (가짜 모델, 비용 0). 또는 CLI 바이너리나 게이트웨이 코드에서 직접 확인했다. <span class="tag doc">문서</span> 공식 문서나 변경 이력에 있다. <span class="tag todo">확인 필요</span> 아직 시험하지 않았다. <span class="tag ex">예시</span> 설명용 예시다.</dd>
+    <dt>보안</dt><dd>사내 도구(플러그인)의 내용은 이 문서에 넣지 않는다. 이 문서는 구조와 규칙만 다룬다.</dd>
+    <dt>Markdown</dt><dd>같은 폴더의 <a href="2026-10-03-defect-analysis-multi-agent-design.md"><code>2026-10-03-defect-analysis-multi-agent-design.md</code></a>. 내용은 같다.</dd>
+  </dl>
+  <div class="legend-row" aria-label="주의 문구 표기">
+    <span><b style="color:var(--warn)">경고</b> 보안 또는 데이터 위험</span>
+    <span><b style="color:var(--caution)">주의</b> 결과를 잃거나 동작이 깨진다</span>
+    <span><b style="color:var(--note)">참고</b> 판단에 도움이 되는 정보</span>
+  </div>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="목차">
+  <details id="toc-d" open>
+    <summary>목차</summary>
+    <ol>
+      <li><a href="#s1"><span class="n">1</span><span>결정 요약</span></a></li>
+      <li><a href="#s2"><span class="n">2</span><span>용어</span></a></li>
+      <li><a href="#s3"><span class="n">3</span><span>배경과 범위</span></a></li>
+      <li><a href="#s4"><span class="n">4</span><span>전체 구조</span></a></li>
+      <li><a href="#s5"><span class="n">5</span><span>분석 흐름</span></a></li>
+      <li><a href="#s6"><span class="n">6</span><span>구성 요소</span></a></li>
+      <li><a href="#s7"><span class="n">7</span><span>도구 범위</span></a></li>
+      <li><a href="#s8"><span class="n">8</span><span>게이트웨이 변경 제안</span></a></li>
+      <li><a href="#s9"><span class="n">9</span><span>확인된 동작과 제약</span></a></li>
+      <li><a href="#s10"><span class="n">10</span><span>보안과 운영</span></a></li>
+      <li><a href="#s11"><span class="n">11</span><span>대안과 판단 기록</span></a></li>
+      <li><a href="#s12"><span class="n">12</span><span>평가 계획</span></a></li>
+      <li><a href="#s13"><span class="n">13</span><span>단계별 계획</span></a></li>
+      <li><a href="#s14"><span class="n">14</span><span>열린 질문</span></a></li>
+      <li><a href="#s15"><span class="n">15</span><span>부록: 검증과 출처</span></a></li>
+    </ol>
+  </details>
+</nav>
+
+<main>
+
+<!-- 1 -->
+<section id="s1">
+  <h2><span class="num">1</span>결정 요약</h2>
+  <p>이 표가 이 문서의 결론이다. 근거는 오른쪽 열의 절에 있다.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>항목</th><th>결정</th><th>절</th></tr></thead>
+      <tbody>
+        <tr><td class="k">하네스</td><td>Claude Code를 쓴다. oh-my-gateway의 Claude 백엔드가 실행한다. 사내 도구가 Claude 플러그인이기 때문이다.</td><td class="ref">§4</td></tr>
+        <tr><td class="k">구조</td><td>오케스트레이터 1개와 관점 에이전트 N개를 쓴다. 관점 에이전트는 한 턴 안에서 병렬로 실행된다.</td><td class="ref">§4, §5</td></tr>
+        <tr><td class="k">관점 에이전트 정의</td><td>1단계는 사내 플러그인의 <code>agents/*.md</code>에 둔다. 2단계는 게이트웨이 레지스트리로 옮긴다.</td><td class="ref">§6.2, §8</td></tr>
+        <tr><td class="k">도구 범위</td><td>관점 에이전트마다 자기 도구만 보게 한다. 1단계는 <code>tools</code> 허용 목록을 쓴다. 2단계는 관점 전용 MCP 연결을 게이트웨이에 추가한다.</td><td class="ref">§7, §8</td></tr>
+        <tr><td class="k">보고</td><td>모든 관점 에이전트가 같은 보고 형식을 쓴다.</td><td class="ref">§6.3</td></tr>
+        <tr><td class="k">지식</td><td>확정된 원인은 사례 DB에 저장한다. 세션 기억에 두지 않는다.</td><td class="ref">§6.5</td></tr>
+        <tr><td class="k">A2A, 상주 에이전트</td><td>1단계와 2단계에서 쓰지 않는다.</td><td class="ref">§11</td></tr>
+        <tr><td class="k">CLI 세션 간 메시징</td><td>쓰지 않는다. 사용자 간 격리가 되지 않는다.</td><td class="ref">§10</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- 2 -->
+<section id="s2">
+  <h2><span class="num">2</span>용어</h2>
+  <p>이 문서는 아래 뜻으로만 용어를 쓴다.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>용어</th><th>뜻</th></tr></thead>
+      <tbody>
+        <tr><td class="k">게이트웨이</td><td>oh-my-gateway. Claude Code를 HTTP API로 제공하는 서버.</td></tr>
+        <tr><td class="k">하네스</td><td>에이전트 루프를 실행하는 런타임. 이 문서에서는 Claude Code CLI.</td></tr>
+        <tr><td class="k">세션</td><td>게이트웨이의 대화 하나. CLI 프로세스 하나가 세션 하나를 실행한다.</td></tr>
+        <tr><td class="k">턴</td><td>클라이언트 요청 하나와 그 응답.</td></tr>
+        <tr><td class="k">오케스트레이터</td><td>세션의 메인 에이전트. 분석을 나누고 결과를 종합한다.</td></tr>
+        <tr><td class="k">관점 에이전트</td><td>관점 하나를 맡는 서브에이전트.</td></tr>
+        <tr><td class="k">검증 에이전트</td><td>교차 검증 때 새로 호출하는 포그라운드 서브에이전트.</td></tr>
+        <tr><td class="k">서브에이전트</td><td>CLI가 같은 프로세스 안에서 실행하는 하위 에이전트. 작업 유형은 <code>local_agent</code>이다.</td></tr>
+        <tr><td class="k">포그라운드</td><td>턴 안에서 끝나는 실행. 턴은 포그라운드 서브에이전트가 끝날 때까지 기다린다.</td></tr>
+        <tr><td class="k">백그라운드</td><td>턴이 끝난 뒤에도 계속되는 실행. 결과는 pending-events로 나간다.</td></tr>
+        <tr><td class="k">pending-events</td><td>턴 사이의 이벤트를 받는 게이트웨이 API. <code>GET /v1/sessions/{id}/pending-events</code>.</td></tr>
+        <tr><td class="k">플러그인</td><td>Claude Code 확장 묶음. 스킬, 에이전트, 커맨드, 훅, MCP 서버를 담는다.</td></tr>
+        <tr><td class="k">MCP 서버</td><td>도구를 제공하는 프로세스 또는 HTTP 서버.</td></tr>
+        <tr><td class="k">도구 정의</td><td>도구의 이름, 설명, 입력 스키마. 모델 호출마다 요청에 실린다.</td></tr>
+        <tr><td class="k">스킬</td><td>절차 설명과 스크립트의 묶음. 목록에는 이름과 설명만 실린다. 본문은 쓸 때 읽힌다.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- 3 -->
+<section id="s3">
+  <h2><span class="num">3</span>배경과 범위</h2>
+  <h3><span class="num">3.1</span>목표</h3>
+  <ul>
+    <li>불량 한 건을 여러 관점에서 동시에 분석한다.</li>
+    <li>관점별 근거를 비교해서 원인 후보의 순위를 정한다.</li>
+    <li>판정과 근거를 사람이 검토할 수 있게 보여 준다.</li>
+  </ul>
+  <h3><span class="num">3.2</span>범위 밖</h3>
+  <ul>
+    <li>상주 에이전트와 A2A 노출. 다시 볼 조건은 §11에 있다.</li>
+    <li>CLI 세션 간 메시징. 이유는 §10에 있다.</li>
+    <li>예약 실행. 게이트웨이는 기본 설정(<code>BLOCKED_DEFERRED_TOOLS</code>)에서 <code>ScheduleWakeup</code>과 <code>CronCreate</code>를 막는다.</li>
+    <li>사내 도구의 내용. 보안 때문에 이 문서에 넣지 않는다.</li>
+  </ul>
+  <h3><span class="num">3.3</span>전제</h3>
+  <ul>
+    <li>사내 도구는 Claude 플러그인으로 이미 구현되어 있다.</li>
+    <li>모든 모델 호출은 UniBridge를 거친다.</li>
+    <li>운영 서버는 워크스페이스 샌드박스를 켠다 (2026-09-27 사용자 확인).</li>
+  </ul>
+</section>
+
+<!-- 4 -->
+<section id="s4">
+  <h2><span class="num">4</span>전체 구조</h2>
+  <figure>
+    <div class="fig-scroll w">
+      <svg class="dg" viewBox="0 0 980 410" role="img" aria-label="그림 1. 앱이 게이트웨이로 턴을 보낸다. 한 세션의 CLI 프로세스 안에서 오케스트레이터가 관점 에이전트 세 개를 병렬로 호출한다. 관점 에이전트는 MCP 서버로 데이터를 조회한다. 오케스트레이터는 공통 조회 도구만 쓴다. 모든 모델 호출은 UniBridge를 거친다.">
+        <defs>
+          <marker id="f1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+          <marker id="f1b" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-acc"/></marker>
+        </defs>
+        <!-- app -->
+        <rect class="box" x="16" y="112" width="150" height="72" rx="6"/>
+        <text x="91" y="143" text-anchor="middle" class="ttl">불량 분석 앱</text>
+        <text x="91" y="164" text-anchor="middle" class="sub">클라이언트</text>
+        <!-- gateway zone -->
+        <rect class="zone" x="214" y="18" width="548" height="378" rx="10"/>
+        <text x="232" y="42" class="ttl">oh-my-gateway</text>
+        <text x="232" y="60" class="sub">인증 · 워크스페이스 격리 · 이벤트 전달</text>
+        <!-- session zone -->
+        <rect class="zone2" x="238" y="76" width="500" height="306" rx="8"/>
+        <text x="254" y="98" class="sub">세션 1개 = CLI 프로세스 1개</text>
+        <!-- orchestrator -->
+        <rect class="box-hl" x="380" y="112" width="220" height="64" rx="6"/>
+        <text x="490" y="140" text-anchor="middle" class="ttl">오케스트레이터</text>
+        <text x="490" y="160" text-anchor="middle" class="sub">메인 에이전트</text>
+        <!-- request / response -->
+        <line class="edge" x1="166" y1="134" x2="378" y2="134" marker-end="url(#f1a)"/>
+        <rect class="lblbg" x="206" y="114" width="136" height="16"/>
+        <text x="274" y="126" text-anchor="middle" class="mono">POST /v1/responses</text>
+        <line class="edge dash" x1="378" y1="156" x2="168" y2="156" marker-end="url(#f1a)"/>
+        <rect class="lblbg" x="196" y="164" width="158" height="16"/>
+        <text x="275" y="176" text-anchor="middle" class="mono">SSE: task_* · 결과</text>
+        <!-- fan to perspectives (both ways) -->
+        <line class="edge-acc" x1="440" y1="176" x2="334" y2="268" marker-start="url(#f1b)" marker-end="url(#f1b)"/>
+        <line class="edge-acc" x1="490" y1="176" x2="490" y2="268" marker-start="url(#f1b)" marker-end="url(#f1b)"/>
+        <line class="edge-acc" x1="540" y1="176" x2="646" y2="268" marker-start="url(#f1b)" marker-end="url(#f1b)"/>
+        <rect class="lblbg2" x="402" y="203" width="176" height="38"/>
+        <text x="490" y="218" text-anchor="middle" class="t-acc">Agent 호출 ×3 · 한 응답</text>
+        <text x="490" y="235" text-anchor="middle" class="sub">병렬 실행 ↓ · 보고 회수 ↑</text>
+        <!-- perspectives -->
+        <rect class="box" x="264" y="270" width="140" height="58" rx="6"/>
+        <text x="334" y="295" text-anchor="middle">관점 A · 공정</text>
+        <text x="334" y="314" text-anchor="middle" class="sub mono">local_agent</text>
+        <rect class="box" x="420" y="270" width="140" height="58" rx="6"/>
+        <text x="490" y="295" text-anchor="middle">관점 B · 설비</text>
+        <text x="490" y="314" text-anchor="middle" class="sub mono">local_agent</text>
+        <rect class="box" x="576" y="270" width="140" height="58" rx="6"/>
+        <text x="646" y="295" text-anchor="middle">관점 C · 자재</text>
+        <text x="646" y="314" text-anchor="middle" class="sub mono">local_agent</text>
+        <!-- bus to MCP -->
+        <line class="edge" x1="334" y1="328" x2="334" y2="352"/>
+        <line class="edge" x1="490" y1="328" x2="490" y2="352"/>
+        <line class="edge" x1="646" y1="328" x2="646" y2="352"/>
+        <line class="edge" x1="334" y1="352" x2="882" y2="352"/>
+        <line class="edge" x1="882" y1="352" x2="882" y2="320" marker-end="url(#f1a)"/>
+        <text x="500" y="372" text-anchor="middle" class="sub">도구 호출 · 각자 허용된 도구만</text>
+        <!-- orchestrator common lookup -->
+        <line class="edge" x1="600" y1="170" x2="838" y2="258" marker-end="url(#f1a)"/>
+        <rect class="lblbg2" x="640" y="180" width="62" height="17"/>
+        <text x="671" y="193" text-anchor="middle" class="sub">공통 조회</text>
+        <!-- MCP -->
+        <rect class="box" x="800" y="260" width="164" height="58" rx="6"/>
+        <text x="882" y="285" text-anchor="middle" class="ttl">MCP 서버</text>
+        <text x="882" y="305" text-anchor="middle" class="sub">사내 플러그인 · 사례 DB</text>
+        <!-- UniBridge -->
+        <rect class="box" x="800" y="112" width="164" height="64" rx="6"/>
+        <text x="882" y="140" text-anchor="middle" class="ttl">UniBridge</text>
+        <text x="882" y="160" text-anchor="middle" class="sub">모델 호출 경로</text>
+        <line class="edge" x1="600" y1="144" x2="798" y2="144" marker-end="url(#f1a)"/>
+        <rect class="lblbg" x="632" y="124" width="140" height="16"/>
+        <text x="702" y="136" text-anchor="middle" class="sub">모델 호출 · 모든 에이전트</text>
+      </svg>
+    </div>
+    <figcaption><b>그림 1.</b> 관점 에이전트는 오케스트레이터와 같은 세션(CLI 프로세스 1개) 안에서 병렬로 실행된다. 별도 서버나 A2A가 필요 없다.</figcaption>
+  </figure>
+  <ul>
+    <li>앱이 <code>/v1/responses</code>로 턴을 보낸다.</li>
+    <li>게이트웨이가 세션의 CLI 프로세스에 턴을 넘긴다.</li>
+    <li>오케스트레이터가 관점 에이전트를 한 응답 안에서 여러 개 호출한다.</li>
+    <li>CLI가 그 호출들을 병렬로 실행한다.</li>
+    <li>관점 에이전트는 MCP 서버의 도구로 데이터를 조회한다.</li>
+    <li>모든 에이전트의 모델 호출은 UniBridge를 거친다.</li>
+    <li>게이트웨이는 관점 에이전트마다 <code>response.task_*</code> 이벤트를 앱으로 보낸다.</li>
+  </ul>
+  <h3><span class="num">4.1</span>Claude Code를 하네스로 고른 이유</h3>
+  <ul>
+    <li>사내 도구가 Claude 플러그인이다. MCP 서버는 다른 하네스에서도 그대로 쓸 수 있다. 스킬, 에이전트, 커맨드, 훅은 하네스마다 다시 맞춰야 한다.</li>
+    <li>게이트웨이의 운영 장치를 그대로 쓴다. 워크스페이스 샌드박스, <code>~/.claude</code> 보호, MCP 진행 알림 중계, 도구 결과 크기 한도 상향, 프롬프트 버전 관리, UniBridge 사용량 기록이 이미 있다.</li>
+    <li>개발자가 로컬 Claude Code에서 시험한 에이전트 정의가 서버에서 똑같이 동작한다.</li>
+  </ul>
+  <div class="callout note"><span class="lbl">참고</span><div><p>관점 에이전트는 오케스트레이터와 같은 CLI 프로세스 안에서 실행된다. 관점 수만큼 프로세스가 늘지 않는다.</p></div></div>
+</section>
+
+<!-- 5 -->
+<section id="s5">
+  <h2><span class="num">5</span>분석 흐름</h2>
+  <p>한 턴은 아래 일곱 단계로 진행된다. 그림 2는 시간 순서를 보여 준다.</p>
+  <figure>
+    <div class="fig-scroll w">
+      <svg class="dg" viewBox="0 0 980 360" role="img" aria-label="그림 2. 한 턴의 흐름. 관점 에이전트 세 개가 같은 시점에 시작한다. 턴은 가장 늦게 끝나는 관점을 기다린다. 교차 검증은 새 포그라운드 호출로 한다.">
+        <defs>
+          <marker id="f2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+        </defs>
+        <!-- step labels -->
+        <text x="160" y="24" text-anchor="middle" class="t-acc">① 접수</text>
+        <text x="236" y="24" text-anchor="middle" class="t-acc">② 맥락</text>
+        <text x="320" y="24" text-anchor="middle" class="t-acc">③ 병렬 호출</text>
+        <text x="548" y="24" text-anchor="middle" class="t-acc">④ 보고</text>
+        <text x="620" y="24" text-anchor="middle" class="t-acc">⑤ 교차 검증</text>
+        <text x="800" y="24" text-anchor="middle" class="t-acc">⑥ 판정</text>
+        <text x="900" y="24" text-anchor="middle" class="t-acc">⑦ 완료</text>
+        <!-- guides -->
+        <line class="guide" x1="160" y1="34" x2="160" y2="340"/>
+        <line class="guide" x1="236" y1="34" x2="236" y2="340"/>
+        <line class="guide" x1="320" y1="34" x2="320" y2="340"/>
+        <line class="guide" x1="548" y1="34" x2="548" y2="340"/>
+        <line class="guide" x1="620" y1="34" x2="620" y2="340"/>
+        <line class="guide" x1="800" y1="34" x2="800" y2="340"/>
+        <line class="guide" x1="900" y1="34" x2="900" y2="340"/>
+        <!-- lanes -->
+        <text x="16" y="68">앱</text>
+        <text x="16" y="116">오케스트레이터</text>
+        <text x="16" y="162">관점 A</text>
+        <text x="16" y="200">관점 B</text>
+        <text x="16" y="238">관점 C</text>
+        <text x="16" y="280">검증 에이전트</text>
+        <text x="16" y="326">MCP 서버</text>
+        <line class="lane" x1="140" y1="64" x2="964" y2="64"/>
+        <line class="lane" x1="140" y1="112" x2="964" y2="112"/>
+        <line class="lane" x1="140" y1="158" x2="964" y2="158"/>
+        <line class="lane" x1="140" y1="196" x2="964" y2="196"/>
+        <line class="lane" x1="140" y1="234" x2="964" y2="234"/>
+        <line class="lane" x1="140" y1="276" x2="964" y2="276"/>
+        <line class="lane" x1="140" y1="322" x2="964" y2="322"/>
+        <!-- orchestrator bars -->
+        <rect class="bar" x="160" y="105" width="160" height="14"/>
+        <rect class="bar-wait" x="320" y="105" width="228" height="14"/>
+        <rect class="bar" x="548" y="105" width="72" height="14"/>
+        <rect class="bar-wait" x="620" y="105" width="180" height="14"/>
+        <rect class="bar" x="800" y="105" width="100" height="14"/>
+        <!-- perspectives (parallel) -->
+        <rect class="bar-sub" x="320" y="151" width="170" height="14"/>
+        <rect class="bar-sub" x="320" y="189" width="228" height="14"/>
+        <rect class="bar-sub" x="320" y="227" width="130" height="14"/>
+        <!-- verifier -->
+        <rect class="bar-sub" x="620" y="269" width="170" height="14"/>
+        <!-- MCP calls -->
+        <rect class="bar-mcp" x="228" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="338" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="366" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="398" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="434" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="476" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="652" y="317" width="16" height="10"/>
+        <rect class="bar-mcp" x="712" y="317" width="16" height="10"/>
+        <!-- request -->
+        <line class="edge" x1="160" y1="66" x2="160" y2="102" marker-end="url(#f2a)"/>
+        <text x="166" y="88" class="sub">요청</text>
+        <!-- spawn ×3 -->
+        <line class="edge" x1="320" y1="120" x2="320" y2="238" marker-end="url(#f2a)"/>
+        <text x="314" y="182" text-anchor="end" class="sub">Agent ×3</text>
+        <!-- reports return (slowest = B) -->
+        <line class="edge" x1="548" y1="190" x2="548" y2="122" marker-end="url(#f2a)"/>
+        <text x="556" y="150" class="sub">보고 회수</text>
+        <!-- verifier spawn and return -->
+        <line class="edge" x1="620" y1="120" x2="620" y2="266" marker-end="url(#f2a)"/>
+        <text x="626" y="250" class="sub">새 Agent 호출</text>
+        <line class="edge" x1="790" y1="270" x2="790" y2="122" marker-end="url(#f2a)"/>
+        <text x="782" y="250" text-anchor="end" class="sub">보고</text>
+        <!-- events to app -->
+        <rect class="tick" x="317" y="58" width="6" height="12"/>
+        <text x="326" y="52" class="mono">task_started ×3</text>
+        <rect class="tick" x="447" y="58" width="6" height="12"/>
+        <rect class="tick" x="487" y="58" width="6" height="12"/>
+        <rect class="tick" x="545" y="58" width="6" height="12"/>
+        <text x="440" y="84" class="mono">task_notification ×3</text>
+        <line class="edge" x1="900" y1="104" x2="900" y2="70" marker-end="url(#f2a)"/>
+        <text x="906" y="52" class="mono">completed</text>
+        <text x="906" y="90" class="sub">결과</text>
+      </svg>
+    </div>
+    <div class="fig-legend" aria-hidden="true">
+      <span><i class="lg-run"></i>오케스트레이터 실행</span>
+      <span><i class="lg-sub"></i>서브에이전트 실행</span>
+      <span><i class="lg-wait"></i>대기 (포그라운드 호출이 끝나기를 기다림)</span>
+      <span><i class="lg-mcp"></i>MCP 도구 호출</span>
+    </div>
+    <figcaption><b>그림 2.</b> 관점 에이전트 세 개가 같은 시점에 시작한다. 턴은 가장 늦게 끝나는 관점(B)을 기다린다. 교차 검증은 새 포그라운드 호출로 한다. 막대 길이는 설명용이다.</figcaption>
+  </figure>
+  <ol class="steps">
+    <li><div><b>접수.</b> 앱이 불량 건 ID를 담아 턴을 보낸다.</div></li>
+    <li><div><b>맥락 수집.</b> 오케스트레이터가 공통 도구로 불량 건 정보를 읽는다. 읽는 항목은 lot, 공정 단계, 발생 시점, 불량 유형이다.</div></li>
+    <li><div><b>병렬 호출.</b> 오케스트레이터가 고른 관점 에이전트를 한 응답에서 모두 호출한다. 호출마다 <code>name</code>을 붙인다.</div></li>
+    <li><div><b>보고.</b> 관점 에이전트는 공통 보고 형식(§6.3)으로 보고하고 끝난다. 턴은 가장 늦게 끝나는 관점을 기다린다.</div></li>
+    <li><div><b>교차 검증.</b> 관점끼리 결론이 충돌하면 오케스트레이터가 새 포그라운드 Agent 호출로 확인한다. 호출 입력에 확인할 질문과 관련 보고를 넣는다.</div></li>
+    <li><div><b>판정.</b> 오케스트레이터가 원인 후보 순위, 근거, 신뢰도, 부족한 데이터를 낸다.</div></li>
+    <li><div><b>완료.</b> 게이트웨이가 결과와 <code>response.completed</code>를 앱으로 보낸다.</div></li>
+  </ol>
+  <div class="callout caution"><span class="lbl">주의</span><div><p>관점 에이전트 호출을 여러 응답으로 나누지 않는다. 포그라운드 호출은 끝날 때까지 다음 응답을 막는다. 응답을 나누면 관점이 하나씩 순서대로 실행된다.</p></div></div>
+  <div class="callout caution"><span class="lbl">주의</span><div><p>끝난 관점 에이전트에게 SendMessage를 보내지 않는다. 그 에이전트는 백그라운드로 재개된다. 턴이 먼저 끝나면 결과는 pending-events로 나간다. 2026-09-27 실제 모델 시험에서 결과는 약 25초 뒤에 도착했다. <span class="tag ok">확인됨</span></p></div></div>
+  <div class="callout note"><span class="lbl">참고</span><div><p>실행 중인 관점 에이전트끼리는 SendMessage로 메시지를 주고받을 수 있다. 받는 쪽은 다음 도구 호출 때 메시지를 읽는다. <span class="tag ok">확인됨</span></p></div></div>
+</section>
+
+<!-- 6 -->
+<section id="s6">
+  <h2><span class="num">6</span>구성 요소</h2>
+
+  <h3><span class="num">6.1</span>오케스트레이터</h3>
+  <ul>
+    <li>정의 위치: 게이트웨이 프롬프트 라이브러리의 기본 프롬프트. 프롬프트 라이브러리는 버전을 쌓는다. 배포, 되돌리기, 시험 실행을 지원한다.</li>
+    <li>도구: 공통 조회 도구와 Agent 도구만 쓴다. 분석 도구를 직접 쓰지 않는다.</li>
+    <li>판정 형식: §6.3의 보고를 모아 원인 후보 순위를 낸다.</li>
+  </ul>
+  <div class="code-wrap">
+    <div class="cap">오케스트레이터 프롬프트 <span class="tag ex">예시</span></div>
+    <button class="copy" type="button">복사</button>
+<pre>너는 불량 분석 오케스트레이터다.
+너는 직접 분석하지 않는다. 관점 에이전트에게 분석을 나누고 결과를 종합한다.
+
+절차
+1. 불량 건 정보를 조회한다: lot, 공정 단계, 발생 시점, 불량 유형.
+2. 분석할 관점을 고른다. 고른 이유를 한 문장으로 적는다.
+3. 고른 관점 에이전트를 한 응답에서 모두 호출한다. 호출마다 name을 붙인다.
+4. 각 보고가 공통 보고 형식을 지키는지 확인한다.
+5. 결론이 충돌하면 새 Agent 호출로 확인한다. 끝난 에이전트에게 SendMessage를 보내지 않는다.
+6. 판정을 낸다: 원인 후보 순위, 근거, 신뢰도, 부족한 데이터.</pre>
+  </div>
+  <div class="callout note"><span class="lbl">참고</span><div><p>세션은 첫 요청에서 받은 시스템 프롬프트를 계속 쓴다. 기본 프롬프트를 바꾸면 새 세션에만 적용된다.</p></div></div>
+
+  <h3><span class="num">6.2</span>관점 에이전트</h3>
+  <ul>
+    <li>정의 위치: 사내 플러그인의 <code>agents/&lt;관점&gt;.md</code>.</li>
+    <li>호출 이름: <code>&lt;플러그인&gt;:&lt;관점&gt;</code>. 예: <code>defect-perspectives:equipment</code>. 접두사 없이 부르면 <code>Agent type 'equipment' not found.</code> 오류가 난다. <span class="tag ok">확인됨</span></li>
+    <li><code>tools</code>: 이 에이전트가 볼 도구를 정한다. <code>mcp__&lt;서버&gt;</code> 또는 <code>mcp__&lt;서버&gt;__*</code>로 서버 단위로 허용한다. 생략하면 모든 도구를 상속한다. <span class="tag doc">문서</span></li>
+    <li><code>skills</code>: 시작할 때 스킬 본문을 미리 넣는다. 사용할 수 있는 스킬을 제한하지 않는다. 관점의 핵심 스킬만 넣는다. <span class="tag doc">문서</span></li>
+    <li><code>model</code>, <code>maxTurns</code>: 관점별 비용 상한에 쓴다.</li>
+    <li>플러그인 에이전트는 <code>hooks</code>, <code>mcpServers</code>, <code>permissionMode</code>를 무시한다. <span class="tag doc">문서</span> <span class="tag ok">확인됨</span></li>
+  </ul>
+  <div class="code-wrap">
+    <div class="cap">agents/equipment.md <span class="tag ex">예시</span></div>
+    <button class="copy" type="button">복사</button>
+<pre>---
+name: equipment
+description: 설비 관점 불량 분석. 설비 센서 추이와 정비 이력으로 원인 후보를 찾는다.
+tools: mcp__&lt;설비-서버&gt;, Read
+model: &lt;모델 별칭&gt;
+maxTurns: 30
+---
+너는 설비 관점 분석가다.
+
+1. 불량 발생 시점 전후의 설비 데이터를 조회한다.
+2. 불량 lot이 지난 설비와 챔버를 확인한다.
+3. 정비 이력과 불량 시점을 비교한다.
+4. 공통 보고 형식으로 보고한다. 원본 데이터는 파일 경로로 넘긴다.</pre>
+  </div>
+  <p>아래 관점은 설명용 예시다. 실제 관점은 사내에서 정한다. <span class="tag ex">예시</span></p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>관점</th><th>보는 데이터</th><th>대표 질문</th></tr></thead>
+      <tbody>
+        <tr><td class="k">공정</td><td>레시피, 공정 조건 변경 이력</td><td>불량 시점 전후에 바뀐 조건이 있는가?</td></tr>
+        <tr><td class="k">설비</td><td>FDC 센서 추이, 정비(PM) 이력</td><td>특정 설비나 챔버에 불량이 몰리는가?</td></tr>
+        <tr><td class="k">자재</td><td>자재 lot, 공급사 변경</td><td>자재 변경 시점과 불량 시점이 겹치는가?</td></tr>
+        <tr><td class="k">계측·검사</td><td>스펙 이탈, 결함 맵 패턴</td><td>불량 패턴이 알려진 유형과 맞는가?</td></tr>
+        <tr><td class="k">통계</td><td>공통성(commonality) 분석, 상관 분석</td><td>불량 lot들이 공유하는 경로가 있는가?</td></tr>
+        <tr><td class="k">과거 사례</td><td>사례 DB의 확정 원인</td><td>비슷한 사례의 확정 원인은 무엇이었나?</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3><span class="num">6.3</span>공통 보고 형식</h3>
+  <ul>
+    <li>근거마다 출처와 조회 조건을 남긴다.</li>
+    <li>신뢰도는 0과 1 사이의 수로 적는다.</li>
+    <li>반대 증거를 빼지 않는다.</li>
+    <li>조회하지 못한 데이터는 <code>data_gaps</code>에 적는다.</li>
+    <li>보고를 짧게 쓴다. 원본 데이터는 파일 경로로 넘긴다.</li>
+  </ul>
+  <div class="code-wrap">
+    <div class="cap">보고 형식 <span class="tag ex">예시</span></div>
+    <button class="copy" type="button">복사</button>
+<pre>{
+  "perspective": "equipment",
+  "case_id": "&lt;불량 건 ID&gt;",
+  "hypotheses": [
+    {
+      "cause": "&lt;원인 후보&gt;",
+      "confidence": 0.6,
+      "evidence": [
+        { "source": "&lt;도구 이름&gt;", "query": "&lt;조회 조건&gt;", "finding": "&lt;관찰 결과&gt;" }
+      ],
+      "counter_evidence": ["&lt;반대 증거&gt;"]
+    }
+  ],
+  "data_gaps": ["&lt;조회하지 못한 데이터와 이유&gt;"],
+  "artifacts": ["&lt;원본 데이터 파일 경로&gt;"]
+}</pre>
+  </div>
+
+  <h3><span class="num">6.4</span>도구와 데이터</h3>
+  <ul>
+    <li>도구를 파라미터형으로 묶는다. 예: 센서 그룹마다 도구 하나 대신 <code>query_fdc(group, lot, step, 기간)</code> 하나를 둔다. 도구 수를 줄이는 것이 효과가 가장 크다.</li>
+    <li>조회 전용 도구는 MCP 서버에서 <code>annotations.readOnlyHint: true</code>를 선언한다. 한 응답의 도구 호출 묶음은 모든 도구가 조회 전용일 때만 동시에 실행된다. <span class="tag ok">확인됨</span></li>
+    <li>게이트웨이의 <code>readOnlyTools</code> 설정은 HTTP MCP 서버에만 적용된다. stdio 서버는 서버 쪽에서 선언한다.</li>
+    <li>큰 결과는 파일로 저장하고 요약만 반환한다. 메시지 하나가 게이트웨이 한도를 넘으면 턴 전체가 실패한다. 기본 한도는 16 MiB 설정값이다. 고정된 SDK는 이 값을 바이트가 아니라 문자 수로 센다.</li>
+    <li>오래 걸리는 도구는 진행 알림(<code>notifications/progress</code>)을 보낸다. 게이트웨이는 HTTP MCP 서버의 진행 알림을 <code>response.tool_progress</code>로 앱에 전달한다.</li>
+    <li>게이트웨이의 MCP 도구 시간 한도는 기본 10분(600000 ms)이다.</li>
+    <li>분석 절차는 스킬로 만든다. 예: 공통성 분석, SPC 판정, 결함 맵 패턴 판정.</li>
+  </ul>
+  <div class="callout caution"><span class="lbl">주의</span><div><p>스킬의 스크립트는 Bash로 실행된다. 관점 에이전트의 <code>tools</code>에서 Bash를 빼면 그 관점은 스크립트를 실행할 수 없다. 스크립트가 필요한 관점에만 Bash를 허용한다.</p></div></div>
+
+  <h3><span class="num">6.5</span>지식 (사례 DB)</h3>
+  <ul>
+    <li>확정된 불량 원인을 사례 DB에 저장한다.</li>
+    <li>관점 에이전트는 MCP 도구로 유사 사례를 조회한다.</li>
+    <li>지식을 세션 기억에 두지 않는다. 이유는 두 가지다.
+      <ul>
+        <li>세션은 마지막 요청 후 60분이 지나면 만료된다 (기본값).</li>
+        <li>CLI가 재시작되면 서브에이전트 이름이 사라진다 (그림 3).</li>
+      </ul>
+    </li>
+  </ul>
+  <figure>
+    <div class="fig-scroll w">
+      <svg class="dg" viewBox="0 0 980 258" role="img" aria-label="그림 3. 관점 에이전트의 수명. 실행 중인 에이전트는 보고하고 끝난다. 끝난 에이전트는 SendMessage로 백그라운드에서 재개된다. CLI가 재시작되면 이름이 사라지고 ID로만 부를 수 있다.">
+        <defs>
+          <marker id="f3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker>
+          <marker id="f3w" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk-warn"/></marker>
+        </defs>
+        <rect class="box-hl" x="16" y="40" width="176" height="62" rx="12"/>
+        <text x="104" y="67" text-anchor="middle" class="ttl">실행 중</text>
+        <text x="104" y="87" text-anchor="middle" class="sub">포그라운드 · 턴 안</text>
+        <rect class="box" x="300" y="40" width="236" height="62" rx="12"/>
+        <text x="418" y="67" text-anchor="middle" class="ttl">끝남</text>
+        <text x="418" y="87" text-anchor="middle" class="sub">기록: 디스크 · 이름: 프로세스 메모리</text>
+        <rect class="box" x="700" y="40" width="200" height="62" rx="12"/>
+        <text x="800" y="67" text-anchor="middle" class="ttl">재개됨</text>
+        <text x="800" y="87" text-anchor="middle" class="sub">백그라운드 · 맥락 유지</text>
+        <rect class="box" x="300" y="180" width="236" height="62" rx="12"/>
+        <text x="418" y="207" text-anchor="middle" class="ttl">끝남 (CLI 재시작 뒤)</text>
+        <text x="418" y="227" text-anchor="middle" class="sub">기록: 디스크 · 이름: 없음</text>
+        <rect class="box-err" x="700" y="188" width="200" height="50" rx="6"/>
+        <text x="800" y="209" text-anchor="middle">이름으로 호출 → 오류</text>
+        <text x="800" y="227" text-anchor="middle" class="sub mono">No agent named … reachable</text>
+        <!-- transitions -->
+        <line class="edge" x1="192" y1="71" x2="298" y2="71" marker-end="url(#f3a)"/>
+        <text x="245" y="62" text-anchor="middle" class="sub">보고하고 끝남</text>
+        <line class="edge" x1="536" y1="60" x2="698" y2="60" marker-end="url(#f3a)"/>
+        <text x="617" y="51" text-anchor="middle" class="sub">SendMessage (이름·ID)</text>
+        <line class="edge dash" x1="700" y1="84" x2="538" y2="84" marker-end="url(#f3a)"/>
+        <text x="618" y="101" text-anchor="middle" class="sub">결과 → pending-events</text>
+        <line class="edge" x1="418" y1="102" x2="418" y2="178" marker-end="url(#f3a)"/>
+        <text x="428" y="136" class="sub">CLI 재시작</text>
+        <text x="428" y="152" class="sub">(세션 만료 뒤 복원,</text>
+        <text x="428" y="168" class="sub">게이트웨이 재시작)</text>
+        <line class="edge" x1="536" y1="192" x2="780" y2="104" marker-end="url(#f3a)"/>
+        <text x="632" y="178" text-anchor="middle" class="sub">SendMessage (ID만)</text>
+        <line class="edge-warn" x1="536" y1="222" x2="698" y2="222" marker-end="url(#f3w)"/>
+        <text x="617" y="214" text-anchor="middle" class="sub">SendMessage (이름)</text>
+      </svg>
+    </div>
+    <figcaption><b>그림 3.</b> 끝난 관점 에이전트는 SendMessage로 다시 깨어나지만 백그라운드로 실행된다. 턴이 먼저 끝나면 결과는 pending-events로 나간다. CLI가 재시작되면 이름이 사라지고 ID로만 부를 수 있다. 그래서 주 흐름은 재개에 기대지 않는다. <span class="tag ok">확인됨</span></figcaption>
+  </figure>
+
+  <h3><span class="num">6.6</span>앱 연동</h3>
+  <ul>
+    <li>게이트웨이는 관점 에이전트마다 <code>response.task_started</code>, <code>response.task_progress</code>, <code>response.task_updated</code>, <code>response.task_notification</code>을 보낸다. <code>task_type</code>은 <code>local_agent</code>이다.</li>
+    <li>SSE의 <code>response.task_started</code>에는 <code>name</code>이 없다. 이름이 필요하면 Agent <code>tool_use</code> 입력의 <code>name</code>을 <code>tool_use_id</code>로 맞춘다. pending-events의 <code>active_tasks[].name</code>에도 이름이 있다.</li>
+    <li>관점 하나만 멈출 때: <code>POST /v1/sessions/{session_id}/tasks/{task_id}/stop</code>.</li>
+    <li>요청의 <code>allowed_tools</code>로 서브에이전트를 제한한다면 관점 에이전트도 허용 목록에 넣는다. 플러그인 에이전트는 <code>Agent(&lt;플러그인&gt;:&lt;관점&gt;)</code>처럼 접두사까지 적는다.</li>
+    <li>이 구조에서 앱이 반드시 받아야 하는 것은 턴의 SSE 스트림이다. pending-events는 교차 검증을 재개 방식으로 바꿀 때만 필요하다.</li>
+  </ul>
+</section>
+
+<!-- 7 -->
+<section id="s7">
+  <h2><span class="num">7</span>도구 범위</h2>
+  <p>모델 호출마다 그 에이전트가 볼 수 있는 모든 도구 정의가 요청에 실린다. 도구가 많으면 컨텍스트를 차지한다. 도구 선택도 흐려진다. 그래서 관점마다 자기 도구만 보게 한다 (그림 4).</p>
+  <figure>
+    <div class="panels">
+      <div class="panel">
+        <h4>기본 (지금)</h4>
+        <svg class="dg" viewBox="0 0 300 262" role="img" aria-label="기본 구성. 두 MCP 서버의 도구 정의가 오케스트레이터와 두 관점 에이전트 모두에게 실린다.">
+          <defs><marker id="p1a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker></defs>
+          <rect class="box" x="90" y="14" width="120" height="44" rx="6"/><text x="150" y="41" text-anchor="middle">오케스트레이터</text>
+          <text x="150" y="80" text-anchor="middle" class="t-warn">도구 139개 · 약 113KB</text>
+          <rect class="box" x="18" y="112" width="114" height="44" rx="6"/><text x="75" y="139" text-anchor="middle">관점 A</text>
+          <rect class="box" x="168" y="112" width="114" height="44" rx="6"/><text x="225" y="139" text-anchor="middle">관점 B</text>
+          <rect class="box" x="18" y="206" width="114" height="44" rx="6"/><text x="75" y="233" text-anchor="middle">MCP 서버 1</text>
+          <rect class="box" x="168" y="206" width="114" height="44" rx="6"/><text x="225" y="233" text-anchor="middle">MCP 서버 2</text>
+          <line class="edge" x1="75" y1="206" x2="75" y2="158" marker-end="url(#p1a)"/>
+          <line class="edge" x1="225" y1="206" x2="225" y2="158" marker-end="url(#p1a)"/>
+          <line class="edge" x1="110" y1="206" x2="190" y2="158" marker-end="url(#p1a)"/>
+          <line class="edge" x1="190" y1="206" x2="110" y2="158" marker-end="url(#p1a)"/>
+          <polyline class="edge" points="18,228 8,228 8,36 88,36" marker-end="url(#p1a)"/>
+          <polyline class="edge" points="282,228 292,228 292,36 212,36" marker-end="url(#p1a)"/>
+        </svg>
+        <p><strong>모든 에이전트가 모든 서버의 도구 정의를 싣는다.</strong> 관점 에이전트도 허용 목록이 없으면 전부 상속한다.</p>
+      </div>
+      <div class="panel">
+        <h4>1단계: <code>tools</code> 허용 목록</h4>
+        <svg class="dg" viewBox="0 0 300 262" role="img" aria-label="1단계. 관점 에이전트는 자기 서버의 도구만 싣는다. 오케스트레이터는 여전히 모든 서버의 도구를 싣는다.">
+          <defs><marker id="p2a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker></defs>
+          <rect class="box" x="90" y="14" width="120" height="44" rx="6"/><text x="150" y="41" text-anchor="middle">오케스트레이터</text>
+          <text x="150" y="80" text-anchor="middle" class="t-warn">도구 139개 · 약 113KB</text>
+          <rect class="box-hl" x="18" y="112" width="114" height="44" rx="6"/><text x="75" y="139" text-anchor="middle">관점 A</text>
+          <rect class="box-hl" x="168" y="112" width="114" height="44" rx="6"/><text x="225" y="139" text-anchor="middle">관점 B</text>
+          <rect class="box" x="18" y="206" width="114" height="44" rx="6"/><text x="75" y="233" text-anchor="middle">MCP 서버 1</text>
+          <rect class="box" x="168" y="206" width="114" height="44" rx="6"/><text x="225" y="233" text-anchor="middle">MCP 서버 2</text>
+          <line class="edge" x1="75" y1="206" x2="75" y2="158" marker-end="url(#p2a)"/>
+          <line class="edge" x1="225" y1="206" x2="225" y2="158" marker-end="url(#p2a)"/>
+          <polyline class="edge" points="18,228 8,228 8,36 88,36" marker-end="url(#p2a)"/>
+          <polyline class="edge" points="282,228 292,228 292,36 212,36" marker-end="url(#p2a)"/>
+        </svg>
+        <p><strong>관점 에이전트는 허용한 도구만 싣는다</strong> (3개 허용 시 1.3KB). 오케스트레이터는 그대로다. 코드 변경이 없다.</p>
+      </div>
+      <div class="panel">
+        <h4>2단계: 관점 전용 MCP 연결</h4>
+        <svg class="dg" viewBox="0 0 300 262" role="img" aria-label="2단계. 관점 전용 MCP 서버가 관점 에이전트에만 연결된다. 오케스트레이터에는 관점 전용 서버의 도구 정의가 실리지 않는다.">
+          <defs><marker id="p3a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" class="mk"/></marker></defs>
+          <rect class="box-hl" x="90" y="14" width="120" height="44" rx="6"/><text x="150" y="41" text-anchor="middle">오케스트레이터</text>
+          <text x="150" y="80" text-anchor="middle" class="t-ok">도구 19~23개 · 전용 서버 도구 0개</text>
+          <rect class="box-hl" x="18" y="112" width="114" height="44" rx="6"/><text x="75" y="139" text-anchor="middle">관점 A</text>
+          <rect class="box-hl" x="168" y="112" width="114" height="44" rx="6"/><text x="225" y="139" text-anchor="middle">관점 B</text>
+          <rect class="box" x="18" y="206" width="114" height="44" rx="6"/><text x="75" y="233" text-anchor="middle">A 전용 서버</text>
+          <rect class="box" x="168" y="206" width="114" height="44" rx="6"/><text x="225" y="233" text-anchor="middle">B 전용 서버</text>
+          <line class="edge" x1="75" y1="206" x2="75" y2="158" marker-end="url(#p3a)"/>
+          <line class="edge" x1="225" y1="206" x2="225" y2="158" marker-end="url(#p3a)"/>
+        </svg>
+        <p><strong>오케스트레이터에서 관점 전용 서버의 도구 정의가 빠진다.</strong> 공통 조회 서버는 남는다. 게이트웨이 기능 추가가 필요하다 (§8).</p>
+      </div>
+    </div>
+    <div class="fig-legend"><span>화살표 = 그 에이전트의 모델 요청에 해당 서버의 도구 정의가 실린다.</span></div>
+    <figcaption><b>그림 4.</b> 도구 범위의 세 단계. 1단계는 관점 에이전트만 가볍게 한다. 2단계는 오케스트레이터에서 관점 전용 MCP 도구 정의를 뺀다. 수치는 아래 측정에서 왔다.</figcaption>
+  </figure>
+
+  <div class="table-wrap wide">
+    <table>
+      <thead><tr><th>구성</th><th>오케스트레이터 요청</th><th>관점 에이전트 요청</th><th>근거</th></tr></thead>
+      <tbody>
+        <tr><td class="k">기본: 모든 MCP 서버를 세션에 연결</td><td class="num">도구 139개 · 약 113KB</td><td>허용 목록이 없으면 전부 상속</td><td><span class="tag ok">확인됨</span> <span class="tag doc">문서</span></td></tr>
+        <tr><td class="k">1단계: <code>tools</code> 허용 목록</td><td class="num">139개 · 약 113KB</td><td class="num">허용한 도구만 (3개 → 1.3KB)</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr><td class="k">2단계: 관점 전용 MCP 연결</td><td class="num">19~23개 · 전용 서버 도구 없음</td><td>전용 서버 도구 + 기본 도구</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr><td class="k">참고: 도구 검색 켬</td><td class="num">11개 · MCP 도구는 검색 후 로드</td><td>—</td><td><span class="tag ok">확인됨</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="mono" style="font-size:12.5px;color:var(--muted)">측정 조건: 모의 MCP 서버(도구 120개), 실제 CLI 2.1.283, 가짜 모델. 크기는 도구 정의 JSON의 바이트 수다. 2026-10-03.</p>
+
+  <h3><span class="num">7.1</span>1단계: 코드 변경 없이</h3>
+  <ol class="steps">
+    <li><div>사내 플러그인에 관점 에이전트 정의를 추가한다.</div></li>
+    <li><div>각 정의의 <code>tools</code>에 그 관점의 서버만 적는다. 예: <code>tools: mcp__&lt;설비-서버&gt;, Read</code>.</div></li>
+    <li><div>오케스트레이터 요청의 크기를 잰다. UniBridge 사용량 기록으로 토큰 사용량을 잰다.</div></li>
+    <li><div>오케스트레이터 부담이 크면 2단계로 간다.</div></li>
+  </ol>
+  <div class="callout note"><span class="lbl">참고</span><div><p>플러그인 MCP 서버의 도구 이름은 <code>mcp__&lt;서버 이름&gt;__&lt;도구 이름&gt;</code>이다. 서버 이름은 플러그인 MCP 설정(<code>plugin.json</code>의 <code>mcpServers</code> 또는 <code>.mcp.json</code>)에 선언한 이름이다. 관리자 API <code>GET /admin/api/plugins/{id}</code>의 <code>mcp_servers</code>에서도 볼 수 있다. <code>GET /v1/mcp/servers</code>는 게이트웨이 설정의 서버만 보여 준다. 플러그인 서버는 나오지 않는다.</p></div></div>
+
+  <h3><span class="num">7.2</span>2단계: 관점 전용 MCP 연결</h3>
+  <p>게이트웨이에 기능을 추가한다. 설계는 §8에 있다.</p>
+  <div class="callout caution"><span class="lbl">주의</span><div>
+    <p>에이전트 정의 파일의 <code>mcpServers</code>로는 2단계를 할 수 없다.</p>
+    <ul>
+      <li>플러그인 에이전트는 <code>mcpServers</code>를 무시한다. <span class="tag doc">문서</span> <span class="tag ok">확인됨</span></li>
+      <li>게이트웨이는 MCP 서버가 하나라도 있으면 <code>strict_mcp_config</code>를 켠다. 이 상태에서는 사용자 범위 에이전트 파일의 <code>mcpServers</code>도 적용되지 않는다. <span class="tag ok">확인됨</span></li>
+      <li>프로젝트 범위 에이전트 파일은 폴더 신뢰가 없으면 <code>mcpServers</code>를 건너뛴다. <span class="tag ok">확인됨</span></li>
+      <li>SDK <code>agents=</code> 옵션으로 넘긴 정의만 <code>strict_mcp_config</code> 상태에서 동작한다. <span class="tag ok">확인됨</span></li>
+    </ul>
+  </div></div>
+
+  <h3><span class="num">7.3</span>도구 검색</h3>
+  <ul>
+    <li><code>ANTHROPIC_BASE_URL</code>이 Anthropic 공식 주소가 아니면 도구 검색은 기본으로 꺼진다. UniBridge 경로가 여기에 해당한다. <span class="tag ok">확인됨</span></li>
+    <li><code>ENABLE_TOOL_SEARCH=true</code>로 켤 수 있다. 이때 CLI는 <code>advanced-tool-use-2025-11-20</code> 베타를 요청에 넣는다. <span class="tag ok">확인됨</span></li>
+    <li>동작하려면 UniBridge가 <code>tool_reference</code> 블록과 베타 헤더를 그대로 전달해야 한다. 실제 모델도 이 기능을 지원해야 한다. <span class="tag todo">확인 필요</span></li>
+    <li><code>auto</code> 값은 도구 120개에서 켜지지 않았다. <span class="tag ok">확인됨</span></li>
+    <li>판단: 도구 검색은 보조 수단으로만 쓴다.</li>
+  </ul>
+</section>
+
+<!-- 8 -->
+<section id="s8">
+  <h2><span class="num">8</span>게이트웨이 변경 제안: 관점 전용 MCP 연결</h2>
+  <h3><span class="num">8.1</span>목적</h3>
+  <p>지정한 MCP 서버를 지정한 관점 에이전트에만 연결한다. 오케스트레이터 요청에서 그 서버의 도구 정의를 뺀다.</p>
+  <h3><span class="num">8.2</span>동작</h3>
+  <ol class="steps">
+    <li><div>운영자가 관점 에이전트 레지스트리 파일을 둔다. 설정 이름은 가칭 <code>GATEWAY_AGENT_REGISTRY</code>이다.</div></li>
+    <li><div>게이트웨이가 세션을 만들 때 레지스트리를 읽는다.</div></li>
+    <li><div>게이트웨이가 레지스트리의 관점 에이전트를 SDK <code>options.agents</code>로 넘긴다.</div></li>
+    <li><div>게이트웨이가 레지스트리에 적힌 MCP 서버를 세션 MCP 맵에서 뺀다. 그 서버 설정을 해당 관점 에이전트 정의 안에 넣는다.</div></li>
+    <li><div>게이트웨이가 옮기는 서버에도 세션 서버와 같은 변환을 적용한다. 변환 항목은 자격 증명 오버레이, <code>{{env:…}}</code> 해석, 게이트웨이 전용 키(<code>readOnlyTools</code>) 제거, HTTP 서버의 진행 알림 중계 주소 변환이다. 에이전트 전용 서버에서 중계가 동작하는지는 아직 모른다. <span class="tag todo">확인 필요</span></div></li>
+    <li><div>세션 MCP 맵이 비어도 <code>strict_mcp_config</code>를 켠다. 지금 코드(<code>_configure_mcp_servers</code>)는 맵이 비면 켜지 않는다. 그러면 플러그인 MCP 서버가 세션에 다시 붙고, 오케스트레이터가 그 도구를 다시 본다.</div></li>
+  </ol>
+  <div class="code-wrap">
+    <div class="cap">레지스트리 <span class="tag ex">예시 · 가칭</span></div>
+    <button class="copy" type="button">복사</button>
+<pre>{
+  "agents": {
+    "equipment": {
+      "description": "설비 관점 불량 분석",
+      "prompt_file": "&lt;플러그인 경로&gt;/agents/equipment.md",
+      "tools": ["mcp__&lt;설비-서버&gt;", "Read"],
+      "mcp_servers": ["&lt;설비-서버&gt;"],
+      "model": "&lt;모델 별칭&gt;",
+      "maxTurns": 30
+    }
+  }
+}</pre>
+  </div>
+  <p><code>mcp_servers</code>에 적은 서버는 세션 MCP 맵에서 빠진다. 그 서버는 이 관점 에이전트에만 연결된다.</p>
+  <h3><span class="num">8.3</span>호환성</h3>
+  <ul>
+    <li>레지스트리가 없으면 게이트웨이는 지금과 똑같이 동작한다.</li>
+    <li><code>options.agents</code>로 넘긴 에이전트는 접두사 없이 이름 그대로 호출된다. 예: <code>equipment</code>. <span class="tag ok">확인됨</span></li>
+    <li>레지스트리로 옮긴 관점은 플러그인 <code>agents/</code>에서 뺀다. 플러그인 사본이 남으면 모델이 그 사본(<code>&lt;플러그인&gt;:&lt;관점&gt;</code>)을 부를 수 있다. 그 사본에는 서버가 없어서 도구 호출이 실패한다.</li>
+    <li>사본을 뺄 수 없으면 <code>disallowed_tools</code>에 <code>Agent(&lt;플러그인&gt;:&lt;관점&gt;)</code>을 넣는다. 게이트웨이 훅이 이 호출을 거부한다.</li>
+  </ul>
+  <h3><span class="num">8.4</span>검증 계획</h3>
+  <p>저장소의 기존 핀 테스트 방식(실제 CLI + 가짜 모델)으로 아래 항목을 고정한다.</p>
+  <ul>
+    <li>오케스트레이터 요청에 지정 서버의 도구가 없다.</li>
+    <li>관점 에이전트 요청에 지정 서버의 도구가 있다.</li>
+    <li>관점 에이전트가 그 도구를 실제로 호출하고 결과를 받는다.</li>
+    <li>세션 MCP 맵이 비어도 <code>strict_mcp_config</code>가 켜진다.</li>
+    <li>옮긴 HTTP 서버의 진행 알림과 조회 전용 표시가 유지된다.</li>
+    <li>남아 있는 플러그인 사본을 부르면 거부된다.</li>
+    <li>레지스트리가 없을 때 기존 동작이 바뀌지 않는다.</li>
+  </ul>
+  <h3><span class="num">8.5</span>확인할 점</h3>
+  <ul>
+    <li>같은 서버를 쓰는 관점 에이전트가 여럿일 때 서버 프로세스가 몇 개 뜨는가? <span class="tag todo">확인 필요</span></li>
+    <li>관점 에이전트가 끝날 때 서버 프로세스가 정리되는가? <span class="tag todo">확인 필요</span></li>
+    <li>CLI를 올릴 때 이 동작이 유지되는가? 핀 테스트가 이것을 감시한다.</li>
+  </ul>
+</section>
+
+<!-- 9 -->
+<section id="s9">
+  <h2><span class="num">9</span>확인된 동작과 제약</h2>
+  <p>이 설계가 기대는 동작을 모았다. 기준 버전은 문서 머리의 버전이다.</p>
+  <div class="filter" role="group" aria-label="근거 상태로 거르기">
+    <button type="button" data-f="all" aria-pressed="true">전체</button>
+    <button type="button" data-f="ok" aria-pressed="false">확인됨</button>
+    <button type="button" data-f="doc" aria-pressed="false">문서</button>
+    <button type="button" data-f="todo" aria-pressed="false">확인 필요</button>
+    <span class="count" id="facts-count" aria-live="polite">18개 표시</span>
+  </div>
+  <div class="table-wrap wide">
+    <table id="facts">
+      <thead><tr><th>동작</th><th>결과</th><th>근거</th><th>상태</th></tr></thead>
+      <tbody>
+        <tr data-s="ok"><td class="k">진짜 에이전트 팀 (상주 팀원)</td><td>불가</td><td>CLI는 대화형 세션에서만 팀을 만든다. SDK는 항상 비대화형으로 CLI를 실행한다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="doc"><td class="k">TeamCreate, TeamDelete 도구</td><td>없음</td><td>CLI 2.1.178에서 제거됐다.</td><td><span class="tag doc">문서</span></td></tr>
+        <tr data-s="ok"><td class="k">최신 버전의 팀 지원</td><td>변화 없음</td><td>SDK 0.2.163 (CLI 2.1.286)도 팀 생성 조건이 같다. 바이너리로 확인했다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">이름 붙은 관점 에이전트 병렬 실행</td><td>된다</td><td>게이트웨이 e2e에서 두 에이전트가 같은 시각에 시작하고 함께 끝났다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">실행 중인 에이전트끼리 메시지</td><td>된다</td><td>받는 쪽은 다음 도구 호출 때 읽는다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">끝난 에이전트 재개</td><td>된다 (백그라운드)</td><td>이전 맥락을 유지한다. 턴이 먼저 끝나면 결과는 pending-events로 나간다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">CLI 재시작 뒤 이름으로 호출</td><td>안 된다</td><td>ID로는 된다. 맥락도 유지된다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">세션 유휴 만료</td><td>60분 (기본)</td><td>요청마다 연장된다. 만료 뒤 대화 기록에서 복원된다. 게이트웨이 코드로 확인했다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="doc"><td class="k">플러그인 에이전트의 <code>mcpServers</code></td><td>무시</td><td>공식 문서와 CLI 경고 문구가 같다.</td><td><span class="tag doc">문서</span></td></tr>
+        <tr data-s="ok"><td class="k">파일 에이전트의 <code>mcpServers</code> (strict 켬)</td><td>무시</td><td>사용자 범위는 strict를 끄면 적용된다. 프로젝트 범위는 폴더 신뢰도 필요하다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">SDK <code>agents=</code> 정의의 <code>mcpServers</code></td><td>된다</td><td><code>strict_mcp_config</code>를 켜도 적용된다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">서브에이전트 <code>tools</code> 허용 목록</td><td>된다</td><td>허용한 도구만 요청에 실린다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">도구 검색 (UniBridge 경로)</td><td>기본 꺼짐</td><td>공식 주소가 아니면 꺼진다는 CLI 메시지가 있다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="ok"><td class="k">CLI 세션 간 메시징의 사용자 간 격리</td><td>안 된다</td><td>설정 디렉터리로는 찾기만 막힌다. 소켓 경로로 보내면 전달된다.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="doc"><td class="k">Claude Code의 A2A 지원</td><td>없음</td><td>공식 문서와 변경 이력에 없다.</td><td><span class="tag doc">문서</span></td></tr>
+        <tr data-s="ok"><td class="k">워크스페이스 샌드박스 훅 (서브에이전트 도구 호출)</td><td>적용됨</td><td>2026-09-27 게이트웨이 e2e.</td><td><span class="tag ok">확인됨</span></td></tr>
+        <tr data-s="todo"><td class="k">UniBridge의 <code>tool_reference</code> 전달</td><td>모름</td><td>운영 경로에서 시험해야 한다.</td><td><span class="tag todo">확인 필요</span></td></tr>
+        <tr data-s="todo"><td class="k">인라인 MCP 서버의 프로세스 수</td><td>모름</td><td>2단계 구현 때 확인한다.</td><td><span class="tag todo">확인 필요</span></td></tr>
+      </tbody>
+    </table>
+  </div>
+  <details class="raw">
+    <summary>원문 메시지와 문구 보기</summary>
+    <ul>
+      <li>CLI (SDK 방식 실행 조건): <code>Error: --input-format=stream-json requires --print.</code></li>
+      <li>공식 문서 (agent teams): <code>In non-interactive mode with the -p flag, including Agent SDK sessions, Claude doesn't spawn teammates, and a subagent that Claude names runs as an ordinary subagent even with agent teams enabled.</code></li>
+      <li>CHANGELOG 2.1.178: <code>Agent teams: removed the TeamCreate and TeamDelete tools. … every session now has one implicit team — spawn teammates directly with the Agent tool's name parameter</code></li>
+      <li>실행 중 메시지: <code>Message queued for delivery to worker-a at its next tool round.</code></li>
+      <li>재개: <code>Resuming agent worker-a</code></li>
+      <li>재시작 뒤 이름 호출: <code>No agent named 'worker-a' is reachable. Check the spelling, or use the agent ID from a background agent's spawn result.</code></li>
+      <li>접두사 없는 플러그인 에이전트: <code>Agent type 'equipment' not found. Available agents: … defect-perspectives:equipment …</code></li>
+      <li>CLI (플러그인 에이전트): <code>Plugin agent file … sets mcpServers, which is ignored for plugin agents. Use .claude/agents/ for this level of control.</code></li>
+      <li>공식 문서 (subagents): <code>For security reasons, plugin subagents don't support the hooks, mcpServers, or permissionMode frontmatter fields.</code></li>
+      <li>공식 문서 (skills 필드): <code>This field controls which skills are preloaded, not which skills the subagent can access</code></li>
+      <li>CLI (프로젝트 에이전트): <code>Skipping frontmatter MCP servers for agent '…': the folder its definition file came from is not trusted</code></li>
+      <li>CLI (도구 검색): <code>[ToolSearch:optimistic] disabled: ANTHROPIC_BASE_URL=… is not a first-party Anthropic host. Set ENABLE_TOOL_SEARCH=true (or auto / auto:N) if your proxy forwards tool_reference blocks.</code></li>
+    </ul>
+  </details>
+</section>
+
+<!-- 10 -->
+<section id="s10">
+  <h2><span class="num">10</span>보안과 운영</h2>
+  <div class="callout warn"><span class="lbl">경고</span><div>
+    <p>CLI 세션 간 메시징(<code>CLAUDE_CODE_HARBOR_KITE</code>)을 켜지 않는다.</p>
+    <ul>
+      <li>게이트웨이의 CLI 프로세스는 모두 같은 사용자 계정으로 실행된다.</li>
+      <li>설정 디렉터리를 나누면 다른 세션이 목록에서만 숨겨진다.</li>
+      <li>소켓 경로(<code>/tmp/cc-socks-&lt;uid&gt;/&lt;pid&gt;.sock</code>)로 직접 보내면 메시지가 전달된다. Linux에서는 인증이 없다.</li>
+      <li>그 결과 한 사용자의 에이전트가 다른 사용자의 세션에 턴을 넣을 수 있다. 그 턴은 받는 세션의 워크스페이스와 권한으로 실행된다. <span class="tag ok">확인됨</span></li>
+      <li>게이트웨이는 시작할 때 이 값을 <code>0</code>으로 설치한다. 이 설정을 유지한다.</li>
+    </ul>
+  </div></div>
+  <div class="callout caution"><span class="lbl">주의</span><div><p>Bash는 아직 사용자 간 격리가 되지 않는다 (#218). Bash가 필요 없는 관점 에이전트는 <code>tools</code>에서 Bash를 뺀다.</p></div></div>
+  <ul>
+    <li>워크스페이스 샌드박스 훅은 관점 에이전트의 도구 호출에도 적용된다. <span class="tag ok">확인됨</span></li>
+    <li>자원: 라이브 세션 하나가 CLI 프로세스 하나를 쓴다. 저장소 문서(<code>.env.example</code>)의 측정값은 약 400 MB다. 관점 에이전트는 이 프로세스 안에서 실행된다.</li>
+    <li>stdio MCP 서버는 세션마다 따로 실행된다. 세션 수에 비례해서 MCP 서버 프로세스가 늘어난다.</li>
+    <li>비용: 관점 에이전트마다 모델 호출이 따로 생긴다. 관점 수에 비례해서 토큰이 늘어난다. 관점별 <code>model</code>과 <code>maxTurns</code>로 상한을 둔다.</li>
+    <li>운영 설정값을 확인한다: 세션 유휴 만료(<code>SESSION_MAX_AGE_MINUTES</code>), 라이브 세션 상한(<code>MAX_LIVE_SESSIONS</code>), 설정 출처(<code>CLAUDE_SETTING_SOURCES</code>). <span class="tag todo">확인 필요</span></li>
+  </ul>
+</section>
+
+<!-- 11 -->
+<section id="s11">
+  <h2><span class="num">11</span>대안과 판단 기록</h2>
+  <div class="table-wrap wide">
+    <table>
+      <thead><tr><th>대안</th><th>판단</th><th>이유</th><th>다시 볼 조건</th></tr></thead>
+      <tbody>
+        <tr><td class="k">A2A로 관점 노출, 상주 에이전트</td><td>보류</td><td>Claude Code는 A2A를 직접 부르지 못한다. MCP 브리지가 필요하다. 지식을 사례 DB에 두므로 상주가 필요 없다.</td><td>관점을 다른 팀이 따로 운영할 때</td></tr>
+        <tr><td class="k">CLI의 진짜 에이전트 팀</td><td>불가</td><td>SDK 방식에서는 팀이 생기지 않는다.</td><td>CLI가 SDK 방식의 팀을 지원할 때. <a href="https://github.com/anthropics/claude-agent-sdk-python/issues/577">claude-agent-sdk-python#577</a>을 추적한다.</td></tr>
+        <tr><td class="k">CLI 세션 간 메시징</td><td>금지</td><td>사용자 간 격리가 되지 않는다.</td><td>테넌트별 OS 격리(별도 uid, 컨테이너)가 생길 때</td></tr>
+        <tr><td class="k">다른 하네스 (Google ADK, 직접 구현)</td><td>미채택</td><td>사내 플러그인을 다시 만들어야 한다.</td><td>가볍고 호출이 많은 단순 관점이 생길 때</td></tr>
+        <tr><td class="k">도구 검색</td><td>보조</td><td>UniBridge 경로에서 기본으로 꺼진다. 전달 지원을 모른다.</td><td>UniBridge 지원을 확인했을 때</td></tr>
+        <tr><td class="k">끝난 에이전트 재개로 교차 검증</td><td>미채택</td><td>결과가 턴 밖으로 나간다.</td><td>앱이 pending-events를 화면에 반영할 때</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <h3><span class="num">11.1</span>A2A를 쓰게 될 때</h3>
+  <ul>
+    <li>외부 팀의 관점 에이전트를 A2A 서버로 노출한다. 서버 쪽은 <code>a2a-sdk</code> 1.2.1(Python, FastAPI 연동)로 만들 수 있다.</li>
+    <li>오케스트레이터는 MCP 브리지 도구로 그 에이전트를 호출한다.</li>
+    <li>내부 관점 에이전트와 외부 A2A 에이전트를 함께 쓴다.</li>
+    <li>외부 에이전트는 게이트웨이 워크스페이스의 파일을 볼 수 없다. 필요한 데이터는 메시지에 담아 보낸다.</li>
+  </ul>
+</section>
+
+<!-- 12 -->
+<section id="s12">
+  <h2><span class="num">12</span>평가 계획</h2>
+  <ul>
+    <li>원인이 확정된 과거 불량 건으로 시험 세트를 만든다.</li>
+    <li>아래 지표를 잰다.
+      <ul>
+        <li>정답 원인이 1위인 비율</li>
+        <li>정답 원인이 3위 안에 든 비율</li>
+        <li>관점별 근거의 정확도 (사람이 검토한다)</li>
+        <li>턴 시간</li>
+        <li>토큰 사용량 (UniBridge 사용량 기록)</li>
+      </ul>
+    </li>
+    <li>오케스트레이터 프롬프트나 관점 정의를 바꿀 때마다 시험 세트를 다시 실행한다.</li>
+    <li>지표가 이전 버전보다 낮으면 배포하지 않는다.</li>
+  </ul>
+</section>
+
+<!-- 13 -->
+<section id="s13">
+  <h2><span class="num">13</span>단계별 계획</h2>
+  <div class="table-wrap wide">
+    <table>
+      <thead><tr><th>단계</th><th>할 일</th><th>코드 변경</th><th>완료 기준</th></tr></thead>
+      <tbody>
+        <tr><td class="k">1</td><td>관점 에이전트 정의를 쓴다. 오케스트레이터 프롬프트를 배포한다. 공통 보고 형식을 적용한다. <code>tools</code> 허용 목록을 적용한다.</td><td>없음 (사내 플러그인, 프롬프트 라이브러리)</td><td>시험 세트로 기준 지표를 잰다. 오케스트레이터 요청 크기를 잰다.</td></tr>
+        <tr><td class="k">2</td><td>관점 전용 MCP 연결을 추가한다 (§8).</td><td>게이트웨이 PR 1개</td><td>핀 테스트가 통과한다. 오케스트레이터 요청에서 해당 도구 정의가 빠진다.</td></tr>
+        <tr><td class="k">3 (선택)</td><td>외부 팀 관점을 A2A로 연결한다.</td><td>MCP 브리지, A2A 서버</td><td>외부 팀의 요구가 생긴다.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- 14 -->
+<section id="s14">
+  <h2><span class="num">14</span>열린 질문</h2>
+  <ol>
+    <li>관점 목록과 관점별 데이터 소스는 무엇인가?</li>
+    <li>사내 플러그인의 MCP 서버는 stdio인가, HTTP인가? 조회 전용 표시와 진행 알림 처리가 달라진다.</li>
+    <li>UniBridge가 <code>tool_reference</code> 블록과 베타 헤더를 전달하는가?</li>
+    <li>운영의 세션 유휴 만료와 라이브 세션 상한은 얼마인가?</li>
+    <li>앱이 pending-events를 화면에 반영하는가?</li>
+    <li>같은 인라인 MCP 서버를 쓰는 관점 에이전트가 여럿일 때 서버 프로세스는 몇 개인가?</li>
+    <li><code>.env.example</code>에 나오는 a2a-agent는 어떤 역할인가?</li>
+  </ol>
+</section>
+
+<!-- 15 -->
+<section id="s15">
+  <h2><span class="num">15</span>부록: 검증과 출처</h2>
+  <h3><span class="num">15.1</span>검증 방법</h3>
+  <ul>
+    <li>실제 번들 CLI(2.1.283)와 가짜 Messages API(<code>tests/fixtures/fake_anthropic_api.py</code>)로 시험했다. 실제 모델을 쓰지 않았다. 비용은 0이다.</li>
+    <li>게이트웨이 e2e: uvicorn으로 <code>src.main:app</code>을 띄우고 가짜 API를 붙였다.</li>
+    <li>저장소 테스트 62개가 통과했다: <code>test_cli_task_identity.py</code>, <code>test_cli_stop_task.py</code>, <code>test_runtime_config.py</code>, <code>test_cli_cross_session_messaging.py</code>. <code>test_cli_mcp_readonly.py</code>의 3개도 통과했다 (2026-10-03).</li>
+    <li>CLI 바이너리의 문자열로 팀 생성 조건, 도구 검색 조건, 에이전트 MCP 처리 규칙을 확인했다.</li>
+  </ul>
+  <h3><span class="num">15.2</span>출처</h3>
+  <ul>
+    <li><a href="https://code.claude.com/docs/en/agent-teams">Claude Code 문서: Agent teams</a></li>
+    <li><a href="https://code.claude.com/docs/en/sub-agents">Claude Code 문서: Subagents</a></li>
+    <li><a href="https://a2a-protocol.org/latest/specification">A2A 명세</a></li>
+    <li><a href="https://pypi.org/project/a2a-sdk/">a2a-sdk (PyPI)</a></li>
+    <li><a href="https://github.com/anthropics/claude-agent-sdk-python/issues/577">claude-agent-sdk-python#577: SDK 방식에서 팀 메시지가 리더에게 전달되지 않음</a></li>
+    <li><a href="https://github.com/anthropics/claude-code-action/issues/1124">claude-code-action#1124: SDK 세션 수명 때문에 에이전트 팀을 쓸 수 없음</a></li>
+  </ul>
+  <h3><span class="num">15.3</span>정정 기록</h3>
+  <ul>
+    <li><code>skills</code> 필드는 쓸 스킬을 지정하는 필드가 아니다. 본문을 미리 넣는 필드다. 사용 범위를 제한하지 않는다.</li>
+    <li>플러그인 MCP 서버의 이름은 <code>GET /v1/mcp/servers</code>로 확인할 수 없다. 플러그인 MCP 설정(<code>plugin.json</code>의 <code>mcpServers</code> 또는 <code>.mcp.json</code>)이나 <code>GET /admin/api/plugins/{id}</code>를 본다.</li>
+  </ul>
+</section>
+
+</main>
+</div>
+</div>
+
+<script>
+(function(){
+  try{
+    var d=document.getElementById('toc-d');
+    if(d && window.matchMedia && window.matchMedia('(max-width: 960px)').matches){ d.open=false; }
+  }catch(e){}
+
+  var links=[].slice.call(document.querySelectorAll('.toc a[href^="#"]'));
+  var map={};
+  links.forEach(function(a){ map[a.getAttribute('href').slice(1)]=a; });
+  if('IntersectionObserver' in window){
+    var obs=new IntersectionObserver(function(entries){
+      entries.forEach(function(en){
+        if(!en.isIntersecting) return;
+        links.forEach(function(a){ a.removeAttribute('aria-current'); });
+        var a=map[en.target.id];
+        if(a) a.setAttribute('aria-current','true');
+      });
+    },{rootMargin:'0px 0px -70% 0px'});
+    Object.keys(map).forEach(function(id){ var s=document.getElementById(id); if(s) obs.observe(s); });
+  }
+
+  [].slice.call(document.querySelectorAll('.code-wrap')).forEach(function(w){
+    var b=w.querySelector('button.copy'), pre=w.querySelector('pre');
+    if(!b||!pre) return;
+    b.addEventListener('click',function(){
+      var reset=function(){ setTimeout(function(){ b.textContent='복사'; },1500); };
+      var fallback=function(){
+        try{ var r=document.createRange(); r.selectNodeContents(pre); var s=window.getSelection(); s.removeAllRanges(); s.addRange(r); b.textContent='선택됨'; }catch(e){ b.textContent='복사 실패'; }
+        reset();
+      };
+      try{
+        navigator.clipboard.writeText(pre.innerText).then(function(){ b.textContent='복사됨'; reset(); }, fallback);
+      }catch(e){ fallback(); }
+    });
+  });
+
+  var chips=[].slice.call(document.querySelectorAll('.filter button'));
+  var rows=[].slice.call(document.querySelectorAll('#facts tbody tr'));
+  var count=document.getElementById('facts-count');
+  chips.forEach(function(c){
+    c.addEventListener('click',function(){
+      chips.forEach(function(x){ x.setAttribute('aria-pressed','false'); });
+      c.setAttribute('aria-pressed','true');
+      var f=c.getAttribute('data-f'), n=0;
+      rows.forEach(function(r){ var show=(f==='all'||r.getAttribute('data-s')===f); r.hidden=!show; if(show) n++; });
+      if(count) count.textContent=n+'개 표시';
+    });
+  });
+})();
+</script>
+</body>
+</html>
