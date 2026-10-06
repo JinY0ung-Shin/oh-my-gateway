@@ -5,6 +5,7 @@ import asyncio
 import logging
 from typing import Any, Dict, Optional
 
+from fastapi.concurrency import run_in_threadpool
 from fastapi import APIRouter, Request, Response, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -176,7 +177,8 @@ async def list_agent_resources(
     from src.routes.terminal_files import resolve_workspace_for_request
 
     workspace = resolve_workspace_for_request(request)
-    resources = agent_catalog.list_agent_resources(workspace)
+    # Reads files in the user's workspace: off the event loop, like the file API.
+    resources = await run_in_threadpool(agent_catalog.list_agent_resources, workspace)
     return {
         **resources,
         "workspace_scoped": workspace is not None,

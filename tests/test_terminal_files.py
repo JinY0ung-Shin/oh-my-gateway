@@ -1,5 +1,6 @@
 """Tests for the Open Terminal-compatible read-only workspace file server."""
 
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -2266,3 +2267,481 @@ def test_archive_refuses_a_workspace_root_swapped_after_the_walk(
 
     with pytest.raises(tf._UnsafeArchiveMember):
         _archive_with_swap(client, monkeypatch, ["/notes.txt"], _swap)
+
+
+# --- every route opens beneath the pinned root, never by path ----------------
+# Same class as the archive TOCTOU (#225 review): the path is checked by
+# ``_resolve_or_403``, then the workspace changes before the route opens it.
+# ``_swap_before_open`` runs the swap at the exact point between the check and
+# the first open beneath the root.
+
+
+def _arm_swap(monkeypatch, swap, when):
+    """Run ``swap`` once: ``before`` the root is pinned, or ``after`` the first
+    directory fd beneath it is open (so only fd-relative operations can still
+    reach what was checked)."""
+    if when == "before":
+        return _swap_before_open(monkeypatch, swap)
+    ran = []
+    real = tf._open_dir_beneath
+
+    def _open(*a, **kw):
+        fd = real(*a, **kw)
+        if not ran:
+            ran.append(True)
+            swap()
+        return fd
+
+    monkeypatch.setattr(tf, "_open_dir_beneath", _open)
+    return ran
+
+
+def _swap_before_open(monkeypatch, swap):
+    ran = []
+    real_pinned, real_pin = tf._pinned_root, tf._pin_root
+
+    def _once():
+        if not ran:
+            ran.append(True)
+            swap()
+
+    def _pinned(*a, **kw):
+        _once()
+        return real_pinned(*a, **kw)
+
+    def _pin(*a, **kw):
+        _once()
+        return real_pin(*a, **kw)
+
+    monkeypatch.setattr(tf, "_pinned_root", _pinned)
+    monkeypatch.setattr(tf, "_pin_root", _pin)
+    return ran
+
+
+@pytest.fixture
+def outside(tmp_path):
+    d = tmp_path / "outside-area"
+    (d / "deeper").mkdir(parents=True)
+    (d / "inner.md").write_bytes(_OUTSIDE_SECRET)
+    (d / "deeper" / "x.txt").write_bytes(_OUTSIDE_SECRET)
+    (tmp_path / "outside-file.txt").write_bytes(_OUTSIDE_SECRET)
+    return d
+
+
+def _swap_file(workspace, rel, target):
+    def _swap():
+        p = workspace / rel
+        p.unlink()
+        p.symlink_to(target)
+
+    return _swap
+
+
+def _swap_dir(workspace, tmp_path, rel, target):
+    def _swap():
+        p = workspace / rel
+        p.rename(tmp_path / ("moved-" + p.name))
+        p.symlink_to(target, target_is_directory=True)
+
+    return _swap
+
+
+_READ_ROUTES = [
+    "/files/read?path=/sub/inner.md",
+    "/files/digest?path=/sub/inner.md",
+    "/files/view?path=/sub/inner.md",
+    "/files/serve/sub/inner.md",
+]
+_SECRET_SHA = hashlib.sha256(_OUTSIDE_SECRET).hexdigest()
+_WHEN = ["before", "after"]
+
+
+def _assert_no_outside_bytes_in(r) -> None:
+    assert _OUTSIDE_SECRET not in r.content
+    assert _SECRET_SHA not in r.text
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("route", _READ_ROUTES)
+def test_read_routes_refuse_a_file_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, route, when
+):
+    ran = _arm_swap(
+        monkeypatch,
+        _swap_file(workspace, "sub/inner.md", tmp_path / "outside-file.txt"),
+        when,
+    )
+    r = client.get(route, headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code == 404
+    _assert_no_outside_bytes_in(r)
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("route", _READ_ROUTES)
+def test_read_routes_refuse_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, route, when
+):
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.get(route, headers={**_AUTH, **_USER})
+    assert ran == [True]
+    # Before the pin the swap is refused; after it, the fd still leads to the
+    # directory that was checked, so the original file is served.
+    assert r.status_code in (404, 200)
+    _assert_no_outside_bytes_in(r)
+
+
+@pytest.mark.parametrize(
+    "route", _READ_ROUTES[:3]
+)
+def test_read_routes_refuse_a_file_swapped_for_a_fifo_without_blocking(
+    client, workspace, monkeypatch, route
+):
+    def _swap():
+        (workspace / "sub" / "inner.md").unlink()
+        os.mkfifo(workspace / "sub" / "inner.md")
+
+    _swap_before_open(monkeypatch, _swap)
+    r = client.get(route, headers={**_AUTH, **_USER})
+    assert r.status_code == 404
+
+
+def test_view_keeps_serving_the_checked_file_after_a_later_swap(
+    client, workspace, tmp_path, outside, monkeypatch
+):
+    """The response body comes from the file opened at check time, even if the
+    path is swapped between opening and sending."""
+    real = tf._read_beneath
+
+    def _read_then_swap(root, target):
+        opened = real(root, target)
+        _swap_file(workspace, "sub/inner.md", tmp_path / "outside-file.txt")()
+        return opened
+
+    monkeypatch.setattr(tf, "_read_beneath", _read_then_swap)
+    r = client.get("/files/view?path=/sub/inner.md", headers={**_AUTH, **_USER})
+    assert r.status_code == 200
+    assert r.content == b"# inner"
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_list_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.get("/files/list?directory=/sub", headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code in (404, 200)
+    assert "deeper" not in r.text
+
+
+# --- write routes create/rename/delete beneath the pinned root ---------------
+
+
+def _outside_tree(outside: Path) -> dict:
+    return {
+        p.relative_to(outside).as_posix(): (p.read_bytes() if p.is_file() else None)
+        for p in outside.rglob("*")
+    }
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_upload_refuses_a_destination_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    victim = tmp_path / "outside-file.txt"
+    ran = _arm_swap(monkeypatch, _swap_file(workspace, "sub/inner.md", victim), when)
+    r = client.post(
+        "/files/upload?directory=/sub",
+        headers={**_AUTH, **_USER},
+        files={"file": ("inner.md", b"PAYLOAD", "text/plain")},
+    )
+    assert ran == [True]
+    assert r.status_code == 409
+    assert victim.read_bytes() == _OUTSIDE_SECRET
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_upload_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post(
+        "/files/upload?directory=/sub",
+        headers={**_AUTH, **_USER},
+        files={"file": ("inner.md", b"PAYLOAD", "text/plain")},
+    )
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+
+
+def test_upload_onto_an_existing_fifo_is_refused_without_blocking(client, workspace):
+    os.mkfifo(workspace / "pipe")
+    r = client.post(
+        "/files/upload?directory=/",
+        headers={**_AUTH, **_USER},
+        files={"file": ("pipe", b"PAYLOAD", "text/plain")},
+    )
+    assert r.status_code == 409
+
+
+@pytest.mark.parametrize("when", _WHEN)
+def test_write_if_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, when
+):
+    """``expected`` is the OUTSIDE file's digest: a write that followed the
+    symlink would match it and replace the outside file."""
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post(
+        f"/files/write_if?directory=/sub&expected_sha256={_SECRET_SHA}",
+        headers={**_AUTH, **_USER},
+        files={"file": ("inner.md", b"PAYLOAD", "text/plain")},
+    )
+    assert ran == [True]
+    assert r.status_code == 409
+    assert _outside_tree(outside) == before
+
+
+def test_mkdir_refuses_a_parent_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch
+):
+    before = _outside_tree(outside)
+    ran = _swap_before_open(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    r = client.post(
+        "/files/mkdir", headers={**_AUTH, **_USER}, json={"path": "/sub/made/deep"}
+    )
+    assert ran == [True]
+    assert r.status_code == 409
+    assert _outside_tree(outside) == before
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("victim", ["deeper/x.txt", "deeper"])
+def test_delete_refuses_a_parent_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, victim, when
+):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.delete(f"/files/delete?path=/sub/{victim}", headers={**_AUTH, **_USER})
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize("no_clobber", [False, True])
+@pytest.mark.parametrize("side", ["source", "destination"])
+def test_move_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, side, no_clobber, when
+):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    (workspace / "other").mkdir()
+    before = _outside_tree(outside)
+    body = (
+        {"source": "/sub/deeper/x.txt", "destination": "/other/x.txt"}
+        if side == "source"
+        else {"source": "/notes.txt", "destination": "/sub/deeper/x.txt"}
+    )
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={**body, "no_clobber": no_clobber},
+    )
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+    for p in workspace.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            assert _OUTSIDE_SECRET not in p.read_bytes(), p
+
+
+@pytest.mark.parametrize("when", _WHEN)
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"source": "/sub/inner.md", "destination": "/copied.md"},
+        {"source": "/sub", "destination": "/copied"},
+        {"source": "/notes.txt", "destination": "/sub/notes.txt"},
+    ],
+)
+def test_copy_refuses_a_directory_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, body, when
+):
+    before = _outside_tree(outside)
+    ran = _arm_swap(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside), when)
+    r = client.post("/files/copy", headers={**_AUTH, **_USER}, json=body)
+    assert ran == [True]
+    assert r.status_code in (409, 200)
+    assert _outside_tree(outside) == before
+    for p in workspace.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            assert _OUTSIDE_SECRET not in p.read_bytes(), p
+
+
+# --- a cross-device move never reopens the checked pathnames ------------------
+# renameat() fails with EXDEV across a mount inside the workspace. The fallback
+# must copy + unlink through the pinned parent fds, not ``shutil.move`` on the
+# early-resolved paths: a parent swapped for a symlink after the pin would
+# otherwise take the move outside the workspace.
+
+
+def _exdev_rename(monkeypatch, swap=None):
+    """Make ``_rename_at`` fail with EXDEV, running ``swap`` first (after both
+    parents are pinned)."""
+    calls = []
+
+    def _rename(*a, **kw):
+        calls.append(a)
+        if swap is not None:
+            swap()
+        raise OSError(errno.EXDEV, os.strerror(errno.EXDEV))
+
+    monkeypatch.setattr(tf, "_rename_at", _rename)
+    return calls
+
+
+def _no_move_leftovers(workspace: Path) -> None:
+    assert not [p for p in workspace.rglob(".gw-move-*")]
+
+
+def _move(client, source, destination):
+    return client.post(
+        "/files/move",
+        headers={**_AUTH, **_USER},
+        json={"source": source, "destination": destination},
+    )
+
+
+def test_move_across_devices_renames_a_file(client, workspace, monkeypatch):
+    calls = _exdev_rename(monkeypatch)
+    r = _move(client, "/notes.txt", "/renamed.txt")
+    assert r.status_code == 200
+    assert calls
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "renamed.txt").read_text() == "hello\nworld\n"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_replaces_an_existing_file(client, workspace, monkeypatch):
+    _exdev_rename(monkeypatch)
+    r = _move(client, "/notes.txt", "/blob.bin")
+    assert r.status_code == 200
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "blob.bin").read_text() == "hello\nworld\n"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_into_an_existing_directory(client, workspace, monkeypatch):
+    _exdev_rename(monkeypatch)
+    r = _move(client, "/notes.txt", "/sub")
+    assert r.status_code == 200
+    assert not (workspace / "notes.txt").exists()
+    assert (workspace / "sub" / "notes.txt").read_text() == "hello\nworld\n"
+    assert (workspace / "sub" / "inner.md").read_text() == "# inner"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_moves_a_directory_tree(client, workspace, monkeypatch):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    (workspace / "sub" / "link").symlink_to("inner.md")
+    _exdev_rename(monkeypatch)
+    r = _move(client, "/sub", "/moved")
+    assert r.status_code == 200
+    assert not (workspace / "sub").exists()
+    assert (workspace / "moved" / "inner.md").read_text() == "# inner"
+    assert (workspace / "moved" / "deeper" / "x.txt").read_text() == "mine"
+    assert os.readlink(workspace / "moved" / "link") == "inner.md"
+    _no_move_leftovers(workspace)
+
+
+def test_move_across_devices_failed_copy_keeps_the_source(
+    client, workspace, monkeypatch
+):
+    _exdev_rename(monkeypatch)
+
+    def _boom(*a, **kw):
+        raise OSError(errno.ENOSPC, "no space")
+
+    monkeypatch.setattr(tf, "_write_all", _boom)
+    with pytest.raises(OSError):
+        _move(client, "/notes.txt", "/renamed.txt")
+    assert (workspace / "notes.txt").read_text() == "hello\nworld\n"
+    assert not (workspace / "renamed.txt").exists()
+    _no_move_leftovers(workspace)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        # (source, destination, gone, landed, content) — gone/landed relative
+        # to tmp_path, where the pinned (pre-swap) ``sub`` now lives at moved-sub.
+        # source parent swapped: a file, and a whole directory
+        (
+            "/sub/deeper/x.txt",
+            "/other/x.txt",
+            "moved-sub/deeper/x.txt",
+            "alice/claude/other/x.txt",
+            "mine",
+        ),
+        (
+            "/sub/deeper",
+            "/other/deeper",
+            "moved-sub/deeper",
+            "alice/claude/other/deeper/x.txt",
+            "mine",
+        ),
+        # destination parent swapped: replace, move into a directory, a tree
+        (
+            "/notes.txt",
+            "/sub/deeper/x.txt",
+            "alice/claude/notes.txt",
+            "moved-sub/deeper/x.txt",
+            "hello\nworld\n",
+        ),
+        (
+            "/notes.txt",
+            "/sub/deeper",
+            "alice/claude/notes.txt",
+            "moved-sub/deeper/notes.txt",
+            "hello\nworld\n",
+        ),
+        (
+            "/other/dir",
+            "/sub/deeper/dir",
+            "alice/claude/other/dir",
+            "moved-sub/deeper/dir/f.txt",
+            "mine too",
+        ),
+    ],
+)
+def test_move_across_devices_refuses_a_parent_swapped_for_a_symlink(
+    client, workspace, tmp_path, outside, monkeypatch, body
+):
+    (workspace / "sub" / "deeper").mkdir()
+    (workspace / "sub" / "deeper" / "x.txt").write_text("mine")
+    (workspace / "other" / "dir").mkdir(parents=True)
+    (workspace / "other" / "dir" / "f.txt").write_text("mine too")
+    before = _outside_tree(outside)
+    calls = _exdev_rename(monkeypatch, _swap_dir(workspace, tmp_path, "sub", outside))
+    source, destination, gone, landed, content = body
+    r = _move(client, source, destination)
+    assert calls
+    # Nothing outside was read into the workspace, created, replaced or deleted.
+    assert _outside_tree(outside) == before
+    for p in workspace.rglob("*"):
+        if p.is_file() and not p.is_symlink():
+            assert _OUTSIDE_SECRET not in p.read_bytes(), p
+    # The move completed on the entries that were pinned, wherever they are now.
+    assert r.status_code == 200
+    assert not (tmp_path / gone).exists()
+    assert (tmp_path / landed).read_text() == content
+    _no_move_leftovers(workspace)
+    _no_move_leftovers(tmp_path / "moved-sub")

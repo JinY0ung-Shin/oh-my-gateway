@@ -356,3 +356,29 @@ async def test_max_turns_result_is_reported_as_incomplete():
     # 지금까지의 텍스트는 버리지 않는다 (SSE 본문은 \uXXXX로 이스케이프된다)
     assert stream_result["assistant_text"] == "부분 답변"
     assert stream_result["success"] is False
+
+
+def test_frontmatter_of_a_fifo_returns_empty_without_blocking(tmp_path):
+    """A skill file swapped for a FIFO after the ``is_file()`` check must not
+    park the reader: ``/v1/agent-resources`` would hang with it."""
+    import os
+    import threading
+
+    from src import agent_catalog
+
+    fifo = tmp_path / "SKILL.md"
+    os.mkfifo(fifo)
+    result = []
+    t = threading.Thread(
+        target=lambda: result.append(agent_catalog._parse_frontmatter(fifo)),
+        daemon=True,
+    )
+    t.start()
+    t.join(5)
+    blocked = t.is_alive()
+    if blocked:  # unblock the reader so the test process can exit
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        t.join(5)
+    assert not blocked, "reading a FIFO's frontmatter blocked"
+    assert result == [{}]

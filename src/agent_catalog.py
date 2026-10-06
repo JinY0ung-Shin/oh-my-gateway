@@ -25,6 +25,8 @@ never fatal.
 from __future__ import annotations
 
 import logging
+import os
+import stat
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -39,11 +41,23 @@ _MANAGED_MARKER = ".oh-my-gateway-managed"
 
 def _parse_frontmatter(path: Path) -> Dict[str, Any]:
     """Return the YAML frontmatter of *path* as a dict (``{}`` when absent)."""
+    # The file was checked with ``is_file()``/``is_symlink()``, but the
+    # workspace keeps changing: open without following a symlink and without
+    # blocking on a FIFO, then confirm a regular file on the open descriptor.
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
+        return {}
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {}
+        os.set_blocking(fd, True)
+        with os.fdopen(os.dup(fd), "r", encoding="utf-8", errors="replace") as fh:
             head = fh.read(_MAX_FRONTMATTER_BYTES)
     except OSError:
         return {}
+    finally:
+        os.close(fd)
     if not head.startswith("---"):
         return {}
     body = head[3:]
