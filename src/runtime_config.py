@@ -8,15 +8,24 @@ Only values listed in ``EDITABLE_KEYS`` can be changed at runtime.
 Changes take effect on the **next request** — already-running requests
 and already-created sessions are not retroactively affected.
 
+Overrides are persisted to ``data/runtime_config.json`` (the same ``data/``
+bind mount as the system prompt), so an admin-set value survives a restart
+and an image rebuild/redeploy. The file is the source of truth: a mutation
+writes it first and changes memory only after the write succeeds. Startup
+restores it with ``load_persisted()``; an unknown key or a value that no
+longer validates is dropped with a warning instead of failing startup.
+
 Rate limits and timeout are intentionally excluded because slowapi
 caches limit strings at decorator time and the backend captures
 timeout at init time.  Changing those requires a server restart.
 """
 
+import json
 import logging
 import os
+from pathlib import Path
 from threading import Lock
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +34,9 @@ logger = logging.getLogger(__name__)
 # one reserve so the advertised file ceiling and the accepted request body stay
 # in lockstep.
 WORKSPACE_UPLOAD_MULTIPART_RESERVE = 8192
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_PERSIST_FILE = _DATA_DIR / "runtime_config.json"
 
 
 def _int_env(name: str) -> int:
@@ -132,11 +144,17 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
 
 
 class RuntimeConfig:
-    """Thread-safe runtime configuration store."""
+    """Thread-safe runtime configuration store.
 
-    def __init__(self) -> None:
+    With *persist_path* set, every mutation is written there before memory
+    changes (``OSError`` leaves memory untouched). Without it the store is
+    memory-only.
+    """
+
+    def __init__(self, persist_path: Optional[Path] = None) -> None:
         self._overrides: Dict[str, Any] = {}
         self._lock = Lock()
+        self.persist_path = persist_path
 
     def get(self, key: str) -> Any:
         """Return the runtime value for *key* (override or original constant)."""
@@ -151,7 +169,7 @@ class RuntimeConfig:
             raise KeyError(f"Key '{key}' is not editable at runtime")
         coerced = self._coerce(key, value)
         with self._lock:
-            self._overrides[key] = coerced
+            self._commit({**self._overrides, key: coerced})
         logger.info(f"Runtime config updated: {key} = {coerced!r}")
 
     def is_overridden(self, key: str) -> bool:
@@ -167,14 +185,64 @@ class RuntimeConfig:
         if key not in EDITABLE_KEYS:
             raise KeyError(f"Key '{key}' is not editable at runtime")
         with self._lock:
-            self._overrides.pop(key, None)
+            remaining = {k: v for k, v in self._overrides.items() if k != key}
+            self._commit(remaining)
         logger.info(f"Runtime config reset: {key}")
 
     def reset_all(self) -> None:
         """Remove all runtime overrides."""
         with self._lock:
-            self._overrides.clear()
+            self._commit({})
         logger.info("Runtime config: all overrides cleared")
+
+    def load_persisted(self) -> None:
+        """Replace the in-memory overrides with the persisted ones.
+
+        A missing file means no overrides. A corrupt file, an unknown key or a
+        value that no longer validates is skipped with a warning; startup never
+        fails because of this file.
+        """
+        path = self.persist_path
+        restored: Dict[str, Any] = {}
+        if path is not None and path.is_file():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                logger.warning("Failed to load persisted runtime config: %s", e)
+                data = {}
+            overrides = data.get("overrides") if isinstance(data, dict) else None
+            if not isinstance(overrides, dict):
+                if data:
+                    logger.warning("Persisted runtime config has invalid structure, ignoring")
+                overrides = {}
+            for key, value in overrides.items():
+                if key not in EDITABLE_KEYS:
+                    logger.warning("Persisted runtime config: unknown key %r ignored", key)
+                    continue
+                try:
+                    restored[key] = self._coerce(key, value)
+                except (ValueError, TypeError) as e:
+                    logger.warning("Persisted runtime config: %s ignored (%s)", key, e)
+        with self._lock:
+            self._overrides = restored
+        if restored:
+            logger.info("Runtime config: restored persisted overrides %s", sorted(restored))
+
+    def _commit(self, overrides: Dict[str, Any]) -> None:
+        """Persist *overrides*, then install them. Caller holds ``_lock``."""
+        path = self.persist_path
+        if path is not None:
+            if overrides:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                tmp = path.with_name(path.name + ".tmp")
+                tmp.write_text(
+                    json.dumps({"overrides": overrides}, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                os.replace(tmp, path)
+            elif path.is_file():
+                path.unlink()
+        self._overrides = overrides
 
     def get_all(self) -> Dict[str, Any]:
         """Return all editable keys with their current effective values."""
@@ -278,7 +346,7 @@ class RuntimeConfig:
 # Convenience getters — import these instead of raw constants
 # ---------------------------------------------------------------------------
 
-runtime_config = RuntimeConfig()
+runtime_config = RuntimeConfig(persist_path=_PERSIST_FILE)
 
 
 def get_default_model() -> str:

@@ -766,6 +766,12 @@ async def update_runtime_config(body: RuntimeConfigUpdate, _=Depends(require_adm
         return JSONResponse(status_code=400, content={"error": str(e)})
     except (ValueError, TypeError) as e:
         return JSONResponse(status_code=422, content={"error": f"Invalid value: {e}"})
+    except OSError as e:
+        logger.error("Runtime config: failed to persist %s: %s", body.key, e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Failed to save runtime config; value unchanged"},
+        )
 
 
 @router.post("/api/runtime-config/reset")
@@ -776,13 +782,20 @@ async def reset_runtime_config(
     """Reset runtime overrides. If *key* is given, reset that key only."""
     from src.runtime_config import runtime_config
 
-    if key:
-        try:
-            runtime_config.reset(key)
-        except KeyError as e:
-            return JSONResponse(status_code=400, content={"error": str(e)})
-        return {"status": "reset", "key": key, "value": runtime_config.get(key)}
-    runtime_config.reset_all()
+    try:
+        if key:
+            try:
+                runtime_config.reset(key)
+            except KeyError as e:
+                return JSONResponse(status_code=400, content={"error": str(e)})
+            return {"status": "reset", "key": key, "value": runtime_config.get(key)}
+        runtime_config.reset_all()
+    except OSError as e:
+        logger.error("Runtime config: failed to persist reset: %s", e)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Failed to save runtime config; value unchanged"},
+        )
     return {"status": "all_reset"}
 
 

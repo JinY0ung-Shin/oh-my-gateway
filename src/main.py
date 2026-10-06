@@ -257,6 +257,11 @@ async def lifespan(app: FastAPI):
 
     load_default_prompt(SYSTEM_PROMPT_FILE)
 
+    # Restore admin runtime-config overrides (upload limit, thinking mode, …)
+    from src.runtime_config import runtime_config
+
+    runtime_config.load_persisted()
+
     # Discover and register backends
     discover_backends()
 

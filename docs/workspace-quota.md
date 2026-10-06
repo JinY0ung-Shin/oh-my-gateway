@@ -10,7 +10,7 @@ USER_WORKSPACE_QUOTA_MB=500
 
 This is separate from the existing single-file upload controls:
 
-- `WORKSPACE_UPLOAD_MAX_BYTES` seeds the runtime-configurable `workspace_upload_max_bytes` (admin `runtime-config`), which limits one `POST /files/upload` file. Its default is 10 MiB; `0` disables uploads.
+- `WORKSPACE_UPLOAD_MAX_BYTES` seeds the runtime-configurable `workspace_upload_max_bytes` (admin `runtime-config`), which limits one `POST /files/upload` file. Its default is 10 MiB; `0` disables uploads. An admin override is saved to `data/runtime_config.json`, so it survives restarts and image rebuilds (Docker bind-mounts `./data`); resetting the key returns to the env value.
 - `MAX_REQUEST_SIZE` limits the whole HTTP request body for ordinary API requests. Its default is also 10 MiB. An authenticated `POST /files/upload` uses the upload-specific ceiling plus multipart envelope room instead, so the advertised `max_upload_bytes` is exactly what the route accepts.
 - `USER_WORKSPACE_QUOTA_MB` limits the aggregate user workspace. It does not replace either request/upload limit.
 

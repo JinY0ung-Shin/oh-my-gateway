@@ -96,8 +96,8 @@ def is_enabled() -> bool:
     """Whether the sanitizer should accept requests right now.
 
     The admin panel may override the boot-time env value at runtime via
-    ``runtime_config.set("sanitizer_enabled", ...)``. Restarting reverts to
-    the ``SANITIZER_ENABLED`` env value. A configured upstream is also required;
+    ``runtime_config.set("sanitizer_enabled", ...)`` (persisted across
+    restarts; resetting it reverts to the ``SANITIZER_ENABLED`` env value). A configured upstream is also required;
     if ``ANTHROPIC_BASE_URL`` is unset, enabling the toggle has no effect.
     """
     # Local import avoids a circular dependency: ``runtime_config._get_original``

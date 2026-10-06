@@ -64,7 +64,10 @@ services:
       # same corporate roots. Override HOST_CA_CERTIFICATES_PATH in .env when
       # the host bundle lives outside the Debian/Ubuntu default path.
       - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
-      # Persist admin overrides (system prompt, runtime config) across restarts
+      # Persist admin overrides (system prompt + prompt library, runtime config
+      # such as the upload limit, MCP/plugin manifests) across restarts and image
+      # rebuilds. Keep this mount when redeploying — without it every admin
+      # setting falls back to its .env/default value.
       - ./data:/app/data
       # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
       # to the host so individual users' state survives container recreates.

@@ -15,7 +15,7 @@ def get_config_html() -> str:
             </div>
           </div>
           <p class="text-xs text-muted mb-md">
-            Changes take effect on the next request. No restart needed.
+            Changes take effect on the next request. No restart needed; overrides are saved to data/runtime_config.json and survive restarts and image rebuilds.
           </p>
           <div class="table-wrapper">
             <table>

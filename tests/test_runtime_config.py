@@ -262,3 +262,164 @@ class TestThreadSafety:
         t1.join()
         t2.join()
         assert errors == []
+
+
+class TestRuntimeConfigPersistence:
+    """Admin overrides survive a restart / image rebuild via data/runtime_config.json."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from src.runtime_config import RuntimeConfig
+
+        return RuntimeConfig(persist_path=tmp_path / "data" / "runtime_config.json")
+
+    def _restart(self, store):
+        from src.runtime_config import RuntimeConfig
+
+        fresh = RuntimeConfig(persist_path=store.persist_path)
+        fresh.load_persisted()
+        return fresh
+
+    def test_overrides_survive_restart(self, store):
+        store.set("workspace_upload_max_bytes", 50 * 1024 * 1024)
+        store.set("thinking_mode", "adaptive")
+        store.set("token_streaming", "false")
+
+        fresh = self._restart(store)
+        assert fresh.get("workspace_upload_max_bytes") == 50 * 1024 * 1024
+        assert fresh.get("thinking_mode") == "adaptive"
+        assert fresh.get("token_streaming") is False
+        assert fresh.is_overridden("workspace_upload_max_bytes")
+
+    def test_zero_upload_limit_survives_restart(self, store):
+        # 0 = uploads disabled; must not be mistaken for "unset" on reload
+        store.set("workspace_upload_max_bytes", 0)
+        fresh = self._restart(store)
+        assert fresh.is_overridden("workspace_upload_max_bytes")
+        assert fresh.get("workspace_upload_max_bytes") == 0
+
+    def test_reset_is_persisted(self, store):
+        store.set("default_max_turns", 77)
+        store.set("default_model", "m")
+        store.reset("default_max_turns")
+        fresh = self._restart(store)
+        assert not fresh.is_overridden("default_max_turns")
+        assert fresh.get("default_model") == "m"
+
+        store.reset_all()
+        assert not store.persist_path.exists()
+        assert not self._restart(store).is_overridden("default_model")
+
+    def test_no_file_means_no_overrides(self, store):
+        store.load_persisted()
+        assert not any(store.is_overridden(k) for k in EDITABLE_KEYS)
+
+    @pytest.mark.parametrize(
+        "content",
+        ["{not json", "[]", '{"overrides": 3}', '"x"'],
+    )
+    def test_corrupt_file_is_ignored(self, store, content):
+        store.persist_path.parent.mkdir(parents=True)
+        store.persist_path.write_text(content, encoding="utf-8")
+        store.load_persisted()
+        assert not any(store.is_overridden(k) for k in EDITABLE_KEYS)
+
+    def test_unknown_and_invalid_entries_are_dropped(self, store):
+        import json
+
+        store.persist_path.parent.mkdir(parents=True)
+        store.persist_path.write_text(
+            json.dumps(
+                {
+                    "overrides": {
+                        "removed_key": 1,
+                        "default_max_turns": 0,
+                        "thinking_mode": "bogus",
+                        "default_model": "kept",
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        store.load_persisted()
+        assert store.get("default_model") == "kept"
+        assert not store.is_overridden("default_max_turns")
+        assert not store.is_overridden("thinking_mode")
+
+    def test_failed_write_leaves_memory_unchanged(self, store, monkeypatch):
+        store.set("default_model", "before")
+
+        def boom(*a, **k):
+            raise OSError("disk full")
+
+        monkeypatch.setattr("src.runtime_config.os.replace", boom)
+        with pytest.raises(OSError):
+            store.set("default_model", "after")
+        with pytest.raises(OSError):
+            store.reset("default_max_turns")
+        assert store.get("default_model") == "before"
+        assert self._restart(store).get("default_model") == "before"
+
+    def test_invalid_value_does_not_touch_file(self, store):
+        store.set("default_max_turns", 5)
+        before = store.persist_path.read_text(encoding="utf-8")
+        with pytest.raises(ValueError):
+            store.set("default_max_turns", 0)
+        assert store.persist_path.read_text(encoding="utf-8") == before
+
+    def test_singleton_persists_under_data_dir(self):
+        from src import runtime_config as module
+
+        assert module._PERSIST_FILE.name == "runtime_config.json"
+        assert module._PERSIST_FILE.parent.name == "data"
+
+
+def test_admin_patch_persists_and_startup_restores(tmp_path, monkeypatch):
+    """PATCH /admin/api/runtime-config writes the file the next process restores."""
+    from fastapi.testclient import TestClient
+
+    from src.admin_auth import require_admin
+    from src.main import app
+    from src.runtime_config import RuntimeConfig
+
+    path = tmp_path / "runtime_config.json"
+    monkeypatch.setattr(runtime_config, "persist_path", path)
+    app.dependency_overrides[require_admin] = lambda: True
+    try:
+        client = TestClient(app)
+        r = client.patch(
+            "/admin/api/runtime-config",
+            json={"key": "workspace_upload_max_bytes", "value": 123456},
+        )
+        assert r.status_code == 200, r.text
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+
+    fresh = RuntimeConfig(persist_path=path)
+    fresh.load_persisted()
+    assert fresh.get("workspace_upload_max_bytes") == 123456
+
+
+def test_admin_patch_reports_persist_failure(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from src.admin_auth import require_admin
+    from src.main import app
+
+    monkeypatch.setattr(runtime_config, "persist_path", tmp_path / "rc.json")
+
+    def boom(*a, **k):
+        raise OSError("read-only file system")
+
+    monkeypatch.setattr("src.runtime_config.os.replace", boom)
+    app.dependency_overrides[require_admin] = lambda: True
+    try:
+        client = TestClient(app)
+        r = client.patch(
+            "/admin/api/runtime-config",
+            json={"key": "default_max_turns", "value": 9},
+        )
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+    assert r.status_code == 500
+    assert not runtime_config.is_overridden("default_max_turns")

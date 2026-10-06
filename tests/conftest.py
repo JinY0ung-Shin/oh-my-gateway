@@ -161,6 +161,10 @@ def _isolate_prompt_data(tmp_path_factory):
     mp.setattr(system_prompt, "_DATA_DIR", base)
     mp.setattr(system_prompt, "_PERSIST_FILE", base / "system_prompt.json")
     mp.setattr(system_prompt, "_PROMPTS_DIR", base / "prompts")
+    # Runtime-config overrides persist under data/ too — keep them out of the checkout.
+    from src.runtime_config import runtime_config
+
+    mp.setattr(runtime_config, "persist_path", base / "runtime_config.json")
     yield
     mp.undo()
 
