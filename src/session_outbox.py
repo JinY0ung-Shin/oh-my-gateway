@@ -465,6 +465,16 @@ def apply_turn_task_chunk(session, chunk: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _redact_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Between-turn output reaches clients too: same host/secret redaction."""
+    from src.backends.claude.sysinfo_redaction import get_redactor
+
+    redactor = get_redactor()
+    if redactor is None or not redactor.active:
+        return event
+    return redactor.redact_value(event)
+
+
 def _handle_idle_message(session, message: Any) -> None:
     # Agent/Task calls name the tasks they spawn — including calls made
     # inside a subagent, whose messages are otherwise not forwarded.
@@ -476,6 +486,7 @@ def _handle_idle_message(session, message: Any) -> None:
     event = _message_to_event(message)
     if event is None:
         return
+    event = _redact_event(event)
     outbox = get_outbox(session)
     if event["type"] == "task_started":
         event["name"] = outbox.agent_name_for(

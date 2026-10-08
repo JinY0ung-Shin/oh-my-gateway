@@ -76,6 +76,12 @@ from src.image_handler import ImageHandler
 from src.mcp_config import get_mcp_tool_patterns, resolve_mcp_servers
 from src.response_models import PermissionMode
 from src.runtime_config import get_default_max_turns
+from src.backends.claude.sysinfo_redaction import (
+    StreamRedactor,
+    child_env_mask,
+    get_redactor,
+    make_redaction_post_tool_use_hook,
+)
 from src.backends.claude.workspace_sandbox import (
     make_claude_home_guard_hook,
     make_workspace_sandbox_hook,
@@ -1058,6 +1064,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             window = runtime_config.get("auto_compact_window")
             sdk_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window) if window else ""
 
+        # Gateway-only secrets (ADMIN_API_KEY, API_KEY, …) are blanked in the
+        # child: the CLI never needs them, and a shell inside the agent would
+        # otherwise inherit them from the gateway process.
+        sdk_env.update(child_env_mask())
+
         if sdk_env:
             options.env.update(sdk_env)
 
@@ -1563,6 +1574,40 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             )
         return matchers
 
+    @staticmethod
+    def _post_tool_use_hooks():
+        """PostToolUse matchers: host/secret redaction of successful tool results.
+
+        A failed call goes through PostToolUseFailure, which cannot rewrite the
+        result — see ``sysinfo_redaction`` for that limit.
+        """
+        redactor = get_redactor()
+        if redactor is None or not redactor.active:
+            return []
+        return [HookMatcher(matcher="", hooks=[make_redaction_post_tool_use_hook(redactor)])]
+
+    async def _redact_stream(self, chunks):
+        """Filter one turn's converted chunks through the outbound redactor.
+
+        Always closes *chunks* on exit so the wrapped generator's cleanup
+        (pending-read cancellation, ``stream_break_event`` reset) runs as soon
+        as the consumer stops, not at garbage collection.
+        """
+        redactor = get_redactor()
+        stream = StreamRedactor(redactor) if redactor is not None and redactor.active else None
+        try:
+            async for chunk in chunks:
+                if stream is None:
+                    yield chunk
+                    continue
+                for out in stream.process(chunk):
+                    yield out
+            if stream is not None:
+                for out in stream.flush_all():
+                    yield out
+        finally:
+            await chunks.aclose()
+
     def _make_ask_user_can_use_tool(self, session):
         """Create a ``can_use_tool`` callback that intercepts AskUserQuestion.
 
@@ -1787,6 +1832,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         options.hooks = {
             "PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools, disallowed_tools)
         }
+        post_tool_use = self._post_tool_use_hooks()
+        if post_tool_use:
+            options.hooks["PostToolUse"] = post_tool_use
 
         with self._sdk_env():
             client = ClaudeSDKClient(options=options)
@@ -1874,6 +1922,28 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         return extract_command_name(text) is not None
 
     async def run_completion_with_client(
+        self,
+        client: ClaudeSDKClient,
+        prompt: Union[str, List[Dict[str, Any]]],
+        session,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Run a completion turn on an existing *client* (redacted output).
+
+        See :meth:`_run_completion_with_client_raw`; every chunk passes the
+        outbound host/secret redactor (``sysinfo_redaction``).
+        """
+        stream = self._redact_stream(
+            self._run_completion_with_client_raw(client, prompt, session)
+        )
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            # ``async for`` never closes what it iterates: without this the
+            # raw turn's cleanup would wait for garbage collection.
+            await stream.aclose()
+
+    async def _run_completion_with_client_raw(
         self,
         client: ClaudeSDKClient,
         prompt: Union[str, List[Dict[str, Any]]],
@@ -2056,6 +2126,21 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             raise TaskStopRejected(str(exc)) from exc
 
     async def receive_response_from_client(
+        self,
+        client: ClaudeSDKClient,
+        session,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Yield remaining messages from *client* (redacted output)."""
+        stream = self._redact_stream(
+            self._receive_response_from_client_raw(client, session)
+        )
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await stream.aclose()
+
+    async def _receive_response_from_client_raw(
         self,
         client: ClaudeSDKClient,
         session,

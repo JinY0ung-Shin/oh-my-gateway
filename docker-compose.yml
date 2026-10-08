@@ -8,6 +8,13 @@ services:
     # grandchildren in the cgroup — the reason `docker restart` used to leak
     # workers while only `compose down && up` recovered (issue #147).
     stop_grace_period: 35s
+    # The agent's tools run inside this container, so whatever `hostname`
+    # returns can reach the model. Docker's default is the container id; a fixed
+    # neutral name means a leaked value says nothing about the real host. The
+    # gateway still redacts its own name/addresses from tool results
+    # (SYSINFO_REDACTION, on by default) — this is the part that holds even for
+    # a failed tool call, which the CLI cannot rewrite.
+    hostname: ${GATEWAY_CONTAINER_HOSTNAME:-agent-sandbox}
     build:
       context: .
       # Inherit proxy settings from the host shell at build time.

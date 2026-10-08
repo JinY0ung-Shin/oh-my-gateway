@@ -15,6 +15,12 @@ os.environ.setdefault("GATEWAY_SKIP_DOTENV", "1")
 # to export the variable. `setdefault` keeps a real value intact when one is set.
 os.environ.setdefault("ADMIN_API_KEY", "test-admin-api-key")
 
+# Host/secret redaction (src/backends/claude/sysinfo_redaction.py) is on by
+# default in production, but its table is built from THIS machine (hostname,
+# interface addresses, env secrets), so leaving it on would make unrelated
+# tests depend on where they run. Its own tests opt back in explicitly.
+os.environ.setdefault("SYSINFO_REDACTION", "false")
+
 import pytest
 
 import src.main as main
