@@ -62,11 +62,15 @@ MIN_SECRET_LEN = 8
 # characters, so a longer value is dropped (with a warning) rather than
 # silently streamed in pieces.
 MAX_LITERAL_LEN = 65536
-# Longest match each built-in pattern can produce (the stream carry keeps at
-# least this much of a whitespace-free run). A DNS name is at most 253.
-_IPV4_MAX = 15
-_IPV6_MAX = 45
-_DOMAIN_MAX = 253
+# How far each built-in pattern can reach from where its match starts — the
+# match plus its trailing lookaround — which the stream carry must keep of a
+# whitespace-free run. These are properties of the REGEXES below, which are
+# bounded on purpose (not just of the protocols): IPv4 15 + 1, IPv6 capped at
+# 40 (the longest textual address is 39) + 1, and a domain match is confined
+# to a run of at most 253 name characters (the DNS limit) + 1.
+_IPV4_MAX = 16
+_IPV6_MAX = 41
+_DOMAIN_MAX = 254
 
 _SECRET_NAME_RE = re.compile(
     r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|COOKIE|DSN)",
@@ -94,7 +98,10 @@ _PRIVATE_IPV4 = (
     r"|169\.254(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2}"
     r")(?![0-9])"
 )
-_PRIVATE_IPV6 = r"(?<![0-9A-Fa-f:])(?:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f]):[0-9A-Fa-f:]*[0-9A-Fa-f](?![0-9A-Fa-f:])"
+_PRIVATE_IPV6 = (
+    r"(?<![0-9A-Fa-f:])(?i:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f])"
+    r":[0-9A-Fa-f:]{0,34}[0-9A-Fa-f](?![0-9A-Fa-f:])"
+)
 
 
 def redaction_enabled() -> bool:
@@ -347,6 +354,28 @@ class Redactor:
         return value
 
 
+def _builtin_patterns() -> List[Tuple[Any, ...]]:
+    """Domain suffixes and private ranges, each with the reach it is bounded to."""
+    patterns: List[Tuple[Any, ...]] = []
+    for suffix in _csv_env("SYSINFO_REDACT_DOMAINS"):
+        suffix = suffix.lstrip(".")
+        patterns.append(
+            (
+                # The lookahead confines the match to a name run of at most 253
+                # characters, so _DOMAIN_MAX really bounds what it can reach.
+                rf"(?<![{_ASCII_HOST_CHAR}.])"
+                r"(?=[A-Za-z0-9.-]{1,253}(?![A-Za-z0-9.-]))"
+                rf"(?:[A-Za-z0-9-]+\.)+{re.escape(suffix)}(?![{_ASCII_HOST_CHAR}])",
+                "domain",
+                _DOMAIN_MAX,
+            )
+        )
+    if parse_bool_env("SYSINFO_REDACT_PRIVATE_IPS", "true"):
+        patterns.append((_PRIVATE_IPV4, "ip", _IPV4_MAX))
+        patterns.append((_PRIVATE_IPV6, "ip", _IPV6_MAX))
+    return patterns
+
+
 def build_redactor(env: Optional[Dict[str, str]] = None) -> Redactor:
     env = dict(os.environ if env is None else env)
     literals: List[_Literal] = []
@@ -359,19 +388,7 @@ def build_redactor(env: Optional[Dict[str, str]] = None) -> Redactor:
         _Literal(v, "custom", False) for v in _csv_env("SYSINFO_REDACT_VALUES")
     ]
 
-    patterns: List[Tuple[str, str]] = []
-    for suffix in _csv_env("SYSINFO_REDACT_DOMAINS"):
-        suffix = suffix.lstrip(".")
-        patterns.append(
-            (
-                rf"(?<![{_ASCII_HOST_CHAR}.])(?:[A-Za-z0-9-]+\.)+{re.escape(suffix)}(?![{_ASCII_HOST_CHAR}])",
-                "domain",
-                _DOMAIN_MAX,
-            )
-        )
-    if parse_bool_env("SYSINFO_REDACT_PRIVATE_IPS", "true"):
-        patterns.append((_PRIVATE_IPV4, "ip", _IPV4_MAX))
-        patterns.append((_PRIVATE_IPV6, "ip", _IPV6_MAX))
+    patterns: List[Tuple[Any, ...]] = _builtin_patterns()
     for regex in os.getenv("SYSINFO_REDACT_PATTERNS", "").split(";;"):
         if regex.strip():
             # Unbounded: an arbitrary regex may span whitespace and has no

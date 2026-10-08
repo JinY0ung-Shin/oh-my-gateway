@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import os
 import random
+import re
 from types import SimpleNamespace
 from typing import Any, Dict, List
 from unittest.mock import patch
@@ -449,6 +450,77 @@ class TestTextCarry:
         assert _streamed_text(first) == ""
         rest = s.process(_stop())
         assert _streamed_text(rest) == "id [REDACTED:custom] ok"
+
+    # --- #229 review: a declared max_len must bound what the REGEX can match
+
+    def _domain_redactor(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_DOMAINS", "corp.internal")
+        return _build()
+
+    @pytest.mark.parametrize(
+        "prefix", ["", "가 ", "가" * 600], ids=["bare", "after-space", "in-cjk-run"]
+    )
+    def test_overlong_ipv6_like_run_streams_like_the_whole(self, prefix, monkeypatch):
+        r = self._domain_redactor(monkeypatch)
+        value = "fd00:" + "a:" * 1500 + "a"
+        assert len(value) > sr._IPV6_MAX
+        text = prefix + value + " 끝"
+        emitted = self._stream(r, text, 20)
+        assert "".join(emitted) == r.redact_text(text)
+
+    @pytest.mark.parametrize(
+        "prefix", ["", "가 ", "가" * 600], ids=["bare", "after-space", "in-cjk-run"]
+    )
+    def test_overlong_domain_run_streams_like_the_whole(self, prefix, monkeypatch):
+        r = self._domain_redactor(monkeypatch)
+        value = ".".join(["abcdefghij"] * 300) + ".corp.internal"
+        assert len(value) > 253
+        text = prefix + value + " 끝"
+        emitted = self._stream(r, text, 20)
+        assert "".join(emitted) == r.redact_text(text)
+        # A run beyond the DNS limit is not a host name: never matched at all,
+        # so there is no partial value to leak either way.
+        assert "[REDACTED" not in r.redact_text(text)
+
+    def test_real_names_and_addresses_at_their_limits_are_still_redacted(self, monkeypatch):
+        r = self._domain_redactor(monkeypatch)
+        longest_name = ".".join(["a" * 63] * 3) + "." + "b" * (253 - 3 * 64 - 14) + ".corp.internal"
+        assert len(longest_name) == 253
+        full_v6 = "fd12:3456:789a:bcde:f012:3456:789a:bcde"
+        assert len(full_v6) == 39
+        out = r.redact_text(f"{longest_name} {full_v6} FE80::1 db1.corp.internal.")
+        assert out == "[REDACTED:domain] [REDACTED:ip] [REDACTED:ip] [REDACTED:domain]."
+
+    @pytest.mark.parametrize(
+        "name,alphabet,starts",
+        [
+            ("ipv4", "0123456789.", ["10.", "172.16.", "192.168.", "100.64.", "169.254."]),
+            ("ipv6", "0123456789abcdefABCDEF:", ["fd00:", "fc12:", "fe80:", "FEBF:"]),
+            ("domain", "abcdefghij0123456789.-", ["a.", "x-y."]),
+        ],
+    )
+    def test_no_builtin_match_reaches_past_its_declared_bound(
+        self, name, alphabet, starts, monkeypatch
+    ):
+        """Random runs over each pattern's own alphabet: every match (plus the
+        one lookahead character) fits the max_len the carry relies on."""
+        monkeypatch.setenv("SYSINFO_REDACT_DOMAINS", "corp.internal")
+        regex, bound = {
+            "ipv4": (sr._PRIVATE_IPV4, sr._IPV4_MAX),
+            "ipv6": (sr._PRIVATE_IPV6, sr._IPV6_MAX),
+            "domain": (None, sr._DOMAIN_MAX),
+        }[name]
+        if regex is None:
+            regex = next(
+                spec[0] for spec in sr._builtin_patterns() if spec[1] == "domain"
+            )
+        compiled = re.compile(regex)
+        rng = random.Random(name)
+        for _ in range(400):
+            body = "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 600)))
+            text = rng.choice(starts) + body + rng.choice(["", ".corp.internal", " "])
+            for match in compiled.finditer(text):
+                assert len(match.group(0)) + 1 <= bound, (name, len(match.group(0)))
 
     @pytest.mark.parametrize("seed", range(3))
     def test_fuzz_with_long_secret_and_custom_regex(self, seed):
