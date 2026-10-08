@@ -55,9 +55,10 @@ def _redactor(**extra) -> Redactor:
         _Literal(SECRET, "secret", False),
         _Literal("pass phrase with spaces", "secret", False),
     ] + extra.get("literals", [])
-    patterns = [(sr._PRIVATE_IPV4, "ip"), (sr._PRIVATE_IPV6, "ip")] + extra.get(
-        "patterns", []
-    )
+    patterns = [
+        (sr._PRIVATE_IPV4, "ip", sr._IPV4_MAX),
+        (sr._PRIVATE_IPV6, "ip", sr._IPV6_MAX),
+    ] + extra.get("patterns", [])
     return Redactor(literals, patterns)
 
 
@@ -387,10 +388,83 @@ class TestTextCarry:
         carry = _TextCarry(r)
         for _ in range(5000):
             carry.feed("가")
-        assert len(carry._buf) <= _TextCarry._MAX_RUN
+        assert len(carry._buf) <= carry._max_run
         for _ in range(5000):
             carry.feed("word ")
         assert len(carry._buf) <= 64
+
+    # --- #229 review: values longer than the forced-cut tail, and custom regexes
+
+    LONG_SECRET = ("eyJhbGciOiJIUzI1NiJ9." + "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo" * 30)[:1000]
+
+    def _stream(self, r, text, size):
+        carry = _TextCarry(r)
+        emitted = []
+        for i in range(0, len(text), size):
+            emitted.append(carry.feed(text[i : i + size]))
+        emitted.append(carry.flush())
+        return emitted
+
+    @pytest.mark.parametrize("size", [1, 7, 64, 100])
+    def test_whitespace_free_secret_longer_than_the_run_cut(self, size):
+        """A 1000-char token (a JWT under *_TOKEN) streamed in <=100-char chunks:
+        no raw prefix may leave before the whole literal is in the buffer."""
+        r = Redactor([_Literal(self.LONG_SECRET, "secret", False)], [])
+        assert len(self.LONG_SECRET) == 1000 and r.stream_keep >= 1000
+        text = "token=" + self.LONG_SECRET + " end"
+        emitted = self._stream(r, text, size)
+        assert "".join(emitted) == "token=[REDACTED:secret] end"
+        assert not any(self.LONG_SECRET[:32] in piece for piece in emitted)
+
+    def test_long_secret_inside_a_long_cjk_run(self):
+        r = Redactor([_Literal(self.LONG_SECRET, "secret", False)], [])
+        text = "가" * 900 + self.LONG_SECRET + "나" * 900
+        emitted = self._stream(r, text, 50)
+        assert "".join(emitted) == r.redact_text(text)
+        assert not any(self.LONG_SECRET[:32] in piece for piece in emitted)
+
+    def test_literals_beyond_the_supported_ceiling_are_dropped_loudly(self, caplog):
+        huge = "z" * (sr.MAX_LITERAL_LEN + 1)
+        with caplog.at_level("WARNING"):
+            r = Redactor([_Literal(huge, "secret", False)], [])
+        assert not r.active
+        assert "longer than" in caplog.text
+
+    def test_custom_regex_spanning_whitespace_split_mid_match(self):
+        r = Redactor([], [(r"secret\s+value", "custom")])
+        assert r.unbounded_patterns
+        carry = _TextCarry(r)
+        assert carry.feed("secret ") == ""  # nothing released mid-block
+        assert carry.feed("value") == ""
+        assert carry.flush() == "[REDACTED:custom]"
+
+    def test_custom_regex_holds_the_block_until_stop(self):
+        r = _redactor(patterns=[(r"EMP-\d+", "custom")])
+        out = TestStreamRedactor()._run(
+            [_delta("id EMP-"), _delta("123456 ok"), _stop()]
+        )
+        assert out  # sanity: the helper ran
+        s = StreamRedactor(r)
+        first = s.process(_delta("id EMP-")) + s.process(_delta("123456 ok"))
+        assert _streamed_text(first) == ""
+        rest = s.process(_stop())
+        assert _streamed_text(rest) == "id [REDACTED:custom] ok"
+
+    @pytest.mark.parametrize("seed", range(3))
+    def test_fuzz_with_long_secret_and_custom_regex(self, seed):
+        rng = random.Random(500 + seed)
+        long_r = _redactor(literals=[_Literal(self.LONG_SECRET, "secret", False)])
+        custom_r = _redactor(patterns=[(r"secret\s+value|EMP-\d{3,}", "custom")])
+        words = self.WORDS + [self.LONG_SECRET, "secret value", "secret\n value", "EMP-1234"]
+        for _ in range(int(os.getenv("REDACTION_FUZZ_CASES", "80")) // 2):
+            text = "".join(
+                rng.choice(words) + rng.choice(self.GLUE) for _ in range(rng.randint(1, 20))
+            )
+            for r in (long_r, custom_r):
+                emitted = self._stream(r, text, rng.choice([1, 5, 33, 100]))
+                assert "".join(emitted) == r.redact_text(text), text[:200]
+                if r is long_r:
+                    assert not any(self.LONG_SECRET[:32] in piece for piece in emitted)
 
 
 # ---------------------------------------------------------------------------

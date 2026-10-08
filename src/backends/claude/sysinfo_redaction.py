@@ -24,8 +24,13 @@ Configuration (env):
 * ``SYSINFO_REDACTION`` — on by default; ``false`` disables both layers.
 * ``SYSINFO_REDACT_PRIVATE_IPS`` — on by default; redact RFC 1918 / CGNAT /
   link-local IPv4 and ULA / link-local IPv6 addresses by pattern.
-* ``SYSINFO_REDACT_VALUES`` — comma-separated extra literals.
-* ``SYSINFO_REDACT_PATTERNS`` — extra regexes, separated by ``;;``.
+* ``SYSINFO_REDACT_VALUES`` — comma-separated extra literals. Any literal
+  (these or a secret env value) longer than ``MAX_LITERAL_LEN`` is dropped
+  with a warning: the stream carry holds back the longest literal's length.
+* ``SYSINFO_REDACT_PATTERNS`` — extra regexes, separated by ``;;``. An
+  arbitrary regex has no static maximum length and may span whitespace, so
+  with one configured streamed text is released per text block (at its end)
+  instead of incrementally.
 * ``SYSINFO_REDACT_DOMAINS`` — comma-separated domain suffixes; any host name
   under one is redacted.
 * ``SYSINFO_REDACT_ALLOW`` — comma-separated literals never redacted (e.g. a
@@ -53,6 +58,15 @@ PLACEHOLDER = "[REDACTED:{label}]"
 MIN_LITERAL_LEN = 4
 # Secret env values shorter than this are not worth treating as secrets.
 MIN_SECRET_LEN = 8
+# Supported ceiling for one literal: the stream carry holds back this many
+# characters, so a longer value is dropped (with a warning) rather than
+# silently streamed in pieces.
+MAX_LITERAL_LEN = 65536
+# Longest match each built-in pattern can produce (the stream carry keeps at
+# least this much of a whitespace-free run). A DNS name is at most 253.
+_IPV4_MAX = 15
+_IPV6_MAX = 45
+_DOMAIN_MAX = 253
 
 _SECRET_NAME_RE = re.compile(
     r"(KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|PRIVATE|COOKIE|DSN)",
@@ -206,12 +220,25 @@ class Redactor:
     """Literal + pattern redaction over text (and nested values)."""
 
     def __init__(
-        self, literals: Iterable[_Literal], patterns: Iterable[Tuple[str, str]]
+        self, literals: Iterable[_Literal], patterns: Iterable[Tuple[Any, ...]]
     ):
+        """*patterns* are ``(regex, label)`` or ``(regex, label, max_len)``.
+
+        ``max_len`` is the longest text the pattern can match; without it the
+        pattern is treated as unbounded, and streamed text is then held back
+        until its block ends (see ``_TextCarry``).
+        """
         allow = set(_csv_env("SYSINFO_REDACT_ALLOW"))
         seen: Dict[str, _Literal] = {}
         for lit in literals:
             if len(lit.value) < MIN_LITERAL_LEN or lit.value in allow:
+                continue
+            if len(lit.value) > MAX_LITERAL_LEN:
+                logger.warning(
+                    "Ignoring a %s redaction value longer than %d characters",
+                    lit.label,
+                    MAX_LITERAL_LEN,
+                )
                 continue
             seen.setdefault(lit.value, lit)
         self._labels: Dict[str, str] = {}
@@ -227,7 +254,11 @@ class Redactor:
                 body = f"(?<![{_ASCII_HOST_CHAR}])(?i:{body})(?![{_ASCII_HOST_CHAR}])"
             parts.append(f"(?P<{group}>{body})")
             self._labels[group] = lit.label
-        for index, (regex, label) in enumerate(patterns):
+        self.unbounded_patterns = False
+        max_pattern_len = 0
+        for index, spec in enumerate(patterns):
+            regex, label = spec[0], spec[1]
+            max_len = spec[2] if len(spec) > 2 else None
             try:
                 re.compile(regex)
             except re.error as exc:
@@ -240,10 +271,18 @@ class Redactor:
             # decide the label (see ``_sub``).
             parts.append(f"(?P<{group}>{regex})")
             self._labels[group] = label
+            if max_len is None:
+                self.unbounded_patterns = True
+            else:
+                max_pattern_len = max(max_pattern_len, max_len)
         self.literal_count = len(seen)
         self.pattern_count = sum(1 for g in self._labels if g.startswith("p"))
         self._allow = allow
         self._regex = re.compile("|".join(parts)) if parts else None
+        self.max_literal_len = max((len(v) for v in seen), default=0)
+        # How much of a whitespace-free run the stream carry must keep so that
+        # no match still being written can start before a forced cut.
+        self.stream_keep = max(256, self.max_literal_len, max_pattern_len)
         self.max_ws_literal_len = max(
             (len(v) for v in seen if any(c.isspace() for c in v)), default=0
         )
@@ -327,13 +366,16 @@ def build_redactor(env: Optional[Dict[str, str]] = None) -> Redactor:
             (
                 rf"(?<![{_ASCII_HOST_CHAR}.])(?:[A-Za-z0-9-]+\.)+{re.escape(suffix)}(?![{_ASCII_HOST_CHAR}])",
                 "domain",
+                _DOMAIN_MAX,
             )
         )
     if parse_bool_env("SYSINFO_REDACT_PRIVATE_IPS", "true"):
-        patterns.append((_PRIVATE_IPV4, "ip"))
-        patterns.append((_PRIVATE_IPV6, "ip"))
+        patterns.append((_PRIVATE_IPV4, "ip", _IPV4_MAX))
+        patterns.append((_PRIVATE_IPV6, "ip", _IPV6_MAX))
     for regex in os.getenv("SYSINFO_REDACT_PATTERNS", "").split(";;"):
         if regex.strip():
+            # Unbounded: an arbitrary regex may span whitespace and has no
+            # static maximum length, so streamed text is held per block.
             patterns.append((regex.strip(), "custom"))
     return Redactor(literals, patterns)
 
@@ -397,19 +439,27 @@ class _TextCarry:
     Built-in patterns never contain whitespace, so cutting just after the last
     whitespace guarantees the second condition; a literal that does contain
     whitespace additionally holds back its own length. A whitespace-free run
-    longer than ``_MAX_RUN`` is cut anyway (CJK text, base64) keeping
-    ``_KEEP_RUN`` characters, longer than any built-in match.
-    """
+    longer than ``keep + 256`` is cut anyway (CJK text, base64) keeping
+    ``keep`` characters — ``Redactor.stream_keep``, at least the longest
+    literal and the longest built-in match, so a value still being written
+    always lies inside the kept tail.
 
-    _MAX_RUN = 512
-    _KEEP_RUN = 256
+    A custom ``SYSINFO_REDACT_PATTERNS`` regex has no static maximum length and
+    may span whitespace, so with one configured nothing is released before the
+    block ends: the text arrives in one piece at ``flush`` (streaming latency
+    is the price of an arbitrary pattern).
+    """
 
     def __init__(self, redactor: Redactor) -> None:
         self._r = redactor
         self._buf = ""
+        self._keep = redactor.stream_keep
+        self._max_run = self._keep + 256
 
     def feed(self, text: str) -> str:
         self._buf += text
+        if self._r.unbounded_patterns:
+            return ""
         cut = self._safe_cut(self._buf)
         if cut <= 0:
             return ""
@@ -434,8 +484,7 @@ class _TextCarry:
             return True
         return not _HOST_CHAR_RE.match(buf[p - 1]) or not _HOST_CHAR_RE.match(buf[p])
 
-    @staticmethod
-    def _soft_boundary(buf: str, upto: int) -> int:
+    def _soft_boundary(self, buf: str, upto: int) -> int:
         """Last splittable position <= *upto*, searched over a bounded window.
 
         Past the window (a huge run of host characters) the cut stays at
@@ -443,16 +492,17 @@ class _TextCarry:
         never let a value through, because every match still being written
         starts within the kept tail.
         """
-        for p in range(upto, max(upto - 4 * _TextCarry._KEEP_RUN, 0), -1):
+        # Inclusive of 0: the buffer start is always a safe cut (hold it all).
+        for p in range(upto, max(upto - 1024, 0) - 1, -1):
             if _TextCarry._splittable(buf, p):
                 return p
         return upto
 
     def _safe_cut(self, buf: str) -> int:
         cut = self._after_last_space(buf, len(buf))
-        forced = len(buf) - cut > self._MAX_RUN
+        forced = len(buf) - cut > self._max_run
         if forced:
-            cut = self._soft_boundary(buf, len(buf) - self._KEEP_RUN)
+            cut = self._soft_boundary(buf, len(buf) - self._keep)
         hold = self._r.max_ws_literal_len
         if hold and cut > len(buf) - hold:
             cut = self._after_last_space(buf, len(buf) - hold)

@@ -175,7 +175,9 @@ uv run pytest --cov=src                            # with coverage
   and private IP ranges in **successful** tool results before the model sees them, and
   `_redact_stream` filters every chunk leaving `run_completion_with_client` /
   `receive_response_from_client` (plus the idle outbox) — streamed deltas through a carry that
-  never emits a value split across chunks. **A failed tool call is not covered**: the CLI routes
+  never emits a value split across chunks (it keeps at least the longest literal/built-in match of a
+  whitespace-free run; any custom `SYSINFO_REDACT_PATTERNS` regex makes it hold each text block
+  whole, since an arbitrary regex has no bound and may span whitespace). **A failed tool call is not covered**: the CLI routes
   it through `PostToolUseFailure`, which cannot rewrite the result, so the model sees that output
   raw (only the client-facing copy is filtered). The CLI also spills oversized results to a file
   with the RAW output; reading it back is a tool call and comes back redacted. The boundary that
