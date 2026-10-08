@@ -65,8 +65,8 @@ MAX_LITERAL_LEN = 65536
 # How far each built-in pattern can reach from where its match starts — the
 # match plus its trailing lookaround — which the stream carry must keep of a
 # whitespace-free run. These are properties of the REGEXES below, which are
-# bounded on purpose (not just of the protocols): IPv4 15 + 1, IPv6 capped at
-# 40 (the longest textual address is 39) + 1, and a domain match is confined
+# bounded on purpose (not just of the protocols): IPv4 15 + 1, an IPv6
+# candidate capped at 40 (the longest textual address is 39) + 1, and a domain match is confined
 # to a run of at most 253 name characters (the DNS limit) + 1.
 _IPV4_MAX = 16
 _IPV6_MAX = 41
@@ -98,10 +98,24 @@ _PRIVATE_IPV4 = (
     r"|169\.254(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2}"
     r")(?![0-9])"
 )
+# A bounded CANDIDATE (fc00::/7 or fe80::/10 prefix, then at most 35 more
+# address characters), confirmed by ``_is_private_ipv6``: the textual IPv6
+# grammar (``::`` anywhere, including at the end as in ``fd00::``) is left to
+# ``ipaddress`` instead of being re-encoded in a regex.
 _PRIVATE_IPV6 = (
     r"(?<![0-9A-Fa-f:])(?i:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f])"
-    r":[0-9A-Fa-f:]{0,34}[0-9A-Fa-f](?![0-9A-Fa-f:])"
+    r":[0-9A-Fa-f:]{0,35}(?![0-9A-Fa-f:])"
 )
+_ULA = ipaddress.IPv6Network("fc00::/7")
+_LINK_LOCAL = ipaddress.IPv6Network("fe80::/10")
+
+
+def _is_private_ipv6(text: str) -> bool:
+    try:
+        address = ipaddress.IPv6Address(text)
+    except ValueError:
+        return False
+    return address in _ULA or address in _LINK_LOCAL
 
 
 def redaction_enabled() -> bool:
@@ -229,11 +243,14 @@ class Redactor:
     def __init__(
         self, literals: Iterable[_Literal], patterns: Iterable[Tuple[Any, ...]]
     ):
-        """*patterns* are ``(regex, label)`` or ``(regex, label, max_len)``.
+        """*patterns* are ``(regex, label[, max_len[, validator]])``.
 
         ``max_len`` is the longest text the pattern can match; without it the
         pattern is treated as unbounded, and streamed text is then held back
-        until its block ends (see ``_TextCarry``).
+        until its block ends (see ``_TextCarry``). ``validator`` (text -> bool)
+        confirms a candidate match; a rejected candidate is left as it is.
+        A verdict depends on the matched text alone, so it reads the same
+        whether the text arrives whole or in streamed pieces.
         """
         allow = set(_csv_env("SYSINFO_REDACT_ALLOW"))
         seen: Dict[str, _Literal] = {}
@@ -249,7 +266,8 @@ class Redactor:
                 continue
             seen.setdefault(lit.value, lit)
         self._labels: Dict[str, str] = {}
-        parts: List[str] = []
+        parts: List[str] = []  # literals
+        pattern_parts: List[str] = []
         # Longest first so a full value wins over its own prefix.
         for index, lit in enumerate(
             sorted(seen.values(), key=lambda item: -len(item.value))
@@ -262,10 +280,12 @@ class Redactor:
             parts.append(f"(?P<{group}>{body})")
             self._labels[group] = lit.label
         self.unbounded_patterns = False
+        self._validators: Dict[str, Callable[[str], bool]] = {}
         max_pattern_len = 0
         for index, spec in enumerate(patterns):
             regex, label = spec[0], spec[1]
             max_len = spec[2] if len(spec) > 2 else None
+            validator = spec[3] if len(spec) > 3 else None
             try:
                 re.compile(regex)
             except re.error as exc:
@@ -276,8 +296,10 @@ class Redactor:
             group = f"p{index}"
             # Wrapped in its own group: a custom pattern's inner groups never
             # decide the label (see ``_sub``).
-            parts.append(f"(?P<{group}>{regex})")
+            pattern_parts.append(f"(?P<{group}>{regex})")
             self._labels[group] = label
+            if validator is not None:
+                self._validators[group] = validator
             if max_len is None:
                 self.unbounded_patterns = True
             else:
@@ -285,7 +307,15 @@ class Redactor:
         self.literal_count = len(seen)
         self.pattern_count = sum(1 for g in self._labels if g.startswith("p"))
         self._allow = allow
-        self._regex = re.compile("|".join(parts)) if parts else None
+        # Two passes: literals first, then patterns over the result. In one
+        # alternation a pattern match starting earlier wins and can swallow the
+        # head of a literal ("fd00::" + a secret starting with a hex digit
+        # would eat the secret's first character, so the secret never matched).
+        self._literal_regex = re.compile("|".join(parts)) if parts else None
+        self._pattern_regex = (
+            re.compile("|".join(pattern_parts)) if pattern_parts else None
+        )
+        self._regex = self._literal_regex or self._pattern_regex
         self.max_literal_len = max((len(v) for v in seen), default=0)
         # How much of a whitespace-free run the stream carry must keep so that
         # no match still being written can start before a forced cut.
@@ -301,24 +331,39 @@ class Redactor:
     def _sub(self, match: "re.Match[str]") -> str:
         if match.group(0) in self._allow:
             return match.group(0)
+        groups = match.re.groupindex  # only this pass's own groups
         for group, label in self._labels.items():
-            if match.group(group) is not None:
+            if group in groups and match.group(group) is not None:
+                validator = self._validators.get(group)
+                if validator is not None and not validator(match.group(0)):
+                    return match.group(0)
                 return PLACEHOLDER.format(label=label)
         return PLACEHOLDER.format(label="custom")
 
     def redact_text(self, text: str) -> str:
-        if self._regex is None or not text:
+        if not text:
             return text
-        return self._regex.sub(self._sub, text)
+        if self._literal_regex is not None:
+            text = self._literal_regex.sub(self._sub, text)
+        if self._pattern_regex is not None:
+            text = self._pattern_regex.sub(self._sub, text)
+        return text
 
     def spans(self, text: str) -> List[Tuple[int, int]]:
-        if self._regex is None:
-            return []
-        return [
-            m.span()
-            for m in self._regex.finditer(text)
-            if m.group(0) not in self._allow
-        ]
+        """Every candidate either pass could match in *text* (raw coordinates).
+
+        A superset is fine: the stream carry only uses spans to avoid cutting
+        inside one, so an extra span can delay text but never release it.
+        """
+        found: List[Tuple[int, int]] = []
+        for regex in (self._literal_regex, self._pattern_regex):
+            if regex is not None:
+                found.extend(
+                    m.span()
+                    for m in regex.finditer(text)
+                    if m.group(0) not in self._allow
+                )
+        return sorted(found)
 
     def redact_value(self, value: Any, _depth: int = 0) -> Any:
         """Redact every string inside *value*; returns a new value.
@@ -372,7 +417,7 @@ def _builtin_patterns() -> List[Tuple[Any, ...]]:
         )
     if parse_bool_env("SYSINFO_REDACT_PRIVATE_IPS", "true"):
         patterns.append((_PRIVATE_IPV4, "ip", _IPV4_MAX))
-        patterns.append((_PRIVATE_IPV6, "ip", _IPV6_MAX))
+        patterns.append((_PRIVATE_IPV6, "ip", _IPV6_MAX, _is_private_ipv6))
     return patterns
 
 

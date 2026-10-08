@@ -56,10 +56,8 @@ def _redactor(**extra) -> Redactor:
         _Literal(SECRET, "secret", False),
         _Literal("pass phrase with spaces", "secret", False),
     ] + extra.get("literals", [])
-    patterns = [
-        (sr._PRIVATE_IPV4, "ip", sr._IPV4_MAX),
-        (sr._PRIVATE_IPV6, "ip", sr._IPV6_MAX),
-    ] + extra.get("patterns", [])
+    # The exact built-in specs in use (bounds + the IPv6 address validator).
+    patterns = sr._builtin_patterns() + extra.get("patterns", [])
     return Redactor(literals, patterns)
 
 
@@ -122,6 +120,14 @@ class TestMatching:
             "sk-live-9f8e7d6c5b4",  # a strict prefix of the secret
             SECRET.upper(),  # secrets are case-sensitive
             "pass phrase with  spaces",
+            # IPv6 candidates the address grammar rejects, or outside the ranges
+            "fe80: x",
+            "fd00::: x",
+            "fe80:abc: x",
+            "fd00:1:2:3:4:5:6:7:8 x",
+            "fec0::1 x",
+            "2001:db8::1 x",
+            "ff02::1 x",
         ],
     )
     def test_leaves_alone(self, text):
@@ -140,6 +146,17 @@ class TestMatching:
             "169.254.169.254",
             "fd12:3456:789a::1",
             "fe80::1ff:fe23:4567:890a",
+            # #229 review: compressed forms that END in "::" are valid too
+            "fd00::",
+            "fc00::",
+            "fc12::",
+            "fe80::",
+            "FD00::",
+            "fd12:3456:789a::",
+            "fd00:0:0::",
+            "fe80::a:b",
+            "febf:ffff::",
+            "fd12:3456:789a:bcde:f012:3456:789a:bcde",
         ],
     )
     def test_private_ranges_by_pattern(self, ip):
@@ -188,6 +205,15 @@ class TestMatching:
     def test_custom_pattern_with_named_groups_keeps_its_label(self, monkeypatch):
         monkeypatch.setenv("SYSINFO_REDACT_PATTERNS", r"(?P<emp>EMP)-(?P<num>\d+)")
         assert _build().redact_text("EMP-42") == "[REDACTED:custom]"
+
+    def test_an_earlier_pattern_never_swallows_the_head_of_a_literal(self):
+        """Found by the stream fuzz: in one alternation the IPv6 candidate at
+        "fd00::" matched first and ate the "e" of a secret starting with a hex
+        digit, so the secret itself was never redacted."""
+        secret = "eyJhbGciOiJIUzI1NiJ9.payload-signature"
+        r = _redactor(literals=[_Literal(secret, "secret", False)])
+        assert r.redact_text(f"fd00::{secret} x") == "[REDACTED:ip][REDACTED:secret] x"
+        assert r.redact_text(f"10.0.0.1{secret}") == "[REDACTED:ip][REDACTED:secret]"
 
     def test_placeholders_are_stable_under_reredaction(self):
         r = _redactor()
@@ -347,6 +373,10 @@ class TestTextCarry:
         SECRET,
         "pass phrase with spaces",
         "fd12::1",
+        "fd00::",
+        "fe80::",
+        "fe80:",
+        "fd00:::",
         "hello",
         "세계",
         "가" * 300,
