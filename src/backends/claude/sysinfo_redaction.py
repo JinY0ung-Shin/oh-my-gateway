@@ -66,10 +66,11 @@ MAX_LITERAL_LEN = 65536
 # match plus its trailing lookaround — which the stream carry must keep of a
 # whitespace-free run. These are properties of the REGEXES below, which are
 # bounded on purpose (not just of the protocols): IPv4 15 + 1, an IPv6
-# candidate capped at 40 (the longest textual address is 39) + 1, and a domain match is confined
+# candidate capped at 45 (the longest textual address, IPv4-embedded
+# "ffff:…:255.255.255.255", is 45) + 1, and a domain match is confined
 # to a run of at most 253 name characters (the DNS limit) + 1.
 _IPV4_MAX = 16
-_IPV6_MAX = 41
+_IPV6_MAX = 46
 _DOMAIN_MAX = 254
 
 _SECRET_NAME_RE = re.compile(
@@ -98,13 +99,17 @@ _PRIVATE_IPV4 = (
     r"|169\.254(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){2}"
     r")(?![0-9])"
 )
-# A bounded CANDIDATE (fc00::/7 or fe80::/10 prefix, then at most 35 more
-# address characters), confirmed by ``_is_private_ipv6``: the textual IPv6
+# A bounded CANDIDATE (fc00::/7 or fe80::/10 prefix, then at most 40 more
+# address characters, dots included for an IPv4-embedded tail such as
+# "fd00::192.168.1.1"), confirmed by ``_is_private_ipv6``: the textual IPv6
 # grammar (``::`` anywhere, including at the end as in ``fd00::``) is left to
-# ``ipaddress`` instead of being re-encoded in a regex.
+# ``ipaddress`` instead of being re-encoded in a regex. The candidate is
+# greedy and every valid address fits its 45-character cap, so a valid short
+# prefix is never approved while the rest of the address stays in the text;
+# only a "." may follow it (sentence punctuation, given back by ``_rejected``).
 _PRIVATE_IPV6 = (
     r"(?<![0-9A-Fa-f:])(?i:f[cd][0-9a-f]{2}|fe[89ab][0-9a-f])"
-    r":[0-9A-Fa-f:]{0,35}(?![0-9A-Fa-f:])"
+    r":[0-9A-Fa-f:.]{0,40}(?![0-9A-Fa-f:])"
 )
 _ULA = ipaddress.IPv6Network("fc00::/7")
 _LINK_LOCAL = ipaddress.IPv6Network("fe80::/10")
@@ -335,10 +340,27 @@ class Redactor:
         for group, label in self._labels.items():
             if group in groups and match.group(group) is not None:
                 validator = self._validators.get(group)
-                if validator is not None and not validator(match.group(0)):
-                    return match.group(0)
+                text = match.group(0)
+                if validator is not None and not validator(text):
+                    return self._rejected(text, validator, label)
                 return PLACEHOLDER.format(label=label)
         return PLACEHOLDER.format(label="custom")
+
+    def _rejected(self, text: str, validator: Callable[[str], bool], label: str) -> str:
+        """A candidate its validator refused: keep it, minus what is still ours.
+
+        Sentence punctuation the candidate swallowed ("… fd00::1.") is given
+        back and the address before it redacted; otherwise the candidate is
+        re-scanned from its second character so any other pattern inside it
+        (an embedded private IPv4) is still redacted. Both depend on the
+        candidate text alone, so streaming reads it the same way.
+        """
+        stripped = text.rstrip(".")
+        if stripped != text and validator(stripped):
+            return PLACEHOLDER.format(label=label) + text[len(stripped) :]
+        if self._pattern_regex is None:
+            return text
+        return text[0] + self._pattern_regex.sub(self._sub, text[1:])
 
     def redact_text(self, text: str) -> str:
         if not text:

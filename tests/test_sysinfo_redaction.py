@@ -157,6 +157,10 @@ class TestMatching:
             "fe80::a:b",
             "febf:ffff::",
             "fd12:3456:789a:bcde:f012:3456:789a:bcde",
+            # #229 review: IPv4-embedded forms are one address, not a prefix
+            "fd00::192.168.1.1",
+            "fe80::192.168.1.1",
+            "fd12:3456:789a:bcde:f012:3456:192.168.255.255",
         ],
     )
     def test_private_ranges_by_pattern(self, ip):
@@ -205,6 +209,32 @@ class TestMatching:
     def test_custom_pattern_with_named_groups_keeps_its_label(self, monkeypatch):
         monkeypatch.setenv("SYSINFO_REDACT_PATTERNS", r"(?P<emp>EMP)-(?P<num>\d+)")
         assert _build().redact_text("EMP-42") == "[REDACTED:custom]"
+
+    @pytest.mark.parametrize(
+        "text,expected",
+        [
+            ("fd00::192.168.1.1", "[REDACTED:ip]"),
+            ("fe80::192.168.1.1 끝", "[REDACTED:ip] 끝"),
+            ("at fd00::1.", "at [REDACTED:ip]."),
+            ("at fd00::1...", "at [REDACTED:ip]..."),
+            ("at fd00::192.168.1.1.", "at [REDACTED:ip]."),
+            # Refused candidates keep their text but not a private IPv4 inside
+            ("fe80:abc:192.168.0.5", "fe80:abc:[REDACTED:ip]"),
+            ("fd00::1.2", "fd00::1.2"),
+            ("fd00:::", "fd00:::"),
+        ],
+    )
+    def test_ipv6_candidates_redact_whole_or_not_at_all(self, text, expected):
+        assert _redactor().redact_text(text) == expected
+
+    @pytest.mark.parametrize("size", [1, 2, 3, 5, 8])
+    @pytest.mark.parametrize("value", ["fd00::192.168.1.1", "fe80::192.168.1.1"])
+    def test_ipv4_embedded_ipv6_split_across_deltas(self, value, size):
+        text = f"주소는 {value} 입니다."
+        chunks = [_delta(text[i : i + size]) for i in range(0, len(text), size)]
+        streamed = _streamed_text(TestStreamRedactor()._run(chunks + [_stop()]))
+        assert streamed == _redactor().redact_text(text) == "주소는 [REDACTED:ip] 입니다."
+        assert ".168" not in streamed
 
     def test_an_earlier_pattern_never_swallows_the_head_of_a_literal(self):
         """Found by the stream fuzz: in one alternation the IPv6 candidate at
@@ -377,6 +407,8 @@ class TestTextCarry:
         "fe80::",
         "fe80:",
         "fd00:::",
+        "fd00::192.168.1.1",
+        "fe80:abc:192.168.0.5",
         "hello",
         "세계",
         "가" * 300,
@@ -525,7 +557,7 @@ class TestTextCarry:
         "name,alphabet,starts",
         [
             ("ipv4", "0123456789.", ["10.", "172.16.", "192.168.", "100.64.", "169.254."]),
-            ("ipv6", "0123456789abcdefABCDEF:", ["fd00:", "fc12:", "fe80:", "FEBF:"]),
+            ("ipv6", "0123456789abcdefABCDEF:.", ["fd00:", "fc12:", "fe80:", "FEBF:"]),
             ("domain", "abcdefghij0123456789.-", ["a.", "x-y."]),
         ],
     )
