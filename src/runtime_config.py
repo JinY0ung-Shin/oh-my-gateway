@@ -111,6 +111,19 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
             "whose every use ends in a 413."
         ),
     },
+    "sysinfo_redaction_enabled": {
+        "label": "Host/secret redaction",
+        "type": "bool",
+        "description": (
+            "Redact this host's name, addresses, container id and secret env "
+            "values (plus private IP ranges and SYSINFO_REDACT_* extras) from "
+            "successful tool results before the model sees them, and from "
+            "every response streamed to clients. Failed tool calls cannot be "
+            "rewritten before the model sees them (CLI limit), so keep the "
+            "container hostname neutral as well. The tool-result hook applies "
+            "to NEW sessions; the response filter from the next turn"
+        ),
+    },
     "agent_teams_enabled": {
         "label": "Agent Teams",
         "type": "bool",
@@ -205,6 +218,7 @@ class RuntimeConfig:
             SESSION_MAX_AGE_MINUTES,
             WORKSPACE_UPLOAD_MAX_BYTES,
         )
+        from src.env_utils import parse_bool_env
         from src.backends.claude.constants import (
             THINKING_MODE,
             TOKEN_STREAMING,
@@ -223,6 +237,7 @@ class RuntimeConfig:
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
             "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
+            "sysinfo_redaction_enabled": parse_bool_env("SYSINFO_REDACTION", "true"),
             # Mirrors the CLI's own parse of the gate (2.1.283): only
             # 1/true/yes/on, case- and whitespace-insensitive, turn it on.
             # src/constants.py defaults it to "1" when unset or blank.

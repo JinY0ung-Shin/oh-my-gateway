@@ -169,6 +169,20 @@ uv run pytest --cov=src                            # with coverage
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
   `tests/test_cli_plans_directory.py` pins it against the bundled CLI.
+- Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
+  `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
+  (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values
+  and private IP ranges in **successful** tool results before the model sees them, and
+  `_redact_stream` filters every chunk leaving `run_completion_with_client` /
+  `receive_response_from_client` (plus the idle outbox) — streamed deltas through a carry that
+  never emits a value split across chunks. **A failed tool call is not covered**: the CLI routes
+  it through `PostToolUseFailure`, which cannot rewrite the result, so the model sees that output
+  raw (only the client-facing copy is filtered). The CLI also spills oversized results to a file
+  with the RAW output; reading it back is a tool call and comes back redacted. The boundary that
+  holds regardless is a neutral container hostname. Gateway-only secrets (`ADMIN_API_KEY`,
+  `API_KEY`, `SYSINFO_CHILD_ENV_MASK`) are blanked in the child env. `tests/conftest.py` turns it
+  off by default (its table is built from the machine); `tests/test_cli_sysinfo_redaction.py`
+  pins all of the above against the bundled CLI, including the failure-path limit.
 
 ## API Compatibility Boundaries
 

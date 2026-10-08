@@ -10,7 +10,9 @@ A ``plan`` callable picks each reply from the request body:
 * ``{"text": "..."}`` — one text block, ``end_turn``;
 * ``{"tool_use": {"name": "...", "input": {...}}}`` — one tool call;
 * ``{"tool_uses": [{"name": ...}, ...]}`` — several tool calls in ONE assistant
-  message (a parallel batch), in that order.
+  message (a parallel batch), in that order;
+* ``{"text_chunks": ["...", ...]}`` — one text block streamed as one
+  ``text_delta`` per chunk (the non-streaming reply joins them).
 
 The default plan answers ``"ok"`` to everything. Use :meth:`cli_env` for the
 ``ClaudeAgentOptions.env`` that points a CLI child at this server with an
@@ -134,7 +136,8 @@ class FakeAnthropicAPI:
                     ]
                     stop = "tool_use"
                 else:
-                    blocks = [{"type": "text", "text": reply.get("text", "ok")}]
+                    chunks = reply.get("text_chunks") or [reply.get("text", "ok")]
+                    blocks = [{"type": "text", "text": "".join(chunks), "_chunks": chunks}]
                     stop = "end_turn"
                 message = {
                     "id": "msg_" + uuid.uuid4().hex[:12],
@@ -151,8 +154,9 @@ class FakeAnthropicAPI:
                     },
                 }
                 if not body.get("stream"):
+                    plain = [{k: v for k, v in b.items() if k != "_chunks"} for b in blocks]
                     return self._json(
-                        200, {**message, "content": blocks, "stop_reason": stop}
+                        200, {**message, "content": plain, "stop_reason": stop}
                     )
 
                 self.send_response(200)
@@ -174,21 +178,27 @@ class FakeAnthropicAPI:
                 for index, block in enumerate(blocks):
                     if block["type"] == "text":
                         start = {"type": "text", "text": ""}
-                        delta = {"type": "text_delta", "text": block["text"]}
+                        deltas = [
+                            {"type": "text_delta", "text": chunk}
+                            for chunk in block["_chunks"]
+                        ]
                     else:
                         start = {**block, "input": {}}
-                        delta = {
-                            "type": "input_json_delta",
-                            "partial_json": json.dumps(block["input"]),
-                        }
+                        deltas = [
+                            {
+                                "type": "input_json_delta",
+                                "partial_json": json.dumps(block["input"]),
+                            }
+                        ]
                     event(
                         "content_block_start",
                         {"type": "content_block_start", "index": index, "content_block": start},
                     )
-                    event(
-                        "content_block_delta",
-                        {"type": "content_block_delta", "index": index, "delta": delta},
-                    )
+                    for delta in deltas:
+                        event(
+                            "content_block_delta",
+                            {"type": "content_block_delta", "index": index, "delta": delta},
+                        )
                     event("content_block_stop", {"type": "content_block_stop", "index": index})
                 event(
                     "message_delta",
