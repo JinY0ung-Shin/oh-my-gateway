@@ -109,7 +109,7 @@
 `scripts/isolation_probe.py`를 **prod 컨테이너 안에서, 세션과 같은 app 유저로** 돌린다. 표준
 라이브러리만 쓰고 읽기 전용이며(네임스페이스/`mount`/`setuid` 테스트는 전부 fork된 자식에서만 수행
 후 종료), 커널 버전·CapEff/CapBnd·seccomp·`/proc` hidepid·`/proc/1/environ` 가독성(F2 재현)·
-Landlock ABI·unshare/mount 가능성·setuid 가능성·공유 자산 현황을 찍고 판정을 낸다.
+Landlock ABI·unshare/mount 가능성·setuid 가능성·공유 자산에 다른 uid가 닿는지를 찍고 판정을 낸다.
 
 ```bash
 docker compose cp scripts/isolation_probe.py gateway:/tmp/isolation_probe.py
@@ -117,8 +117,9 @@ docker compose exec -u app gateway python3 -I /tmp/isolation_probe.py
 ```
 
 > `docker compose exec`는 USER 지시자가 없어 기본 root로 붙는다. 세션 맥락을 반영하려면 **`-u app`**가
-> 필수다. 개발 머신(WSL2)에서 돌린 값은 스모크 테스트일 뿐 prod가 아니다(그곳은 PID1=게이트웨이, 기본
-> seccomp가 `mount`를 막는 식으로 다르다).
+> 필수다 — root는 언제나 setuid가 되므로 root로 돌리면 프로브는 **판정을 내지 않는다**. 개발 머신(WSL2)에서
+> 돌린 값은 스모크 테스트일 뿐 prod가 아니다(그곳은 PID1=게이트웨이, 기본 seccomp가 `mount`를 막는 식으로
+> 다르다).
 
 판정 규칙:
 
@@ -145,11 +146,20 @@ docker compose exec -u app gateway python3 -I /tmp/isolation_probe.py
   `~/.claude/settings.json`의 `enabledPlugins`를 먼저 확인한다.
 - 메커니즘별 실현:
   - **①**: 공유 트리는 world/group-readable(`0755`/`0644`) + 각 세션에 Landlock *ro 허용* 규칙.
+    ⚠️ **트리 자체의 모드만으로는 부족하다.** 다른 uid는 경로의 **모든 상위 디렉터리**에 o+x가 있어야
+    닿는데, Dockerfile의 `useradd -m`이 만든 `/home/app`은 **0700**이다(trixie `login.defs`의
+    `HOME_MODE 0700`; 로컬 빌드 이미지로 확인, prod 값은 프로브가 찍는다). 그대로면 `skills/`가 0755여도
+    세션 uid는 `~/.claude` 아래 공유 자산에 전혀 닿지 못하고, 세션 HOME에서 symlink로 이어도 대상 경로가
+    같은 이유로 막힌다. 공유 트리를 HOME 밖(예: `/opt/claude-shared`, `0755`)으로 옮겨 세션 config dir에서
+    연결하는 쪽을 권한다. `/home/app`에 o+x(`0711`)를 주는 방법도 있지만, 그러면 HOME 아래에서 경로를
+    아는 o+r 파일이 전부 세션 uid에 열린다.
   - **②**: 공유 트리를 각 감옥에 **ro bind-mount**, 워크스페이스만 rw bind.
 - 이는 **세션별 HOME/`CLAUDE_CONFIG_DIR` 리팩터**를 수반한다(지금은 HOME 하나를 공유하므로
   `make_claude_home_guard_hook`로 가리는 중). 공유 자산은 세션 HOME에 ro로 mount/symlink 한다.
 - **검증 항목**: CLI가 세션별 config dir에서 공유 스킬/플러그인을 **여전히 인식**하는지 e2e로 확인.
-  프로브의 "SHARED ASSET LAYOUT" 섹션이 현재 소유권·권한을 찍으니 리팩터 범위 산정에 쓴다.
+  프로브의 "SHARED ASSET LAYOUT" 섹션이 자산마다 소유권·권한과 함께 **다른 uid가 닿는지**(막는 상위
+  디렉터리)와 **안에서 못 쓰는 항목 수**(o+r 없는 파일, o+x 없는 실행 파일·디렉터리)를 찍으니 리팩터
+  범위 산정에 쓴다.
 
 ## 6. spawn 설계 (메커니즘 공통 골격)
 
