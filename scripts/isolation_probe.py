@@ -10,9 +10,9 @@ runs in a short-lived forked child that exits immediately; the parent only reads
 /proc. Nothing is created, mounted, or changed in the live process.
 
 It answers which per-user isolation mechanism is available in THIS container:
-  * uid-per-user (needs CAP_SETUID/SETGID or root)
-  * Landlock filesystem confinement (needs kernel >=5.13 + landlock LSM active)
-  * bubblewrap/nsjail namespaces (needs unprivileged userns + mount in-userns)
+  * uid-per-user (needs CAP_SETUID/SETGID kept across the root->app drop, or root)
+  * Landlock filesystem confinement (needs kernel >=5.19 for ABI 2 + landlock LSM)
+  * bubblewrap/nsjail namespaces (needs userns + a fresh procfs in a new PID ns)
 and whether /proc/1/environ is currently readable (the reported finding).
 """
 
@@ -104,7 +104,9 @@ def probe_kernel() -> None:
     rel = platform.release().split("-")[0].split(".")
     try:
         major, minor = int(rel[0]), int(rel[1])
-        _kv("Landlock kernel floor (>=5.13)", "OK" if (major, minor) >= (5, 13) else "TOO OLD")
+        # ABI 2 (LANDLOCK_ACCESS_FS_REFER, cross-dir rename/link) needs 5.19.
+        floor = "OK" if (major, minor) >= (5, 19) else "TOO OLD (need >=5.19)"
+        _kv("Landlock ABI-2 floor (>=5.19)", floor)
     except Exception:
         _kv("Landlock kernel floor", "unknown")
 
@@ -114,13 +116,35 @@ def probe_identity() -> None:
     _kv("uid / euid", f"{os.getuid()} / {os.geteuid()}")
     _kv("gid / egid", f"{os.getgid()} / {os.getegid()}")
     _kv("running as root", os.geteuid() == 0)
+    # This probe is only meaningful run AS the session/app user. Warn loudly if
+    # it runs as root (forgot `-u app`) or as a uid that already differs from
+    # PID 1's -- either inverts the F2 / uid verdicts below.
+    try:
+        pid1_uid = os.stat("/proc/1").st_uid
+        _kv("PID 1 uid", pid1_uid)
+        if os.geteuid() == 0:
+            _kv(
+                "!! WARNING",
+                "running as root -- use `docker compose exec -u app`; "
+                "setuid/F2 results will be wrong",
+            )
+        elif os.geteuid() != pid1_uid:
+            _kv(
+                "!! WARNING",
+                f"euid {os.geteuid()} != PID1 uid {pid1_uid}: not the gateway's "
+                "uid; F2/uid verdicts do not reflect real sessions",
+            )
+    except OSError as exc:
+        _kv("PID 1 uid", exc)
 
 
 def _decode_caps(hexval: str) -> set[str]:
     bits = int(hexval, 16)
+    # Bit numbers per linux/capability.h: CAP_CHOWN is 0, DAC_OVERRIDE is 1.
     names = {
-        0: "DAC_OVERRIDE", 6: "SETGID", 7: "SETUID",
-        19: "SYS_PTRACE", 21: "SYS_ADMIN", 23: "SYS_NICE",
+        0: "CHOWN", 1: "DAC_OVERRIDE", 2: "DAC_READ_SEARCH", 5: "KILL",
+        6: "SETGID", 7: "SETUID", 19: "SYS_PTRACE", 21: "SYS_ADMIN",
+        23: "SYS_NICE",
     }
     return {n for b, n in names.items() if bits & (1 << b)}
 
@@ -141,14 +165,18 @@ def probe_caps_seccomp() -> dict:
                     seccomp = line.split()[1]
                 elif line.startswith("Seccomp_filters:"):
                     info["seccomp_filters"] = line.split()[1]
+                elif line.startswith("NoNewPrivs:"):
+                    info["nnp"] = line.split()[1]
     except OSError as exc:
         _kv("error", exc)
     eff_caps = _decode_caps(eff)
     bnd_caps = _decode_caps(bnd)
     _kv("CapEff (effective)", f"{eff}  -> {sorted(eff_caps) or 'none of interest'}")
     _kv("CapBnd (bounding)", f"{bnd}  -> {sorted(bnd_caps) or 'none of interest'}")
-    _kv("Seccomp", {"0": "disabled", "1": "strict", "2": "filter"}.get(seccomp, seccomp))
+    modes = {"0": "disabled", "1": "strict", "2": "filter"}
+    _kv("Seccomp", modes.get(seccomp, seccomp))
     _kv("Seccomp_filters", info.get("seccomp_filters", "n/a"))
+    _kv("NoNewPrivs", info.get("nnp", "?"))
     info["eff"] = eff_caps
     info["bnd"] = bnd_caps
     return info
@@ -165,7 +193,9 @@ def probe_proc_hardening() -> None:
                 if mp == "/proc":
                     opts = line.rsplit(" - ", 1)[-1]
                     if "hidepid=" in opts:
-                        hidepid = [o for o in opts.replace(",", " ").split() if "hidepid" in o]
+                        hidepid = [
+                            o for o in opts.replace(",", " ").split() if "hidepid" in o
+                        ]
                     break
     except OSError:
         pass
@@ -178,11 +208,17 @@ def probe_proc_hardening() -> None:
         _kv("/proc/1/comm", exc)
     try:
         with open("/proc/1/environ", "rb") as f:
-            data = f.read(4096)
-        names = sorted({b.split(b"=", 1)[0].decode("latin1") for b in data.split(b"\0") if b})
+            data = f.read()  # read to EOF; prod env easily exceeds one 4 KiB page
+        names = sorted(
+            {b.split(b"=", 1)[0].decode("latin1") for b in data.split(b"\0") if b}
+        )
         _kv("/proc/1/environ READABLE", f"YES ({len(names)} vars visible) <-- finding")
-        hot = [n for n in names if any(s in n.upper() for s in ("KEY", "TOKEN", "SECRET", "PASS", "URL"))]
-        _kv("  secret-ish names in PID1 env", hot[:12])
+        hot = [
+            n
+            for n in names
+            if any(s in n.upper() for s in ("KEY", "TOKEN", "SECRET", "PASS", "URL"))
+        ]
+        _kv("  secret-ish names in PID1 env", hot[:20])
     except PermissionError:
         _kv("/proc/1/environ READABLE", "NO (EACCES) -- already isolated from PID1")
     except OSError as exc:
@@ -199,18 +235,33 @@ def probe_landlock() -> dict:
     except OSError:
         lsm = "(unreadable)"
     _kv("active LSMs (informational)", lsm)
-    _kv("landlock in LSM list", "landlock" in lsm if lsm != "(unreadable)" else "unknown")
+    in_list = "landlock" in lsm if lsm != "(unreadable)" else "unknown"
+    _kv("landlock in LSM list", in_list)
     # The syscall is authoritative: it returns an ABI version (>=1) only when
-    # Landlock is compiled AND active in the running kernel's LSM stack;
-    # otherwise -ENOSYS (not compiled) or -EOPNOTSUPP (not in the lsm= list).
-    abi, en = _syscall(_NR["landlock_create_ruleset"], 0, 0, LANDLOCK_CREATE_RULESET_VERSION)
-    if abi >= 1:
-        _kv("landlock ABI version", f"{abi}  (ABI>=1 => active & usable)")
+    # Landlock is compiled AND active in the running kernel's LSM stack.
+    # ENOSYS = not compiled; EOPNOTSUPP = not in the lsm= list; EPERM = a seccomp
+    # filter blocks the syscall (fix the seccomp profile, not the kernel/LSM).
+    abi, en = _syscall(
+        _NR["landlock_create_ruleset"], 0, 0, LANDLOCK_CREATE_RULESET_VERSION
+    )
+    out["abi"] = abi if abi >= 1 else 0
+    out["seccomp_blocked"] = en == errno.EPERM
+    if abi >= 2:
+        _kv("landlock ABI version", f"{abi}  (>=2: cross-dir rename/link confinable)")
         out["usable"] = True
+    elif abi == 1:
+        # ABI 1 (kernel 5.13-5.18) lacks LANDLOCK_ACCESS_FS_REFER, so ANY ruleset
+        # forces cross-directory rename/link to EXDEV: git object finalize,
+        # package installs, `mv a/x b/` all break inside sessions.
+        _kv("landlock ABI version", "1  (no REFER: cross-dir rename/link => EXDEV)")
+        out["usable"] = False
+    elif out["seccomp_blocked"]:
+        _kv("landlock_create_ruleset", "FAILED (EPERM) => blocked by seccomp")
+        out["usable"] = False
     else:
         _kv("landlock_create_ruleset", f"FAILED ({_errname(en)}) => not usable")
         out["usable"] = False
-    _kv("=> Landlock usable", out["usable"])
+    _kv("=> Landlock usable (ABI>=2)", out["usable"])
     return out
 
 
@@ -240,22 +291,56 @@ def probe_namespaces() -> dict:
         rc = _libc.mount(b"none", b"/tmp", b"tmpfs", 0, None)
         return (rc == 0, _errname(ctypes.get_errno()))
 
+    def t_proc_in_pidns():
+        # ②'s F2 fix needs a FRESH procfs in a new PID ns. A tmpfs mount
+        # succeeding is NOT the same test: Docker masks parts of /proc, which
+        # usually makes `mount -t proc` fail (EPERM) in a userns even when tmpfs
+        # works. Fork into the new PID ns (child is PID 1 there) and mount proc.
+        _, en1 = _syscall(_NR["unshare"], CLONE_NEWUSER | CLONE_NEWNS | CLONE_NEWPID)
+        if en1 != 0:
+            return (False, f"unshare:{_errname(en1)}")
+        r2, w2 = os.pipe()
+        pid = os.fork()
+        if pid == 0:  # PID 1 of the new pid ns
+            os.close(r2)
+            _libc.mount.restype = ctypes.c_int
+            ctypes.set_errno(0)
+            rc = _libc.mount(b"proc", b"/proc", b"proc", 0, None)
+            en = ctypes.get_errno()
+            os.write(w2, f"{int(rc == 0)} {_errname(en)}".encode())
+            os.close(w2)
+            os._exit(0)
+        os.close(w2)
+        msg = os.read(r2, 64).decode()
+        os.close(r2)
+        os.waitpid(pid, 0)
+        ok_s, _, en = msg.partition(" ")
+        return (int(ok_s or 0) == 1, en.strip())
+
     ok_u, d_u = _in_child(t_userns)
     _kv("unshare(CLONE_NEWUSER)", "OK" if ok_u else f"DENIED ({d_u})")
     ok_p, d_p = _in_child(t_pidns)
     _kv("+ CLONE_NEWPID", "OK" if ok_p else f"DENIED ({d_p})")
     ok_m, d_m = _in_child(t_mountns)
     _kv("+ CLONE_NEWNS + mount tmpfs", "OK" if ok_m else f"DENIED ({d_m})")
+    ok_pm, d_pm = _in_child(t_proc_in_pidns)
+    _kv("+ mount proc in new PID ns", "OK" if ok_pm else f"DENIED ({d_pm})")
     out["userns"] = ok_u
+    out["pidns"] = ok_p
     out["mountns"] = ok_m
-    _kv("=> bwrap/nsjail viable (needs all 3)", ok_u and ok_p and ok_m)
+    out["procns"] = ok_pm
+    # ② needs userns + a new PID ns + a FRESH procfs in it (the actual F2 fix).
+    out["viable"] = ok_u and ok_p and ok_m and ok_pm
+    _kv("=> bwrap/nsjail viable (userns+pidns+proc)", out["viable"])
     return out
 
 
 def probe_setuid(caps: dict) -> dict:
     _hdr("UID SWITCHING (uid-per-user viability)")
     out = {}
-    can = os.geteuid() == 0 or "SETUID" in caps.get("eff", set())
+    eff = caps.get("eff", set())
+    # t_setuid calls setgid() THEN setuid(), so BOTH caps are required (unless root).
+    can = os.geteuid() == 0 or {"SETUID", "SETGID"} <= eff
 
     def t_setuid():
         try:
@@ -270,11 +355,24 @@ def probe_setuid(caps: dict) -> dict:
         _kv("fork+setgid/setuid(nobody)", "OK" if ok else f"FAILED ({d})")
         out["usable"] = ok
     else:
-        _kv("CAP_SETUID present", False)
-        _kv("fork+setuid test", "skipped (no privilege) — needs cap_add: [SETUID,SETGID]")
+        present = sorted({"SETUID", "SETGID"} & eff) or "neither"
+        _kv("CAP_SETUID/SETGID effective", present)
+        _kv("fork+setuid test", "skipped (not both caps effective)")
         out["usable"] = False
-    out["grantable"] = "SETUID" in caps.get("bnd", set())
-    _kv("SETUID in bounding set (grantable)", out["grantable"])
+    # NOTE: SETUID/SETGID in the BOUNDING set is not enough here.
+    # docker/entrypoint.py switches root->1000, which clears every effective and
+    # permitted cap, so a bare `cap_add: [SETUID, SETGID]` leaves CapEff empty.
+    # Making uid-per-user work needs the caps kept ACROSS that drop (prctl
+    # KEEPCAPS + ambient) or a setuid-root helper -- and a setuid helper is
+    # blocked when NoNewPrivs=1.
+    out["grantable"] = {"SETUID", "SETGID"} <= caps.get("bnd", set())
+    out["nnp"] = caps.get("nnp") == "1"
+    _kv("SETUID+SETGID in bounding set", out["grantable"])
+    _kv(
+        "  (bounding alone insufficient)",
+        "entrypoint root->1000 clears CapEff; needs ambient/keepcaps or helper",
+    )
+    _kv("NoNewPrivs (blocks setuid helper)", out["nnp"])
     _kv("=> uid-per-user usable now", out["usable"])
     return out
 
@@ -282,43 +380,83 @@ def probe_setuid(caps: dict) -> dict:
 def probe_shared_assets() -> None:
     _hdr("SHARED ASSET LAYOUT (must stay readable by every user)")
     home = os.environ.get("HOME", "")
-    cdir = os.path.join(home, ".claude")
+    cdir_env = os.environ.get("CLAUDE_CONFIG_DIR", "")
+    cdir = cdir_env or os.path.join(home, ".claude")
     _kv("HOME", home or "(unset)")
+    _kv("CLAUDE_CONFIG_DIR", cdir_env or "(unset -> HOME/.claude)")
     _kv(".claude dir", cdir)
-    for sub in ("plugins", "skills", "agents", "commands", "projects", "plans"):
+    shared = ("plugins", "skills", "agents", "commands", "output-styles")
+    split = ("projects", "plans")
+    for sub in shared + split:
         p = os.path.join(cdir, sub)
         try:
             st = os.stat(p)
             others_read = bool(st.st_mode & 0o004)
-            _kv(f"  {sub}/", f"mode={oct(st.st_mode & 0o777)} uid={st.st_uid} "
-                             f"world-read={others_read} entries={len(os.listdir(p)) if os.path.isdir(p) else '-'}")
+            entries = len(os.listdir(p)) if os.path.isdir(p) else "-"
+            _kv(
+                f"  {sub}/",
+                f"mode={oct(st.st_mode & 0o777)} uid={st.st_uid} "
+                f"world-read={others_read} entries={entries}",
+            )
         except OSError as exc:
             _kv(f"  {sub}/", f"absent/err ({exc.errno})")
-    print("  note: under isolation, plugins/skills/agents/commands must be a")
-    print("        read-only tree every session uid/jail is granted ro access to;")
-    print("        only projects/plans/workspace + SDK-written state get split.")
+    # settings.json is SHARED POLICY (admin env block + enabledPlugins), not
+    # per-session writable state -- flag its ownership too.
+    sp = os.path.join(cdir, "settings.json")
+    try:
+        st = os.stat(sp)
+        mode = oct(st.st_mode & 0o777)
+        _kv("  settings.json (shared policy)", f"mode={mode} uid={st.st_uid}")
+    except OSError as exc:
+        _kv("  settings.json", f"absent/err ({exc.errno})")
+    print("  note: plugins/skills/agents/commands/output-styles (+ settings.json)")
+    print("        must stay a read-only tree every session uid/jail can read;")
+    print("        only projects/plans/workspace + SDK cache/history get split.")
 
 
 def verdict(ll: dict, ns: dict, uid: dict) -> None:
     _hdr("VERDICT")
-    if uid.get("usable") and ll.get("usable"):
+    ll_ok = ll.get("usable")  # ABI >= 2
+    if uid.get("usable") and ll_ok:
         print("  BEST PATH (a/single-container): uid-per-user + Landlock is READY now.")
-    elif (uid.get("grantable") or uid.get("usable")) and ll.get("usable"):
-        print("  BEST PATH (a/single-container): uid-per-user + Landlock.")
-        if not uid.get("usable"):
-            print("    - add  cap_add: [SETUID, SETGID]  to the gateway container.")
-    elif ns.get("userns") and ns.get("mountns"):
-        print("  bwrap/nsjail namespaces are viable here; uid+Landlock preferred if")
-        print("  Landlock can be enabled (lighter, no mount-ns / seccomp changes).")
+        print("    - still drop ambient/permitted caps + set NoNewPrivs before exec,")
+        print("      and give the gateway CAP_KILL (or a helper) to reap children.")
+    elif ll_ok and not uid.get("usable"):
+        print("  Landlock is usable; uid switching is NOT effective yet.")
+        print("    - cap_add alone will NOT work: entrypoint root->1000 clears CapEff.")
+        print("      Keep caps across the drop (ambient) or add a setuid helper.")
+        if uid.get("nnp"):
+            print("      (NoNewPrivs=1 is set, which BLOCKS a setuid-root helper).")
+        print("    - OR interim: Landlock-ONLY (no uid switch, no caps). It confines")
+        print("      filesystem reads and (new kernel) hides /proc/1/environ.")
+    elif ns.get("viable"):
+        print("  bwrap/nsjail (userns+pidns+fresh procfs) is viable here.")
+        print("  uid+Landlock is preferred if Landlock can be enabled (lighter; no")
+        print("  mount-ns / seccomp changes).")
     else:
-        print("  Neither path is fully available as-is. Needed, in order of preference:")
-        if not ll.get("usable"):
-            print("    - Landlock: kernel >=5.13 with 'landlock' in the active LSM list.")
-        if not (uid.get("usable") or uid.get("grantable")):
-            print("    - CAP_SETUID/SETGID: grant via cap_add (narrow) for uid-per-user.")
-        if not ns.get("mountns"):
-            print("    - OR relax seccomp / add CAP_SYS_ADMIN for bwrap (widens surface).")
-    print("\n  /proc/1/environ: fixed the moment sessions run as a uid != the gateway's.")
+        print("  No path is fully available as-is. Needed, in order of preference:")
+        if not ll_ok:
+            if ll.get("seccomp_blocked"):
+                print("    - Landlock: allowed by kernel but seccomp-BLOCKED -- allow")
+                print("      the landlock_* syscalls in the seccomp profile.")
+            elif ll.get("abi") == 1:
+                print("    - Landlock: kernel has ABI 1 only; need >=5.19 (ABI 2) so")
+                print("      cross-dir rename/link is not forced to EXDEV.")
+            else:
+                print("    - Landlock: kernel >=5.19 + 'landlock' in the LSM list.")
+        if not uid.get("usable"):
+            print("    - uid-per-user: keep CAP_SETUID/SETGID across root->1000")
+            print("      (ambient) or add a setuid helper; bare cap_add is not enough.")
+        if not ns.get("viable"):
+            missing = [
+                k for k in ("userns", "pidns", "mountns", "procns") if not ns.get(k)
+            ]
+            print(
+                "    - OR for bwrap: relax seccomp / add CAP_SYS_ADMIN (missing: "
+                f"{', '.join(missing) or 'none'}); widens the outer surface."
+            )
+    print("\n  /proc/1/environ: fixed by a uid != the gateway's, a new PID ns, OR")
+    print("  Landlock ptrace-scoping on a new enough kernel.")
 
 
 def main() -> int:
