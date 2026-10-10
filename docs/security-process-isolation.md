@@ -169,8 +169,12 @@ uid 분리면 세션 uid를 `app`과 다르게 두고 `/app`에 쓰기 금지; �
 > - **래퍼 바이너리에만 file capability — spawn 단계만 커버.** `cli_path` 래퍼에 `cap_setuid,cap_setgid+ep`를
 >   파일 cap으로 주면 게이트웨이는 cap 0으로 두고 래퍼만 uid 전환 + Landlock + exec을 할 수 있다. 하지만
 >   래퍼는 1회성 setuid→exec이라 **exec 뒤에 남는 특권이 없다** — 자식 종료·소유권 복구는 여전히 브로커가
->   필요하므로(그래서 `cap_kill`은 래퍼에 줘도 소용없다) 브로커를 대체하지 못하고, 브로커의 spawn 경로를
->   대신하는 정도다. 또 file cap은 `no_new_privs`가 서면 무시되므로 NNP 전에 전환을 끝내야 한다(아래).
+>   필요하므로(그래서 `cap_kill`은 래퍼에 줘도 소용없다) 래퍼 하나로는 브로커를 대체하지 못하고, 브로커의
+>   spawn 경로를 대신하는 정도다. 또 file cap은 `no_new_privs`가 서면 무시되므로 NNP 전에 전환을 끝내야
+>   한다(아래). 비root 시작(compose `user:`)처럼 브로커를 둘 root 단계가 없으면, 종료·정리용 **형제 file-cap
+>   헬퍼**(U로 전환한 뒤 시그널·삭제)를 따로 두어 spawn과 종료·정리를 모두 file cap으로 덮어야 한다. 세션은
+>   NNP라 이 헬퍼들의 file cap을 쓰지 못하지만, 게이트웨이가 NNP 없이 exec하는 uid 1000 프로세스는 누구나
+>   호출할 수 있으므로 헬퍼가 요청(대상 uid·경로)을 검증해야 한다.
 >
 > **uid 전환·cap drop 순서(래퍼/브로커 공통).** `no_new_privs` 설정 → Landlock 룰셋 적용(`restrict_self`는
 > NNP를 요구) → `setgroups`(보조 그룹 초기화 — 안 하면 브로커의 root 그룹 목록이 남는다) → `setgid` →
@@ -182,7 +186,8 @@ uid 분리면 세션 uid를 `app`과 다르게 두고 `/app`에 쓰기 금지; �
 > **자식 종료(#147).** uid 1000(CAP_KILL 없음)은 uid U 자식에 시그널을 못 보낸다. SDK `close()`는
 > `ProcessLookupError`만 무시하므로(`subprocess_cli.py`) teardown이 `PermissionError`로 깨지고, 멈춘 도구·
 > 긴 Bash가 안 죽어 프로세스가 샌다(#147의 SIGTERM→SIGKILL 에스컬레이션도 무력화). → 종료를 **상주
-> 브로커에 위임**하고, 브로커는 U로 전환한 단명 자식으로 시그널을 보낸다(위; 1회성 file-cap 래퍼로는 안 된다).
+> 브로커에 위임**하고, 브로커는 U로 전환한 단명 자식으로 시그널을 보낸다(위; 1회성 file-cap 래퍼만으로는 안
+되고, 비root 시작이면 종료용 형제 file-cap 헬퍼가 그 역할을 한다).
 >
 > **userland은 passwd 항목을 요구한다.** 커널은 숫자 uid로의 `setuid`에 `/etc/passwd` 레코드를 요구하지
 > 않지만, `whoami`·python `getpass.getuser()`·node `os.userInfo()`는 레코드가 없으면 실패한다(CLI 본체는
@@ -421,6 +426,6 @@ docker compose exec -u app gateway python3 -I -S /tmp/isolation_probe.py
 - `BACKENDS` 값: codex/opencode가 켜져 있으면 그 spawn 경로는 래퍼 밖이다(§2).
 - prod가 init shim(compose `init: true`/`--init`)을 쓰는가 — 쓰면 PID 1은 docker-init이고 F2 대상과 브로커
   배치 전제가 게이트웨이 자식 기준으로 바뀐다(§1·§4).
-- prod가 compose `user:`로 비root 시작하는가 — 그러면 브로커를 fork할 root 단계가 없다(프로브는 이를 검사하지
-  않고 가정만 한다, §4).
+- prod가 compose `user:`로 비root 시작하는가 — 그러면 브로커를 fork할 root 단계가 없어 spawn과 종료·정리를
+  모두 형제 file-cap 헬퍼로 덮어야 한다(§3; 프로브는 이를 검사하지 않고 가정만 한다, §4).
 - 네트워크 egress 통제(①은 egress를 다루지 않음 — 별도 레이어 / #173의 zero-egress 게이트).

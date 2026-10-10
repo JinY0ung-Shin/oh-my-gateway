@@ -1261,8 +1261,8 @@ def verdict(
         print("      before its drop, a broker that holds only SETUID/SETGID and")
         print("      stops/cleans up sessions through a short-lived child switched")
         print("      to the session's uid. A non-root start (compose `user:`) has")
-        print("      no root step: file caps on the wrapper then cover the spawn")
-        print("      only; stopping and cleaning up sessions stays unsolved.")
+        print("      no root step: file caps on the wrapper (or a sibling helper)")
+        print("      must then cover the spawn AND stopping/cleaning up sessions.")
         print("    - never in the gateway: KEEPCAPS/ambient caps leak into all it")
         print("      execs. The session drops every cap and sets NoNewPrivs.")
         if uid.get("nnp"):
