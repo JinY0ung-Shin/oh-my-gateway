@@ -1,5 +1,6 @@
 """Docker packaging expectations."""
 
+import errno
 import os
 import importlib.util
 from pathlib import Path
@@ -129,9 +130,10 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
 
     chowned: list[Path] = []
 
-    def fake_chown(path, uid, gid):
+    def fake_chown(path, uid, gid, *, follow_symlinks=True):
         assert uid == 123
         assert gid == 456
+        assert follow_symlinks is False
         chowned.append(Path(path))
 
     monkeypatch.setattr(entrypoint.os, "chown", fake_chown)
@@ -163,6 +165,293 @@ def test_docker_entrypoint_repairs_admin_data_without_touching_mysql_data(
     assert uv_cache_dir in chowned
     assert mysql_dir not in chowned
     assert mysql_file not in chowned
+
+
+def _entrypoint_paths(tmp_path: Path) -> dict[str, Path]:
+    home = tmp_path / "home"
+    return {
+        "data_dir": tmp_path / "data",
+        "claude_home": home / ".claude",
+        "codex_home": home / ".codex",
+        "opencode_home": home / ".local" / "share" / "opencode",
+        "opencode_config": home / ".config" / "opencode",
+        "uv_cache_dir": home / ".cache" / "uv",
+    }
+
+
+def _outside_tree(tmp_path: Path) -> Path:
+    """A directory the permission repair must never change or create entries in."""
+    outside = tmp_path / "outside"
+    (outside / "nested").mkdir(parents=True)
+    (outside / "file.txt").write_text("x", encoding="utf-8")
+    (outside / "nested" / "inner.txt").write_text("x", encoding="utf-8")
+    return outside
+
+
+def _record_chown_targets(entrypoint, monkeypatch) -> list[Path]:
+    """Record the path each chown call would actually change."""
+    targets: list[Path] = []
+
+    def fake_chown(path, uid, gid, *, follow_symlinks=True):
+        path = Path(path)
+        if follow_symlinks:
+            targets.append(Path(os.path.realpath(path)))
+        else:
+            targets.append(Path(os.path.realpath(path.parent)) / path.name)
+
+    monkeypatch.setattr(entrypoint.os, "chown", fake_chown)
+    return targets
+
+
+def _targets_under(targets: list[Path], root: Path) -> list[Path]:
+    root = Path(os.path.realpath(root))
+    return [target for target in targets if target == root or root in target.parents]
+
+
+def test_docker_entrypoint_does_not_chown_through_links_in_trees(tmp_path, monkeypatch):
+    """Links inside a repaired tree never redirect the chown to their target."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    outside = _outside_tree(tmp_path)
+    claude_home = paths["claude_home"]
+    skill = claude_home / "skills" / "demo" / "SKILL.md"
+    skill.parent.mkdir(parents=True)
+    skill.write_text("x", encoding="utf-8")
+    (claude_home / "file-link").symlink_to(outside / "file.txt")
+    (claude_home / "dir-link").symlink_to(outside, target_is_directory=True)
+    (skill.parent / "nested-link").symlink_to(outside / "nested")
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert _targets_under(targets, outside) == []
+    assert Path(os.path.realpath(skill)) in targets
+
+
+@pytest.mark.parametrize(
+    ("link", "skipped"),
+    [
+        (".claude", "claude_home"),
+        (".codex", "codex_home"),
+        (".local", "opencode_home"),
+        (".local/share", "opencode_home"),
+        (".config", "opencode_config"),
+        (".cache", "uv_cache_dir"),
+    ],
+    # Explicit ids: conftest deselects any test id naming a stale backend.
+    ids=[
+        "claude-root",
+        "second-root",
+        "local-parent",
+        "share-parent",
+        "config-parent",
+        "cache-parent",
+    ],
+)
+def test_docker_entrypoint_skips_trees_reached_through_a_link(
+    tmp_path, monkeypatch, capsys, link, skipped
+):
+    """A linked tree root or parent is skipped, not created through or chowned."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    outside = _outside_tree(tmp_path)
+    link_path = paths["claude_home"].parent / link
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    link_path.symlink_to(outside, target_is_directory=True)
+    entries_before = sorted(outside.rglob("*"))
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert _targets_under(targets, outside) == []
+    assert sorted(outside.rglob("*")) == entries_before
+    assert f"skipping {paths[skipped]}" in capsys.readouterr().err
+    for name, path in paths.items():
+        if name not in ("data_dir", skipped):
+            assert Path(os.path.realpath(path)) in targets
+
+
+def test_docker_entrypoint_skips_a_dangling_link(tmp_path, monkeypatch, capsys):
+    """A link to a missing path is skipped, and the missing path is not created."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    missing = tmp_path / "missing"
+    paths["claude_home"].parent.mkdir()
+    paths["claude_home"].symlink_to(missing, target_is_directory=True)
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert not missing.exists()
+    assert _targets_under(targets, missing) == []
+    assert f"skipping {paths['claude_home']}" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("owned", [False, True], ids=["foreign", "owned"])
+def test_docker_entrypoint_skips_foreign_multiply_linked_files(
+    tmp_path, monkeypatch, capsys, owned
+):
+    """A file with several hard links is chowned only if the app uid owns it."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    outside = _outside_tree(tmp_path)
+    linked = paths["claude_home"] / "linked.txt"
+    linked.parent.mkdir(parents=True)
+    os.link(outside / "file.txt", linked)
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+    # This test owns every file it creates, so any other uid makes them foreign.
+    uid = os.getuid() if owned else os.getuid() + 1
+
+    entrypoint.prepare_writable_paths(uid=uid, gid=456, **paths)
+
+    err = capsys.readouterr().err
+    if owned:
+        assert Path(os.path.realpath(linked)) in targets
+        assert "hard links" not in err
+    else:
+        assert Path(os.path.realpath(linked)) not in targets
+        assert f"skipping {linked}: 2 hard links" in err
+
+
+def _read_only_at(entrypoint, monkeypatch, top: Path) -> list[Path]:
+    """Make chown fail with EROFS at and below ``top``; record every attempt."""
+    attempted: list[Path] = []
+
+    def fake_chown(path, uid, gid, *, follow_symlinks=True):
+        path = Path(path)
+        attempted.append(path)
+        if path == top or top in path.parents:
+            raise OSError(errno.EROFS, os.strerror(errno.EROFS), str(path))
+
+    monkeypatch.setattr(entrypoint.os, "chown", fake_chown)
+    return attempted
+
+
+def test_docker_entrypoint_stops_at_a_read_only_subtree(tmp_path, monkeypatch, capsys):
+    """A read-only mount warns once and is not walked; startup carries on."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    skills = paths["claude_home"] / "skills"
+    (skills / "demo").mkdir(parents=True)
+    (skills / "demo" / "SKILL.md").write_text("x", encoding="utf-8")
+    attempted = _read_only_at(entrypoint, monkeypatch, skills)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert capsys.readouterr().err.count(os.strerror(errno.EROFS)) == 1
+    assert skills in attempted
+    assert skills / "demo" not in attempted
+    assert paths["uv_cache_dir"] in attempted
+
+
+def test_docker_entrypoint_does_not_walk_a_read_only_tree_root(tmp_path, monkeypatch):
+    """A tree whose root is read-only is not walked at all."""
+    entrypoint = _load_docker_entrypoint()
+    root = tmp_path / "tree"
+    (root / "sub").mkdir(parents=True)
+    (root / "sub" / "file.txt").write_text("x", encoding="utf-8")
+    attempted = _read_only_at(entrypoint, monkeypatch, root)
+
+    entrypoint._chown_tree(root, 123, 456)
+
+    assert attempted == [root]
+
+
+def test_docker_entrypoint_skips_entries_of_a_read_only_data_dir(
+    tmp_path, monkeypatch, capsys
+):
+    """A read-only data dir warns once; its entries are not attempted."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    data_dir = paths["data_dir"]
+    (data_dir / "prompts").mkdir(parents=True)
+    (data_dir / "system_prompt.json").write_text("{}", encoding="utf-8")
+    attempted = _read_only_at(entrypoint, monkeypatch, data_dir)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert capsys.readouterr().err.count(os.strerror(errno.EROFS)) == 1
+    under_data = [
+        path for path in attempted if path == data_dir or data_dir in path.parents
+    ]
+    assert under_data == [data_dir]
+    assert paths["uv_cache_dir"] in attempted
+
+
+def test_docker_entrypoint_skips_a_file_where_a_directory_belongs(
+    tmp_path, monkeypatch, capsys
+):
+    """A regular file in place of a repaired directory is skipped, not fatal."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    home = paths["claude_home"].parent
+    home.mkdir()
+    (home / ".codex").write_text("x", encoding="utf-8")
+    (home / ".local").write_text("x", encoding="utf-8")
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    err = capsys.readouterr().err
+    assert f"skipping {paths['codex_home']}" in err
+    assert f"skipping {paths['opencode_home']}" in err
+    assert Path(os.path.realpath(paths["uv_cache_dir"])) in targets
+
+
+def test_docker_entrypoint_skips_a_path_outside_its_anchor(
+    tmp_path, monkeypatch, capsys
+):
+    """A repaired path outside the home directory is skipped, not chowned."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    paths["uv_cache_dir"] = elsewhere / "uv"
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert not elsewhere.exists()
+    assert _targets_under(targets, elsewhere) == []
+    assert f"skipping {paths['uv_cache_dir']}: not under" in capsys.readouterr().err
+
+
+def test_docker_entrypoint_does_not_chown_through_links_in_data_dir(
+    tmp_path, monkeypatch, capsys
+):
+    """A linked data file or prompts dir is never followed."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    outside = _outside_tree(tmp_path)
+    data_dir = paths["data_dir"]
+    data_dir.mkdir()
+    (data_dir / "settings.json").symlink_to(outside / "file.txt")
+    (data_dir / "prompts").symlink_to(outside, target_is_directory=True)
+    persisted_prompt = data_dir / "system_prompt.json"
+    persisted_prompt.write_text("{}", encoding="utf-8")
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert _targets_under(targets, outside) == []
+    assert Path(os.path.realpath(persisted_prompt)) in targets
+    assert f"skipping {data_dir / 'prompts'}" in capsys.readouterr().err
+
+
+def test_docker_entrypoint_skips_a_linked_data_dir(tmp_path, monkeypatch, capsys):
+    """A data dir that is itself a link is left alone."""
+    entrypoint = _load_docker_entrypoint()
+    paths = _entrypoint_paths(tmp_path)
+    outside = _outside_tree(tmp_path)
+    paths["data_dir"].symlink_to(outside, target_is_directory=True)
+    entries_before = sorted(outside.rglob("*"))
+    targets = _record_chown_targets(entrypoint, monkeypatch)
+
+    entrypoint.prepare_writable_paths(uid=123, gid=456, **paths)
+
+    assert _targets_under(targets, outside) == []
+    assert sorted(outside.rglob("*")) == entries_before
+    assert f"skipping {paths['data_dir']}" in capsys.readouterr().err
+    assert Path(os.path.realpath(paths["claude_home"])) in targets
 
 
 def test_docker_entrypoint_rejects_root_runtime_uid(monkeypatch):
