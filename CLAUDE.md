@@ -164,7 +164,10 @@ uv run pytest --cov=src                            # with coverage
   file tools only: for **Bash the guard is static defense in depth, not a boundary** (shell-local vars,
   `cd` + relative paths, command substitution and Bash writes to shared assets get through). Bash is
   not isolated across users today: the CLI's OS bash sandbox only restricts reads via `Read` deny
-  rules, which the gateway does not set (#218). Don't describe the guard as covering Bash. Plan files are
+  rules, which the gateway does not set (#218), and in the image this repo's Dockerfile builds it does
+  not run at all — no bubblewrap/socat, and `sandbox.failIfUnavailable` is unset, so the CLI only
+  warns on stderr and runs Bash unsandboxed (installing bwrap/socat alone doesn't help under Docker's
+  default seccomp: every sandboxed Bash call then fails). Don't describe the guard as covering Bash. Plan files are
   moved into
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
