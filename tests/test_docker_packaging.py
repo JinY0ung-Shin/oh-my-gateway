@@ -101,7 +101,10 @@ def test_dockerfile_uses_entrypoint_for_bind_mount_permissions():
     final_stage = _final_docker_stage(dockerfile)
 
     assert "COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py" in final_stage
-    assert 'ENTRYPOINT ["python", "/usr/local/bin/docker-entrypoint.py"]' in final_stage
+    assert (
+        'ENTRYPOINT ["python", "-I", "/usr/local/bin/docker-entrypoint.py"]'
+        in final_stage
+    )
     assert "USER app" not in final_stage
 
 
@@ -615,7 +618,10 @@ def test_codex_dockerfile_installs_codex_cli_runtime():
     assert '"@openai/codex@${CODEX_VERSION}"' in dockerfile
     assert "codex --version" in dockerfile
     assert "CODEX_HOME=/home/app/.codex" in dockerfile
-    assert "ENTRYPOINT [\"python\", \"/usr/local/bin/docker-entrypoint.py\"]" in dockerfile
+    assert (
+        'ENTRYPOINT ["python", "-I", "/usr/local/bin/docker-entrypoint.py"]'
+        in dockerfile
+    )
 
 
 def test_codex_compose_enables_codex_backend_and_state_volume():
