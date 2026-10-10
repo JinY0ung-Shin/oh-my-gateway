@@ -185,6 +185,27 @@ uv run pytest --cov=src                            # with coverage
   `API_KEY`, `SYSINFO_CHILD_ENV_MASK`) are blanked in the child env. `tests/conftest.py` turns it
   off by default (its table is built from the machine); `tests/test_cli_sysinfo_redaction.py`
   pins all of the above against the bundled CLI, including the failure-path limit.
+- The first step of `lifespan` marks the serving process non-dumpable
+  (`src/process_hardening.py`, `prctl(PR_SET_DUMPABLE, 0)`; `GATEWAY_NON_DUMPABLE=false` opts
+  out, blank stays on, failure only logs): its `/proc/<pid>/` entries turn root-owned, so a
+  same-uid process (a session's Bash, hook or MCP server) gets EACCES on its `environ`, `mem`
+  and `fd/`. What that adds is narrow. The SDK builds the CLI child env as
+  `{**os.environ, **options.env}`; for session CLI children the gateway first blanks
+  `ADMIN_API_KEY`, `API_KEY` and the `SYSINFO_CHILD_ENV_MASK` names (`child_env_mask()`, only
+  while `SYSINFO_REDACTION` is on) and drops `OPENAI_API_KEY` (plus `CLAUDE_CODE_OAUTH_TOKEN` in
+  api-key auth; `_sdk_env` / `_isolation_vars`). Those values then sit only in the gateway's
+  environ: this closes that `/proc/<gateway>/environ` bypass and keeps the gateway's memory and
+  fds out of reach. Not every spawn path goes through that scrubbing yet (#230 follow-up). It
+  hides no inherited secret: `ANTHROPIC_AUTH_TOKEN` and every other unscrubbed variable sits in
+  each session's own env, and every exec'd CLI child is dumpable again (`execve` resets it).
+  `SYSINFO_CHILD_ENV_MASK` adds gateway-only names to the session-child mask. It starts at the
+  prctl (fds opened before it are not revoked) and skips a `uvicorn --workers`/`--reload`
+  supervisor. Side effects: no core dumps; py-spy/gdb attach needs CAP_SYS_PTRACE (host root or
+  `cap_add: [SYS_PTRACE]`; a `docker exec` root shell has none by default); the process loses its
+  own owner-only `/proc/self` files (`environ`, `io`, `auxv`, …) and writes to its own
+  `oom_score_adj` (nothing uses them; `/proc/self/fd` and prometheus' process collector still
+  work). `tests/conftest.py` turns it off; `tests/test_process_hardening.py` pins the EACCES on a
+  child.
 
 ## API Compatibility Boundaries
 
