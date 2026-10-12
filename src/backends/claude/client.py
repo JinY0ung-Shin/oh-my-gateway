@@ -356,10 +356,60 @@ HUMAN_DECISION_TOOLS = frozenset({"AskUserQuestion", EXIT_PLAN_MODE_TOOL_NAME})
 _EXECUTION_MODES = ("default", "acceptEdits", "bypassPermissions")
 
 
+# Read boundary (#234): confine every read to the CLI's working directories (the
+# session workspace plus ``add_dirs``). The CLI enforces it natively through
+# ``permissions.blockReadsOutsideWorkingDirectories``: file tools are refused
+# outright, but a Bash read it cannot clear becomes an *ask*, and so does a
+# command it cannot check (``cd`` to a computed path, ``python -c``). The gateway
+# answers every ask, so the boundary needs two more pieces (pinned against the
+# bundled CLI in ``tests/test_cli_read_boundary.py``):
+#
+# * execution modes run as ``bypassPermissions`` — under ``default`` ordinary
+#   Bash asks too, and the read-block asks cannot be told apart from those;
+#   under ``bypassPermissions`` the read block's asks are the only Bash asks
+#   left, and the gateway already auto-approves everything else in ``default``;
+# * the permission callback refuses those asks (Bash, or any ask naming a
+#   ``blocked_path``) instead of approving them.
+#
+# Not covered: a script the agent writes into its workspace and then runs reads
+# whatever the process can (the CLI cannot see inside it). Only an OS boundary
+# (separate uid, or a full bubblewrap sandbox) closes that.
+READ_BOUNDARY_ENV = "CLAUDE_BLOCK_READS_OUTSIDE_WORKSPACE"
+READ_BOUNDARY_DENY_MESSAGE = (
+    "Blocked: reads outside the session workspace are not allowed, and this "
+    "command either reads outside it or cannot be checked (a computed path, "
+    "inline code such as python -c / node -e, or a glob). Work with files "
+    "inside the workspace and spell paths out literally. Do not retry the same "
+    "command."
+)
+
+
+def read_boundary_enabled() -> bool:
+    """Whether reads are confined to the working directories (opt-in)."""
+    raw = os.getenv(READ_BOUNDARY_ENV)
+    return raw is not None and raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def effective_permission_mode(mode: Optional[str]) -> Optional[str]:
+    """The mode a Claude session actually runs in.
+
+    With the read boundary on, the execution modes (``default``, ``acceptEdits``,
+    and an omitted mode, which the CLI starts as ``default``) run as
+    ``bypassPermissions``: the gateway's callback approves every ordinary ask in
+    those modes anyway, so tool behavior is unchanged, but the asks left under
+    ``bypassPermissions`` are the read block's and can be refused. ``plan`` and
+    ``bypassPermissions`` pass through.
+    """
+    if read_boundary_enabled() and (mode or "default") in ("default", "acceptEdits"):
+        return "bypassPermissions"
+    return mode
+
+
 def plan_execution_mode() -> str:
     """The mode an approved plan continues in: the operator default, never ``plan``."""
     configured = (os.getenv("PERMISSION_MODE") or "").strip()
-    return configured if configured in _EXECUTION_MODES else "default"
+    mode = configured if configured in _EXECUTION_MODES else "default"
+    return effective_permission_mode(mode) or mode
 
 
 def plan_decision_result(output: str):
@@ -822,6 +872,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 )
         options.settings = json.dumps({"plansDirectory": plans_dir})
 
+    def _configure_read_boundary(self, options: ClaudeAgentOptions) -> None:
+        """Hand the CLI its native read block when the read boundary is on.
+
+        Passed through ``--settings`` (flag settings), which outrank the
+        workspace's own ``.claude/settings.json`` — the agent can write that
+        file, so a project-level opt-out must not win. See ``READ_BOUNDARY_ENV``.
+        """
+        if not read_boundary_enabled():
+            return
+        settings = json.loads(options.settings) if options.settings else {}
+        permissions = settings.setdefault("permissions", {})
+        permissions["blockReadsOutsideWorkingDirectories"] = True
+        options.settings = json.dumps(settings)
+
     _UNSET = object()  # sentinel for _custom_base default
 
     def _resolve_custom_base_prompt(
@@ -1108,6 +1172,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_sandbox(options)
         self._configure_add_dirs(options)
         self._configure_plans_directory(options)
+        self._configure_read_boundary(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
 
         if model:
@@ -1122,6 +1187,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         custom_base = self._resolve_custom_base_prompt(_custom_base, effective_cwd)
         self._configure_system_prompt(options, custom_base, system_prompt)
+        permission_mode = effective_permission_mode(permission_mode)
         if permission_mode:
             # The SDK narrows to a 6-value Literal; the value is validated
             # upstream (request schema / runtime), so cast at this boundary.
@@ -1627,8 +1693,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         answer, then deny with the answer as the message — the CLI turns the
         deny message into a tool_result that Claude reads as the user's reply
         (the same contract the old PreToolUse hook used). Every other tool that
-        reaches this callback is approved; hooks (workspace sandbox, Skill) run
-        before it, so this does not weaken those gates.
+        reaches this callback is approved — except, with the read boundary on,
+        the read block's asks (see ``READ_BOUNDARY_ENV``); hooks (workspace
+        sandbox, Skill) run before it, so this does not weaken those gates.
 
         ExitPlanMode (plan mode's "I am done planning") parks the same way, so a
         human reviews the plan before anything runs; see :func:`plan_decision_result`.
@@ -1679,6 +1746,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         async def can_use_tool(tool_name, input_data, context):
             if tool_name not in HUMAN_DECISION_TOOLS:
+                if read_boundary_enabled() and (
+                    tool_name == "Bash" or getattr(context, "blocked_path", None)
+                ):
+                    # The read block's asks (see READ_BOUNDARY_ENV): approving
+                    # them would hand the read straight back.
+                    return PermissionResultDeny(message=READ_BOUNDARY_DENY_MESSAGE)
                 return PermissionResultAllow()
 
             tool_input = input_data if isinstance(input_data, dict) else {}
@@ -1741,7 +1814,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             # Let SDK exceptions propagate so the route can fail closed —
             # silently running the next turn under the old mode could be a
             # downgrade (e.g. from acceptEdits back to default).
-            await client.set_permission_mode(permission_mode)
+            await client.set_permission_mode(
+                cast(Any, effective_permission_mode(permission_mode))
+            )
 
     async def create_client(
         self,

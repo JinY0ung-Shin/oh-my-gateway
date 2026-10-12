@@ -169,6 +169,16 @@ uv run pytest --cov=src                            # with coverage
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
   `tests/test_cli_plans_directory.py` pins it against the bundled CLI.
+- Read boundary (#234, opt-in `CLAUDE_BLOCK_READS_OUTSIDE_WORKSPACE`): the CLI's native
+  `permissions.blockReadsOutsideWorkingDirectories` goes out through `--settings` (flag settings
+  outrank the agent-writable workspace `.claude/settings.json`). The CLI refuses file-tool reads
+  outright, but a Bash read it cannot clear is an **ask**, and the gateway's `can_use_tool` approves
+  asks — so with the boundary on, execution modes run as `bypassPermissions`
+  (`effective_permission_mode`, also on continuation and after an approved plan; `plan` stays) and
+  the callback refuses Bash / `blocked_path` asks. Under `bypassPermissions` the read block's asks
+  are the only Bash asks left, and they **still reach `can_use_tool`** despite the SDK's
+  `CanUseToolShadowedWarning`. A script the agent writes and runs still reads anything (needs an
+  OS boundary). `tests/test_cli_read_boundary.py` pins all of it against the bundled CLI.
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values
