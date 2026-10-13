@@ -85,6 +85,7 @@ from src.backends.claude.sysinfo_redaction import (
 from src.backends.claude.workspace_sandbox import (
     make_claude_home_guard_hook,
     make_workspace_sandbox_hook,
+    operator_add_dirs,
     plugin_resource_roots,
     sandbox_enabled,
 )
@@ -784,9 +785,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         directory is otherwise blocked ("...may only change directories to the
         allowed working directories for this session"). Add the
         plugin/skill/marketplace roots plus any operator-specified
-        ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. Writes to
-        these stay confined by the sandbox hook (which keeps write tools to the
-        workspace + the session's own ``$HOME/.claude/projects`` entry).
+        ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. The sandbox
+        hook grants the same directories to read/exec; writes stay confined to
+        the workspace + the session's own ``$HOME/.claude/projects`` entry.
         """
         dirs: List[str] = []
         seen: set[str] = set()
@@ -798,9 +799,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     dirs.append(s)
         except Exception:  # pragma: no cover - never block session creation
             logger.debug("plugin_resource_roots() failed for add_dirs", exc_info=True)
-        for part in os.getenv("CLAUDE_ADD_DIRS", "").split(","):
-            p = part.strip()
-            if p and p not in seen:
+        for p in operator_add_dirs():
+            if p not in seen:
                 seen.add(p)
                 dirs.append(p)
         if dirs:
