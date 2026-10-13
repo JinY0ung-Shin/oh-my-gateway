@@ -40,6 +40,10 @@ class _Limiter:
         self.in_flight += 1
         return self.slot, "global"
 
+    async def acquire(self, user, *, abort=None, ticket=None):
+        slot, _reason = self.try_acquire(user)
+        return slot, "", 0.0
+
 
 async def _invoke(middleware, scope, messages):
     sent = []

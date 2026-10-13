@@ -57,10 +57,15 @@ def _reset_turn_limiter():
 
     original_total = concurrency.turn_limiter.total
     original_per_user = concurrency.turn_limiter.per_user
+    limiter = concurrency.turn_limiter
+    original_queue = (limiter.queue_timeout, limiter.queue_max)
     concurrency.turn_limiter.reset()
+    # Fail-fast unless a test opts into the wait queue (TestTurnQueue).
+    concurrency.turn_limiter.queue_timeout = 0
     yield
     concurrency.turn_limiter.total = original_total
     concurrency.turn_limiter.per_user = original_per_user
+    limiter.queue_timeout, limiter.queue_max = original_queue
     concurrency.turn_limiter.reset()
 
 
@@ -423,6 +428,53 @@ class TestConcurrencyMiddleware:
         assert seen == ["http.disconnect"]
         assert concurrency.turn_limiter.in_flight == 0
 
+    async def test_a_client_gone_while_sending_its_body_never_queues(self):
+        """Review #236: a client that dropped mid-body must not hold a waiting
+        spot for TURN_QUEUE_TIMEOUT_SECONDS, nor start a turn when a slot frees."""
+        from src import concurrency
+        from src.concurrency_middleware import ConcurrencyLimitMiddleware
+
+        concurrency.turn_limiter.total = 1
+        concurrency.turn_limiter.queue_timeout = 300
+        held, _ = concurrency.turn_limiter.try_acquire("someone-else")
+        ran = []
+
+        async def app(scope, receive, send):  # pragma: no cover - must not run
+            ran.append(True)
+
+        frames = iter(
+            [
+                {"type": "http.request", "body": b'{"mo', "more_body": True},
+                {"type": "http.disconnect"},
+            ]
+        )
+
+        async def receive():
+            return next(frames)
+
+        async def send(_message):
+            pass
+
+        await asyncio.wait_for(
+            ConcurrencyLimitMiddleware(app)(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/responses",
+                    "headers": [(b"content-length", b"40")],
+                    "state": {},
+                },
+                receive,
+                send,
+            ),
+            timeout=2,
+        )
+
+        assert ran == []
+        assert concurrency.turn_limiter.queued == 0
+        assert concurrency.turn_limiter.in_flight == 1  # only the slot already held
+        held.release()
+
     def test_unguarded_paths_are_never_blocked(self):
         """A saturated gateway must stay diagnosable."""
         from src import concurrency
@@ -432,6 +484,334 @@ class TestConcurrencyMiddleware:
         with client_context() as (client, _mock_cli):
             assert client.get("/health").status_code == 200
             assert client.get("/v1/models").status_code == 200
+
+
+class TestTurnQueue:
+    """A turn over a limit waits briefly for a slot instead of failing at once."""
+
+    async def test_a_waiter_is_admitted_when_a_slot_frees(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        asyncio.get_running_loop().call_later(0.05, held.release)
+
+        slot, reason, waited = await limiter.acquire("b")
+
+        assert slot is not None and reason == ""
+        assert waited >= 0.04
+        assert limiter.in_flight == 1 and limiter.queued == 0
+        slot.release()
+        assert limiter.in_flight == 0
+
+    async def test_a_waiter_gives_up_after_the_queue_timeout(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=0.05)
+        limiter.try_acquire("a")
+        slot, reason, waited = await limiter.acquire("b")
+        assert slot is None and reason == "queue_timeout" and waited >= 0.04
+        assert limiter.queued == 0 and limiter.in_flight == 1
+
+    async def test_a_full_queue_refuses_at_once(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5, queue_max=1)
+        limiter.try_acquire("a")
+        first = asyncio.ensure_future(limiter.acquire("b"))
+        await asyncio.sleep(0)
+        assert limiter.queued == 1
+
+        slot, reason, waited = await limiter.acquire("c")
+
+        assert (slot, reason, waited) == (None, "queue_full", 0.0)
+        first.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await first
+
+    async def test_queue_disabled_keeps_the_fail_fast_reasons(self):
+        limiter = TurnLimiter(total=1, per_user=1, queue_timeout=0)
+        limiter.try_acquire("a")
+        assert (await limiter.acquire("b"))[:2] == (None, "global")
+        limiter = TurnLimiter(total=5, per_user=1, queue_timeout=0)
+        limiter.try_acquire("a")
+        assert (await limiter.acquire("a"))[:2] == (None, "per_user")
+
+    async def test_waiters_are_admitted_oldest_first(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        order: list[str] = []
+
+        async def wait(user):
+            slot, _, _ = await limiter.acquire(user)
+            order.append(user)
+            await asyncio.sleep(0.01)
+            slot.release()
+
+        tasks = [asyncio.ensure_future(wait(u)) for u in ("first", "second", "third")]
+        await asyncio.sleep(0)
+        held.release()
+        await asyncio.gather(*tasks)
+        assert order == ["first", "second", "third"]
+        assert limiter.in_flight == 0
+
+    async def test_a_waiter_blocked_by_its_own_cap_does_not_hold_up_others(self):
+        """Per-user fairness without head-of-line blocking."""
+        limiter = TurnLimiter(total=3, per_user=1, queue_timeout=5)
+        ada, _ = limiter.try_acquire("ada")
+        ada_second = asyncio.ensure_future(limiter.acquire("ada"))
+        await asyncio.sleep(0)
+        assert limiter.queued == 1
+
+        grace, reason, waited = await limiter.acquire("grace")
+
+        assert grace is not None and reason == "" and waited == 0.0
+        assert not ada_second.done()
+        ada.release()
+        slot, reason, _ = await ada_second
+        assert slot is not None and reason == ""
+
+    async def test_a_new_arrival_does_not_jump_the_queue(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        waiter = asyncio.ensure_future(limiter.acquire("waiting"))
+        await asyncio.sleep(0)
+
+        held.release()
+        # The freed slot already belongs to the waiter, even before it runs
+        assert limiter.try_acquire("newcomer") == (None, "global")
+        slot, _, _ = await waiter
+        assert slot is not None
+
+    async def test_an_abort_leaves_the_queue_without_taking_a_slot(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        limiter.try_acquire("a")
+        gone = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_later(0.02, gone.set_result, None)
+
+        slot, reason, _ = await limiter.acquire("b", abort=lambda: gone)
+
+        assert slot is None and reason == "aborted"
+        assert limiter.queued == 0 and limiter.in_flight == 1
+
+    async def test_a_slot_granted_to_a_cancelled_waiter_is_returned(self):
+        """Grant and cancellation in the same instant must not leak the slot."""
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        waiter = asyncio.ensure_future(limiter.acquire("b"))
+        await asyncio.sleep(0)
+
+        held.release()  # grants to the waiter; delivery is scheduled, not run
+        waiter.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+        await asyncio.sleep(0)
+
+        assert limiter.in_flight == 0 and limiter.queued == 0
+        assert limiter.try_acquire("c")[0] is not None
+
+    async def test_a_release_from_another_thread_wakes_the_waiter(self):
+        import threading
+
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        threading.Timer(0.05, held.release).start()
+        slot, reason, _ = await limiter.acquire("b")
+        assert slot is not None and reason == ""
+
+    async def test_a_client_that_disconnects_while_queued_is_dropped(self):
+        """No turn runs and nothing is sent for a caller who already left."""
+        import json as _json
+
+        from src.concurrency_middleware import ConcurrencyLimitMiddleware
+
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        limiter.try_acquire("someone-else")
+        payload = {"model": DEFAULT_MODEL, "input": "hi", "user": "ada"}
+        body = _json.dumps(payload).encode()
+        messages = [{"type": "http.request", "body": body, "more_body": False}]
+        left = asyncio.Event()
+
+        async def receive():
+            if messages:
+                return messages.pop(0)
+            await left.wait()
+            return {"type": "http.disconnect"}
+
+        sent, ran = [], []
+
+        async def app(scope, receive, send):
+            ran.append(True)
+
+        async def send(message):
+            sent.append(message)
+
+        scope = {
+            "type": "http",
+            "method": "POST",
+            "path": "/v1/responses",
+            "headers": [(b"content-length", str(len(body)).encode())],
+            "query_string": b"",
+        }
+        middleware = ConcurrencyLimitMiddleware(app, limiter)
+        call = asyncio.ensure_future(middleware(scope, receive, send))
+        await asyncio.sleep(0.02)
+        assert limiter.queued == 1
+        left.set()
+        await asyncio.wait_for(call, 2)
+
+        assert ran == [] and sent == []
+        assert limiter.queued == 0 and limiter.in_flight == 1
+
+    async def test_a_waiter_can_see_its_place_in_line(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        tickets = ["t" * 16 + str(i) for i in range(3)]
+        waiters = [
+            asyncio.ensure_future(limiter.acquire(f"u{i}", ticket=t))
+            for i, t in enumerate(tickets)
+        ]
+        await asyncio.sleep(0.01)
+
+        middle = limiter.position(tickets[1])
+        assert middle["ahead"] == 1 and middle["behind"] == 1
+        assert middle["waited_seconds"] >= 0
+        assert middle["max_wait_seconds"] == 5
+        assert limiter.position(tickets[0])["ahead"] == 0
+        assert limiter.position("unknown-ticket-xxxx") is None
+
+        held.release()  # the first waiter is admitted and leaves the line
+        slot, _, _ = await waiters[0]
+        assert limiter.position(tickets[0]) is None
+        assert limiter.position(tickets[1])["ahead"] == 0
+        slot.release()
+        for task in waiters[1:]:
+            got, _, _ = await task
+            got.release()
+
+    async def test_the_ticket_header_reaches_the_limiter(self):
+        import json as _json
+
+        from src.concurrency_middleware import ConcurrencyLimitMiddleware
+
+        seen = {}
+
+        class Recording:
+            in_flight = 0
+            queued = 0
+
+            async def acquire(self, user, *, abort=None, ticket=None):
+                seen["ticket"] = ticket
+                return None, "queue_full", 0.0
+
+        body = _json.dumps({"model": DEFAULT_MODEL, "input": "hi"}).encode()
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        async def app(scope, receive, send):  # pragma: no cover - never admitted
+            raise AssertionError("refused before the app")
+
+        for header, expected in [
+            (b"ticket_ABC-0123456789xyz", "ticket_ABC-0123456789xyz"),
+            (b"short", None),
+            (b"has spaces in it 0123456789", None),
+        ]:
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": [
+                    (b"content-length", str(len(body)).encode()),
+                    (b"x-turn-ticket", header),
+                ],
+                "query_string": b"",
+            }
+            await ConcurrencyLimitMiddleware(app, Recording())(scope, receive, send)
+            assert seen["ticket"] == expected
+
+    def test_the_queue_position_endpoint(self, monkeypatch):
+        from src import concurrency
+
+        with client_context() as (client, _mock_cli):
+            monkeypatch.setattr(
+                concurrency.turn_limiter,
+                "position",
+                lambda t: {
+                    "ahead": 2,
+                    "behind": 1,
+                    "waited_seconds": 7.5,
+                    "max_wait_seconds": 300,
+                }
+                if t == "waiting-ticket-0001"
+                else None,
+            )
+            waiting = client.get("/v1/turn-queue/waiting-ticket-0001")
+            gone = client.get("/v1/turn-queue/other-ticket-00001")
+        assert waiting.status_code == 200
+        assert waiting.json() == {
+            "queued": True,
+            "ahead": 2,
+            "behind": 1,
+            "waited_seconds": 7.5,
+            "max_wait_seconds": 300,
+        }
+        assert gone.json() == {"queued": False}
+
+    def test_a_queued_request_is_served_once_a_slot_frees(self):
+        """End to end: the caller sees a slower 200 instead of a 503."""
+        import threading
+
+        from prometheus_client import REGISTRY
+
+        from src import concurrency
+
+        def admitted_count():
+            return (
+                REGISTRY.get_sample_value(
+                    "gateway_turn_queue_wait_seconds_count", {"outcome": "admitted"}
+                )
+                or 0
+            )
+
+        before = admitted_count()
+        with client_context() as (client, _mock_cli):
+            concurrency.turn_limiter.total = 1
+            concurrency.turn_limiter.queue_timeout = 5
+            held, _ = concurrency.turn_limiter.try_acquire("someone-else")
+            threading.Timer(0.2, held.release).start()
+            resp = client.post(
+                "/v1/responses",
+                json={"model": DEFAULT_MODEL, "input": "hi", "stream": True},
+            )
+        assert resp.status_code == 200
+        assert "response.completed" in resp.text
+        assert concurrency.turn_limiter.in_flight == 0
+        assert admitted_count() == before + 1
+
+    def test_a_queued_request_still_gets_503_after_the_timeout(self):
+        from prometheus_client import REGISTRY
+
+        from src import concurrency
+
+        def timeouts():
+            return (
+                REGISTRY.get_sample_value(
+                    "gateway_turns_rejected_total", {"scope": "queue_timeout"}
+                )
+                or 0
+            )
+
+        before = timeouts()
+        with client_context() as (client, _mock_cli):
+            concurrency.turn_limiter.total = 1
+            concurrency.turn_limiter.queue_timeout = 0.1
+            concurrency.turn_limiter.try_acquire("someone-else")
+            payload = {"model": DEFAULT_MODEL, "input": "hi"}
+            resp = client.post("/v1/responses", json=payload)
+        assert resp.status_code == 503
+        assert resp.headers["retry-after"] == "30"
+        assert resp.json()["error"]["code"] == "concurrency_limit_exceeded"
+        assert timeouts() == before + 1
+        assert concurrency.turn_limiter.queued == 0
 
 
 class TestLiveSessionLimit:

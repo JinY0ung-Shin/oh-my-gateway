@@ -93,8 +93,22 @@ TURNS_IN_FLIGHT = Gauge(
 
 TURNS_REJECTED_TOTAL = Counter(
     "gateway_turns_rejected_total",
-    "Agent runs rejected with 503 because a concurrency limit was reached.",
+    "Agent runs rejected with 503 because a concurrency limit was reached. "
+    "scope: global / per_user (queue disabled), queue_full, queue_timeout.",
     ["scope"],
+)
+
+TURNS_QUEUED = Gauge(
+    "gateway_turns_queued",
+    "Agent runs waiting for a concurrency slot (TURN_QUEUE_TIMEOUT_SECONDS).",
+)
+
+TURN_QUEUE_WAIT = Histogram(
+    "gateway_turn_queue_wait_seconds",
+    "How long a queued agent run waited for a slot, by outcome "
+    "(admitted, or refused/abandoned).",
+    ["outcome"],
+    buckets=(0.1, 0.5, 1, 2, 5, 10, 20, 30, 60),
 )
 
 LIVE_SESSIONS = Gauge(
@@ -205,12 +219,23 @@ def set_turns_in_flight(value: int) -> None:
     TURNS_IN_FLIGHT.set(value)
 
 
+def record_turn_queue_wait(seconds: float, *, admitted: bool) -> None:
+    """Record one queued run's wait, admitted or not."""
+    outcome = "admitted" if admitted else "refused"
+    TURN_QUEUE_WAIT.labels(outcome=outcome).observe(seconds)
+
+
 def record_turn_rejected(scope: str) -> None:
     """Record one agent run refused by admission control.
 
     *scope* is ``"global"`` or ``"per_user"`` — a bounded label set.
     """
     TURNS_REJECTED_TOTAL.labels(scope=scope).inc()
+
+
+def bind_turns_queued_source(source: Callable[[], float]) -> None:
+    """Have ``gateway_turns_queued`` read *source* at scrape time (see below)."""
+    TURNS_QUEUED.set_function(source)
 
 
 def bind_live_sessions_source(source: Callable[[], float]) -> None:

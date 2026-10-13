@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -323,6 +324,35 @@ def _bind_principal_to_request(scope: Scope, principal: str, body: Optional[byte
     return body
 
 
+# A caller-chosen opaque id that lets it ask where its request stands while it
+# waits (``GET /v1/turn-queue/{ticket}``). Unguessable ids keep one caller from
+# reading another's place; anything else is ignored rather than refused.
+TURN_TICKET_HEADER = "x-turn-ticket"
+_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def _turn_ticket(scope: Scope) -> Optional[str]:
+    value = Headers(scope=scope).get(TURN_TICKET_HEADER)
+    return value if value and _TICKET_RE.match(value) else None
+
+
+class _DisconnectTap:
+    """Watch the client's ``receive`` while a turn waits for a slot.
+
+    Only used once the body is fully buffered, so the only message the client
+    can still send is ``http.disconnect``: :meth:`wait` resolves when it does.
+    A wait that caught it always ends as ``aborted`` (the limiter checks the
+    task, not just which future woke it), so no message is ever swallowed from
+    a request that goes on to run.
+    """
+
+    def __init__(self, receive: Receive) -> None:
+        self._receive = receive
+
+    async def wait(self) -> Message:
+        return await self._receive()
+
+
 class ConcurrencyLimitMiddleware:
     """Apply request-boundary guards and reject agent runs beyond configured limits."""
 
@@ -337,6 +367,7 @@ class ConcurrencyLimitMiddleware:
 
         original_receive = receive
         body: Optional[bytes] = None
+        client_gone = False
         method = scope.get("method", "")
         body_limit = _request_body_limit(scope)
 
@@ -363,6 +394,7 @@ class ConcurrencyLimitMiddleware:
                 await self._send_413(send, body_limit)
                 return
             if disconnected is not None:
+                client_gone = True
                 receive = _replay_message(disconnected, original_receive)
             else:
                 principal = _credential_principal(scope)
@@ -381,8 +413,28 @@ class ConcurrencyLimitMiddleware:
 
         user, receive = await self._extract_user(scope, receive)
 
-        slot, reason = self.limiter.try_acquire(user)
+        # The body is already buffered, so the next message the client can send
+        # is ``http.disconnect``: watch for it while queued and drop the request
+        # if it comes, instead of running a turn nobody will read.
+        if client_gone:
+            # The client already left while sending its body: never queue it — it
+            # would hold a waiting spot (and maybe start a turn) for nobody. Take a
+            # free slot or be refused at once, as before the queue existed; a
+            # free slot hands the app the disconnect, which ends the request.
+            slot, reason = self.limiter.try_acquire(user)
+            waited = 0.0
+        else:
+            tap = _DisconnectTap(original_receive)
+            slot, reason, waited = await self.limiter.acquire(
+                user,
+                abort=tap.wait if body is not None else None,
+                ticket=_turn_ticket(scope),
+            )
+        if waited:
+            metrics.record_turn_queue_wait(waited, admitted=slot is not None)
         if slot is None:
+            if reason == "aborted":
+                return  # the client left while queued; there is no one to answer
             metrics.record_turn_rejected(reason)
             self._log_rejection(scope.get("path", ""), reason)
             await self._send_503(send)

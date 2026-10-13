@@ -125,6 +125,30 @@ async def list_mcp_servers(
     return {"servers": servers, "total": len(servers)}
 
 
+@router.get("/v1/turn-queue/{ticket}")
+async def turn_queue_position(
+    request: Request,
+    ticket: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Where a waiting agent run stands in the admission queue.
+
+    A caller that sent ``X-Turn-Ticket: <ticket>`` on ``POST /v1/responses`` or
+    ``/v1/agents/messages`` may poll this while no response headers have come
+    back. ``{"queued": false}`` means that ticket is not waiting (admitted,
+    refused, or unknown). Only counts are returned — never who else waits.
+    Not rate limited: it is an in-memory lookup that a client polls once per
+    waiting turn, all from the same caller address.
+    """
+    await verify_api_key(request, credentials)
+    from src.concurrency import turn_limiter
+
+    position = turn_limiter.position(ticket)
+    if position is None:
+        return {"queued": False}
+    return {"queued": True, **position}
+
+
 @router.get("/v1/mcp/health")
 @rate_limit_endpoint("general")
 async def mcp_health(
