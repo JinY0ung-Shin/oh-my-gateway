@@ -428,6 +428,53 @@ class TestConcurrencyMiddleware:
         assert seen == ["http.disconnect"]
         assert concurrency.turn_limiter.in_flight == 0
 
+    async def test_a_client_gone_while_sending_its_body_never_queues(self):
+        """Review #236: a client that dropped mid-body must not hold a waiting
+        spot for TURN_QUEUE_TIMEOUT_SECONDS, nor start a turn when a slot frees."""
+        from src import concurrency
+        from src.concurrency_middleware import ConcurrencyLimitMiddleware
+
+        concurrency.turn_limiter.total = 1
+        concurrency.turn_limiter.queue_timeout = 300
+        held, _ = concurrency.turn_limiter.try_acquire("someone-else")
+        ran = []
+
+        async def app(scope, receive, send):  # pragma: no cover - must not run
+            ran.append(True)
+
+        frames = iter(
+            [
+                {"type": "http.request", "body": b'{"mo', "more_body": True},
+                {"type": "http.disconnect"},
+            ]
+        )
+
+        async def receive():
+            return next(frames)
+
+        async def send(_message):
+            pass
+
+        await asyncio.wait_for(
+            ConcurrencyLimitMiddleware(app)(
+                {
+                    "type": "http",
+                    "method": "POST",
+                    "path": "/v1/responses",
+                    "headers": [(b"content-length", b"40")],
+                    "state": {},
+                },
+                receive,
+                send,
+            ),
+            timeout=2,
+        )
+
+        assert ran == []
+        assert concurrency.turn_limiter.queued == 0
+        assert concurrency.turn_limiter.in_flight == 1  # only the slot already held
+        held.release()
+
     def test_unguarded_paths_are_never_blocked(self):
         """A saturated gateway must stay diagnosable."""
         from src import concurrency

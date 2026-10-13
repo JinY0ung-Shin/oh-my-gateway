@@ -416,12 +416,20 @@ class ConcurrencyLimitMiddleware:
         # The body is already buffered, so the next message the client can send
         # is ``http.disconnect``: watch for it while queued and drop the request
         # if it comes, instead of running a turn nobody will read.
-        tap = _DisconnectTap(original_receive)
-        slot, reason, waited = await self.limiter.acquire(
-            user,
-            abort=tap.wait if body is not None and not client_gone else None,
-            ticket=_turn_ticket(scope),
-        )
+        if client_gone:
+            # The client already left while sending its body: never queue it — it
+            # would hold a waiting spot (and maybe start a turn) for nobody. Take a
+            # free slot or be refused at once, as before the queue existed; a
+            # free slot hands the app the disconnect, which ends the request.
+            slot, reason = self.limiter.try_acquire(user)
+            waited = 0.0
+        else:
+            tap = _DisconnectTap(original_receive)
+            slot, reason, waited = await self.limiter.acquire(
+                user,
+                abort=tap.wait if body is not None else None,
+                ticket=_turn_ticket(scope),
+            )
         if waited:
             metrics.record_turn_queue_wait(waited, admitted=slot is not None)
         if slot is None:
