@@ -2,6 +2,11 @@
 
 Oh My Gateway supports a credential-bound user identity in addition to the legacy single service key.
 
+> This page covers **application-layer** isolation: how a credential scopes a caller to its own
+> workspace/session over HTTP. The **OS/process-layer** boundary (keeping one session's CLI subprocess
+> from reading another session's or the gateway's files/memory/secrets — uid, Landlock, namespaces) is a
+> separate, in-design concern: see [security-process-isolation.md](security-process-isolation.md).
+
 ## Configuration
 
 Set `USER_API_KEYS` to a JSON object mapping the gateway user/workspace id to its bearer token:
