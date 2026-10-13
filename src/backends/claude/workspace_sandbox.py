@@ -263,18 +263,26 @@ def _read_only_tree(path: Path) -> bool:
     to be read-only too. A missing path, a platform without ``statvfs`` or an
     unreadable mount table counts as writable.
     """
-    if not _statvfs_read_only(str(path)):
+    root = str(path)
+    if not _statvfs_read_only(root):
         return False
     try:
         table = os.fsdecode(_MOUNTINFO.read_bytes())
     except OSError:
         return False
-    for line in table.splitlines():
+    # Mount points are absolute and normalized, so a string prefix decides
+    # "inside": no Path per line, which matters for a large table.
+    prefix = root.rstrip("/") + "/"
+    # Only "\n" ends a line: a mount point may hold a raw "\r" (not escaped).
+    for line in table.split("\n"):
         fields = line.split(" ")
         if len(fields) < 5:
             continue
-        point = Path(_MOUNTINFO_ESCAPE.sub(lambda m: chr(int(m[1], 8)), fields[4]))
-        if _is_within(point, path) and not _statvfs_read_only(str(point)):
+        point = fields[4]
+        if "\\" in point:
+            point = _MOUNTINFO_ESCAPE.sub(lambda m: chr(int(m[1], 8)), point)
+        inside = point == root or point.startswith(prefix)
+        if inside and not _statvfs_read_only(point):
             return False
     return True
 

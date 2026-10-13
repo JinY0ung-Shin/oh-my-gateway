@@ -748,14 +748,26 @@ class TestOperatorAddDirs:
         table = tmp_path / "mountinfo"
         monkeypatch.setattr(sandbox, "_MOUNTINFO", table)
         top, sub = (str(p).replace(" ", "\\040") for p in (root, below))
-        table.write_text(
-            f"36 35 0:1 / {top} ro,relatime - tmpfs tmpfs ro\n"
-            f"37 36 0:2 / {sub} rw,relatime - tmpfs tmpfs rw\n"
-        )
+        mounts = [
+            f"36 35 0:1 / {top} ro,relatime - tmpfs tmpfs ro",
+            f"37 36 0:2 / {sub} rw,relatime - tmpfs tmpfs rw",
+            # A sibling that merely shares the prefix is not below the entry.
+            f"39 35 0:4 / {top}-sibling rw,relatime - tmpfs tmpfs rw",
+        ]
+
+        def write(*lines):
+            table.write_bytes(os.fsencode("".join(f"{line}\n" for line in lines)))
+
+        write(*mounts)
         # A writable mount below the read-only entry reopens its subtree.
         assert sandbox._read_only_tree(root) is False
         read_only.add(str(below))
         assert sandbox._read_only_tree(root) is True
+        # The kernel escapes only space, tab, newline and backslash, so a mount
+        # point may hold a raw carriage return; a line ends only at "\n".
+        read_only.add(f"{root}/sub")
+        write(*mounts, f"38 36 0:3 / {top}/sub\rx rw - tmpfs tmpfs rw")
+        assert sandbox._read_only_tree(root) is False
         table.unlink()
         assert sandbox._read_only_tree(root) is False
 
