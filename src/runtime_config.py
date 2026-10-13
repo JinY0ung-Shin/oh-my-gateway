@@ -16,7 +16,7 @@ timeout at init time.  Changing those requires a server restart.
 import logging
 import os
 from threading import Lock
-from typing import Any, Dict
+from typing import Any, Callable, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,56 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
             "to NEW sessions; the response filter from the next turn"
         ),
     },
+    # Turn admission (src/concurrency.py). Unlike most keys these apply to the
+    # live limiter at once: a raised cap admits queued turns immediately. A turn
+    # already waiting keeps the wait it started with; a lowered cap never cuts a
+    # turn that is already running. 0 means "no limit" / "queue off" as in env.
+    "max_concurrent_turns": {
+        "label": "Concurrent turns",
+        "type": "int",
+        "min": 0,
+        "max": 1000,
+        "description": (
+            "How many agent turns may run at once across the gateway "
+            "(MAX_CONCURRENT_TURNS). Beyond it a turn waits in the queue. "
+            "0 = no limit. Applies at once"
+        ),
+    },
+    "max_concurrent_turns_per_user": {
+        "label": "Concurrent turns per user",
+        "type": "int",
+        "min": 0,
+        "max": 1000,
+        "description": (
+            "Fairness hint for requests that carry a `user` "
+            "(MAX_CONCURRENT_TURNS_PER_USER) — not a security control. "
+            "0 = no limit. Applies at once"
+        ),
+    },
+    "turn_queue_timeout_seconds": {
+        "label": "Queue wait (s)",
+        "type": "int",
+        "min": 0,
+        "max": 3600,
+        "description": (
+            "How long a turn over a limit waits for a slot before 503 + "
+            "Retry-After (TURN_QUEUE_TIMEOUT_SECONDS). 0 = no queue (fail fast). "
+            "Keep it under the client's and proxies' read timeout — no response "
+            "header is sent while a turn waits. Applies to turns that start "
+            "waiting from now on"
+        ),
+    },
+    "turn_queue_max_waiters": {
+        "label": "Queue length",
+        "type": "int",
+        "min": 0,
+        "max": 100000,
+        "description": (
+            "How many turns may wait at once; the next one is refused with 503 "
+            "straight away (TURN_QUEUE_MAX_WAITERS). 0 = no bound. Turns already "
+            "waiting are never dropped. Applies at once"
+        ),
+    },
     "agent_teams_enabled": {
         "label": "Agent Teams",
         "type": "bool",
@@ -150,6 +200,23 @@ class RuntimeConfig:
     def __init__(self) -> None:
         self._overrides: Dict[str, Any] = {}
         self._lock = Lock()
+        self._listeners: List[Callable[[Optional[str]], None]] = []
+
+    def on_change(self, listener: Callable[[Optional[str]], None]) -> None:
+        """Call *listener* with the changed key (``None`` = all) after a change.
+
+        For values that live in long-lived objects rather than being read per
+        request (the turn limiter). A failing listener is logged, never raised:
+        the override itself has been stored.
+        """
+        self._listeners.append(listener)
+
+    def _notify(self, key: Optional[str]) -> None:
+        for listener in list(self._listeners):
+            try:
+                listener(key)
+            except Exception:  # noqa: BLE001 — a listener must not undo the write
+                logger.exception("Runtime config listener failed for %s", key)
 
     def get(self, key: str) -> Any:
         """Return the runtime value for *key* (override or original constant)."""
@@ -166,6 +233,7 @@ class RuntimeConfig:
         with self._lock:
             self._overrides[key] = coerced
         logger.info(f"Runtime config updated: {key} = {coerced!r}")
+        self._notify(key)
 
     def is_overridden(self, key: str) -> bool:
         """Return ``True`` if *key* has a runtime override."""
@@ -182,12 +250,14 @@ class RuntimeConfig:
         with self._lock:
             self._overrides.pop(key, None)
         logger.info(f"Runtime config reset: {key}")
+        self._notify(key)
 
     def reset_all(self) -> None:
         """Remove all runtime overrides."""
         with self._lock:
             self._overrides.clear()
         logger.info("Runtime config: all overrides cleared")
+        self._notify(None)
 
     def get_all(self) -> Dict[str, Any]:
         """Return all editable keys with their current effective values."""
@@ -214,8 +284,12 @@ class RuntimeConfig:
         from src.constants import (
             DEFAULT_MAX_TURNS,
             DEFAULT_MODEL,
+            MAX_CONCURRENT_TURNS,
+            MAX_CONCURRENT_TURNS_PER_USER,
             SESSION_EVICTION_POLICY,
             SESSION_MAX_AGE_MINUTES,
+            TURN_QUEUE_MAX_WAITERS,
+            TURN_QUEUE_TIMEOUT_SECONDS,
             WORKSPACE_UPLOAD_MAX_BYTES,
         )
         from src.env_utils import parse_bool_env
@@ -237,6 +311,10 @@ class RuntimeConfig:
             "token_streaming": TOKEN_STREAMING,
             "sanitizer_enabled": _sanitizer_env_enabled(),
             "workspace_upload_max_bytes": WORKSPACE_UPLOAD_MAX_BYTES,
+            "max_concurrent_turns": max(0, MAX_CONCURRENT_TURNS),
+            "max_concurrent_turns_per_user": max(0, MAX_CONCURRENT_TURNS_PER_USER),
+            "turn_queue_timeout_seconds": TURN_QUEUE_TIMEOUT_SECONDS,
+            "turn_queue_max_waiters": TURN_QUEUE_MAX_WAITERS,
             "sysinfo_redaction_enabled": parse_bool_env("SYSINFO_REDACTION", "true"),
             # Mirrors the CLI's own parse of the gate (2.1.283): only
             # 1/true/yes/on, case- and whitespace-insensitive, turn it on.
@@ -266,6 +344,9 @@ class RuntimeConfig:
             low = meta.get("min", 1)
             if v < low:
                 raise ValueError(f"{key} must be >= {low}, got {v}")
+            high = meta.get("max")
+            if high is not None and v > high:
+                raise ValueError(f"{key} must be <= {high}, got {v}")
             return v
         if expected == "bool":
             if isinstance(value, bool):

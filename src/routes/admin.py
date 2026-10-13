@@ -245,6 +245,14 @@ async def admin_summary(_=Depends(require_admin)):
     }
 
 
+def _turn_admission() -> dict:
+    from src.concurrency import turn_limiter
+
+    snap = turn_limiter.snapshot()
+    snap["queue_timeout_seconds"] = turn_limiter.queue_timeout
+    return snap
+
+
 @router.get("/api/server-info")
 async def get_server_info(request: Request, _=Depends(require_admin)):
     """Return server uptime, version, and basic runtime info."""
@@ -277,6 +285,9 @@ async def get_server_info(request: Request, _=Depends(require_admin)):
         "cleanup_task_alive": session_manager._cleanup_task is not None
         and not session_manager._cleanup_task.done(),
         "blocked_deferred_tools": list(BLOCKED_DEFERRED_TOOLS),
+        # Live turn admission — running / waiting against the effective limits
+        # (runtime-config keys max_concurrent_turns… / turn_queue_…).
+        "turn_admission": _turn_admission(),
         # Each capability comes from the tool it needs, so a client never hides a
         # working scheduler nor advertises a blocked one (review on #202).
         **deferred_capabilities(),
