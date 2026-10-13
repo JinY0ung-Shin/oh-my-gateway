@@ -38,22 +38,35 @@ Operators on larger hosts should raise them; see ``.env.example``.
 
 Set either to ``0`` to disable that limit entirely.
 
-Admission is **fail-fast**: a rejected caller gets ``503`` with
-``Retry-After`` rather than queueing.  Turns run for up to ``MAX_TIMEOUT``
-(default 10 minutes), so blocking a waiter on a full gateway would tie up a
-connection far longer than any client is willing to wait.
+Admission **waits briefly, then fails fast**: a turn that finds either cap
+full joins a FIFO queue for up to ``TURN_QUEUE_TIMEOUT_SECONDS`` (default 30;
+``0`` disables the queue) and gets ``503`` with ``Retry-After`` only if no
+slot frees in time or ``TURN_QUEUE_MAX_WAITERS`` are already waiting. Nearly
+every collision is one turn ending moments later, so a short wait turns an
+error the user sees into a pause. The wait stays short on purpose: turns run
+for up to ``MAX_TIMEOUT`` (default 10 minutes), so an unbounded queue would
+tie up a connection far longer than any client is willing to wait.
+
+A freed slot goes to the **oldest waiter that can take it** — one blocked
+only by its own per-user cap does not hold up anyone else's turn — and a new
+arrival never jumps ahead of a waiter that could have taken the slot.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
-from typing import Dict, Optional, Tuple
+import time
+from collections import deque
+from typing import Awaitable, Callable, Deque, Dict, Optional, Tuple
 
 from src.constants import (
     MAX_CONCURRENT_TURNS,
     MAX_CONCURRENT_TURNS_PER_USER,
     MAX_LIVE_SESSIONS,
+    TURN_QUEUE_MAX_WAITERS,
+    TURN_QUEUE_TIMEOUT_SECONDS,
 )
 
 __all__ = [
@@ -105,21 +118,68 @@ class TurnSlot:
         self.release()
 
 
+class _Waiter:
+    __slots__ = ("key", "identified", "future", "loop")
+
+    def __init__(
+        self, key: str, identified: bool, loop: asyncio.AbstractEventLoop
+    ) -> None:
+        self.key = key
+        self.identified = identified
+        self.loop = loop
+        self.future: "asyncio.Future[TurnSlot]" = loop.create_future()
+
+
 class TurnLimiter:
-    """Fail-fast counter for in-flight agent turns.
+    """Counter for in-flight agent turns, with a short FIFO wait queue.
 
     Guarded by a plain :class:`threading.Lock` rather than an asyncio
-    primitive: acquisition never blocks, so there is nothing to await, and a
-    sync lock keeps the limiter usable from non-async callers (admin
-    snapshots, tests) without an event loop.
+    primitive: the counting itself never blocks, and a sync lock keeps
+    :meth:`try_acquire` usable from non-async callers (admin snapshots,
+    tests) without an event loop. Only :meth:`acquire` waits, on a future that
+    a release resolves through the waiter's own loop.
     """
 
-    def __init__(self, total: int, per_user: int) -> None:
+    def __init__(
+        self,
+        total: int,
+        per_user: int,
+        queue_timeout: float = 0.0,
+        queue_max: int = 0,
+    ) -> None:
         self.total = total
         self.per_user = per_user
+        self.queue_timeout = queue_timeout
+        self.queue_max = queue_max
         self._lock = threading.Lock()
         self._in_flight = 0
         self._by_user: Dict[str, int] = {}
+        self._waiters: Deque[_Waiter] = deque()
+
+    def _blocked(self, key: str, identified: bool) -> str:
+        """Which limit stops *key* now — ``""`` when a slot is free. Lock held."""
+        if self.total > 0 and self._in_flight >= self.total:
+            return "global"
+        # Enforced only for callers that actually identified themselves.
+        # Unidentified requests all hash to one bucket, so enforcing there
+        # would cap an entire endpoint at ``per_user`` rather than share it
+        # fairly: /v1/agents/messages forbids a ``user`` field outright, and a
+        # chunked request has no content-length to peek. Both would silently
+        # collapse to 3 concurrent turns for every caller combined. They are
+        # bounded by ``total`` instead.
+        if (
+            identified
+            and self.per_user > 0
+            and self._by_user.get(key, 0) >= self.per_user
+        ):
+            return "per_user"
+        return ""
+
+    def _take(self, key: str) -> TurnSlot:
+        """Count one slot for *key*. Lock held."""
+        self._in_flight += 1
+        self._by_user[key] = self._by_user.get(key, 0) + 1
+        return TurnSlot(self, key)
 
     def try_acquire(self, user: Optional[str] = None) -> Tuple[Optional[TurnSlot], str]:
         """Take a slot without blocking.
@@ -127,24 +187,92 @@ class TurnLimiter:
         Returns ``(slot, "")`` on success, or ``(None, reason)`` when a limit
         is hit.  *reason* is a short scope label for logging and metrics —
         never echoed to the caller, since per-user counts would leak the
-        gateway's tenancy shape.
+        gateway's tenancy shape. A waiter that could take a free slot has it
+        already (see :meth:`_grant_waiters`), so this never jumps the queue.
         """
         key = user or _ANONYMOUS
         with self._lock:
+            reason = self._blocked(key, bool(user))
+            if reason:
+                return None, reason
+            return self._take(key), ""
+
+    async def acquire(
+        self,
+        user: Optional[str] = None,
+        *,
+        abort: Optional[Callable[[], Awaitable[object]]] = None,
+    ) -> Tuple[Optional[TurnSlot], str, float]:
+        """Take a slot, waiting up to ``queue_timeout`` seconds for one.
+
+        Returns ``(slot, reason, waited_seconds)``. *reason* is the limit that
+        refused an immediate admission (``global``/``per_user``), then
+        ``queue_full`` or ``queue_timeout`` when waiting did not help, or
+        ``aborted`` when *abort* (the client disconnecting) finished first.
+        *abort* is a factory, called only if this request actually queues.
+        A slot granted in the same instant as a timeout or abort is released,
+        never leaked.
+        """
+        key = user or _ANONYMOUS
+        identified = bool(user)
+        with self._lock:
+            reason = self._blocked(key, identified)
+            if not reason:
+                return self._take(key), "", 0.0
+            if self.queue_timeout <= 0:
+                return None, reason, 0.0
+            if self.queue_max > 0 and len(self._waiters) >= self.queue_max:
+                return None, "queue_full", 0.0
+            waiter = _Waiter(key, identified, asyncio.get_running_loop())
+            self._waiters.append(waiter)
+
+        started = time.monotonic()
+        abort_task = asyncio.ensure_future(abort()) if abort is not None else None
+        outcome = "queue_timeout"
+        keep = False
+        try:
+            wait_for = {waiter.future} | ({abort_task} if abort_task else set())
+            await asyncio.wait(
+                wait_for,
+                timeout=self.queue_timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if abort_task is not None and abort_task.done():
+                outcome = "aborted"
+            keep = outcome != "aborted"
+        finally:
+            with self._lock:
+                try:
+                    self._waiters.remove(waiter)
+                except ValueError:
+                    pass  # granted: _grant_waiters already took it out
+            if abort_task is not None and not abort_task.done():
+                abort_task.cancel()
+            if not waiter.future.done():
+                # A grant still in flight sees the cancelled future and
+                # releases the slot itself (_resolve_waiter).
+                waiter.future.cancel()
+            elif not waiter.future.cancelled() and not keep:
+                # Granted, but we are leaving anyway (abort, or this task was
+                # cancelled mid-wait): hand the slot straight back.
+                waiter.future.result().release()
+        waited = time.monotonic() - started
+        if not waiter.future.cancelled() and outcome != "aborted":
+            return waiter.future.result(), "", waited
+        return None, outcome, waited
+
+    def _grant_waiters(self) -> None:
+        """Hand free slots to the oldest waiters that can take them. Lock held."""
+        if not self._waiters:
+            return
+        for waiter in list(self._waiters):
             if self.total > 0 and self._in_flight >= self.total:
-                return None, "global"
-            # Enforced only for callers that actually identified themselves.
-            # Unidentified requests all hash to one bucket, so enforcing there
-            # would cap an entire endpoint at ``per_user`` rather than share
-            # it fairly: /v1/agents/messages forbids a ``user`` field
-            # outright, and a chunked request has no content-length to peek.
-            # Both would silently collapse to 3 concurrent turns for every
-            # caller combined. They are bounded by ``total`` instead.
-            if user and self.per_user > 0 and self._by_user.get(key, 0) >= self.per_user:
-                return None, "per_user"
-            self._in_flight += 1
-            self._by_user[key] = self._by_user.get(key, 0) + 1
-        return TurnSlot(self, key), ""
+                return
+            if waiter.future.done() or self._blocked(waiter.key, waiter.identified):
+                continue
+            self._waiters.remove(waiter)
+            slot = self._take(waiter.key)
+            waiter.loop.call_soon_threadsafe(_resolve_waiter, waiter.future, slot)
 
     def _release(self, user: str) -> None:
         with self._lock:
@@ -157,11 +285,17 @@ class TurnLimiter:
                 # Drop the key so an idle gateway does not accumulate one
                 # dict entry per user seen since boot.
                 self._by_user.pop(user, None)
+            self._grant_waiters()
 
     @property
     def in_flight(self) -> int:
         with self._lock:
             return self._in_flight
+
+    @property
+    def queued(self) -> int:
+        with self._lock:
+            return len(self._waiters)
 
     def snapshot(self) -> Dict[str, int]:
         """Return current occupancy for admin/diagnostic surfaces."""
@@ -171,6 +305,8 @@ class TurnLimiter:
                 "limit": self.total,
                 "distinct_users": len(self._by_user),
                 "per_user_limit": self.per_user,
+                "queued": len(self._waiters),
+                "queue_limit": self.queue_max,
             }
 
     def reset(self) -> None:
@@ -178,9 +314,23 @@ class TurnLimiter:
         with self._lock:
             self._in_flight = 0
             self._by_user.clear()
+            self._waiters.clear()
 
 
-turn_limiter = TurnLimiter(MAX_CONCURRENT_TURNS, MAX_CONCURRENT_TURNS_PER_USER)
+def _resolve_waiter(future: "asyncio.Future[TurnSlot]", slot: TurnSlot) -> None:
+    """Deliver a granted slot on the waiter's loop — or return it if nobody waits."""
+    if future.done():
+        slot.release()
+    else:
+        future.set_result(slot)
+
+
+turn_limiter = TurnLimiter(
+    MAX_CONCURRENT_TURNS,
+    MAX_CONCURRENT_TURNS_PER_USER,
+    queue_timeout=TURN_QUEUE_TIMEOUT_SECONDS,
+    queue_max=TURN_QUEUE_MAX_WAITERS,
+)
 
 
 # ---------------------------------------------------------------------------

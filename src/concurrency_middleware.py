@@ -323,6 +323,23 @@ def _bind_principal_to_request(scope: Scope, principal: str, body: Optional[byte
     return body
 
 
+class _DisconnectTap:
+    """Watch the client's ``receive`` while a turn waits for a slot.
+
+    Only used once the body is fully buffered, so the only message the client
+    can still send is ``http.disconnect``: :meth:`wait` resolves when it does.
+    A wait that caught it always ends as ``aborted`` (the limiter checks the
+    task, not just which future woke it), so no message is ever swallowed from
+    a request that goes on to run.
+    """
+
+    def __init__(self, receive: Receive) -> None:
+        self._receive = receive
+
+    async def wait(self) -> Message:
+        return await self._receive()
+
+
 class ConcurrencyLimitMiddleware:
     """Apply request-boundary guards and reject agent runs beyond configured limits."""
 
@@ -337,6 +354,7 @@ class ConcurrencyLimitMiddleware:
 
         original_receive = receive
         body: Optional[bytes] = None
+        client_gone = False
         method = scope.get("method", "")
         body_limit = _request_body_limit(scope)
 
@@ -363,6 +381,7 @@ class ConcurrencyLimitMiddleware:
                 await self._send_413(send, body_limit)
                 return
             if disconnected is not None:
+                client_gone = True
                 receive = _replay_message(disconnected, original_receive)
             else:
                 principal = _credential_principal(scope)
@@ -381,8 +400,18 @@ class ConcurrencyLimitMiddleware:
 
         user, receive = await self._extract_user(scope, receive)
 
-        slot, reason = self.limiter.try_acquire(user)
+        # The body is already buffered, so the next message the client can send
+        # is ``http.disconnect``: watch for it while queued and drop the request
+        # if it comes, instead of running a turn nobody will read.
+        tap = _DisconnectTap(original_receive)
+        slot, reason, waited = await self.limiter.acquire(
+            user, abort=tap.wait if body is not None and not client_gone else None
+        )
+        if waited:
+            metrics.record_turn_queue_wait(waited, admitted=slot is not None)
         if slot is None:
+            if reason == "aborted":
+                return  # the client left while queued; there is no one to answer
             metrics.record_turn_rejected(reason)
             self._log_rejection(scope.get("path", ""), reason)
             await self._send_503(send)

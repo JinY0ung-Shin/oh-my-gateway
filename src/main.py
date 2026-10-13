@@ -316,22 +316,28 @@ async def lifespan(app: FastAPI):
     # Warn when MAX_LIVE_SESSIONS cannot fit in the memory this process
     # actually has. Sessions pin a Claude CLI subprocess for their whole TTL,
     # so an over-large cap means the host OOMs before the cap ever trips.
-    from src.concurrency import check_session_limit_fits_memory
+    from src.concurrency import check_session_limit_fits_memory, turn_limiter
     from src.constants import (
         MAX_CONCURRENT_TURNS,
         MAX_CONCURRENT_TURNS_PER_USER,
         MAX_LIVE_SESSIONS,
+        TURN_QUEUE_MAX_WAITERS,
+        TURN_QUEUE_TIMEOUT_SECONDS,
     )
 
     check_session_limit_fits_memory()
     logger.info(
         "Concurrency limits: live sessions=%s, in-flight turns=%s, per-user turns=%s "
-        "(0 = unlimited)",
+        "(0 = unlimited); a turn over a limit waits up to %ss for a slot "
+        "(%s waiters max)",
         MAX_LIVE_SESSIONS or "unlimited",
         MAX_CONCURRENT_TURNS or "unlimited",
         MAX_CONCURRENT_TURNS_PER_USER or "unlimited",
+        TURN_QUEUE_TIMEOUT_SECONDS,
+        TURN_QUEUE_MAX_WAITERS or "unlimited",
     )
     metrics.bind_live_sessions_source(lambda: len(session_manager.sessions))
+    metrics.bind_turns_queued_source(lambda: turn_limiter.queued)
     metrics.bind_oldest_active_turn_silence_source(
         session_manager.oldest_active_turn_silence
     )
