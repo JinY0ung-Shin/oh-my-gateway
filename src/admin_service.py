@@ -134,6 +134,7 @@ def get_redacted_config() -> Dict[str, Any]:
         "OPENAI_API_KEY",
         "MCP_CONFIG",
         "CLAUDE_SANDBOX_ENABLED",
+        "CLAUDE_BLOCK_READS_OUTSIDE_WORKSPACE",
         "PERMISSION_MODE",
         "BACKENDS",
         "OPENCODE_USE_WRAPPER_MCP_CONFIG",
