@@ -241,22 +241,40 @@ def operator_add_dirs() -> List[str]:
     return dirs
 
 
+def _on_read_only_mount(path: Path) -> bool:
+    """Whether *path* is on a read-only mount (``statvfs`` reports ``ST_RDONLY``).
+
+    A missing path or a platform without ``statvfs`` counts as writable.
+    """
+    try:
+        return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
+    except (OSError, AttributeError, ValueError):
+        return False
+
+
 def _operator_add_dir_roots(
     claude_home: Optional[Path], workspace_root: Path
 ) -> List[Path]:
     """Resolved absolute ``CLAUDE_ADD_DIRS`` entries for the sandbox read roots.
 
-    Relative entries are ignored, and so is any entry that would open other
-    users' state:
+    The hook checks Bash only against its read roots, so a granted entry is
+    open to Bash writes too, and the CLI loads every ``--add-dir``'s
+    ``.claude/`` skills, agents and commands into every session: a writable
+    entry would let one user plant instructions in other users' sessions. So
+    only an entry on a read-only mount is granted; the filesystem refuses those
+    writes. Relative entries are ignored, and so is an entry that
 
-    * one that is ``$HOME/.claude``, inside it or an ancestor of it (``$HOME``,
-      ``/``) — every user's transcripts and plans; only the always-on home guard
-      decides what of it a session may read (its own project dir plus the
-      shared assets);
-    * one that is the workspace base, inside it or an ancestor of it — every
-      user's workspace;
-    * one that contains this session's workspace — a cwd outside the base has
-      other sessions' workspaces beside it.
+    * is ``$HOME/.claude``, inside it or an ancestor of it (``$HOME``, ``/``) —
+      every user's transcripts and plans; only the always-on home guard decides
+      what of it a session may read (its own project dir plus the shared
+      assets);
+    * is the workspace base, inside it or an ancestor of it — every user's
+      workspace;
+    * contains this session's workspace — a cwd outside the base has other
+      sessions' workspaces beside it.
+
+    A read-only mount can still hold such state when a writable one is mounted
+    below it, which is why these overlaps are refused as well.
     """
     roots: List[Path] = []
     seen: Set[Path] = set()
@@ -281,6 +299,14 @@ def _operator_add_dir_roots(
                 "to the workspace sandbox",
                 root,
                 clash,
+            )
+            continue
+        if not _on_read_only_mount(root):
+            logger.warning(
+                "CLAUDE_ADD_DIRS entry %s is not on a read-only mount; not "
+                "granted to the workspace sandbox (Bash could write into it, "
+                "and the CLI loads its .claude/ skills into every session)",
+                root,
             )
             continue
         kept.append(root)
@@ -660,10 +686,10 @@ def make_workspace_sandbox_hook(workspace_root: Path):
       ``$HOME/.claude/projects/<encoded cwd>``;
     * ``read_roots`` — write roots plus the read-only shared assets under
       ``$HOME/.claude`` (skills, plugins, agents, …), plugin resource roots and
-      the operator's ``CLAUDE_ADD_DIRS`` (minus any entry that would open
-      other users' state, see ``_operator_add_dir_roots``). The rest of
-      ``$HOME/.claude`` (``plans/``, other ``projects/*``) belongs to other
-      users.
+      the operator's ``CLAUDE_ADD_DIRS`` entries that sit on a read-only mount
+      and do not overlap per-user state (``_operator_add_dir_roots``). The
+      rest of ``$HOME/.claude`` (``plans/``, other ``projects/*``) belongs to
+      other users.
 
     Direct callers historically receive a boundary-enforcing hook even when the
     env flag is off; preserve that behavior when quota is disabled. The special
@@ -680,10 +706,15 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     write_roots = [workspace_root] + _writable_extra_roots(given_root)
     read_roots = list(write_roots)
     seen: Set[Path] = set(read_roots)
+    add_dir_roots: List[Path] = []
+    if boundary_enabled:
+        # Quota-only mode never checks paths; it would only log warnings about
+        # entries it does not use.
+        add_dir_roots = _operator_add_dir_roots(claude_home, workspace_root)
     for root in (
         _shared_asset_roots(claude_home)
         + _plugin_resource_roots(claude_home)
-        + _operator_add_dir_roots(claude_home, workspace_root)
+        + add_dir_roots
     ):
         if root not in seen:
             seen.add(root)

@@ -547,10 +547,11 @@ class TestPluginResourceRoots:
 
 class TestOperatorAddDirs:
     """``CLAUDE_ADD_DIRS`` is also a CLI working directory (``--add-dir``), so the
-    sandbox must grant it to read/exec too — otherwise the CLI lets a session
-    ``cd`` there while the hook refuses every Read/Bash on it (#234). The write
-    tools stay confined to the workspace; Bash is not split into read and
-    write."""
+    sandbox grants it to read/exec too — otherwise the CLI lets a session ``cd``
+    there while the hook refuses every Read/Bash on it (#234). Only an entry on
+    a read-only mount is granted: the hook does not split Bash into read and
+    write, and the CLI loads the entry's ``.claude/`` skills into every
+    session. The write tools stay confined to the workspace."""
 
     @pytest.fixture
     def shared(self, tmp_path: Path, monkeypatch) -> Path:
@@ -562,6 +563,8 @@ class TestOperatorAddDirs:
         monkeypatch.delenv("CLAUDE_PLUGIN_CLONE_ROOT", raising=False)
         # Keep the host's workspace base out of the overlap checks.
         monkeypatch.setattr(sandbox.workspace_manager, "base_path", tmp_path / "ws")
+        # tmp is writable; model the read-only mount an operator has to use.
+        monkeypatch.setattr(sandbox, "_on_read_only_mount", lambda path: True)
         shared = tmp_path / "data" / "shared"
         (shared / "docs").mkdir(parents=True)
         (shared / "docs" / "guide.md").write_text("# guide")
@@ -651,17 +654,20 @@ class TestOperatorAddDirs:
         assert await _call(sandbox, "Read", doc) == {}
         assert _is_deny(await _call(sandbox, "Write", doc))
 
+    @pytest.mark.parametrize("mine_in_base", [False, True])
     @pytest.mark.parametrize("entry", ["base", "base_parent", "other_user"])
     async def test_entry_overlapping_workspace_base_opens_no_other_workspace(
-        self, shared, tmp_path, monkeypatch, entry
+        self, shared, tmp_path, monkeypatch, entry, mine_in_base
     ):
         # The workspace base holds every user's workspace. An operator entry
         # that is it, inside it or an ancestor of it must not open another
-        # user's workspace; a separate entry still works.
+        # user's workspace; a separate entry still works. With this session's
+        # cwd outside the base, the base rule alone has to refuse the entry.
         from src.backends.claude import workspace_sandbox as sandbox
 
         base = tmp_path / "srv" / "workspaces"
-        mine = base / "alice" / "claude"
+        owner = base if mine_in_base else tmp_path / "cwd"
+        mine = owner / "alice" / "claude"
         theirs = base / "bob" / "claude"
         mine.mkdir(parents=True)
         theirs.mkdir(parents=True)
@@ -705,10 +711,72 @@ class TestOperatorAddDirs:
         doc = {"file_path": str(shared / "docs" / "guide.md")}
         assert await _call(hook, "Read", doc) == {}
 
-    def test_cli_and_hook_share_one_list(self, shared, tmp_path):
+    async def test_entry_not_on_a_read_only_mount_opens_nothing(
+        self, workspace, shared, tmp_path, monkeypatch
+    ):
+        # A writable entry would let one user's Bash plant .claude/ skills that
+        # every other session loads, so the hook refuses it like any other
+        # outside path; the read-only entry next to it is still granted.
+        from src.backends.claude import workspace_sandbox as sandbox
+
+        refs = (tmp_path / "opt" / "refs").resolve()
+        monkeypatch.setattr(sandbox, "_on_read_only_mount", lambda path: path == refs)
+        hook = make_workspace_sandbox_hook(workspace)
+        doc = shared / "docs" / "guide.md"
+        plant = f"mkdir -p {shared}/.claude/skills/x"
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(doc)}))
+        assert _is_deny(await _call(hook, "Bash", {"command": plant}))
+        assert await _call(hook, "Glob", {"pattern": "*", "path": str(refs)}) == {}
+
+    def test_read_only_mount_detection(self, tmp_path, monkeypatch):
+        import os
+
+        from src.backends.claude.workspace_sandbox import _on_read_only_mount
+
+        assert _on_read_only_mount(tmp_path) is False
+        assert _on_read_only_mount(tmp_path / "missing") is False
+
+        class _ReadOnly:
+            f_flag = os.ST_RDONLY
+
+        monkeypatch.setattr(os, "statvfs", lambda path: _ReadOnly())
+        assert _on_read_only_mount(tmp_path) is True
+
+    async def test_quota_only_mode_logs_nothing_about_entries(
+        self, workspace, shared, monkeypatch, caplog
+    ):
+        # Quota-only mode checks no paths, so a warning about a refused entry
+        # would only mislead; an enforcing hook still logs it.
+        import logging
+
+        monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "100")
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", "/")
+        logger_name = "src.backends.claude.workspace_sandbox"
+        monkeypatch.setenv("WORKSPACE_SANDBOX_ENABLED", "false")
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            make_workspace_sandbox_hook(workspace)
+        assert "CLAUDE_ADD_DIRS" not in caplog.text
+        monkeypatch.setenv("WORKSPACE_SANDBOX_ENABLED", "true")
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            make_workspace_sandbox_hook(workspace)
+        assert "CLAUDE_ADD_DIRS entry / overlaps" in caplog.text
+
+    def test_operator_add_dirs_parses_the_env_list(self, shared, tmp_path):
         from src.backends.claude.workspace_sandbox import operator_add_dirs
 
         assert operator_add_dirs() == [str(shared), str(tmp_path / "opt" / "refs")]
+
+    def test_cli_gets_every_entry(self, shared, monkeypatch):
+        # The CLI list is not filtered: an entry the hook refuses still goes out
+        # as --add-dir, so these rules hold only with the sandbox on.
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"/, {shared} ,/")
+        options = ClaudeAgentOptions()
+        ClaudeCodeCLI.__new__(ClaudeCodeCLI)._configure_add_dirs(options)
+        assert options.add_dirs == ["/", str(shared)]
 
 
 class TestUnknownTool:
