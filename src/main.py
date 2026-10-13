@@ -203,6 +203,13 @@ async def _shutdown_backends() -> None:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize backends, verify authentication, and start background tasks."""
+    # First, before startup spawns any CLI child and before the first request:
+    # session tools run as this process's uid and could otherwise open its
+    # /proc/<pid>/environ (bypassing the child-env scrubbing), mem and fds.
+    from src.process_hardening import apply_non_dumpable_policy
+
+    apply_non_dumpable_policy()
+
     logger.info("Initializing backend registry...")
 
     # Validate admin configuration — fail fast if ADMIN_API_KEY is missing

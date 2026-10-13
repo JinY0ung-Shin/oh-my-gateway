@@ -21,6 +21,13 @@ os.environ.setdefault("ADMIN_API_KEY", "test-admin-api-key")
 # tests depend on where they run. Its own tests opt back in explicitly.
 os.environ.setdefault("SYSINFO_REDACTION", "false")
 
+# The gateway marks its serving process non-dumpable at startup
+# (src/process_hardening.py). Under pytest that process is the test runner:
+# its own /proc/self/environ would turn unreadable and a debugger could no
+# longer attach to a hung run, so the suite opts out.
+# tests/test_process_hardening.py checks the real effect in child processes.
+os.environ.setdefault("GATEWAY_NON_DUMPABLE", "false")
+
 import pytest
 
 import src.main as main
