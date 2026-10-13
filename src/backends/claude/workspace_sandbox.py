@@ -241,13 +241,32 @@ def operator_add_dirs() -> List[str]:
     return dirs
 
 
-def _operator_add_dir_roots() -> List[Path]:
-    """Resolved absolute ``CLAUDE_ADD_DIRS`` entries (relative ones ignored)."""
+def _operator_add_dir_roots(claude_home: Optional[Path]) -> List[Path]:
+    """Resolved absolute ``CLAUDE_ADD_DIRS`` entries for the sandbox read roots.
+
+    Relative entries are ignored, and so is any entry that is ``$HOME/.claude``,
+    inside it or an ancestor of it (``$HOME``, ``/``): that state is shared by
+    every user and only the always-on home guard decides what of it a session
+    may read (its own project dir plus the shared assets).
+    """
     roots: List[Path] = []
     seen: Set[Path] = set()
     for d in operator_add_dirs():
         _add_root(roots, seen, Path(d))
-    return roots
+    if claude_home is None:
+        return roots
+    kept: List[Path] = []
+    for root in roots:
+        if _is_within(root, claude_home) or _is_within(claude_home, root):
+            logger.warning(
+                "CLAUDE_ADD_DIRS entry %s overlaps the shared %s; not granted "
+                "to the workspace sandbox",
+                root,
+                claude_home,
+            )
+            continue
+        kept.append(root)
+    return kept
 
 
 def _read_json(path: Path) -> Any:
@@ -623,7 +642,8 @@ def make_workspace_sandbox_hook(workspace_root: Path):
       ``$HOME/.claude/projects/<encoded cwd>``;
     * ``read_roots`` — write roots plus the read-only shared assets under
       ``$HOME/.claude`` (skills, plugins, agents, …), plugin resource roots and
-      the operator's ``CLAUDE_ADD_DIRS``. The rest of ``$HOME/.claude``
+      the operator's ``CLAUDE_ADD_DIRS`` (minus any entry overlapping
+      ``$HOME/.claude``). The rest of ``$HOME/.claude``
       (``plans/``, other ``projects/*``) belongs to other users.
 
     Direct callers historically receive a boundary-enforcing hook even when the
@@ -644,7 +664,7 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     for root in (
         _shared_asset_roots(claude_home)
         + _plugin_resource_roots(claude_home)
-        + _operator_add_dir_roots()
+        + _operator_add_dir_roots(claude_home)
     ):
         if root not in seen:
             seen.add(root)
@@ -752,11 +772,9 @@ def make_claude_home_guard_hook(workspace_root: Path):
     claude_home = _claude_home()
     own = _own_project_roots(Path(workspace_root), claude_home)
     readable = list(own)
-    for root in (
-        _shared_asset_roots(claude_home)
-        + _plugin_resource_roots(claude_home)
-        + _operator_add_dir_roots()
-    ):
+    # Never the operator's CLAUDE_ADD_DIRS: an entry that is $HOME or
+    # $HOME/.claude would otherwise open every user's transcripts and plans.
+    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
         if root not in readable:
             readable.append(root)
     # Shared, read-only for the write tools wherever they live: plugin resource

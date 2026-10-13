@@ -604,6 +604,48 @@ class TestOperatorAddDirs:
         doc = shared / "docs" / "guide.md"
         assert _is_deny(await _call(hook, "Read", {"file_path": str(doc)}))
 
+    @pytest.mark.parametrize("entry", ["home", "claude_home", "projects", "root"])
+    async def test_entry_overlapping_shared_claude_state_opens_nothing_there(
+        self, workspace, other_workspace, shared, tmp_path, monkeypatch, entry
+    ):
+        # $HOME/.claude holds every user's transcripts and plans. An operator
+        # entry that is it, inside it or an ancestor of it must not open them
+        # in either hook (#237 review); a separate entry still works.
+        from src.backends.claude.workspace_sandbox import make_claude_home_guard_hook
+
+        home = tmp_path / "home" / "app"
+        claude = home / ".claude"
+        target = {
+            "home": home,
+            "claude_home": claude,
+            "projects": claude / "projects",
+            "root": Path("/"),
+        }[entry]
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"{target},{shared}")
+        name = re.sub(r"[^a-zA-Z0-9]", "-", str(other_workspace.resolve()))
+        transcript = claude / "projects" / name / "sess.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}")
+        plan = claude / "plans" / "someone-elses-plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# plan")
+        attempts = [
+            ("Read", {"file_path": str(transcript)}),
+            ("Read", {"file_path": str(plan)}),
+            ("Grep", {"pattern": "x", "path": str(claude / "projects")}),
+            ("Glob", {"pattern": "*", "path": str(claude / "plans")}),
+        ]
+        for hook in (
+            make_workspace_sandbox_hook(workspace),
+            make_claude_home_guard_hook(workspace),
+        ):
+            for tool, tool_input in attempts:
+                assert _is_deny(await _call(hook, tool, tool_input)), (tool, tool_input)
+        sandbox = make_workspace_sandbox_hook(workspace)
+        doc = {"file_path": str(shared / "docs" / "guide.md")}
+        assert await _call(sandbox, "Read", doc) == {}
+        assert _is_deny(await _call(sandbox, "Write", doc))
+
     def test_cli_and_hook_share_one_list(self, shared, tmp_path):
         from src.backends.claude.workspace_sandbox import operator_add_dirs
 
