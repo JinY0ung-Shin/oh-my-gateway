@@ -669,6 +669,19 @@ def _check_cross_session_messaging() -> List[ConfigIssue]:
     ]
 
 
+def _check_landlock_confinement() -> List[ConfigIssue]:
+    """Fail closed when Landlock confinement is requested but cannot be enforced.
+
+    With a Landlock ``CLAUDE_ISOLATION_MODE`` on, the gateway points ``cli_path`` at the
+    launcher stub; if the launcher or the real CLI cannot be resolved, or the
+    kernel's Landlock is unusable, the only safe outcome is to refuse to start
+    rather than spawn an unconfined CLI. See ``src/backends/claude/landlock.py``.
+    """
+    from src.backends.claude.landlock import check_config as _landlock_check
+
+    return [ConfigIssue("error", message) for message in _landlock_check()]
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -690,6 +703,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_workspace_initial_dirs())
     issues.extend(_check_workspace_quota())
     issues.extend(_check_cross_session_messaging())
+    issues.extend(_check_landlock_confinement())
     return issues
 
 

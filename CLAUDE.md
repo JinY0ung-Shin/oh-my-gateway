@@ -186,7 +186,33 @@ uv run pytest --cov=src                            # with coverage
   the callback refuses Bash / `blocked_path` asks. Under `bypassPermissions` the read block's asks
   are the only Bash asks left, and they **still reach `can_use_tool`** despite the SDK's
   `CanUseToolShadowedWarning`. A script the agent writes and runs still reads anything (needs an
-  OS boundary). `tests/test_cli_read_boundary.py` pins all of it against the bundled CLI.
+  OS boundary — see Landlock confinement next). `tests/test_cli_read_boundary.py` pins all of it
+  against the bundled CLI.
+- Landlock confinement (#241, `CLAUDE_ISOLATION_MODE=off|landlock|uid`; `uid` lands with the broker
+  follow-up): the OS boundary that closes the written-script read path (F1) the read boundary cannot.
+  One operator knob picks the mode; `confine_enabled()` is true for the Landlock modes, an unknown
+  value fails closed at startup. When on, `_get_cli_path` points `cli_path`
+  at a fixed launcher (`docker/landlock_launcher.py`, root-owned) instead of the real CLI; the
+  launcher re-execs itself under `python3 -I` (cwd is the agent workspace — never import from it),
+  applies a Landlock ruleset, and execs the real CLI (operator `CLAUDE_CLI_PATH` or SDK bundle,
+  resolved by `landlock.resolve_real_cli`). Landlock is inherited across `execve`, so Bash, a script
+  the agent wrote, and stdio MCP are all confined at `open()`. The per-workspace ro/rw path lists
+  ride `options.env` (`landlock.options_env`) and are built from the **same** `workspace_sandbox`
+  helpers as the always-on `~/.claude` guard (`_shared_asset_roots`, `plugin_resource_roots`,
+  `_writable_extra_roots`), so a confined script reaches exactly what a file tool may — `/app` is
+  never listed (code + `/app/data` creds denied by rule absence, not a ro rule). `/etc` and `/usr`
+  stay ro (the CLI/libc need them; a passwd entry is required), so acceptance is "a path **outside
+  the ruleset**", not `/etc/passwd`. The launcher redirects `TMPDIR`/`CLAUDE_CODE_TMPDIR` to
+  `<cwd>/.cli-tmp` (off the shared `/tmp`). This is the no-privilege **interim** of
+  `docs/security-process-isolation.md` §3: no uid switch, so no cross-session DAC/signal isolation
+  (that is the uid-per-user broker follow-up). Fail-closed: `config_check._check_landlock_confinement`
+  refuses startup if the launcher/real CLI cannot resolve or Landlock ABI < 2 (kernel < 5.19); the
+  CLI's own bwrap sandbox is forced off (`_configure_sandbox`) because it cannot start inside a
+  Landlock domain. Startup installs `GATEWAY_REAL_CLI` + `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1` in
+  the process env (`landlock.install_process_env`, for the SDK's option-less `-v` spawn). Unit:
+  `tests/test_landlock_confine.py` (launcher + wiring, no bundled CLI); the bundled-CLI closure +
+  workspace-work proof is `tests/test_cli_read_boundary.py::TestLandlockConfinement` (the kept
+  `test_known_gap_*` is its non-vacuous control).
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values

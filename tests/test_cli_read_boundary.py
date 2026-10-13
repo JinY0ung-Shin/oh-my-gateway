@@ -174,9 +174,19 @@ def _bash(command: str) -> Tuple[str, Dict[str, Any]]:
 
 
 async def _run(
-    tmp_path: Path, calls: List[Tuple[str, Dict[str, Any]]], mode: str
+    tmp_path: Path,
+    calls: List[Tuple[str, Dict[str, Any]]],
+    mode: str,
+    *,
+    confine: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """Run *calls* in one turn with the gateway's options; tool results + asks."""
+    """Run *calls* in one turn with the gateway's options; tool results + asks.
+
+    With ``confine=True`` the CLI is spawned through the Landlock launcher
+    (#241), the way the gateway does when ``CLAUDE_ISOLATION_MODE`` selects a
+    Landlock mode: the
+    workspace and the CLI's test HOME are read-write, everything else is denied.
+    """
     workspace = tmp_path / "ws"
     workspace.mkdir()
     (workspace / "in.txt").write_text(f"{INSIDE}\n")
@@ -211,6 +221,34 @@ async def _run(
     env = {"CLAUDE_CODE_HARBOR_KITE": "0"}
     if os.geteuid() == 0:  # the CLI refuses bypassPermissions as root otherwise
         env["IS_SANDBOX"] = "1"
+    cli_path = None
+    if confine:
+        from src.backends.claude import landlock
+
+        cli_path = landlock.launcher_path()
+        real_cli = landlock.resolve_real_cli()
+        assert real_cli, "no real CLI to confine"
+        # Read-write: the workspace and the CLI's test HOME (its config dir,
+        # transcripts, state). Everything else — the sibling 'outside' dir, the
+        # gateway code — is denied by omission.
+        # sys.prefix is the dev venv, which lives UNDER the repo root. In
+        # production ``python3`` is /usr/bin/python3 (already in the launcher's
+        # ro system roots); here the CLI's Bash resolves it to the venv python,
+        # so grant the venv read-only — only then does python actually start and
+        # the closure tests prove the OUTSIDE read is blocked, not that python
+        # failed to boot. It is a subtree, so the repo's src/ and data/ stay
+        # denied (the /app protection the other tests check).
+        import sys
+
+        env.update(
+            {
+                landlock.REAL_CLI_ENV: real_cli,
+                landlock.RW_ENV: os.pathsep.join(
+                    [str(workspace), str(tmp_path / "home")]
+                ),
+                landlock.RO_ENV: sys.prefix,
+            }
+        )
     with FakeAnthropicAPI(plan) as api:
         options = ClaudeAgentOptions(
             cwd=str(workspace),
@@ -221,6 +259,7 @@ async def _run(
             max_turns=len(calls) + 2,
             session_id=str(uuid.uuid4()),
             can_use_tool=can_use_tool,
+            **({"cli_path": cli_path} if cli_path else {}),
         )
         client = ClaudeSDKClient(options=options)
         await asyncio.wait_for(client.connect(), timeout=_TURN_TIMEOUT)
@@ -308,9 +347,12 @@ class TestBundledCliReadBoundary:
     async def test_known_gap_a_workspace_script_reads_outside(
         self, tmp_path, boundary_on
     ):
-        # The CLI cannot see inside a script file. Only an OS boundary closes
-        # this (#234); when this starts failing, the CLI closed it — update the
-        # docs that describe the gap.
+        # Control (#241): the read boundary alone cannot see inside a script the
+        # agent wrote, so the written-script read path stays open WITHOUT an OS
+        # boundary. This keeps TestLandlockConfinement below non-vacuous: that
+        # class runs the same script under the Landlock launcher and asserts the
+        # secret no longer comes back. If this ever stops leaking on its own,
+        # the CLI closed the gap — update the docs that describe it.
         results, _ = await _run(tmp_path, [_bash("python3 rd.py")], "default")
         assert SECRET in results[0], results[0]
 
@@ -320,3 +362,56 @@ class TestBundledCliReadBoundary:
         # Proves the tests above are not vacuous.
         results, _ = await _run(tmp_path, [_bash("cat @OUT/secret.txt")], "default")
         assert SECRET in results[0], results[0]
+
+
+def _landlock_unusable() -> Optional[str]:
+    from src.backends.claude import landlock
+
+    abi = landlock.landlock_abi()
+    if abi < 2:
+        return f"Landlock ABI {abi} < 2 (need kernel >= 5.19)"
+    launcher = Path(landlock.launcher_path())
+    if not (launcher.is_file() and os.access(launcher, os.X_OK)):
+        return f"launcher {launcher} not executable"
+    return None
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("_no_inherited_claude_env")
+@pytest.mark.filterwarnings("ignore::claude_agent_sdk.types.CanUseToolShadowedWarning")
+@pytest.mark.skipif(bool(_landlock_unusable()), reason=_landlock_unusable() or "")
+class TestLandlockConfinement:
+    """The OS boundary (#241, PR-A): a Landlock ruleset inherited across execve
+    confines every CLI descendant's file access, closing the written-script read
+    path the command-line checks cannot — while workspace work still runs."""
+
+    async def test_written_script_cannot_read_outside(self, tmp_path, boundary_on):
+        # The exact scenario of the control known-gap test, now confined: the
+        # agent writes rd.py into its workspace and runs it; the outside read
+        # must come back empty/denied, not the secret.
+        results, _ = await _run(
+            tmp_path, [_bash("python3 rd.py")], "default", confine=True
+        )
+        assert not _leaks(results[0]), results[0]
+
+    async def test_confined_direct_bash_read_outside_also_blocked(
+        self, tmp_path, boundary_on
+    ):
+        # Beyond the written script: a plain outside read is denied at the OS
+        # layer too (belt-and-suspenders with the read boundary's own refusal).
+        results, _ = await _run(
+            tmp_path, [_bash("cat @OUT/secret.txt")], "default", confine=True
+        )
+        assert not _leaks(results[0]), results[0]
+
+    async def test_confined_workspace_work_still_runs(self, tmp_path, boundary_on):
+        # Confinement must not break ordinary in-workspace work: reading a file,
+        # running a script that reads an in-workspace file, and writing.
+        calls = [
+            _bash("cat in.txt"),
+            _bash("python3 ok.py"),
+            _bash("echo written > out.txt && cat out.txt"),
+        ]
+        results, _ = await _run(tmp_path, calls, "default", confine=True)
+        assert all(INSIDE in r for r in results[:2]), results
+        assert "written" in results[2], results[2]

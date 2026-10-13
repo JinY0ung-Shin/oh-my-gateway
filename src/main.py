@@ -210,6 +210,14 @@ async def lifespan(app: FastAPI):
 
     apply_non_dumpable_policy()
 
+    # Install the process-wide env the Landlock launcher needs before any CLI
+    # child is spawned (the SDK's version-check spawn carries no options.env).
+    # No-op unless CLAUDE_ISOLATION_MODE selects a Landlock mode. The fail-closed
+    # check runs below in run_startup_config_check (#241).
+    from src.backends.claude import landlock
+
+    landlock.install_process_env()
+
     logger.info("Initializing backend registry...")
 
     # Validate admin configuration — fail fast if ADMIN_API_KEY is missing

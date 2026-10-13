@@ -221,7 +221,17 @@ def _get_cli_path() -> Optional[str]:
     requires an explicit ``cli_path``. Fail safe: a CLAUDE_CLI_PATH that is not
     an executable file is ignored with a warning rather than breaking session
     creation.
+
+    With Landlock confinement on (#241), ``cli_path`` instead points at the
+    fixed launcher stub, which applies the ruleset and then execs the real CLI
+    (operator override or bundled — resolved by ``landlock.resolve_real_cli``).
+    Startup fails closed if that launcher/real CLI cannot be resolved
+    (``landlock.check_config``), so returning it here is safe.
     """
+    from . import landlock
+
+    if landlock.confine_enabled():
+        return landlock.launcher_path()
     if not CLAUDE_CLI_PATH:
         return None
     path = Path(CLAUDE_CLI_PATH)
@@ -823,7 +833,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         * ``True`` — force-enable sandbox with env-configured parameters.
         * ``False`` — force-disable sandbox explicitly (honored even when the
           workspace sandbox is on).
+
+        Landlock confinement (#241) overrides all of the above: bwrap cannot
+        start inside a Landlock domain (it needs mount/pivot_root the domain
+        denies), so the CLI's own OS sandbox must be off or every sandboxed
+        Bash call would fail. See ``docs/security-process-isolation.md`` §3.
         """
+        from . import landlock
+
+        if landlock.confine_enabled():
+            options.sandbox = SandboxSettings(enabled=False)
+            return
+
         effective_enabled = CLAUDE_SANDBOX_ENABLED
         if effective_enabled is None and sandbox_enabled():
             effective_enabled = True
@@ -1235,8 +1256,28 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_task_budget(options, task_budget)
         self._configure_metadata_env(options, extra_env)
         self._configure_sdk_env(options)
+        self._configure_confinement(options, effective_cwd)
 
         return options
+
+    def _configure_confinement(
+        self, options: ClaudeAgentOptions, effective_cwd: Optional[Path]
+    ) -> None:
+        """Hand the Landlock launcher this workspace's path lists (#241).
+
+        No-op unless confinement is on. ``cli_path`` already points at the
+        launcher (``_get_cli_path``); here we add the per-workspace read-only /
+        read-write path lists it enforces, through ``options.env`` so they ride
+        the clean child env the SDK builds. Built from the same guard helpers,
+        so a confined script reaches exactly what a file tool may.
+        """
+        from . import landlock
+
+        env = landlock.options_env(Path(effective_cwd)) if effective_cwd else {}
+        if env:
+            if options.env is None:
+                options.env = {}
+            options.env.update(env)
 
     # ------------------------------------------------------------------
     # SDK message conversion (SDK types -> plain dicts)
