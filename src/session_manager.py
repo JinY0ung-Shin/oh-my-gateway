@@ -40,7 +40,23 @@ from src.constants import (
 logger = logging.getLogger(__name__)
 
 _CWD_ENCODE_RE = re.compile(r"[/_.]")
-_PROJECTS_ROOT: Path = Path.home() / ".claude" / "projects"
+
+# Where the SDK stores per-session transcripts: ``<config dir>/projects``.
+# Resolved per call (``_projects_root``) via the shared config-dir resolver so a
+# per-session config dir (PR-C) is honored, instead of being frozen at import.
+# ``None`` means "resolve from the environment"; a test may set this attribute
+# to pin the root (the historical seam ``monkeypatch.setattr(session_manager,
+# "_PROJECTS_ROOT", tmp_path)`` keeps working).
+_PROJECTS_ROOT: Optional[Path] = None
+
+
+def _projects_root() -> Path:
+    """The ``projects`` root, honoring a test override of ``_PROJECTS_ROOT``."""
+    if _PROJECTS_ROOT is not None:
+        return _PROJECTS_ROOT
+    from src.claude_config_paths import projects_root
+
+    return projects_root()
 
 
 def _encode_cwd(cwd) -> str:
@@ -64,7 +80,7 @@ def _session_jsonl_path(session_id: str, workspace) -> Path:
 
     Path layout: ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``.
     """
-    return _PROJECTS_ROOT / _encode_cwd(workspace) / f"{session_id}.jsonl"
+    return _projects_root() / _encode_cwd(workspace) / f"{session_id}.jsonl"
 
 
 def _session_jsonl_exists(session: "Session") -> bool:

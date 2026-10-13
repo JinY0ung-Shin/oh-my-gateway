@@ -91,14 +91,16 @@ def settings_path() -> Optional[Path]:
     override = (os.getenv(SETTINGS_PATH_VAR) or "").strip()
     if override:
         return Path(override)
-    home = (os.getenv("HOME") or "").strip()
-    if not home:
+    from src.claude_config_paths import settings_path_default
+
+    base = settings_path_default()
+    if base is None:
         logger.warning(
             "HOME is unset and %s is not set; cannot locate the Claude settings file",
             SETTINGS_PATH_VAR,
         )
         return None
-    return Path(home) / ".claude" / "settings.json"
+    return base
 
 
 def store_path() -> Path:

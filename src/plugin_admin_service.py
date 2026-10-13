@@ -304,11 +304,9 @@ def _default_name(repo: str) -> str:
 
 def clone_root() -> Path:
     """Resolve the directory remote marketplace repos are cloned into."""
-    configured = os.environ.get("CLAUDE_PLUGIN_CLONE_ROOT", "").strip()
-    if configured:
-        return Path(configured)
-    home = os.environ.get("HOME", "").strip() or tempfile.gettempdir()
-    return Path(home) / ".claude" / "plugin-marketplaces"
+    from src.claude_config_paths import plugin_clone_root
+
+    return plugin_clone_root()
 
 
 def _clone_dir(root: Path, repo: str) -> Path:
@@ -435,8 +433,9 @@ def _resolve_marketplace_repo_raw(marketplace: str) -> str:
     record = plugin_manifest.get_marketplace(marketplace)
     if record.get("repo", "").strip():
         return record["repo"].strip()
-    home = os.environ.get("HOME", "").strip() or str(Path.home())
-    known = Path(home) / ".claude" / "plugins" / "known_marketplaces.json"
+    from src.claude_config_paths import config_dir
+
+    known = config_dir() / "plugins" / "known_marketplaces.json"
     try:
         data = json.loads(known.read_text(encoding="utf-8"))
     except (OSError, ValueError):
