@@ -213,6 +213,25 @@ uv run pytest --cov=src                            # with coverage
   `tests/test_landlock_confine.py` (launcher + wiring, no bundled CLI); the bundled-CLI closure +
   workspace-work proof is `tests/test_cli_read_boundary.py::TestLandlockConfinement` (the kept
   `test_known_gap_*` is its non-vacuous control).
+- `uid` mode (#241 PR-C) adds per-user uid + DAC/signal isolation on top of the Landlock ruleset.
+  The gateway body stays unprivileged; a resident **broker** (`docker/isolation_broker.py`, holds
+  only SETUID/SETGID) forks each CLI as its session's uid, then the CLI applies the **same**
+  `docker/_landlock_rules.py` ruleset *after* the switch. The launcher's uid branch hands the broker
+  the SDK's fds (`SCM_RIGHTS`) + a signed single-use ticket (`uid_isolation.mint_ticket`, HMAC +
+  nonce + exp; `GATEWAY_ISOLATION_TICKET_SECRET` is entrypoint-generated, shared with gateway+broker,
+  blanked in every child env, never to a session) and relays exit status so the SDK's `wait()` is
+  right. The broker execs the CLI with the launcher-passed env (the SDK's child env) — not the
+  broker's — filtered + plumbing-stripped. `effective_mode()` self-detects at startup (Landlock
+  ABI≥2 + broker reachable); unavailable uid is a hard `check_config` error **unless**
+  `CLAUDE_ISOLATION_FALLBACK=landlock`. The broker's uid switch is a no-op when target==current euid,
+  so the whole protocol (fd passing, fork tree, Landlock, exit mirroring, forged-ticket refusal) is
+  unit-tested same-uid in `tests/test_isolation_broker.py` + `tests/test_uid_isolation.py`; **the
+  privileged cross-uid switch and `docker/entrypoint.py:launch_isolation_broker` are
+  container-only — unverifiable on this dev box, gated fail-closed, verify with the probe + acceptance
+  tests before enabling uid in prod.** Remaining hardening (seccomp arg filter on set*id, bounding-set
+  drop) is a container step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py` never
+  import `/app/src` (session-writable + privileged); the broker's ticket-verify is duplicated from
+  `uid_isolation` and kept in lockstep by `test_isolation_broker`.
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values

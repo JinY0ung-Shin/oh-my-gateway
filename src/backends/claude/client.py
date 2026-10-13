@@ -1169,6 +1169,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # (tests/test_cli_blank_oauth_token.py).
         sdk_env.update(dict.fromkeys(self._isolation_vars(), ""))
 
+        # The uid-isolation ticket secret (set in the gateway's env by the
+        # entrypoint) must never reach a session child: the CLI does not need it
+        # and it would let a child forge broker tickets. The launcher presents a
+        # pre-minted ticket, not the secret, and the broker holds its own copy;
+        # blank it here as defense in depth (#241).
+        sdk_env["GATEWAY_ISOLATION_TICKET_SECRET"] = ""
+
         if sdk_env:
             options.env.update(sdk_env)
 
