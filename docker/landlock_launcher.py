@@ -81,8 +81,12 @@ def _session_tmpdir(cwd):
     configured = os.environ.get("CLAUDE_CODE_TMPDIR", "").strip()
     if configured and os.path.realpath(configured).startswith(real_cwd + os.sep):
         tmp = configured
+        try:
+            os.makedirs(tmp, exist_ok=True)
+        except OSError:
+            pass
     else:
-        tmp = os.path.join(real_cwd, ".cli-tmp")
+        tmp = ll.safe_tmpdir(real_cwd)
     os.environ["TMPDIR"] = tmp
     os.environ["CLAUDE_CODE_TMPDIR"] = tmp
     return tmp
@@ -93,7 +97,11 @@ def _ro_rw(real_cli, cwd):
     ro = list(ll.SYSTEM_RO)
     ro.append(os.path.dirname(os.path.realpath(real_cli)))
     ro.extend(_parse_paths("GATEWAY_LANDLOCK_RO"))
-    rw = [cwd, _session_tmpdir(cwd), "/dev/shm"]
+    # TMPDIR is set inside the workspace but is NOT a separate rule: it lies
+    # beneath the granted cwd, so a rule would be redundant and (because it is
+    # agent-controlled) a symlink-escape vector — see ll.safe_tmpdir.
+    _session_tmpdir(cwd)
+    rw = [cwd, "/dev/shm"]
     rw.extend(_parse_paths("GATEWAY_LANDLOCK_RW"))
     return ro, rw
 

@@ -178,6 +178,9 @@ def run(cmd: List[str], *, token: str = "") -> subprocess.CompletedProcess:
         if not k.startswith("CLAUDE_PLUGIN_GIT_TOKEN")
     }
     env["GIT_TERMINAL_PROMPT"] = "0"
+    # The uid-isolation ticket secret must never reach a plugin/git child: it
+    # would let plugin-controlled content forge broker tickets (#241).
+    env.pop("GATEWAY_ISOLATION_TICKET_SECRET", None)
     askpass_path = _write_askpass(token, env) if token else None
     try:
         proc = subprocess.run(

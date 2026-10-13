@@ -203,7 +203,7 @@ class TestFailClosed:
     def test_unusable_landlock_is_an_error(self, confine_on, monkeypatch):
         monkeypatch.setattr(landlock, "landlock_abi", lambda: 1)
         errors = landlock.check_config()
-        assert any("Landlock is not usable" in e for e in errors)
+        assert any("Landlock cannot be enforced" in e for e in errors)
 
     def test_config_check_surfaces_errors_as_config_issues(
         self, confine_on, monkeypatch
@@ -341,3 +341,159 @@ class TestLauncherConfines:
         )
         assert proc.returncode != 0
         assert "GATEWAY_REAL_CLI" in proc.stderr
+
+    def test_regular_file_in_ro_list_is_readable(self, tmp_path):
+        # #4: a regular file (e.g. the user CLAUDE.md) in the ro list must not
+        # abort the ruleset build with EINVAL (READ_DIR on a non-dir) and must
+        # be readable by the confined child.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        cfg = tmp_path / "CLAUDE.md"
+        cfg.write_text("HELLO\n")
+        (ws / "p.py").write_text(
+            "import sys\n"
+            "try: print('READ:' + open(sys.argv[1]).read().strip())\n"
+            "except OSError as e: print('DENY:' + str(e.errno))\n"
+        )
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PWD": str(ws),
+            landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
+            landlock.RW_ENV: str(ws),
+            landlock.RO_ENV: str(cfg),
+        }
+        proc = subprocess.run(
+            [sys.executable, str(_LAUNCHER), str(ws / "p.py"), str(cfg)],
+            cwd=str(ws),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == "READ:HELLO"
+
+    def test_cli_tmp_symlink_cannot_escape(self, tmp_path):
+        # #1: a hostile .cli-tmp -> / symlink must not widen the sandbox; it is
+        # no longer a rule, and the launcher replaces it with a real directory.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("SECRET\n")
+        os.symlink("/", ws / ".cli-tmp")
+        (ws / "p.py").write_text(
+            "import os, sys, json\n"
+            "tmp = os.environ.get('TMPDIR', '')\n"
+            "def w(p):\n"
+            "    try:\n"
+            "        open(p, 'w').write('x'); return 'OK'\n"
+            "    except OSError as e: return 'DENY:' + str(e.errno)\n"
+            "print(json.dumps({\n"
+            "  'tmp_is_real_dir': bool(tmp) and not os.path.islink(tmp),\n"
+            "  'escape_write': w(sys.argv[1]),\n"
+            "}))\n"
+        )
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PWD": str(ws),
+            landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
+            landlock.RW_ENV: str(ws),
+            landlock.RO_ENV: "",
+        }
+        proc = subprocess.run(
+            [sys.executable, str(_LAUNCHER), str(ws / "p.py"), str(outside / "evil")],
+            cwd=str(ws),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        r = json.loads(proc.stdout)
+        assert r["tmp_is_real_dir"] is True  # symlink replaced with a real dir
+        assert r["escape_write"].startswith("DENY")  # cannot write outside the ws
+
+
+class TestReviewRoRwLists:
+    """#5/#6/#14: the confined CLI can read its own config, write its runtime
+    caches, and CLAUDE_ADD_DIRS rides the #240 filter (not the raw strings)."""
+
+    def _cfg(self, monkeypatch, tmp_path) -> Path:
+        cfg = tmp_path / ".claude"
+        cfg.mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+        return cfg
+
+    def test_ro_includes_cli_config_files(self, confine_on, monkeypatch, tmp_path):
+        cfg = self._cfg(monkeypatch, tmp_path)
+        env = landlock.options_env(tmp_path / "ws")
+        ro = env[landlock.RO_ENV].split(os.pathsep)
+        assert str(cfg / "settings.json") in ro
+        assert str(cfg.parent / ".claude.json") in ro
+
+    def test_rw_includes_runtime_caches(self, confine_on, monkeypatch, tmp_path):
+        cfg = self._cfg(monkeypatch, tmp_path)
+        monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uvc"))
+        env = landlock.options_env(tmp_path / "ws")
+        rw = env[landlock.RW_ENV].split(os.pathsep)
+        assert str(cfg / "plugins" / "data") in rw
+        assert str(tmp_path / "uvc") in rw
+
+    def test_add_dirs_are_filtered_not_raw(self, confine_on, monkeypatch, tmp_path):
+        self._cfg(monkeypatch, tmp_path)
+        extra = tmp_path / "extra"
+        extra.mkdir()  # a writable mount → the #240 filter must drop it
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", str(extra))
+        env = landlock.options_env(tmp_path / "ws")
+        ro = env[landlock.RO_ENV].split(os.pathsep)
+        assert str(extra) not in ro
+
+
+class TestPreflightConfinement:
+    """#8: the slash/catalog preflight is confined (landlock shape, real cwd)."""
+
+    def test_preflight_env_is_landlock_even_in_uid_mode(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        monkeypatch.setenv(landlock.REAL_CLI_ENV, _SYSTEM_PYTHON)
+        landlock.reset_mode_cache()
+        env = landlock.preflight_options_env(tmp_path)
+        assert env[landlock.MODE_ENV] == "landlock"  # never uid (no ticket/broker)
+        assert landlock.RO_ENV in env and landlock.RW_ENV in env
+        assert env[landlock.REAL_CLI_ENV]
+
+    def test_preflight_env_empty_when_off(self, confine_off, tmp_path):
+        assert landlock.preflight_options_env(tmp_path) == {}
+
+    def test_build_preflight_options_gives_real_cwd_and_env(
+        self, confine_on, monkeypatch
+    ):
+        from src.backends.claude import slash_commands as sc
+
+        monkeypatch.setenv(landlock.REAL_CLI_ENV, _SYSTEM_PYTHON)
+        opts = sc._build_preflight_options(None)  # no cwd supplied
+        assert opts.cwd is not None  # a real dir, never None (would grab /app)
+        assert (opts.env or {}).get(landlock.MODE_ENV) == "landlock"
+        assert (opts.env or {}).get("GATEWAY_ISOLATION_TICKET_SECRET") == ""
+
+
+class TestSkipConfigCheckGuard:
+    """A mistyped CLAUDE_ISOLATION_MODE is not bypassable by SKIP_CONFIG_CHECK."""
+
+    def test_skip_does_not_bypass_invalid_mode(self, monkeypatch):
+        monkeypatch.setenv("SKIP_CONFIG_CHECK", "true")
+        monkeypatch.setenv(landlock.MODE_ENV, "landblock")  # typo
+        landlock.reset_mode_cache()
+        from src.config_check import run_startup_config_check
+
+        with pytest.raises(RuntimeError):
+            run_startup_config_check()
+
+    def test_skip_bypasses_when_mode_valid(self, monkeypatch):
+        monkeypatch.setenv("SKIP_CONFIG_CHECK", "true")
+        monkeypatch.setenv(landlock.MODE_ENV, "off")
+        landlock.reset_mode_cache()
+        from src.config_check import run_startup_config_check
+
+        assert run_startup_config_check() == []

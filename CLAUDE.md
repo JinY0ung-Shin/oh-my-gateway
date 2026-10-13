@@ -199,39 +199,66 @@ uv run pytest --cov=src                            # with coverage
   the agent wrote, and stdio MCP are all confined at `open()`. The per-workspace ro/rw path lists
   ride `options.env` (`landlock.options_env`) and are built from the **same** `workspace_sandbox`
   helpers as the always-on `~/.claude` guard (`_shared_asset_roots`, `plugin_resource_roots`,
-  `_writable_extra_roots`), so a confined script reaches exactly what a file tool may — `/app` is
-  never listed (code + `/app/data` creds denied by rule absence, not a ro rule). `/etc` and `/usr`
-  stay ro (the CLI/libc need them; a passwd entry is required), so acceptance is "a path **outside
-  the ruleset**", not `/etc/passwd`. The launcher redirects `TMPDIR`/`CLAUDE_CODE_TMPDIR` to
-  `<cwd>/.cli-tmp` (off the shared `/tmp`). This is the no-privilege **interim** of
-  `docs/security-process-isolation.md` §3: no uid switch, so no cross-session DAC/signal isolation
-  (that is the uid-per-user broker follow-up). Fail-closed: `config_check._check_landlock_confinement`
-  refuses startup if the launcher/real CLI cannot resolve or Landlock ABI < 2 (kernel < 5.19); the
-  CLI's own bwrap sandbox is forced off (`_configure_sandbox`) because it cannot start inside a
-  Landlock domain. Startup installs `GATEWAY_REAL_CLI` + `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1` in
+  `_writable_extra_roots`), plus the CLI's own config files (ro: `settings.json`, `~/.claude.json`)
+  and its writable runtime caches (rw: `~/.claude/plugins/data`, `~/.npm`, the uv cache) so user
+  settings load and plugin hooks / `npx` / `uv run` work; `CLAUDE_ADD_DIRS` rides the #240 filter
+  (`_operator_add_dir_roots`), never the raw strings. A confined script reaches exactly what a file
+  tool may — `/app` is never listed (code + `/app/data` creds denied by rule absence, not a ro
+  rule). `/etc` and `/usr` stay ro (the CLI/libc need them; a passwd entry is required), so
+  acceptance is "a path **outside the ruleset**", not `/etc/passwd`. A rule target that is a regular
+  file (e.g. the user `CLAUDE.md`) gets file-only rights — the dir-only `READ_DIR` bit is EINVAL for
+  a file and would abort the whole build. `TMPDIR`/`CLAUDE_CODE_TMPDIR` point at `<cwd>/.cli-tmp`
+  (off the shared `/tmp`), which is **not** a Landlock rule: it rides beneath the granted cwd and is
+  symlink-stripped first, because a rule on that agent-controlled path was a `ln -s / .cli-tmp`
+  escape (`_add_rule` opens targets with `O_PATH`, following the link). The image ships
+  launcher+broker+`_landlock_rules` at `/usr/local/bin` (root-owned, outside `/app` so
+  `chown -R app /app` can't make them agent-writable) and sets `GATEWAY_LANDLOCK_LAUNCHER`. This is
+  the no-privilege **interim** of `docs/security-process-isolation.md` §3: no uid switch, so no
+  cross-session DAC/signal isolation (that is the uid-per-user broker follow-up). Fail-closed:
+  `config_check._check_landlock_confinement` refuses startup if the launcher/real CLI cannot resolve,
+  Landlock cannot actually be **enforced** (a forked probe builds+`restrict_self`es a real ruleset,
+  not just an ABI query — a seccomp filter blocking `add_rule`/`restrict_self` is caught), the uid
+  band is unusable, or the mode is a typo (an invalid `CLAUDE_ISOLATION_MODE` is refused even under
+  `SKIP_CONFIG_CHECK`); the CLI's own bwrap sandbox is forced off (`_configure_sandbox`) because it
+  cannot start inside a Landlock domain. Startup installs `GATEWAY_REAL_CLI` +
+  `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1` in
   the process env (`landlock.install_process_env`, for the SDK's option-less `-v` spawn). Unit:
   `tests/test_landlock_confine.py` (launcher + wiring, no bundled CLI); the bundled-CLI closure +
   workspace-work proof is `tests/test_cli_read_boundary.py::TestLandlockConfinement` (the kept
   `test_known_gap_*` is its non-vacuous control).
 - `uid` mode (#241 PR-C) adds per-user uid + DAC/signal isolation on top of the Landlock ruleset.
   The gateway body stays unprivileged; a resident **broker** (`docker/isolation_broker.py`, holds
-  only SETUID/SETGID) forks each CLI as its session's uid, then the CLI applies the **same**
+  only SETUID/SETGID) forks each CLI as its session's uid, **drops all caps** (`ll.drop_all_caps`)
+  after the switch so the session CLI carries no SETUID/SETGID, then applies the **same**
   `docker/_landlock_rules.py` ruleset *after* the switch. The launcher's uid branch hands the broker
   the SDK's fds (`SCM_RIGHTS`) + a signed single-use ticket (`uid_isolation.mint_ticket`, HMAC +
   nonce + exp; `GATEWAY_ISOLATION_TICKET_SECRET` is entrypoint-generated, shared with gateway+broker,
-  blanked in every child env, never to a session) and relays exit status so the SDK's `wait()` is
-  right. The broker execs the CLI with the launcher-passed env (the SDK's child env) — not the
-  broker's — filtered + plumbing-stripped. `effective_mode()` self-detects at startup (Landlock
-  ABI≥2 + broker reachable); unavailable uid is a hard `check_config` error **unless**
-  `CLAUDE_ISOLATION_FALLBACK=landlock`. The broker's uid switch is a no-op when target==current euid,
-  so the whole protocol (fd passing, fork tree, Landlock, exit mirroring, forged-ticket refusal) is
-  unit-tested same-uid in `tests/test_isolation_broker.py` + `tests/test_uid_isolation.py`; **the
-  privileged cross-uid switch and `docker/entrypoint.py:launch_isolation_broker` are
-  container-only — unverifiable on this dev box, gated fail-closed, verify with the probe + acceptance
-  tests before enabling uid in prod.** Remaining hardening (seccomp arg filter on set*id, bounding-set
-  drop) is a container step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py` never
-  import `/app/src` (session-writable + privileged); the broker's ticket-verify is duplicated from
-  `uid_isolation` and kept in lockstep by `test_isolation_broker`.
+  blanked in the session CLI env and in every gateway-spawned backend/plugin/preflight child — not
+  the one-shot boot CMD) and relays exit status / SIGTERM. The broker verifies the ticket **in the
+  resident parent** (so the single-use nonce set is authoritative — a per-connection fork would miss
+  a replay), pins the peer to the gateway uid (`SO_PEERCRED`), and bounds the target uid/gid to the
+  band with 0/app/broker excluded (`_authorize`), before forking. Teardown: the CLI is its own
+  session/process-group leader (`setsid`), the watcher relays signals to that group and sweeps it on
+  exit, and the handler watches the launcher link — on the launcher's disconnect (SDK `close()`) it
+  tears the watcher (hence the CLI tree) down, so a session's processes never outlive it. The broker
+  binds a `0660` socket with the gateway's gid (`CLAUDE_ISOLATION_BROKER_GID` defaults to `APP_GID`)
+  in a broker-owned `0750` dir, so the gateway-uid launcher connects by group without a world socket.
+  The broker execs the CLI with the launcher-passed env (the SDK's child env) — not the broker's —
+  filtered + plumbing-stripped. Anonymous/stateless runs use a **recycled in-memory ephemeral uid
+  band** (`_EphemeralPool`, top `CLAUDE_ISOLATION_EPHEMERAL_UIDS` of the band) so they cannot grow
+  the persisted registry or exhaust it; named users get durable uids (persist fails closed).
+  `effective_mode()` self-detects at startup (Landlock ABI≥2 + broker reachable); unavailable uid is
+  a hard `check_config` error **unless** `CLAUDE_ISOLATION_FALLBACK=landlock`. The broker's uid
+  switch is a no-op when target==current euid, so the whole protocol (fd passing, fork tree,
+  Landlock, exit mirroring, forged/replayed-ticket refusal, launcher-death teardown) is unit-tested
+  same-uid in `tests/test_isolation_broker.py` + `tests/test_uid_isolation.py`; **the privileged
+  cross-uid switch, the cap/securebits lockdown and `docker/entrypoint.py:launch_isolation_broker`
+  are container-only — unverifiable on this dev box, gated fail-closed, verify with the probe +
+  acceptance tests before enabling uid in prod.** Remaining hardening (seccomp arg filter on set*id,
+  bounding-set drop, per-user workspace ownership) is a container/follow-up step.
+  `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py` never import `/app/src`
+  (session-writable + privileged); the broker's ticket-verify is duplicated from `uid_isolation` and
+  exercised end-to-end (mint in `uid_isolation`, verify in the broker) by `test_isolation_broker`.
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values

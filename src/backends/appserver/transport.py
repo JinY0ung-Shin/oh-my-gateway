@@ -537,6 +537,10 @@ class AppServerTransport:
             proc_env.update(self.env)
         for key in self.env_remove:
             proc_env.pop(key, None)
+        # The uid-isolation ticket secret (present in the gateway env under
+        # CLAUDE_ISOLATION_MODE=uid) must never reach a backend child: it would
+        # let that process forge broker tickets. A backend never needs it (#241).
+        proc_env.pop("GATEWAY_ISOLATION_TICKET_SECRET", None)
         self._proc = await asyncio.create_subprocess_exec(
             *self.argv,
             stdin=asyncio.subprocess.PIPE,

@@ -199,6 +199,7 @@ def drop_privileges(uid: int, gid: int) -> None:
 # container/image step.
 
 _CAP_SETGID = 6
+_CAP_SETPCAP = 8
 _CAP_SETUID = 7
 _PR_SET_KEEPCAPS = 8
 _PR_SET_NO_NEW_PRIVS = 38
@@ -209,16 +210,8 @@ _PR_SET_SECUREBITS = 28
 _CAP_VERSION_3 = 0x20080522
 
 
-def _keep_only_setuid_setgid() -> None:
-    """Retain only CAP_SETUID/SETGID (effective+permitted+inheritable+ambient).
-
-    Called in the broker child after it has dropped to its dedicated uid with
-    PR_SET_KEEPCAPS set. ctypes because the stdlib has no capset binding.
-    """
+def _capset(libc, effective: int, permitted: int, inheritable: int) -> None:
     import ctypes
-
-    libc = ctypes.CDLL(None, use_errno=True)
-    mask = (1 << _CAP_SETUID) | (1 << _CAP_SETGID)
 
     class _Header(ctypes.Structure):
         _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
@@ -232,17 +225,43 @@ def _keep_only_setuid_setgid() -> None:
 
     hdr = _Header(_CAP_VERSION_3, 0)
     data = (_Data * 2)()
-    data[0].effective = mask
-    data[0].permitted = mask
-    data[0].inheritable = mask
+    data[0].effective = effective
+    data[0].permitted = permitted
+    data[0].inheritable = inheritable
     if libc.capset(ctypes.byref(hdr), ctypes.byref(data)) != 0:
         raise OSError(ctypes.get_errno(), "capset failed")
-    # Ambient so the caps survive the broker's own execve of the script.
+
+
+def _keep_only_setuid_setgid() -> None:
+    """Retain only CAP_SETUID/SETGID (effective+permitted+inheritable+ambient).
+
+    Called in the broker child after it has dropped to its dedicated uid with
+    PR_SET_KEEPCAPS set. ctypes because the stdlib has no capset binding.
+
+    Order matters: locking securebits needs CAP_SETPCAP *effective*, so we keep
+    SETPCAP through the securebits step and only then drop it. Doing the drop
+    first (as before) made PR_SET_SECUREBITS fail with EPERM — the NOROOT lock
+    that stops a later setuid(0) from regaining root never took (#241 review).
+    """
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    keep = (1 << _CAP_SETUID) | (1 << _CAP_SETGID)
+    with_setpcap = keep | (1 << _CAP_SETPCAP)
+
+    # 1. Keep SETUID/SETGID + SETPCAP (effective) so the securebits lock works.
+    _capset(libc, effective=with_setpcap, permitted=with_setpcap, inheritable=keep)
+    # 2. Lock securebits: a later setuid(0) cannot regain root (NOROOT_LOCKED).
+    if libc.prctl(_PR_SET_SECUREBITS, _SECUREBITS_LOCKDOWN, 0, 0, 0) != 0:
+        raise OSError(ctypes.get_errno(), "PR_SET_SECUREBITS failed")
+    # 3. Now drop SETPCAP; keep only SETUID/SETGID.
+    _capset(libc, effective=keep, permitted=keep, inheritable=keep)
+    # 4. Ambient so the caps survive the broker's own execve of the script.
     for cap in (_CAP_SETUID, _CAP_SETGID):
         if libc.prctl(_PR_CAP_AMBIENT, _PR_CAP_AMBIENT_RAISE, cap, 0, 0) != 0:
             raise OSError(ctypes.get_errno(), "PR_CAP_AMBIENT_RAISE failed")
-    # Lock securebits so a later setuid(0) cannot regain root.
-    libc.prctl(_PR_SET_SECUREBITS, _SECUREBITS_LOCKDOWN, 0, 0, 0)
+    # 5. No new privileges: the broker never needs to gain any via execve.
+    libc.prctl(_PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)
 
 
 def _resolve_real_cli() -> str | None:
@@ -258,8 +277,11 @@ def _resolve_real_cli() -> str | None:
         "print(t._find_cli())"
     )
     try:
+        # -I: this runs as root with cwd=/app and HOME=/home/app, so without it
+        # the app user's site-packages and cwd are on sys.path and an app-uid
+        # process could plant a module that executes as root here (#233 / #241).
         out = subprocess.run(
-            [sys.executable, "-c", snippet],
+            [sys.executable, "-I", "-c", snippet],
             capture_output=True,
             text=True,
             timeout=30,
@@ -272,7 +294,7 @@ def _resolve_real_cli() -> str | None:
     return None
 
 
-def launch_isolation_broker() -> None:
+def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     """Fork the resident broker before privilege drop. No-op unless uid mode.
 
     Generates the ticket secret (if unset) and exports it, the socket path and
@@ -308,16 +330,24 @@ def launch_isolation_broker() -> None:
         return
     os.environ["GATEWAY_REAL_CLI"] = real_cli
 
+    # The broker runs under a dedicated non-root uid but keeps the gateway's gid
+    # by default, so the socket it binds (mode 0660, group = that gid) is
+    # connectable by the gateway-uid launcher without a world-writable socket.
+    broker_uid = _parse_id("CLAUDE_ISOLATION_BROKER_UID", 21000)
+    broker_gid = _parse_id("CLAUDE_ISOLATION_BROKER_GID", app_gid)
+    # The broker pins its only legitimate client to the gateway's uid.
+    os.environ["GATEWAY_ISOLATION_PEER_UID"] = str(app_uid)
+
     sock_dir = Path(sock).parent
     try:
         sock_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(sock_dir, 0o711)  # traversable; the socket itself is the gate
+        # The broker (dropped to broker_uid) must own the dir to bind its
+        # socket; the gateway gid gets traverse (x) to reach it. Not world.
+        os.chown(sock_dir, broker_uid, broker_gid)
+        os.chmod(sock_dir, 0o750)
     except OSError as exc:
         print(f"warning: could not prepare broker socket dir: {exc}", file=sys.stderr)
         return
-
-    broker_uid = _parse_id("CLAUDE_ISOLATION_BROKER_UID", 21000)
-    broker_gid = _parse_id("CLAUDE_ISOLATION_BROKER_GID", broker_uid)
 
     pid = os.fork()
     if pid > 0:
@@ -348,7 +378,7 @@ def main(argv: list[str]) -> None:
 
     if os.geteuid() == 0:
         prepare_writable_paths(uid=uid, gid=gid)
-        launch_isolation_broker()  # before the drop; no-op unless uid mode
+        launch_isolation_broker(uid, gid)  # before the drop; no-op unless uid mode
         drop_privileges(uid, gid)
 
     os.execvp(argv[0], argv)

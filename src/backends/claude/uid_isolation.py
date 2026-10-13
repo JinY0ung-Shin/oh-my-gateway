@@ -37,14 +37,17 @@ import os
 import secrets
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 UID_MIN_ENV = "CLAUDE_ISOLATION_UID_MIN"
 UID_MAX_ENV = "CLAUDE_ISOLATION_UID_MAX"
 UID_REGISTRY_ENV = "CLAUDE_ISOLATION_UID_REGISTRY"
+EPHEMERAL_UIDS_ENV = "CLAUDE_ISOLATION_EPHEMERAL_UIDS"
+BROKER_UID_ENV = "CLAUDE_ISOLATION_BROKER_UID"
 TICKET_SECRET_ENV = "GATEWAY_ISOLATION_TICKET_SECRET"
 TICKET_ENV = "GATEWAY_ISOLATION_TICKET"
 BROKER_SOCKET_ENV = "GATEWAY_ISOLATION_BROKER_SOCKET"
@@ -54,6 +57,10 @@ BROKER_SOCKET_ENV = "GATEWAY_ISOLATION_BROKER_SOCKET"
 # entries (userland needs a passwd record for the uid — see the design §3 V).
 _DEFAULT_UID_MIN = 20000
 _DEFAULT_UID_MAX = 29999
+# Top slice of the band reserved for anonymous/stateless runs (recycled in
+# memory, never persisted) so they cannot exhaust the band — see the split in
+# :func:`_stable_band` / :func:`_ephemeral_band`.
+_DEFAULT_EPHEMERAL = 256
 
 _TICKET_TTL_SECONDS = 120  # a ticket is presented within one spawn; keep it short
 
@@ -76,6 +83,39 @@ def uid_range() -> Tuple[int, int]:
     return lo, hi
 
 
+def reserved_uids() -> Set[int]:
+    """uids a session must never be assigned: 0, the gateway app uid and the
+    broker uid. Excluded from both allocators even if they fall inside the band
+    (so a misconfigured band can never hand a session root, the gateway's own
+    identity, or the broker's uid — the #241 review's band-overlap finding)."""
+    out: Set[int] = {0}
+    out.add(_int_env("APP_UID", 1000))
+    out.add(_int_env(BROKER_UID_ENV, 21000))
+    return out
+
+
+def _ephemeral_count() -> int:
+    lo, hi = uid_range()
+    span = hi - lo + 1
+    if span <= 1:
+        return 0
+    default = min(_DEFAULT_EPHEMERAL, max(1, span // 4))
+    n = _int_env(EPHEMERAL_UIDS_ENV, default)
+    # Always leave at least one uid for the stable (named-user) band.
+    return max(0, min(n, span - 1))
+
+
+def _stable_band() -> Tuple[int, int]:
+    lo, hi = uid_range()
+    return lo, hi - _ephemeral_count()
+
+
+def _ephemeral_band() -> Tuple[int, int]:
+    lo, hi = uid_range()
+    e = _ephemeral_count()
+    return hi - e + 1, hi
+
+
 class UidAllocationError(RuntimeError):
     """Raised when no uid can be assigned (range exhausted or invalid)."""
 
@@ -85,14 +125,20 @@ class UidRegistry:
 
     The map is JSON on disk so uids survive restarts (a resumed session must
     land on the same uid that owns its files). Allocation hands out the lowest
-    free uid in the band and never reuses one still mapped. Thread-safe for the
-    gateway's concurrent session creation.
+    free uid in the band, skips the reserved uids, and never reuses one still
+    mapped. Thread-safe for the gateway's concurrent session creation. Only
+    stable (named-user) keys live here — anonymous/stateless runs use the
+    in-memory :class:`_EphemeralPool` so they cannot grow this file or exhaust
+    the band.
     """
 
-    def __init__(self, path: Path, lo: int, hi: int) -> None:
+    def __init__(
+        self, path: Path, lo: int, hi: int, reserved: Optional[Set[int]] = None
+    ) -> None:
         self._path = path
         self._lo = lo
         self._hi = hi
+        self._reserved = set(reserved or ())
         self._lock = threading.Lock()
         self._map: Dict[str, int] = {}
         self._used: set[int] = set()
@@ -108,18 +154,24 @@ class UidRegistry:
         for key, uid in raw.items():
             if not (isinstance(key, str) and isinstance(uid, int)):
                 continue
-            if self._lo <= uid <= self._hi:
+            if self._lo <= uid <= self._hi and uid not in self._reserved:
                 self._map[key] = uid
                 self._used.add(uid)
 
     def _persist(self) -> None:
+        """Write the map durably. Raises ``UidAllocationError`` on failure so a
+        new allocation fails closed rather than handing out a uid that would be
+        lost on restart (a resumed session must land on the uid owning its
+        files; a silently dropped write risks a different or reused uid)."""
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_suffix(self._path.suffix + ".tmp")
             tmp.write_text(json.dumps(self._map), encoding="utf-8")
             os.replace(tmp, self._path)
         except OSError as exc:
-            logger.warning("Could not persist uid registry %s: %s", self._path, exc)
+            raise UidAllocationError(
+                f"could not persist uid registry {self._path}: {exc}"
+            ) from exc
 
     def resolve(self, key: str) -> int:
         """Return the uid for *key*, allocating the lowest free one if new."""
@@ -128,18 +180,63 @@ class UidRegistry:
             if existing is not None:
                 return existing
             for uid in range(self._lo, self._hi + 1):
-                if uid not in self._used:
-                    self._map[key] = uid
-                    self._used.add(uid)
+                if uid in self._used or uid in self._reserved:
+                    continue
+                self._map[key] = uid
+                self._used.add(uid)
+                try:
                     self._persist()
-                    return uid
+                except UidAllocationError:
+                    # roll back the in-memory grant so a retry can try again
+                    self._map.pop(key, None)
+                    self._used.discard(uid)
+                    raise
+                return uid
             raise UidAllocationError(
-                f"uid range [{self._lo}, {self._hi}] is exhausted "
+                f"stable uid band [{self._lo}, {self._hi}] is exhausted "
                 f"({len(self._used)} in use); widen {UID_MIN_ENV}/{UID_MAX_ENV}"
             )
 
 
+class _EphemeralPool:
+    """In-memory ``key -> uid`` ring for anonymous/stateless runs.
+
+    Hands out distinct uids from the ephemeral band until it is full, then
+    recycles the least-recently-used mapping. Never persisted and never raises
+    on exhaustion (it recycles), so the high-volume anonymous path — every
+    ``/v1/agents/messages`` call, each anonymous ``/v1/responses`` session,
+    admin try-runs, startup ``verify()`` — cannot grow a file or permanently
+    exhaust the band. A recycled uid can at most be shared by more than
+    ``size`` concurrent anonymous runs, which Landlock still confines to their
+    own per-spawn workspace.
+    """
+
+    def __init__(self, lo: int, hi: int, reserved: Optional[Set[int]] = None) -> None:
+        reserved = set(reserved or ())
+        self._uids = [u for u in range(lo, hi + 1) if u not in reserved]
+        self._lru: "OrderedDict[str, int]" = OrderedDict()
+        self._lock = threading.Lock()
+
+    def resolve(self, key: str) -> int:
+        with self._lock:
+            if key in self._lru:
+                self._lru.move_to_end(key)
+                return self._lru[key]
+            if not self._uids:
+                raise UidAllocationError(
+                    "no ephemeral uids available; widen the band or raise "
+                    f"{EPHEMERAL_UIDS_ENV}"
+                )
+            if len(self._lru) < len(self._uids):
+                uid = self._uids[len(self._lru)]
+            else:
+                _old, uid = self._lru.popitem(last=False)  # recycle LRU
+            self._lru[key] = uid
+            return uid
+
+
 _registry: Optional[UidRegistry] = None
+_ephemeral_pool: Optional[_EphemeralPool] = None
 _registry_lock = threading.Lock()
 
 
@@ -147,22 +244,86 @@ def _registry_path() -> Path:
     raw = (os.getenv(UID_REGISTRY_ENV) or "").strip()
     if raw:
         return Path(raw)
-    # Default beside the gateway's data dir (same place other durable state lives).
-    return Path(__file__).resolve().parents[2] / "data" / "isolation_uids.json"
+    # Default under the gateway's /app/data volume (durable, writable), not
+    # /app/src/data (code tree): parents[3] is /app for this module.
+    return Path(__file__).resolve().parents[3] / "data" / "isolation_uids.json"
 
 
 def get_registry() -> UidRegistry:
     global _registry
     with _registry_lock:
         if _registry is None:
-            lo, hi = uid_range()
-            _registry = UidRegistry(_registry_path(), lo, hi)
+            lo, hi = _stable_band()
+            _registry = UidRegistry(_registry_path(), lo, hi, reserved_uids())
         return _registry
 
 
-def resolve_uid(key: str) -> int:
-    """Map a user key to its stable per-user uid (see :class:`UidRegistry`)."""
-    return get_registry().resolve(key)
+def get_ephemeral_pool() -> _EphemeralPool:
+    global _ephemeral_pool
+    with _registry_lock:
+        if _ephemeral_pool is None:
+            lo, hi = _ephemeral_band()
+            _ephemeral_pool = _EphemeralPool(lo, hi, reserved_uids())
+        return _ephemeral_pool
+
+
+def reset_registry_cache() -> None:
+    """Drop the memoized registry/pool (tests, or a band reconfiguration)."""
+    global _registry, _ephemeral_pool
+    with _registry_lock:
+        _registry = None
+        _ephemeral_pool = None
+
+
+def resolve_uid(key: str, *, persist: bool = True) -> int:
+    """Map a key to its per-user uid.
+
+    ``persist=True`` (a named user) uses the durable stable band; ``persist=
+    False`` (an anonymous/stateless run) uses the recycled in-memory ephemeral
+    band, so it can never grow the registry file or exhaust the band.
+    """
+    if persist:
+        return get_registry().resolve(key)
+    return get_ephemeral_pool().resolve(key)
+
+
+def validate_bands() -> List[str]:
+    """Startup errors for an unusable uid band (empty message list means OK)."""
+    lo, hi = uid_range()
+    errors: List[str] = []
+    if hi < lo:
+        errors.append(
+            f"{UID_MIN_ENV}={lo} is greater than {UID_MAX_ENV}={hi}; the uid band "
+            "is empty."
+        )
+        return errors
+    if lo <= 0:
+        errors.append(
+            f"{UID_MIN_ENV}={lo} must be >= 1 so a session is never mapped to uid 0 "
+            "(root)."
+        )
+    slo, shi = _stable_band()
+    reserved = reserved_uids()
+    stable = [u for u in range(slo, shi + 1) if u not in reserved]
+    if not stable:
+        errors.append(
+            f"the stable uid band [{slo}, {shi}] has no allocatable uids after "
+            f"reserving {sorted(reserved)}; widen {UID_MIN_ENV}/{UID_MAX_ENV} or "
+            f"lower {EPHEMERAL_UIDS_ENV}."
+        )
+    broker_uid = _int_env(BROKER_UID_ENV, 21000)
+    app_uid = _int_env("APP_UID", 1000)
+    for name, val in (("broker", broker_uid), ("gateway app", app_uid)):
+        if lo <= val <= hi:
+            logger.warning(
+                "the %s uid %d falls inside the per-user band [%d, %d]; it is "
+                "excluded from allocation, but move the band clear of it",
+                name,
+                val,
+                lo,
+                hi,
+            )
+    return errors
 
 
 # --------------------------------------------------------------------------

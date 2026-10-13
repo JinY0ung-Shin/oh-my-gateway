@@ -21,11 +21,15 @@ def _clean(monkeypatch):
         ui.UID_MIN_ENV,
         ui.UID_MAX_ENV,
         ui.UID_REGISTRY_ENV,
+        ui.EPHEMERAL_UIDS_ENV,
+        ui.BROKER_UID_ENV,
         ui.TICKET_SECRET_ENV,
+        "APP_UID",
     ):
         monkeypatch.delenv(var, raising=False)
-    # Reset the module-level registry cache between tests.
+    # Reset the module-level registry + ephemeral-pool caches between tests.
     monkeypatch.setattr(ui, "_registry", None)
+    monkeypatch.setattr(ui, "_ephemeral_pool", None)
 
 
 class TestUidRange:
@@ -79,6 +83,70 @@ class TestUidRegistry:
         monkeypatch.setenv(ui.UID_MAX_ENV, "25100")
         uid = ui.resolve_uid("someone")
         assert 25000 <= uid <= 25100
+
+
+class TestReviewFixes:
+    """Fixes from the PR #244 review: ephemeral recycling (#9), reserved-uid
+    exclusion + band validation (#15), registry path, persist fail-closed."""
+
+    def test_default_registry_path_is_data_volume(self):
+        # /app/data (durable volume), never /app/src/data (code tree).
+        p = ui._registry_path()
+        assert p.name == "isolation_uids.json"
+        assert p.parent.name == "data"
+        assert p.parent.parent.name != "src"
+
+    def test_ephemeral_pool_recycles_and_never_exhausts(self, monkeypatch):
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20010")
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "3")
+        pool = ui.get_ephemeral_pool()
+        first = [pool.resolve(f"ws{i}") for i in range(3)]
+        assert len(set(first)) == 3  # distinct while the ring has room
+        # A 4th distinct key recycles the LRU rather than raising.
+        fourth = pool.resolve("ws3")
+        assert fourth == first[0]
+        # A repeated key is stable while still in the ring.
+        assert pool.resolve("ws3") == fourth
+
+    def test_anonymous_runs_do_not_touch_the_registry(self, monkeypatch, tmp_path):
+        reg_path = tmp_path / "uids.json"
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(reg_path))
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20100")
+        for i in range(50):
+            ui.resolve_uid(f"anon{i}", persist=False)
+        # Nothing persisted: the ephemeral path never writes the registry file.
+        assert not reg_path.exists()
+
+    def test_reserved_uids_excluded_from_allocation(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("APP_UID", "20000")
+        monkeypatch.setenv(ui.BROKER_UID_ENV, "20001")
+        reg = ui.UidRegistry(tmp_path / "u.json", 20000, 20010, ui.reserved_uids())
+        got = {reg.resolve(f"u{i}") for i in range(5)}
+        assert 20000 not in got and 20001 not in got and 0 not in got
+
+    def test_validate_bands_flags_root_and_empty(self, monkeypatch):
+        monkeypatch.setenv(ui.UID_MIN_ENV, "0")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "10")
+        errs = ui.validate_bands()
+        assert any("uid 0" in e or ">= 1" in e for e in errs)
+
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "19999")
+        assert any("empty" in e for e in ui.validate_bands())
+
+    def test_validate_bands_ok_for_default(self):
+        assert ui.validate_bands() == []
+
+    def test_persist_failure_fails_closed(self, tmp_path, monkeypatch):
+        # A registry whose parent cannot be created must refuse to allocate
+        # rather than hand out a uid that will be lost on restart.
+        target = tmp_path / "blocker"
+        target.write_text("x")  # a file where a directory is needed
+        reg = ui.UidRegistry(target / "uids.json", 20000, 20005)
+        with pytest.raises(ui.UidAllocationError):
+            reg.resolve("alice")
 
 
 class TestTicket:

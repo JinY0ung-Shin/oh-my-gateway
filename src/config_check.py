@@ -714,6 +714,22 @@ def run_startup_config_check() -> List[ConfigIssue]:
     operators who accept the flagged configuration).
     """
     if parse_bool_env("SKIP_CONFIG_CHECK", "false"):
+        # The bypass accepts flagged-but-understood config, but a mistyped
+        # CLAUDE_ISOLATION_MODE must never be skipped into silently running
+        # unconfined: an unknown mode reads as not-confined, so enforce just
+        # that one check fail-closed even here (#241 review).
+        from src.backends.claude.landlock import (
+            MODE_ENV,
+            isolation_mode,
+            isolation_mode_is_valid,
+        )
+
+        if not isolation_mode_is_valid():
+            raise RuntimeError(
+                f"Refusing to start: {MODE_ENV}={isolation_mode()!r} is not a valid "
+                "isolation mode; a typo here would silently run sessions "
+                "unconfined. This check is not bypassable by SKIP_CONFIG_CHECK."
+            )
         logger.warning(
             "SKIP_CONFIG_CHECK=true — startup configuration validation skipped"
         )

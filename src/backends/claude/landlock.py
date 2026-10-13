@@ -259,6 +259,98 @@ def landlock_abi() -> int:
         return -1
 
 
+# A self-contained probe: build a trivial ruleset and ``restrict_self``, in a
+# throwaway interpreter that confines itself and exits. Run as ``python -I -c``
+# (not os.fork — the gateway is multi-threaded at startup and a forked child
+# could deadlock on an inherited malloc/logging lock). Raw syscalls only.
+_ENFORCE_PROBE = (
+    "import ctypes,os,struct,sys\n"
+    "a=int(sys.argv[1])\n"
+    "h=(1<<16)-1 if a>=5 else (1<<15)-1 if a>=3 else (1<<14)-1\n"
+    "L=ctypes.CDLL(None,use_errno=True)\n"
+    "C=ctypes.c_long\n"
+    "L.syscall.restype=C\n"  # addresses must be c_long, or 64-bit args truncate
+    "attr=ctypes.create_string_buffer(struct.pack('=Q',h))\n"
+    "rs=L.syscall(C(444),C(ctypes.addressof(attr)),C(8),C(0))\n"
+    "sys.exit(2) if rs<0 else 0\n"
+    "fd=os.open('/',os.O_PATH|os.O_CLOEXEC)\n"
+    "buf=ctypes.create_string_buffer(struct.pack('=Qi',1<<2,fd))\n"
+    "rc=L.syscall(C(445),C(rs),C(1),C(ctypes.addressof(buf)),C(0))\n"
+    "os.close(fd)\n"
+    "sys.exit(3) if rc!=0 else 0\n"
+    "sys.exit(4) if L.prctl(38,1,0,0,0)!=0 else 0\n"
+    "sys.exit(0 if L.syscall(C(446),C(rs),C(0))==0 else 5)\n"
+)
+
+
+def can_enforce_landlock() -> Tuple[bool, str]:
+    """Whether Landlock can actually be *enforced* here, not merely queried.
+
+    :func:`landlock_abi` is a version query; it can succeed while a seccomp
+    filter blocks ``landlock_add_rule``/``landlock_restrict_self``, in which
+    case every real spawn would die while startup looked healthy. Probe the
+    whole path once in a throwaway interpreter that confines itself and exits,
+    so startup fails closed instead of every turn failing (#241 review).
+    """
+    abi = landlock_abi()
+    if abi < 2:
+        return False, (
+            f"Landlock ABI {abi}" if abi >= 0 else "the syscall is unavailable on "
+            "this arch"
+        )
+    import subprocess
+    import sys
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-I", "-c", _ENFORCE_PROBE, str(abi)],
+            capture_output=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
+        return True, f"could not run a Landlock probe ({exc})"
+    if result.returncode == 0:
+        return True, ""
+    return False, (
+        "Landlock reports a usable ABI but a ruleset could not be created or "
+        "enforced (a seccomp filter may block landlock_add_rule/restrict_self)"
+    )
+
+
+def isolation_mode_is_valid() -> bool:
+    """Whether ``CLAUDE_ISOLATION_MODE`` is one of the known modes."""
+    return isolation_mode() in _KNOWN_MODES
+
+
+def _warn_if_launcher_agent_writable(launcher: Path) -> None:
+    """Warn (not fail) if the launcher is agent-writable.
+
+    The launcher is privileged — it applies the ruleset / hands off to the
+    broker — so an agent-writable copy (group/other-writable, or owned by the
+    app uid, e.g. a ``docker/`` tree copied under ``/app`` and chowned to
+    ``app``) would let a session rewrite it. ``check_config`` cannot hard-fail
+    here (a dev checkout runs as a normal user that owns the file), so it warns.
+    """
+    try:
+        st = launcher.stat()
+    except OSError:
+        return
+    if st.st_mode & 0o022:
+        logger.warning(
+            "isolation launcher %s is group/other-writable; ship it root-owned "
+            "and non-agent-writable (outside /app)",
+            launcher,
+        )
+    raw = (os.getenv("APP_UID") or "").strip()
+    if raw.isdigit() and st.st_uid == int(raw):
+        logger.warning(
+            "isolation launcher %s is owned by the app uid %s; a session could "
+            "rewrite it — ship it root-owned outside /app",
+            launcher,
+            raw,
+        )
+
+
 def _ro_rw_roots(effective_cwd: Path) -> Tuple[List[str], List[str]]:
     """Build the read-only and read-write path lists for *effective_cwd*.
 
@@ -279,17 +371,74 @@ def _ro_rw_roots(effective_cwd: Path) -> Tuple[List[str], List[str]]:
         ro.append(str(root))
     for root in ws.plugin_resource_roots():
         ro.append(str(root))
-    # Operator add-dirs are read-only (see #237/#240); keep them readable here.
-    for raw in ws.operator_add_dirs():
-        ro.append(raw)
+    # The CLI's own config files (settings.json, ~/.claude.json): the confined
+    # CLI process reads them at startup to load user-scope plugins, the admin
+    # env block and the output style. These are not file-tool targets (the home
+    # guard never grants them), so they must be listed here explicitly or the
+    # CLI silently starts with user settings dropped (#241 review). Shared,
+    # read-only — writes stay denied.
+    for path in _claude_config_files(claude_home):
+        ro.append(path)
+    # Operator add-dirs are read-only (see #237/#240). Use the *filtered* roots
+    # (the #240 check that refuses an entry overlapping ~/.claude or the
+    # workspace base), not the raw CLAUDE_ADD_DIRS strings — otherwise a
+    # confined script could read every user's transcripts/plans/workspaces.
+    for root in ws._operator_add_dir_roots(claude_home, Path(effective_cwd)):
+        ro.append(str(root))
 
     # Read-write: the workspace itself and this session's own ~/.claude project
     # dir (transcripts, auto memory, spilled tool results).
     rw.append(str(effective_cwd))
     for root in ws._writable_extra_roots(Path(effective_cwd)):
         rw.append(str(root))
+    # Writable runtime state the CLI and its tools need, or plugin hooks fail
+    # open (reporting success while not running), npx-launched MCP servers fail
+    # on ~/.npm and `uv run` fails on its cache (#241 review).
+    for root in _runtime_writable_roots(claude_home):
+        rw.append(root)
 
     return _dedupe(ro), _dedupe(rw)
+
+
+def _claude_config_files(claude_home: Optional[Path]) -> List[str]:
+    """The CLI's own config files the confined process must be able to read."""
+    if claude_home is None:
+        return []
+    out = [
+        str(claude_home / "settings.json"),
+        str(claude_home / "settings.local.json"),
+    ]
+    # ~/.claude.json sits beside the config dir (the CLI's project/account state).
+    try:
+        out.append(str(claude_home.parent / ".claude.json"))
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return out
+
+
+def _runtime_writable_roots(claude_home: Optional[Path]) -> List[str]:
+    """Writable caches/state the CLI and its tools create outside the workspace.
+
+    Plugin hook state (``~/.claude/plugins/data``), the npm cache (``~/.npm``,
+    for ``npx -y`` plugin MCP servers) and the uv cache (``$UV_CACHE_DIR`` or
+    ``~/.cache/uv``, for skill ``uv run``). Shared HOME today; per-user
+    ownership under uid mode is a tracked follow-up.
+    """
+    roots: List[str] = []
+    if claude_home is not None:
+        roots.append(str(claude_home / "plugins" / "data"))
+    try:
+        home = Path(os.path.expanduser("~"))
+    except (OSError, RuntimeError, ValueError):
+        home = None
+    if home is not None and str(home) not in ("", "~"):
+        roots.append(str(home / ".npm"))
+    uv_cache = (os.getenv("UV_CACHE_DIR") or "").strip()
+    if uv_cache:
+        roots.append(uv_cache)
+    elif home is not None and str(home) not in ("", "~"):
+        roots.append(str(home / ".cache" / "uv"))
+    return roots
 
 
 def _dedupe(paths: List[str]) -> List[str]:
@@ -323,10 +472,12 @@ def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, st
         from . import uid_isolation as ui
 
         # Key the uid on the user when known, else on the (per-run) workspace so
-        # concurrent anonymous runs still get distinct uids. (Recycling dead
-        # anonymous entries is a follow-up; the band is wide.)
+        # concurrent anonymous runs still get distinct uids. A named user gets a
+        # durable uid (persist=True); an anonymous/stateless run uses the
+        # recycled in-memory ephemeral band (persist=False) so it cannot grow
+        # the registry or exhaust the band (#241 review).
         key = user or str(effective_cwd)
-        uid = ui.resolve_uid(key)
+        uid = ui.resolve_uid(key, persist=bool(user))
         ticket = ui.mint_ticket(
             uid=uid,
             workspace=str(effective_cwd),
@@ -340,6 +491,33 @@ def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, st
             BROKER_SOCKET_ENV: broker_socket_path(),
         }
 
+    env: Dict[str, str] = {
+        MODE_ENV: "landlock",
+        RO_ENV: os.pathsep.join(ro),
+        RW_ENV: os.pathsep.join(rw),
+    }
+    real_cli = os.environ.get(REAL_CLI_ENV) or resolve_real_cli()
+    if real_cli:
+        env[REAL_CLI_ENV] = real_cli
+    return env
+
+
+def preflight_options_env(effective_cwd: Path) -> Dict[str, str]:
+    """Confinement env for an internal catalog / slash-preflight spawn.
+
+    The slash-command preflight and catalog run a throwaway CLI only to read the
+    registered command list; they carry no user data and need no per-user
+    identity, so they are confined in **landlock** mode regardless of the
+    effective mode. This keeps them off the broker/ticket path (uid mode) — an
+    unticketed uid-mode spawn would exit non-zero and turn every ``/skill``
+    prompt into a 500, and would consume a per-user uid per preflight — while
+    still handing the launcher the ro/rw lists so the confined CLI can read
+    ``~/.claude`` (without them the catalog loses every user/plugin skill and a
+    ``None`` cwd lets the launcher grab ``/app`` as writable). No-op off.
+    """
+    if not confine_enabled():
+        return {}
+    ro, rw = _ro_rw_roots(Path(effective_cwd))
     env: Dict[str, str] = {
         MODE_ENV: "landlock",
         RO_ENV: os.pathsep.join(ro),
@@ -398,6 +576,9 @@ def check_config() -> List[str]:
                 "cannot mint a broker ticket. The entrypoint must generate it and "
                 "share it with the gateway and broker."
             )
+        # The per-user uid band must be usable and must not force a session onto
+        # root, the gateway's own uid or the broker's uid.
+        errors.extend(ui.validate_bands())
 
     launcher = Path(launcher_path())
     if not (launcher.is_file() and os.access(launcher, os.X_OK)):
@@ -406,6 +587,8 @@ def check_config() -> List[str]:
             f"not executable. Point {LAUNCHER_ENV} at the fixed, root-owned "
             "landlock_launcher.py (chmod +x)."
         )
+    else:
+        _warn_if_launcher_agent_writable(launcher)
 
     if resolve_real_cli() is None:
         errors.append(
@@ -414,13 +597,10 @@ def check_config() -> List[str]:
             "launcher would have nothing to exec."
         )
 
-    abi = landlock_abi()
-    if abi < 2:
-        detail = (
-            f"ABI {abi}" if abi >= 0 else "the syscall is unavailable on this arch"
-        )
+    ok, why = can_enforce_landlock()
+    if not ok:
         errors.append(
-            f"{MODE_ENV}={mode} but Landlock is not usable here ({detail}; need "
+            f"{MODE_ENV}={mode} but Landlock cannot be enforced here ({why}; need "
             "ABI >= 2, kernel >= 5.19). Confinement cannot be enforced."
         )
 

@@ -14,6 +14,7 @@ under ``python3 -I`` so the sibling import cannot be redirected.
 
 import ctypes
 import os
+import stat
 import struct
 
 _MACH = os.uname().machine
@@ -48,6 +49,14 @@ _ACCESS_BY_ABI = {
 # imply execute, so a CLI/plugin exec needs EXECUTE explicitly.
 RO_RIGHTS = _FS_EXECUTE | _FS_READ_FILE | _FS_READ_DIR
 RW_RIGHTS_FULL = (1 << 16) - 1
+
+# The access rights that apply to a *non-directory* file. READ_DIR, REFER and
+# the MAKE_*/REMOVE_* bits are directory-only: adding a rule that carries any of
+# them for a regular file makes ``landlock_add_rule`` fail with EINVAL, which
+# would abort the whole ruleset build and kill every confined spawn. A ro list
+# legitimately contains files (e.g. the user ``CLAUDE.md`` shared asset), so a
+# rule's rights are narrowed to this mask when its target is not a directory.
+_FILE_RIGHTS = _FS_EXECUTE | _FS_WRITE_FILE | _FS_READ_FILE | _FS_TRUNCATE | _FS_IOCTL_DEV
 
 # Default system policy both modes apply. /etc and /usr stay readable on purpose
 # (the CLI and libc resolvers read them; a passwd entry is needed for whoami /
@@ -102,6 +111,16 @@ def _add_rule(ruleset_fd, path, rights):
     except OSError:
         return False  # absent path: nothing to grant (ro) / created first (rw)
     try:
+        # A rule on a regular file must carry only file-applicable rights, or
+        # the kernel rejects it with EINVAL and the whole build fails. O_PATH
+        # fds are fstat-able, so narrow the mask for a non-directory target.
+        try:
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                rights &= _FILE_RIGHTS
+        except OSError:
+            pass
+        if rights == 0:
+            return False
         buf = ctypes.create_string_buffer(struct.pack("=Qi", rights, fd))
         rc, errno = _syscall(
             _NR_ADD_RULE, ruleset_fd, _RULE_PATH_BENEATH, ctypes.addressof(buf), 0
@@ -118,6 +137,60 @@ def _ensure_dir(path):
         os.makedirs(path, exist_ok=True)
     except OSError:
         pass
+
+
+def safe_tmpdir(cwd):
+    """``<cwd>/.cli-tmp`` as a real directory, replacing a planted symlink.
+
+    The session's temp dir rides inside the workspace (off the shared /tmp). It
+    is **not** added as a Landlock rule — it lies beneath the already-granted
+    workspace, so a rule would be redundant, and a rule on an agent-controlled
+    path is an escape: ``_add_rule`` opens targets with ``O_PATH`` (follows
+    symlinks), so a ``.cli-tmp`` the agent replaced with ``ln -s / .cli-tmp``
+    would grant the link's target. Without a rule, Landlock resolves the real
+    path at ``open()`` and a symlink out of the workspace is simply denied. We
+    still unlink any symlink and remake a real dir so the CLI's temp writes
+    land inside the sandbox rather than failing. Caller sets TMPDIR to this."""
+    tmp = os.path.join(cwd, ".cli-tmp")
+    try:
+        if os.path.islink(tmp):
+            os.unlink(tmp)
+        os.makedirs(tmp, exist_ok=True)
+    except OSError:
+        pass
+    return tmp
+
+
+_PR_CAP_AMBIENT = 47
+_PR_CAP_AMBIENT_CLEAR_ALL = 4
+_CAP_VERSION_3 = 0x20080522
+
+
+def drop_all_caps():
+    """Drop every capability: ambient, then effective/permitted/inheritable.
+
+    Called in the session-uid watcher *before* it forks the CLI (uid mode).
+    The broker holds CAP_SETUID/SETGID to switch uid; the session CLI and all
+    its descendants must carry none, or a Bash/script could ``setresuid`` to
+    any uid and void the DAC/signal isolation. Lowering caps is always
+    permitted; a no-op when there are none (same-uid tests). Raises on failure
+    so the broker fails closed rather than exec a CLI that kept privilege."""
+    _libc.prctl(_PR_CAP_AMBIENT, _PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
+
+    class _Header(ctypes.Structure):
+        _fields_ = [("version", ctypes.c_uint32), ("pid", ctypes.c_int)]
+
+    class _Data(ctypes.Structure):
+        _fields_ = [
+            ("effective", ctypes.c_uint32),
+            ("permitted", ctypes.c_uint32),
+            ("inheritable", ctypes.c_uint32),
+        ]
+
+    hdr = _Header(_CAP_VERSION_3, 0)
+    data = (_Data * 2)()  # zero-initialized: drop everything
+    if _libc.capset(ctypes.byref(hdr), ctypes.byref(data)) != 0:
+        raise LandlockError("capset(drop all) failed (errno %d)" % ctypes.get_errno())
 
 
 def build_and_restrict(ro_dirs, rw_dirs, ro_files=RO_FILES, rw_files=RW_FILES):

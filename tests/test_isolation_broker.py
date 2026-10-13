@@ -87,6 +87,16 @@ def broker(tmp_path):
     proc.wait(timeout=5)
 
 
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
 def _run_launcher(sock, secret, tmp_path):
     ws = tmp_path / "ws"
     ws.mkdir()
@@ -193,6 +203,91 @@ class TestBrokerProtocol:
         assert result["marker"] == "hello"  # SDK-built env reached the CLI
         assert result["ticket"] is None  # plumbing stripped
         assert result["secret"] is None
+
+    def test_ticket_single_use_replay_refused(self, broker, tmp_path, monkeypatch):
+        """A nonce is spent in the resident parent, so a replay is refused even
+        though each connection is served by a fresh fork (#241 review #13)."""
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, broker[1])
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "ok.py").write_text("print('ran')\n")
+        ticket = ui.mint_ticket(
+            uid=os.getuid(), workspace=str(ws), ro=[], rw=[str(ws)], env_allow=[]
+        )
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PWD": str(ws),
+            "CLAUDE_ISOLATION_MODE": "uid",
+            "GATEWAY_ISOLATION_TICKET": ticket,
+            ui.BROKER_SOCKET_ENV: str(broker[0]),
+            ui.TICKET_SECRET_ENV: broker[1],
+        }
+
+        def _run():
+            return subprocess.run(
+                [sys.executable, str(_LAUNCHER), str(ws / "ok.py")],
+                cwd=str(ws),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+
+        first = _run()
+        assert first.returncode == 0, first.stderr
+        assert "ran" in first.stdout
+        second = _run()  # same ticket (same nonce) → refused
+        assert second.returncode != 0
+        assert "ran" not in second.stdout
+
+    def test_launcher_death_tears_down_cli(self, broker, tmp_path, monkeypatch):
+        """Killing the launcher (as the SDK's close() does) must tear the CLI
+        tree down, not leave it running after the session ends (#241 review #7)."""
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, broker[1])
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        pidfile = ws / "cli.pid"
+        (ws / "sleeper.py").write_text(
+            "import os, sys, time\n"
+            "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+            "time.sleep(60)\n"
+        )
+        ticket = ui.mint_ticket(
+            uid=os.getuid(), workspace=str(ws), ro=[], rw=[str(ws)], env_allow=[]
+        )
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PWD": str(ws),
+            "CLAUDE_ISOLATION_MODE": "uid",
+            "GATEWAY_ISOLATION_TICKET": ticket,
+            ui.BROKER_SOCKET_ENV: str(broker[0]),
+            ui.TICKET_SECRET_ENV: broker[1],
+        }
+        proc = subprocess.Popen(
+            [sys.executable, str(_LAUNCHER), str(ws / "sleeper.py"), str(pidfile)],
+            cwd=str(ws),
+            env=env,
+        )
+        try:
+            cli_pid = None
+            for _ in range(200):
+                if pidfile.exists() and pidfile.read_text().strip():
+                    cli_pid = int(pidfile.read_text().strip())
+                    break
+                if proc.poll() is not None:
+                    raise RuntimeError("launcher exited before the CLI started")
+                time.sleep(0.05)
+            assert cli_pid and _alive(cli_pid), "CLI never started"
+            proc.kill()  # the SDK's SIGKILL on the launcher
+            proc.wait(timeout=5)
+            for _ in range(200):
+                if not _alive(cli_pid):
+                    break
+                time.sleep(0.05)
+            assert not _alive(cli_pid), "CLI survived the launcher's death"
+        finally:
+            if proc.poll() is None:
+                proc.kill()
 
     def test_forged_ticket_refused(self, broker, tmp_path):
         ws = tmp_path / "ws"

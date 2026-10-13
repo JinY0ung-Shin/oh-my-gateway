@@ -137,6 +137,65 @@ class _Cache:
 
 _cache = _Cache()
 
+_preflight_dir: Optional[Path] = None
+
+
+def _preflight_cwd() -> Path:
+    """A stable, gateway-owned directory for a confined preflight with no cwd.
+
+    When confinement is on, the launcher needs a real cwd (a ``None`` cwd makes
+    it grab ``$PWD`` — ``/app`` in the image — as writable). This throwaway dir
+    is never a session workspace; it only gives the confined catalog CLI a
+    writable root of its own.
+    """
+    global _preflight_dir
+    if _preflight_dir is None:
+        import tempfile
+
+        d = Path(tempfile.gettempdir()) / "gateway-slash-preflight"
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            d = Path(tempfile.mkdtemp(prefix="gateway-slash-preflight-"))
+        _preflight_dir = d
+    return _preflight_dir
+
+
+def _build_preflight_options(cwd: Optional[Path]) -> ClaudeAgentOptions:
+    """Build the SDK options for a catalog/preflight spawn.
+
+    Shared by the names and the details fetchers so they stay identical. Routes
+    through the same cwd/confinement path a real session uses: ``cli_path`` is
+    the launcher under confinement, and the per-workspace ro/rw lists ride
+    ``options.env`` so the confined catalog CLI can read ``~/.claude`` (#241).
+    """
+    from src.backends.claude import landlock
+    from src.backends.claude.client import (
+        _get_cli_path,
+        _get_max_buffer_size,
+        _get_setting_sources,
+    )
+
+    if cwd is not None:
+        _materialize_project_resources(cwd)
+    effective_cwd = cwd
+    if landlock.confine_enabled() and effective_cwd is None:
+        effective_cwd = _preflight_cwd()
+    opts = ClaudeAgentOptions(
+        cwd=effective_cwd,
+        setting_sources=_get_setting_sources(),
+        cli_path=_get_cli_path(),
+    )
+    opts.max_buffer_size = _get_max_buffer_size()
+    env: dict[str, str] = {}
+    if effective_cwd is not None:
+        env.update(landlock.preflight_options_env(Path(effective_cwd)))
+    # The catalog CLI never needs the uid-isolation ticket secret; blank it so a
+    # skill body cannot read it from the preflight spawn's env (#241).
+    env["GATEWAY_ISOLATION_TICKET_SECRET"] = ""
+    opts.env = {**(getattr(opts, "env", None) or {}), **env}
+    return opts
+
 
 async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
     """Pull the registered slash-command names from the SDK.
@@ -145,17 +204,7 @@ async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
     so user-scope plugin skills installed by the admin panel are visible to the
     preflight and the answer describes the CLI that will actually run the turn.
     """
-    from src.backends.claude.client import (
-        _get_cli_path,
-        _get_max_buffer_size,
-        _get_setting_sources,
-    )
-
-    _materialize_project_resources(cwd)
-    opts = ClaudeAgentOptions(
-        cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
-    )
-    opts.max_buffer_size = _get_max_buffer_size()
+    opts = _build_preflight_options(cwd)
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -201,17 +250,7 @@ _details_cache = _DetailsCache()
 
 async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str]]:
     """Names plus SDK metadata (description, argumentHint) for completion UIs."""
-    from src.backends.claude.client import (
-        _get_cli_path,
-        _get_max_buffer_size,
-        _get_setting_sources,
-    )
-
-    _materialize_project_resources(cwd)
-    opts = ClaudeAgentOptions(
-        cwd=cwd, setting_sources=_get_setting_sources(), cli_path=_get_cli_path()
-    )
-    opts.max_buffer_size = _get_max_buffer_size()
+    opts = _build_preflight_options(cwd)
     details: dict[str, dict[str, str]] = {}
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
