@@ -362,11 +362,12 @@ class TestSessionManagerGaps:
     # ------------------------------------------------------------------
 
     def test_rehydrate_returns_none_on_corrupt_line(self, tmp_path):
-        from src.session_manager import _try_rehydrate_from_jsonl, _PROJECTS_ROOT, _encode_cwd
+        from src import session_manager
+        from src.session_manager import _try_rehydrate_from_jsonl, _encode_cwd
 
         cwd = str(tmp_path)
         encoded = _encode_cwd(cwd)
-        project_dir = _PROJECTS_ROOT / encoded
+        project_dir = session_manager._projects_root() / encoded
         project_dir.mkdir(parents=True, exist_ok=True)
         jsonl = project_dir / "sess-corrupt.jsonl"
         jsonl.write_text("not-valid-json\n")
@@ -379,11 +380,12 @@ class TestSessionManagerGaps:
     # ------------------------------------------------------------------
 
     def test_rehydrate_returns_none_on_cwd_mismatch(self, tmp_path):
-        from src.session_manager import _try_rehydrate_from_jsonl, _PROJECTS_ROOT, _encode_cwd
+        from src import session_manager
+        from src.session_manager import _try_rehydrate_from_jsonl, _encode_cwd
 
         cwd = str(tmp_path)
         encoded = _encode_cwd(cwd)
-        project_dir = _PROJECTS_ROOT / encoded
+        project_dir = session_manager._projects_root() / encoded
         project_dir.mkdir(parents=True, exist_ok=True)
         jsonl = project_dir / "sess-mismatch.jsonl"
         # Record a line with a DIFFERENT cwd
@@ -399,11 +401,12 @@ class TestSessionManagerGaps:
 
     def test_rehydrate_skips_imeta_lines(self, tmp_path):
         """Line 121: isMeta=True user lines do not increment turn_counter."""
-        from src.session_manager import _try_rehydrate_from_jsonl, _PROJECTS_ROOT, _encode_cwd
+        from src import session_manager
+        from src.session_manager import _try_rehydrate_from_jsonl, _encode_cwd
 
         cwd = str(tmp_path)
         encoded = _encode_cwd(cwd)
-        project_dir = _PROJECTS_ROOT / encoded
+        project_dir = session_manager._projects_root() / encoded
         project_dir.mkdir(parents=True, exist_ok=True)
         jsonl = project_dir / "sess-imeta.jsonl"
         lines = [
@@ -422,11 +425,12 @@ class TestSessionManagerGaps:
 
     def test_rehydrate_skips_tool_result_only_lines(self, tmp_path):
         """Lines 122-128: user lines whose content is only tool_result blocks are skipped."""
-        from src.session_manager import _try_rehydrate_from_jsonl, _PROJECTS_ROOT, _encode_cwd
+        from src import session_manager
+        from src.session_manager import _try_rehydrate_from_jsonl, _encode_cwd
 
         cwd = str(tmp_path)
         encoded = _encode_cwd(cwd)
-        project_dir = _PROJECTS_ROOT / encoded
+        project_dir = session_manager._projects_root() / encoded
         project_dir.mkdir(parents=True, exist_ok=True)
         jsonl = project_dir / "sess-tool-result.jsonl"
         lines = [
@@ -455,11 +459,12 @@ class TestSessionManagerGaps:
 
     def test_rehydrate_returns_none_on_oserror(self, tmp_path):
         """Lines 138-139: OSError during file open → returns None."""
-        from src.session_manager import _try_rehydrate_from_jsonl, _PROJECTS_ROOT, _encode_cwd
+        from src import session_manager
+        from src.session_manager import _try_rehydrate_from_jsonl, _encode_cwd
 
         cwd = str(tmp_path)
         encoded = _encode_cwd(cwd)
-        project_dir = _PROJECTS_ROOT / encoded
+        project_dir = session_manager._projects_root() / encoded
         project_dir.mkdir(parents=True, exist_ok=True)
         jsonl = project_dir / "sess-oserror.jsonl"
         jsonl.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n")
@@ -503,16 +508,16 @@ class TestSessionManagerGaps:
 
     def test_get_session_increments_rehydrate_hit_counter(self, tmp_path):
         """Line 478: _rehydrate_hits incremented when rehydration succeeds."""
+        from src import session_manager
         from src.session_manager import (
             SessionManager,
-            _PROJECTS_ROOT,
             _encode_cwd,
             Session,
         )
 
         cwd = str(tmp_path)
         encoded = _encode_cwd(cwd)
-        project_dir = _PROJECTS_ROOT / encoded
+        project_dir = session_manager._projects_root() / encoded
         project_dir.mkdir(parents=True, exist_ok=True)
         jsonl = project_dir / "sess-hit.jsonl"
         jsonl.write_text(json.dumps({"type": "assistant", "cwd": cwd}) + "\n")
