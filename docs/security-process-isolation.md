@@ -42,6 +42,12 @@
     막지 않는다; ②는 그것을 중첩하고, ①·Landlock 단독의 도메인 안에선 bwrap이 뜨지 못하므로 꺼야 한다 — §3).
     `command -v bwrap socat`(과 프로브의 PATH 줄)은 **존재만** 보므로 (2)와 (3)을 가르지 못한다 — 배포 컨테이너에서
     프로브의 **`=> CLI OS sandbox can run`** 줄로 판정한다(게이트웨이 트리거·user/managed 설정·바이너리·네임스페이스 시험을 합친 값, §4).
+- **읽기 경계(#234, opt-in `CLAUDE_BLOCK_READS_OUTSIDE_WORKSPACE`)도 F1의 '코드를 써서 실행' 경로는 못 막는다.**
+  CLI 네이티브 `permissions.blockReadsOutsideWorkingDirectories`를 `--settings`로 넘겨 파일 도구의 워크스페이스
+  (+`add_dirs`) 밖 읽기를 거부하고, CLI가 판별하지 못하는 Bash 읽기(계산된 경로·`python -c` 등)는 ask가 돼 게이트웨이
+  콜백이 거부한다(그래서 실행 모드를 `bypassPermissions`로 돌린다). 하지만 에이전트가 워크스페이스에 쓴 스크립트를
+  실행하면 CLI는 그 안을 보지 못해 프로세스가 읽을 수 있는 것은 다 읽는다 — `client.py`의 읽기 경계 주석과
+  `tests/test_cli_read_boundary.py`가 이 한계를 고정한다. 그래서 F1은 여전히 OS 경계(Landlock·bwrap; uid 분리는 교차 사용자 읽기만)가 닫는다.
 - **PID 1 = 게이트웨이(기본 구성).** entrypoint(`docker/entrypoint.py`)가 `os.execvp`로 CMD를 exec 하므로
   PID 1은 uvicorn 게이트웨이 프로세스다. `/proc/1/environ`은 게이트웨이의 **마스킹되지 않은 전체 env**다. 단
   compose `init: true`/`--init`(#147 고아 회수의 그럴듯한 해법)을 쓰면 PID 1은 docker-init이고 게이트웨이는 그
@@ -80,9 +86,8 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 읽는 것뿐 아니라 **코드 쓰기 경로**도 닫아야 한다(§3·§5·§6: 같은-uid(Landlock 단독) 옵션이면 `/app`을
 **룰셋에서 통째로 빼** 규칙 부재로 읽기·쓰기를 모두 거부하고(ro 규칙에 넣으면 그 아래 `/app/data`의
 자격증명 오버레이까지 읽기 허용이 된다 — §6.3), uid 분리면 세션 uid를 `app`과 다르게 두고 DAC로 `/app`
-쓰기를 막는다; 이미지가 애초에 쓰기 상태만 app 소유로 넘기도록 바꾸는 선택지도 있다). 같은 맥락에서 root 단계(entrypoint의 소유권 복구)는 #233(**별도 PR, 아직 미병합** — 이 브랜치의
-`docker/entrypoint.py`는 아직 평이한 `os.chown`이다)에서
-하드닝된다: symlink를 따라가지 않고, 대상 uid 소유가 아닌 다중 링크 비디렉터리는 건너뛰며(그래서
+쓰기를 막는다; 이미지가 애초에 쓰기 상태만 app 소유로 넘기도록 바꾸는 선택지도 있다). 같은 맥락에서 root 단계(entrypoint의 소유권 복구)는 #233에서
+하드닝됐다: symlink를 따라가지 않고, 대상 uid 소유가 아닌 다중 링크 비디렉터리는 건너뛰며(그래서
 호스트 sysctl `fs.protected_hardlinks`에 의존하지 않는다), root 단계 인터프리터를 격리 모드(`python -I`)로
 돌려 app 사용자의 site 디렉터리를 읽지 않고, 읽기 전용·예기치 않은 경로가 있어도 기동을 실패시키지 않는다.
 
@@ -387,15 +392,14 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 > 소켓 경로를 알면 붙고, 피어 uid만 보는 서버는 같은 uid라 받아 준다. ①은 소켓 inode의 쓰기 권한(DAC)이, ②는 mount
 > ns가 막는다.
 
-> **무특권 즉시 완화 — 게이트웨이 non-dumpable (#232 — 별도 PR, 아직 미병합: 이 브랜치 `src/`엔 `PR_SET_DUMPABLE`가
-> 없다).** 위 메커니즘 전부와 독립적으로, FastAPI
+> **무특권 즉시 완화 — 게이트웨이 non-dumpable (#232, `src/process_hardening.py`).** 위 메커니즘 전부와 독립적으로, FastAPI
 > lifespan의 **첫 단계**에서 `prctl(PR_SET_DUMPABLE, 0)`를 건다(기본 on; `GATEWAY_NON_DUMPABLE=false|0|no|off`로
 > 끔, 빈 값은 on 유지). 세션 CLI 자식의 env에서는 `child_env_mask()`가 `ADMIN_API_KEY`·`API_KEY`와
-> `SYSINFO_CHILD_ENV_MASK` 이름을 덮고(`SYSINFO_REDACTION`이 켜졌을 때만), `_sdk_env`/`_isolation_vars`가
-> `OPENAI_API_KEY`(api-key 인증이면 `CLAUDE_CODE_OAUTH_TOKEN`도)를 뺀다. ⚠️ 단 이 '빼기'는 **프로세스 전역
-> `os.environ`에서 pop했다가 `await client.connect()`가 끝난 뒤 되돌리는** 방식이고, SDK는 `-v` 체크를 await한
-> **뒤에야** `os.environ`을 스냅숏하므로, 세션 생성이 겹치면 먼저 끝난 connect가 되돌린 값을 나중 connect의 자식이
-> 물려받을 수 있다(이 PR 밖에서 따로 고친다). 정리가 지켜진 경우 그 값들은 게이트웨이 environ에만 남고, 이 설정은 그
+> `SYSINFO_CHILD_ENV_MASK` 이름을 덮고(`SYSINFO_REDACTION`이 켜졌을 때만), `_configure_sdk_env`/`_isolation_vars`가
+> `OPENAI_API_KEY`(api-key 인증이면 `CLAUDE_CODE_OAUTH_TOKEN`도)를 `options.env`에서 **늘 빈 값으로 덮는다**
+> (`os.environ`을 `await client.connect()` 너머로 pop/restore하면, SDK가 `-v` 체크를 await한 **뒤에야** env를
+> 스냅숏하는 사이 겹친 세션 생성의 자식이 값을 물려받는다 — `tests/test_sdk_env_race.py`). 그 값들은 게이트웨이
+> environ에만 남고, 이 설정은 그
 > environ을 **`/proc/<게이트웨이>/environ`으로 읽어 정리를 우회하는 경로를 닫고**,
 > 게이트웨이의 메모리·fd를 같은-uid 세션으로부터 보호한다 — cap·컨테이너 변경 없이. 단 모든 spawn 경로가
 > 아직 이 정리를 거치지는 않는다(#230 후속). 보호 대상은 lifespan을 실행하는 프로세스이고, 그것이 PID 1인
@@ -755,7 +759,7 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
 
 ## 7. 단계별 계획
 
-1. **(이 PR)** 역량 프로브 + 본 설계 문서. prod에서 프로브 실행 → 메커니즘 확정.
+1. **(#231)** 역량 프로브 + 본 설계 문서. prod에서 프로브 실행 → 메커니즘 확정.
 2. **세션별 HOME 리팩터** (공유 ro 자산 보존). 가장 공유-스킬 민감한 부분 — 먼저, 독립적으로. 지금 config/plugin
    루트는 아홉 곳이 서로 다른 우선순위로 따로 푼다(`session_manager`의 `_PROJECTS_ROOT`, `workspace_sandbox`의
    `_claude_home`, `plugin_service`의 `_plugins_root`와 clone anchor, `plugin_admin_service`의 `clone_root`와
@@ -783,7 +787,7 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
    삼킨 채 mirror 갱신을 건너뛴다. 그래서 **U 소유 파일 상태의 읽기·쓰기(업로드·mirror 갱신)·정리**는 §3대로 브로커가
    U로 전환한 단명 자식으로 대행하거나 의도한 group 권한으로 연다(`CAP_CHOWN`은 소유권 반환이 필요할 때만) — 삭제는
    브로커가 그 세션의 CLI를 죽이고 거둔 **뒤에만** 한다(§3 C). 무특권 스톱갭 `PR_SET_DUMPABLE`(#232)과 entrypoint
-   하드닝(#233)은 **둘 다 별도 PR**(현재 이 브랜치에 미병합)이며 이 단계와 **독립적으로 먼저** 넣을 수 있다.
+   하드닝(#233)은 이 단계와 독립적으로 이미 들어가 있다.
 5. **검증**: 2-사용자 파일 격리 테스트, 세션 uid가 게이트웨이의 environ **그리고 다른 세션 CLI 자식의
    environ**을 못 읽는지 확인(#232만으로는 앞의 것만 통과한다), **두 세션 간 loopback**(세션 A가 띄운 loopback
    리스너에 세션 B가 닿는지 — §3), ①·Landlock 단독에서 CLI 샌드박스가 꺼진 채 Bash가 도는지(§3 ⚠️), `-v` spawn이
