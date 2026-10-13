@@ -305,6 +305,9 @@ class TurnLimiter:
     def position(self, ticket: str) -> Optional[Dict[str, float]]:
         """Where the waiter holding *ticket* stands — ``None`` once it is not waiting.
 
+        ``max_wait_seconds`` is the whole wait allowed before the 503, so a
+        client can say "up to N" next to the time already waited.
+
         ``ahead``/``behind`` count other waiters in arrival order. A freed slot
         can skip a waiter blocked by its own per-user cap, so ``ahead`` is the
         line in front, not a promise of how many turns start first.
@@ -318,6 +321,8 @@ class TurnLimiter:
                         "ahead": index,
                         "behind": len(self._waiters) - index - 1,
                         "waited_seconds": round(time.monotonic() - waiter.since, 1),
+                        # how long this wait may last in all before a 503
+                        "max_wait_seconds": self.queue_timeout,
                     }
         return None
 

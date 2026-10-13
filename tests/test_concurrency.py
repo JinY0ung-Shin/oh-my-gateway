@@ -623,6 +623,7 @@ class TestTurnQueue:
         middle = limiter.position(tickets[1])
         assert middle["ahead"] == 1 and middle["behind"] == 1
         assert middle["waited_seconds"] >= 0
+        assert middle["max_wait_seconds"] == 5
         assert limiter.position(tickets[0])["ahead"] == 0
         assert limiter.position("unknown-ticket-xxxx") is None
 
@@ -687,7 +688,12 @@ class TestTurnQueue:
             monkeypatch.setattr(
                 concurrency.turn_limiter,
                 "position",
-                lambda t: {"ahead": 2, "behind": 1, "waited_seconds": 7.5}
+                lambda t: {
+                    "ahead": 2,
+                    "behind": 1,
+                    "waited_seconds": 7.5,
+                    "max_wait_seconds": 300,
+                }
                 if t == "waiting-ticket-0001"
                 else None,
             )
@@ -699,6 +705,7 @@ class TestTurnQueue:
             "ahead": 2,
             "behind": 1,
             "waited_seconds": 7.5,
+            "max_wait_seconds": 300,
         }
         assert gone.json() == {"queued": False}
 
