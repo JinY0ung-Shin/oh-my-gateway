@@ -128,9 +128,7 @@ def _child_ro_rw(real_cli, workspace, ticket_ro, ticket_rw):
     ro = list(ll.SYSTEM_RO)
     ro.append(os.path.dirname(os.path.realpath(real_cli)))
     ro.extend(ticket_ro)
-    tmp = os.path.join(workspace, ".cli-tmp")
-    os.environ["TMPDIR"] = tmp
-    os.environ["CLAUDE_CODE_TMPDIR"] = tmp
+    tmp = os.path.join(workspace, ".cli-tmp")  # TMPDIR set in _child_env to match
     rw = [workspace, tmp, "/dev/shm"]
     rw.extend(ticket_rw)
     return ro, rw
@@ -148,6 +146,8 @@ def _spawn_watcher(payload, fds, real_cli):
     argv = payload.get("argv", [])
     ro = payload.get("ro", [])
     rw = payload.get("rw", [])
+    env = payload.get("env", {})
+    env_allow = payload.get("env_allow", [])
 
     wpid = os.fork()
     if wpid > 0:
@@ -159,7 +159,7 @@ def _spawn_watcher(payload, fds, real_cli):
         _prctl(_PR_SET_CHILD_SUBREAPER, 1)
         cpid = os.fork()
         if cpid == 0:
-            _exec_cli(real_cli, argv, workspace, ro, rw, fds)  # never returns
+            _exec_cli(real_cli, argv, workspace, ro, rw, fds, env, env_allow)
         for fd in fds:
             _close(fd)
         status = _waitpid_status(cpid)
@@ -170,7 +170,32 @@ def _spawn_watcher(payload, fds, real_cli):
         os._exit(111)
 
 
-def _exec_cli(real_cli, argv, workspace, ro, rw, fds):
+# Env names the broker always strips before handing the env to the CLI: the
+# ticket/socket/secret must never leak into a session.
+_ENV_STRIP = (
+    "GATEWAY_ISOLATION_TICKET",
+    "GATEWAY_ISOLATION_TICKET_SECRET",
+    "GATEWAY_ISOLATION_BROKER_SOCKET",
+)
+
+
+def _child_env(env, env_allow, workspace):
+    """The CLI's environment: the launcher-passed env (already secret-scrubbed
+    by the gateway), narrowed to the ticket allowlist when one is given, with
+    the isolation plumbing stripped and a workspace-local TMPDIR set."""
+    if env_allow:
+        out = {k: v for k, v in env.items() if k in set(env_allow)}
+    else:
+        out = dict(env)
+    for name in _ENV_STRIP:
+        out.pop(name, None)
+    tmp = os.path.join(workspace, ".cli-tmp")
+    out["TMPDIR"] = tmp
+    out["CLAUDE_CODE_TMPDIR"] = tmp
+    return out
+
+
+def _exec_cli(real_cli, argv, workspace, ro, rw, fds, env, env_allow):
     # Re-parent death to the watcher, enter the workspace, confine, exec.
     _prctl(_PR_SET_PDEATHSIG, signal.SIGKILL)
     try:
@@ -178,6 +203,7 @@ def _exec_cli(real_cli, argv, workspace, ro, rw, fds):
     except OSError:
         os._exit(113)
     child_ro, child_rw = _child_ro_rw(real_cli, workspace, ro, rw)
+    child_env = _child_env(env, env_allow, workspace)
     for target, src in enumerate(fds[:3]):
         os.dup2(src, target)
     for fd in fds:
@@ -188,7 +214,7 @@ def _exec_cli(real_cli, argv, workspace, ro, rw, fds):
     except ll.LandlockError as exc:
         sys.stderr.write("isolation_broker: %s\n" % exc)
         os._exit(114)
-    os.execv(real_cli, [real_cli, *argv])
+    os.execve(real_cli, [real_cli, *argv], child_env)
 
 
 # --- small libc / wait helpers ----------------------------------------------
@@ -258,6 +284,7 @@ def _handle(conn, real_cli, secret):
         header, fds = _recv_spawn(conn)
         payload = verify_ticket(header["ticket"], secret, _seen_nonces)
         payload["argv"] = header.get("argv", [])
+        payload["env"] = header.get("env", {})
     except (ValueError, KeyError, OSError) as exc:
         _log("rejecting spawn: %s" % exc)
         for fd in fds:

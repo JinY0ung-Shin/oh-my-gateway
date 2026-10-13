@@ -1256,24 +1256,34 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_task_budget(options, task_budget)
         self._configure_metadata_env(options, extra_env)
         self._configure_sdk_env(options)
-        self._configure_confinement(options, effective_cwd)
+        self._configure_confinement(options, effective_cwd, user)
 
         return options
 
     def _configure_confinement(
-        self, options: ClaudeAgentOptions, effective_cwd: Optional[Path]
+        self,
+        options: ClaudeAgentOptions,
+        effective_cwd: Optional[Path],
+        user: Optional[str] = None,
     ) -> None:
-        """Hand the Landlock launcher this workspace's path lists (#241).
+        """Confine the spawn through the isolation launcher (#241).
 
         No-op unless confinement is on. ``cli_path`` already points at the
-        launcher (``_get_cli_path``); here we add the per-workspace read-only /
-        read-write path lists it enforces, through ``options.env`` so they ride
-        the clean child env the SDK builds. Built from the same guard helpers,
-        so a confined script reaches exactly what a file tool may.
+        launcher (``_get_cli_path``); here we add, through ``options.env`` (so
+        they ride the clean child env the SDK builds), either the per-workspace
+        read-only / read-write path lists (landlock mode) or the signed per-user
+        broker ticket (uid mode). The path lists are built from the same guard
+        helpers, so a confined script reaches exactly what a file tool may; the
+        uid-mode ticket carries them signed to the broker. ``user`` keys the
+        per-user uid.
         """
         from . import landlock
 
-        env = landlock.options_env(Path(effective_cwd)) if effective_cwd else {}
+        env = (
+            landlock.options_env(Path(effective_cwd), user=user)
+            if effective_cwd
+            else {}
+        )
         if env:
             if options.env is None:
                 options.env = {}

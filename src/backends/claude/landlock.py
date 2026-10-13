@@ -33,20 +33,27 @@ from typing import Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 MODE_ENV = "CLAUDE_ISOLATION_MODE"
+FALLBACK_ENV = "CLAUDE_ISOLATION_FALLBACK"
 LAUNCHER_ENV = "GATEWAY_LANDLOCK_LAUNCHER"
 REAL_CLI_ENV = "GATEWAY_REAL_CLI"
 RO_ENV = "GATEWAY_LANDLOCK_RO"
 RW_ENV = "GATEWAY_LANDLOCK_RW"
+BROKER_SOCKET_ENV = "GATEWAY_ISOLATION_BROKER_SOCKET"
+TICKET_ENV = "GATEWAY_ISOLATION_TICKET"
 _SKIP_VERSION_CHECK_ENV = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"
 
-# The single operator knob for session isolation. Values grow with the design:
+# The single operator knob for session isolation:
 #   off      — no OS boundary (default)
-#   landlock — Landlock ruleset, no privilege (this PR; kernel >= 5.19)
-#   uid      — uid-per-user broker + Landlock (added by the broker follow-up)
-# The modes that apply the Landlock ruleset; ``uid`` joins this set when the
-# broker lands. An unknown value is rejected fail-closed in :func:`check_config`.
-_LANDLOCK_MODES = {"landlock"}
-_KNOWN_MODES = {"off", "landlock"}
+#   landlock — Landlock ruleset, no privilege (kernel >= 5.19)
+#   uid      — uid-per-user broker + Landlock (DAC + signal isolation too)
+# Both landlock and uid apply the Landlock ruleset. An unknown value is rejected
+# fail-closed in :func:`check_config`.
+_LANDLOCK_MODES = {"landlock", "uid"}
+_KNOWN_MODES = {"off", "landlock", "uid"}
+
+# CAP_SETGID is bit 6, CAP_SETUID is bit 7 (linux/capability.h).
+_CAP_SETGID_BIT = 1 << 6
+_CAP_SETUID_BIT = 1 << 7
 
 # The launcher ships beside this repo's docker/ directory. In the image it is a
 # fixed, root-owned path; an operator may override the location, but never make
@@ -56,19 +63,107 @@ _DEFAULT_LAUNCHER = (
 )
 
 
+_effective_mode_cache: Optional[str] = None
+
+
 def isolation_mode() -> str:
     """The configured isolation mode (lowercased); ``off`` when unset."""
     return (os.getenv(MODE_ENV) or "off").strip().lower()
 
 
-def confine_enabled() -> bool:
-    """Whether the Landlock ruleset is applied to CLI children.
+def _cap_bnd_has_setuid_setgid() -> bool:
+    """Whether this process's capability bounding set carries SETUID+SETGID.
 
-    True for the modes that confine the filesystem (``landlock`` now, ``uid``
-    once the broker lands). An unknown mode reads as not-confined here; startup
-    (:func:`check_config`) rejects it fail-closed so it never silently runs off.
+    In uid mode the broker (not the gateway) wields them, but the gateway cannot
+    read the broker's caps; the container-level signal is that they are in the
+    bounding set (inherited from container start). Informative for diagnostics —
+    the authoritative runtime signal is broker reachability.
     """
-    return isolation_mode() in _LANDLOCK_MODES
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("CapBnd:"):
+                    bits = int(line.split()[1], 16)
+                    return bool(bits & _CAP_SETUID_BIT) and bool(
+                        bits & _CAP_SETGID_BIT
+                    )
+    except (OSError, ValueError):
+        pass
+    return False
+
+
+def broker_socket_path() -> str:
+    return (os.getenv(BROKER_SOCKET_ENV) or "").strip()
+
+
+def _broker_reachable() -> bool:
+    """Whether the resident broker is up and accepting on its socket."""
+    import socket
+
+    path = broker_socket_path()
+    if not path:
+        return False
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(path)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def uid_mode_available() -> bool:
+    """Whether ``uid`` mode can actually run here: Landlock usable and the
+    broker reachable (the broker being up means the entrypoint gave it the
+    privilege to switch uid)."""
+    return landlock_abi() >= 2 and _broker_reachable()
+
+
+def effective_mode() -> str:
+    """The mode actually in force, after the fail-open-never fallback rule.
+
+    ``uid`` stays ``uid`` when available. When it is not, it downgrades to
+    ``landlock`` only if the operator explicitly set
+    ``CLAUDE_ISOLATION_FALLBACK=landlock`` (with a warning); otherwise it stays
+    ``uid`` and :func:`check_config` turns the unavailability into a startup
+    error — never a silent drop to a weaker or absent boundary.
+
+    Resolved once and cached (broker availability is fixed post-startup);
+    :func:`reset_mode_cache` clears it for tests.
+    """
+    global _effective_mode_cache
+    if _effective_mode_cache is not None:
+        return _effective_mode_cache
+    mode = isolation_mode()
+    resolved = mode
+    if mode == "uid" and not uid_mode_available():
+        fallback = (os.getenv(FALLBACK_ENV) or "").strip().lower()
+        if fallback == "landlock":
+            logger.warning(
+                "%s=uid is not available (Landlock ABI or broker); falling back "
+                "to landlock per %s=landlock",
+                MODE_ENV,
+                FALLBACK_ENV,
+            )
+            resolved = "landlock"
+    _effective_mode_cache = resolved
+    return resolved
+
+
+def reset_mode_cache() -> None:
+    """Clear the memoized effective mode (tests, or a deliberate re-resolve)."""
+    global _effective_mode_cache
+    _effective_mode_cache = None
+
+
+def confine_enabled() -> bool:
+    """Whether the Landlock ruleset is applied to CLI children (landlock/uid).
+
+    An unknown mode reads as not-confined here; startup (:func:`check_config`)
+    rejects it fail-closed so it never silently runs off.
+    """
+    return effective_mode() in _LANDLOCK_MODES
 
 
 def launcher_path() -> str:
@@ -128,7 +223,15 @@ def install_process_env() -> None:
     lists still ride ``options.env`` (see :func:`options_env`). No-op unless
     confinement is on.
     """
-    if not confine_enabled():
+    # Resolve and lock the effective mode once, before the first spawn, and log
+    # it (a uid->landlock fallback is surfaced here, not silently per-call).
+    mode = effective_mode()
+    requested = isolation_mode()
+    if requested != mode:
+        logger.warning("isolation mode requested=%s, effective=%s", requested, mode)
+    elif mode in _LANDLOCK_MODES:
+        logger.info("isolation mode: %s", mode)
+    if mode not in _LANDLOCK_MODES:
         return
     real_cli = resolve_real_cli()
     if real_cli:
@@ -199,17 +302,46 @@ def _dedupe(paths: List[str]) -> List[str]:
     return out
 
 
-def options_env(effective_cwd: Path) -> Dict[str, str]:
+def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, str]:
     """The ``options.env`` entries that confine a spawn for *effective_cwd*.
 
-    Empty when confinement is off. ``GATEWAY_REAL_CLI`` is included (so a clean
-    child env carries it even where ``os.environ`` is not inherited verbatim),
-    alongside the per-workspace read-only / read-write path lists.
+    Empty when confinement is off. The effective mode decides the shape:
+
+    * **landlock** — the read-only / read-write path lists the launcher enforces
+      in place, plus the real CLI it execs.
+    * **uid** — a signed single-use ticket carrying the per-user uid and the
+      path lists, which the launcher presents to the broker; the broker (not the
+      launcher) holds the real CLI and does the uid switch. The path lists do
+      **not** go in the clear here — only inside the signed ticket.
     """
-    if not confine_enabled():
+    mode = effective_mode()
+    if mode not in _LANDLOCK_MODES:
         return {}
     ro, rw = _ro_rw_roots(Path(effective_cwd))
+
+    if mode == "uid":
+        from . import uid_isolation as ui
+
+        # Key the uid on the user when known, else on the (per-run) workspace so
+        # concurrent anonymous runs still get distinct uids. (Recycling dead
+        # anonymous entries is a follow-up; the band is wide.)
+        key = user or str(effective_cwd)
+        uid = ui.resolve_uid(key)
+        ticket = ui.mint_ticket(
+            uid=uid,
+            workspace=str(effective_cwd),
+            ro=ro,
+            rw=rw,
+            env_allow=[],  # pass-through (gateway already scrubbed secrets)
+        )
+        return {
+            MODE_ENV: "uid",
+            TICKET_ENV: ticket,
+            BROKER_SOCKET_ENV: broker_socket_path(),
+        }
+
     env: Dict[str, str] = {
+        MODE_ENV: "landlock",
         RO_ENV: os.pathsep.join(ro),
         RW_ENV: os.pathsep.join(rw),
     }
@@ -226,16 +358,46 @@ def check_config() -> List[str]:
     ``ConfigIssue("error", ...)`` so the gateway refuses to start rather than
     spawn an unconfined or broken CLI.
     """
-    mode = isolation_mode()
-    if mode not in _KNOWN_MODES:
+    requested = isolation_mode()
+    if requested not in _KNOWN_MODES:
         return [
-            f"{MODE_ENV}={mode!r} is not a valid isolation mode "
+            f"{MODE_ENV}={requested!r} is not a valid isolation mode "
             f"(expected one of: {', '.join(sorted(_KNOWN_MODES))}). Refusing to "
             "start rather than run an unexpected (possibly unconfined) mode."
         ]
-    if not confine_enabled():
+    mode = effective_mode()
+    if mode not in _LANDLOCK_MODES:
         return []
     errors: List[str] = []
+
+    # uid mode that could not be satisfied (and was not allowed to fall back to
+    # landlock) is a hard startup error — never a silent drop.
+    if requested == "uid" and mode == "uid" and not uid_mode_available():
+        why = []
+        if landlock_abi() < 2:
+            why.append("Landlock ABI < 2 (kernel >= 5.19 needed)")
+        if not broker_socket_path():
+            why.append(f"{BROKER_SOCKET_ENV} is unset")
+        elif not _broker_reachable():
+            why.append("the broker is not reachable on its socket")
+        if not _cap_bnd_has_setuid_setgid():
+            why.append("SETUID/SETGID are not in the capability bounding set")
+        errors.append(
+            f"{MODE_ENV}=uid but uid isolation is unavailable here ("
+            + "; ".join(why)
+            + f"). Fix the broker/caps, or set {FALLBACK_ENV}=landlock to run the "
+            "no-privilege Landlock boundary instead."
+        )
+        return errors
+    if requested == "uid" and mode == "uid":
+        from . import uid_isolation as ui
+
+        if not (os.getenv(ui.TICKET_SECRET_ENV) or "").strip():
+            errors.append(
+                f"{MODE_ENV}=uid but {ui.TICKET_SECRET_ENV} is unset; the gateway "
+                "cannot mint a broker ticket. The entrypoint must generate it and "
+                "share it with the gateway and broker."
+            )
 
     launcher = Path(launcher_path())
     if not (launcher.is_file() and os.access(launcher, os.X_OK)):

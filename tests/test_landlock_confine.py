@@ -37,14 +37,31 @@ def _landlock_skip() -> str:
     return ""
 
 
+@pytest.fixture(autouse=True)
+def _reset_isolation_env(monkeypatch):
+    # effective_mode is memoized and several vars steer it; start each test from
+    # a clean slate so cross-test state never leaks.
+    for var in (
+        landlock.FALLBACK_ENV,
+        landlock.BROKER_SOCKET_ENV,
+        "GATEWAY_ISOLATION_TICKET_SECRET",
+    ):
+        monkeypatch.delenv(var, raising=False)
+    landlock.reset_mode_cache()
+    yield
+    landlock.reset_mode_cache()
+
+
 @pytest.fixture
 def confine_on(monkeypatch):
     monkeypatch.setenv(landlock.MODE_ENV, "landlock")
+    landlock.reset_mode_cache()
 
 
 @pytest.fixture
 def confine_off(monkeypatch):
     monkeypatch.delenv(landlock.MODE_ENV, raising=False)
+    landlock.reset_mode_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -107,18 +124,71 @@ class TestGatewayWiring:
         assert landlock.REAL_CLI_ENV not in os.environ
 
 
+class TestUidMode:
+    """Gateway-side uid wiring (no privilege): mode resolution, fallback, the
+    ticket in options.env, and fail-closed when uid is unavailable."""
+
+    def test_available_uid_stays_uid(self, monkeypatch):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        landlock.reset_mode_cache()
+        assert landlock.effective_mode() == "uid"
+        assert landlock.confine_enabled() is True
+
+    def test_unavailable_uid_without_fallback_stays_uid(self, monkeypatch):
+        # Stays uid (not silently downgraded); check_config makes it a hard error.
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: False)
+        landlock.reset_mode_cache()
+        assert landlock.effective_mode() == "uid"
+
+    def test_unavailable_uid_with_fallback_downgrades(self, monkeypatch):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setenv(landlock.FALLBACK_ENV, "landlock")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: False)
+        landlock.reset_mode_cache()
+        assert landlock.effective_mode() == "landlock"
+
+    def test_options_env_uid_mints_ticket(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setenv("GATEWAY_ISOLATION_TICKET_SECRET", "s3cret")
+        monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+        monkeypatch.setenv("CLAUDE_ISOLATION_UID_REGISTRY", str(tmp_path / "u.json"))
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        landlock.reset_mode_cache()
+        env = landlock.options_env(tmp_path, user="alice")
+        assert env[landlock.MODE_ENV] == "uid"
+        assert env[landlock.BROKER_SOCKET_ENV] == "/run/x.sock"
+        # the ticket verifies and carries the workspace + a uid in range
+        from src.backends.claude import uid_isolation as ui
+
+        payload = ui.verify_ticket(env[landlock.TICKET_ENV])
+        assert payload["workspace"] == str(tmp_path)
+        lo, hi = ui.uid_range()
+        assert lo <= payload["uid"] <= hi
+        # path lists are NOT in the clear — only inside the signed ticket
+        assert landlock.RO_ENV not in env and landlock.RW_ENV not in env
+
+    def test_check_config_uid_unavailable_is_error(self, monkeypatch):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: False)
+        landlock.reset_mode_cache()
+        errors = landlock.check_config()
+        assert any("uid isolation is unavailable" in e for e in errors)
+
+    def test_check_config_uid_without_secret_is_error(self, monkeypatch):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        landlock.reset_mode_cache()
+        errors = landlock.check_config()
+        assert any("TICKET_SECRET" in e for e in errors)
+
+
 class TestFailClosed:
     def test_invalid_mode_is_rejected(self, monkeypatch):
         monkeypatch.setenv(landlock.MODE_ENV, "bogus")
         errors = landlock.check_config()
         assert errors and "not a valid isolation mode" in errors[0]
-
-    def test_uid_mode_not_yet_available(self, monkeypatch):
-        # The broker follow-up adds "uid"; until then it is an unknown mode and
-        # must fail closed rather than silently run unconfined.
-        monkeypatch.setenv(landlock.MODE_ENV, "uid")
-        assert landlock.confine_enabled() is False
-        assert landlock.check_config()
 
     def test_bad_launcher_is_an_error(self, confine_on, monkeypatch):
         monkeypatch.setenv(landlock.LAUNCHER_ENV, "/nonexistent/launcher.py")

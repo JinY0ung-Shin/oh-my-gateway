@@ -132,7 +132,15 @@ def _run_uid():
     # 0/1/2 as SCM_RIGHTS ancillary data. The broker forks the CLI onto them.
     import json
 
-    header = json.dumps({"ticket": ticket, "argv": sys.argv[1:]}).encode("utf-8")
+    # Pass our own environment too: it is the env the SDK built for this child
+    # (ANTHROPIC_*, PATH, HOME, …), already scrubbed of gateway secrets by the
+    # gateway's _configure_sdk_env. The broker uses it as the CLI's env (the
+    # broker's own env would otherwise be inherited, losing the SDK's values),
+    # filtered by the ticket's env allowlist. The ticket/socket vars are dropped
+    # by the broker so they never reach the CLI.
+    header = json.dumps(
+        {"ticket": ticket, "argv": sys.argv[1:], "env": dict(os.environ)}
+    ).encode("utf-8")
     fds = array.array("i", [0, 1, 2])
     try:
         conn.sendmsg(

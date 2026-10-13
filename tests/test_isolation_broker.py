@@ -156,6 +156,44 @@ class TestBrokerProtocol:
         )
         assert proc.returncode == 7, proc.stderr
 
+    def test_env_propagated_but_ticket_stripped(self, broker, tmp_path, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, broker[1])
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "envprobe.py").write_text(
+            "import json, os\n"
+            "print(json.dumps({\n"
+            "  'marker': os.environ.get('MY_MARKER'),\n"
+            "  'ticket': os.environ.get('GATEWAY_ISOLATION_TICKET'),\n"
+            "  'secret': os.environ.get('GATEWAY_ISOLATION_TICKET_SECRET'),\n"
+            "}))\n"
+        )
+        ticket = ui.mint_ticket(
+            uid=os.getuid(), workspace=str(ws), ro=[], rw=[str(ws)], env_allow=[]
+        )
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PWD": str(ws),
+            "MY_MARKER": "hello",  # a gateway-set child var must reach the CLI
+            "CLAUDE_ISOLATION_MODE": "uid",
+            "GATEWAY_ISOLATION_TICKET": ticket,
+            ui.BROKER_SOCKET_ENV: str(broker[0]),
+            ui.TICKET_SECRET_ENV: broker[1],
+        }
+        proc = subprocess.run(
+            [sys.executable, str(_LAUNCHER), str(ws / "envprobe.py")],
+            cwd=str(ws),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        result = json.loads(proc.stdout)
+        assert result["marker"] == "hello"  # SDK-built env reached the CLI
+        assert result["ticket"] is None  # plumbing stripped
+        assert result["secret"] is None
+
     def test_forged_ticket_refused(self, broker, tmp_path):
         ws = tmp_path / "ws"
         ws.mkdir()
