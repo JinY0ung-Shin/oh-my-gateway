@@ -241,15 +241,42 @@ def operator_add_dirs() -> List[str]:
     return dirs
 
 
-def _on_read_only_mount(path: Path) -> bool:
-    """Whether *path* is on a read-only mount (``statvfs`` reports ``ST_RDONLY``).
+_MOUNTINFO = Path("/proc/self/mountinfo")
+# mountinfo writes space, tab, newline and backslash in a path as octal escapes.
+_MOUNTINFO_ESCAPE = re.compile(r"\\([0-7]{3})")
 
-    A missing path or a platform without ``statvfs`` counts as writable.
-    """
+
+def _statvfs_read_only(path: str) -> bool:
     try:
         return bool(os.statvfs(path).f_flag & os.ST_RDONLY)
     except (OSError, AttributeError, ValueError):
         return False
+
+
+def _read_only_tree(path: Path) -> bool:
+    """Whether *path* and every mount below it are read-only.
+
+    ``statvfs`` sets ``ST_RDONLY`` for a read-only bind as well as a read-only
+    filesystem, but only for the mount a path is on. A writable mount below
+    *path* (a rw data volume under a read-only ``/app``) would reopen its
+    subtree, so every mount point under *path* in ``/proc/self/mountinfo`` has
+    to be read-only too. A missing path, a platform without ``statvfs`` or an
+    unreadable mount table counts as writable.
+    """
+    if not _statvfs_read_only(str(path)):
+        return False
+    try:
+        table = os.fsdecode(_MOUNTINFO.read_bytes())
+    except OSError:
+        return False
+    for line in table.splitlines():
+        fields = line.split(" ")
+        if len(fields) < 5:
+            continue
+        point = Path(_MOUNTINFO_ESCAPE.sub(lambda m: chr(int(m[1], 8)), fields[4]))
+        if _is_within(point, path) and not _statvfs_read_only(str(point)):
+            return False
+    return True
 
 
 def _operator_add_dir_roots(
@@ -261,8 +288,9 @@ def _operator_add_dir_roots(
     open to Bash writes too, and the CLI loads every ``--add-dir``'s
     ``.claude/`` skills, agents and commands into every session: a writable
     entry would let one user plant instructions in other users' sessions. So
-    only an entry on a read-only mount is granted; the filesystem refuses those
-    writes. Relative entries are ignored, and so is an entry that
+    only an entry whose whole tree is read-only (``_read_only_tree``) is
+    granted; the filesystem refuses those writes. Relative entries are ignored,
+    and so is an entry that
 
     * is ``$HOME/.claude``, inside it or an ancestor of it (``$HOME``, ``/``) —
       every user's transcripts and plans; only the always-on home guard decides
@@ -273,8 +301,8 @@ def _operator_add_dir_roots(
     * contains this session's workspace — a cwd outside the base has other
       sessions' workspaces beside it.
 
-    A read-only mount can still hold such state when a writable one is mounted
-    below it, which is why these overlaps are refused as well.
+    Per-user state is written at runtime, so the read-only check alone should
+    already refuse such an entry; the overlap rules are defense in depth.
     """
     roots: List[Path] = []
     seen: Set[Path] = set()
@@ -301,11 +329,12 @@ def _operator_add_dir_roots(
                 clash,
             )
             continue
-        if not _on_read_only_mount(root):
+        if not _read_only_tree(root):
             logger.warning(
-                "CLAUDE_ADD_DIRS entry %s is not on a read-only mount; not "
-                "granted to the workspace sandbox (Bash could write into it, "
-                "and the CLI loads its .claude/ skills into every session)",
+                "CLAUDE_ADD_DIRS entry %s is not on a read-only mount, or has a "
+                "writable mount below it; not granted to the workspace sandbox "
+                "(Bash could write into it, and the CLI loads its .claude/ "
+                "skills into every session)",
                 root,
             )
             continue
@@ -686,8 +715,8 @@ def make_workspace_sandbox_hook(workspace_root: Path):
       ``$HOME/.claude/projects/<encoded cwd>``;
     * ``read_roots`` — write roots plus the read-only shared assets under
       ``$HOME/.claude`` (skills, plugins, agents, …), plugin resource roots and
-      the operator's ``CLAUDE_ADD_DIRS`` entries that sit on a read-only mount
-      and do not overlap per-user state (``_operator_add_dir_roots``). The
+      the operator's ``CLAUDE_ADD_DIRS`` entries whose tree is read-only and
+      that do not overlap per-user state (``_operator_add_dir_roots``). The
       rest of ``$HOME/.claude`` (``plans/``, other ``projects/*``) belongs to
       other users.
 

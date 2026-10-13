@@ -564,7 +564,7 @@ class TestOperatorAddDirs:
         # Keep the host's workspace base out of the overlap checks.
         monkeypatch.setattr(sandbox.workspace_manager, "base_path", tmp_path / "ws")
         # tmp is writable; model the read-only mount an operator has to use.
-        monkeypatch.setattr(sandbox, "_on_read_only_mount", lambda path: True)
+        monkeypatch.setattr(sandbox, "_read_only_tree", lambda path: True)
         shared = tmp_path / "data" / "shared"
         (shared / "docs").mkdir(parents=True)
         (shared / "docs" / "guide.md").write_text("# guide")
@@ -720,7 +720,7 @@ class TestOperatorAddDirs:
         from src.backends.claude import workspace_sandbox as sandbox
 
         refs = (tmp_path / "opt" / "refs").resolve()
-        monkeypatch.setattr(sandbox, "_on_read_only_mount", lambda path: path == refs)
+        monkeypatch.setattr(sandbox, "_read_only_tree", lambda path: path == refs)
         hook = make_workspace_sandbox_hook(workspace)
         doc = shared / "docs" / "guide.md"
         plant = f"mkdir -p {shared}/.claude/skills/x"
@@ -728,19 +728,36 @@ class TestOperatorAddDirs:
         assert _is_deny(await _call(hook, "Bash", {"command": plant}))
         assert await _call(hook, "Glob", {"pattern": "*", "path": str(refs)}) == {}
 
-    def test_read_only_mount_detection(self, tmp_path, monkeypatch):
+    def test_read_only_tree(self, tmp_path, monkeypatch):
         import os
 
-        from src.backends.claude.workspace_sandbox import _on_read_only_mount
+        from src.backends.claude import workspace_sandbox as sandbox
 
-        assert _on_read_only_mount(tmp_path) is False
-        assert _on_read_only_mount(tmp_path / "missing") is False
+        assert sandbox._read_only_tree(tmp_path) is False
+        assert sandbox._read_only_tree(tmp_path / "missing") is False
 
-        class _ReadOnly:
-            f_flag = os.ST_RDONLY
+        root = tmp_path / "ro"
+        below = root / "data dir"
+        read_only = {str(root)}
 
-        monkeypatch.setattr(os, "statvfs", lambda path: _ReadOnly())
-        assert _on_read_only_mount(tmp_path) is True
+        class _Stat:
+            def __init__(self, path):
+                self.f_flag = os.ST_RDONLY if str(path) in read_only else 0
+
+        monkeypatch.setattr(os, "statvfs", _Stat)
+        table = tmp_path / "mountinfo"
+        monkeypatch.setattr(sandbox, "_MOUNTINFO", table)
+        top, sub = (str(p).replace(" ", "\\040") for p in (root, below))
+        table.write_text(
+            f"36 35 0:1 / {top} ro,relatime - tmpfs tmpfs ro\n"
+            f"37 36 0:2 / {sub} rw,relatime - tmpfs tmpfs rw\n"
+        )
+        # A writable mount below the read-only entry reopens its subtree.
+        assert sandbox._read_only_tree(root) is False
+        read_only.add(str(below))
+        assert sandbox._read_only_tree(root) is True
+        table.unlink()
+        assert sandbox._read_only_tree(root) is False
 
     async def test_quota_only_mode_logs_nothing_about_entries(
         self, workspace, shared, monkeypatch, caplog
