@@ -316,6 +316,59 @@ def _get_max_buffer_size() -> int:
     return value
 
 
+# Other backends' credentials, blanked in every Claude CLI child on top of the
+# auth provider's mode-specific list (child_secret_env).
+_ISOLATION_VARS = ["OPENAI_API_KEY"]
+
+
+def _isolation_vars() -> List[str]:
+    """``_ISOLATION_VARS`` merged with the auth provider's mode-specific list."""
+    # src.auth first: it builds its auth manager at import, which imports the
+    # provider module, so importing the provider module first is a cycle (the
+    # slash preflight can run before anything has loaded src.auth).
+    import src.auth  # noqa: F401
+    from src.backends.claude.auth import ClaudeAuthProvider
+
+    merged = list(_ISOLATION_VARS)
+    try:
+        for key in ClaudeAuthProvider().get_isolation_vars():
+            if key not in merged:
+                merged.append(key)
+    except Exception:  # pragma: no cover - provider construction is env-only
+        logger.debug("auth provider isolation vars unavailable", exc_info=True)
+    return merged
+
+
+def child_secret_env() -> Dict[str, str]:
+    """``options.env`` blanks for every gateway-side secret a CLI child must not see.
+
+    One list for every Claude CLI child the gateway spawns — session turns and
+    ``verify()`` (``_configure_sdk_env``) and the slash-command catalog/preflight
+    (``slash_commands``) — because each child runs workspace-controlled code:
+    a session its tools and hooks, the preflight a workspace ``apiKeyHelper``
+    from ``.claude/settings.json`` (#241 review: it saw ``ADMIN_API_KEY``).
+
+    * gateway-only secrets (``ADMIN_API_KEY``, ``API_KEY``, the
+      ``SYSINFO_CHILD_ENV_MASK`` names) while ``SYSINFO_REDACTION`` is on;
+    * other backends' credentials plus whatever the auth provider says must not
+      reach the CLI in the chosen auth mode (api_key mode: a leftover
+      ``CLAUDE_CODE_OAUTH_TOKEN``). The CLI reads a blank token as unset
+      (tests/test_cli_blank_oauth_token.py);
+    * the uid-isolation ticket secret: a child holding it could forge broker
+      tickets. The launcher presents a pre-minted ticket, not the secret, and
+      the broker holds its own copy.
+
+    Blanked through ``options.env``, never by popping ``os.environ`` around
+    ``connect()``: the SDK copies ``os.environ`` into the child only after
+    awaiting its ``claude -v`` check, so an overlapping session's restore leaked
+    them into another session's CLI (tests/test_sdk_env_race.py).
+    """
+    env = dict(child_env_mask())
+    env.update(dict.fromkeys(_isolation_vars(), ""))
+    env["GATEWAY_ISOLATION_TICKET_SECRET"] = ""
+    return env
+
+
 _BUFFER_OVERFLOW_MARKER = "JSON message exceeded maximum buffer size"
 _BUFFER_OVERFLOW_SIZE_RE = re.compile(r"Buffer size (\d+) exceeds limit (\d+)")
 
@@ -716,7 +769,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 filtered.extend(f"Skill({name}:*)" for name in granular)
         options.allowed_tools = filtered
 
-    async def _apply_skills_allowlist(self, options: ClaudeAgentOptions) -> None:
+    async def _apply_skills_allowlist(
+        self, options: ClaudeAgentOptions, user: Optional[str] = None
+    ) -> None:
         """Resolve ``options.skills`` into the session's effective allowlist.
 
         The SDK ``skills`` allowlist is the only surface that removes a skill
@@ -744,6 +799,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         Discovered names the SDK would reject (a skill directory such as
         ``weird (v2)``, an MCP prompt command such as ``server:prompt (MCP)``)
         are left out: one of them in the allowlist makes ``connect()`` raise.
+
+        ``user`` is the session's user: under ``uid`` isolation the discovery
+        preflight runs in the session workspace as that user's uid.
         """
         granular = isinstance(options.skills, list)
         if not granular and not HIDDEN_SKILLS:
@@ -760,7 +818,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             requested = set(options.skills or [])
             resolved = set(requested)
             try:
-                names = await slash_commands.get_available_commands(cwd)
+                names = await slash_commands.get_available_commands(cwd, user=user)
                 if any(
                     not any(d == r or d.endswith(":" + r) for d in names)
                     for r in requested
@@ -768,7 +826,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     # A requested skill may have been installed after the
                     # 60s discovery cache was populated — refresh once.
                     names = await slash_commands.get_available_commands(
-                        cwd, force=True
+                        cwd, force=True, user=user
                     )
                 resolved |= {
                     d
@@ -783,7 +841,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.skills = _drop_unusable_skill_names(n for n in resolved if keep(n))
             return
 
-        names = await slash_commands.get_available_commands(cwd)
+        names = await slash_commands.get_available_commands(cwd, user=user)
         options.skills = _drop_unusable_skill_names(n for n in names if keep(n))
 
     def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
@@ -1152,29 +1210,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             window = runtime_config.get("auto_compact_window")
             sdk_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window) if window else ""
 
-        # Gateway-only secrets (ADMIN_API_KEY, API_KEY, …) are blanked in the
-        # child: the CLI never needs them, and a shell inside the agent would
-        # otherwise inherit them from the gateway process.
-        sdk_env.update(child_env_mask())
-
-        # Other backends' credentials, plus whatever the auth provider says must
-        # not reach the CLI in the chosen auth mode (api_key mode: a leftover
-        # CLAUDE_CODE_OAUTH_TOKEN), are blanked the same way for the children
-        # built from these options (sessions and verify()). The slash-command
-        # catalog/preflight builds bare options and still inherits them (#230).
-        # Never by popping them from os.environ around connect(): the SDK copies
-        # os.environ into the child only after awaiting its `claude -v` check, so
-        # an overlapping session's restore leaked them into another session's
-        # CLI (tests/test_sdk_env_race.py). The CLI reads a blank token as unset
-        # (tests/test_cli_blank_oauth_token.py).
-        sdk_env.update(dict.fromkeys(self._isolation_vars(), ""))
-
-        # The uid-isolation ticket secret (set in the gateway's env by the
-        # entrypoint) must never reach a session child: the CLI does not need it
-        # and it would let a child forge broker tickets. The launcher presents a
-        # pre-minted ticket, not the secret, and the broker holds its own copy;
-        # blank it here as defense in depth (#241).
-        sdk_env["GATEWAY_ISOLATION_TICKET_SECRET"] = ""
+        # Gateway-only secrets (ADMIN_API_KEY, API_KEY, …), other backends'
+        # credentials, the auth mode's leftovers and the uid-isolation ticket
+        # secret are blanked in the child: the CLI never needs them, and a shell
+        # inside the agent would otherwise inherit them from the gateway
+        # process. The same blanks go to the slash-command preflight
+        # (child_secret_env).
+        sdk_env.update(child_secret_env())
 
         if sdk_env:
             options.env.update(sdk_env)
@@ -1263,7 +1305,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_task_budget(options, task_budget)
         self._configure_metadata_env(options, extra_env)
         self._configure_sdk_env(options)
-        self._configure_confinement(options, effective_cwd, user)
+        self._configure_confinement(options, effective_cwd, user, session_id or resume)
 
         return options
 
@@ -1272,6 +1314,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         options: ClaudeAgentOptions,
         effective_cwd: Optional[Path],
         user: Optional[str] = None,
+        session_id: Optional[str] = None,
     ) -> None:
         """Confine the spawn through the isolation launcher (#241).
 
@@ -1279,19 +1322,25 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         launcher (``_get_cli_path``); here we add, through ``options.env`` (so
         they ride the clean child env the SDK builds), either the per-workspace
         read-only / read-write path lists (landlock mode) or the signed per-user
-        broker ticket (uid mode). The path lists are built from the same guard
-        helpers, so a confined script reaches exactly what a file tool may; the
-        uid-mode ticket carries them signed to the broker. ``user`` keys the
-        per-user uid.
+        broker ticket (uid mode), which carries the same lists signed to the
+        broker (``landlock.options_env`` documents what they grant). ``user``
+        keys the per-user uid; ``session_id`` (the CLI's ``--session-id`` or
+        ``--resume`` id) grants that session's own ``session-env`` dir.
+
+        ``options.cwd`` becomes absolute like the path lists: the SDK copies it
+        into the child's ``PWD``, which the launcher reads as the cwd it grants.
+        Called again right before ``connect()`` by ``create_client`` so a
+        uid-mode ticket is fresh when the broker sees it.
         """
         from . import landlock
 
         env = (
-            landlock.options_env(Path(effective_cwd), user=user)
+            landlock.options_env(Path(effective_cwd), user=user, session_id=session_id)
             if effective_cwd
             else {}
         )
         if env:
+            options.cwd = Path(os.path.abspath(effective_cwd))
             if options.env is None:
                 options.env = {}
             options.env.update(env)
@@ -1375,25 +1424,6 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         ):
             converted["gateway_interrupted"] = True
         return converted
-
-    # ------------------------------------------------------------------
-    # Environment management
-    # ------------------------------------------------------------------
-
-    # Env vars from other backends blanked for session/verify() CLI children
-    # (_configure_sdk_env); the slash-command preflight still inherits them.
-    _ISOLATION_VARS = ["OPENAI_API_KEY"]
-
-    def _isolation_vars(self) -> List[str]:
-        """Class defaults merged with the auth provider's mode-specific list."""
-        merged = list(self._ISOLATION_VARS)
-        try:
-            for key in self.get_auth_provider().get_isolation_vars():
-                if key not in merged:
-                    merged.append(key)
-        except Exception:  # pragma: no cover - provider construction is env-only
-            logger.debug("auth provider isolation vars unavailable", exc_info=True)
-        return merged
 
     # ------------------------------------------------------------------
     # Public API
@@ -1929,7 +1959,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if effort and effort != "none":
             options.effort = effort
             options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
-        await self._apply_skills_allowlist(options)
+        await self._apply_skills_allowlist(options, user)
         await self._attach_mcp_progress_relay(options, session)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
@@ -1942,6 +1972,17 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         post_tool_use = self._post_tool_use_hooks()
         if post_tool_use:
             options.hooks["PostToolUse"] = post_tool_use
+
+        # A uid-mode broker ticket expires two minutes after it is minted, and
+        # the awaits above (skill discovery serialized under the global preflight
+        # lock, the relay probe) can outlast that under a burst: the broker
+        # would refuse the spawn. Mint it again right before the spawn (#241).
+        self._configure_confinement(
+            options,
+            Path(options.cwd) if options.cwd else None,
+            user,
+            session.session_id,
+        )
 
         # Auth and credential isolation ride options.env (_configure_sdk_env);
         # os.environ is shared by every concurrent connect and stays untouched.

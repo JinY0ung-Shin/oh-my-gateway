@@ -1077,13 +1077,17 @@ async def _validate_backend_prompt(
     resolved: ResolvedModel,
     prompt: str,
     workspace_str: str,
+    user: Optional[str] = None,
 ) -> None:
     if resolved.backend != "claude":
         return
     try:
+        # ``user`` is the identity create_client gets: under uid isolation the
+        # catalog preflight in the workspace runs as that session's uid.
         await validate_slash_prompt(
             prompt,
             cwd=Path(workspace_str) if workspace_str else None,
+            user=user,
         )
     except SlashCommandError as e:
         raise HTTPException(
@@ -2146,7 +2150,7 @@ async def create_response(
     # unknown skills or run destructive built-ins.  Only applies to the Claude
     # backend; other backends pass through unchanged.
     if isinstance(prompt, str):
-        await _validate_backend_prompt(resolved, prompt, workspace_str)
+        await _validate_backend_prompt(resolved, prompt, workspace_str, body.user)
     elif resolved.backend == "claude":
         # Block-mode prompts get the same slash validation on their text.
         await _validate_backend_prompt(
@@ -2157,6 +2161,7 @@ async def create_response(
                 if isinstance(b, dict) and b.get("type") == "text"
             ),
             workspace_str,
+            body.user,
         )
 
     if body.background:

@@ -362,6 +362,20 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 >   브로커로 온다). ABI ≥ 6이면 세션 룰셋에 `LANDLOCK_SCOPE_SIGNAL`을 넣어 세션이 감시 프로세스에 시그널을 못 보내게
 >   한다. reaping엔 특권이 아니라 **조상 관계**가 필요하다 — CLI의 조상이 아닌 형제 헬퍼는 거둘 수 없다.
 >
+> **구현 노트(PR #244 리뷰 2).** 위 C·O의 "U 감시 프로세스"는 구현에서 **spawn별 supervisor** 하나로 합쳐졌고,
+> 완전한 U가 아니다: `setgroups([])` → `setresgid(G,G,G)` → `setresuid(broker, U, broker)` 뒤 cap을 전부 버린다.
+> real/saved uid가 브로커라 uid U 프로세스는 supervisor에 시그널도 ptrace도 못 하고(kill은 보내는 쪽 real/effective를
+> 받는 쪽 real/saved와 비교한다 — **시그널 scoping이 없는 ABI < 6 커널에서도**), effective uid가 U라 supervisor는 U
+> 트리에 시그널을 보낼 수 있다. CLI 자식이 `(U,U,U)`를 스스로 마저 맞추고 확인한다(특권 불필요). 그래서 위의 "세션이
+> 자기 감시 프로세스를 죽일 수 있다"는 경로는 닫혔다. 런처 연결이 제어 채널이다: 중계된 SIGTERM/SIGINT는 CLI 그룹으로,
+> EOF면 SIGTERM → 첫 SIGTERM 5초 뒤 SIGKILL, CLI가 끝나면 남은 하위 프로세스를 자식이 없을 때까지 SIGKILL·reap한 뒤에야
+> 상태를 보낸다(CLI는 Bash 명령마다 따로 세션을 만들므로 그룹 kill만으론 `cmd &`가 샜다; `kill(-1)`은 같은 uid를 쓰는
+> 같은 사용자의 다른 세션까지 죽이므로 안 쓴다). 상주 브로커는 교차 uid로 시그널을 보내지 않는다 — CAP_KILL이 없어
+> EPERM이 조용히 삼켜지던 것이 리뷰 2의 #1이다. supervisor가 비정상 종료해 남긴 프로세스만 브로커(subreaper)가 그 uid로
+> 전환한 단명 자식으로 죽인다. ABI ≥ 6이면 두 모드 모두 `LANDLOCK_SCOPE_SIGNAL | ABSTRACT_UNIX_SOCKET`을 더한다. 남은 창:
+> 런처를 SIGTERM 중계 없이 바로 SIGKILL하면(`agent_messages` wedge) CLI가 최대 5초 더 살아 위의 정리 경쟁이 남는다 —
+> 정리를 브로커로 라우팅하는 후속에서 닫는다.
+>
 > **(V) userland은 passwd 항목을 요구한다.** 커널은 숫자 uid `setuid`에 `/etc/passwd`를 요구하지 않는다.
 > python `getpass.getuser()`는 **`LOGNAME`·`USER`·`LNAME`·`USERNAME`을 차례로 보고 하나라도 있으면** passwd를 보지
 > 않는다(CPython 3.12 `getpass.py`와 로컬 이미지의 Python 3.12.13으로 확인). 다만 출하된 env(이미지 ENV·entrypoint·
@@ -583,6 +597,13 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
   체크로는 안 잡힘). → `plugins/data`를 **쓰기 가능한 세션 상태**로 분리하거나, `CLAUDE_CODE_PLUGIN_CACHE_DIR`
   (쓰기용)과 `CLAUDE_CODE_PLUGIN_SEED_DIR`(읽기 전용 seed, 경로 구분자 목록)로 공유 seed와 세션별 쓰기를
   나눈다. 세션은 `plugins/cache/.../<ver>/.in_use/<pid>` 마커도 쓴다.
+  **구현(PR #244 리뷰 2):** 공유 `plugins/data`를 세션에 rw로 주면(landlock 모드는 모든 세션이 한 uid) 다른 세션의
+  훅이 실행하는 플러그인 상태를 심을 수 있어 막았다. CLI의 유일한 노브 `CLAUDE_CODE_PLUGIN_CACHE_DIR`은 data만이
+  아니라 plugins 루트 전체(cache·registry·marketplaces)를 옮기므로 세션별 data 디렉터리는 사용자별 config dir 없이는
+  불가능하다. 그래서 `plugins/data`는 **읽기 전용**으로 두고, 게이트웨이가 confined spawn마다
+  `installed_plugins.json`의 각 플러그인에 대해 `plugins/data/<id>`를 미리 만든다(`landlock._ensure_plugin_data_dirs`;
+  CLI의 mkdir가 EEXIST로 통과해 훅이 돈다 — 그 안에 쓰는 훅만 EACCES로 실패). 같은 이유로 `~/.npm`·uv 캐시도 공유
+  rw에서 빼고 세션별 `<cwd>/.cli-tmp/{npm-cache,uv-cache}`(`npm_config_cache`·`UV_CACHE_DIR`)로 옮겼다.
 - ⚠️ **`~/.claude/settings.json`은 세션별로 나누지 말 것 — 공유 *정책*이다.** admin이 관리하는 env 블록이
   여기 쓰이고(`claude_settings_env.py`, `user` setting source로 모든 세션에 적용), `claude plugin install
   --scope user`가 **플러그인 활성화(`enabledPlugins`)를 이 파일에 기록**한다. 세션마다 새 `settings.json`을
@@ -688,6 +709,10 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
      `multiprocessing.Lock()` 같은 POSIX 세마포어가 `PermissionError`다(로컬 확인). 공유 `/dev/shm`을 rw로 주면
      Landlock-only(모두 uid 1000)에선 `/tmp`처럼 세션 간 통로가 된다(POSIX shm/세마포어 경로는 `/dev/shm` 바로
      아래로 고정이라 Landlock만으론 세션별로 가를 수 없다).
+     **구현(PR #244):** 두 캐시는 세션 쓰기 경로로 재지정했다 — 런처/브로커가 `npm_config_cache`·
+     `NPM_CONFIG_CACHE`·`UV_CACHE_DIR`을 `<cwd>/.cli-tmp/{npm-cache,uv-cache}`로 덮어쓰고, 공유
+     `~/.npm`·uv 캐시는 rw 규칙에서 뺐다(워크스페이스마다 새로 받는다). `/dev/shm`은 multiprocessing 때문에 rw로
+     남겼고, landlock 모드에선 같은 uid 세션끼리의 공유 면으로 문서화한다(uid 모드는 DAC로 갈린다).
    - **②**: `bwrap --unshare-user --unshare-pid --proc /proc --dev /dev --die-with-parent --new-session
      --ro-bind <공유 자산> … --bind <워크스페이스> …`로 깨끗한 env와 함께 실제 `claude` exec. ⚠️ **빠지면 F2가 안
      닫히는 플래그들**: `--unshare-user`(비setuid·무특권 bwrap이 pid/mount ns를 만들려면 user ns가 필수),

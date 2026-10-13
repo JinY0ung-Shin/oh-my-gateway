@@ -142,7 +142,7 @@ def known_x(monkeypatch):
     sc._cache.reset()
     calls = {"n": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         calls["n"] += 1
         return {"x", "compact"}
 

@@ -19,7 +19,9 @@ The gateway body holds **no privilege**. This module is the unprivileged part:
   socket (``docker/landlock_launcher.py`` uid branch), and the broker verifies
   the signature, the nonce (single-use) and the expiry before switching uid.
   The shared secret (``GATEWAY_ISOLATION_TICKET_SECRET``) is established once at
-  broker startup and handed to the gateway; it never reaches a session.
+  broker startup and handed to the gateway, which moves it out of its own
+  environment at startup (:func:`capture_ticket_secret`) so no child inherits
+  it; it never reaches a session.
 
 The actual uid switch, the Landlock-after-switch and the broker's fork/watcher/
 reaper live in ``docker/isolation_broker.py`` and are only exercisable with
@@ -57,6 +59,9 @@ BROKER_SOCKET_ENV = "GATEWAY_ISOLATION_BROKER_SOCKET"
 # entries (userland needs a passwd record for the uid — see the design §3 V).
 _DEFAULT_UID_MIN = 20000
 _DEFAULT_UID_MAX = 29999
+# The broker's own dedicated uid, outside the default band (the entrypoint's
+# default must match: docker/entrypoint.py).
+_DEFAULT_BROKER_UID = 19999
 # Top slice of the band reserved for anonymous/stateless runs (recycled in
 # memory, never persisted) so they cannot exhaust the band — see the split in
 # :func:`_stable_band` / :func:`_ephemeral_band`.
@@ -90,7 +95,7 @@ def reserved_uids() -> Set[int]:
     identity, or the broker's uid — the #241 review's band-overlap finding)."""
     out: Set[int] = {0}
     out.add(_int_env("APP_UID", 1000))
-    out.add(_int_env(BROKER_UID_ENV, 21000))
+    out.add(_int_env(BROKER_UID_ENV, _DEFAULT_BROKER_UID))
     return out
 
 
@@ -130,6 +135,17 @@ class UidRegistry:
     stable (named-user) keys live here — anonymous/stateless runs use the
     in-memory :class:`_EphemeralPool` so they cannot grow this file or exhaust
     the band.
+
+    Fail-closed on a damaged file (#241 review): a registry that exists but
+    cannot be read or parsed raises :class:`UidAllocationError` instead of
+    loading as empty — an empty map would hand the lowest free uids out again,
+    giving a returning user a different uid (losing their files) or another
+    user's former uid. Entries that cannot be honored (malformed, outside the
+    band, reserved, or sharing a uid with another key) are kept on disk, their
+    uids are never handed to anyone else (the ephemeral pool excludes them too,
+    see :func:`get_ephemeral_pool`), their keys refuse to resolve, and uid-mode
+    startup refuses (:func:`registry_errors`) until an operator fixes the
+    registry or the band.
     """
 
     def __init__(
@@ -142,36 +158,128 @@ class UidRegistry:
         self._lock = threading.Lock()
         self._map: Dict[str, int] = {}
         self._used: set[int] = set()
+        # Raw entries kept verbatim on persist but never resolved (see _load).
+        self._held: Dict[str, object] = {}
         self._load()
 
     def _load(self) -> None:
         try:
-            raw = json.loads(self._path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return
+            text = self._path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return  # first start: nothing allocated yet
+        except (OSError, UnicodeDecodeError) as exc:
+            raise UidAllocationError(
+                f"cannot read uid registry {self._path}: {exc}; refusing to "
+                "allocate uids rather than reassign them"
+            ) from exc
+        try:
+            raw = json.loads(text)
+        except ValueError as exc:
+            raise UidAllocationError(
+                f"uid registry {self._path} is corrupt ({exc}); refusing to "
+                "allocate uids rather than reassign them. Restore it from a "
+                "backup, or remove it deliberately to start a fresh mapping."
+            ) from exc
         if not isinstance(raw, dict):
-            return
+            raise UidAllocationError(
+                f"uid registry {self._path} is not a JSON object; refusing to "
+                "allocate uids rather than reassign them"
+            )
+
+        def _is_uid(val: object) -> bool:
+            return isinstance(val, int) and not isinstance(val, bool)
+
+        owners: Dict[int, int] = {}
+        for uid in raw.values():
+            if _is_uid(uid):
+                owners[uid] = owners.get(uid, 0) + 1
         for key, uid in raw.items():
-            if not (isinstance(key, str) and isinstance(uid, int)):
-                continue
-            if self._lo <= uid <= self._hi and uid not in self._reserved:
+            if (
+                _is_uid(uid)
+                and self._lo <= uid <= self._hi
+                and uid not in self._reserved
+                and owners[uid] == 1
+            ):
                 self._map[key] = uid
                 self._used.add(uid)
+                continue
+            self._held[key] = uid
+            if _is_uid(uid):
+                self._used.add(uid)  # never hand a held uid to another key
+        if self._held:
+            logger.warning(
+                "uid registry %s: %d entr%s cannot be honored (malformed, outside "
+                "[%d, %d], reserved, or sharing a uid with another user); those "
+                "users' spawns are refused until the registry or the band is fixed",
+                self._path,
+                len(self._held),
+                "y" if len(self._held) == 1 else "ies",
+                self._lo,
+                self._hi,
+            )
 
     def _persist(self) -> None:
         """Write the map durably. Raises ``UidAllocationError`` on failure so a
         new allocation fails closed rather than handing out a uid that would be
         lost on restart (a resumed session must land on the uid owning its
-        files; a silently dropped write risks a different or reused uid)."""
+        files; a silently dropped write risks a different or reused uid).
+
+        The temp file is fsynced before the atomic replace and the directory
+        after it, so a crash cannot leave a truncated registry behind (which
+        :meth:`_load` would then refuse). Held entries are written back
+        unchanged. Mode 0600: the map names every user.
+
+        Only a failure *before* the replace raises: once the new map is in
+        place the allocation is on disk, so a failing directory fsync is
+        logged instead — rolling the grant back then would free a uid the file
+        already assigns, and the next allocation could hand it to someone else.
+        """
+        data: Dict[str, object] = dict(self._held)
+        data.update(self._map)
+        payload = json.dumps(data, sort_keys=True).encode("utf-8")
+        tmp = self._path.with_suffix(self._path.suffix + ".tmp")
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(self._map), encoding="utf-8")
+            fd = os.open(
+                tmp,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            with os.fdopen(fd, "wb") as fh:
+                os.fchmod(fh.fileno(), 0o600)
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, self._path)
         except OSError as exc:
             raise UidAllocationError(
                 f"could not persist uid registry {self._path}: {exc}"
             ) from exc
+        try:
+            dfd = os.open(
+                self._path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError as exc:
+            logger.warning(
+                "uid registry %s was replaced but its directory could not be "
+                "fsynced (%s); the allocation stands",
+                self._path,
+                exc,
+            )
+
+    def claimed_uids(self) -> Set[int]:
+        """Every uid the registry file accounts for, honored or held."""
+        with self._lock:
+            return set(self._used)
+
+    def held_count(self) -> int:
+        """How many registry entries cannot be honored under the current band."""
+        with self._lock:
+            return len(self._held)
 
     def resolve(self, key: str) -> int:
         """Return the uid for *key*, allocating the lowest free one if new."""
@@ -179,6 +287,13 @@ class UidRegistry:
             existing = self._map.get(key)
             if existing is not None:
                 return existing
+            if key in self._held:
+                raise UidAllocationError(
+                    f"the uid registry entry for this user ({self._held[key]!r}) "
+                    f"cannot be honored (outside [{self._lo}, {self._hi}], "
+                    "reserved, malformed, or shared with another user); refusing "
+                    "to assign a different uid. Fix the registry or the band."
+                )
             for uid in range(self._lo, self._hi + 1):
                 if uid in self._used or uid in self._reserved:
                     continue
@@ -259,11 +374,24 @@ def get_registry() -> UidRegistry:
 
 
 def get_ephemeral_pool() -> _EphemeralPool:
+    """The anonymous/stateless uid pool.
+
+    Excludes every uid the persisted registry accounts for — not only the
+    reserved ones: after a band change a named user's uid (now *held*) can sit
+    inside the ephemeral band, and handing it to an anonymous run would give
+    that run the named user's files. The registry is loaded first (outside the
+    lock — :func:`get_registry` takes it too), so a damaged registry fails the
+    anonymous path closed as well.
+    """
     global _ephemeral_pool
+    pool = _ephemeral_pool
+    if pool is not None:
+        return pool
+    claimed = get_registry().claimed_uids()
     with _registry_lock:
         if _ephemeral_pool is None:
             lo, hi = _ephemeral_band()
-            _ephemeral_pool = _EphemeralPool(lo, hi, reserved_uids())
+            _ephemeral_pool = _EphemeralPool(lo, hi, reserved_uids() | claimed)
         return _ephemeral_pool
 
 
@@ -285,6 +413,32 @@ def resolve_uid(key: str, *, persist: bool = True) -> int:
     if persist:
         return get_registry().resolve(key)
     return get_ephemeral_pool().resolve(key)
+
+
+def registry_errors() -> List[str]:
+    """Startup errors for an unusable uid registry (empty list means OK).
+
+    Loads the registry once so a damaged file refuses startup in uid mode
+    instead of failing each named user's first spawn later. Entries the current
+    band cannot honor (e.g. after narrowing it or growing the ephemeral slice)
+    are an error too: their users would be refused at every spawn.
+    """
+    try:
+        registry = get_registry()
+    except UidAllocationError as exc:
+        return [str(exc)]
+    held = registry.held_count()
+    if held:
+        lo, hi = _stable_band()
+        return [
+            f"the uid registry {_registry_path()} holds {held} entr"
+            f"{'y' if held == 1 else 'ies'} the current stable band [{lo}, {hi}] "
+            "cannot honor (outside it, reserved, malformed, or sharing a uid); "
+            "those users would be refused at every spawn. Restore "
+            f"{UID_MIN_ENV}/{UID_MAX_ENV}/{EPHEMERAL_UIDS_ENV}, or fix the "
+            "registry deliberately."
+        ]
+    return []
 
 
 def validate_bands() -> List[str]:
@@ -311,7 +465,20 @@ def validate_bands() -> List[str]:
             f"reserving {sorted(reserved)}; widen {UID_MIN_ENV}/{UID_MAX_ENV} or "
             f"lower {EPHEMERAL_UIDS_ENV}."
         )
-    broker_uid = _int_env(BROKER_UID_ENV, 21000)
+    # Anonymous/stateless runs (every /v1/agents/messages call, anonymous
+    # sessions) draw from the ephemeral band; an empty one would fail each of
+    # them at spawn time instead of refusing startup with the reason.
+    elo, ehi = _ephemeral_band()
+    if _ephemeral_count() <= 0 or not any(
+        u not in reserved for u in range(elo, ehi + 1)
+    ):
+        errors.append(
+            f"the ephemeral uid band (top {EPHEMERAL_UIDS_ENV} uids of "
+            f"[{lo}, {hi}]) has no allocatable uids after reserving "
+            f"{sorted(reserved)}; anonymous/stateless runs could not be assigned "
+            f"a uid. Widen the band or raise {EPHEMERAL_UIDS_ENV} (>= 1)."
+        )
+    broker_uid = _int_env(BROKER_UID_ENV, _DEFAULT_BROKER_UID)
     app_uid = _int_env("APP_UID", 1000)
     for name, val in (("broker", broker_uid), ("gateway app", app_uid)):
         if lo <= val <= hi:
@@ -331,9 +498,46 @@ def validate_bands() -> List[str]:
 # --------------------------------------------------------------------------
 
 
-def _secret() -> Optional[bytes]:
+_captured_secret: Optional[bytes] = None
+
+
+def capture_ticket_secret() -> None:
+    """Move the ticket secret out of ``os.environ`` into module memory.
+
+    The entrypoint hands the secret to the gateway through its environment.
+    Left there, every child that copies ``os.environ`` — the frozen
+    codex/opencode clients, startup probes, anything not routed through the
+    per-spawn blanking — inherits it and could mint a valid ticket for any uid
+    or workspace (#241 review). Called once at startup, before any spawn;
+    idempotent. The exec-time copy in ``/proc/<gateway>/environ`` remains: the
+    non-dumpable policy (``GATEWAY_NON_DUMPABLE``, on by default) keeps it
+    root-only for the serving process, but not for a ``uvicorn --workers`` /
+    ``--reload`` supervisor; confined sessions are kept off both by the uid
+    split (uid mode) or Landlock's ptrace scoping.
+    """
+    global _captured_secret
+    raw = (os.environ.pop(TICKET_SECRET_ENV, None) or "").strip()
+    if raw:
+        _captured_secret = raw.encode("utf-8")
+
+
+def reset_captured_secret() -> None:
+    """Forget a captured secret (tests)."""
+    global _captured_secret
+    _captured_secret = None
+
+
+def ticket_secret() -> Optional[bytes]:
+    """The ticket HMAC secret: the environment value if set, else the one
+    :func:`capture_ticket_secret` moved into memory; ``None`` when neither."""
     raw = (os.getenv(TICKET_SECRET_ENV) or "").strip()
-    return raw.encode("utf-8") if raw else None
+    if raw:
+        return raw.encode("utf-8")
+    return _captured_secret
+
+
+def _secret() -> Optional[bytes]:
+    return ticket_secret()
 
 
 def mint_ticket(
@@ -379,16 +583,25 @@ def verify_ticket(ticket: str, *, seen_nonces: Optional[set] = None) -> Dict:
     secret = _secret()
     if secret is None:
         raise ValueError("no ticket secret configured")
+    # Same refusals as the broker's copy (docker/isolation_broker.py), so the
+    # two never disagree: tickets are minted ASCII, so anything else is
+    # malformed rather than a TypeError out of compare_digest.
+    if not isinstance(ticket, str) or not ticket.isascii():
+        raise ValueError("malformed ticket")
     sig, _, body = ticket.partition(".")
     if not sig or not body:
         raise ValueError("malformed ticket")
-    expected = hmac.new(secret, body.encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
+    expected = hmac.new(secret, body.encode("ascii"), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(sig.encode("ascii"), expected.encode("ascii")):
         raise ValueError("bad ticket signature")
     payload = json.loads(body)
-    if int(payload.get("exp", 0)) < int(time.time()):
+    if not isinstance(payload, dict):
+        raise ValueError("ticket payload is not an object")
+    exp, nonce = payload.get("exp"), payload.get("nonce")
+    if type(exp) is not int or not isinstance(nonce, str) or not nonce:
+        raise ValueError("ticket lacks an integer exp or a nonce")
+    if exp < int(time.time()):
         raise ValueError("ticket expired")
-    nonce = payload.get("nonce")
     if seen_nonces is not None:
         if nonce in seen_nonces:
             raise ValueError("ticket already used")

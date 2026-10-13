@@ -20,7 +20,10 @@ import json
 import os
 import subprocess
 import sys
+import time
+import uuid
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,18 +41,28 @@ def _landlock_skip() -> str:
 
 
 @pytest.fixture(autouse=True)
-def _reset_isolation_env(monkeypatch):
+def _reset_isolation_env(monkeypatch, tmp_path_factory):
     # effective_mode is memoized and several vars steer it; start each test from
     # a clean slate so cross-test state never leaks.
+    from src.backends.claude import uid_isolation as ui
+
     for var in (
         landlock.FALLBACK_ENV,
         landlock.BROKER_SOCKET_ENV,
+        landlock.BROKER_WAIT_ENV,
         "GATEWAY_ISOLATION_TICKET_SECRET",
     ):
         monkeypatch.delenv(var, raising=False)
+    # Building the path lists pre-creates plugin data and session-env dirs in
+    # the config dir: keep that out of the developer's real ~/.claude.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path_factory.mktemp("claude-cfg")))
     landlock.reset_mode_cache()
+    ui.reset_captured_secret()
+    ui.reset_registry_cache()
     yield
     landlock.reset_mode_cache()
+    ui.reset_captured_secret()
+    ui.reset_registry_cache()
 
 
 @pytest.fixture
@@ -182,6 +195,20 @@ class TestUidMode:
         landlock.reset_mode_cache()
         errors = landlock.check_config()
         assert any("TICKET_SECRET" in e for e in errors)
+
+    def test_check_config_uid_accepts_a_captured_secret(self, monkeypatch):
+        # Startup moves the secret out of os.environ before check_config runs;
+        # the check must read the captured copy, not report it missing.
+        from src.backends.claude import uid_isolation as ui
+
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        landlock.reset_mode_cache()
+        ui.capture_ticket_secret()
+        assert ui.TICKET_SECRET_ENV not in os.environ
+        errors = landlock.check_config()
+        assert not any("TICKET_SECRET" in e for e in errors), errors
 
 
 class TestFailClosed:
@@ -415,30 +442,69 @@ class TestLauncherConfines:
         assert r["escape_write"].startswith("DENY")  # cannot write outside the ws
 
 
-class TestReviewRoRwLists:
-    """#5/#6/#14: the confined CLI can read its own config, write its runtime
-    caches, and CLAUDE_ADD_DIRS rides the #240 filter (not the raw strings)."""
+def _cfg(monkeypatch, tmp_path) -> Path:
+    cfg = tmp_path / ".claude"
+    cfg.mkdir()
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    return cfg
 
-    def _cfg(self, monkeypatch, tmp_path) -> Path:
-        cfg = tmp_path / ".claude"
-        cfg.mkdir()
-        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
-        return cfg
+
+def _entries(env: dict, var: str) -> list:
+    return env[var].split(os.pathsep)
+
+
+class TestReviewRoRwLists:
+    """#5/#6/#14 and the second review: the confined CLI can read its own
+    config, no shared cache is writable, and CLAUDE_ADD_DIRS rides the #240
+    filter (not the raw strings)."""
+
+    _cfg = staticmethod(_cfg)
 
     def test_ro_includes_cli_config_files(self, confine_on, monkeypatch, tmp_path):
+        # With CLAUDE_CONFIG_DIR set, CLI 2.1.283 reads <dir>/.claude.json —
+        # inside the dir, not beside it — and the legacy <dir>/.config.json
+        # first when that exists.
         cfg = self._cfg(monkeypatch, tmp_path)
-        env = landlock.options_env(tmp_path / "ws")
-        ro = env[landlock.RO_ENV].split(os.pathsep)
+        ro = _entries(landlock.options_env(tmp_path / "ws"), landlock.RO_ENV)
         assert str(cfg / "settings.json") in ro
-        assert str(cfg.parent / ".claude.json") in ro
+        assert str(cfg / ".claude.json") in ro
+        assert str(cfg / ".config.json") in ro
+        assert str(cfg.parent / ".claude.json") not in ro
 
-    def test_rw_includes_runtime_caches(self, confine_on, monkeypatch, tmp_path):
+    def test_global_config_of_a_symlinked_config_dir(
+        self, confine_on, monkeypatch, tmp_path
+    ):
+        # Without CLAUDE_CONFIG_DIR the CLI reads $HOME/.claude.json. The guard
+        # resolves a symlinked ~/.claude, whose parent is not $HOME.
+        home = tmp_path / "home"
+        home.mkdir()
+        real = tmp_path / "volume" / "cfg"
+        real.mkdir(parents=True)
+        (home / ".claude").symlink_to(real)
+        monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+        monkeypatch.setenv("HOME", str(home))
+        ro = _entries(landlock.options_env(tmp_path / "ws"), landlock.RO_ENV)
+        assert str(home / ".claude.json") in ro
+        assert str(real.parent / ".claude.json") not in ro
+        assert str(real / "settings.json") in ro
+
+    def test_rw_holds_no_shared_cache(self, confine_on, monkeypatch, tmp_path):
+        # Every landlock-mode session shares one uid, so a writable ~/.npm, uv
+        # cache or plugins/data would let one session plant what another's
+        # `npx -y`, `uv run` or plugin hook runs next. RW is the session's own.
+        from src.backends.claude.workspace_sandbox import _project_dir_name
+
         cfg = self._cfg(monkeypatch, tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uvc"))
-        env = landlock.options_env(tmp_path / "ws")
-        rw = env[landlock.RW_ENV].split(os.pathsep)
-        assert str(cfg / "plugins" / "data") in rw
-        assert str(tmp_path / "uvc") in rw
+        ws = tmp_path / "ws"
+        env = landlock.options_env(ws)
+        assert _entries(env, landlock.RW_ENV) == [
+            str(ws),
+            str(cfg / "projects" / _project_dir_name(str(ws))),
+        ]
+        # plugins/data stays readable: the whole plugins tree is a ro asset.
+        assert str(cfg / "plugins") in _entries(env, landlock.RO_ENV)
 
     def test_add_dirs_are_filtered_not_raw(self, confine_on, monkeypatch, tmp_path):
         self._cfg(monkeypatch, tmp_path)
@@ -450,21 +516,62 @@ class TestReviewRoRwLists:
         assert str(extra) not in ro
 
 
-class TestPreflightConfinement:
-    """#8: the slash/catalog preflight is confined (landlock shape, real cwd)."""
+@pytest.fixture
+def uid_on(monkeypatch, tmp_path):
+    """uid mode with a reachable broker faked, a secret and a temp registry."""
+    monkeypatch.setenv(landlock.MODE_ENV, "uid")
+    monkeypatch.setenv("GATEWAY_ISOLATION_TICKET_SECRET", "s3cret")
+    monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+    monkeypatch.setenv("CLAUDE_ISOLATION_UID_REGISTRY", str(tmp_path / "uids.json"))
+    monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+    landlock.reset_mode_cache()
 
-    def test_preflight_env_is_landlock_even_in_uid_mode(self, monkeypatch, tmp_path):
-        monkeypatch.setenv(landlock.MODE_ENV, "uid")
-        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+
+def _ticket(env: dict) -> dict:
+    from src.backends.claude import uid_isolation as ui
+
+    return ui.verify_ticket(env[landlock.TICKET_ENV])
+
+
+class TestPreflightConfinement:
+    """#8 and the second review (G1): the slash/catalog preflight is confined,
+    runs as the session's uid in a session workspace, and runs no hook and no
+    MCP server."""
+
+    def test_session_preflight_runs_as_the_session_uid(self, uid_on, tmp_path):
+        # The workspace's settings, skills and commands load in the preflight
+        # too, so in uid mode it must not run as the gateway uid.
+        ws = tmp_path / "ws"
+        pre = landlock.preflight_options_env(ws, user="alice")
+        assert pre[landlock.MODE_ENV] == "uid"
+        assert landlock.RO_ENV not in pre and landlock.RW_ENV not in pre
+        session = _ticket(landlock.options_env(ws, user="alice"))
+        assert _ticket(pre)["uid"] == session["uid"]
+        assert _ticket(pre)["workspace"] == str(ws)
+
+    def test_anonymous_preflight_shares_the_session_uid(
+        self, uid_on, monkeypatch, tmp_path
+    ):
+        # Keyed on the absolute workspace however the cwd was spelled: the
+        # preflight's cwd is absolute, the session's may be relative.
+        monkeypatch.chdir(tmp_path)
+        pre = landlock.preflight_options_env(tmp_path / "ws")
+        session = landlock.options_env(Path("ws"))
+        assert _ticket(pre)["uid"] == _ticket(session)["uid"]
+
+    def test_gateway_owned_preflight_is_landlock_even_in_uid_mode(
+        self, uid_on, monkeypatch, tmp_path
+    ):
+        # No session uid to run a no-workspace preflight as.
         monkeypatch.setenv(landlock.REAL_CLI_ENV, _SYSTEM_PYTHON)
-        landlock.reset_mode_cache()
-        env = landlock.preflight_options_env(tmp_path)
+        env = landlock.preflight_options_env(tmp_path, gateway_owned=True)
         assert env[landlock.MODE_ENV] == "landlock"  # never uid (no ticket/broker)
         assert landlock.RO_ENV in env and landlock.RW_ENV in env
         assert env[landlock.REAL_CLI_ENV]
 
     def test_preflight_env_empty_when_off(self, confine_off, tmp_path):
         assert landlock.preflight_options_env(tmp_path) == {}
+        assert landlock.preflight_options_env(tmp_path, gateway_owned=True) == {}
 
     def test_build_preflight_options_gives_real_cwd_and_env(
         self, confine_on, monkeypatch
@@ -476,6 +583,534 @@ class TestPreflightConfinement:
         assert opts.cwd is not None  # a real dir, never None (would grab /app)
         assert (opts.env or {}).get(landlock.MODE_ENV) == "landlock"
         assert (opts.env or {}).get("GATEWAY_ISOLATION_TICKET_SECRET") == ""
+
+    def test_build_preflight_options_in_a_workspace_uses_the_ticket(
+        self, uid_on, tmp_path
+    ):
+        from src.backends.claude import slash_commands as sc
+
+        opts = sc._build_preflight_options(tmp_path / "ws", user="alice")
+        assert opts.env[landlock.MODE_ENV] == "uid"
+        assert _ticket(opts.env)["workspace"] == str(tmp_path / "ws")
+        assert opts.env["GATEWAY_ISOLATION_TICKET_SECRET"] == ""
+
+    @pytest.mark.parametrize("mode", ["off", "landlock"])
+    def test_preflight_runs_no_hook_no_mcp_server_and_no_helper(
+        self, monkeypatch, tmp_path, mode
+    ):
+        from src.backends.claude import slash_commands as sc
+
+        monkeypatch.setenv(landlock.MODE_ENV, mode)
+        landlock.reset_mode_cache()
+        opts = sc._build_preflight_options(tmp_path)
+        assert opts.strict_mcp_config is True
+        assert not opts.mcp_servers
+        settings = json.loads(opts.settings)
+        assert settings.pop("disableAllHooks") is True
+        # Every startup command the CLI 2.1.283 schema has, blanked; the four
+        # observed to run in a preflight among them.
+        assert {
+            "apiKeyHelper",
+            "awsAuthRefresh",
+            "awsCredentialExport",
+            "gcpAuthRefresh",
+        } <= set(settings)
+        assert settings == dict.fromkeys(sc._PREFLIGHT_HELPERS, "")
+
+    @pytest.mark.parametrize("mode", ["off", "landlock", "uid"])
+    def test_preflight_env_blanks_the_session_secrets(
+        self, monkeypatch, tmp_path, mode
+    ):
+        # Whatever still runs in a preflight (a workspace apiKeyHelper did)
+        # must see none of the gateway's secrets.
+        from src.backends.claude import slash_commands as sc
+
+        monkeypatch.setenv("SYSINFO_REDACTION", "true")
+        monkeypatch.setenv("CLAUDE_AUTH_METHOD", "api_key")
+        secrets = (
+            "ADMIN_API_KEY",
+            "API_KEY",
+            "OPENAI_API_KEY",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+        )
+        for name in secrets:
+            monkeypatch.setenv(name, f"{name}-value")
+        monkeypatch.setenv(landlock.MODE_ENV, mode)
+        monkeypatch.setenv("GATEWAY_ISOLATION_TICKET_SECRET", "s3cret")
+        if mode == "uid":
+            monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+            monkeypatch.setenv(
+                "CLAUDE_ISOLATION_UID_REGISTRY", str(tmp_path / "uids.json")
+            )
+            monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        landlock.reset_mode_cache()
+        env = sc._build_preflight_options(tmp_path / "ws", user="alice").env
+        for name in (*secrets, "GATEWAY_ISOLATION_TICKET_SECRET"):
+            assert env[name] == "", name
+        if mode == "uid":
+            assert env[landlock.MODE_ENV] == "uid"  # the confinement env survives
+
+    def test_preflight_and_session_share_the_secret_blanks(
+        self, monkeypatch, tmp_path
+    ):
+        from src.backends.claude import slash_commands as sc
+        from src.backends.claude.client import child_secret_env
+
+        monkeypatch.setenv("SYSINFO_REDACTION", "true")
+        monkeypatch.setenv("SYSINFO_CHILD_ENV_MASK", "USAGE_LOG_DB_URL")
+        blanks = child_secret_env()
+        expected = {"ADMIN_API_KEY", "API_KEY", "USAGE_LOG_DB_URL", "OPENAI_API_KEY"}
+        assert expected <= set(blanks)
+        preflight = sc._build_preflight_options(tmp_path).env
+        session = TestClientOverrides()._cli()._build_sdk_options(cwd=tmp_path).env
+        assert blanks.items() <= preflight.items()
+        assert blanks.items() <= session.items()
+
+    def test_preflight_cwd_is_private_per_process(self, monkeypatch, tmp_path):
+        # A fixed shared name could be pre-created by another uid with a
+        # planted .claude/settings.json; the dir must be fresh and 0700.
+        import stat
+        import tempfile
+
+        from src.backends.claude import slash_commands as sc
+
+        monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+        monkeypatch.setattr(sc, "_preflight_dir", None)
+        planted = tmp_path / "gateway-slash-preflight"
+        (planted / ".claude").mkdir(parents=True)
+        (planted / ".claude" / "settings.json").write_text("{}")
+        d = sc._preflight_cwd()
+        assert d != planted and d.parent == tmp_path
+        assert d.name.startswith("gateway-slash-preflight-")
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+        assert list(d.iterdir()) == []
+        assert sc._preflight_cwd() == d  # one per process
+
+
+class TestPreflightUserThreading:
+    """The user reaches the preflight from every caller that knows it."""
+
+    async def test_validate_prompt_passes_the_user(self, monkeypatch, tmp_path):
+        from src.backends.claude import slash_commands as sc
+
+        seen = []
+
+        async def _fake_fetch(cwd, user=None):
+            seen.append(user)
+            return {"review"}
+
+        sc._cache.reset()
+        monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
+        await sc.validate_prompt("/review", cwd=tmp_path, user="alice")
+        assert seen == ["alice"]
+        sc._cache.reset()
+
+    async def test_skills_allowlist_passes_the_user(self, monkeypatch):
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        from src.backends.claude import slash_commands as sc
+
+        seen = []
+
+        async def _fake_available(cwd=None, force=False, user=None):
+            seen.append(user)
+            return {"review"}
+
+        monkeypatch.setattr(sc, "get_available_commands", _fake_available)
+        options = ClaudeAgentOptions(cwd="/tmp/ws", skills=["review"])
+        await TestClientOverrides()._cli()._apply_skills_allowlist(options, "alice")
+        assert seen == ["alice"]
+
+    async def test_responses_validation_passes_the_user(self, monkeypatch):
+        import src.routes.responses as responses_module
+
+        seen = {}
+
+        async def _fake_validate(prompt, cwd=None, user=None):
+            seen.update(prompt=prompt, cwd=cwd, user=user)
+
+        monkeypatch.setattr(responses_module, "validate_slash_prompt", _fake_validate)
+        await responses_module._validate_backend_prompt(
+            SimpleNamespace(backend="claude"), "/review", "/tmp/ws", "alice"
+        )
+        assert seen == {"prompt": "/review", "cwd": Path("/tmp/ws"), "user": "alice"}
+
+
+class TestPluginDataDirs:
+    """G3: plugins/data is read-only to sessions, so the gateway pre-creates
+    each installed plugin's data dir or the CLI fails the plugin's hooks."""
+
+    @pytest.mark.parametrize(
+        ("plugin_id", "names"),
+        [
+            # Both observed as CLI-created dirs on CLI 2.1.283.
+            ("hookplug@testmkt", ["hookplug-testmkt"]),
+            (
+                "defect-agent-frontend@defect-agent-plugins",
+                ["defect-agent-frontend-defect-agent-plugins"],
+            ),
+            ("a.b c@m_k", ["a-b-c-m_k"]),
+            ("@scope/Pkg@npm", ["-scope-Pkg-npm", "_40scope_2f_50kg-npm"]),
+            ("../..", []),
+        ],
+    )
+    def test_data_dir_names_follow_the_cli(self, plugin_id, names):
+        assert landlock._plugin_data_names(plugin_id) == names
+
+    def test_installed_plugins_get_their_data_dir(
+        self, confine_on, monkeypatch, tmp_path
+    ):
+        cfg = _cfg(monkeypatch, tmp_path)
+        (cfg / "plugins").mkdir()
+        (cfg / "plugins" / "installed_plugins.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {"hookplug@testmkt": [], "other@mkt": []},
+                }
+            )
+        )
+        env = landlock.options_env(tmp_path / "ws")
+        data = cfg / "plugins" / "data"
+        assert sorted(p.name for p in data.iterdir()) == [
+            "hookplug-testmkt",
+            "other-mkt",
+        ]
+        assert not any(e.startswith(str(data)) for e in _entries(env, landlock.RW_ENV))
+
+    def test_no_registry_creates_nothing(self, confine_on, monkeypatch, tmp_path):
+        cfg = _cfg(monkeypatch, tmp_path)
+        landlock.options_env(tmp_path / "ws")
+        assert not (cfg / "plugins" / "data").exists()
+
+
+class TestSessionEnvDir:
+    """G10: the session's own session-env dir is created 0700 and granted; the
+    directory of every session's env scripts is not."""
+
+    def test_own_dir_is_created_and_granted(self, confine_on, monkeypatch, tmp_path):
+        import stat
+
+        cfg = _cfg(monkeypatch, tmp_path)
+        sid = str(uuid.uuid4())
+        env = landlock.options_env(tmp_path / "ws", session_id=sid)
+        own = cfg / "session-env" / sid
+        assert str(own) in _entries(env, landlock.RW_ENV)
+        assert stat.S_IMODE(own.stat().st_mode) == 0o700
+        everything = _entries(env, landlock.RW_ENV) + _entries(env, landlock.RO_ENV)
+        assert str(cfg / "session-env") not in everything
+
+    def test_unknown_session_id_grants_nothing(self, confine_on, monkeypatch, tmp_path):
+        cfg = _cfg(monkeypatch, tmp_path)
+        env = landlock.options_env(tmp_path / "ws")
+        assert not any("session-env" in e for e in _entries(env, landlock.RW_ENV))
+        assert not (cfg / "session-env").exists()
+
+    @pytest.mark.parametrize("sid", ["../escape", "a/b", ".hidden", "-x", "a b"])
+    def test_unsafe_session_id_grants_nothing(
+        self, confine_on, monkeypatch, tmp_path, sid
+    ):
+        _cfg(monkeypatch, tmp_path)
+        env = landlock.options_env(tmp_path / "ws", session_id=sid)
+        assert not any("session-env" in e for e in _entries(env, landlock.RW_ENV))
+
+    def test_planted_symlink_is_not_granted(self, confine_on, monkeypatch, tmp_path):
+        cfg = _cfg(monkeypatch, tmp_path)
+        sid = str(uuid.uuid4())
+        (cfg / "session-env").mkdir()
+        (cfg / "session-env" / sid).symlink_to(tmp_path)
+        env = landlock.options_env(tmp_path / "ws", session_id=sid)
+        assert not any("session-env" in e for e in _entries(env, landlock.RW_ENV))
+
+    def test_removal_takes_exactly_the_sessions_dir(
+        self, confine_on, monkeypatch, tmp_path
+    ):
+        cfg = _cfg(monkeypatch, tmp_path)
+        sid, other = str(uuid.uuid4()), str(uuid.uuid4())
+        landlock.options_env(tmp_path / "ws", session_id=sid)
+        landlock.options_env(tmp_path / "ws", session_id=other)
+        own = cfg / "session-env" / sid
+        (own / "sessionstart-hook-0.sh").write_text("export X=1\n")
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "keep.txt").write_text("keep")
+        (own / "link").symlink_to(outside)  # removed, never followed
+        landlock.remove_session_env_dir(sid)
+        assert not own.exists()
+        assert (cfg / "session-env" / other).is_dir()
+        assert (outside / "keep.txt").read_text() == "keep"
+
+    @pytest.mark.parametrize("sid", ["../escape", "a/b", ".hidden", "", None])
+    def test_removal_ignores_an_unsafe_session_id(self, monkeypatch, tmp_path, sid):
+        cfg = _cfg(monkeypatch, tmp_path)
+        (cfg / "session-env" / "keep").mkdir(parents=True)
+        (cfg / "escape").mkdir()  # what session-env/../escape would name
+        (cfg / "session-env" / "a").mkdir()  # and a/b's parent
+        landlock.remove_session_env_dir(sid)
+        assert (cfg / "session-env" / "keep").is_dir()
+        assert (cfg / "escape").is_dir()
+        assert (cfg / "session-env" / "a").is_dir()
+
+    def test_removal_leaves_a_symlink_alone(self, monkeypatch, tmp_path):
+        cfg = _cfg(monkeypatch, tmp_path)
+        sid = str(uuid.uuid4())
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "keep.txt").write_text("keep")
+        (cfg / "session-env").mkdir()
+        (cfg / "session-env" / sid).symlink_to(target)
+        landlock.remove_session_env_dir(sid)
+        assert (cfg / "session-env" / sid).is_symlink()
+        assert (target / "keep.txt").read_text() == "keep"
+        landlock.remove_session_env_dir(str(uuid.uuid4()))  # missing: a no-op
+
+    def test_stateless_cleanup_removes_it(self, confine_on, monkeypatch, tmp_path):
+        # /v1/agents/messages and the admin prompt try-run share this cleanup.
+        from src.routes.agent_messages import _cleanup_sdk_transcript
+        from src.session_manager import Session
+
+        cfg = _cfg(monkeypatch, tmp_path)
+        sid = str(uuid.uuid4())
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        landlock.options_env(ws, session_id=sid)
+        assert (cfg / "session-env" / sid).is_dir()
+        _cleanup_sdk_transcript(Session(session_id=sid, workspace=str(ws)))
+        assert not (cfg / "session-env" / sid).exists()
+
+    @pytest.mark.parametrize("kind", ["session_id", "resume"])
+    def test_session_options_grant_the_cli_session_id(
+        self, confine_on, monkeypatch, tmp_path, kind
+    ):
+        # A resumed session keeps its id, so it uses the same dir.
+        cfg = _cfg(monkeypatch, tmp_path)
+        sid = str(uuid.uuid4())
+        options = TestClientOverrides()._cli()._build_sdk_options(
+            cwd=tmp_path / "ws", **{kind: sid}
+        )
+        assert str(cfg / "session-env" / sid) in _entries(options.env, landlock.RW_ENV)
+
+
+class TestAbsolutePaths:
+    """G13: a relative workspace (USER_WORKSPACES_DIR=./workspaces) leaves the
+    gateway absolute — the launcher would resolve it against the workspace."""
+
+    def test_landlock_lists_are_absolute(self, confine_on, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        env = landlock.options_env(Path("workspaces") / "alice", session_id="s1")
+        entries = _entries(env, landlock.RO_ENV) + _entries(env, landlock.RW_ENV)
+        assert entries and all(os.path.isabs(e) for e in entries), entries
+        assert str(tmp_path / "workspaces" / "alice") in _entries(
+            env, landlock.RW_ENV
+        )
+
+    def test_lists_name_the_project_dir_of_the_absolute_cwd(
+        self, confine_on, monkeypatch, tmp_path
+    ):
+        # The CLI names its project dir after its absolute cwd; a name encoded
+        # from the relative spelling would be an extra, wrong grant.
+        from src.backends.claude.workspace_sandbox import _project_dir_name
+
+        cfg = _cfg(monkeypatch, tmp_path)
+        monkeypatch.chdir(tmp_path)
+        ws = tmp_path / "workspaces" / "alice"
+        _ro, rw = landlock._ro_rw_roots(Path("workspaces") / "alice")
+        assert rw == [str(ws), str(cfg / "projects" / _project_dir_name(str(ws)))]
+
+    def test_relative_config_dir_entries_are_absolute(
+        self, confine_on, monkeypatch, tmp_path
+    ):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "cfg").mkdir()
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", "cfg")
+        env = landlock.options_env(tmp_path / "ws")
+        assert str(tmp_path / "cfg" / ".claude.json") in _entries(
+            env, landlock.RO_ENV
+        )
+        assert all(os.path.isabs(e) for e in _entries(env, landlock.RO_ENV))
+
+    def test_uid_ticket_is_absolute(self, uid_on, monkeypatch, tmp_path):
+        monkeypatch.chdir(tmp_path)
+        payload = _ticket(landlock.options_env(Path("workspaces") / "alice"))
+        assert payload["workspace"] == str(tmp_path / "workspaces" / "alice")
+        assert all(os.path.isabs(e) for e in payload["ro"] + payload["rw"])
+
+    def test_session_cwd_is_absolute(self, confine_on, monkeypatch, tmp_path):
+        # The SDK copies options.cwd into PWD, which the launcher grants.
+        monkeypatch.chdir(tmp_path)
+        options = TestClientOverrides()._cli()._build_sdk_options(
+            cwd=Path("workspaces") / "alice"
+        )
+        assert Path(options.cwd) == tmp_path / "workspaces" / "alice"
+
+    def test_preflight_cwd_is_absolute(self, confine_on, monkeypatch, tmp_path):
+        from src.backends.claude import slash_commands as sc
+
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "workspaces" / "alice").mkdir(parents=True)
+        opts = sc._build_preflight_options(Path("workspaces") / "alice")
+        assert Path(opts.cwd) == tmp_path / "workspaces" / "alice"
+
+    def test_off_leaves_the_cwd_alone(self, confine_off):
+        options = TestClientOverrides()._cli()._build_sdk_options(
+            cwd=Path("workspaces") / "alice"
+        )
+        assert str(options.cwd) == str(Path("workspaces") / "alice")
+
+
+class TestBrokerWait:
+    """G6: startup waits (bounded) for a broker the entrypoint started a moment
+    earlier; effective_mode() itself never blocks."""
+
+    @pytest.fixture
+    def uid_requested(self, monkeypatch, tmp_path):
+        sock = tmp_path / "broker.sock"
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, str(sock))
+        monkeypatch.setattr(landlock, "landlock_abi", lambda: 5)
+        # install_process_env writes these into os.environ; restore them.
+        monkeypatch.delenv(landlock.REAL_CLI_ENV, raising=False)
+        monkeypatch.delenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", raising=False)
+        landlock.reset_mode_cache()
+        return sock
+
+    @staticmethod
+    def _listen_after(sock: Path, delay: float):
+        import socket
+        import threading
+
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+
+        def bind_later():
+            time.sleep(delay)
+            server.bind(str(sock))
+            server.listen(64)
+
+        thread = threading.Thread(target=bind_later, daemon=True)
+        thread.start()
+        return server, thread
+
+    def test_startup_waits_for_a_late_broker(self, uid_requested, monkeypatch):
+        monkeypatch.setenv(landlock.BROKER_WAIT_ENV, "10")
+        server, thread = self._listen_after(uid_requested, 0.5)
+        try:
+            started = time.monotonic()
+            landlock.install_process_env()
+            elapsed = time.monotonic() - started
+            assert landlock.effective_mode() == "uid"
+            assert 0.4 <= elapsed < 10
+        finally:
+            thread.join()
+            server.close()
+
+    def test_a_miss_cached_before_startup_is_resolved_again(
+        self, uid_requested, monkeypatch
+    ):
+        monkeypatch.setenv(landlock.FALLBACK_ENV, "landlock")
+        monkeypatch.setenv(landlock.BROKER_WAIT_ENV, "10")
+        assert landlock.effective_mode() == "landlock"  # broker not up yet
+        server, thread = self._listen_after(uid_requested, 0.2)
+        try:
+            landlock.install_process_env()
+            assert landlock.effective_mode() == "uid"
+        finally:
+            thread.join()
+            server.close()
+
+    def test_the_wait_is_bounded(self, uid_requested, monkeypatch):
+        monkeypatch.setenv(landlock.FALLBACK_ENV, "landlock")
+        monkeypatch.setenv(landlock.BROKER_WAIT_ENV, "0.4")
+        started = time.monotonic()
+        landlock.install_process_env()
+        elapsed = time.monotonic() - started
+        assert 0.4 <= elapsed < 5
+        assert landlock.effective_mode() == "landlock"
+
+    def test_effective_mode_never_waits(self, uid_requested, monkeypatch):
+        monkeypatch.setenv(landlock.FALLBACK_ENV, "landlock")
+        monkeypatch.setenv(landlock.BROKER_WAIT_ENV, "30")
+        started = time.monotonic()
+        assert landlock.effective_mode() == "landlock"
+        assert time.monotonic() - started < 2
+
+    def test_no_wait_without_a_socket_or_landlock(self, monkeypatch):
+        monkeypatch.setenv(landlock.MODE_ENV, "uid")
+        monkeypatch.setenv(landlock.FALLBACK_ENV, "landlock")
+        monkeypatch.setenv(landlock.BROKER_WAIT_ENV, "30")
+        monkeypatch.delenv(landlock.REAL_CLI_ENV, raising=False)
+        monkeypatch.delenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", raising=False)
+        started = time.monotonic()
+        landlock.install_process_env()  # no broker socket configured
+        assert time.monotonic() - started < 2
+
+    @pytest.mark.parametrize(
+        ("raw", "seconds"),
+        [
+            ("", 10.0),
+            ("2.5", 2.5),
+            ("0", 0.0),
+            ("-3", 0.0),
+            ("x", 10.0),
+            # inf would wait forever and nan compare as no wait: the default.
+            ("inf", 10.0),
+            ("-inf", 10.0),
+            ("nan", 10.0),
+            ("1e400", 10.0),
+            ("299.5", 299.5),
+            ("300", 300.0),
+            ("1000", 300.0),
+        ],
+    )
+    def test_wait_knob(self, monkeypatch, raw, seconds):
+        monkeypatch.setenv(landlock.BROKER_WAIT_ENV, raw)
+        assert landlock._broker_wait_seconds() == seconds
+
+
+class TestTicketFreshAtConnect:
+    """G5: the single-use ticket is minted again right before connect(), so a
+    create_client whose awaits outlast the TTL still spawns."""
+
+    async def test_slow_preflight_still_connects_with_a_fresh_ticket(
+        self, uid_on, monkeypatch, tmp_path
+    ):
+        from src.backends.claude import client as client_module
+        from src.backends.claude import uid_isolation as ui
+        from src.session_manager import Session
+
+        monkeypatch.setenv("MCP_PROGRESS_RELAY", "false")
+        clock = {"now": 1_000_000.0}
+        monkeypatch.setattr(ui, "time", SimpleNamespace(time=lambda: clock["now"]))
+        minted = []
+        real_mint = ui.mint_ticket
+
+        def _recording_mint(**kwargs):
+            minted.append(real_mint(**kwargs))
+            return minted[-1]
+
+        monkeypatch.setattr(ui, "mint_ticket", _recording_mint)
+        cli = TestClientOverrides()._cli()
+
+        async def _slow_allowlist(options, user=None):
+            clock["now"] += 10 * 60  # a queued preflight outlasts the 120 s TTL
+
+        monkeypatch.setattr(cli, "_apply_skills_allowlist", _slow_allowlist)
+        presented = []
+
+        class _FakeClient:
+            def __init__(self, options=None, **_kwargs):
+                self.options = options
+
+            async def connect(self, prompt=None):
+                presented.append(self.options.env[landlock.TICKET_ENV])
+
+        monkeypatch.setattr(client_module, "ClaudeSDKClient", _FakeClient)
+        session = Session(session_id=str(uuid.uuid4()))
+        await cli.create_client(session, cwd=str(tmp_path / "ws"), user="alice")
+
+        assert len(minted) == 2 and presented == [minted[-1]]
+        with pytest.raises(ValueError, match="expired"):
+            ui.verify_ticket(minted[0])  # the build-time ticket is stale by now
+        assert ui.verify_ticket(presented[0])["workspace"] == str(tmp_path / "ws")
 
 
 class TestSkipConfigCheckGuard:

@@ -361,7 +361,7 @@ class TestSkillsOptionMigration:
         from src.backends.claude import slash_commands
         from src.backends.claude.client import ClaudeCodeCLI
 
-        async def _fake_available(cwd=None, force=False):
+        async def _fake_available(cwd=None, force=False, user=None):
             return {"verify", "simplify", "compact", "review"}
 
         monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"verify"}))
@@ -432,7 +432,7 @@ class TestSkillsOptionMigration:
         from src.backends.claude import slash_commands
         from src.backends.claude.client import ClaudeCodeCLI
 
-        async def _fake_available(cwd=None, force=False):
+        async def _fake_available(cwd=None, force=False, user=None):
             return {"summarize", "translate"}
 
         monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"translate"}))
@@ -580,7 +580,7 @@ class TestSkillsOptionMigration:
         from src.backends.claude import slash_commands
         from src.backends.claude.client import ClaudeCodeCLI
 
-        async def _fake_available(cwd=None, force=False):
+        async def _fake_available(cwd=None, force=False, user=None):
             return {"docs-helper:summarize", "translate", "review"}
 
         monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset())
@@ -605,7 +605,7 @@ class TestSkillsOptionMigration:
         from src.backends.claude import slash_commands
         from src.backends.claude.client import ClaudeCodeCLI
 
-        async def _fake_available(cwd=None, force=False):
+        async def _fake_available(cwd=None, force=False, user=None):
             return {"docs-helper:verify", "translate"}
 
         monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset({"verify"}))
@@ -625,7 +625,7 @@ class TestSkillsOptionMigration:
         from src.backends.claude import slash_commands
         from src.backends.claude.client import ClaudeCodeCLI
 
-        async def _boom(cwd=None, force=False):
+        async def _boom(cwd=None, force=False, user=None):
             raise RuntimeError("no CLI")
 
         monkeypatch.setattr(client_module, "HIDDEN_SKILLS", frozenset())

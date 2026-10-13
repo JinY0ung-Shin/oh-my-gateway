@@ -24,6 +24,7 @@ from pydantic import BaseModel
 
 from src.agent_message_models import AgentMessagesRequest
 from src.auth import security, verify_api_key
+from src.backends.claude import landlock
 from src.constants import SSE_KEEPALIVE_INTERVAL
 from src.mcp_config import get_mcp_servers
 from src.rate_limiter import rate_limit_endpoint
@@ -683,6 +684,8 @@ def _cleanup_sdk_transcript(session: Optional[Session]) -> None:
             pass
     except OSError:
         logger.debug("Stateless agent transcript cleanup failed", exc_info=True)
+    # Its session-env dir too: a confined CLI cannot sweep it (#241).
+    landlock.remove_session_env_dir(session.session_id)
 
 
 async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):

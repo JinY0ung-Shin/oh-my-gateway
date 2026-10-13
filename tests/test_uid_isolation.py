@@ -8,6 +8,11 @@ test_isolation_broker.py.
 
 from __future__ import annotations
 
+import json
+import os
+import stat
+import subprocess
+import sys
 import time
 
 import pytest
@@ -96,7 +101,8 @@ class TestReviewFixes:
         assert p.parent.name == "data"
         assert p.parent.parent.name != "src"
 
-    def test_ephemeral_pool_recycles_and_never_exhausts(self, monkeypatch):
+    def test_ephemeral_pool_recycles_and_never_exhausts(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
         monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
         monkeypatch.setenv(ui.UID_MAX_ENV, "20010")
         monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "3")
@@ -140,13 +146,237 @@ class TestReviewFixes:
         assert ui.validate_bands() == []
 
     def test_persist_failure_fails_closed(self, tmp_path, monkeypatch):
-        # A registry whose parent cannot be created must refuse to allocate
-        # rather than hand out a uid that will be lost on restart.
+        # A registry that cannot be written must refuse to allocate rather than
+        # hand out a uid that will be lost on restart.
+        reg = ui.UidRegistry(tmp_path / "uids.json", 20000, 20005)
+
+        def _boom(*_a, **_k):
+            raise OSError(28, "No space left on device")
+
+        with monkeypatch.context() as m:
+            m.setattr(ui.os, "replace", _boom)
+            with pytest.raises(ui.UidAllocationError):
+                reg.resolve("alice")
+        # the in-memory grant was rolled back, so a retry may try again
+        assert reg.resolve("alice") == 20000
+
+    def test_unusable_registry_path_fails_closed(self, tmp_path):
+        # A registry path that cannot be read (here: its parent is a file) is
+        # refused at load, not treated as an empty registry.
         target = tmp_path / "blocker"
         target.write_text("x")  # a file where a directory is needed
-        reg = ui.UidRegistry(target / "uids.json", 20000, 20005)
+        with pytest.raises(ui.UidAllocationError):
+            ui.UidRegistry(target / "uids.json", 20000, 20005)
+
+
+class TestRegistryFailClosed:
+    """PR #244 review 2 (#8): a damaged registry must never load as empty."""
+
+    def test_missing_file_is_an_empty_registry(self, tmp_path):
+        reg = ui.UidRegistry(tmp_path / "uids.json", 20000, 20005)
+        assert reg.resolve("alice") == 20000
+
+    @pytest.mark.parametrize("content", ['{"alice": 20000', "[1, 2]", "\udcff"])
+    def test_corrupt_or_non_object_registry_refuses(self, tmp_path, content):
+        path = tmp_path / "uids.json"
+        path.write_bytes(content.encode("utf-8", "surrogateescape"))
+        with pytest.raises(ui.UidAllocationError):
+            ui.UidRegistry(path, 20000, 20005)
+        # the file is left untouched for the operator to restore
+        assert path.read_bytes() == content.encode("utf-8", "surrogateescape")
+
+    def test_unreadable_registry_refuses(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root reads a 000 file")
+        path = tmp_path / "uids.json"
+        path.write_text('{"alice": 20000}')
+        path.chmod(0)
+        try:
+            with pytest.raises(ui.UidAllocationError):
+                ui.UidRegistry(path, 20000, 20005)
+        finally:
+            path.chmod(0o600)
+
+    def test_registry_errors_reports_a_corrupt_file(self, monkeypatch, tmp_path):
+        path = tmp_path / "uids.json"
+        path.write_text("{truncated")
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and "corrupt" in errs[0]
+        # and a named user's spawn refuses instead of getting a fresh uid
+        with pytest.raises(ui.UidAllocationError):
+            ui.resolve_uid("alice")
+
+    def test_registry_errors_ok_when_missing(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
+        assert ui.registry_errors() == []
+
+    def test_out_of_band_entry_is_held_not_reassigned(self, tmp_path):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({"alice": 31000, "bob": 20001}))
+        reg = ui.UidRegistry(path, 20000, 20005)
+        assert reg.resolve("bob") == 20001  # honored
+        with pytest.raises(ui.UidAllocationError):
+            reg.resolve("alice")  # held: no silently different uid
+        # a new user allocates, and the held entry survives the rewrite
+        assert reg.resolve("carol") == 20000
+        on_disk = json.loads(path.read_text())
+        assert on_disk == {"alice": 31000, "bob": 20001, "carol": 20000}
+
+    def test_shared_uid_is_held_for_both_keys_and_never_reused(self, tmp_path):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({"alice": 20000, "mallory": 20000}))
+        reg = ui.UidRegistry(path, 20000, 20005)
+        for key in ("alice", "mallory"):
+            with pytest.raises(ui.UidAllocationError):
+                reg.resolve(key)
+        assert reg.resolve("carol") == 20001  # 20000 is never handed out again
+
+    def test_reserved_and_malformed_entries_are_held(self, tmp_path):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({"r": 20002, "b": True, "s": "20003"}))
+        reg = ui.UidRegistry(path, 20000, 20005, reserved={20002})
+        for key in ("r", "b", "s"):
+            with pytest.raises(ui.UidAllocationError):
+                reg.resolve(key)
+
+    def test_persist_writes_0600(self, tmp_path):
+        path = tmp_path / "uids.json"
+        reg = ui.UidRegistry(path, 20000, 20005)
+        reg.resolve("alice")
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert json.loads(path.read_text()) == {"alice": 20000}
+        assert not (tmp_path / "uids.json.tmp").exists()
+
+    def test_dir_fsync_failure_after_replace_keeps_the_allocation(
+        self, tmp_path, monkeypatch
+    ):
+        # Once the new map replaced the file the grant is on disk; rolling it
+        # back in memory would free a uid the file still assigns (review 2).
+        path = tmp_path / "uids.json"
+        reg = ui.UidRegistry(path, 20000, 20005)
+        real_fsync = ui.os.fsync
+
+        def _fsync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(5, "Input/output error")
+            return real_fsync(fd)
+
+        with monkeypatch.context() as m:
+            m.setattr(ui.os, "fsync", _fsync)
+            assert reg.resolve("alice") == 20000
+        assert reg.resolve("bob") == 20001  # 20000 was not handed out again
+        assert json.loads(path.read_text()) == {"alice": 20000, "bob": 20001}
+
+    def test_held_entries_fail_startup(self, monkeypatch, tmp_path):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({"alice": 31000}))
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and "cannot honor" in errs[0]
+
+    def test_ephemeral_pool_never_hands_out_a_held_uid(self, monkeypatch, tmp_path):
+        # A benign band change (a larger ephemeral slice) moves a named user's
+        # uid into the ephemeral band: that user is held, and the uid must not
+        # go to an anonymous run (cross-user file access in uid mode).
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({"bob": 20009}))
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20009")
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "3")  # ephemeral [20007, 20009]
+        assert ui.registry_errors()  # bob is held: startup refuses
+        handed = {ui.resolve_uid(f"/ws/anon-{i}", persist=False) for i in range(20)}
+        assert 20009 not in handed
+        assert handed <= {20007, 20008}
+
+    def test_corrupt_registry_fails_the_anonymous_path_closed(
+        self, monkeypatch, tmp_path
+    ):
+        path = tmp_path / "uids.json"
+        path.write_text("{nope")
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        with pytest.raises(ui.UidAllocationError):
+            ui.resolve_uid("/ws/anon", persist=False)
+
+    def test_persist_refuses_a_planted_tmp_symlink(self, tmp_path):
+        path = tmp_path / "uids.json"
+        victim = tmp_path / "victim"
+        victim.write_text("keep")
+        (tmp_path / "uids.json.tmp").symlink_to(victim)
+        reg = ui.UidRegistry(path, 20000, 20005)
         with pytest.raises(ui.UidAllocationError):
             reg.resolve("alice")
+        assert victim.read_text() == "keep"
+
+
+class TestBandsReview2:
+    def test_default_broker_uid_is_outside_the_default_band(self):
+        lo, hi = ui.uid_range()
+        assert not (lo <= ui._DEFAULT_BROKER_UID <= hi)
+        assert ui._DEFAULT_BROKER_UID in ui.reserved_uids()
+
+    def test_zero_ephemeral_uids_refuses(self, monkeypatch):
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "0")
+        assert any("ephemeral" in e for e in ui.validate_bands())
+
+    def test_fully_reserved_ephemeral_band_refuses(self, monkeypatch):
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20003")
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "1")
+        monkeypatch.setenv(ui.BROKER_UID_ENV, "20003")  # the only ephemeral uid
+        assert any("ephemeral" in e for e in ui.validate_bands())
+
+
+class TestTicketSecretCapture:
+    """PR #244 review 2 (#5): the secret must not stay in os.environ."""
+
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        ui.reset_captured_secret()
+        yield
+        ui.reset_captured_secret()
+
+    def test_capture_moves_the_secret_out_of_the_environment(self, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        ui.capture_ticket_secret()
+        assert ui.TICKET_SECRET_ENV not in os.environ
+        assert ui.ticket_secret() == b"s3cret"
+        # minting and verifying keep working from the captured copy
+        t = ui.mint_ticket(uid=20001, workspace="/ws", ro=[], rw=[], env_allow=[])
+        assert ui.verify_ticket(t)["uid"] == 20001
+
+    def test_child_copying_os_environ_does_not_inherit_it(self, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        ui.capture_ticket_secret()
+        out = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                f"import os; print(os.environ.get({ui.TICKET_SECRET_ENV!r}, ''))",
+            ],
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert out.stdout.strip() == ""
+
+    def test_capture_is_idempotent_and_blank_is_ignored(self, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        ui.capture_ticket_secret()
+        ui.capture_ticket_secret()  # env already gone: keeps the captured one
+        assert ui.ticket_secret() == b"s3cret"
+        ui.reset_captured_secret()
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "   ")
+        ui.capture_ticket_secret()
+        assert ui.ticket_secret() is None
+
+    def test_env_value_wins_over_a_captured_one(self, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "old")
+        ui.capture_ticket_secret()
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "new")
+        assert ui.ticket_secret() == b"new"
 
 
 class TestTicket:

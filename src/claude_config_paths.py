@@ -31,7 +31,6 @@ a change in one place rather than six.
 from __future__ import annotations
 
 import os
-import tempfile
 from pathlib import Path
 from typing import Optional
 
@@ -39,11 +38,30 @@ CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 PLUGIN_CLONE_ROOT_ENV = "CLAUDE_PLUGIN_CLONE_ROOT"
 
 _CONFIG_DIR_NAME = ".claude"
+_GLOBAL_CONFIG_NAME = ".claude.json"
 _PLUGIN_MARKETPLACES = "plugin-marketplaces"
 
 
 def _override() -> str:
     return os.environ.get(CONFIG_DIR_ENV, "").strip()
+
+
+def _home() -> Path:
+    """``$HOME`` when set, else the passwd home — Node's ``os.homedir()`` rule.
+
+    Never a shared temp dir: a path derived from here may be created or read
+    on behalf of every session, so it must not land somewhere another uid can
+    pre-create (#241 review).
+    """
+    home = (os.getenv("HOME") or "").strip()
+    if home:
+        return Path(home)
+    try:
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError):
+        return Path.home()
 
 
 def config_dir() -> Path:
@@ -77,6 +95,19 @@ def projects_root() -> Path:
     return config_dir() / "projects"
 
 
+def global_config_file() -> Path:
+    """The CLI's global config file (``.claude.json``), located as the CLI does.
+
+    CLI 2.1.283 reads ``join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")``:
+    with ``$CLAUDE_CONFIG_DIR`` set the file lives *inside* that dir, otherwise
+    in the home dir beside ``~/.claude`` — never ``<config dir>.parent`` (wrong
+    for an override or a symlinked ``~/.claude``). Returned unresolved.
+    """
+    override = _override()
+    base = Path(override) if override else _home()
+    return base / _GLOBAL_CONFIG_NAME
+
+
 def settings_path_default() -> Optional[Path]:
     """``<config dir>/settings.json`` with the strict ``$HOME`` contract.
 
@@ -91,12 +122,12 @@ def plugin_clone_root() -> Path:
     """Where remote marketplace repos are cloned.
 
     ``$CLAUDE_PLUGIN_CLONE_ROOT`` else ``<home>/.claude/plugin-marketplaces``.
-    This root keys off ``$HOME`` directly (not ``CLAUDE_CONFIG_DIR``), matching
-    the CLI; when ``$HOME`` is unset it falls back to a temp dir so a clone still
-    has somewhere to land.
+    This root keys off the home dir directly (not ``CLAUDE_CONFIG_DIR``),
+    matching the CLI; when ``$HOME`` is unset it falls back to the passwd home
+    like the CLI's ``os.homedir()`` — never the shared temp dir, where another
+    uid could pre-create the clone root the gateway then trusts.
     """
     configured = os.environ.get(PLUGIN_CLONE_ROOT_ENV, "").strip()
     if configured:
         return Path(configured)
-    home = os.environ.get("HOME", "").strip() or tempfile.gettempdir()
-    return Path(home) / _CONFIG_DIR_NAME / _PLUGIN_MARKETPLACES
+    return _home() / _CONFIG_DIR_NAME / _PLUGIN_MARKETPLACES

@@ -145,10 +145,16 @@ async def _log_slash_commands() -> None:
     if not BackendRegistry.is_registered("claude"):
         return
     try:
-        from src.backends.claude import slash_commands
+        from src.backends.claude import landlock, slash_commands
 
         claude_backend = BackendRegistry.get("claude")
         cwd = getattr(claude_backend, "cwd", None)
+        if landlock.confine_enabled():
+            # Under confinement a preflight with a cwd is confined like a session
+            # in that dir (uid mode: an ephemeral uid that cannot enter the
+            # backend's app-owned private dir). The warmup carries no user
+            # workspace, so use the gateway-owned preflight dir instead.
+            cwd = None
         commands = await slash_commands.get_available_commands(cwd=cwd)
     except Exception as e:
         logger.warning(f"Could not fetch slash-command list: {e}")
@@ -214,8 +220,11 @@ async def lifespan(app: FastAPI):
     # child is spawned (the SDK's version-check spawn carries no options.env).
     # No-op unless CLAUDE_ISOLATION_MODE selects a Landlock mode. The fail-closed
     # check runs below in run_startup_config_check (#241).
-    from src.backends.claude import landlock
+    from src.backends.claude import landlock, uid_isolation
 
+    # First move the uid-mode ticket secret out of os.environ into memory, so
+    # no child that copies the environment can inherit it (#241 review).
+    uid_isolation.capture_ticket_secret()
     landlock.install_process_env()
 
     logger.info("Initializing backend registry...")

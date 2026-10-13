@@ -1710,7 +1710,7 @@ class TestValidateBackendPromptSlashError:
     def test_slash_command_error_returns_400(self, isolated_session_manager):
         from src.backends.claude.slash_commands import SlashCommandError
 
-        async def fake_validate(resolved, prompt, workspace_str):
+        async def fake_validate(resolved, prompt, workspace_str, user=None):
             raise HTTPException(
                 status_code=400,
                 detail={

@@ -183,9 +183,10 @@ async def _run(
     """Run *calls* in one turn with the gateway's options; tool results + asks.
 
     With ``confine=True`` the CLI is spawned through the Landlock launcher
-    (#241), the way the gateway does when ``CLAUDE_ISOLATION_MODE`` selects a
-    Landlock mode: the
-    workspace and the CLI's test HOME are read-write, everything else is denied.
+    (#241) with the gateway's own path lists (``landlock.options_env``, the
+    ``landlock_on`` fixture points the gateway at the test HOME): the
+    workspace, the session's project and session-env dirs are read-write, the
+    shared assets read-only, everything else is denied.
     """
     workspace = tmp_path / "ws"
     workspace.mkdir()
@@ -221,16 +222,20 @@ async def _run(
     env = {"CLAUDE_CODE_HARBOR_KITE": "0"}
     if os.geteuid() == 0:  # the CLI refuses bypassPermissions as root otherwise
         env["IS_SANDBOX"] = "1"
+    session_id = str(uuid.uuid4())
     cli_path = None
     if confine:
+        import sys
+
         from src.backends.claude import landlock
 
         cli_path = landlock.launcher_path()
-        real_cli = landlock.resolve_real_cli()
-        assert real_cli, "no real CLI to confine"
-        # Read-write: the workspace and the CLI's test HOME (its config dir,
-        # transcripts, state). Everything else — the sibling 'outside' dir, the
-        # gateway code — is denied by omission.
+        (tmp_path / "home" / ".claude").mkdir(parents=True, exist_ok=True)
+        # The lists a session gets: everything else — the sibling 'outside'
+        # dir, the gateway code — is denied by omission.
+        confinement = landlock.options_env(workspace, session_id=session_id)
+        assert confinement[landlock.MODE_ENV] == "landlock", confinement
+        assert confinement[landlock.REAL_CLI_ENV], "no real CLI to confine"
         # sys.prefix is the dev venv, which lives UNDER the repo root. In
         # production ``python3`` is /usr/bin/python3 (already in the launcher's
         # ro system roots); here the CLI's Bash resolves it to the venv python,
@@ -238,17 +243,8 @@ async def _run(
         # the closure tests prove the OUTSIDE read is blocked, not that python
         # failed to boot. It is a subtree, so the repo's src/ and data/ stay
         # denied (the /app protection the other tests check).
-        import sys
-
-        env.update(
-            {
-                landlock.REAL_CLI_ENV: real_cli,
-                landlock.RW_ENV: os.pathsep.join(
-                    [str(workspace), str(tmp_path / "home")]
-                ),
-                landlock.RO_ENV: sys.prefix,
-            }
-        )
+        confinement[landlock.RO_ENV] += os.pathsep + sys.prefix
+        env.update(confinement)
     with FakeAnthropicAPI(plan) as api:
         options = ClaudeAgentOptions(
             cwd=str(workspace),
@@ -257,7 +253,7 @@ async def _run(
             permission_mode=built.permission_mode,
             settings=built.settings,
             max_turns=len(calls) + 2,
-            session_id=str(uuid.uuid4()),
+            session_id=session_id,
             can_use_tool=can_use_tool,
             **({"cli_path": cli_path} if cli_path else {}),
         )
@@ -376,8 +372,22 @@ def _landlock_unusable() -> Optional[str]:
     return None
 
 
+@pytest.fixture
+def landlock_on(_no_inherited_claude_env, monkeypatch, tmp_path):
+    """Landlock mode, with the gateway's config dir at the CLI's test HOME."""
+    from src.backends.claude import landlock
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    monkeypatch.setenv(landlock.MODE_ENV, "landlock")
+    landlock.reset_mode_cache()
+    yield
+    landlock.reset_mode_cache()
+
+
 @pytest.mark.integration
-@pytest.mark.usefixtures("_no_inherited_claude_env")
+@pytest.mark.usefixtures("landlock_on")
 @pytest.mark.filterwarnings("ignore::claude_agent_sdk.types.CanUseToolShadowedWarning")
 @pytest.mark.skipif(bool(_landlock_unusable()), reason=_landlock_unusable() or "")
 class TestLandlockConfinement:

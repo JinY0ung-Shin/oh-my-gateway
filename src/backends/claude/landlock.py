@@ -1,32 +1,44 @@
-"""Gateway side of the Landlock confinement launcher (issue #241, PR-A).
+"""Gateway side of the Landlock confinement launcher (issue #241).
 
 This wires the fixed launcher stub (``docker/landlock_launcher.py``) into the
 CLI spawn path. When ``CLAUDE_ISOLATION_MODE`` selects a Landlock mode
-(``landlock`` now; ``uid`` once the broker lands):
+(``landlock``, or ``uid``, which hands the spawn to the broker — see
+``uid_isolation``):
 
 * ``_get_cli_path()`` points ``cli_path`` at the launcher instead of the real
   CLI, so every Claude child (session turns, slash preflight, ``verify()``) is
   confined with a Landlock ruleset inherited across ``execve``;
 * per spawn, the gateway hands the launcher the read-only and read-write path
-  lists for that workspace through ``options.env`` — built from the **same**
-  helpers the always-on ``~/.claude`` guard uses, so a script confined here
-  reaches exactly what a file tool may (its workspace, its own project dir, the
-  shared read-only assets) and nothing else;
+  lists for that workspace through ``options.env``, every entry absolute. The
+  shared part comes from the **same** helpers the always-on ``~/.claude`` guard
+  uses. Read-write: the workspace, the ``projects/`` dir the CLI names after it
+  (lossy: workspaces whose paths differ only in non-alphanumeric characters
+  share one — a pre-existing gap tracked separately) and, when the session id
+  is known, its own ``session-env/<session id>`` dir; the launcher adds
+  ``/dev/shm``. Read-only: the shared assets a file tool may read
+  (``plugins`` among them, so ``plugins/data`` too — each installed plugin's
+  data dir is pre-created by the gateway), the CLI's own config files and the
+  system roots. No shared cache (``~/.npm``, the uv cache) is writable; the
+  launcher and broker point those at the session's tmpdir;
 * the CLI's own OS sandbox is forced off, because bwrap cannot start inside a
   Landlock domain (see ``docs/security-process-isolation.md`` §3).
 
-This is the no-privilege interim of the design (no uid switch, no broker). It
-confines filesystem access; cross-session DAC and signal isolation are the
-uid-per-user follow-up. Fail-closed: if confinement is requested but the
-launcher or the real CLI cannot be resolved, startup refuses rather than
-spawn an unconfined CLI (``check_config``).
+``landlock`` mode is the no-privilege interim of the design: it confines
+filesystem access only; cross-session DAC and signal isolation come with
+``uid`` mode. Fail-closed: if confinement is requested but the launcher or the
+real CLI cannot be resolved, startup refuses rather than spawn an unconfined
+CLI (``check_config``).
 """
 
 from __future__ import annotations
 
 import ctypes
 import logging
+import math
 import os
+import re
+import shutil
+import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -34,6 +46,7 @@ logger = logging.getLogger(__name__)
 
 MODE_ENV = "CLAUDE_ISOLATION_MODE"
 FALLBACK_ENV = "CLAUDE_ISOLATION_FALLBACK"
+BROKER_WAIT_ENV = "CLAUDE_ISOLATION_BROKER_WAIT_SECONDS"
 LAUNCHER_ENV = "GATEWAY_LANDLOCK_LAUNCHER"
 REAL_CLI_ENV = "GATEWAY_REAL_CLI"
 RO_ENV = "GATEWAY_LANDLOCK_RO"
@@ -41,6 +54,12 @@ RW_ENV = "GATEWAY_LANDLOCK_RW"
 BROKER_SOCKET_ENV = "GATEWAY_ISOLATION_BROKER_SOCKET"
 TICKET_ENV = "GATEWAY_ISOLATION_TICKET"
 _SKIP_VERSION_CHECK_ENV = "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK"
+
+# How long startup waits for the broker socket in uid mode (seconds). The
+# entrypoint forks the broker and execs the gateway with no readiness handshake.
+_DEFAULT_BROKER_WAIT_SECONDS = 10.0
+_MAX_BROKER_WAIT_SECONDS = 300.0
+_BROKER_POLL_SECONDS = 0.2
 
 # The single operator knob for session isolation:
 #   off      — no OS boundary (default)
@@ -120,6 +139,53 @@ def uid_mode_available() -> bool:
     return landlock_abi() >= 2 and _broker_reachable()
 
 
+def _broker_wait_seconds() -> float:
+    """``CLAUDE_ISOLATION_BROKER_WAIT_SECONDS``: blank → default, negative → 0.
+
+    Not a finite number (``x``, ``nan``, ``inf``, ``1e400``) → the default,
+    with a warning: ``inf`` would wait forever and ``nan`` compare as no wait.
+    Capped at ``_MAX_BROKER_WAIT_SECONDS``. ``docker/entrypoint.py`` parses the
+    same knob identically (tests/test_entrypoint_broker.py pins the parity).
+    """
+    raw = (os.getenv(BROKER_WAIT_ENV) or "").strip()
+    if not raw:
+        return _DEFAULT_BROKER_WAIT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        logger.warning(
+            "Ignoring %s=%r: not a finite number of seconds; using %s",
+            BROKER_WAIT_ENV,
+            raw,
+            _DEFAULT_BROKER_WAIT_SECONDS,
+        )
+        return _DEFAULT_BROKER_WAIT_SECONDS
+    if value > _MAX_BROKER_WAIT_SECONDS:
+        logger.warning(
+            "%s=%r is above the %s s cap; waiting %s s",
+            BROKER_WAIT_ENV,
+            raw,
+            _MAX_BROKER_WAIT_SECONDS,
+            _MAX_BROKER_WAIT_SECONDS,
+        )
+        return _MAX_BROKER_WAIT_SECONDS
+    return max(0.0, value)
+
+
+def _wait_for_broker(timeout: float) -> bool:
+    """Poll the broker socket until it accepts or *timeout* seconds pass."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _broker_reachable():
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(_BROKER_POLL_SECONDS, remaining))
+
+
 def effective_mode() -> str:
     """The mode actually in force, after the fail-open-never fallback rule.
 
@@ -129,8 +195,9 @@ def effective_mode() -> str:
     ``uid`` and :func:`check_config` turns the unavailability into a startup
     error — never a silent drop to a weaker or absent boundary.
 
-    Resolved once and cached (broker availability is fixed post-startup);
-    :func:`reset_mode_cache` clears it for tests.
+    Resolved once and cached (broker availability is fixed post-startup) and
+    never blocks: :func:`install_process_env` waits for the broker first and
+    re-resolves; :func:`reset_mode_cache` clears it for tests.
     """
     global _effective_mode_cache
     if _effective_mode_cache is not None:
@@ -222,7 +289,23 @@ def install_process_env() -> None:
     confined with only the default ruleset and adds nothing. Per-workspace path
     lists still ride ``options.env`` (see :func:`options_env`). No-op unless
     confinement is on.
+
+    In ``uid`` mode this is the one place that waits for the broker
+    (``CLAUDE_ISOLATION_BROKER_WAIT_SECONDS``, default 10): the entrypoint
+    starts it just before the gateway, and the availability resolved here is
+    kept for the process lifetime, so an unlucky first connect would otherwise
+    fall back to landlock (or refuse startup) for good. :func:`effective_mode`
+    itself never blocks.
     """
+    if isolation_mode() == "uid" and broker_socket_path() and landlock_abi() >= 2:
+        timeout = _broker_wait_seconds()
+        if not _wait_for_broker(timeout):
+            logger.warning(
+                "isolation broker not reachable on %s after %.1fs",
+                broker_socket_path(),
+                timeout,
+            )
+        reset_mode_cache()
     # Resolve and lock the effective mode once, before the first spawn, and log
     # it (a uid->landlock fallback is surfaced here, not silently per-call).
     mode = effective_mode()
@@ -351,94 +434,227 @@ def _warn_if_launcher_agent_writable(launcher: Path) -> None:
         )
 
 
-def _ro_rw_roots(effective_cwd: Path) -> Tuple[List[str], List[str]]:
+def _absolute(path) -> str:
+    """*path* as an absolute, normalized string (no filesystem access).
+
+    The launcher and broker resolve a relative entry against the CLI's cwd —
+    the workspace — not the gateway's, so with ``USER_WORKSPACES_DIR=./...``
+    a relative workspace granted ``<ws>/<ws>`` instead of itself (#241 review).
+    Every entry and the workspace itself therefore leave here absolute.
+    """
+    return os.path.abspath(str(path))
+
+
+def _ro_rw_roots(
+    effective_cwd: Path, session_id: Optional[str] = None
+) -> Tuple[List[str], List[str]]:
     """Build the read-only and read-write path lists for *effective_cwd*.
 
     Reuses the guard's helpers so confinement and the file-tool guard grant the
-    same set. The launcher adds the static system roots, the real CLI dir,
-    ``/proc`` and ``/dev`` entries itself; here we add only what depends on the
-    workspace and the shared assets.
+    same shared set. The launcher adds the static system roots, the real CLI
+    dir, ``/proc``, ``/dev`` entries and ``/dev/shm`` itself; here we add only
+    what depends on the workspace, the session and the shared assets. Every
+    entry is absolute (:func:`_absolute`).
+
+    Two side effects, both as the gateway (unconfined) before the spawn: each
+    installed plugin's data dir is pre-created (:func:`_ensure_plugin_data_dirs`)
+    and so is this session's ``session-env`` dir (:func:`_session_env_dir`).
     """
     from . import workspace_sandbox as ws
 
+    cwd = Path(_absolute(effective_cwd))
     claude_home = ws._claude_home()
     ro: List[str] = []
     rw: List[str] = []
 
-    # Read-only shared assets: skills, plugins, agents, commands, output-styles,
-    # user CLAUDE.md, and the plugin clone roots the CLI executes from.
+    # Read-only shared assets: skills, plugins (plugins/data included), agents,
+    # commands, output-styles, user CLAUDE.md, and the plugin clone roots the
+    # CLI executes from.
     for root in ws._shared_asset_roots(claude_home):
         ro.append(str(root))
     for root in ws.plugin_resource_roots():
         ro.append(str(root))
-    # The CLI's own config files (settings.json, ~/.claude.json): the confined
-    # CLI process reads them at startup to load user-scope plugins, the admin
-    # env block and the output style. These are not file-tool targets (the home
-    # guard never grants them), so they must be listed here explicitly or the
-    # CLI silently starts with user settings dropped (#241 review). Shared,
-    # read-only — writes stay denied.
+    _ensure_plugin_data_dirs(claude_home)
+    # The CLI's own config files (settings.json, the global .claude.json): the
+    # confined CLI process reads them at startup to load user-scope plugins, the
+    # admin env block and the output style. These are not file-tool targets
+    # (the home guard never grants them), so they must be listed here
+    # explicitly or the CLI silently starts with user settings dropped (#241
+    # review). Shared, read-only — writes stay denied.
     for path in _claude_config_files(claude_home):
         ro.append(path)
     # Operator add-dirs are read-only (see #237/#240). Use the *filtered* roots
     # (the #240 check that refuses an entry overlapping ~/.claude or the
     # workspace base), not the raw CLAUDE_ADD_DIRS strings — otherwise a
     # confined script could read every user's transcripts/plans/workspaces.
-    for root in ws._operator_add_dir_roots(claude_home, Path(effective_cwd)):
+    for root in ws._operator_add_dir_roots(claude_home, cwd):
         ro.append(str(root))
 
-    # Read-write: the workspace itself and this session's own ~/.claude project
-    # dir (transcripts, auto memory, spilled tool results).
-    rw.append(str(effective_cwd))
-    for root in ws._writable_extra_roots(Path(effective_cwd)):
+    # Read-write: the workspace itself, the ~/.claude project dir the CLI names
+    # after it (transcripts, auto memory, spilled tool results) and this
+    # session's session-env dir. No shared cache: ~/.npm and the uv cache stay
+    # out (the launcher points npm_config_cache / UV_CACHE_DIR at the session
+    # tmpdir), and so does plugins/data. Every session shares those, so a write
+    # there is what another session's `npx`, `uv run` or plugin hook runs next.
+    # Caveat (pre-existing, tracked separately): the CLI's project-dir name is
+    # lossy — every non-alphanumeric character becomes "-" — so workspaces
+    # whose paths differ only there (users a.b / a_b / a-b, alice@x.com /
+    # alice.x.com) share one projects/ entry, and with it each other's
+    # transcripts and memory.
+    rw.append(str(cwd))
+    for root in ws._writable_extra_roots(cwd):
         rw.append(str(root))
-    # Writable runtime state the CLI and its tools need, or plugin hooks fail
-    # open (reporting success while not running), npx-launched MCP servers fail
-    # on ~/.npm and `uv run` fails on its cache (#241 review).
-    for root in _runtime_writable_roots(claude_home):
-        rw.append(root)
+    env_dir = _session_env_dir(claude_home, session_id)
+    if env_dir is not None:
+        rw.append(str(env_dir))
 
-    return _dedupe(ro), _dedupe(rw)
+    return _dedupe([_absolute(p) for p in ro]), _dedupe([_absolute(p) for p in rw])
 
 
 def _claude_config_files(claude_home: Optional[Path]) -> List[str]:
-    """The CLI's own config files the confined process must be able to read."""
+    """The CLI's own config files the confined process must be able to read.
+
+    ``settings.json`` / ``settings.local.json`` in the config dir and the
+    global config. CLI 2.1.283 reads the global config from the legacy
+    ``<config dir>/.config.json`` when that file exists, else from
+    ``join(CLAUDE_CONFIG_DIR || homedir(), ".claude.json")`` — which
+    :func:`~src.claude_config_paths.global_config_file` mirrors. Not
+    ``<config dir>.parent``: that misses the file under ``CLAUDE_CONFIG_DIR``
+    or a symlinked ``~/.claude`` and grants an unrelated one (#241 review).
+    """
     if claude_home is None:
         return []
-    out = [
+    from src.claude_config_paths import global_config_file
+
+    return [
         str(claude_home / "settings.json"),
         str(claude_home / "settings.local.json"),
+        str(claude_home / ".config.json"),
+        str(global_config_file()),
     ]
-    # ~/.claude.json sits beside the config dir (the CLI's project/account state).
-    try:
-        out.append(str(claude_home.parent / ".claude.json"))
-    except (OSError, RuntimeError, ValueError):
-        pass
-    return out
 
 
-def _runtime_writable_roots(claude_home: Optional[Path]) -> List[str]:
-    """Writable caches/state the CLI and its tools create outside the workspace.
+# CLI 2.1.283 keeps a plugin's ``${CLAUDE_PLUGIN_DATA}`` at
+# ``<config dir>/plugins/data/<name>``: the plugin id with every character
+# outside ``[A-Za-z0-9_-]`` replaced by ``-`` (``bX``/``lct``); an
+# ``<npm package>@npm`` id uses the package name with every character outside
+# ``[a-z0-9-]`` hex-escaped, plus ``-npm`` (``hHr``).
+_PLUGIN_DATA_UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
+_NPM_DATA_UNSAFE = re.compile(r"[^a-z0-9-]")
 
-    Plugin hook state (``~/.claude/plugins/data``), the npm cache (``~/.npm``,
-    for ``npx -y`` plugin MCP servers) and the uv cache (``$UV_CACHE_DIR`` or
-    ``~/.cache/uv``, for skill ``uv run``). Shared HOME today; per-user
-    ownership under uid mode is a tracked follow-up.
+
+def _npm_escape(match: "re.Match[str]") -> str:
+    code = ord(match.group(0))
+    return f"_{code:02x}" if code <= 255 else f"__{code:x}_"
+
+
+def _plugin_data_names(plugin_id: str) -> List[str]:
+    """The data dir name(s) the CLI may use for *plugin_id*."""
+    names = [_PLUGIN_DATA_UNSAFE.sub("-", plugin_id)]
+    if plugin_id.endswith("@npm"):
+        package = plugin_id[: plugin_id.rindex("@")]
+        names.append(_NPM_DATA_UNSAFE.sub(_npm_escape, package) + "-npm")
+    return [n for n in names if n.strip("-")]
+
+
+def _ensure_plugin_data_dirs(claude_home: Optional[Path]) -> None:
+    """Pre-create each installed plugin's data dir, which sessions only read.
+
+    ``plugins/data`` is read-only to a confined session (see
+    :func:`_ro_rw_roots`), but the CLI ``mkdirSync``s a plugin's
+    ``${CLAUDE_PLUGIN_DATA}`` before running each of its hooks and fails the
+    hook when that throws: "Hook failed to run ... EACCES ... mkdir
+    plugins/data" on CLI 2.1.283. The gateway, unconfined, creates the dirs
+    first, so the CLI's recursive mkdir sees them and the hook runs. A hook that
+    writes into its data dir then fails visibly with EACCES. Reads the same
+    registry as :func:`workspace_sandbox.plugin_resource_roots`, every spawn,
+    so a plugin installed later is covered by its first session.
     """
-    roots: List[str] = []
-    if claude_home is not None:
-        roots.append(str(claude_home / "plugins" / "data"))
+    if claude_home is None:
+        return
+    from .workspace_sandbox import _read_json
+
+    plugins_dir = claude_home / "plugins"
+    installed = _read_json(plugins_dir / "installed_plugins.json")
+    plugins = installed.get("plugins") if isinstance(installed, dict) else None
+    if not isinstance(plugins, dict):
+        return
+    for plugin_id in plugins:
+        if not isinstance(plugin_id, str):
+            continue
+        for name in _plugin_data_names(plugin_id):
+            try:
+                (plugins_dir / "data" / name).mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                logger.warning(
+                    "Could not pre-create the data dir of plugin %s; its hooks "
+                    "fail under confinement: %s",
+                    plugin_id,
+                    exc,
+                )
+
+
+# A session id becomes one path component: no separator, no dot-dot.
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+
+def _session_env_dir(
+    claude_home: Optional[Path], session_id: Optional[str]
+) -> Optional[Path]:
+    """This session's ``<config dir>/session-env/<session id>``, pre-created 0700.
+
+    The CLI keeps the env files of SessionStart/Setup/CwdChanged/FileChanged
+    hooks (``$CLAUDE_ENV_FILE``) there and sources them into every Bash call;
+    a resumed session keeps its id, so it is the same dir. Under Landlock the
+    CLI cannot create it and fails those hooks ("Hook failed to run
+    (SessionStart:startup): EACCES ... mkdir session-env/<id>" on CLI 2.1.283).
+    Only this session's entry is created and granted: its siblings are other
+    sessions' env scripts, so ``session-env`` itself stays out of reach.
+    ``None`` when the id is unknown (``verify()``, where the CLI picks its
+    own), not a single safe path component, or a planted symlink.
+    """
+    if claude_home is None or not session_id or not _SESSION_ID_RE.match(session_id):
+        return None
+    path = claude_home / "session-env" / session_id
     try:
-        home = Path(os.path.expanduser("~"))
-    except (OSError, RuntimeError, ValueError):
-        home = None
-    if home is not None and str(home) not in ("", "~"):
-        roots.append(str(home / ".npm"))
-    uv_cache = (os.getenv("UV_CACHE_DIR") or "").strip()
-    if uv_cache:
-        roots.append(uv_cache)
-    elif home is not None and str(home) not in ("", "~"):
-        roots.append(str(home / ".cache" / "uv"))
-    return roots
+        if path.is_symlink():
+            logger.warning("Not granting %s: it is a symlink", path)
+            return None
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning(
+            "Could not pre-create %s; SessionStart hooks fail under "
+            "confinement: %s",
+            path,
+            exc,
+        )
+        return None
+    return path
+
+
+def remove_session_env_dir(session_id: Optional[str]) -> None:
+    """Remove a finished one-shot session's ``session-env/<session id>`` dir.
+
+    :func:`_session_env_dir` creates one per confined spawn with a session id,
+    and the CLI's own sweep of stale ones cannot reach them from inside
+    Landlock, so every stateless run (``/v1/agents/messages``, an admin prompt
+    try-run) would leave one behind. Their cleanup calls this once the CLI is
+    dead; persistent ``/v1/responses`` sessions keep theirs (a resume reuses
+    the id). Only that exact dir: the id is validated as at creation, a symlink
+    in its place is left alone, and links inside it are removed, not followed.
+    """
+    from . import workspace_sandbox as ws
+
+    claude_home = ws._claude_home()
+    if claude_home is None or not session_id or not _SESSION_ID_RE.match(session_id):
+        return
+    path = claude_home / "session-env" / session_id
+    try:
+        if path.is_symlink() or not path.is_dir():
+            return
+        shutil.rmtree(path)
+    except OSError:
+        logger.debug("Could not remove %s", path, exc_info=True)
 
 
 def _dedupe(paths: List[str]) -> List[str]:
@@ -451,7 +667,24 @@ def _dedupe(paths: List[str]) -> List[str]:
     return out
 
 
-def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, str]:
+def _landlock_env(ro: List[str], rw: List[str]) -> Dict[str, str]:
+    """The landlock-mode ``options.env``: the path lists plus the real CLI."""
+    env: Dict[str, str] = {
+        MODE_ENV: "landlock",
+        RO_ENV: os.pathsep.join(ro),
+        RW_ENV: os.pathsep.join(rw),
+    }
+    real_cli = os.environ.get(REAL_CLI_ENV) or resolve_real_cli()
+    if real_cli:
+        env[REAL_CLI_ENV] = real_cli
+    return env
+
+
+def options_env(
+    effective_cwd: Path,
+    user: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> Dict[str, str]:
     """The ``options.env`` entries that confine a spawn for *effective_cwd*.
 
     Empty when confinement is off. The effective mode decides the shape:
@@ -461,12 +694,18 @@ def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, st
     * **uid** — a signed single-use ticket carrying the per-user uid and the
       path lists, which the launcher presents to the broker; the broker (not the
       launcher) holds the real CLI and does the uid switch. The path lists do
-      **not** go in the clear here — only inside the signed ticket.
+      **not** go in the clear here — only inside the signed ticket. The ticket
+      expires two minutes after it is minted, so a caller that awaits before
+      spawning calls this again right before (``create_client``).
+
+    ``session_id`` (the CLI's session id: ``--session-id`` or ``--resume``)
+    grants that session's own ``session-env`` dir.
     """
     mode = effective_mode()
     if mode not in _LANDLOCK_MODES:
         return {}
-    ro, rw = _ro_rw_roots(Path(effective_cwd))
+    cwd = _absolute(effective_cwd)
+    ro, rw = _ro_rw_roots(Path(cwd), session_id)
 
     if mode == "uid":
         from . import uid_isolation as ui
@@ -475,12 +714,14 @@ def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, st
         # concurrent anonymous runs still get distinct uids. A named user gets a
         # durable uid (persist=True); an anonymous/stateless run uses the
         # recycled in-memory ephemeral band (persist=False) so it cannot grow
-        # the registry or exhaust the band (#241 review).
-        key = user or str(effective_cwd)
+        # the registry or exhaust the band (#241 review). The absolute path, so
+        # a session and its preflight land on the same uid however the cwd was
+        # spelled.
+        key = user or cwd
         uid = ui.resolve_uid(key, persist=bool(user))
         ticket = ui.mint_ticket(
             uid=uid,
-            workspace=str(effective_cwd),
+            workspace=cwd,
             ro=ro,
             rw=rw,
             env_allow=[],  # pass-through (gateway already scrubbed secrets)
@@ -491,42 +732,36 @@ def options_env(effective_cwd: Path, user: Optional[str] = None) -> Dict[str, st
             BROKER_SOCKET_ENV: broker_socket_path(),
         }
 
-    env: Dict[str, str] = {
-        MODE_ENV: "landlock",
-        RO_ENV: os.pathsep.join(ro),
-        RW_ENV: os.pathsep.join(rw),
-    }
-    real_cli = os.environ.get(REAL_CLI_ENV) or resolve_real_cli()
-    if real_cli:
-        env[REAL_CLI_ENV] = real_cli
-    return env
+    return _landlock_env(ro, rw)
 
 
-def preflight_options_env(effective_cwd: Path) -> Dict[str, str]:
+def preflight_options_env(
+    effective_cwd: Path,
+    user: Optional[str] = None,
+    *,
+    gateway_owned: bool = False,
+) -> Dict[str, str]:
     """Confinement env for an internal catalog / slash-preflight spawn.
 
     The slash-command preflight and catalog run a throwaway CLI only to read the
-    registered command list; they carry no user data and need no per-user
-    identity, so they are confined in **landlock** mode regardless of the
-    effective mode. This keeps them off the broker/ticket path (uid mode) — an
-    unticketed uid-mode spawn would exit non-zero and turn every ``/skill``
-    prompt into a 500, and would consume a per-user uid per preflight — while
-    still handing the launcher the ro/rw lists so the confined CLI can read
-    ``~/.claude`` (without them the catalog loses every user/plugin skill and a
-    ``None`` cwd lets the launcher grab ``/app`` as writable). No-op off.
+    registered command list. In a session workspace that CLI still loads the
+    workspace's project settings, skills and commands, so it is confined as the
+    session would be (:func:`options_env`, same uid key): in uid mode it goes
+    through the broker as that session's uid, not the gateway uid — the
+    workspace's hooks and ``.mcp.json`` servers ran as the gateway uid before
+    (#241 review; the preflight also disables both, see ``slash_commands``). A
+    preflight with no workspace runs in a private gateway-owned dir
+    (``gateway_owned=True``): there is no session uid to run it as, so it stays
+    landlock-shaped in every Landlock mode — with the ro/rw lists, so the
+    confined CLI can read ``~/.claude`` (without them the catalog loses every
+    user/plugin skill). No-op off.
     """
     if not confine_enabled():
         return {}
-    ro, rw = _ro_rw_roots(Path(effective_cwd))
-    env: Dict[str, str] = {
-        MODE_ENV: "landlock",
-        RO_ENV: os.pathsep.join(ro),
-        RW_ENV: os.pathsep.join(rw),
-    }
-    real_cli = os.environ.get(REAL_CLI_ENV) or resolve_real_cli()
-    if real_cli:
-        env[REAL_CLI_ENV] = real_cli
-    return env
+    if not gateway_owned:
+        return options_env(effective_cwd, user=user)
+    ro, rw = _ro_rw_roots(Path(_absolute(effective_cwd)))
+    return _landlock_env(ro, rw)
 
 
 def check_config() -> List[str]:
@@ -570,7 +805,9 @@ def check_config() -> List[str]:
     if requested == "uid" and mode == "uid":
         from . import uid_isolation as ui
 
-        if not (os.getenv(ui.TICKET_SECRET_ENV) or "").strip():
+        # ticket_secret(), not the env: startup moves the secret out of
+        # os.environ into memory before this check runs.
+        if not ui.ticket_secret():
             errors.append(
                 f"{MODE_ENV}=uid but {ui.TICKET_SECRET_ENV} is unset; the gateway "
                 "cannot mint a broker ticket. The entrypoint must generate it and "

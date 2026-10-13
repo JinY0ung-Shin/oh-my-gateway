@@ -37,6 +37,7 @@ This module validates the prompt before it reaches the SDK:
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import time
@@ -139,34 +140,62 @@ _cache = _Cache()
 
 _preflight_dir: Optional[Path] = None
 
+# The preflight only reads the command catalog, so it runs with no MCP servers
+# (strict and empty, as sessions are strict), every hook disabled and every
+# settings command the CLI runs at startup blanked. In a session workspace the
+# workspace's own hooks (InstructionsLoaded, SessionStart, SessionEnd), its
+# ``.mcp.json`` stdio servers and its ``apiKeyHelper`` — plus the AWS / GCP
+# auth helpers once its ``env`` block switches provider — otherwise ran during
+# connect + get_server_info (#241 review). A ``--settings`` value outranks the
+# project's, and ``""`` runs nothing. Measured on the bundled CLI 2.1.283: no
+# hook, MCP or helper side effect, and the catalog is unchanged — workspace,
+# user and plugin commands and skills included. Pinned by
+# tests/test_cli_slash_preflight.py. statusLine is covered by disableAllHooks;
+# subagentStatusLine and fileSuggestion never run headless.
+_PREFLIGHT_HELPERS = (
+    "apiKeyHelper",
+    "proxyAuthHelper",
+    "awsCredentialExport",
+    "awsAuthRefresh",
+    "gcpAuthRefresh",
+    "otelHeadersHelper",
+)
+_PREFLIGHT_SETTINGS = json.dumps(
+    {"disableAllHooks": True, **dict.fromkeys(_PREFLIGHT_HELPERS, "")}
+)
+
 
 def _preflight_cwd() -> Path:
-    """A stable, gateway-owned directory for a confined preflight with no cwd.
+    """A private, gateway-owned directory for a confined preflight with no cwd.
 
     When confinement is on, the launcher needs a real cwd (a ``None`` cwd makes
     it grab ``$PWD`` — ``/app`` in the image — as writable). This throwaway dir
     is never a session workspace; it only gives the confined catalog CLI a
-    writable root of its own.
+    writable root of its own. ``mkdtemp`` makes it fresh and 0700 for this
+    process: a fixed shared name under the temp dir could be pre-created by
+    another uid with a ``.claude/settings.json`` the preflight then loads (#241
+    review). Removed at exit.
     """
     global _preflight_dir
     if _preflight_dir is None:
+        import atexit
+        import shutil
         import tempfile
 
-        d = Path(tempfile.gettempdir()) / "gateway-slash-preflight"
-        try:
-            d.mkdir(parents=True, exist_ok=True)
-        except OSError:
-            d = Path(tempfile.mkdtemp(prefix="gateway-slash-preflight-"))
-        _preflight_dir = d
+        _preflight_dir = Path(tempfile.mkdtemp(prefix="gateway-slash-preflight-"))
+        atexit.register(shutil.rmtree, _preflight_dir, True)
     return _preflight_dir
 
 
-def _build_preflight_options(cwd: Optional[Path]) -> ClaudeAgentOptions:
+def _build_preflight_options(
+    cwd: Optional[Path], user: Optional[str] = None
+) -> ClaudeAgentOptions:
     """Build the SDK options for a catalog/preflight spawn.
 
     Shared by the names and the details fetchers so they stay identical. Routes
     through the same cwd/confinement path a real session uses: ``cli_path`` is
-    the launcher under confinement, and the per-workspace ro/rw lists ride
+    the launcher under confinement, and the per-workspace ro/rw lists (or, in
+    uid mode, the session uid's broker ticket — ``user`` keys it) ride
     ``options.env`` so the confined catalog CLI can read ``~/.claude`` (#241).
     """
     from src.backends.claude import landlock
@@ -174,37 +203,44 @@ def _build_preflight_options(cwd: Optional[Path]) -> ClaudeAgentOptions:
         _get_cli_path,
         _get_max_buffer_size,
         _get_setting_sources,
+        child_secret_env,
     )
 
     if cwd is not None:
         _materialize_project_resources(cwd)
-    effective_cwd = cwd
-    if landlock.confine_enabled() and effective_cwd is None:
-        effective_cwd = _preflight_cwd()
     opts = ClaudeAgentOptions(
-        cwd=effective_cwd,
+        cwd=cwd,
         setting_sources=_get_setting_sources(),
         cli_path=_get_cli_path(),
+        strict_mcp_config=True,
+        settings=_PREFLIGHT_SETTINGS,
     )
     opts.max_buffer_size = _get_max_buffer_size()
-    env: dict[str, str] = {}
-    if effective_cwd is not None:
-        env.update(landlock.preflight_options_env(Path(effective_cwd)))
-    # The catalog CLI never needs the uid-isolation ticket secret; blank it so a
-    # skill body cannot read it from the preflight spawn's env (#241).
-    env["GATEWAY_ISOLATION_TICKET_SECRET"] = ""
+    # The same secret blanks a session child gets (ADMIN_API_KEY, API_KEY, the
+    # other backends' and auth-mode credentials, the ticket secret): whatever
+    # still runs in the preflight sees none of them (#241 review). Then the
+    # confinement env, in the order a session's options get them.
+    env: dict[str, str] = dict(child_secret_env())
+    if landlock.confine_enabled():
+        if cwd is None:
+            opts.cwd = _preflight_cwd()
+            env.update(landlock.preflight_options_env(opts.cwd, gateway_owned=True))
+        else:
+            # Absolute like the path lists: the launcher reads its cwd from PWD.
+            opts.cwd = Path(os.path.abspath(cwd))
+            env.update(landlock.preflight_options_env(opts.cwd, user=user))
     opts.env = {**(getattr(opts, "env", None) or {}), **env}
     return opts
 
 
-async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
+async def _fetch_commands(cwd: Optional[Path], user: Optional[str] = None) -> set[str]:
     """Pull the registered slash-command names from the SDK.
 
     Uses the same setting sources *and CLI binary* as the backend's SDK calls,
     so user-scope plugin skills installed by the admin panel are visible to the
     preflight and the answer describes the CLI that will actually run the turn.
     """
-    opts = _build_preflight_options(cwd)
+    opts = _build_preflight_options(cwd, user)
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -218,13 +254,18 @@ async def _fetch_commands(cwd: Optional[Path]) -> set[str]:
 
 
 async def get_available_commands(
-    cwd: Optional[Path] = None, force: bool = False
+    cwd: Optional[Path] = None, force: bool = False, user: Optional[str] = None
 ) -> set[str]:
+    """The registered command names for *cwd*, TTL-cached per cwd.
+
+    ``user`` is whom the preflight runs as under ``uid`` isolation (the session
+    in *cwd*); the cache stays keyed on the cwd alone.
+    """
     async with _cache.lock:
         if not force and _cache.is_fresh(cwd):
             assert _cache.commands is not None
             return _cache.commands
-        _cache.commands = await _fetch_commands(cwd)
+        _cache.commands = await _fetch_commands(cwd, user)
         _cache.fetched_at = time.monotonic()
         _cache.cwd_key = _cwd_key(cwd)
         return _cache.commands
@@ -248,9 +289,11 @@ class _DetailsCache:
 _details_cache = _DetailsCache()
 
 
-async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str]]:
+async def _fetch_command_details(
+    cwd: Optional[Path], user: Optional[str] = None
+) -> dict[str, dict[str, str]]:
     """Names plus SDK metadata (description, argumentHint) for completion UIs."""
-    opts = _build_preflight_options(cwd)
+    opts = _build_preflight_options(cwd, user)
     details: dict[str, dict[str, str]] = {}
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -270,14 +313,14 @@ async def _fetch_command_details(cwd: Optional[Path]) -> dict[str, dict[str, str
 
 
 async def get_command_details(
-    cwd: Optional[Path] = None, force: bool = False
+    cwd: Optional[Path] = None, force: bool = False, user: Optional[str] = None
 ) -> dict[str, dict[str, str]]:
     """Like :func:`get_available_commands` but with per-command metadata."""
     async with _details_cache.lock:
         if not force and _details_cache.is_fresh(cwd):
             assert _details_cache.details is not None
             return _details_cache.details
-        _details_cache.details = await _fetch_command_details(cwd)
+        _details_cache.details = await _fetch_command_details(cwd, user)
         _details_cache.fetched_at = time.monotonic()
         _details_cache.cwd_key = _cwd_key(cwd)
         return _details_cache.details
@@ -310,10 +353,13 @@ def extract_command_name(prompt: str) -> Optional[str]:
     return name
 
 
-async def validate_prompt(prompt: str, cwd: Optional[Path] = None) -> None:
+async def validate_prompt(
+    prompt: str, cwd: Optional[Path] = None, user: Optional[str] = None
+) -> None:
     """Raise ``SlashCommandError`` if ``prompt`` is a slash command we reject.
 
-    No-ops for prompts that don't start with ``/``.
+    No-ops for prompts that don't start with ``/``. ``user`` is the session's
+    user, whom the catalog preflight in *cwd* runs as under ``uid`` isolation.
     """
     name = extract_command_name(prompt)
     if name is None:
@@ -341,12 +387,12 @@ async def validate_prompt(prompt: str, cwd: Optional[Path] = None) -> None:
             ),
         )
 
-    known = await get_available_commands(cwd)
+    known = await get_available_commands(cwd, user=user)
     if name in known:
         return
 
     # Refresh once in case a skill was added after the cache was populated.
-    known = await get_available_commands(cwd, force=True)
+    known = await get_available_commands(cwd, force=True, user=user)
     if name in known:
         return
 

@@ -1,10 +1,12 @@
-"""Shared Landlock ruleset machinery for the isolation launcher and broker.
+"""Shared machinery for the isolation launcher and broker.
 
 Both ``landlock_launcher.py`` (landlock mode: confine in place) and
 ``isolation_broker.py`` (uid mode: confine the forked child after the uid
 switch) must confine with the **same** rules, so the syscall surface, the
 access masks and the default system policy live here once rather than being
-duplicated across two security-critical files.
+duplicated across two security-critical files. So do the few things both ends
+of a confined spawn must agree on: the per-session temp/cache environment and
+the uid-mode status wire format.
 
 stdlib only. This module lives beside the launcher/broker under ``docker/`` —
 a fixed, root-owned location in the image — and is imported as a sibling; it is
@@ -14,6 +16,7 @@ under ``python3 -I`` so the sibling import cannot be redirected.
 
 import ctypes
 import os
+import signal
 import stat
 import struct
 
@@ -44,6 +47,16 @@ _ACCESS_BY_ABI = {
     3: (1 << 15) - 1,  # + TRUNCATE
     5: (1 << 16) - 1,  # + IOCTL_DEV
 }
+
+# ABI 6 IPC scoping (struct landlock_ruleset_attr gains handled_access_net and
+# scoped). A scoped domain cannot signal, or connect to an abstract unix socket
+# bound by, a process outside itself; its own processes still can, and signals
+# into it are unaffected. In uid mode that keeps a session from killing its
+# supervisor to escape teardown; in both modes it blocks cross-session signals
+# and the abstract-socket namespace, which has no DAC at all.
+_SCOPE_ABI = 6
+_SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0
+_SCOPE_SIGNAL = 1 << 1
 
 # A read-only tree: read + execute + traverse. Landlock's read right does not
 # imply execute, so a CLI/plugin exec needs EXECUTE explicitly.
@@ -161,6 +174,56 @@ def safe_tmpdir(cwd):
     return tmp
 
 
+def session_tmp_env(tmp):
+    """The env overrides that keep a confined CLI's temp files and tool caches
+    in its own session tmp dir (beneath the granted workspace).
+
+    The npm and uv caches must not be the shared, app-owned ``~/.npm`` /
+    ``~/.cache/uv``: a package another session planted there is what the next
+    ``npx -y`` / ``uv run`` executes. Inherited values are overridden. npm reads
+    ``npm_config_*`` case-insensitively and the last spelling in the env wins,
+    so both spellings are set."""
+    npm_cache = os.path.join(tmp, "npm-cache")
+    return {
+        "TMPDIR": tmp,
+        "CLAUDE_CODE_TMPDIR": tmp,
+        "npm_config_cache": npm_cache,
+        "NPM_CONFIG_CACHE": npm_cache,
+        "UV_CACHE_DIR": os.path.join(tmp, "uv-cache"),
+    }
+
+
+def restore_exec_signals():
+    """Reset what Python ignores at startup (SIGPIPE, SIGXFSZ) before ``exec``.
+
+    Ignored dispositions survive ``execve``; the SDK spawns an unconfined CLI
+    with them at the default (``restore_signals``), so a confined one should
+    start the same way."""
+    for name in ("SIGPIPE", "SIGXFSZ"):
+        sig = getattr(signal, name, None)
+        if sig is not None:
+            try:
+                signal.signal(sig, signal.SIG_DFL)
+            except (OSError, ValueError):
+                pass
+
+
+# --- uid-mode wire format (launcher <-> broker) ------------------------------
+#
+# The launcher opens with one spawn header: a 4-byte length, then JSON
+# ``{"ticket": str, "argv": [str], "env": {str: str}}``, with fds 0/1/2 as
+# SCM_RIGHTS on its first byte. Everything after that, in both directions, is
+# fixed-size ``(kind, value)`` records. The exit code and the terminating signal
+# travel as separate kinds, so no exit code is ever mistaken for a signal.
+
+MAX_HEADER = 8 << 20  # env + argv + the ticket's path lists, JSON-escaped
+REC = struct.Struct("=Ii")
+REC_RELAY = 1  # launcher -> broker: relay signal ``value`` to the CLI's group
+ST_EXITED = 1  # broker -> launcher: the CLI exited with code ``value``
+ST_SIGNALED = 2  # broker -> launcher: the CLI was killed by signal ``value``
+ST_REFUSED = 3  # broker -> launcher: spawn refused; the CLI never started
+
+
 _PR_CAP_AMBIENT = 47
 _PR_CAP_AMBIENT_CLEAR_ALL = 4
 _CAP_VERSION_3 = 0x20080522
@@ -198,7 +261,8 @@ def build_and_restrict(ro_dirs, rw_dirs, ro_files=RO_FILES, rw_files=RW_FILES):
 
     Requires ABI >= 2 (kernel >= 5.19); raises :class:`LandlockError` otherwise
     so the caller fails closed. Read-write dirs are created first (a rule needs
-    an existing path to O_PATH-open); absent read-only paths are skipped.
+    an existing path to O_PATH-open); absent read-only paths are skipped. On
+    ABI >= 6 the domain is also scoped (signals, abstract unix sockets).
     """
     a = abi()
     if a < 2:
@@ -206,8 +270,16 @@ def build_and_restrict(ro_dirs, rw_dirs, ro_files=RO_FILES, rw_files=RW_FILES):
             "Landlock ABI %d < 2 (need kernel >= 5.19); cannot confine" % a
         )
     handled = _rights_mask(a)
-    attr = ctypes.create_string_buffer(struct.pack("=Q", handled))
-    ruleset_fd, errno = _syscall(_NR_CREATE_RULESET, ctypes.addressof(attr), 8, 0)
+    if a >= _SCOPE_ABI:
+        # handled_access_net stays 0: the network is not restricted.
+        scoped = _SCOPE_SIGNAL | _SCOPE_ABSTRACT_UNIX_SOCKET
+        raw = struct.pack("=QQQ", handled, 0, scoped)
+    else:
+        raw = struct.pack("=Q", handled)
+    attr = ctypes.create_string_buffer(raw)
+    ruleset_fd, errno = _syscall(
+        _NR_CREATE_RULESET, ctypes.addressof(attr), len(raw), 0
+    )
     if ruleset_fd < 0:
         raise LandlockError("create_ruleset failed (errno %d)" % errno)
     try:

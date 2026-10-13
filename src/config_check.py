@@ -682,6 +682,93 @@ def _check_landlock_confinement() -> List[ConfigIssue]:
     return [ConfigIssue("error", message) for message in _landlock_check()]
 
 
+# Linux managed-settings locations the CLI reads (policy outranks --settings).
+_MANAGED_SETTINGS_DIR = "/etc/claude-code"
+
+
+def _managed_sandbox_enabled(base: str = "") -> List[str]:
+    """Managed-settings files that turn the CLI's OS sandbox on, if any."""
+    base = base or _MANAGED_SETTINGS_DIR
+    candidates = [os.path.join(base, "managed-settings.json")]
+    drop_in = os.path.join(base, "managed-settings.d")
+    try:
+        candidates.extend(
+            os.path.join(drop_in, name)
+            for name in sorted(os.listdir(drop_in))
+            if name.endswith(".json")
+        )
+    except OSError:
+        pass
+    hits: List[str] = []
+    for path in candidates:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            continue
+        sandbox = data.get("sandbox") if isinstance(data, dict) else None
+        if isinstance(sandbox, dict) and sandbox.get("enabled") is True:
+            hits.append(path)
+    return hits
+
+
+def _check_isolation_sandbox_conflict() -> List[ConfigIssue]:
+    """Say so when Landlock confinement overrides a requested CLI sandbox.
+
+    bwrap cannot start inside a Landlock domain, so with confinement on the
+    gateway forces the CLI's own OS sandbox off. An operator's explicit
+    ``CLAUDE_SANDBOX_ENABLED=true`` is therefore not honored (Landlock is the
+    stronger boundary), and a managed policy that enables the sandbox cannot be
+    overridden by the gateway's ``--settings`` at all — with bwrap present every
+    sandboxed Bash call would then fail. Both used to happen silently (#241
+    review).
+    """
+    from src.backends.claude.landlock import confine_enabled
+
+    if not confine_enabled():
+        return []
+    issues: List[ConfigIssue] = []
+    raw = (os.getenv("CLAUDE_SANDBOX_ENABLED") or "").strip().lower()
+    if raw in {"true", "1", "yes", "on"}:
+        issues.append(
+            ConfigIssue(
+                "warning",
+                "CLAUDE_SANDBOX_ENABLED=true is not honored while "
+                "CLAUDE_ISOLATION_MODE confines sessions with Landlock: bwrap "
+                "cannot start inside a Landlock domain, so the CLI's OS sandbox "
+                "is forced off and Landlock is the boundary. Unset "
+                "CLAUDE_SANDBOX_ENABLED to silence this.",
+            )
+        )
+    for path in _managed_sandbox_enabled():
+        issues.append(
+            ConfigIssue(
+                "warning",
+                f"managed settings {path} enable the CLI's OS sandbox, which the "
+                "gateway cannot override and which cannot run inside the Landlock "
+                "domain of CLAUDE_ISOLATION_MODE: if bubblewrap is installed every "
+                "sandboxed Bash call will fail. Disable sandbox.enabled in the "
+                "managed policy for confined deployments.",
+            )
+        )
+    return issues
+
+
+def _check_uid_registry() -> List[ConfigIssue]:
+    """Refuse to start uid mode on a damaged uid registry (fail closed).
+
+    A registry that exists but cannot be read or parsed would otherwise fail
+    every named user's spawn at runtime; loading it as empty (the old behavior)
+    reassigned uids. See ``uid_isolation.UidRegistry``.
+    """
+    from src.backends.claude import landlock
+    from src.backends.claude import uid_isolation as ui
+
+    if landlock.isolation_mode() != "uid" or landlock.effective_mode() != "uid":
+        return []
+    return [ConfigIssue("error", message) for message in ui.registry_errors()]
+
+
 def check_config() -> List[ConfigIssue]:
     """Inspect the environment and return all detected configuration issues."""
     backends = _enabled_backends()
@@ -704,6 +791,8 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_workspace_quota())
     issues.extend(_check_cross_session_messaging())
     issues.extend(_check_landlock_confinement())
+    issues.extend(_check_isolation_sandbox_conflict())
+    issues.extend(_check_uid_registry())
     return issues
 
 

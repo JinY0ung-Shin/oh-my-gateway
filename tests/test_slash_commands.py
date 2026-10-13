@@ -50,7 +50,7 @@ def test_extract_command_name(prompt, expected):
 async def test_non_slash_is_noop(monkeypatch):
     called = {"n": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         called["n"] += 1
         return set()
 
@@ -62,7 +62,7 @@ async def test_non_slash_is_noop(monkeypatch):
 
 
 async def test_blocked_command_raises(monkeypatch):
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         return {"compact", "init", "heapdump", "dev-server"}
 
     monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
@@ -87,7 +87,7 @@ def test_parse_blocked_commands_env(raw, expected):
 async def test_env_blocked_command_raises(monkeypatch):
     """Names from BLOCKED_SLASH_COMMANDS reject even when the skill is registered."""
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         return {"verify"}
 
     monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
@@ -99,7 +99,7 @@ async def test_env_blocked_command_raises(monkeypatch):
 
 
 async def test_known_command_passes(monkeypatch):
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         return {"dev-server", "review"}
 
     monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
@@ -111,7 +111,7 @@ async def test_known_command_passes(monkeypatch):
 async def test_unknown_command_raises(monkeypatch):
     calls = {"n": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         calls["n"] += 1
         return {"review"}  # does not contain "help"
 
@@ -128,7 +128,7 @@ async def test_slash_prefixed_plain_input_is_noop(monkeypatch):
     """Paths / URLs / bare slash pass through without a command fetch (#117)."""
     called = {"n": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         called["n"] += 1
         return {"review"}
 
@@ -148,7 +148,7 @@ async def test_slash_prefixed_plain_input_is_noop(monkeypatch):
 async def test_ttl_cache_reuses_within_window(monkeypatch):
     calls = {"n": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         calls["n"] += 1
         return {"review"}
 
@@ -202,7 +202,7 @@ async def test_fetch_commands_uses_backend_setting_sources(monkeypatch, tmp_path
 async def test_ttl_cache_refreshes_after_expiry(monkeypatch):
     calls = {"n": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         calls["n"] += 1
         return {"review"}
 
@@ -222,7 +222,7 @@ async def test_refresh_picks_up_newly_added_skill(monkeypatch):
     """If the cache is stale and the skill was just added, refresh rescues it."""
     state = {"commands": {"review"}, "calls": 0}
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         state["calls"] += 1
         # Second call (the forced refresh) reveals the new skill.
         if state["calls"] >= 2:

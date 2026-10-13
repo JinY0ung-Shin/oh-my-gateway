@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import errno
+import math
 import os
+import socket
 import stat
 import sys
+import time
 from pathlib import Path
 
 
@@ -19,6 +22,15 @@ DEFAULT_OPENCODE_HOME = Path("/home/app/.local/share/opencode")
 DEFAULT_OPENCODE_CONFIG = Path("/home/app/.config/opencode")
 DEFAULT_UV_CACHE_DIR = Path("/home/app/.cache/uv")
 MYSQL_DATA_DIR_NAME = "mysql_data"
+# Just below the default per-user band (20000-29999) and kept equal to the
+# gateway's default in uid_isolation, so the broker's uid is never a session's.
+DEFAULT_BROKER_UID = 19999
+DEFAULT_BROKER_SOCKET = "/run/gateway-isolation/broker.sock"
+# One operator knob bounds both waits for the broker: this one, before the
+# gateway is exec'd, and the gateway's own (src/backends/claude/landlock.py).
+BROKER_WAIT_ENV = "CLAUDE_ISOLATION_BROKER_WAIT_SECONDS"
+DEFAULT_BROKER_WAIT_SECONDS = 10.0
+MAX_BROKER_WAIT_SECONDS = 300.0
 
 
 def _parse_id(name: str, default: int) -> int:
@@ -294,6 +306,174 @@ def _resolve_real_cli() -> str | None:
     return None
 
 
+def _untrusted_component(path: Path, trusted_owners: frozenset[int]) -> str | None:
+    """Why *path* cannot safely hold the broker's socket directory, or None.
+
+    Every component from ``/`` down must be a real directory (no symlink to
+    retarget later), owned by a trusted uid, and not writable by other users
+    unless sticky — otherwise someone could rename the socket directory away
+    and plant a fake broker socket in its place.
+    """
+    current = Path(path.anchor)
+    for part in (None, *path.parts[1:]):
+        if part is not None:
+            current = current / part
+        try:
+            info = os.lstat(current)
+        except OSError as exc:
+            return f"{current}: {exc.strerror}"
+        if stat.S_ISLNK(info.st_mode):
+            return f"{current} is a symlink"
+        if not stat.S_ISDIR(info.st_mode):
+            return f"{current} is not a directory"
+        if info.st_uid not in trusted_owners:
+            return f"{current} is owned by uid {info.st_uid}"
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            return f"{current} is writable by other users"
+    return None
+
+
+def _prepare_broker_socket_dir(
+    sock_dir: Path,
+    uid: int,
+    gid: int,
+    *,
+    trusted_owners: frozenset[int] = frozenset({0}),
+) -> bool:
+    """Create (or adopt) the broker's private socket directory, fail-closed.
+
+    The broker must own it to bind its socket, the gateway gid needs traverse
+    (0750), and nothing else may write it. This root step must never follow a
+    symlink or re-own a shared directory (a socket configured as
+    ``/tmp/broker.sock`` used to turn ``/tmp`` into 0750): the directory is
+    either created here, or adopted only when it already belongs to the broker
+    uid and is not group/other-writable, and its owner and mode are set through
+    an ``O_NOFOLLOW | O_DIRECTORY`` fd.
+    """
+    if not sock_dir.is_absolute():
+        print(f"warning: broker socket dir {sock_dir} is not absolute", file=sys.stderr)
+        return False
+    reason = _untrusted_component(sock_dir.parent, trusted_owners)
+    if reason:
+        print(
+            f"warning: refusing broker socket dir {sock_dir}: {reason}; point "
+            "GATEWAY_ISOLATION_BROKER_SOCKET into a dedicated directory under a "
+            "root-owned path such as /run",
+            file=sys.stderr,
+        )
+        return False
+    created = True
+    try:
+        os.mkdir(sock_dir, 0o700)
+    except FileExistsError:
+        created = False
+    except OSError as exc:
+        print(f"warning: cannot create {sock_dir}: {exc}", file=sys.stderr)
+        return False
+    try:
+        fd = os.open(sock_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError as exc:
+        print(
+            f"warning: refusing broker socket dir {sock_dir}: a symlink or not a "
+            f"directory ({exc.strerror})",
+            file=sys.stderr,
+        )
+        return False
+    try:
+        info = os.fstat(fd)
+        if not created and (info.st_uid != uid or info.st_mode & 0o022):
+            print(
+                f"warning: refusing pre-existing broker socket dir {sock_dir} "
+                f"(uid {info.st_uid}, mode {stat.S_IMODE(info.st_mode):o}): not a "
+                f"private directory of the broker uid {uid}",
+                file=sys.stderr,
+            )
+            return False
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, 0o750)
+    except OSError as exc:
+        print(f"warning: cannot prepare {sock_dir}: {exc}", file=sys.stderr)
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _broker_wait_seconds() -> float:
+    """``CLAUDE_ISOLATION_BROKER_WAIT_SECONDS``, parsed exactly like the gateway.
+
+    Blank gives the default. Anything that is not a finite number warns and
+    gives the default (``inf``/``1e400`` would wait forever, ``nan`` used to
+    read as 0). Otherwise the value is clamped to ``[0, MAX_BROKER_WAIT_SECONDS]``,
+    with a warning above the cap.
+    """
+    raw = (os.environ.get(BROKER_WAIT_ENV) or "").strip()
+    if not raw:
+        return DEFAULT_BROKER_WAIT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        value = math.nan
+    if not math.isfinite(value):
+        print(
+            f"warning: ignoring {BROKER_WAIT_ENV}={raw!r}: not a finite number of "
+            f"seconds; using {DEFAULT_BROKER_WAIT_SECONDS}",
+            file=sys.stderr,
+        )
+        return DEFAULT_BROKER_WAIT_SECONDS
+    if value > MAX_BROKER_WAIT_SECONDS:
+        print(
+            f"warning: {BROKER_WAIT_ENV}={raw!r} is above the "
+            f"{MAX_BROKER_WAIT_SECONDS}s cap; using the cap",
+            file=sys.stderr,
+        )
+        return MAX_BROKER_WAIT_SECONDS
+    return max(0.0, value)
+
+
+def _wait_for_broker(
+    sock: str, pid: int, timeout: float = DEFAULT_BROKER_WAIT_SECONDS
+) -> bool:
+    """Wait (bounded) until the forked broker accepts on *sock*.
+
+    The gateway probes the broker once at startup and caches the answer, so it
+    must not race the broker's bind. Polls ``connect()``; an early broker exit
+    ends the wait at once. On failure only warns: the gateway's own startup
+    check still refuses uid mode (fail-closed).
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            done, status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            done, status = pid, 0
+        if done == pid:
+            print(
+                "warning: isolation broker exited during startup (exit code "
+                f"{os.waitstatus_to_exitcode(status)}); the gateway will refuse "
+                "uid mode",
+                file=sys.stderr,
+            )
+            return False
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(1.0)
+            probe.connect(sock)
+            return True
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        if time.monotonic() >= deadline:
+            print(
+                f"warning: isolation broker not accepting on {sock} after "
+                f"{timeout:.1f}s; the gateway will refuse uid mode",
+                file=sys.stderr,
+            )
+            return False
+        time.sleep(0.05)
+
+
 def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     """Fork the resident broker before privilege drop. No-op unless uid mode.
 
@@ -315,7 +495,7 @@ def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     broker = Path(__file__).resolve().parent / "isolation_broker.py"
     sock = (os.environ.get("GATEWAY_ISOLATION_BROKER_SOCKET") or "").strip()
     if not sock:
-        sock = "/run/gateway-isolation/broker.sock"
+        sock = DEFAULT_BROKER_SOCKET
         os.environ["GATEWAY_ISOLATION_BROKER_SOCKET"] = sock
     import secrets as _secrets
 
@@ -333,25 +513,22 @@ def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     # The broker runs under a dedicated non-root uid but keeps the gateway's gid
     # by default, so the socket it binds (mode 0660, group = that gid) is
     # connectable by the gateway-uid launcher without a world-writable socket.
-    broker_uid = _parse_id("CLAUDE_ISOLATION_BROKER_UID", 21000)
+    broker_uid = _parse_id("CLAUDE_ISOLATION_BROKER_UID", DEFAULT_BROKER_UID)
     broker_gid = _parse_id("CLAUDE_ISOLATION_BROKER_GID", app_gid)
     # The broker pins its only legitimate client to the gateway's uid.
     os.environ["GATEWAY_ISOLATION_PEER_UID"] = str(app_uid)
 
-    sock_dir = Path(sock).parent
-    try:
-        sock_dir.mkdir(parents=True, exist_ok=True)
-        # The broker (dropped to broker_uid) must own the dir to bind its
-        # socket; the gateway gid gets traverse (x) to reach it. Not world.
-        os.chown(sock_dir, broker_uid, broker_gid)
-        os.chmod(sock_dir, 0o750)
-    except OSError as exc:
-        print(f"warning: could not prepare broker socket dir: {exc}", file=sys.stderr)
+    # The broker (dropped to broker_uid) must own the dir to bind its socket;
+    # the gateway gid gets traverse (x) to reach it. Not world.
+    if not _prepare_broker_socket_dir(Path(sock).parent, broker_uid, broker_gid):
         return
 
     pid = os.fork()
     if pid > 0:
-        return  # entrypoint continues; the gateway will verify reachability
+        # Hold the gateway back until the broker accepts: its one-shot startup
+        # probe would otherwise race the bind and cache "unavailable".
+        _wait_for_broker(sock, pid, _broker_wait_seconds())
+        return
 
     # --- broker child: drop to the dedicated uid keeping SETUID/SETGID ------
     try:
