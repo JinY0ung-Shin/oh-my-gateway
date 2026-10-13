@@ -786,9 +786,11 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         directory is otherwise blocked ("...may only change directories to the
         allowed working directories for this session"). Add the
         plugin/skill/marketplace roots plus any operator-specified
-        ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. The sandbox
-        hook grants the same directories to read/exec; writes stay confined to
-        the workspace + the session's own ``$HOME/.claude/projects`` entry.
+        ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. Every entry
+        goes to the CLI; the sandbox hook grants read/exec only to the ones
+        whose tree is read-only and that do not overlap per-user state
+        (``_operator_add_dir_roots``), and the write tools stay confined to the
+        workspace + the session's own ``$HOME/.claude/projects`` entry.
         """
         dirs: List[str] = []
         seen: set[str] = set()

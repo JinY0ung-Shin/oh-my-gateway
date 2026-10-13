@@ -547,16 +547,24 @@ class TestPluginResourceRoots:
 
 class TestOperatorAddDirs:
     """``CLAUDE_ADD_DIRS`` is also a CLI working directory (``--add-dir``), so the
-    sandbox must grant it to read/exec too — otherwise the CLI lets a session
-    ``cd`` there while the hook refuses every Read/Bash on it (#234). Writes
-    stay confined to the workspace."""
+    sandbox grants it to read/exec too — otherwise the CLI lets a session ``cd``
+    there while the hook refuses every Read/Bash on it (#234). Only an entry on
+    a read-only mount is granted: the hook does not split Bash into read and
+    write, and the CLI loads the entry's ``.claude/`` skills into every
+    session. The write tools stay confined to the workspace."""
 
     @pytest.fixture
     def shared(self, tmp_path: Path, monkeypatch) -> Path:
+        from src.backends.claude import workspace_sandbox as sandbox
+
         home = tmp_path / "home" / "app"
         (home / ".claude").mkdir(parents=True)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("CLAUDE_PLUGIN_CLONE_ROOT", raising=False)
+        # Keep the host's workspace base out of the overlap checks.
+        monkeypatch.setattr(sandbox.workspace_manager, "base_path", tmp_path / "ws")
+        # tmp is writable; model the read-only mount an operator has to use.
+        monkeypatch.setattr(sandbox, "_read_only_tree", lambda path: True)
         shared = tmp_path / "data" / "shared"
         (shared / "docs").mkdir(parents=True)
         (shared / "docs" / "guide.md").write_text("# guide")
@@ -646,10 +654,158 @@ class TestOperatorAddDirs:
         assert await _call(sandbox, "Read", doc) == {}
         assert _is_deny(await _call(sandbox, "Write", doc))
 
-    def test_cli_and_hook_share_one_list(self, shared, tmp_path):
+    @pytest.mark.parametrize("mine_in_base", [False, True])
+    @pytest.mark.parametrize("entry", ["base", "base_parent", "other_user"])
+    async def test_entry_overlapping_workspace_base_opens_no_other_workspace(
+        self, shared, tmp_path, monkeypatch, entry, mine_in_base
+    ):
+        # The workspace base holds every user's workspace. An operator entry
+        # that is it, inside it or an ancestor of it must not open another
+        # user's workspace; a separate entry still works. With this session's
+        # cwd outside the base, the base rule alone has to refuse the entry.
+        from src.backends.claude import workspace_sandbox as sandbox
+
+        base = tmp_path / "srv" / "workspaces"
+        owner = base if mine_in_base else tmp_path / "cwd"
+        mine = owner / "alice" / "claude"
+        theirs = base / "bob" / "claude"
+        mine.mkdir(parents=True)
+        theirs.mkdir(parents=True)
+        secret = theirs / "notes.md"
+        secret.write_text("not yours")
+        monkeypatch.setattr(sandbox.workspace_manager, "base_path", base)
+        target = {
+            "base": base,
+            "base_parent": base.parent,
+            "other_user": base / "bob",
+        }[entry]
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"{target},{shared}")
+        hook = make_workspace_sandbox_hook(mine)
+        attempts = [
+            ("Read", {"file_path": str(secret)}),
+            ("Grep", {"pattern": "x", "path": str(theirs)}),
+            ("Glob", {"pattern": "*", "path": str(theirs)}),
+            ("Bash", {"command": f"cat {secret}"}),
+        ]
+        for tool, tool_input in attempts:
+            assert _is_deny(await _call(hook, tool, tool_input)), (tool, tool_input)
+        doc = {"file_path": str(shared / "docs" / "guide.md")}
+        assert await _call(hook, "Read", doc) == {}
+
+    async def test_entry_containing_the_workspace_opens_no_sibling(
+        self, shared, tmp_path, monkeypatch
+    ):
+        # A cwd outside the workspace base: an entry that contains it also
+        # holds the other sessions' workspaces beside it.
+        custom = tmp_path / "srv" / "custom"
+        mine = custom / "alice"
+        theirs = custom / "bob"
+        mine.mkdir(parents=True)
+        theirs.mkdir(parents=True)
+        secret = theirs / "notes.md"
+        secret.write_text("not yours")
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"{custom},{shared}")
+        hook = make_workspace_sandbox_hook(mine)
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(secret)}))
+        assert _is_deny(await _call(hook, "Bash", {"command": f"cat {secret}"}))
+        doc = {"file_path": str(shared / "docs" / "guide.md")}
+        assert await _call(hook, "Read", doc) == {}
+
+    async def test_entry_not_on_a_read_only_mount_opens_nothing(
+        self, workspace, shared, tmp_path, monkeypatch
+    ):
+        # A writable entry would let one user's Bash plant .claude/ skills that
+        # every other session loads, so the hook refuses it like any other
+        # outside path; the read-only entry next to it is still granted.
+        from src.backends.claude import workspace_sandbox as sandbox
+
+        refs = (tmp_path / "opt" / "refs").resolve()
+        monkeypatch.setattr(sandbox, "_read_only_tree", lambda path: path == refs)
+        hook = make_workspace_sandbox_hook(workspace)
+        doc = shared / "docs" / "guide.md"
+        plant = f"mkdir -p {shared}/.claude/skills/x"
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(doc)}))
+        assert _is_deny(await _call(hook, "Bash", {"command": plant}))
+        assert await _call(hook, "Glob", {"pattern": "*", "path": str(refs)}) == {}
+
+    def test_read_only_tree(self, tmp_path, monkeypatch):
+        import os
+
+        from src.backends.claude import workspace_sandbox as sandbox
+
+        assert sandbox._read_only_tree(tmp_path) is False
+        assert sandbox._read_only_tree(tmp_path / "missing") is False
+
+        root = tmp_path / "ro"
+        below = root / "data dir"
+        read_only = {str(root)}
+
+        class _Stat:
+            def __init__(self, path):
+                self.f_flag = os.ST_RDONLY if str(path) in read_only else 0
+
+        monkeypatch.setattr(os, "statvfs", _Stat)
+        table = tmp_path / "mountinfo"
+        monkeypatch.setattr(sandbox, "_MOUNTINFO", table)
+        top, sub = (str(p).replace(" ", "\\040") for p in (root, below))
+        mounts = [
+            f"36 35 0:1 / {top} ro,relatime - tmpfs tmpfs ro",
+            f"37 36 0:2 / {sub} rw,relatime - tmpfs tmpfs rw",
+            # A sibling that merely shares the prefix is not below the entry.
+            f"39 35 0:4 / {top}-sibling rw,relatime - tmpfs tmpfs rw",
+        ]
+
+        def write(*lines):
+            table.write_bytes(os.fsencode("".join(f"{line}\n" for line in lines)))
+
+        write(*mounts)
+        # A writable mount below the read-only entry reopens its subtree.
+        assert sandbox._read_only_tree(root) is False
+        read_only.add(str(below))
+        assert sandbox._read_only_tree(root) is True
+        # The kernel escapes only space, tab, newline and backslash, so a mount
+        # point may hold a raw carriage return; a line ends only at "\n".
+        read_only.add(f"{root}/sub")
+        write(*mounts, f"38 36 0:3 / {top}/sub\rx rw - tmpfs tmpfs rw")
+        assert sandbox._read_only_tree(root) is False
+        table.unlink()
+        assert sandbox._read_only_tree(root) is False
+
+    async def test_quota_only_mode_logs_nothing_about_entries(
+        self, workspace, shared, monkeypatch, caplog
+    ):
+        # Quota-only mode checks no paths, so a warning about a refused entry
+        # would only mislead; an enforcing hook still logs it.
+        import logging
+
+        monkeypatch.setenv("USER_WORKSPACE_QUOTA_MB", "100")
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", "/")
+        logger_name = "src.backends.claude.workspace_sandbox"
+        monkeypatch.setenv("WORKSPACE_SANDBOX_ENABLED", "false")
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            make_workspace_sandbox_hook(workspace)
+        assert "CLAUDE_ADD_DIRS" not in caplog.text
+        monkeypatch.setenv("WORKSPACE_SANDBOX_ENABLED", "true")
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            make_workspace_sandbox_hook(workspace)
+        assert "CLAUDE_ADD_DIRS entry / overlaps" in caplog.text
+
+    def test_operator_add_dirs_parses_the_env_list(self, shared, tmp_path):
         from src.backends.claude.workspace_sandbox import operator_add_dirs
 
         assert operator_add_dirs() == [str(shared), str(tmp_path / "opt" / "refs")]
+
+    def test_cli_gets_every_entry(self, shared, monkeypatch):
+        # The CLI list is not filtered: an entry the hook refuses still goes out
+        # as --add-dir, so these rules hold only with the sandbox on.
+        from claude_agent_sdk import ClaudeAgentOptions
+
+        from src.backends.claude.client import ClaudeCodeCLI
+
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"/, {shared} ,/")
+        options = ClaudeAgentOptions()
+        ClaudeCodeCLI.__new__(ClaudeCodeCLI)._configure_add_dirs(options)
+        assert options.add_dirs == ["/", str(shared)]
 
 
 class TestUnknownTool:
