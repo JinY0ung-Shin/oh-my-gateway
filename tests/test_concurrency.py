@@ -610,6 +610,98 @@ class TestTurnQueue:
         assert ran == [] and sent == []
         assert limiter.queued == 0 and limiter.in_flight == 1
 
+    async def test_a_waiter_can_see_its_place_in_line(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        held, _ = limiter.try_acquire("a")
+        tickets = ["t" * 16 + str(i) for i in range(3)]
+        waiters = [
+            asyncio.ensure_future(limiter.acquire(f"u{i}", ticket=t))
+            for i, t in enumerate(tickets)
+        ]
+        await asyncio.sleep(0.01)
+
+        middle = limiter.position(tickets[1])
+        assert middle["ahead"] == 1 and middle["behind"] == 1
+        assert middle["waited_seconds"] >= 0
+        assert limiter.position(tickets[0])["ahead"] == 0
+        assert limiter.position("unknown-ticket-xxxx") is None
+
+        held.release()  # the first waiter is admitted and leaves the line
+        slot, _, _ = await waiters[0]
+        assert limiter.position(tickets[0]) is None
+        assert limiter.position(tickets[1])["ahead"] == 0
+        slot.release()
+        for task in waiters[1:]:
+            got, _, _ = await task
+            got.release()
+
+    async def test_the_ticket_header_reaches_the_limiter(self):
+        import json as _json
+
+        from src.concurrency_middleware import ConcurrencyLimitMiddleware
+
+        seen = {}
+
+        class Recording:
+            in_flight = 0
+            queued = 0
+
+            async def acquire(self, user, *, abort=None, ticket=None):
+                seen["ticket"] = ticket
+                return None, "queue_full", 0.0
+
+        body = _json.dumps({"model": DEFAULT_MODEL, "input": "hi"}).encode()
+        sent = []
+
+        async def receive():
+            return {"type": "http.request", "body": body, "more_body": False}
+
+        async def send(message):
+            sent.append(message)
+
+        async def app(scope, receive, send):  # pragma: no cover - never admitted
+            raise AssertionError("refused before the app")
+
+        for header, expected in [
+            (b"ticket_ABC-0123456789xyz", "ticket_ABC-0123456789xyz"),
+            (b"short", None),
+            (b"has spaces in it 0123456789", None),
+        ]:
+            scope = {
+                "type": "http",
+                "method": "POST",
+                "path": "/v1/responses",
+                "headers": [
+                    (b"content-length", str(len(body)).encode()),
+                    (b"x-turn-ticket", header),
+                ],
+                "query_string": b"",
+            }
+            await ConcurrencyLimitMiddleware(app, Recording())(scope, receive, send)
+            assert seen["ticket"] == expected
+
+    def test_the_queue_position_endpoint(self, monkeypatch):
+        from src import concurrency
+
+        with client_context() as (client, _mock_cli):
+            monkeypatch.setattr(
+                concurrency.turn_limiter,
+                "position",
+                lambda t: {"ahead": 2, "behind": 1, "waited_seconds": 7.5}
+                if t == "waiting-ticket-0001"
+                else None,
+            )
+            waiting = client.get("/v1/turn-queue/waiting-ticket-0001")
+            gone = client.get("/v1/turn-queue/other-ticket-00001")
+        assert waiting.status_code == 200
+        assert waiting.json() == {
+            "queued": True,
+            "ahead": 2,
+            "behind": 1,
+            "waited_seconds": 7.5,
+        }
+        assert gone.json() == {"queued": False}
+
     def test_a_queued_request_is_served_once_a_slot_frees(self):
         """End to end: the caller sees a slower 200 instead of a 503."""
         import threading

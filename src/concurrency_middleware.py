@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 import time
 from typing import Any, Dict, Optional, Tuple
@@ -323,6 +324,18 @@ def _bind_principal_to_request(scope: Scope, principal: str, body: Optional[byte
     return body
 
 
+# A caller-chosen opaque id that lets it ask where its request stands while it
+# waits (``GET /v1/turn-queue/{ticket}``). Unguessable ids keep one caller from
+# reading another's place; anything else is ignored rather than refused.
+TURN_TICKET_HEADER = "x-turn-ticket"
+_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]{16,128}$")
+
+
+def _turn_ticket(scope: Scope) -> Optional[str]:
+    value = Headers(scope=scope).get(TURN_TICKET_HEADER)
+    return value if value and _TICKET_RE.match(value) else None
+
+
 class _DisconnectTap:
     """Watch the client's ``receive`` while a turn waits for a slot.
 
@@ -405,7 +418,9 @@ class ConcurrencyLimitMiddleware:
         # if it comes, instead of running a turn nobody will read.
         tap = _DisconnectTap(original_receive)
         slot, reason, waited = await self.limiter.acquire(
-            user, abort=tap.wait if body is not None and not client_gone else None
+            user,
+            abort=tap.wait if body is not None and not client_gone else None,
+            ticket=_turn_ticket(scope),
         )
         if waited:
             metrics.record_turn_queue_wait(waited, admitted=slot is not None)

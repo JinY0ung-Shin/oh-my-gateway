@@ -121,14 +121,20 @@ class TurnSlot:
 
 
 class _Waiter:
-    __slots__ = ("key", "identified", "future", "loop")
+    __slots__ = ("key", "identified", "future", "loop", "ticket", "since")
 
     def __init__(
-        self, key: str, identified: bool, loop: asyncio.AbstractEventLoop
+        self,
+        key: str,
+        identified: bool,
+        loop: asyncio.AbstractEventLoop,
+        ticket: Optional[str] = None,
     ) -> None:
         self.key = key
         self.identified = identified
         self.loop = loop
+        self.ticket = ticket
+        self.since = time.monotonic()
         self.future: "asyncio.Future[TurnSlot]" = loop.create_future()
 
 
@@ -204,6 +210,7 @@ class TurnLimiter:
         user: Optional[str] = None,
         *,
         abort: Optional[Callable[[], Awaitable[object]]] = None,
+        ticket: Optional[str] = None,
     ) -> Tuple[Optional[TurnSlot], str, float]:
         """Take a slot, waiting up to ``queue_timeout`` seconds for one.
 
@@ -212,6 +219,7 @@ class TurnLimiter:
         ``queue_full`` or ``queue_timeout`` when waiting did not help, or
         ``aborted`` when *abort* (the client disconnecting) finished first.
         *abort* is a factory, called only if this request actually queues.
+        *ticket* is the caller's opaque id for :meth:`position` while it waits.
         A slot granted in the same instant as a timeout or abort is released,
         never leaked.
         """
@@ -225,7 +233,7 @@ class TurnLimiter:
                 return None, reason, 0.0
             if self.queue_max > 0 and len(self._waiters) >= self.queue_max:
                 return None, "queue_full", 0.0
-            waiter = _Waiter(key, identified, asyncio.get_running_loop())
+            waiter = _Waiter(key, identified, asyncio.get_running_loop(), ticket)
             self._waiters.append(waiter)
 
         started = time.monotonic()
@@ -293,6 +301,25 @@ class TurnLimiter:
     def in_flight(self) -> int:
         with self._lock:
             return self._in_flight
+
+    def position(self, ticket: str) -> Optional[Dict[str, float]]:
+        """Where the waiter holding *ticket* stands — ``None`` once it is not waiting.
+
+        ``ahead``/``behind`` count other waiters in arrival order. A freed slot
+        can skip a waiter blocked by its own per-user cap, so ``ahead`` is the
+        line in front, not a promise of how many turns start first.
+        """
+        if not ticket:
+            return None
+        with self._lock:
+            for index, waiter in enumerate(self._waiters):
+                if waiter.ticket == ticket:
+                    return {
+                        "ahead": index,
+                        "behind": len(self._waiters) - index - 1,
+                        "waited_seconds": round(time.monotonic() - waiter.since, 1),
+                    }
+        return None
 
     @property
     def queued(self) -> int:
