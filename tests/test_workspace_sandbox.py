@@ -545,6 +545,113 @@ class TestPluginResourceRoots:
         assert _is_deny(await _call(hook, "Read", {"file_path": str(cwd_relative)}))
 
 
+class TestOperatorAddDirs:
+    """``CLAUDE_ADD_DIRS`` is also a CLI working directory (``--add-dir``), so the
+    sandbox must grant it to read/exec too — otherwise the CLI lets a session
+    ``cd`` there while the hook refuses every Read/Bash on it (#234). Writes
+    stay confined to the workspace."""
+
+    @pytest.fixture
+    def shared(self, tmp_path: Path, monkeypatch) -> Path:
+        home = tmp_path / "home" / "app"
+        (home / ".claude").mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(home))
+        monkeypatch.delenv("CLAUDE_PLUGIN_CLONE_ROOT", raising=False)
+        shared = tmp_path / "data" / "shared"
+        (shared / "docs").mkdir(parents=True)
+        (shared / "docs" / "guide.md").write_text("# guide")
+        other = tmp_path / "opt" / "refs"
+        other.mkdir(parents=True)
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f" {shared} ,{other},")
+        return shared
+
+    async def test_read_tools_allowed(self, workspace, shared, tmp_path):
+        hook = make_workspace_sandbox_hook(workspace)
+        doc = shared / "docs" / "guide.md"
+        assert await _call(hook, "Read", {"file_path": str(doc)}) == {}
+        assert await _call(hook, "Grep", {"pattern": "x", "path": str(shared)}) == {}
+        refs = tmp_path / "opt" / "refs"
+        assert await _call(hook, "Glob", {"pattern": "*", "path": str(refs)}) == {}
+
+    async def test_bash_allowed(self, workspace, shared):
+        hook = make_workspace_sandbox_hook(workspace)
+        command = f"cat {shared}/docs/guide.md"
+        assert await _call(hook, "Bash", {"command": command}) == {}
+
+    @pytest.mark.parametrize("tool", ["Write", "Edit", "MultiEdit"])
+    async def test_writes_denied(self, workspace, shared, tool):
+        hook = make_workspace_sandbox_hook(workspace)
+        target = {"file_path": str(shared / "docs" / "guide.md")}
+        assert _is_deny(await _call(hook, tool, target))
+
+    async def test_sibling_still_denied(self, workspace, shared, tmp_path):
+        hook = make_workspace_sandbox_hook(workspace)
+        bad = tmp_path / "data" / "secrets.txt"
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(bad)}))
+        assert _is_deny(await _call(hook, "Bash", {"command": f"cat {bad}"}))
+
+    async def test_relative_entry_ignored(self, workspace, tmp_path, monkeypatch):
+        import os
+
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", "relative/dir")
+        hook = make_workspace_sandbox_hook(workspace)
+        cwd_relative = Path(os.getcwd()) / "relative" / "dir" / "x.md"
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(cwd_relative)}))
+
+    async def test_unset_grants_nothing(self, workspace, shared, monkeypatch):
+        monkeypatch.delenv("CLAUDE_ADD_DIRS", raising=False)
+        hook = make_workspace_sandbox_hook(workspace)
+        doc = shared / "docs" / "guide.md"
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(doc)}))
+
+    @pytest.mark.parametrize("entry", ["home", "claude_home", "projects", "root"])
+    async def test_entry_overlapping_shared_claude_state_opens_nothing_there(
+        self, workspace, other_workspace, shared, tmp_path, monkeypatch, entry
+    ):
+        # $HOME/.claude holds every user's transcripts and plans. An operator
+        # entry that is it, inside it or an ancestor of it must not open them
+        # in either hook (#237 review); a separate entry still works.
+        from src.backends.claude.workspace_sandbox import make_claude_home_guard_hook
+
+        home = tmp_path / "home" / "app"
+        claude = home / ".claude"
+        target = {
+            "home": home,
+            "claude_home": claude,
+            "projects": claude / "projects",
+            "root": Path("/"),
+        }[entry]
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"{target},{shared}")
+        name = re.sub(r"[^a-zA-Z0-9]", "-", str(other_workspace.resolve()))
+        transcript = claude / "projects" / name / "sess.jsonl"
+        transcript.parent.mkdir(parents=True)
+        transcript.write_text("{}")
+        plan = claude / "plans" / "someone-elses-plan.md"
+        plan.parent.mkdir(parents=True)
+        plan.write_text("# plan")
+        attempts = [
+            ("Read", {"file_path": str(transcript)}),
+            ("Read", {"file_path": str(plan)}),
+            ("Grep", {"pattern": "x", "path": str(claude / "projects")}),
+            ("Glob", {"pattern": "*", "path": str(claude / "plans")}),
+        ]
+        for hook in (
+            make_workspace_sandbox_hook(workspace),
+            make_claude_home_guard_hook(workspace),
+        ):
+            for tool, tool_input in attempts:
+                assert _is_deny(await _call(hook, tool, tool_input)), (tool, tool_input)
+        sandbox = make_workspace_sandbox_hook(workspace)
+        doc = {"file_path": str(shared / "docs" / "guide.md")}
+        assert await _call(sandbox, "Read", doc) == {}
+        assert _is_deny(await _call(sandbox, "Write", doc))
+
+    def test_cli_and_hook_share_one_list(self, shared, tmp_path):
+        from src.backends.claude.workspace_sandbox import operator_add_dirs
+
+        assert operator_add_dirs() == [str(shared), str(tmp_path / "opt" / "refs")]
+
+
 class TestUnknownTool:
     async def test_unknown_tool_passes_through(self, workspace):
         hook = make_workspace_sandbox_hook(workspace)

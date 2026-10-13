@@ -225,6 +225,50 @@ def plugin_resource_roots() -> List[Path]:
     return _plugin_resource_roots(_claude_home())
 
 
+def operator_add_dirs() -> List[str]:
+    """Operator-specified extra working directories (``CLAUDE_ADD_DIRS``).
+
+    Comma-separated, read per session build. Two consumers share it: the CLI
+    ``--add-dir`` list (``_configure_add_dirs`` in ``client.py``) and the
+    sandbox hook's read/exec roots, so a directory the CLI treats as a working
+    directory is not then refused by the hook.
+    """
+    dirs: List[str] = []
+    for part in os.getenv("CLAUDE_ADD_DIRS", "").split(","):
+        p = part.strip()
+        if p and p not in dirs:
+            dirs.append(p)
+    return dirs
+
+
+def _operator_add_dir_roots(claude_home: Optional[Path]) -> List[Path]:
+    """Resolved absolute ``CLAUDE_ADD_DIRS`` entries for the sandbox read roots.
+
+    Relative entries are ignored, and so is any entry that is ``$HOME/.claude``,
+    inside it or an ancestor of it (``$HOME``, ``/``): that state is shared by
+    every user and only the always-on home guard decides what of it a session
+    may read (its own project dir plus the shared assets).
+    """
+    roots: List[Path] = []
+    seen: Set[Path] = set()
+    for d in operator_add_dirs():
+        _add_root(roots, seen, Path(d))
+    if claude_home is None:
+        return roots
+    kept: List[Path] = []
+    for root in roots:
+        if _is_within(root, claude_home) or _is_within(claude_home, root):
+            logger.warning(
+                "CLAUDE_ADD_DIRS entry %s overlaps the shared %s; not granted "
+                "to the workspace sandbox",
+                root,
+                claude_home,
+            )
+            continue
+        kept.append(root)
+    return kept
+
+
 def _read_json(path: Path) -> Any:
     """Read and parse a JSON file, returning ``None`` on any error."""
     try:
@@ -597,9 +641,10 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     * ``write_roots`` — workspace plus this session's own
       ``$HOME/.claude/projects/<encoded cwd>``;
     * ``read_roots`` — write roots plus the read-only shared assets under
-      ``$HOME/.claude`` (skills, plugins, agents, …) and plugin resource
-      roots. The rest of ``$HOME/.claude`` (``plans/``, other ``projects/*``)
-      belongs to other users.
+      ``$HOME/.claude`` (skills, plugins, agents, …), plugin resource roots and
+      the operator's ``CLAUDE_ADD_DIRS`` (minus any entry overlapping
+      ``$HOME/.claude``). The rest of ``$HOME/.claude``
+      (``plans/``, other ``projects/*``) belongs to other users.
 
     Direct callers historically receive a boundary-enforcing hook even when the
     env flag is off; preserve that behavior when quota is disabled. The special
@@ -616,7 +661,11 @@ def make_workspace_sandbox_hook(workspace_root: Path):
     write_roots = [workspace_root] + _writable_extra_roots(given_root)
     read_roots = list(write_roots)
     seen: Set[Path] = set(read_roots)
-    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
+    for root in (
+        _shared_asset_roots(claude_home)
+        + _plugin_resource_roots(claude_home)
+        + _operator_add_dir_roots(claude_home)
+    ):
         if root not in seen:
             seen.add(root)
             read_roots.append(root)
@@ -723,6 +772,8 @@ def make_claude_home_guard_hook(workspace_root: Path):
     claude_home = _claude_home()
     own = _own_project_roots(Path(workspace_root), claude_home)
     readable = list(own)
+    # Never the operator's CLAUDE_ADD_DIRS: an entry that is $HOME or
+    # $HOME/.claude would otherwise open every user's transcripts and plans.
     for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
         if root not in readable:
             readable.append(root)
