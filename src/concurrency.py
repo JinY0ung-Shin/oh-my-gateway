@@ -49,6 +49,13 @@ connection far longer than any client is willing to wait. While a turn waits
 no response headers are sent, so the client's (and any proxy's) read timeout
 must outlast it.
 
+All four turn values (``MAX_CONCURRENT_TURNS``, ``MAX_CONCURRENT_TURNS_PER_USER``,
+``TURN_QUEUE_TIMEOUT_SECONDS``, ``TURN_QUEUE_MAX_WAITERS``) are also admin
+runtime-config keys (``src/runtime_config.py``) that apply to the live limiter
+at once (:meth:`TurnLimiter.configure`): a raised cap admits queued turns now,
+a lowered one never cuts a running turn, and a turn already waiting keeps the
+wait it started with. ``MAX_LIVE_SESSIONS`` stays env-only.
+
 A freed slot goes to the **oldest waiter that can take it** — one blocked
 only by its own per-user cap does not hold up anyone else's turn — and a new
 arrival never jumps ahead of a waiter that could have taken the slot.
@@ -121,7 +128,7 @@ class TurnSlot:
 
 
 class _Waiter:
-    __slots__ = ("key", "identified", "future", "loop", "ticket", "since")
+    __slots__ = ("key", "identified", "future", "loop", "ticket", "since", "timeout")
 
     def __init__(
         self,
@@ -129,12 +136,15 @@ class _Waiter:
         identified: bool,
         loop: asyncio.AbstractEventLoop,
         ticket: Optional[str] = None,
+        timeout: float = 0.0,
     ) -> None:
         self.key = key
         self.identified = identified
         self.loop = loop
         self.ticket = ticket
         self.since = time.monotonic()
+        # the wait this turn was promised — a later runtime change does not move it
+        self.timeout = timeout
         self.future: "asyncio.Future[TurnSlot]" = loop.create_future()
 
 
@@ -233,7 +243,10 @@ class TurnLimiter:
                 return None, reason, 0.0
             if self.queue_max > 0 and len(self._waiters) >= self.queue_max:
                 return None, "queue_full", 0.0
-            waiter = _Waiter(key, identified, asyncio.get_running_loop(), ticket)
+            timeout = self.queue_timeout
+            waiter = _Waiter(
+                key, identified, asyncio.get_running_loop(), ticket, timeout
+            )
             self._waiters.append(waiter)
 
         started = time.monotonic()
@@ -244,7 +257,7 @@ class TurnLimiter:
             wait_for = {waiter.future} | ({abort_task} if abort_task else set())
             await asyncio.wait(
                 wait_for,
-                timeout=self.queue_timeout,
+                timeout=timeout,
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if abort_task is not None and abort_task.done():
@@ -297,6 +310,32 @@ class TurnLimiter:
                 self._by_user.pop(user, None)
             self._grant_waiters()
 
+    def configure(
+        self,
+        *,
+        total: Optional[int] = None,
+        per_user: Optional[int] = None,
+        queue_timeout: Optional[float] = None,
+        queue_max: Optional[int] = None,
+    ) -> None:
+        """Change the limits of a live limiter (admin runtime config).
+
+        Takes effect at once for admission: a raised cap hands free slots to
+        the queue right now. A lowered cap never cuts a running turn (it only
+        stops new ones until enough end), a turn already waiting keeps the wait
+        it started with, and a shorter queue drops no one already in it.
+        """
+        with self._lock:
+            if total is not None:
+                self.total = max(0, int(total))
+            if per_user is not None:
+                self.per_user = max(0, int(per_user))
+            if queue_timeout is not None:
+                self.queue_timeout = max(0.0, float(queue_timeout))
+            if queue_max is not None:
+                self.queue_max = max(0, int(queue_max))
+            self._grant_waiters()
+
     @property
     def in_flight(self) -> int:
         with self._lock:
@@ -322,7 +361,7 @@ class TurnLimiter:
                         "behind": len(self._waiters) - index - 1,
                         "waited_seconds": round(time.monotonic() - waiter.since, 1),
                         # how long this wait may last in all before a 503
-                        "max_wait_seconds": self.queue_timeout,
+                        "max_wait_seconds": waiter.timeout,
                     }
         return None
 
@@ -365,6 +404,36 @@ turn_limiter = TurnLimiter(
     queue_timeout=TURN_QUEUE_TIMEOUT_SECONDS,
     queue_max=TURN_QUEUE_MAX_WAITERS,
 )
+
+# runtime-config key → TurnLimiter.configure argument
+TURN_LIMIT_KEYS = {
+    "max_concurrent_turns": "total",
+    "max_concurrent_turns_per_user": "per_user",
+    "turn_queue_timeout_seconds": "queue_timeout",
+    "turn_queue_max_waiters": "queue_max",
+}
+
+
+def apply_runtime_turn_limits(key: Optional[str] = None) -> None:
+    """Push the effective runtime-config turn limits into :data:`turn_limiter`."""
+    if key is not None and key not in TURN_LIMIT_KEYS:
+        return
+    from src.runtime_config import runtime_config
+
+    turn_limiter.configure(
+        **{arg: runtime_config.get(name) for name, arg in TURN_LIMIT_KEYS.items()}
+    )
+
+
+def _register_runtime_listener() -> None:
+    from src.runtime_config import runtime_config
+
+    runtime_config.on_change(apply_runtime_turn_limits)
+    # An override stored before this module was imported still applies.
+    apply_runtime_turn_limits()
+
+
+_register_runtime_listener()
 
 
 # ---------------------------------------------------------------------------

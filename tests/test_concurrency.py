@@ -1430,3 +1430,131 @@ class TestCapacityMetrics:
             and 'status="503"' in line
             for line in exposition.splitlines()
         )
+
+
+class TestRuntimeTurnLimits:
+    """The four turn values are admin runtime-config keys applied to the live limiter."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_overrides(self):
+        from src.runtime_config import runtime_config
+
+        yield
+        runtime_config.reset_all()
+
+    async def test_raising_the_cap_admits_a_queued_turn_at_once(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5)
+        limiter.try_acquire("a")
+        waiting = asyncio.ensure_future(limiter.acquire("b"))
+        await asyncio.sleep(0)
+        assert limiter.queued == 1
+
+        limiter.configure(total=2)
+
+        slot, reason, _ = await asyncio.wait_for(waiting, 1)
+        assert slot is not None and reason == ""
+        assert limiter.in_flight == 2 and limiter.queued == 0
+
+    async def test_lowering_the_cap_never_cuts_a_running_turn(self):
+        limiter = TurnLimiter(total=3, per_user=0)
+        held = [limiter.try_acquire(u)[0] for u in ("a", "b", "c")]
+        limiter.configure(total=1)
+        assert limiter.in_flight == 3
+        assert limiter.try_acquire("d") == (None, "global")
+        for slot in held[:2]:
+            slot.release()
+        assert limiter.try_acquire("d") == (None, "global")
+        held[2].release()
+        assert limiter.try_acquire("d")[0] is not None
+
+    async def test_a_waiter_keeps_the_wait_it_started_with(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=0.05)
+        limiter.try_acquire("a")
+        waiting = asyncio.ensure_future(limiter.acquire("b", ticket="t1"))
+        await asyncio.sleep(0)
+        limiter.configure(queue_timeout=600)
+        assert limiter.position("t1")["max_wait_seconds"] == 0.05
+        slot, reason, _ = await asyncio.wait_for(waiting, 1)
+        assert slot is None and reason == "queue_timeout"
+
+    async def test_a_shorter_queue_drops_no_one_already_waiting(self):
+        limiter = TurnLimiter(total=1, per_user=0, queue_timeout=5, queue_max=5)
+        held, _ = limiter.try_acquire("a")
+        waiters = [asyncio.ensure_future(limiter.acquire(u)) for u in ("b", "c")]
+        await asyncio.sleep(0)
+        limiter.configure(queue_max=1)
+        assert limiter.queued == 2
+        assert (await limiter.acquire("d"))[:2] == (None, "queue_full")
+        held.release()
+        first, _, _ = await asyncio.wait_for(waiters[0], 1)
+        first.release()
+        second, _, _ = await asyncio.wait_for(waiters[1], 1)
+        second.release()
+
+    def test_runtime_config_reaches_the_gateway_limiter_and_reset_restores(self):
+        from src import concurrency
+        from src.runtime_config import runtime_config
+
+        runtime_config.set("max_concurrent_turns", 2)
+        runtime_config.set("max_concurrent_turns_per_user", "1")
+        runtime_config.set("turn_queue_timeout_seconds", 30)
+        runtime_config.set("turn_queue_max_waiters", 0)
+        limiter = concurrency.turn_limiter
+        assert (limiter.total, limiter.per_user) == (2, 1)
+        assert (limiter.queue_timeout, limiter.queue_max) == (30, 0)
+
+        runtime_config.reset("max_concurrent_turns")
+        assert limiter.total == runtime_config.get("max_concurrent_turns")
+        runtime_config.reset_all()
+        assert limiter.queue_timeout == runtime_config.get("turn_queue_timeout_seconds")
+
+    @pytest.mark.parametrize(
+        ("key", "bad"),
+        [
+            ("max_concurrent_turns", -1),
+            ("max_concurrent_turns", 1001),
+            ("turn_queue_timeout_seconds", 3601),
+            ("turn_queue_max_waiters", -5),
+        ],
+    )
+    def test_out_of_range_values_are_refused(self, key, bad):
+        from src import concurrency
+        from src.runtime_config import runtime_config
+
+        before = concurrency.turn_limiter.snapshot()
+        with pytest.raises(ValueError):
+            runtime_config.set(key, bad)
+        assert concurrency.turn_limiter.snapshot() == before
+
+    def test_zero_means_unlimited_or_queue_off(self):
+        from src.runtime_config import runtime_config
+
+        runtime_config.set("max_concurrent_turns", 0)
+        runtime_config.set("turn_queue_timeout_seconds", 0)
+        assert runtime_config.get("max_concurrent_turns") == 0
+        assert runtime_config.get("turn_queue_timeout_seconds") == 0
+
+    def test_admin_routes_patch_and_show_live_admission(self):
+        from src.runtime_config import runtime_config
+
+        with client_context() as (client, _):
+            headers = {"Authorization": "Bearer test-admin-key"}
+            res = client.patch(
+                "/admin/api/runtime-config",
+                json={"key": "turn_queue_timeout_seconds", "value": 45},
+                headers=headers,
+            )
+            assert res.status_code == 200, res.text
+            bad = client.patch(
+                "/admin/api/runtime-config",
+                json={"key": "max_concurrent_turns", "value": -1},
+                headers=headers,
+            )
+            assert bad.status_code == 422
+            info = client.get("/admin/api/server-info", headers=headers).json()
+        admission = info["turn_admission"]
+        assert admission["queue_timeout_seconds"] == 45
+        assert {"in_flight", "limit", "per_user_limit", "queued", "queue_limit"} <= set(
+            admission
+        )
+        assert runtime_config.is_overridden("turn_queue_timeout_seconds")
