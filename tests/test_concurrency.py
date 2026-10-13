@@ -273,6 +273,42 @@ class TestConcurrencyMiddleware:
             _drain(concurrency.turn_limiter)
             assert concurrency.turn_limiter.in_flight == 0
 
+    def test_published_in_flight_gauge_follows_a_background_release(self):
+        """The runner frees a background slot after the middleware returned, so
+        a gauge pushed only from the middleware stayed at 1 on an idle gateway."""
+        import asyncio
+
+        from src import concurrency
+        from src.metrics import render_latest
+
+        def gauge() -> float:
+            for line in render_latest()[0].decode().splitlines():
+                if line.startswith("gateway_turns_in_flight "):
+                    return float(line.split()[1])
+            raise AssertionError("gateway_turns_in_flight not exposed")
+
+        async def slow(client, prompt, session):
+            await asyncio.sleep(0.3)
+            yield {"content": [{"type": "text", "text": "done"}]}
+            yield {"subtype": "success", "result": "done"}
+
+        with client_context() as (client, mock_cli):
+            mock_cli.run_completion_with_client = slow
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hi",
+                    "background": True,
+                    "store": True,
+                },
+            )
+            assert resp.json()["status"] == "queued"
+            assert gauge() == 1
+            _drain(concurrency.turn_limiter)
+            assert concurrency.turn_limiter.in_flight == 0
+            assert gauge() == 0
+
     def test_background_slot_is_released_when_the_backend_fails(self):
         """A leaked slot permanently shrinks capacity — worse than no cap."""
         import asyncio

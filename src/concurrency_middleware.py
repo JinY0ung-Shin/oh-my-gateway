@@ -440,7 +440,6 @@ class ConcurrencyLimitMiddleware:
             await self._send_503(send)
             return
 
-        metrics.set_turns_in_flight(self.limiter.in_flight)
         # Published on request.state so a handler that outlives the response
         # (background mode) can take ownership; see take_turn_slot().
         state = scope.setdefault("state", {})
@@ -454,7 +453,6 @@ class ConcurrencyLimitMiddleware:
             if not state.get(TRANSFERRED_KEY):
                 slot.release()
             state.pop(SLOT_KEY, None)
-            metrics.set_turns_in_flight(self.limiter.in_flight)
             # This middleware is one of the few places that observes a
             # streaming response all the way to its final body chunk, so it
             # is also where the true end-to-end duration becomes measurable.

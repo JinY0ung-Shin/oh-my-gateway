@@ -214,9 +214,15 @@ def record_token_usage(
             ).inc(amount)
 
 
-def set_turns_in_flight(value: int) -> None:
-    """Publish the current in-flight turn count."""
-    TURNS_IN_FLIGHT.set(value)
+def bind_turns_in_flight_source(source: Callable[[], float]) -> None:
+    """Have ``gateway_turns_in_flight`` read *source* at scrape time.
+
+    Pull-based like ``gateway_live_sessions``: a background turn hands its
+    slot back from its detached runner, long after the middleware that took
+    it returned, so a value pushed only from the middleware stayed stuck at
+    the last admission and showed turns in flight on an idle gateway.
+    """
+    TURNS_IN_FLIGHT.set_function(source)
 
 
 def record_turn_queue_wait(seconds: float, *, admitted: bool) -> None:

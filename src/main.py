@@ -337,6 +337,7 @@ async def lifespan(app: FastAPI):
         TURN_QUEUE_MAX_WAITERS or "unlimited",
     )
     metrics.bind_live_sessions_source(lambda: len(session_manager.sessions))
+    metrics.bind_turns_in_flight_source(lambda: turn_limiter.in_flight)
     metrics.bind_turns_queued_source(lambda: turn_limiter.queued)
     metrics.bind_oldest_active_turn_silence_source(
         session_manager.oldest_active_turn_silence
