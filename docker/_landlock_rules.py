@@ -69,7 +69,9 @@ RW_RIGHTS_FULL = (1 << 16) - 1
 # would abort the whole ruleset build and kill every confined spawn. A ro list
 # legitimately contains files (e.g. the user ``CLAUDE.md`` shared asset), so a
 # rule's rights are narrowed to this mask when its target is not a directory.
-_FILE_RIGHTS = _FS_EXECUTE | _FS_WRITE_FILE | _FS_READ_FILE | _FS_TRUNCATE | _FS_IOCTL_DEV
+_FILE_RIGHTS = (
+    _FS_EXECUTE | _FS_WRITE_FILE | _FS_READ_FILE | _FS_TRUNCATE | _FS_IOCTL_DEV
+)
 
 # Default system policy both modes apply. /etc and /usr stay readable on purpose
 # (the CLI and libc resolvers read them; a passwd entry is needed for whoami /

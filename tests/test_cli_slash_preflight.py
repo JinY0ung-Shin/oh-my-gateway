@@ -88,9 +88,7 @@ def _no_inherited_claude_env(monkeypatch):
 
 def _hook(marks: Path, name: str) -> Dict:
     return {
-        "hooks": [
-            {"type": "command", "command": f'echo {name} >> "{marks}/hooks.txt"'}
-        ]
+        "hooks": [{"type": "command", "command": f'echo {name} >> "{marks}/hooks.txt"'}]
     }
 
 

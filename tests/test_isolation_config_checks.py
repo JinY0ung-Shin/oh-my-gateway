@@ -75,9 +75,7 @@ class TestSandboxConflict:
         _confined(monkeypatch, True)
         monkeypatch.setenv("CLAUDE_SANDBOX_ENABLED", "true")
         monkeypatch.setattr(cc, "_check_landlock_confinement", lambda: [])
-        assert any(
-            "CLAUDE_SANDBOX_ENABLED" in i.message for i in cc.check_config()
-        )
+        assert any("CLAUDE_SANDBOX_ENABLED" in i.message for i in cc.check_config())
 
 
 class TestUidRegistryCheck:

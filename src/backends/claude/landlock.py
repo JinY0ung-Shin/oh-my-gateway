@@ -103,9 +103,7 @@ def _cap_bnd_has_setuid_setgid() -> bool:
             for line in f:
                 if line.startswith("CapBnd:"):
                     bits = int(line.split()[1], 16)
-                    return bool(bits & _CAP_SETUID_BIT) and bool(
-                        bits & _CAP_SETGID_BIT
-                    )
+                    return bool(bits & _CAP_SETUID_BIT) and bool(bits & _CAP_SETGID_BIT)
     except (OSError, ValueError):
         pass
     return False
@@ -378,8 +376,9 @@ def can_enforce_landlock() -> Tuple[bool, str]:
     abi = landlock_abi()
     if abi < 2:
         return False, (
-            f"Landlock ABI {abi}" if abi >= 0 else "the syscall is unavailable on "
-            "this arch"
+            f"Landlock ABI {abi}"
+            if abi >= 0
+            else "the syscall is unavailable on " "this arch"
         )
     import subprocess
     import sys
@@ -623,8 +622,7 @@ def _session_env_dir(
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
     except OSError as exc:
         logger.warning(
-            "Could not pre-create %s; SessionStart hooks fail under "
-            "confinement: %s",
+            "Could not pre-create %s; SessionStart hooks fail under " "confinement: %s",
             path,
             exc,
         )

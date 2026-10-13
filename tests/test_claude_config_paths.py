@@ -98,10 +98,7 @@ class TestPluginCloneRoot:
 
     def test_defaults_to_home_marketplaces(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HOME", str(tmp_path))
-        assert (
-            cp.plugin_clone_root()
-            == tmp_path / ".claude" / "plugin-marketplaces"
-        )
+        assert cp.plugin_clone_root() == tmp_path / ".claude" / "plugin-marketplaces"
 
     def test_home_unset_falls_back_to_passwd_home(self, monkeypatch):
         monkeypatch.delenv("HOME", raising=False)
@@ -116,7 +113,4 @@ class TestPluginCloneRoot:
         # The clone root keys off HOME, not CLAUDE_CONFIG_DIR (matches the CLI).
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv(cp.CONFIG_DIR_ENV, str(tmp_path / "custom"))
-        assert (
-            cp.plugin_clone_root()
-            == tmp_path / ".claude" / "plugin-marketplaces"
-        )
+        assert cp.plugin_clone_root() == tmp_path / ".claude" / "plugin-marketplaces"

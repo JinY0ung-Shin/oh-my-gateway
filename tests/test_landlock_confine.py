@@ -248,9 +248,10 @@ class TestClientOverrides:
     def _cli(self):
         from unittest.mock import patch
 
-        with patch("src.auth.validate_claude_code_auth") as v, patch(
-            "src.auth.auth_manager"
-        ) as a:
+        with (
+            patch("src.auth.validate_claude_code_auth") as v,
+            patch("src.auth.auth_manager") as a,
+        ):
             v.return_value = (True, {"method": "anthropic"})
             a.get_claude_code_env_vars.return_value = {"ANTHROPIC_AUTH_TOKEN": "x"}
             from src.backends.claude.client import ClaudeCodeCLI
@@ -650,9 +651,7 @@ class TestPreflightConfinement:
         if mode == "uid":
             assert env[landlock.MODE_ENV] == "uid"  # the confinement env survives
 
-    def test_preflight_and_session_share_the_secret_blanks(
-        self, monkeypatch, tmp_path
-    ):
+    def test_preflight_and_session_share_the_secret_blanks(self, monkeypatch, tmp_path):
         from src.backends.claude import slash_commands as sc
         from src.backends.claude.client import child_secret_env
 
@@ -885,8 +884,10 @@ class TestSessionEnvDir:
         # A resumed session keeps its id, so it uses the same dir.
         cfg = _cfg(monkeypatch, tmp_path)
         sid = str(uuid.uuid4())
-        options = TestClientOverrides()._cli()._build_sdk_options(
-            cwd=tmp_path / "ws", **{kind: sid}
+        options = (
+            TestClientOverrides()
+            ._cli()
+            ._build_sdk_options(cwd=tmp_path / "ws", **{kind: sid})
         )
         assert str(cfg / "session-env" / sid) in _entries(options.env, landlock.RW_ENV)
 
@@ -900,9 +901,7 @@ class TestAbsolutePaths:
         env = landlock.options_env(Path("workspaces") / "alice", session_id="s1")
         entries = _entries(env, landlock.RO_ENV) + _entries(env, landlock.RW_ENV)
         assert entries and all(os.path.isabs(e) for e in entries), entries
-        assert str(tmp_path / "workspaces" / "alice") in _entries(
-            env, landlock.RW_ENV
-        )
+        assert str(tmp_path / "workspaces" / "alice") in _entries(env, landlock.RW_ENV)
 
     def test_lists_name_the_project_dir_of_the_absolute_cwd(
         self, confine_on, monkeypatch, tmp_path
@@ -924,9 +923,7 @@ class TestAbsolutePaths:
         (tmp_path / "cfg").mkdir()
         monkeypatch.setenv("CLAUDE_CONFIG_DIR", "cfg")
         env = landlock.options_env(tmp_path / "ws")
-        assert str(tmp_path / "cfg" / ".claude.json") in _entries(
-            env, landlock.RO_ENV
-        )
+        assert str(tmp_path / "cfg" / ".claude.json") in _entries(env, landlock.RO_ENV)
         assert all(os.path.isabs(e) for e in _entries(env, landlock.RO_ENV))
 
     def test_uid_ticket_is_absolute(self, uid_on, monkeypatch, tmp_path):
@@ -938,8 +935,10 @@ class TestAbsolutePaths:
     def test_session_cwd_is_absolute(self, confine_on, monkeypatch, tmp_path):
         # The SDK copies options.cwd into PWD, which the launcher grants.
         monkeypatch.chdir(tmp_path)
-        options = TestClientOverrides()._cli()._build_sdk_options(
-            cwd=Path("workspaces") / "alice"
+        options = (
+            TestClientOverrides()
+            ._cli()
+            ._build_sdk_options(cwd=Path("workspaces") / "alice")
         )
         assert Path(options.cwd) == tmp_path / "workspaces" / "alice"
 
@@ -952,8 +951,10 @@ class TestAbsolutePaths:
         assert Path(opts.cwd) == tmp_path / "workspaces" / "alice"
 
     def test_off_leaves_the_cwd_alone(self, confine_off):
-        options = TestClientOverrides()._cli()._build_sdk_options(
-            cwd=Path("workspaces") / "alice"
+        options = (
+            TestClientOverrides()
+            ._cli()
+            ._build_sdk_options(cwd=Path("workspaces") / "alice")
         )
         assert str(options.cwd) == str(Path("workspaces") / "alice")
 

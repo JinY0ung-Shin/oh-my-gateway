@@ -63,9 +63,7 @@ _TRY_NPM_CACHE = (
     ' >> "$CLAUDE_PROJECT_DIR/project-start.txt"'
 )
 _PLUGIN_HOOKS = {
-    "SessionStart": [
-        _command('echo ran >> "$CLAUDE_PROJECT_DIR/plugin-start.txt"')
-    ],
+    "SessionStart": [_command('echo ran >> "$CLAUDE_PROJECT_DIR/plugin-start.txt"')],
     "UserPromptSubmit": [_command(_TRY_PLUGIN_DATA)],
 }
 
