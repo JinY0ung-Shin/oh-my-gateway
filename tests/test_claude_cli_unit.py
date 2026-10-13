@@ -1228,86 +1228,66 @@ class TestConvertMessageEdgeCases:
         assert result["error_message"] == "custom error"
 
 
-class TestSdkEnvContextManager:
-    """Test ClaudeCodeCLI._sdk_env() environment variable management."""
+class TestCreateClientChildEnv:
+    """create_client hands auth and isolation to the child via options.env only.
 
-    def test_sdk_env_sets_and_restores(self, cli_instance):
-        """_sdk_env sets auth env vars and restores originals."""
-        original = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+    ``os.environ`` is shared by every concurrent connect, so it is never mutated
+    around ``connect()`` (see ``tests/test_sdk_env_race.py`` for the race).
+    """
 
-        with cli_instance._sdk_env():
-            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
+    @staticmethod
+    def _capture_connect(monkeypatch, captured, probe=None):
+        from src.backends.claude import client as claude_client_mod
 
-        if original is None:
-            assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        else:
-            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original
+        monkeypatch.setenv("MCP_PROGRESS_RELAY", "false")  # no relay self-probe
 
-    def test_sdk_env_restores_on_exception(self, cli_instance):
-        """_sdk_env restores env vars even when an exception occurs."""
-        original = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        class FakeSDKClient:
+            def __init__(self, *, options):
+                captured["options"] = options
 
-        with pytest.raises(RuntimeError):
-            with cli_instance._sdk_env():
-                assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
-                raise RuntimeError("boom")
+            async def connect(self, prompt=None):
+                captured["environ"] = dict(os.environ)
+                if probe is not None:
+                    captured["probe"] = probe()
 
-        if original is None:
-            assert "ANTHROPIC_AUTH_TOKEN" not in os.environ
-        else:
-            assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == original
+        monkeypatch.setattr(claude_client_mod, "ClaudeSDKClient", FakeSDKClient)
 
-    def test_sdk_env_does_not_mutate_base_url_when_sanitizer_enabled(
+    async def test_connect_sees_untouched_os_environ(self, cli_instance, monkeypatch):
+        from src.session_manager import Session
+
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-other-backend")
+        monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+        captured = {}
+        self._capture_connect(monkeypatch, captured)
+        before = dict(os.environ)
+
+        await cli_instance.create_client(Session(session_id="env-untouched"))
+
+        assert captured["environ"] == before
+        assert dict(os.environ) == before
+        assert captured["options"].env["ANTHROPIC_AUTH_TOKEN"] == "test-key"
+        assert captured["options"].env["OPENAI_API_KEY"] == ""
+
+    async def test_sanitizer_upstream_stays_readable_during_connect(
         self, cli_instance, monkeypatch
     ):
-        """Sanitizer upstream must remain readable while SDK env is active."""
-        from src.sanitizer.config import get_upstream_url
         from src.runtime_config import runtime_config
+        from src.sanitizer.config import get_upstream_url
+        from src.session_manager import Session
 
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
         monkeypatch.setenv("PORT", "8765")
+        captured = {}
+        self._capture_connect(monkeypatch, captured, probe=get_upstream_url)
         runtime_config.set("sanitizer_enabled", True)
         try:
-            with cli_instance._sdk_env():
-                assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
-                assert get_upstream_url() == "http://litellm:4000"
-                assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "test-key"
-
-            assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
+            await cli_instance.create_client(Session(session_id="env-sanitizer"))
         finally:
             runtime_config.reset("sanitizer_enabled")
 
-    def test_sdk_env_preserves_base_url_when_sanitizer_disabled(self, cli_instance, monkeypatch):
-        """Disabled sanitizer should leave Claude's upstream base URL untouched."""
-        from src.runtime_config import runtime_config
-
-        monkeypatch.setenv("ANTHROPIC_BASE_URL", "http://litellm:4000")
-        runtime_config.set("sanitizer_enabled", False)
-        try:
-            with cli_instance._sdk_env():
-                assert os.environ.get("ANTHROPIC_BASE_URL") == "http://litellm:4000"
-        finally:
-            runtime_config.reset("sanitizer_enabled")
-
-    def test_sdk_env_noop_when_no_vars(self):
-        """_sdk_env is a no-op when no auth env vars configured."""
-        with tempfile.TemporaryDirectory() as temp_dir:
-            with patch("src.auth.validate_claude_code_auth") as mock_validate:
-                with patch("src.auth.auth_manager") as mock_auth:
-                    mock_validate.return_value = (True, {"method": "anthropic"})
-                    mock_auth.get_claude_code_env_vars.return_value = {}
-
-                    from src.claude_cli import ClaudeCodeCLI
-
-                    cli = ClaudeCodeCLI(cwd=temp_dir)
-
-        env_before = dict(os.environ)
-        with cli._sdk_env():
-            env_during = dict(os.environ)
-        env_after = dict(os.environ)
-
-        assert env_before == env_during
-        assert env_before == env_after
+        assert captured["probe"] == "http://litellm:4000"
+        assert captured["environ"]["ANTHROPIC_BASE_URL"] == "http://litellm:4000"
+        assert captured["options"].env["ANTHROPIC_BASE_URL"] == "http://127.0.0.1:8765"
 
 
 class TestConfigureHelpers:

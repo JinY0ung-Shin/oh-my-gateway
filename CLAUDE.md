@@ -210,8 +210,12 @@ uv run pytest --cov=src                            # with coverage
   and `fd/`. What that adds is narrow. The SDK builds the CLI child env as
   `{**os.environ, **options.env}`; for session CLI children the gateway first blanks
   `ADMIN_API_KEY`, `API_KEY` and the `SYSINFO_CHILD_ENV_MASK` names (`child_env_mask()`, only
-  while `SYSINFO_REDACTION` is on) and drops `OPENAI_API_KEY` (plus `CLAUDE_CODE_OAUTH_TOKEN` in
-  api-key auth; `_sdk_env` / `_isolation_vars`). Those values then sit only in the gateway's
+  while `SYSINFO_REDACTION` is on) and always blanks `OPENAI_API_KEY` (plus
+  `CLAUDE_CODE_OAUTH_TOKEN` in api-key auth; `_configure_sdk_env` / `_isolation_vars`) in
+  `options.env` — never by popping `os.environ` around `connect()`: the SDK copies `os.environ`
+  only after awaiting its `claude -v` check, so an overlapping session creation used to hand the
+  popped values to another session's CLI (`tests/test_sdk_env_race.py`; a blank token reads as
+  unset, `tests/test_cli_blank_oauth_token.py`). Those values then sit only in the gateway's
   environ: this closes that `/proc/<gateway>/environ` bypass and keeps the gateway's memory and
   fds out of reach. Not every spawn path goes through that scrubbing yet (#230 follow-up). It
   hides no inherited secret: `ANTHROPIC_AUTH_TOKEN` and every other unscrubbed variable sits in

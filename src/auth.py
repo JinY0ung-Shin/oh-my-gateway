@@ -44,9 +44,11 @@ class BackendAuthProvider(ABC):
 
     @abstractmethod
     def get_isolation_vars(self) -> List[str]:
-        """Return env var names that must be REMOVED when calling this backend.
+        """Return env var names that must not reach this backend's child process.
 
-        Prevents cross-backend key leakage.
+        Removed where the transport can drop variables (app-server
+        ``env_remove``), blanked where it can only add them (Claude
+        ``options.env``). Prevents cross-backend key leakage.
         """
 
 

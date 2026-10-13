@@ -11,16 +11,17 @@ What that adds is narrow. The SDK builds each CLI child's env as
 ``{**os.environ, **options.env}``. For session CLI children the gateway scrubs
 a few names first: ``child_env_mask()`` blanks ``ADMIN_API_KEY``, ``API_KEY``
 and the ``SYSINFO_CHILD_ENV_MASK`` names (only while ``SYSINFO_REDACTION`` is
-on), and ``_sdk_env`` drops ``OPENAI_API_KEY`` (plus ``CLAUDE_CODE_OAUTH_TOKEN``
-in api-key auth). Those values then sit only in this process's environ; this
-closes that ``/proc/<gateway>/environ`` bypass and keeps the gateway's memory
-and open fds out of reach. Not every spawn path goes through that scrubbing
-yet (#230 follow-up). Every other variable (``ANTHROPIC_AUTH_TOKEN`` among
-them) is still in each session's own env, and dumpable resets to 1 on
-``execve`` of an ordinary binary, so a CLI child's environ stays readable by
-other same-uid processes. ``SYSINFO_CHILD_ENV_MASK`` adds gateway-only names to
-the session-child mask. The protection starts at the prctl call; it does not
-revoke fds another process opened on this one before it.
+on), and ``_configure_sdk_env`` always blanks ``OPENAI_API_KEY`` (plus
+``CLAUDE_CODE_OAUTH_TOKEN`` in api-key auth). Those values then sit only in
+this process's environ; this closes that ``/proc/<gateway>/environ`` bypass and
+keeps the gateway's memory and open fds out of reach. Not every spawn path goes
+through that scrubbing yet (#230 follow-up). Every other variable
+(``ANTHROPIC_AUTH_TOKEN`` among them) is still in each session's own env, and
+dumpable resets to 1 on ``execve`` of an ordinary binary, so a CLI child's
+environ stays readable by other same-uid processes. ``SYSINFO_CHILD_ENV_MASK``
+adds gateway-only names to the session-child mask. The protection starts at the
+prctl call; it does not revoke fds another process opened on this one before
+it.
 
 Side effects on this process: no core dumps; attaching py-spy/gdb needs
 CAP_SYS_PTRACE (host root, or ``cap_add: [SYS_PTRACE]``; a ``docker exec``

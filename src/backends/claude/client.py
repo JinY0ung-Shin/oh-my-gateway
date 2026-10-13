@@ -538,7 +538,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         else:
             logger.info(f"Claude Code authentication method: {auth_info.get('method', 'unknown')}")
 
-        # Auth env vars for SDK – constant per instance, set before each query.
+        # Auth env vars for SDK – constant per instance, copied into the options
+        # _build_sdk_options makes (_configure_sdk_env), never into os.environ.
         self.claude_env_vars = auth_manager.get_claude_code_env_vars()
 
     @property
@@ -1133,6 +1134,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # otherwise inherit them from the gateway process.
         sdk_env.update(child_env_mask())
 
+        # Other backends' credentials, plus whatever the auth provider says must
+        # not reach the CLI in the chosen auth mode (api_key mode: a leftover
+        # CLAUDE_CODE_OAUTH_TOKEN), are blanked the same way for the children
+        # built from these options (sessions and verify()). The slash-command
+        # catalog/preflight builds bare options and still inherits them (#230).
+        # Never by popping them from os.environ around connect(): the SDK copies
+        # os.environ into the child only after awaiting its `claude -v` check, so
+        # an overlapping session's restore leaked them into another session's
+        # CLI (tests/test_sdk_env_race.py). The CLI reads a blank token as unset
+        # (tests/test_cli_blank_oauth_token.py).
+        sdk_env.update(dict.fromkeys(self._isolation_vars(), ""))
+
         if sdk_env:
             options.env.update(sdk_env)
 
@@ -1307,7 +1320,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     # Environment management
     # ------------------------------------------------------------------
 
-    # Env vars from other backends that must be hidden during Claude SDK calls
+    # Env vars from other backends blanked for session/verify() CLI children
+    # (_configure_sdk_env); the slash-command preflight still inherits them.
     _ISOLATION_VARS = ["OPENAI_API_KEY"]
 
     def _isolation_vars(self) -> List[str]:
@@ -1320,48 +1334,6 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         except Exception:  # pragma: no cover - provider construction is env-only
             logger.debug("auth provider isolation vars unavailable", exc_info=True)
         return merged
-
-    @contextlib.contextmanager
-    def _sdk_env(self):
-        """Temporarily inject auth env vars for an SDK call.
-
-        The SDK reads authentication from ``os.environ``.  Because these
-        values are constant per instance the worst-case concurrent-write
-        scenario is benign (same values), but we still restore the originals
-        to keep tests hermetic.
-
-        Also temporarily removes env vars belonging to other backends
-        (e.g. ``OPENAI_API_KEY``) to prevent cross-contamination.
-        """
-        original = {}
-        removed = {}
-        try:
-            # Inject Claude auth vars
-            for key, value in (self.claude_env_vars or {}).items():
-                original[key] = os.environ.get(key)
-                os.environ[key] = value
-
-            # Remove other backends' credentials (cross-isolation) plus whatever
-            # the auth provider says must not reach the CLI in the chosen auth
-            # mode (api_key mode strips a leftover CLAUDE_CODE_OAUTH_TOKEN so the
-            # CLI cannot prefer it over ANTHROPIC_AUTH_TOKEN and leak it to a
-            # custom ANTHROPIC_BASE_URL).
-            for key in self._isolation_vars():
-                if key in os.environ:
-                    removed[key] = os.environ.pop(key)
-
-            yield
-        finally:
-            # Restore Claude auth vars
-            for key, original_value in original.items():
-                if original_value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = original_value
-
-            # Restore removed isolation vars
-            for key, value in removed.items():
-                os.environ[key] = value
 
     # ------------------------------------------------------------------
     # Public API
@@ -1911,9 +1883,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if post_tool_use:
             options.hooks["PostToolUse"] = post_tool_use
 
-        with self._sdk_env():
-            client = ClaudeSDKClient(options=options)
-            await client.connect(prompt=None)
+        # Auth and credential isolation ride options.env (_configure_sdk_env);
+        # os.environ is shared by every concurrent connect and stays untouched.
+        client = ClaudeSDKClient(options=options)
+        await client.connect(prompt=None)
 
         return client
 
