@@ -167,12 +167,13 @@ uv run pytest --cov=src                            # with coverage
   rules, which the gateway does not set (#218), and in the image this repo's Dockerfile builds
   with the default (no-op) build hook there is no bubblewrap/socat, so with `sandbox.failIfUnavailable`
   unset the CLI only warns on stderr and runs Bash unsandboxed — but a private
-  `GATEWAY_BUILD_INSTALL_SCRIPT` may install them, and then under Docker's default seccomp every
-  sandboxed Bash call fails instead (`bwrap: No permissions to create new namespace`). Which of the two
-  holds in prod is not verifiable from this dev machine, so confirm in the prod container with
-  `command -v bwrap socat` (or the probe's PATH line) rather than asserting either. Either way Bash is
-  not isolated across users today. Don't describe the guard as covering Bash. Plan files are
-  moved into
+  `GATEWAY_BUILD_INSTALL_SCRIPT` may install them, and then under Docker's default seccomp (userns
+  denied) every sandboxed Bash call fails instead (`bwrap: No permissions to create new namespace`),
+  while a profile that allows the namespaces and mounts bwrap needs lets the sandbox run. Which state
+  holds in prod is not verifiable from this dev machine, and `command -v bwrap socat` (or the probe's
+  PATH lines) only shows presence, so confirm in the prod container with the probe's
+  `=> CLI OS sandbox can run` line rather than asserting any. In every case Bash is not isolated
+  across users today. Don't describe the guard as covering Bash. Plan files are moved into
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
   `tests/test_cli_plans_directory.py` pins it against the bundled CLI.
