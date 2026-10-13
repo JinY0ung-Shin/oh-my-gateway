@@ -74,14 +74,19 @@ class ClaudeAuthProvider(BackendAuthProvider):
     def get_isolation_vars(self) -> List[str]:
         # OPENAI_API_KEY: another backend's credential (cross-backend isolation).
         #
-        # CLAUDE_CODE_OAUTH_TOKEN: the CLI prefers a Claude.ai OAuth token over
-        # ANTHROPIC_AUTH_TOKEN. When the operator explicitly chose api_key auth
-        # (typically together with a custom ANTHROPIC_BASE_URL such as a LiteLLM
-        # proxy), a leftover OAuth token silently wins AND is sent as the bearer
-        # to that third-party base URL. Observed: LiteLLM answered
-        # "400 No connected db" because it received the OAuth bearer instead of
-        # the configured master key. In api_key mode the OAuth token is never
-        # what the operator meant, so strip it from the SDK subprocess env.
+        # CLAUDE_CODE_OAUTH_TOKEN: an older CLI preferred a Claude.ai OAuth token
+        # over ANTHROPIC_AUTH_TOKEN, so with api_key auth (typically a custom
+        # ANTHROPIC_BASE_URL such as a LiteLLM proxy) a leftover OAuth token won
+        # AND was sent as the bearer to that third-party base URL. Observed:
+        # LiteLLM answered "400 No connected db" because it received the OAuth
+        # bearer instead of the configured master key. That does not reproduce on
+        # CLI 2.1.283 with a custom base URL (ANTHROPIC_AUTH_TOKEN wins), and
+        # 2.1.283 already strips the token from its Bash and MCP children; the
+        # blank now mainly keeps it out of the CLI process's own environ, which
+        # the agent's Bash can read via /proc/<pid>/environ (same uid). In api_key
+        # mode the OAuth token is never what the operator meant, so it is blanked
+        # in the SDK subprocess env (ClaudeCodeCLI._configure_sdk_env; the CLI
+        # reads blank as unset: tests/test_cli_blank_oauth_token.py).
         if self.auth_method == "anthropic":
             return ["OPENAI_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"]
         return ["OPENAI_API_KEY"]

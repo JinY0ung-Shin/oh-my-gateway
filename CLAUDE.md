@@ -167,12 +167,13 @@ uv run pytest --cov=src                            # with coverage
   rules, which the gateway does not set (#218), and in the image this repo's Dockerfile builds
   with the default (no-op) build hook there is no bubblewrap/socat, so with `sandbox.failIfUnavailable`
   unset the CLI only warns on stderr and runs Bash unsandboxed — but a private
-  `GATEWAY_BUILD_INSTALL_SCRIPT` may install them, and then under Docker's default seccomp every
-  sandboxed Bash call fails instead (`bwrap: No permissions to create new namespace`). Which of the two
-  holds in prod is not verifiable from this dev machine, so confirm in the prod container with
-  `command -v bwrap socat` (or the probe's PATH line) rather than asserting either. Either way Bash is
-  not isolated across users today. Don't describe the guard as covering Bash. Plan files are
-  moved into
+  `GATEWAY_BUILD_INSTALL_SCRIPT` may install them, and then under Docker's default seccomp (userns
+  denied) every sandboxed Bash call fails instead (`bwrap: No permissions to create new namespace`),
+  while a profile that allows the namespaces and mounts bwrap needs lets the sandbox run. Which state
+  holds in prod is not verifiable from this dev machine, and `command -v bwrap socat` (or the probe's
+  PATH lines) only shows presence, so confirm in the prod container with the probe's
+  `=> CLI OS sandbox can run` line rather than asserting any. In every case Bash is not isolated
+  across users today. Don't describe the guard as covering Bash. Plan files are moved into
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
   `tests/test_cli_plans_directory.py` pins it against the bundled CLI.
@@ -209,8 +210,12 @@ uv run pytest --cov=src                            # with coverage
   and `fd/`. What that adds is narrow. The SDK builds the CLI child env as
   `{**os.environ, **options.env}`; for session CLI children the gateway first blanks
   `ADMIN_API_KEY`, `API_KEY` and the `SYSINFO_CHILD_ENV_MASK` names (`child_env_mask()`, only
-  while `SYSINFO_REDACTION` is on) and drops `OPENAI_API_KEY` (plus `CLAUDE_CODE_OAUTH_TOKEN` in
-  api-key auth; `_sdk_env` / `_isolation_vars`). Those values then sit only in the gateway's
+  while `SYSINFO_REDACTION` is on) and always blanks `OPENAI_API_KEY` (plus
+  `CLAUDE_CODE_OAUTH_TOKEN` in api-key auth; `_configure_sdk_env` / `_isolation_vars`) in
+  `options.env` — never by popping `os.environ` around `connect()`: the SDK copies `os.environ`
+  only after awaiting its `claude -v` check, so an overlapping session creation used to hand the
+  popped values to another session's CLI (`tests/test_sdk_env_race.py`; a blank token reads as
+  unset, `tests/test_cli_blank_oauth_token.py`). Those values then sit only in the gateway's
   environ: this closes that `/proc/<gateway>/environ` bypass and keeps the gateway's memory and
   fds out of reach. Not every spawn path goes through that scrubbing yet (#230 follow-up). It
   hides no inherited secret: `ANTHROPIC_AUTH_TOKEN` and every other unscrubbed variable sits in

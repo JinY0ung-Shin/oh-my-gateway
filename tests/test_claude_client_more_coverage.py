@@ -466,57 +466,52 @@ class TestClaudeCodeCLIVerify:
 
 
 # ---------------------------------------------------------------------------
-# ClaudeCodeCLI._sdk_env() — line 605 (cross-isolation restore)
+# ClaudeCodeCLI._configure_sdk_env() — auth and isolation ride options.env
 # ---------------------------------------------------------------------------
 
 
-class TestClaudeCodeCLISdkEnv:
-    """Tests for _sdk_env() environment isolation."""
+class TestClaudeCodeCLIChildEnv:
+    """_build_sdk_options puts auth vars and isolation blanks in options.env.
 
-    def test_sdk_env_removes_and_restores_isolation_vars(self, monkeypatch):
-        """_sdk_env() removes OPENAI_API_KEY during the call and restores it after (line 605)."""
+    These only build options; the connect-time ``os.environ`` guards are
+    ``test_connect_sees_untouched_os_environ`` (test_claude_cli_unit.py) and
+    ``tests/test_sdk_env_race.py``.
+    """
+
+    def test_isolation_vars_blanked_in_child_env_not_popped(self, monkeypatch):
+        """OPENAI_API_KEY is blanked in options.env, the SDK's only way to mask it."""
         monkeypatch.setenv("OPENAI_API_KEY", "sk-secret")
 
         cli = _make_cli()
         cli.claude_env_vars = {}
 
-        captured_inside = {}
+        options = cli._build_sdk_options()
 
-        with cli._sdk_env():
-            captured_inside["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY")
+        assert options.env["OPENAI_API_KEY"] == ""
+        assert os.environ.get("OPENAI_API_KEY") == "sk-secret"
 
-        assert captured_inside["OPENAI_API_KEY"] is None  # removed during call
-        assert os.environ.get("OPENAI_API_KEY") == "sk-secret"  # restored after
-
-    def test_sdk_env_injects_claude_vars(self, monkeypatch):
-        """_sdk_env() injects claude_env_vars into os.environ during the call."""
+    def test_claude_env_vars_ride_options_env(self, monkeypatch):
+        """claude_env_vars land in options.env (as they did before the race fix)."""
         monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
 
         cli = _make_cli()
         cli.claude_env_vars = {"ANTHROPIC_AUTH_TOKEN": "injected-key"}
 
-        captured = {}
-        with cli._sdk_env():
-            captured["tok"] = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        options = cli._build_sdk_options()
 
-        assert captured["tok"] == "injected-key"
-        # Restored after: the env var should be absent (it wasn't set before)
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "injected-key"
         assert os.environ.get("ANTHROPIC_AUTH_TOKEN") is None
 
-    def test_sdk_env_restores_existing_claude_var(self, monkeypatch):
-        """_sdk_env() restores pre-existing values when exiting (line 524)."""
+    def test_claude_env_var_wins_over_inherited_value(self, monkeypatch):
+        """options.env carries the configured value the SDK merges over os.environ."""
         monkeypatch.setenv("ANTHROPIC_AUTH_TOKEN", "original-value")
 
         cli = _make_cli()
-        # Inject a different value, overriding the existing one
         cli.claude_env_vars = {"ANTHROPIC_AUTH_TOKEN": "new-value"}
 
-        captured = {}
-        with cli._sdk_env():
-            captured["inside"] = os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        options = cli._build_sdk_options()
 
-        assert captured["inside"] == "new-value"
-        # After the context, the original value must be restored (line 524)
+        assert options.env["ANTHROPIC_AUTH_TOKEN"] == "new-value"
         assert os.environ.get("ANTHROPIC_AUTH_TOKEN") == "original-value"
 
 

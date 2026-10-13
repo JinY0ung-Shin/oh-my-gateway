@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Isolation capability probe for the Claude gateway container.
 
-Run INSIDE the prod gateway container, as the uid:gid that sessions run as (the
-gateway's -- `docker compose exec` attaches as root here unless given `-u`):
+Run INSIDE the gateway container, as the uid:gid that sessions run as (the
+gateway's -- `docker compose exec` attaches as root here unless given `-u`), fed
+on stdin so no session-writable path in the container is involved:
 
-    docker compose exec -u app gateway python3 -I -S /tmp/isolation_probe.py
+    docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.py
 
 With APP_GID != the app user's group, `-u app` is NOT the sessions' identity;
 the probe then prints the exact `-u <uid>:<gid>` to re-run with.
@@ -14,17 +15,19 @@ mount, the landlock_create_ruleset version query AND a full create/add_rule/
 restrict_self enforce chain) runs in a short-lived forked child that exits
 immediately -- Landlock restrict_self binds only that child, never the probe;
 uid-per-user is judged from the bounding set, not a setuid attempt. The parent
-only reads /proc, /sys, PATH and the ~/.claude
-tree. Sessions can write that tree, so it is read as hostile: a registry file is
-stat'ed first and opened (non-blocking, no controlling tty) only as a small
-regular file, walks are bounded in entries, depth and time, and names are
-escaped before they reach the terminal. Nothing is created, mounted, or changed
-in the live process.
+only reads /proc, /sys, PATH, the CLI's settings files and the ~/.claude
+tree. Sessions can write that tree, so it is read as hostile: a registry or
+settings file is stat'ed first and opened (non-blocking, no controlling tty)
+only as a small regular file, every walk and scan (shared-asset and code
+walks, registry paths, the LISTEN-socket fd scan) is bounded in entries, path
+length/depth and time, and names are escaped before they reach the terminal.
+Nothing is created, mounted, or changed in the live process.
 
 It answers which per-user isolation mechanism is available in THIS container:
-  * uid-per-user (needs CAP_SETUID/SETGID in the bounding set, for a broker the
-    root entrypoint forks before its drop or for file caps on the wrapper --
-    never held by the gateway itself, whose children would inherit them)
+  * uid-per-user (needs CAP_SETUID/SETGID in the bounding set, for the resident
+    spawn broker the root entrypoint forks before its drop -- or file caps on
+    the broker binary under a non-root start; never held by the gateway
+    itself, whose children would inherit them)
   * Landlock filesystem confinement (needs ABI >= 2: kernel >= 5.19 or a distro
     backport, the landlock LSM, and a seccomp profile that allows the syscalls)
   * bubblewrap/nsjail namespaces (needs userns + a fresh procfs in a new PID ns)
@@ -47,6 +50,7 @@ import stat
 import struct
 import sys
 import sysconfig
+import textwrap
 import time
 
 # ---- syscall numbers ---------------------------------------------------------
@@ -76,18 +80,31 @@ _libc.syscall.restype = ctypes.c_long
 # the gateway is its child.
 _INIT_SHIMS = ("docker-init", "tini", "dumb-init", "catatonit")
 # Name fragments that make an env var worth flagging (names only, never values).
-_SECRETISH = ("KEY", "TOKEN", "SECRET", "PASS", "AUTH", "CRED", "COOKIE", "DSN", "URL")
+_SECRETISH = tuple("KEY TOKEN SECRET PASS PRIVATE AUTH CRED COOKIE DSN URL".split())
 # Bounds for the session-writable tree.
 _JSON_CAP = 4 << 20  # registry/settings files above this size are skipped
 _PATHS_CAP = 500  # absolute paths taken from the registries
+_PATH_MAX = 4096  # longer path values are unusable (ENAMETOOLONG): skipped
+_SEEDS_CAP = 16  # distinct CLAUDE_CODE_PLUGIN_SEED_DIR entries checked
+_SHOWN_CAP = 160  # chars of a session-written value echoed in a row
 _OUTSIDE_CAP = 10  # off-root registry paths listed (not walked) in the report
+_RESOLVE_TIME_CAP = 5.0  # seconds for resolving the off-root registry paths
 _WALK_CAP = 50000  # entries per walk
 _EXAMPLES_CAP = 32  # bad-entry examples kept per walk (count stays exact)
 _DEPTH_CAP = 256  # path components followed in a symlink target
 _TIME_CAP = 60.0  # seconds for all shared-asset walks together
 _ROW_TIME_CAP = 15.0  # per-row slice of _TIME_CAP: one tree can't starve the rest
 _CODE_TIME_CAP = 10.0  # its own budget: planted shared trees can't starve it
+# The LISTEN-socket owner scan readlinks fds of every process this uid can see,
+# sessions included: a process holding a million fds must not stall the probe.
+_FD_SCAN_CAP = 200000
+_FD_SCAN_TIME_CAP = 5.0
 _TRUE = ("true", "1", "yes", "on")  # the gateway's boolean spellings
+_FALSE = ("false", "0", "no", "off")
+# The CLI's managed (policy) settings on Linux: managed-settings.json, then the
+# *.json drop-ins of managed-settings.d in name order, later files winning.
+_MANAGED_DIR = "/etc/claude-code"
+_DROPINS_CAP = 64
 # Reading a session-writable path can raise beyond OSError: an embedded NUL or a
 # lone surrogate (ValueError) or a long symlink chain (RecursionError, py3.12
 # realpath recurses per hop). Fail the one entry, never the whole probe.
@@ -139,6 +156,9 @@ def _kv(key: str, val) -> None:
 
 
 # ---- run a test in a forked child, return (ok, errno-name) -------------------
+_REPORT_FDS: list[int] = []  # report-pipe write ends this (test child) holds
+
+
 def _in_child(fn) -> tuple[bool, str]:
     r, w = os.pipe()
     try:
@@ -149,6 +169,15 @@ def _in_child(fn) -> tuple[bool, str]:
         return (False, f"fork:{_errname(exc.errno)}")
     if pid == 0:  # child
         os.close(r)
+        # A nested test (t_proc_in_pidns) forks again: the grandchild must not
+        # keep the outer report pipe open, or the probe's read-to-EOF would hang
+        # on it for as long as the grandchild lives.
+        for fd in _REPORT_FDS:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _REPORT_FDS[:] = [w]
         try:
             ok, en = fn()
             os.write(w, f"{int(ok)} {en}".encode())
@@ -180,16 +209,30 @@ def _in_child(fn) -> tuple[bool, str]:
     return (ok_s == "1", en.strip())
 
 
-def _unrun(detail: str) -> str:
-    """Display text for a child test that gave no answer of its own, else ""."""
+def _child_result(ok: bool, detail: str) -> tuple[str, str]:
+    """(kind, text): the one reading of an _in_child result every test uses.
+
+    kind is "ok"; "denied" (the test ran and its call failed -- `detail` names
+    the step/errno); "seccomp" (killed by SIGSYS: a seccomp KILL action, which
+    denies the call); or "unknown" (fork failed, killed by any other signal,
+    the test raised, or it died without reporting) -- a test that never gave
+    its own answer, so never a denial: it must not make a mechanism or the CLI
+    sandbox look broken. `text` is the display form for the last two kinds.
+    """
+    if ok:
+        return "ok", ""
     kind, _, why = detail.partition(":")
-    if kind == "fork":
-        return f"UNKNOWN (fork failed: {why}; pids/nproc limit?)"
     if kind == "killed":
-        return f"KILLED ({why}{': seccomp kill' if why == 'SIGSYS' else ''})"
+        if why == "SIGSYS":
+            return "seccomp", "KILLED (SIGSYS: seccomp kill)"
+        return "unknown", f"UNKNOWN (test child killed by {why})"
+    if kind == "fork":
+        return "unknown", f"UNKNOWN (fork failed: {why}; pids/nproc limit?)"
     if kind == "died":
-        return "UNKNOWN (test child died without reporting)"
-    return ""
+        return "unknown", "UNKNOWN (test child died without reporting)"
+    if kind == "EXC":
+        return "unknown", f"UNKNOWN (test child raised: {why})"
+    return "denied", ""
 
 
 def _errname(en: int) -> str:
@@ -204,11 +247,14 @@ def _kernel_version() -> tuple[int, int] | None:
         return None
 
 
+# procfs text is read as bytes and decoded leniently: a process name (comm,
+# status Name:) or a mount path can hold any bytes, and a UnicodeDecodeError
+# must never end the probe before its VERDICT.
 def _line(path: str) -> str:
     """First line of a procfs/sysfs file ("" if unreadable)."""
     try:
-        with open(path) as f:
-            return f.readline().strip()
+        with open(path, "rb") as f:
+            return f.readline(4096).decode(errors="replace").strip()
     except OSError:
         return ""
 
@@ -219,9 +265,9 @@ def _read_status(pid: str) -> dict:
     keys += ("Seccomp", "Seccomp_filters", "NoNewPrivs")
     out: dict = {}
     try:
-        with open(f"/proc/{pid}/status") as f:
-            for line in f:
-                key, _, val = line.partition(":")
+        with open(f"/proc/{pid}/status", "rb") as f:
+            for raw in f:
+                key, _, val = raw.decode(errors="replace").partition(":")
                 if key in keys:
                     out[key] = val.split()
     except OSError as exc:
@@ -234,8 +280,9 @@ def _hidepid() -> str:
     any earlier -- or ""."""
     found = ""
     try:
-        with open("/proc/self/mountinfo") as f:
-            for line in f:
+        with open("/proc/self/mountinfo", "rb") as f:
+            for raw in f:
+                line = raw.decode(errors="replace")
                 parts = line.split()
                 if len(parts) > 4 and parts[4] == "/proc":
                     opts = line.rsplit(" - ", 1)[-1].replace(",", " ").split()
@@ -278,10 +325,11 @@ def _port() -> int:
         return 8000
 
 
-def _listen_inodes(port: int) -> set[str]:
-    """Socket inodes in TCP_LISTEN state on `port` (IPv4 + IPv6)."""
+def _listen_inodes(port: int) -> dict[str, str]:
+    """Socket inodes in TCP_LISTEN state on `port` (IPv4 + IPv6), each mapped to
+    the uid that owns the socket (the tables' uid column)."""
     want = f"{port:04X}"
-    inodes: set[str] = set()
+    inodes: dict[str, str] = {}
     for proc in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
             with open(proc) as f:
@@ -291,71 +339,168 @@ def _listen_inodes(port: int) -> set[str]:
                     if len(parts) < 10 or parts[3] != "0A":  # 0A = TCP_LISTEN
                         continue
                     if parts[1].rsplit(":", 1)[-1].upper() == want:
-                        inodes.add(parts[9])
+                        inodes[parts[9]] = parts[7]
         except OSError:
             continue
     return inodes
 
 
-def _pids_for_inodes(inodes: set[str]) -> list[str]:
-    """PIDs holding any of `inodes` as an open socket. Only /proc/<pid>/fd that
-    this uid may read is scanned -- which includes the gateway, since the probe
-    runs as its uid; other-uid listeners are simply not found here."""
+def _listen_owners(inodes: dict[str, str]) -> tuple[list[str], str]:
+    """(pids, gap): processes holding one of the LISTEN `inodes` as an open fd,
+    and why that list cannot be trusted on its own: "" (it can), "unheld" (some
+    LISTEN socket has no readable holder), "unheld-own" (one of those sockets
+    belongs to this uid -- a non-dumpable same-uid holder, as the gateway is
+    under #232) or "capped" (the scan stopped early).
+
+    Only a /proc/<pid>/fd this uid may read is scanned: another uid's is not,
+    and neither is a non-dumpable process's (its fd dir turns root-owned, as
+    #232 makes the gateway's). So when some LISTEN socket on the port has no
+    readable holder, a holder that WAS found may be a session's own listener
+    on the same port (a dev server on [::]:8000 beside the gateway's
+    0.0.0.0:8000) rather than the gateway. Sessions share this uid and can hold
+    any number of fds, so the scan stops at _FD_SCAN_CAP entries or
+    _FD_SCAN_TIME_CAP seconds.
+    """
     if not inodes:
-        return []
-    targets = {f"socket:[{i}]" for i in inodes}
+        return [], ""
+    targets = {f"socket:[{i}]": i for i in inodes}
     pids: list[str] = []
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
+    held: set[str] = set()
+    left = _FD_SCAN_CAP
+    deadline = time.monotonic() + _FD_SCAN_TIME_CAP
+    try:
+        names = [n for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return [], "unheld"
+    for name in names:
+        hit = False
         try:
-            fds = os.listdir(f"/proc/{name}/fd")
+            with os.scandir(f"/proc/{name}/fd") as it:
+                for entry in it:
+                    left -= 1
+                    if left < 0 or time.monotonic() > deadline:
+                        return (pids + [name] if hit else pids), "capped"
+                    try:
+                        inode = targets.get(os.readlink(entry.path))
+                    except OSError:
+                        continue
+                    if inode is not None:
+                        held.add(inode)
+                        hit = True
         except OSError:
-            continue
-        for fd in fds:
-            try:
-                if os.readlink(f"/proc/{name}/fd/{fd}") in targets:
-                    pids.append(name)
-                    break
-            except OSError:
-                continue
-    return pids
+            pass  # unreadable fd dir, or the process exited mid-scan
+        if hit:
+            pids.append(name)
+    unheld = set(inodes) - held
+    if not unheld:
+        return pids, ""
+    me = str(os.geteuid())
+    return pids, "unheld-own" if any(inodes[i] == me for i in unheld) else "unheld"
 
 
-def _gateway() -> tuple[str, str, list[str]]:
-    """(pid, note, rivals): the gateway process, and others that look as likely.
+def _gw(pid: str, note: str, rivals=(), unsure: str = "", found=True) -> dict:
+    return {
+        "pid": pid,
+        "note": note,
+        "rivals": list(rivals),
+        "unsure": unsure,
+        "found": found,
+    }
+
+
+def _gateway() -> dict:
+    """The gateway process: {"pid", "note", "rivals", "unsure", "found"}.
 
     Authoritative first: the process that owns the LISTEN socket on $PORT (its
-    /proc/<pid>/fd is readable because the probe runs as the gateway's uid). Only
-    when no such owner is readable (probe run as a different uid, or $PORT wrong)
-    does it fall back to PID 1 -- unless PID 1 is an init shim (compose `init:
-    true`, `--init`), runs as root, or is hidden by hidepid, in which case a
-    non-root child of PID 1: cmdline naming uvicorn/src.main first, then a python
-    one (under a shim, any). A tie is reported as rivals rather than guessed.
+    /proc/<pid>/fd is readable because the probe runs as the gateway's uid) --
+    trusted only when every LISTEN socket on the port has a readable holder
+    (see _listen_owners). Otherwise (probe run as another uid, a non-dumpable
+    gateway, $PORT wrong) it falls back to PID 1 (_gateway_from_pid1), and any
+    holder found that is not that pick becomes a rival. `unsure` names why the
+    pick is not concluded (a tie, an untrusted holder, a capped scan, or a pick
+    whose fds the scan read although a LISTEN socket has no readable holder),
+    with the other candidates in `rivals`; `found` is False when nothing was
+    identified.
     """
     me = str(os.getpid())
     port = _port()
-    owners = sorted(
-        (p for p in _pids_for_inodes(_listen_inodes(port)) if p != me), key=int
-    )
-    if len(owners) == 1:
-        return owners[0], f"owns the LISTEN socket on :{port}", []
-    if len(owners) > 1:
+    owners, gap = _listen_owners(_listen_inodes(port))
+    owners = sorted((p for p in owners if p != me), key=int)
+    if owners and not gap:
+        if len(owners) == 1:
+            return _gw(owners[0], f"owns the LISTEN socket on :{port}")
         # Disambiguate master/worker etc. by cmdline before declaring a tie.
         named = [
             p for p in owners if "uvicorn" in _cmdline(p) or "src.main" in _cmdline(p)
         ]
         if len(named) == 1:
-            return named[0], f"owns :{port} (uvicorn among {len(owners)} holders)", []
-        return owners[0], f"several processes hold :{port}", owners[1:]
-    comm = _line("/proc/1/comm")
+            return _gw(named[0], f"owns :{port} (uvicorn among {len(owners)} holders)")
+        tie = f"several processes hold :{port}"
+        return _gw(owners[0], tie, owners[1:], tie)
+    pick = _gateway_from_pid1(me)
+    others = [p for p in owners if p != pick["pid"]]
+    pick["rivals"] += others
+    if pick["unsure"]:
+        pass
+    elif gap == "capped":
+        pick["unsure"] = f"the fd scan for the :{port} holder hit its cap"
+    elif others:
+        pick["unsure"] = (
+            f"a LISTEN socket on :{port} has no readable holder (non-dumpable?),"
+            " so the holder found may be a session's own listener"
+        )
+    elif (
+        gap.startswith("unheld")
+        and _fd_listable(pick["pid"])
+        and (pick["pid"] not in owners or gap == "unheld-own")
+    ):
+        # The scan read this pick's fds, so had it held the unheld LISTEN socket
+        # it would have been found: the gateway may be that socket's unreadable
+        # holder -- a hidden PID 1, a shim's non-dumpable child -- and this pick a
+        # session listener, a CLI or an orphan. A pick that holds a socket on
+        # the port is doubted only when the unheld one is this uid's.
+        pick["unsure"] = (
+            f"a LISTEN socket on :{port} has no readable holder and PID"
+            f" {pick['pid']} does not hold it, so the gateway may be that holder"
+        )
+    return pick
+
+
+def _fd_listable(pid: str) -> bool:
+    """Whether this uid can list /proc/<pid>/fd (as _listen_owners did)."""
     try:
-        euid = int(_read_status("1")["Uid"][1])
+        with os.scandir(f"/proc/{pid}/fd"):
+            return True
+    except OSError:
+        return False
+
+
+def _pid1_euid() -> "int | None":
+    """PID 1's effective uid: from its status, else from the /proc/1 dir --
+    hidepid=noaccess lists it but refuses its files, and the dir keeps the
+    task's euid even when non-dumpable. None when hidden (hidepid=invisible)."""
+    try:
+        return int(_read_status("1")["Uid"][1])
     except (KeyError, IndexError, ValueError):
-        euid = None  # hidden by hidepid: its children we can see still tell
+        pass
+    try:
+        return os.stat("/proc/1").st_uid
+    except OSError:
+        return None
+
+
+def _gateway_from_pid1(me: str) -> dict:
+    """_gateway()'s fallback: PID 1 -- unless PID 1 is an init shim (compose
+    `init: true`, `--init`), runs as root, or is hidden by hidepid, in which
+    case a non-root child of PID 1: cmdline naming uvicorn/src.main first, then
+    a python one (under a shim, any). Under a hidden PID 1 only the first kind
+    counts: PID 1 may be the gateway itself, hidden because it is non-dumpable,
+    and its visible children then are its CLIs or reparented orphans."""
+    comm = _line("/proc/1/comm")
+    euid = _pid1_euid()  # None: hidden by hidepid (non-dumpable, or another uid)
     shim = comm in _INIT_SHIMS
     if euid not in (None, 0) and not shim:
-        return "1", "", []
+        return _gw("1", "")
     ranked: dict[int, list[str]] = {}
     for kid in sorted(_children("1"), key=int):
         if kid == me:
@@ -368,6 +513,8 @@ def _gateway() -> tuple[str, str, list[str]]:
         cmd = _cmdline(kid)
         if "uvicorn" in cmd or "src.main" in cmd:
             rank = 2
+        elif euid is None:
+            continue
         elif _line(f"/proc/{kid}/comm").startswith("python"):
             rank = 1
         elif shim:
@@ -375,24 +522,49 @@ def _gateway() -> tuple[str, str, list[str]]:
         else:
             continue
         ranked.setdefault(rank, []).append(kid)
-    who = f"PID 1 is {comm} (uid {euid})" if euid is not None else "PID 1 is hidden"
+    who = "PID 1 is hidden"
+    if euid is not None:
+        who = f"PID 1 is {comm or '?'} (uid {euid})"
     if not ranked:
-        return "1", "" if euid is None else f"{who}: gateway not identified", []
+        if euid is None:
+            return _gw("1", f"{who}; no visible child names uvicorn/src.main")
+        return _gw("1", f"{who}: gateway not identified", found=False)
     best = ranked[max(ranked)]
-    return best[0], f"{who}; this is its child", best[1:]
+    tie = "several children of PID 1 look alike" if best[1:] else ""
+    return _gw(best[0], f"{who}; this is its child", best[1:], tie)
+
+
+def _app_ids() -> tuple[int, int] | None:
+    """The uid:gid a root start drops to: APP_UID/APP_GID, blank = 1000, as
+    docker/entrypoint.py parses them (None if malformed: it would not start)."""
+    ids = []
+    for name in ("APP_UID", "APP_GID"):
+        raw = os.environ.get(name, "").strip()
+        try:
+            ids.append(int(raw) if raw else 1000)
+        except ValueError:
+            return None
+    return (ids[0], ids[1]) if min(ids) > 0 else None
 
 
 def _rerun_ids(ident: dict) -> str:
-    """The `-u` value to re-run with: the gateway's ids, never root's.
+    """The `-u` value to re-run with: the sessions' ids when known and
+    concluded, else what the entrypoint drops to (APP_UID:APP_GID) -- never
+    root's, and never the probe's own euid (with APP_UID != 1000 that would
+    print the wrong id and loop)."""
+    ids = ident.get("session_ids")
+    if ids and ids[0] and not ident.get("unsure"):  # known, non-zero, concluded
+        return f"{ids[0]}:{ids[1]}"
+    app = _app_ids()
+    return f"{app[0]}:{app[1]}" if app else "app"
 
-    The fallback is APP_UID (what the entrypoint drops to), not the probe's own
-    euid -- with APP_UID != 1000 the latter would print the wrong id and loop.
-    """
-    if ident.get("uid") and not ident.get("rivals"):  # known, non-zero, unique
-        return f"{ident['uid']}:{ident['gid']}"
-    user = os.environ.get("APP_UID", "").strip() or str(os.geteuid() or "") or "app"
-    gid = os.environ.get("APP_GID", "").strip()
-    return f"{user}:{gid}" if gid else user
+
+def _rerun_cmd(ident: dict) -> str:
+    """The re-run command, fed on stdin like the module docstring's."""
+    return (
+        f"docker compose exec -T -u {_rerun_ids(ident)} gateway"
+        " python3 -I -S - < scripts/isolation_probe.py"
+    )
 
 
 def _quota_mb() -> int:
@@ -403,13 +575,6 @@ def _quota_mb() -> int:
         return int(raw) if raw else 0
     except ValueError:
         return 0
-
-
-def _cli_path(value: str) -> str:
-    """A path env var normalized the way the CLI reads it: trimmed, blank treated
-    as unset (""), and `~` expanded. Returns "" for an unset/blank value."""
-    value = (value or "").strip()
-    return os.path.expanduser(value) if value else ""
 
 
 # ---- individual probes -------------------------------------------------------
@@ -431,25 +596,25 @@ def probe_kernel() -> None:
 def probe_identity() -> dict:
     _hdr("PROCESS IDENTITY")
     euid, egid = os.geteuid(), os.getegid()
-    gw, note, rivals = _gateway()
-    ident = {"root": euid == 0, "gw": gw, "uid": None, "gid": None}
-    ident.update(same_creds=False, invisible=False, hidepid=_hidepid())
-    ident.update(noaccess=False, gw_root=False, rivals=rivals)
-    # Under an init shim (docker-init/tini) PID 1 -- not the gateway child -- holds
-    # the full container env; probe_proc_hardening checks its environ too (F2).
-    pid1_comm = _line("/proc/1/comm")
-    ident["pid1_comm"] = pid1_comm
-    ident["pid1_shim"] = pid1_comm in _INIT_SHIMS
-    ident["gw_found"] = not (gw == "1" and "not identified" in note)
+    found = _gateway()
+    gw = found["pid"]
+    ident = {"root": euid == 0, "gw": gw, "gw_found": found["found"]}
+    ident.update(rivals=found["rivals"], unsure=found["unsure"])
+    ident.update(uid=None, session_ids=None, same_creds=False)
+    ident.update(gw_root=False, hidepid=_hidepid(), hidden="")
+    # When the gateway is not PID 1 (an init shim, a uvicorn master), PID 1
+    # holds the full container env too; probe_proc_hardening checks it (F2).
+    ident["pid1_comm"] = _line("/proc/1/comm")
+    ident["pid1_uid"] = _pid1_euid()  # a shim's uid tells a root start from not
     _kv("uid / euid", f"{os.getuid()} / {euid}")
     _kv("gid / egid", f"{os.getgid()} / {egid}")
     _kv("running as root", ident["root"])
     shown = f"PID {gw} ({_line(f'/proc/{gw}/comm') or '?'})"
-    _kv("gateway process", f"{shown} -- {note}" if note else shown)
-    if rivals:
-        for rival in rivals:
-            _kv("!! also a candidate", f"PID {rival}: {_cmdline(rival)[:60]}")
-        _kv("", "several look like the gateway: F2 and -u advice not concluded")
+    _kv("gateway process", f"{shown} -- {found['note']}" if found["note"] else shown)
+    for rival in ident["rivals"]:
+        _kv("!! also a candidate", f"PID {rival}: {_cmdline(rival)[:60]}")
+    if ident["unsure"]:
+        _kv("!! not concluded", f"{ident['unsure']}: F2 and -u advice not concluded")
     # This probe is only meaningful run AS a session: with the gateway's uid AND
     # gid. Reading another process's /proc/<pid>/environ needs our fsuid/fsgid to
     # equal all of its real/effective/saved uids AND gids, so a uid-only match
@@ -461,29 +626,16 @@ def probe_identity() -> dict:
         gids = [int(x) for x in st["Gid"][:3]]
     except (KeyError, ValueError):
         err = st.get("error")
-        if isinstance(err, FileNotFoundError) and ident["hidepid"]:
-            ident["invisible"] = True
-            _kv("gateway uid:gid", f"INVISIBLE ({ident['hidepid']}) to this uid:gid")
-            _kv(
-                "!! WARNING",
-                "sessions run with the gateway's ids and see it -- re-run with "
-                f"`docker compose exec -u {_rerun_ids(ident)}`",
-            )
-        elif isinstance(err, PermissionError):
-            # hidepid=noaccess (EACCES): the process is visible but its /proc is
-            # unreadable to other uids, so this probe is not a session's view.
-            ident["noaccess"] = True
-            extra = f" ({ident['hidepid']})" if ident["hidepid"] else ""
-            _kv("gateway uid:gid", f"UNREADABLE (EACCES){extra} to this uid:gid")
-            _kv(
-                "!! WARNING",
-                "sessions run with the gateway's ids and can read it -- re-run "
-                f"with `docker compose exec -u {_rerun_ids(ident)}`",
-            )
+        hidden = isinstance(err, (FileNotFoundError, PermissionError))
+        if ident["hidepid"] and hidden and ident["gw_found"]:
+            _hidden_gateway(ident, err)
+        elif isinstance(err, OSError):
+            _kv("gateway uid:gid", f"unreadable ({_errname(err.errno)})")
         else:
-            _kv("gateway uid:gid", err or "unreadable")
+            _kv("gateway uid:gid", "unreadable")
         return ident
-    ident["uid"], ident["gid"] = uids[1], gids[1]  # effective ids
+    ident["uid"] = uids[1]  # effective uid
+    ident["session_ids"] = (uids[1], gids[1])
     ident["gw_root"] = uids[1] == 0
     shown = f"{uids[1]}:{gids[1]}"
     if len(set(uids)) > 1 or len(set(gids)) > 1:
@@ -493,44 +645,97 @@ def probe_identity() -> dict:
     if ident["root"]:
         _kv(
             "!! WARNING",
-            f"running as root -- use `docker compose exec -u {_rerun_ids(ident)}`; "
+            f"running as root -- use `{_rerun_cmd(ident)}`; "
             "setuid/F2 results are wrong, so no VERDICT is given",
         )
     elif uids[1] == 0:
         _kv(
             "!! WARNING",
             "the gateway runs as root (or was not found), so the sessions' ids "
-            f"are unknown -- re-run with `docker compose exec -u {_rerun_ids(ident)}`",
+            f"are unknown -- re-run with `{_rerun_cmd(ident)}`",
         )
-    elif not ident["same_creds"] and not rivals:
+    elif not ident["same_creds"] and not ident["unsure"]:
         _kv(
             "!! WARNING",
             f"this probe is {euid}:{egid} but sessions inherit the gateway's "
             f"{uids[1]}:{gids[1]}, so F2/uid results below are not theirs -- "
-            f"re-run with `docker compose exec -u {_rerun_ids(ident)}`",
+            f"re-run with `{_rerun_cmd(ident)}`",
         )
     return ident
 
 
-def _not_session_view(ident: dict) -> str:
-    """One reason this probe is not running as the sessions' identity, or "".
-
-    Single source for the caveat printed by proc-hardening and the verdict, so the
-    two cannot drift. The most specific reason wins; "" means the probe does hold
-    the sessions' uid:gid and the F2/uid results below are theirs.
+def _hidden_gateway(ident: dict, err: OSError) -> None:
+    """hidepid hides the gateway's /proc from this uid:gid. It does so for
+    another uid -- AND for the same uid when the gateway is non-dumpable (#232):
+    hidepid applies the ptrace-read check -- so this IS the sessions' view
+    exactly when the probe holds their ids. Those are read off the /proc/<pid>
+    dir under hidepid=noaccess (it keeps the task's euid/egid even when
+    non-dumpable), else taken from APP_UID:APP_GID (what a root start drops to).
     """
-    if ident.get("rivals"):
-        return "several processes look like the gateway (not concluded)"
-    if ident.get("invisible"):
-        return f"the gateway is invisible to this uid ({ident.get('hidepid')})"
-    if ident.get("noaccess"):
-        hp = ident.get("hidepid") or "EACCES"
-        return f"the gateway's /proc is unreadable to this uid ({hp})"
-    if ident.get("gw_root") or not ident.get("gw_found"):
-        return "the gateway runs as root (or was not identified)"
-    if ident.get("uid") and not ident.get("same_creds"):
-        return "this probe's uid:gid differs from the gateway's"
-    return ""
+    hp = ident["hidepid"]
+    ident["hidden"] = hp
+    if isinstance(err, FileNotFoundError):
+        how = f"INVISIBLE ({hp})"
+    else:  # noaccess: EPERM, not EACCES
+        how = f"UNREADABLE ({_errname(err.errno)}, {hp})"
+    try:
+        st = os.stat(f"/proc/{ident['gw']}")
+        ids, src = (st.st_uid, st.st_gid), "its /proc dir"
+    except OSError:
+        ids, src = _app_ids(), "APP_UID:APP_GID"
+    if ids is None:
+        _kv("gateway uid:gid", f"{how} to this uid:gid; APP_UID/APP_GID malformed")
+        return
+    me = (os.geteuid(), os.getegid())
+    ident["session_ids"] = ids
+    ident["gw_root"] = ids[0] == 0
+    ident["same_creds"] = ids == me
+    sessions = f"{ids[0]}:{ids[1]} ({src})"
+    if ident["same_creds"]:
+        _kv("gateway uid:gid", f"{how} to this uid:gid = the sessions' {sessions}")
+        _kv("", "so sessions are refused too: hidepid hides a non-dumpable")
+        _kv("", "gateway even from its own uid")
+    else:
+        _kv("gateway uid:gid", f"{how} to this uid:gid; sessions run as {sessions}")
+        _kv(
+            "!! WARNING", f"not the sessions' view -- re-run with `{_rerun_cmd(ident)}`"
+        )
+
+
+def _view(ident: dict) -> tuple[str, str]:
+    """(kind, why): whether this probe sees what the sessions see -- the one
+    classification /proc hardening and the verdict both print. Checked in this
+    order, the first match winning:
+
+      "unknown" the gateway was not identified, or runs as root -- this wins
+                even over a pick that is not concluded
+      "unsure"  the gateway pick is not concluded (rivals, untrusted holder)
+      "unknown" the gateway's uid:gid could not be read
+      "other"   this probe's uid:gid is not the sessions': its F2/uid results
+                are not theirs (re-run with _rerun_cmd)
+      "ok"      the probe holds the sessions' uid:gid -- also when hidepid
+                hides the gateway from it (then F2 is closed for the gateway)
+
+    "unknown" means no verdict can be read off the results.
+    """
+    unsure = ident.get("unsure")
+    if not ident.get("gw_found"):
+        return "unknown", "the gateway was not identified" + (
+            f"; {unsure}" if unsure else ""
+        )
+    if ident.get("gw_root"):
+        return "unknown", "the gateway runs as root"
+    if unsure:
+        return "unsure", unsure
+    if not ident.get("session_ids"):
+        return "unknown", "the gateway's uid:gid could not be read"
+    if not ident.get("same_creds"):
+        if ident.get("hidden"):
+            uid, gid = ident["session_ids"]
+            why = f"{ident['hidden']} hides the gateway from this uid:gid"
+            return "other", f"{why}, but sessions run as {uid}:{gid}"
+        return "other", "this probe's uid:gid differs from the gateway's"
+    return "ok", ""
 
 
 def _decode_caps(hexval: str) -> set[str]:
@@ -600,26 +805,40 @@ def probe_caps_seccomp(ident: dict) -> dict:
     return info
 
 
-def _report_pid1_environ() -> "bool | None":
-    """F2 via PID 1 itself: an init shim started non-root (compose `user:`) runs
-    docker-init/tini as the session uid and holds the full container env, so its
-    environ stays readable to sessions even when the gateway child's does not."""
-    label = "/proc/1/environ (init shim, F2)"
+def _env_names(data: bytes) -> tuple[int, str]:
+    """(count, secret-ish names) of an environ blob -- names only, never values."""
+    names = sorted(
+        {b.split(b"=", 1)[0].decode("latin1") for b in data.split(b"\0") if b}
+    )
+    hot = [n for n in names if any(s in n.upper() for s in _SECRETISH)]
+    more = f" (+{len(hot) - 20} more)" if len(hot) > 20 else ""
+    return len(names), f"{hot[:20]}{more}"
+
+
+def _report_pid1_environ(ident: dict) -> "bool | None":
+    """F2 via PID 1 itself, when the gateway is not PID 1: an init shim started
+    non-root (compose `user:`) runs docker-init/tini as the session uid and holds
+    the full container env, so its environ stays readable to sessions even when
+    the gateway's is not (#232 makes only the gateway non-dumpable)."""
+    label = f"/proc/1/environ ({ident.get('pid1_comm') or 'PID 1'}, F2)"
     try:
         with open("/proc/1/environ", "rb") as f:
             data = f.read()
-        names = {b.split(b"=", 1)[0] for b in data.split(b"\0") if b}
-        _kv(label, f"YES ({len(names)} vars visible) <-- F2 OPEN via PID 1")
-        return True
-    except PermissionError:
-        _kv(label, "NO (EACCES) -- PID 1 runs as root or another uid")
+    except PermissionError as exc:
+        why = "PID 1 runs as root or another uid, or is non-dumpable"
+        _kv(label, f"NO ({_errname(exc.errno)}) -- {why}")
         return False
     except FileNotFoundError:
-        _kv(label, "no such process")
+        hp = ident.get("hidepid")
+        _kv(label, f"hidden ({hp}) from this uid:gid" if hp else "no such process")
         return None
     except OSError as exc:
         _kv(label, exc)
         return None
+    count, hot = _env_names(data)
+    _kv(label, f"YES ({count} vars visible) <-- F2 OPEN via PID 1")
+    _kv("  secret-ish names in its env", hot)
+    return True
 
 
 def probe_proc_hardening(ident: dict) -> dict:
@@ -640,7 +859,9 @@ def probe_proc_hardening(ident: dict) -> dict:
         owner = os.stat(f"/proc/{gw}/status").st_uid
     except OSError:
         owner = None
-    if owner is None or not ident.get("uid"):
+    if ident.get("hidden"):
+        dumpable = f"unknown -- hidden ({ident['hidden']}) from this uid:gid"
+    elif owner is None or not ident.get("uid"):
         dumpable = "unknown (gateway runs as root or is not visible)"
     else:
         out["non_dumpable"] = owner == 0
@@ -648,24 +869,27 @@ def probe_proc_hardening(ident: dict) -> dict:
         if out["non_dumpable"]:
             dumpable = "NO (non-dumpable: its /proc files are owned by root)"
     _kv("gateway dumpable", dumpable)
-    if ident.get("pid1_shim") and gw != "1":
-        out["pid1_environ"] = _report_pid1_environ()
+    if gw != "1":
+        out["pid1_environ"] = _report_pid1_environ(ident)
     label = f"/proc/{gw}/environ READABLE"
-    if ident["rivals"]:
-        others = ", ".join(ident["rivals"])
-        _kv(label, f"NOT CONCLUDED -- gateway candidates PID {gw}, {others}")
+    kind, caveat = _view(ident)  # the verdict prints the same classification
+    if kind == "unsure":
+        _kv(label, f"NOT CONCLUDED -- {caveat}")
+        return out
+    if ident.get("hidden"):
+        if kind == "ok":
+            _kv(label, f"NO -- hidden ({ident['hidden']}) from the sessions' ids:")
+            _kv("", "F2 closed for the gateway itself (not for its CLI children)")
+        else:
+            _kv(label, f"HIDDEN -- not a session's view: {caveat}")
         return out
     try:
         with open(f"/proc/{gw}/environ", "rb") as f:
-            data = f.read()  # read to EOF; prod env easily exceeds one 4 KiB page
-        names = sorted(
-            {b.split(b"=", 1)[0].decode("latin1") for b in data.split(b"\0") if b}
-        )
-        _kv(label, f"YES ({len(names)} vars visible) <-- finding")
-        hot = [n for n in names if any(s in n.upper() for s in _SECRETISH)]
-        more = f" (+{len(hot) - 20} more)" if len(hot) > 20 else ""
-        _kv("  secret-ish names in its env", f"{hot[:20]}{more}")
-    except PermissionError:
+            data = f.read()  # read to EOF; a real env easily exceeds a 4 KiB page
+        count, hot = _env_names(data)
+        _kv(label, f"YES ({count} vars visible) <-- finding")
+        _kv("  secret-ish names in its env", hot)
+    except PermissionError as exc:
         # same_creds first: a non-dumpable same-uid gateway is EACCES for the
         # dumpable reason, never because the ids "differ" (nothing was compared).
         if ident.get("same_creds") and out["non_dumpable"]:
@@ -673,19 +897,13 @@ def probe_proc_hardening(ident: dict) -> dict:
         elif ident.get("same_creds"):
             why = "blocked for the gateway's own uid:gid"
         else:
-            caveat = _not_session_view(ident)
             why = f"not a session's view: {caveat}" if caveat else "blocked"
-        _kv(label, f"NO (EACCES) -- {why}")
+        _kv(label, f"NO ({_errname(exc.errno)}) -- {why}")
         if out["non_dumpable"] and ident.get("same_creds"):
             _kv("  but", "exec'd CLI children are dumpable again: their env")
             _kv("", "stays readable to every other same-uid session")
     except FileNotFoundError:
-        if ident["hidepid"]:
-            # hidepid hides a process whose ids differ from ours -- not F2 closed.
-            _kv(label, f"INVISIBLE ({ident['hidepid']}) -- not a session's view")
-            _kv("", f"re-run with `-u {_rerun_ids(ident)}`")
-        else:
-            _kv(label, "no such process")
+        _kv(label, "no such process")
     except OSError as exc:
         _kv(label, exc)
     return out
@@ -755,26 +973,21 @@ def probe_landlock() -> dict:
 
     # In a child: a seccomp KILL action on the syscall must not take the probe
     # (and its report so far) down with it.
-    _, detail = _in_child(t_landlock)
+    ok, reply = _in_child(t_landlock)
+    kind, text = _child_result(ok, reply)
     try:
-        abi_s, en_s = detail.split()
+        if kind not in ("ok", "denied"):  # no "<abi> <errno>" reply of its own
+            raise ValueError(reply)
+        abi_s, en_s = reply.split()
         abi, en = int(abi_s), int(en_s)
     except ValueError:
-        # Only SIGSYS is a seccomp kill; any other killing signal is UNKNOWN.
-        if detail == "killed:SIGSYS":
+        if kind == "seccomp":
             out["cause"] = "seccomp-kill"
-            _kv("landlock_create_ruleset", "KILLED (SIGSYS) => seccomp kills it")
+            _kv("landlock_create_ruleset", f"{text} => seccomp kills it")
             _kv("=> Landlock usable (ABI>=2)", False)
-        elif detail.startswith("killed:"):
-            out["cause"] = "other"
-            _kv(
-                "landlock_create_ruleset",
-                f"KILLED ({detail[7:]}) => cause UNKNOWN (not seccomp)",
-            )
-            _kv("=> Landlock usable (ABI>=2)", "unknown")
         else:
             out["cause"] = "untested"
-            _kv("landlock_create_ruleset", _unrun(detail) or f"UNKNOWN ({detail})")
+            _kv("landlock_create_ruleset", text or f"UNKNOWN ({reply})")
             _kv("=> Landlock usable (ABI>=2)", "unknown")
         return out
     # The syscall is authoritative: it returns an ABI version (>=1) only when
@@ -789,18 +1002,24 @@ def probe_landlock() -> dict:
         # 444 answering a version is not proof 445/446 run: a seccomp profile can
         # allow the query and block the enforce syscalls. Verify the whole chain.
         ok_enf, d_enf = _in_child(t_landlock_enforce)
-        if ok_enf:
+        kind, text = _child_result(ok_enf, d_enf)
+        step, _, err = d_enf.partition(":")
+        if kind == "ok":
             out["usable"] = True
             _kv("landlock enforce (create+add_rule+restrict_self)", "OK")
-        elif d_enf == "killed:SIGSYS":
+        elif kind == "seccomp":
             out["cause"] = "seccomp-kill"
-            _kv("landlock enforce", "KILLED (SIGSYS) => 445/446 blocked by seccomp")
-        elif _unrun(d_enf):  # fork failed / child died: cannot conclude
+            _kv("landlock enforce", f"{text} => 445/446 blocked by seccomp")
+        elif kind == "unknown":  # never ran to an answer: cannot conclude
             out["cause"] = "untested"
-            _kv("landlock enforce", _unrun(d_enf))
-        else:
+            _kv("landlock enforce", text)
+        elif step in ("create", "add_rule", "restrict") and err in ("EPERM", "ENOSYS"):
+            # What a seccomp filter answers once 444's version query passed.
             out["cause"] = "seccomp"
             _kv("landlock enforce", f"FAILED ({d_enf}) => 445/446 blocked by seccomp")
+        else:
+            out["cause"] = "other"
+            _kv("landlock enforce", f"FAILED ({d_enf}) => not usable")
     elif abi == 1:
         # ABI 1 (kernel 5.13-5.18) lacks LANDLOCK_ACCESS_FS_REFER, so ANY ruleset
         # forces cross-directory rename/link to EXDEV: git object finalize,
@@ -832,15 +1051,304 @@ def probe_landlock() -> dict:
         _kv("landlock_create_ruleset", f"FAILED ({_errname(en)}) => not usable")
     if abi >= 1:
         # Every ABI denies a sandboxed process ptrace-class access to processes
-        # outside its domain -- reading their /proc/<pid>/environ included. ABI 6
-        # (6.12) adds opt-in scopes for signals and abstract unix sockets.
+        # outside its domain -- reading their /proc/<pid>/environ included. ABI 4
+        # (6.7) adds TCP bind/connect port rules (loopback between sessions);
+        # ABI 6 (6.12) opt-in scopes for signals and abstract unix sockets.
+        tcp = "yes (ABI>=4)" if abi >= 4 else f"no (ABI {abi} < 4)"
+        _kv("TCP bind/connect port rules", tcp)
         scoped = "yes (ABI>=6)" if abi >= 6 else f"no (ABI {abi} < 6)"
         _kv("signal/abstract-socket scoping", scoped)
     _kv("=> Landlock usable (ABI>=2)", out["usable"])
     return out
 
 
-def probe_namespaces(caps: dict) -> dict:
+def _home() -> str:
+    """The CLI's home: $HOME, else the passwd entry (os.homedir())."""
+    return os.environ.get("HOME") or _passwd_home()
+
+
+def _claude_dirs() -> tuple[str, "str | None", str, str]:
+    """(home, CLAUDE_CONFIG_DIR or None when unset, config dir, problem) the way
+    the CLI finds them: the config dir is CLAUDE_CONFIG_DIR verbatim whenever it
+    is set -- an empty value too, which the CLI's `??` keeps (cwd-relative) --
+    else HOME/.claude; "" with the `problem` when the set value is unusable."""
+    home = _home()
+    cdir_env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if cdir_env is None:
+        return home, None, os.path.join(home, ".claude"), ""
+    cdir, problem = _usable_path(cdir_env, verbatim=True)
+    return home, cdir_env, cdir, problem
+
+
+def _setting_sources() -> list[str]:
+    """The --setting-sources the gateway passes, parsed like client.py's
+    _get_setting_sources: unset, blank or invalid -> project,local (no user)."""
+    raw = os.environ.get("CLAUDE_SETTING_SOURCES")
+    default = ["project", "local"]
+    if raw is None or not raw.strip():
+        return default
+    sources = [part.strip() for part in raw.split(",") if part.strip()]
+    if not sources or any(s not in ("user", "project", "local") for s in sources):
+        return default
+    return list(dict.fromkeys(sources))
+
+
+def _setting(layers: list, keys: tuple[str, ...], kind: type) -> tuple:
+    """(value, label) from the LAST layer whose nested `keys` hold a `kind` --
+    the CLI merges settings key by key, a later layer winning -- else (None, "")."""
+    for label, conf in reversed(layers):
+        cur = conf
+        for key in keys:
+            cur = cur.get(key) if isinstance(cur, dict) else None
+        if isinstance(cur, kind):
+            return cur, label
+    return None, ""
+
+
+def _short(value: str) -> str:
+    """A session-written value cut for display (_kv escapes it)."""
+    if len(value) <= _SHOWN_CAP:
+        return value
+    return f"{value[:_SHOWN_CAP]}... ({len(value)} chars)"
+
+
+def _env_value(value) -> "str | None":
+    """A settings env value the way the CLI applies it: a string as-is, a number
+    or boolean stringified, anything else -- or a value holding a NUL -- dropped,
+    so the variable keeps the lower layer's value."""
+    if isinstance(value, bool):
+        value = "true" if value else "false"
+    elif isinstance(value, int):
+        value = str(value)
+    elif isinstance(value, float):
+        value = str(int(value)) if value.is_integer() else repr(value)
+    if not isinstance(value, str) or "\x00" in value:
+        return None
+    return value
+
+
+def _setting_env(settings: dict, name: str) -> tuple[str, str]:
+    """(value, source) of env var `name` as the CLI reads it: the last settings
+    layer whose env block sets it to a kept value, else the container env ("")."""
+    for label, conf in reversed(settings["env_layers"]):
+        env = conf.get("env")
+        if isinstance(env, dict) and name in env:
+            value = _env_value(env[name])
+            if value is not None:
+                return value, f"{label} env"
+    return os.environ.get(name, ""), ""
+
+
+def _usable_path(value: str, verbatim: bool = False) -> tuple[str, str]:
+    """(path, problem) for a path-valued setting: the absolute path the CLI
+    would use, normalized, or "" and why the probe cannot check it. The CLI
+    takes the config dir `verbatim`; a plugin cache/seed dir it expands only
+    when it is "~" or starts "~/" (never "~user") -- after trimming the whole
+    value, which the caller does. Anything left relative resolves against each
+    session's own cwd. Settings values are session-writable, so this runs before
+    any os.* call sees them: a value over _PATH_MAX or _DEPTH_CAP would stall
+    realpath and the walks, and a lone surrogate or a NUL would raise."""
+    if not verbatim and (value == "~" or value.startswith("~/")):
+        value = _home() + value[1:]
+    if not value:
+        return "", "blank: resolved against each session's cwd"
+    if len(value) > _PATH_MAX:
+        return "", f"over {_PATH_MAX} chars"
+    if value.count("/") > _DEPTH_CAP:
+        return "", f"over {_DEPTH_CAP} components"
+    try:
+        if "\x00" in value:
+            raise ValueError("embedded NUL")
+        os.fsencode(value)
+    except _PATH_ERRORS:
+        return "", "not a valid path"
+    if not value.startswith("/"):
+        return "", "relative: resolved against each session's cwd"
+    return os.path.normpath(value), ""
+
+
+def _seed_entries(value: str) -> tuple[list[str], bool]:
+    """The first _SEEDS_CAP distinct entries of a (trimmed) SEED_DIR list, split
+    on ':' with empty entries dropped as the CLI does -- it neither trims an
+    entry nor drops a blank one -- and whether entries were left unchecked.
+    Scanned piecewise, never in one split: a session-written value may hold
+    millions of entries."""
+    entries: list[str] = []
+    start = 0
+    for _ in range(64 * _SEEDS_CAP):
+        end = value.find(":", start)
+        item = value[start:] if end < 0 else value[start:end]
+        if item and item not in entries:
+            if len(entries) == _SEEDS_CAP:
+                return entries, True
+            entries.append(item)
+        if end < 0:
+            return entries, False
+        start = end + 1
+    return entries, bool(value[start:].strip(":"))  # only colons left: no entry
+
+
+def _global_config(home: str, cdir_env: "str | None", cdir: str) -> str:
+    """The CLI's global config file: <config dir>/.config.json when it exists
+    (legacy), else .claude.json (.claude-custom-oauth.json under
+    CLAUDE_CODE_CUSTOM_OAUTH_URL) in CLAUDE_CONFIG_DIR -- here the CLI uses
+    `||`, so an empty value falls back -- else in HOME. "" when a non-empty
+    CLAUDE_CONFIG_DIR is unusable."""
+    if cdir and os.path.exists(os.path.join(cdir, ".config.json")):
+        return os.path.join(cdir, ".config.json")
+    suffix = "-custom-oauth" if os.environ.get("CLAUDE_CODE_CUSTOM_OAUTH_URL") else ""
+    if not cdir_env:
+        return os.path.join(home, f".claude{suffix}.json")
+    return os.path.join(cdir, f".claude{suffix}.json") if cdir else ""
+
+
+def _settings_summary(conf: dict) -> str:
+    parts = []
+    env = conf.get("env")
+    if isinstance(env, dict):
+        parts.append(f"env: {len(env)} keys")
+    sandbox = conf.get("sandbox")
+    keys = ("enabled", "failIfUnavailable", "enableWeakerNestedSandbox")
+    for key in keys + ("enabledPlatforms",) if isinstance(sandbox, dict) else ():
+        if key not in sandbox:
+            continue
+        value = sandbox[key]
+        if isinstance(value, list):  # never str() a session-shaped value
+            value = ",".join(v for v in value[:8] if isinstance(v, str))[:60]
+        elif not isinstance(value, (bool, int, float)):
+            value = type(value).__name__
+        parts.append(f"sandbox.{key}={value}")
+    return ", ".join(parts) or "no env/sandbox keys"
+
+
+def probe_cli_settings() -> dict:
+    """The settings layers the CLI merges over the gateway's env and flags, as
+    far as the probe can read them. The CLI copies each layer's `env` block onto
+    its process env, so a settings value beats the container env, and merges
+    the other keys one by one, the last layer winning: user < project < local <
+    the gateway's --settings < managed. The global config (_global_config) adds
+    only an env block, before user's -- and it may move the config dir
+    (CLAUDE_CONFIG_DIR), under which the CLI then finds user settings and every
+    later path; the user layer counts only when the gateway passes "user" in
+    --setting-sources. project/local live in each workspace and are written by
+    its session, so they are not read here (nor can they set the plugin
+    cache/seed dirs or the config dir).
+    """
+    _hdr("CLI SETTINGS (layers the CLI merges over the gateway's env)")
+    home, cdir_env, cdir, cdir_problem = _claude_dirs()
+    sources = _setting_sources()
+    out: dict = {"env_layers": [], "user": [], "managed": [], "unread": []}
+    out["user_conf"] = None
+    _kv("gateway --setting-sources", ",".join(sources))
+
+    def layer(label: str, path: str, dest: str, used: bool = True) -> "dict | None":
+        notes: list[str] = []
+        conf = _load_json(path, notes)
+        if notes or (conf is not None and not isinstance(conf, dict)):
+            out["unread"].append(label)
+            _kv(label, f"!! {notes[0] if notes else path + ': not a JSON object'}")
+            return None
+        if conf is None:
+            _kv(label, f"{path}: absent")
+            return None
+        state = _settings_summary(conf)
+        if not used:
+            _kv(label, f"{path}: {state} -- not a gateway setting source: unused")
+            return conf
+        _kv(label, f"{path}: {state}")
+        out["env_layers"].append((label, conf))
+        if dest:
+            out[dest].append((label, conf))
+        return conf
+
+    def config_dir() -> tuple[str, str, str, str]:
+        """(dir, value, source, problem): CLAUDE_CONFIG_DIR as the env blocks
+        applied so far leave it -- an env-block HOME does not move it."""
+        value, src = _setting_env(out, "CLAUDE_CONFIG_DIR")
+        if not src:
+            return cdir, cdir_env or "", "", cdir_problem
+        path, problem = _usable_path(value, verbatim=True)
+        return path, value, src, problem
+
+    gconf = _global_config(home, cdir_env, cdir)
+    if gconf:
+        layer("global config", gconf, "")
+    else:
+        out["unread"].append("global config")
+        _kv("global config", "!! not read: CLAUDE_CONFIG_DIR is unusable")
+    now, _, src, problem = config_dir()
+    if now:
+        user = os.path.join(now, "settings.json")
+        out["user_conf"] = layer("user settings", user, "user", "user" in sources)
+    else:
+        out["unread"].append("user settings")
+        who = src or "the container env"
+        _kv("user settings", f"!! not read: {who} sets an unusable config dir")
+    managed = os.path.join(_MANAGED_DIR, "managed-settings.json")
+    layer("managed settings", managed, "managed")
+    dropins = os.path.join(_MANAGED_DIR, "managed-settings.d")
+    names: list[str] = []
+    try:
+        with os.scandir(dropins) as it:
+            for n, entry in enumerate(it):
+                if n >= 10 * _DROPINS_CAP:
+                    names.append("")  # marks the scan as cut short
+                    break
+                name = entry.name
+                if name.endswith(".json") and not name.startswith("."):
+                    if entry.is_symlink() or entry.is_file():
+                        names.append(name)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        out["unread"].append("managed-settings.d")
+        _kv("managed-settings.d", f"!! {dropins}: {_errname(exc.errno)}: not read")
+    if "" in names:
+        out["unread"].append("managed-settings.d")
+        many = f"over {10 * _DROPINS_CAP} entries"
+        _kv("managed-settings.d", f"!! {many}: scanned no further, the rest not read")
+    elif len(names) > _DROPINS_CAP:
+        out["unread"].append("managed-settings.d")
+        _kv("managed-settings.d", f"!! over {_DROPINS_CAP} drop-ins: the rest not read")
+    for name in sorted(n for n in names if n)[:_DROPINS_CAP]:
+        label = f"managed-settings.d/{name}"
+        layer(label, os.path.join(dropins, name), "managed")
+    # The config dir every later CLI path hangs off: the last layer's
+    # CLAUDE_CONFIG_DIR, else the container's.
+    now, value, src, problem = config_dir()
+    out.update(cdir=now, cdir_value=value, cdir_src=src, cdir_problem=problem)
+    if src:
+        _kv("config dir moved", _env_row(value, src, "", problem))
+    return out
+
+
+def _cli_platform() -> str:
+    """The platform name the CLI gives this Linux host: "wsl" when WSL_DISTRO_NAME
+    or WSL_INTEROP is set or the kernel version says microsoft/wsl, else "linux"."""
+    if os.environ.get("WSL_DISTRO_NAME") or os.environ.get("WSL_INTEROP"):
+        return "wsl"
+    kernel = _line("/proc/version").lower()
+    return "wsl" if "microsoft" in kernel or "wsl" in kernel else "linux"
+
+
+def _gateway_sandbox() -> tuple["bool | None", str]:
+    """The sandbox.enabled the gateway puts in its --settings (None: none), and
+    why -- client.py _configure_sandbox: CLAUDE_SANDBOX_ENABLED (lowercased, not
+    stripped, by constants.py) decides; unset or invalid, the workspace sandbox
+    or a quota force it on; otherwise options.sandbox stays unset."""
+    raw = os.environ.get("CLAUDE_SANDBOX_ENABLED")
+    if raw is not None and raw.lower() in _FALSE:
+        return False, "CLAUDE_SANDBOX_ENABLED=false"
+    if raw is not None and raw.lower() in _TRUE:
+        return True, "CLAUDE_SANDBOX_ENABLED"
+    if os.environ.get("WORKSPACE_SANDBOX_ENABLED", "").strip().lower() in _TRUE:
+        return True, "WORKSPACE_SANDBOX_ENABLED"
+    if _quota_mb() > 0:
+        return True, "USER_WORKSPACE_QUOTA_MB>0"
+    return None, ""
+
+
+def probe_namespaces(caps: dict, settings: dict) -> dict:
     _hdr("NAMESPACES (bubblewrap / nsjail viability)")
     out: dict = {"untested": []}
 
@@ -882,11 +1390,11 @@ def probe_namespaces(caps: dict) -> dict:
     apparmor = caps.get("apparmor", "")
 
     def show(key: str, label: str, ok: bool, detail: str) -> None:
-        shown = _unrun(detail)
-        if shown:
-            if not detail.startswith("killed:"):  # killed counts as denied
-                out["untested"].append(key)
-            _kv(label, shown)
+        kind, text = _child_result(ok, detail)
+        if kind == "unknown":  # never ran: UNKNOWN, not DENIED
+            out["untested"].append(key)
+        if text:  # a SIGSYS kill counts as denied (bwrap would be killed too)
+            _kv(label, text)
             return
         hint = ""
         if not ok and detail.endswith("EACCES") and apparmor:
@@ -906,53 +1414,66 @@ def probe_namespaces(caps: dict) -> dict:
     out["viable"] = ok_u and ok_p and ok_m and ok_pm
     _kv("=> bwrap/nsjail viable (userns+pidns+proc)", out["viable"])
     # The CLI's own OS sandbox (sandbox.enabled -- the gateway turns it on with
-    # the workspace sandbox, USER_WORKSPACE_QUOTA_MB>0, or CLAUDE_SANDBOX_ENABLED,
-    # as prod does) checks that bwrap and socat are on PATH (ripgrep: bundled):
-    # missing one, it prints "Sandbox disabled" and runs Bash unconfined.
-    # Otherwise every Bash call runs under `bwrap --unshare-user --unshare-pid`
-    # plus a fresh `--proc /proc` -- a bind of this /proc instead under
-    # sandbox.enableWeakerNestedSandbox (CLAUDE_SANDBOX_WEAKER_NESTED) -- so a
-    # denied namespace or proc mount makes every sandboxed Bash call fail.
+    # the workspace sandbox, USER_WORKSPACE_QUOTA_MB>0, or CLAUDE_SANDBOX_ENABLED)
+    # checks only that bwrap and socat are on PATH (ripgrep: bundled): missing
+    # one, it prints "Sandbox disabled" and runs Bash unconfined -- or, with
+    # sandbox.failIfUnavailable, exits 1. Otherwise every Bash call runs under
+    # `bwrap --unshare-user --unshare-pid` plus a fresh `--proc /proc` -- a bind
+    # of this /proc instead under sandbox.enableWeakerNestedSandbox
+    # (CLAUDE_SANDBOX_WEAKER_NESTED) -- so a denied namespace or proc mount makes
+    # every sandboxed Bash call fail. All of it is measured here, outside any
+    # Landlock domain: inside one, bwrap cannot start at all (see the verdict).
     bins = {b: shutil.which(b) for b in ("bwrap", "socat")}
     for name, path in bins.items():
         _kv(f"{name} on PATH", path or "NO")
     out["bwrap"] = bool(bins["bwrap"])
     out["apparmor"] = apparmor
-    weaker = os.environ.get("CLAUDE_SANDBOX_WEAKER_NESTED", "").lower() in _TRUE
+    # The CLI decides from its merged settings (probe_cli_settings): the
+    # gateway's --settings beat user settings, managed settings beat both.
+    gw_on, trigger = _gateway_sandbox()
+    flag: dict = {}
+    if gw_on is not None:
+        flag["enabled"] = gw_on
+    if gw_on:  # the gateway passes its knob only alongside enabled=true
+        knob = os.environ.get("CLAUDE_SANDBOX_WEAKER_NESTED", "").lower() in _TRUE
+        flag["enableWeakerNestedSandbox"] = knob
+    gateway = (f"the gateway via {trigger}", {"sandbox": flag})
+    layers = settings["user"] + [gateway] + settings["managed"]
+    enabled, by = _setting(layers, ("sandbox", "enabled"), bool)
+    fail, fail_by = _setting(layers, ("sandbox", "failIfUnavailable"), bool)
+    weaker, _ = _setting(layers, ("sandbox", "enableWeakerNestedSandbox"), bool)
+    # Managed settings alone can limit the sandbox to listed platforms (lists
+    # merge across the managed files), named the way the CLI names this host.
+    platforms = None
+    for _, conf in settings["managed"]:
+        box = conf.get("sandbox")
+        value = box.get("enabledPlatforms") if isinstance(box, dict) else None
+        if isinstance(value, list):
+            platforms = (platforms or []) + [v for v in value if isinstance(v, str)]
+    if enabled and platforms is not None and _cli_platform() not in platforms:
+        enabled, by = False, f"managed sandbox.enabledPlatforms ({_cli_platform()})"
     missing = [b for b, p in bins.items() if not p]
-    out["cli_missing"] = missing
+    out.update(cli_missing=missing, cli_by=by, cli_fail_by=fail_by)
     need = ["userns", "pidns", "mountns"] + ([] if weaker else ["procns"])
     untested = out["untested"]
-    # A fork-failed test is UNKNOWN, not DENIED: never report the sandbox BROKEN
-    # about a namespace that never actually ran.
+    # A test that never ran is UNKNOWN, not DENIED: never report the sandbox
+    # BROKEN about a namespace that never actually ran.
     out["cli_denied"] = [k for k in need if not out.get(k) and k not in untested]
     out["cli_untested"] = [k for k in need if k in untested]
-    # Mirror the gateway's own trigger (src/backends/claude): it force-enables the
-    # CLI OS sandbox when CLAUDE_SANDBOX_ENABLED is unset AND
-    # (WORKSPACE_SANDBOX_ENABLED or USER_WORKSPACE_QUOTA_MB>0); an explicit false
-    # disables it; otherwise it leaves options.sandbox unset and project settings
-    # (default off) decide. So with nothing set, the gateway never turns it on.
-    sb_raw = os.environ.get("CLAUDE_SANDBOX_ENABLED", "").strip().lower()
-    ws_on = os.environ.get("WORKSPACE_SANDBOX_ENABLED", "").strip().lower() in _TRUE
-    quota_on = _quota_mb() > 0
-    if sb_raw in ("false", "0", "no", "off"):
-        gateway_on, trigger = False, "CLAUDE_SANDBOX_ENABLED=false"
-    elif sb_raw in _TRUE:
-        gateway_on, trigger = True, "CLAUDE_SANDBOX_ENABLED"
-    elif ws_on or quota_on:
-        gateway_on = True
-        trigger = "WORKSPACE_SANDBOX_ENABLED" if ws_on else "USER_WORKSPACE_QUOTA_MB>0"
-    else:
-        gateway_on, trigger = None, ""
-    out["gateway_trigger"] = trigger
-    if gateway_on is False:
+    if enabled is False:
         out["cli_sandbox"] = "off"
-        state = "n/a (CLAUDE_SANDBOX_ENABLED=false)"
-    elif gateway_on is None:
+        state = f"n/a (turned off by {by})"
+    elif not enabled:
         out["cli_sandbox"] = "unset"
         state = (
-            "the gateway does not enable it (CLAUDE_SANDBOX_ENABLED unset, no "
-            "workspace sandbox/quota) -> project settings decide, default off"
+            "not enabled by the gateway, user or managed settings -> a "
+            "workspace's project/local settings decide, default off"
+        )
+    elif missing and fail:
+        out["cli_sandbox"] = "fail"
+        state = (
+            f"NO -- {', '.join(missing)} missing and sandbox.failIfUnavailable "
+            f"({fail_by}): the CLI exits 1"
         )
     elif missing:
         out["cli_sandbox"] = "inert"
@@ -964,19 +1485,21 @@ def probe_namespaces(caps: dict) -> dict:
     elif out["cli_untested"]:
         out["cli_sandbox"] = "unknown"
         unk = ", ".join(out["cli_untested"])
-        state = f"UNKNOWN -- {unk} untested (fork failed): cannot conclude"
+        state = f"UNKNOWN -- {unk} untested (the test never ran): cannot conclude"
     else:
         out["cli_sandbox"] = "ok"
         state = "yes"
     _kv("=> CLI OS sandbox can run", state)
-    if gateway_on:
-        _kv("", f"(gateway enables it; trigger: {trigger})")
-    elif gateway_on is None:
+    if enabled:
+        _kv("", f"(enabled by {by})")
+    elif enabled is None:
         _kv(
             "",
             "(gateway enables it via WORKSPACE_SANDBOX_ENABLED, "
             "USER_WORKSPACE_QUOTA_MB>0, or CLAUDE_SANDBOX_ENABLED)",
         )
+    if settings["unread"]:
+        _kv("", f"(unverified: {', '.join(settings['unread'])} not read)")
     if weaker and out["cli_sandbox"] not in ("off", "unset"):
         _kv("", "(weaker nested: sandboxed Bash still sees this /proc)")
     unsandboxed = os.environ.get("CLAUDE_SANDBOX_ALLOW_UNSANDBOXED", "").lower()
@@ -985,15 +1508,19 @@ def probe_namespaces(caps: dict) -> dict:
     return out
 
 
-def probe_setuid(caps: dict) -> dict:
+def probe_setuid(caps: dict, ident: dict) -> dict:
     _hdr("UID SWITCHING (uid-per-user viability)")
     want = {"SETUID", "SETGID"}
-    # The bounding set caps every process here, the root entrypoint included. A
-    # broker the entrypoint forks before its root->app drop can keep the caps;
-    # file caps on the wrapper need them in the bounding set AND NoNewPrivs=0.
-    # The gateway itself must hold none: ambient/KEEPCAPS caps are inherited by
-    # everything it execs (plugin installs, MCP tests, the bundled-CLI fallback).
+    # The bounding set caps every process here, the root entrypoint included. The
+    # spawn broker the entrypoint forks before its root->app drop keeps the caps
+    # (under a non-root start, file caps on the broker binary need them in the
+    # bounding set AND NoNewPrivs=0 at container start). The gateway itself must
+    # hold none: ambient/KEEPCAPS caps are inherited by everything it execs
+    # (plugin installs, MCP tests, the bundled-CLI fallback).
     out = {"grantable": want <= caps["CapBnd"], "nnp": caps.get("nnp") == "1"}
+    # docker exec inherits the runtime's no-new-privileges, so NoNewPrivs on the
+    # probe itself means it was set from container start, not by the gateway.
+    out["nnp_start"] = _read_status("self").get("NoNewPrivs", ["?"])[0] == "1"
     out["gw_ambient"] = sorted(want & caps["CapAmb"])
     _kv("SETUID+SETGID in bounding set", out["grantable"])
     held = sorted(want & caps["CapPrm"])
@@ -1004,22 +1531,40 @@ def probe_setuid(caps: dict) -> dict:
     else:
         held_s = "none (expected: the root->app drop clears every set)"
     _kv("gateway holds SETUID/SETGID", held_s)
-    nnp_note = "  (file caps on a wrapper are ignored)" if out["nnp"] else ""
+    nnp_note = "  (file caps on what it execs are ignored)" if out["nnp"] else ""
     _kv("NoNewPrivs (gateway)", f"{out['nnp']}{nnp_note}")
-    # SETUID/SETGID let a teardown broker switch to a session's uid. Such a broker
-    # is NOT least-privilege: CAP_SETUID is root-equivalent (setresuid(0,0,0),
-    # regains the full set on execve, writes root-owned files), so it must be locked
-    # down (non-root ideally, else NNP + SECBIT_NOROOT_LOCKED + a set*id-limited
-    # seccomp filter + a minimal bounding set) and is teardown-only -- spawn goes
-    # through the in-place file-cap re-exec wrapper. The four below are extra caps
-    # only an alternative broker (acting on session files/processes as itself) would
-    # hold. See docs/security-process-isolation.md sections 3/8 for the full design.
+    _kv(
+        "NoNewPrivs (this probe)",
+        f"{out['nnp_start']}  (True: set from container start)",
+    )
+    # SETUID/SETGID let the broker fork each CLI as its session's uid (the
+    # root-owned launcher stub at cli_path hands it the SDK's pipes over SCM_RIGHTS
+    # with a single-use ticket) and act on session processes/files through
+    # short-lived children switched to that uid. Such a broker is NOT
+    # least-privilege: CAP_SETUID is root-equivalent (setresuid(0,0,0), regains the
+    # full set on execve, writes root-owned files), so it must be locked down
+    # (non-root ideally, else NNP + SECBIT_NOROOT_LOCKED + a set*id-limited seccomp
+    # filter + a minimal bounding set). The four below are extra caps only an
+    # alternative broker (acting on session files/processes as itself) would hold.
+    # See docs/security-process-isolation.md section 3 for the full design.
     alt = ("KILL", "DAC_OVERRIDE", "FOWNER", "CHOWN")
     held_alt = " ".join(c for c in alt if c in caps["CapBnd"]) or "none"
     _kv("privileged-broker caps (alt. only)", f"{held_alt} in bounding set")
-
-    _kv("=> uid-per-user buildable", out["grantable"])
+    buildable = _reachable(out, ident)
+    if out["grantable"] and not buildable:
+        buildable = "no, as started (non-root, NoNewPrivs from start)"
+    _kv("=> uid-per-user buildable", buildable)
     return out
+
+
+def _reachable(uid: dict, ident: dict) -> bool:
+    """SETUID/SETGID grantable AND something can hand them to a broker. An init
+    shim never changes uid, so one running as non-root proves a non-root start:
+    no root entrypoint forks the broker, and with NoNewPrivs set from container
+    start no file cap can grant the caps either."""
+    shim = ident.get("pid1_comm") in _INIT_SHIMS
+    nonroot = shim and ident.get("pid1_uid") not in (None, 0)
+    return bool(uid.get("grantable")) and not (nonroot and uid.get("nnp_start"))
 
 
 def _mode_block(path: str, need: int, st: os.stat_result | None = None) -> str:
@@ -1166,7 +1711,9 @@ def _private_entries(
 
 def _link_problem(path: str, real_top: str, pending: list[str]) -> list:
     """A symlinked entry, judged by its target (its own mode bits never count).
-    A linked dir outside the tree is queued in `pending` to be walked too."""
+    A linked dir outside the tree is queued in `pending` to be walked too --
+    unlike an off-root registry value (probe_shared_assets): a symlinked entry
+    IS content of the tree the CLI loads, and its walk spends this row's caps."""
     try:
         deep = os.readlink(path).count("/") >= _DEPTH_CAP
     except OSError:
@@ -1191,22 +1738,23 @@ def _link_problem(path: str, real_top: str, pending: list[str]) -> list:
 
 def _report_shared(
     label: str, path: str, deadline: float, skip: tuple[str, ...] = ()
-) -> tuple[str, bool]:
+) -> tuple[str, str]:
     """One shared asset: its mode, and whether a session under another uid can
-    reach it and use everything inside. Returns (problem, incomplete): `incomplete`
-    is True when a walk hit its entry/time cap, so the clean rows are not an
-    all-clear. An asset that is absent, or broken for the probe's own uid too, is
-    no problem a uid split would add."""
+    reach it and use everything inside. Returns (problem, incomplete): the
+    `incomplete` cause is set when the walk hit its entry/time cap or met dirs
+    the probe cannot list, so a blocker past them may be unreported and the
+    clean rows are not an all-clear. An asset that is absent, or broken for the
+    probe's own uid too, is no problem a uid split would add."""
     try:
         literal, real = os.path.abspath(path), os.path.realpath(path)
     except _PATH_ERRORS:  # a malformed registry value must not kill the walk
         _kv(label, "unreadable (malformed path)")
-        return "", False
+        return "", ""
     try:
         st = os.stat(path)
     except (ValueError, RecursionError):
         _kv(label, "unreadable (malformed path)")
-        return "", False
+        return "", ""
     except OSError as exc:
         try:
             is_link = stat.S_ISLNK(os.lstat(path).st_mode)
@@ -1217,7 +1765,7 @@ def _report_shared(
         else:
             where = _chain_block(real) or _chain_block(literal)
             _kv(label, f"unreachable for this uid too: blocked at {where}")
-        return "", False
+        return "", ""
     is_dir = stat.S_ISDIR(st.st_mode)
     entries = ""
     if is_dir:
@@ -1237,7 +1785,7 @@ def _report_shared(
         block = block or target
     problem = f"blocked at {block}" if block else ""
     if not is_dir:
-        return problem, False
+        return problem, ""
     examples, total, capped, unlisted = _private_entries(path, skip, deadline)
     count = f"{total}+ ({capped}-capped)" if capped else str(total)
     if unlisted:
@@ -1246,14 +1794,18 @@ def _report_shared(
     _kv("    entries they cannot use", f"{count}  e.g. {eg}" if examples else count)
     if total and not problem:
         problem = f"{total} entries other uids cannot use"
-    return problem, bool(capped)
+    causes = [f"{capped} cap hit"] if capped else []
+    if unlisted:
+        causes.append(f"{unlisted} dir(s) this uid cannot list")
+    return problem, ", ".join(causes)
 
 
 def _load_json(path: str, notes: list[str]):
     """A registry/settings JSON from the session-writable tree, or None. It is
     stat'ed first, so a FIFO or device planted in its place is never opened;
     then opened non-blocking without a controlling tty, re-checked with fstat
-    (it may have been swapped meanwhile) and read once, at most _JSON_CAP."""
+    (it may have been swapped meanwhile) and read once, at most _JSON_CAP.
+    NaN/Infinity, which the CLI's JSON.parse rejects, make it "not JSON" too."""
     try:
         if not stat.S_ISREG(os.stat(path).st_mode):
             notes.append(f"{path}: not a regular file, skipped")
@@ -1263,6 +1815,9 @@ def _load_json(path: str, notes: list[str]):
         return None
     except OSError as exc:
         notes.append(f"{path}: {_errname(exc.errno)}")
+        return None
+    except (ValueError, RecursionError):  # NUL/surrogate: never a usable file
+        notes.append(f"{_short(path)}: malformed path, skipped")
         return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
@@ -1278,27 +1833,40 @@ def _load_json(path: str, notes: list[str]):
         notes.append(f"{path}: over {_JSON_CAP} bytes, skipped")
         return None
     try:
-        return json.loads(data)
+        return json.loads(data, parse_constant=_not_json)
     except (ValueError, RecursionError):
         notes.append(f"{path}: not JSON, skipped")
         return None
 
 
+def _not_json(name: str):
+    raise ValueError(f"{name} is not JSON")
+
+
 def _registry_paths(
-    registries: list[str], settings: str, notes: list[str]
-) -> tuple[list[str], bool]:
+    registries: list[str], settings: "dict | None", notes: list[str]
+) -> tuple[list[str], int]:
     """Absolute paths the CLI records for plugins: marketplace installLocation /
     source.path (known_marketplaces.json), each install's installPath
-    (installed_plugins.json), and settings.json extraKnownMarketplaces source
-    paths. The CLI loads plugin skills and hooks (CLAUDE_PLUGIN_ROOT) from the
-    marketplace clone these point at, not from plugins/cache. Returns (paths,
-    truncated): at most _PATHS_CAP are kept."""
+    (installed_plugins.json), and the user settings' (already parsed)
+    extraKnownMarketplaces source paths. The CLI loads plugin skills and hooks
+    (CLAUDE_PLUGIN_ROOT) from the marketplace clone these point at, not from
+    plugins/cache. Returns (paths, dropped): at most _PATHS_CAP are kept and
+    `dropped` counts the rest. A value longer than _PATH_MAX (the kernel refuses
+    it, so the CLI cannot use it either) or deeper than _DEPTH_CAP components is
+    dropped too and noted, never resolved: resolving such session-written
+    strings costs time super-linear in their length."""
     found: dict[str, None] = {}
+    skipped = 0
 
     def add(value) -> None:
+        nonlocal skipped
         if not isinstance(value, str) or not os.path.isabs(value):
             return
         if "\x00" in value:  # a NUL would raise ValueError at every os.* call site
+            return
+        if len(value) > _PATH_MAX or value.count("/") > _DEPTH_CAP:
+            skipped += 1
             return
         try:
             os.fsencode(value)  # a lone surrogate would raise at os.stat/realpath
@@ -1323,12 +1891,15 @@ def _registry_paths(
             for inst in installs if isinstance(installs, list) else ():
                 if isinstance(inst, dict):
                     add(inst.get("installPath"))
-    conf = _load_json(settings, notes)
+    conf = settings
     extra = conf.get("extraKnownMarketplaces") if isinstance(conf, dict) else None
     for entry in extra.values() if isinstance(extra, dict) else ():
         add_source(entry)
+    if skipped:
+        limits = f"over {_PATH_MAX} chars or {_DEPTH_CAP} components"
+        notes.append(f"{skipped} path values {limits}: skipped (unverified)")
     paths = list(found)
-    return paths[:_PATHS_CAP], len(paths) > _PATHS_CAP
+    return paths[:_PATHS_CAP], max(0, len(paths) - _PATHS_CAP) + skipped
 
 
 def _inventory(label: str, path: str) -> None:
@@ -1338,6 +1909,9 @@ def _inventory(label: str, path: str) -> None:
         n = _count(path)
     except OSError as exc:
         _kv(label, "absent" if exc.errno == errno.ENOENT else _errname(exc.errno))
+        return
+    except (ValueError, RecursionError):
+        _kv(label, "unreadable (malformed path)")
         return
     _kv(label, f"mode={oct(st.st_mode & 0o777)} uid={st.st_uid} entries={n}")
 
@@ -1353,6 +1927,20 @@ def _can_write(path: str) -> bool:
         return not os.statvfs(path).f_flag & os.ST_RDONLY
     except OSError:
         return False
+
+
+def _creatable(path: str) -> str:
+    """The nearest existing ancestor dir of an absent `path` when this uid can
+    write it -- so it could create `path` below it -- else ""."""
+    cur = path
+    for _ in range(_DEPTH_CAP):
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return ""
+        cur = parent
+        if os.path.isdir(cur):
+            return cur if _can_write(cur) else ""
+    return ""
 
 
 def _code_writable(
@@ -1416,70 +2004,118 @@ def _passwd_home() -> str:
         return "/"
 
 
-def probe_shared_assets(ident: dict) -> dict:
+def _env_row(value: str, source: str, default: str, problem: str = "") -> str:
+    shown = _short(value)
+    if not value.strip() or value != value.strip():  # make blanks visible
+        shown = repr(shown)
+    if problem:
+        src = f"  (from {source})" if source else ""
+        return f"{shown}{src} -- !! unusable ({problem}): not checked"
+    if value.strip():
+        return f"{shown}  (from {source})" if source else shown
+    return f"(blank in {source} -> {default})" if source else f"(unset -> {default})"
+
+
+def probe_shared_assets(ident: dict, settings: dict) -> dict:
     _hdr("SHARED ASSET LAYOUT (must stay readable by every user)")
-    # The CLI's home is $HOME, else the passwd entry (os.homedir()).
-    home = os.environ.get("HOME") or _passwd_home()
-    cdir_env = os.environ.get("CLAUDE_CONFIG_DIR", "")
-    cdir = os.path.abspath(cdir_env or os.path.join(home, ".claude"))
+    home = _home()
+    # The config dir the CLI ends up with (probe_cli_settings): a settings
+    # layer's CLAUDE_CONFIG_DIR beats the container's; "" when it is unusable.
+    cdir = settings["cdir"]
     # The CLI's plugin root (registries, cache, marketplaces AND data/) moves with
     # CLAUDE_CODE_PLUGIN_CACHE_DIR; CLAUDE_CODE_PLUGIN_SEED_DIR adds read-only
-    # pre-populated roots. install_plugins.py clones remote marketplaces under
-    # CLAUDE_PLUGIN_CLONE_ROOT, else $HOME/.claude/plugin-marketplaces -- HOME,
-    # not CLAUDE_CONFIG_DIR, both stripped, and the temp dir when HOME is blank.
-    cache_env = os.environ.get("CLAUDE_CODE_PLUGIN_CACHE_DIR", "")
-    seed_env = os.environ.get("CLAUDE_CODE_PLUGIN_SEED_DIR", "")
+    # pre-populated roots. The CLI reads both only after copying the settings'
+    # env blocks onto its env, so a global-config, user or managed settings value
+    # beats the container env -- and arrives session-written, so every value is
+    # vetted (_usable_path) before it reaches an os.* call. install_plugins.py
+    # clones remote marketplaces under CLAUDE_PLUGIN_CLONE_ROOT, else
+    # $HOME/.claude/plugin-marketplaces -- HOME, not CLAUDE_CONFIG_DIR, both
+    # stripped, and the temp dir when HOME is blank.
+    cache_env, cache_src = _setting_env(settings, "CLAUDE_CODE_PLUGIN_CACHE_DIR")
+    seed_env, seed_src = _setting_env(settings, "CLAUDE_CODE_PLUGIN_SEED_DIR")
     clone_env = os.environ.get("CLAUDE_PLUGIN_CLONE_ROOT", "").strip()
     tmps = [os.environ.get(v, "") for v in ("TMPDIR", "TEMP", "TMP")]
     inst_home = os.environ.get("HOME", "").strip() or next(filter(None, tmps), "/tmp")
-    # Normalize like the CLI: trim, blank => unset, expand ~ before abspath -- so a
-    # value of "~/x" checks $HOME/x (what the CLI uses), not <cwd>/~/x.
-    plugins = os.path.abspath(_cli_path(cache_env) or os.path.join(cdir, "plugins"))
-    seeds = [
-        os.path.abspath(_cli_path(s)) for s in seed_env.split(os.pathsep) if s.strip()
-    ]
+    cache, cache_bad = (
+        _usable_path(cache_env.strip()) if cache_env.strip() else ("", "")
+    )
+    plugins = "" if cache_bad else cache or (cdir and os.path.join(cdir, "plugins"))
     clones = os.path.abspath(
         clone_env or os.path.join(inst_home, ".claude", "plugin-marketplaces")
     )
-    data = os.path.join(plugins, "data")
-    _kv("HOME", os.environ.get("HOME") or f"(unset -> {home})")
-    _kv("CLAUDE_CONFIG_DIR", cdir_env or "(unset -> HOME/.claude)")
-    _kv("CLAUDE_CODE_PLUGIN_CACHE_DIR", cache_env or f"(unset -> {plugins})")
-    _kv("CLAUDE_CODE_PLUGIN_SEED_DIR", seed_env or "(unset)")
-    _kv("CLAUDE_PLUGIN_CLONE_ROOT", clone_env or f"(unset -> {clones})")
-    _kv(".claude dir", cdir)
+    data = os.path.join(plugins, "data") if plugins else ""
     result: dict = {
-        "problems": [],
-        "code": "",
+        "problems": [],  # shared assets other uids cannot reach or use
+        "incomplete": [],  # "<row> <cause>": walks that stopped short
+        "unverified": 0,  # session-written path values never checked
+        "code_dir": "",  # the gateway's code dir (stays OUT of a ruleset)
         "code_writable": False,
-        "code_writable_paths": [],
-        "incomplete": False,
+        "code_incomplete": "",  # why the code walk stopped short of a "yes"
+        "site_writable": [],  # site-packages this uid can write or create
     }
+    _kv("HOME", os.environ.get("HOME") or f"(unset -> {home})")
+    _kv(
+        "CLAUDE_CONFIG_DIR",
+        _env_row(
+            settings["cdir_value"],
+            settings["cdir_src"],
+            "HOME/.claude",
+            settings["cdir_problem"],
+        ),
+    )
+    default = plugins or "not checked"
+    _kv(
+        "CLAUDE_CODE_PLUGIN_CACHE_DIR",
+        _env_row(cache_env, cache_src, default, cache_bad),
+    )
+    _kv("CLAUDE_CODE_PLUGIN_SEED_DIR", _env_row(seed_env, seed_src, "none"))
+    seeds: list[str] = []
+    entries, cut = _seed_entries(seed_env.strip())
+    for item in entries:
+        path, problem = _usable_path(item)
+        if path and path not in seeds:
+            seeds.append(path)
+        elif problem:
+            result["unverified"] += 1
+            _kv("  !! seed entry", f"{_short(item)!r} -- unusable ({problem})")
+    if cut:
+        result["unverified"] += 1
+        why = f"only the first {_SEEDS_CAP} distinct entries are checked"
+        _kv("  !! seed entries", f"the rest not scanned ({why})")
+    _kv("CLAUDE_PLUGIN_CLONE_ROOT", clone_env or f"(unset -> {clones})")
+    if settings["unread"]:
+        _kv("", f"(unverified: {', '.join(settings['unread'])} not read)")
+    _kv(".claude dir", cdir or "not checked (unusable config dir)")
+    if not cdir or cache_bad:  # the CLI's real roots cannot be checked
+        result["unverified"] += 1
     # A global deadline bounds every walk together; each row also gets its own slice
     # (_ROW_TIME_CAP) so one planted tree cannot starve the rows that follow it.
     deadline = time.monotonic() + _TIME_CAP
 
     def check(label: str, path: str, skip: tuple[str, ...] = ()) -> None:
         row_deadline = min(deadline, time.monotonic() + _ROW_TIME_CAP)
-        problem, capped = _report_shared(label, path, row_deadline, skip)
-        result["incomplete"] |= capped
+        problem, incomplete = _report_shared(label, path, row_deadline, skip)
+        if incomplete:
+            result["incomplete"].append(f"{label.strip()} {incomplete}")
         if problem:
             result["problems"].append(f"{label.strip()} {problem}")
 
-    # plugins/data/ is writable plugin state, not a shared asset: pruned here.
-    check("  plugins/", plugins, (data,))
     subs = ("skills", "agents", "commands", "output-styles")
-    for sub in subs:
+    # plugins/data/ is writable plugin state, not a shared asset: pruned here.
+    if plugins:
+        check("  plugins/", plugins, (data,))
+    for sub in subs if cdir else ():
         check(f"  {sub}/", os.path.join(cdir, sub))
     # settings.json is SHARED POLICY (admin env block + enabledPlugins), not
     # per-session writable state, so it -- like the user-scope CLAUDE.md -- must
     # stay readable by every session too.
-    for name in ("settings.json", "CLAUDE.md"):
+    for name in ("settings.json", "CLAUDE.md") if cdir else ():
         check(f"  {name}", os.path.join(cdir, name))
     check("  plugin-marketplaces/ (clones)", clones)
     for seed in seeds:
-        check(f"  seed {seed}", seed)
-    roots = [plugins, clones, *seeds] + [os.path.join(cdir, s) for s in subs]
+        check(f"  seed {_short(seed)}", seed)
+    roots = [r for r in (plugins, clones, *seeds) if r]
+    roots += [os.path.join(cdir, s) for s in subs] if cdir else []
     # A path under a checked root -- literally or via the root's symlink target,
     # which that root's rows already walked -- needs no row of its own.
     real_roots = []
@@ -1490,53 +2126,82 @@ def probe_shared_assets(ident: dict) -> dict:
             continue
     roots += real_roots
     notes: list[str] = []
-    registry, truncated = _registry_paths(
-        [plugins, *seeds], os.path.join(cdir, "settings.json"), notes
+    registry, dropped = _registry_paths(
+        [plugins, *seeds] if plugins else seeds, settings["user_conf"], notes
     )
     for note in notes:
         _kv("  !! registry file", note)
     # The registry files are session-writable, so a path they declare is trusted
-    # only when it resolves UNDER a known shared root (already walked above). An
-    # off-root value (/etc, /root, /proc/1, or a symlink out of the tree) is LISTED
-    # but never walked -- walking it would let a session aim this report, and the
-    # operator's VERDICT, at arbitrary paths.
-    off_root = []
+    # only when it lies UNDER a known shared root (walked above). An off-root
+    # value (/etc, /root, /proc/1, or a symlink out of the tree) gets only its
+    # ancestor chain checked and is never walked -- walking it would let a
+    # session aim this report, and the operator's VERDICT, at arbitrary paths --
+    # so the verdict reports it as unverified; one that does not exist at all is
+    # a stale entry, counted apart. The literal test comes first; only what it
+    # leaves is stat'ed and resolved, under its own deadline.
+    off_root, absent = [], 0
+    resolve_by = time.monotonic() + _RESOLVE_TIME_CAP
     for p in registry:
-        try:
-            rp = os.path.realpath(p)
-        except _PATH_ERRORS:
-            rp = p
-        if any(_inside(p, r) for r in roots) or any(_inside(rp, r) for r in roots):
+        if any(_inside(p, r) for r in roots):
             continue  # under a shared root: covered by that root's own walk
+        if time.monotonic() < resolve_by:
+            try:
+                os.stat(p)
+                rp = os.path.realpath(p)
+            except FileNotFoundError:
+                absent += 1
+                continue
+            except _PATH_ERRORS:
+                rp = p
+            if any(_inside(rp, r) for r in roots):
+                continue
         off_root.append(p)
-    total = f"{len(registry)}{'+ (truncated)' if truncated else ''}"
-    _kv("registry paths", f"{total} absolute, {len(off_root)} off the shared roots")
+    result["unverified"] += len(off_root) + dropped
+    kept = f"{len(registry)} absolute" + (f" (+{dropped} dropped)" if dropped else "")
+    stale = f", {absent} of those absent (stale)" if absent else ""
+    _kv(
+        "registry paths",
+        f"{kept}, {len(off_root) + absent} off the shared roots{stale}",
+    )
     for path in off_root[:_OUTSIDE_CAP]:
-        _kv("  registry-declared (not walked)", _safe(path))
+        try:
+            os.stat(path)
+            block = _chain_block(path)
+            where = (
+                f"other uids: blocked at {block}" if block else "other uids reach it"
+            )
+        except FileNotFoundError:
+            where = "absent"
+        except _PATH_ERRORS:
+            where = "unreachable for this uid too"
+        _kv("  registry-declared (not walked)", f"{_short(path)} -- {where}")
     if len(off_root) > _OUTSIDE_CAP:
         _kv("  !! and more", f"{len(off_root) - _OUTSIDE_CAP} further off-root paths")
     # Writable state: split per session (or kept writable), so only inventoried.
-    for sub in ("projects", "plans"):
+    for sub in ("projects", "plans") if cdir else ():
         _inventory(f"  {sub}/ (split)", os.path.join(cdir, sub))
-    _inventory("  plugins/data/ (writable)", data)
-    # The gateway's code must stay read-only to sessions under any option that
-    # keeps them at its uid; the image chowns /app to app. The packages it
-    # imports live in this interpreter's site-packages (the image's pip target).
+    if data:
+        _inventory("  plugins/data/ (writable)", data)
+    # Sessions that keep the gateway's uid must not write its code, and the image
+    # chowns /app to app: a Landlock ruleset therefore leaves the code dir OUT
+    # (no rule = no read, no write -- a read-only rule would also expose the
+    # credentials under its data/). The packages it imports live in this
+    # interpreter's site-packages (the image's pip target).
     gw = ident["gw"]
     try:
         code = os.readlink(f"/proc/{gw}/cwd")
     except OSError:
         code = "/app"  # the image's WORKDIR; the gateway's cwd is unreadable here
-    result["code"] = code
-    writable_code: list[str] = []
     if os.path.isdir(code):
+        result["code_dir"] = code
         writable, checked, capped, code_inc = _code_writable(
             code, time.monotonic() + _CODE_TIME_CAP
         )
-        result["incomplete"] |= bool(capped) or bool(code_inc)
-        if writable > 0:
-            result["code_writable"] = True
-            writable_code.append(code)
+        result["code_writable"] = writable > 0
+        if not writable and (capped or code_inc):
+            # Only a walk that found nothing writable leaves the answer open.
+            cut = f"{capped} cap hit" if capped else ""
+            result["code_incomplete"] = ", ".join(filter(None, (cut, code_inc)))
         more = f"+ ({capped}-capped)" if capped else ""
         inc = f"; {code_inc}: partial" if code_inc else ""
         state = f"{writable} of {checked}{more} entries writable (data/ skipped){inc}"
@@ -1545,7 +2210,10 @@ def probe_shared_assets(ident: dict) -> dict:
     _kv(f"  gateway code (PID {gw} cwd)", f"{code}: {state}")
     # The gateway runs `python -m uvicorn` (no -s/-I), so system site-packages AND,
     # unless PYTHONNOUSERSITE, the user site run their .pth/sitecustomize at startup
-    # (user site precedes system site on sys.path); both must stay read-only.
+    # (user site precedes system site on sys.path); both must stay read-only. An
+    # absent user site is no safer when this uid can create it: site.py adds it at
+    # the next interpreter start once it exists (the gateway, install_plugins.py,
+    # and a root entrypoint python run without -I).
     sites = [("system site", sysconfig.get_paths()["purelib"])]
     if not os.environ.get("PYTHONNOUSERSITE"):
         try:
@@ -1555,18 +2223,25 @@ def probe_shared_assets(ident: dict) -> dict:
         except Exception:  # noqa: BLE001 - site is best-effort (probe runs -I -S)
             pass
     for name, path in sites:
-        if not path or not os.path.isdir(path):
+        under = "" if not path or os.path.isdir(path) else _creatable(path)
+        if not path:
+            state = "unknown"
+        elif under:
+            state = f"absent, but CREATABLE by this uid (under {under})"
+            result["site_writable"].append(path)
+        elif not os.path.isdir(path):
             state = "absent"
         elif _can_write(path):
             state = "WRITABLE by this uid"
-            result["code_writable"] = True
-            writable_code.append(path)
+            result["site_writable"].append(path)
         else:
             state = "read-only"
         _kv(f"    {path or '?'} ({name})", state)
-    result["code_writable_paths"] = writable_code
-    if result["incomplete"]:
-        _kv("  !! INCOMPLETE", "a walk hit its entry/time cap: results are partial")
+    for cause in result["incomplete"]:
+        _kv("  !! INCOMPLETE", f"{cause}: a blocker past it may be unreported")
+    if result["code_incomplete"]:
+        cause = result["code_incomplete"]
+        _kv("  !! INCOMPLETE", f"gateway code walk ({cause}): not an all-clear")
     _kv(
         "  note",
         "reachability reflects CURRENT (session-mutable) mode bits; a recreated",
@@ -1613,12 +2288,132 @@ _LANDLOCK_REMEDY = {
     ),
     "other": (
         "Landlock: the create/enforce test failed for an unexpected reason",
-        "-- see the LANDLOCK section above for the errno/signal.",
+        "-- see the LANDLOCK section above for the errno.",
     ),
     "arch": ("Landlock: untested on this arch (its syscall number differs).",),
-    "untested": ("Landlock: untested (the test child could not run).",),
 }
-_LANDLOCK_DEFAULT = ("Landlock: kernel >=5.19 + 'landlock' in the LSM list.",)
+
+
+def _say(text: str, first: str = "  ", rest: str = "     ") -> None:
+    """Print verdict prose built from probe data, escaped and wrapped at 76."""
+    for line in textwrap.wrap(
+        _safe(text),
+        76,
+        initial_indent=first,
+        subsequent_indent=rest,
+        break_long_words=False,
+        break_on_hyphens=False,
+    ):
+        print(line)
+
+
+def _shared_problems(shared: dict) -> None:
+    """For every verdict that recommends uid-per-user: the shared assets other
+    uids cannot reach or use (SHARED ASSET LAYOUT lists them all)."""
+    problems = shared.get("problems", [])
+    if problems:
+        print("    - !! shared assets fail for other uids -- fix before uid split:")
+        for problem in problems[:3]:
+            print(f"         {_safe(problem)}")
+        if len(problems) > 3:
+            print(f"         (+{len(problems) - 3} more in SHARED ASSET LAYOUT)")
+
+
+def _gaps(shared: dict) -> None:
+    """The verdict's '!!' lines for what the shared-asset and code checks could
+    not settle: each names the walk and its cause."""
+    incomplete = shared.get("incomplete", [])
+    if incomplete:
+        print("  !! shared-asset check INCOMPLETE -- a blocker past these may be")
+        print("     unreported, so the clean rows are not an all-clear:")
+        for cause in incomplete[:5]:
+            _say(cause, "       ", "         ")
+        if len(incomplete) > 5:
+            print(f"       (+{len(incomplete) - 5} more in SHARED ASSET LAYOUT)")
+        print("     Rerun after a cap hit; list unlistable dirs as their owner.")
+    if shared.get("code_incomplete"):
+        _say(
+            f"!! gateway-code check INCOMPLETE ({shared['code_incomplete']}): "
+            "nothing session-writable turned up in the part walked, but that is "
+            "not an all-clear."
+        )
+    if shared.get("unverified"):
+        _say(
+            f"!! {shared['unverified']} plugin path value(s) from the registries "
+            "or settings were NOT checked (session-written: off the shared "
+            "roots, unusable, or past a cap) -- unverified: confirm the sessions' "
+            "uid/jail can read the real ones (SHARED ASSET LAYOUT lists them)."
+        )
+
+
+def _ruleset(shared: dict, ns: dict, abi: int, both: bool) -> None:
+    """What a Landlock ruleset must hold -- the same for uid-per-user + Landlock
+    and for the interim (docs/security-process-isolation.md section 6.3)."""
+    if both:
+        print("\n  Landlock ruleset (uid-per-user + Landlock and the interim alike):")
+    else:
+        print("\n  Landlock ruleset (the Landlock-only interim):")
+    code = shared.get("code_dir")
+    if code:
+        now = "writable" if shared.get("code_writable") else "read-only"
+        if not shared.get("code_writable") and shared.get("code_incomplete"):
+            now = "not seen writable (walk incomplete)"
+        _say(
+            f"- keep {code} (the gateway's code; {now} to this uid today) OUT of "
+            "it: no rule = no read and no write, while a read-only rule would "
+            f"also expose {os.path.join(code, 'data')} credentials to every session.",
+            "    ",
+            "      ",
+        )
+    if shared.get("site_writable"):
+        print("    - grant no write on these (this uid can write or create them, and")
+        print("      the gateway imports from them at startup):")
+        for path in shared["site_writable"]:
+            print(f"        {_safe(path)}")
+    print("    - include /proc (read-only) and /dev/urandom -- the CLI aborts at")
+    print("      exec without both -- a /dev/null file rule, a per-session TMPDIR,")
+    print("      the package caches, and EXECUTE on its read-only rules.")
+    tcp = "available" if abi >= 4 else "missing"
+    print("    - loopback TCP between sessions stays open unless it also sets the")
+    print(f"      TCP bind/connect port rules (ABI >= 4; {tcp} here, ABI {abi}).")
+    state = ns.get("cli_sandbox")
+    if state == "off":
+        return
+    # The CLI's availability check only looks for bwrap and socat on PATH, so
+    # with both present it starts and every sandboxed Bash call then fails;
+    # failIfUnavailable makes it exit 1 only while one of them is missing.
+    missing = ", ".join(ns.get("cli_missing", []))
+    one = len(ns.get("cli_missing", [])) == 1
+    stay, them = ("stays", "it") if one else ("stay", "them")
+    if state == "unset" and missing:
+        tail = (
+            "settings: nothing enables it here today, but a workspace's "
+            f"project/local settings could -- inert there while {missing} {stay} "
+            f"absent, every sandboxed Bash call failing once {them} "
+            f"{'is' if one else 'are'} installed."
+        )
+    elif state == "unset":
+        tail = (
+            "settings: nothing enables it here today, but a workspace's "
+            "project/local settings could, and every sandboxed Bash call there "
+            "would fail."
+        )
+    elif state == "inert":
+        tail = (
+            f"settings. With {missing} absent it is inert here today, but "
+            f"installing {them} would make every sandboxed Bash call fail."
+        )
+    elif state == "fail":
+        tail = (
+            f"settings. With {missing} absent and failIfUnavailable set, the "
+            "CLI exits 1 here already."
+        )
+    else:  # ok / broken / unknown: enabled, with bwrap and socat present
+        tail = "settings, else every sandboxed Bash call fails."
+    print("    - the CLI's own sandbox cannot start inside it (no bwrap in a")
+    print("      Landlock domain): set CLAUDE_SANDBOX_ENABLED=false and keep")
+    text = f"sandbox.enabled / failIfUnavailable out of user and managed {tail}"
+    _say(text, "      ", "      ")
 
 
 def verdict(
@@ -1631,87 +2426,150 @@ def verdict(
         print("  NONE: this ran as root, which can always setuid, so the uid/caps")
         print("  results above are root's, not a session's (app uid, CapEff empty).")
         print("  Re-run as the session user:")
-        print(f"    docker compose exec -u {_rerun_ids(ident)} gateway ...")
+        print(f"    {_rerun_cmd(ident)}")
         return
-    ids = _rerun_ids(ident)
-    # No confident path without the gateway's real identity: when it runs as root
-    # or was not found, the uid/caps/F2 results above are root PID 1's, not a
-    # session's -- stop here (like the root-probe case) instead of reading a BEST
-    # PATH off them, which would contradict the warning printed earlier.
-    if (ident.get("gw_root") or not ident.get("gw_found")) and not ident.get("rivals"):
-        print("  INCONCLUSIVE: no confident path without the gateway's own identity")
-        print("  (it runs as root, or was not identified). Re-run as the session")
-        print(f"  user: docker compose exec -u {ids} gateway ...")
+    kind, why = _view(ident)  # the classification /proc hardening printed too
+    if kind == "unknown":
+        # No confident path without the gateway's real identity: the uid/caps/F2
+        # results above are not a session's -- stop here (like the root-probe
+        # case) instead of reading a BEST PATH off them, which would contradict
+        # the warning printed earlier.
+        _say(
+            "INCONCLUSIVE: no confident path without the gateway's own identity "
+            f"({why}). Is it running, with $PORT its port? Re-run as the session "
+            "user:",
+            "  ",
+            "  ",
+        )
+        print(f"    {_rerun_cmd(ident)}")
         return
-    caveat = _not_session_view(ident)  # single source, shared with proc-hardening
-    if ident.get("rivals"):
-        pids = ", ".join([ident["gw"], *ident["rivals"]])
-        print(f"  !! several gateway candidates (PID {pids}): F2 and the -u advice")
-        print("     are not concluded; find the one whose cmdline names uvicorn/")
-        print("     src.main and re-run when it is the only one.")
-    elif caveat:
-        print(f"  !! {caveat};")
-        print("     the F2/uid results above are not the sessions'. Re-run with")
-        print(f"     `docker compose exec -u {ids}`.")
-    if shared.get("incomplete"):
-        print("  !! shared-asset check INCOMPLETE: a walk hit its entry/time cap, so a")
-        print("     blocker past the cap may be unreported -- rerun (raise the caps)")
-        print("     or fix before any uid split; the clean rows are not an all-clear.")
+    if kind == "unsure":
+        _say(
+            f"!! gateway not concluded: {why}. F2 and the -u advice are not "
+            "concluded; find the process whose cmdline names uvicorn/src.main "
+            "and re-run when it is the only candidate."
+        )
+    elif kind == "other":
+        _say(f"!! {why}; the F2/uid results above are not the sessions'. Re-run:")
+        print(f"       {_rerun_cmd(ident)}")
+    _gaps(shared)
     ll_ok = ll.get("usable")  # ABI >= 2 AND the create/enforce chain succeeded
-    if ll_ok and uid.get("grantable"):
+    ll_unknown = ll.get("cause") == "untested"
+    four = ("userns", "pidns", "mountns", "procns")
+    untested = ns.get("untested", [])
+    denied = [k for k in four if not ns.get(k) and k not in untested]
+    ns_unknown = bool(untested) and not denied  # bwrap neither shown nor ruled out
+    grantable = uid.get("grantable")
+    reachable = _reachable(uid, ident)  # grantable, and something can use it
+    shim, uid1 = ident.get("pid1_comm"), ident.get("pid1_uid")
+    needs = "a root start, or NoNewPrivs=0 at start for a file-cap broker"
+    stuck = (
+        f"PID 1 ({shim}) runs as uid {uid1} (a non-root start) and NoNewPrivs "
+        "is set from container start, so nothing can give a broker SETUID/SETGID"
+    )
+    cli = ns.get("cli_sandbox")
+    if ll_ok and reachable:
         print("  BEST PATH (a/single-container): uid-per-user + Landlock is buildable.")
-        print("    - spawn goes through the in-place file-cap re-exec wrapper (the")
-        print("      SDK owns the child's pipes); a broker/helper is teardown-only.")
-        print("    - a SETUID/SETGID broker is NOT least-privilege: CAP_SETUID is")
-        print("      root-equivalent, so it must be locked down -- non-root ideally,")
-        print("      else NNP + SECBIT_NOROOT_LOCKED + a set*id seccomp filter + a")
-        print("      minimal bounding set. See docs/security-process-isolation.md")
-        print("      sections 3/8 for the design and the open tensions (teardown")
-        print("      EPERM; the NNP-vs-file-cap-wrapper conflict).")
+        print("    - spawn: cli_path is a fixed, root-owned launcher stub with no file")
+        print("      caps, running as the gateway's uid: it presents a single-use")
+        print("      ticket and hands the SDK's pipes (fds 0/1/2) to a resident broker")
+        print("      over SCM_RIGHTS; the broker forks each CLI on them as its")
+        print("      session's uid. The gateway keeps cap 0 and may set NoNewPrivs.")
+        print("    - the broker's SETUID/SETGID are NOT least-privilege: CAP_SETUID is")
+        print("      root-equivalent, so lock it down -- non-root ideally, else NNP +")
+        print("      SECBIT_NOROOT_LOCKED + a set*id seccomp filter + a minimal")
+        print("      bounding set. See docs/security-process-isolation.md section 3.")
+        if shim in _INIT_SHIMS and uid1 == 0:
+            print(f"    - a root start (PID 1, {shim}, runs as root): the entrypoint")
+            print("      can fork the broker before its drop.")
+        elif shim in _INIT_SHIMS and uid1 is not None:
+            _say(
+                f"- PID 1 ({shim}) runs as uid {uid1}: a non-root start, so no "
+                "root entrypoint can fork the broker -- it needs file caps on its "
+                "binary and NoNewPrivs=0 at container start.",
+                "    ",
+                "      ",
+            )
+        else:
+            print("    - this assumes a root start: the entrypoint forks the broker")
+            print("      before its drop (not checked here).")
         print("    - never in the gateway: KEEPCAPS/ambient caps leak into all it")
         print("      execs. The session drops every cap and sets NoNewPrivs.")
-        if uid.get("nnp"):
-            print("    - NoNewPrivs=1 here: the file-cap wrapper is out (file caps")
-            print("      need NNP=0), leaving only a root-started broker -- the")
-            print("      open NNP-vs-file-cap-wrapper tension (see the doc).")
-        problems = shared.get("problems", [])
-        if problems:
-            print("    - !! shared assets fail for other uids -- fix before uid split:")
-            for problem in problems[:3]:
-                print(f"         {_safe(problem)}")
-            if len(problems) > 3:
-                print(f"         (+{len(problems) - 3} more in SHARED ASSET LAYOUT)")
+        if uid.get("nnp") and uid.get("nnp_start"):
+            print("    - NoNewPrivs=1 from container start (this probe has it too):")
+            print("      fine for the root-started broker; it rules out a non-root")
+            print("      start (file caps on the broker binary) and the in-place")
+            print("      file-cap wrapper alternative.")
+        elif uid.get("nnp"):
+            print("    - NoNewPrivs=1 on the gateway only (set after start): fine for")
+            print("      the broker; it rules out the in-place file-cap wrapper.")
+        _shared_problems(shared)
     elif ll_ok:
         print("  LANDLOCK-ONLY: Landlock is usable; uid switching is not:")
-        print("  SETUID/SETGID are missing from the bounding set (cap_drop?).")
+        if grantable:
+            _say(f"{stuck}. uid-per-user needs {needs}.", "  ", "  ")
+        else:
+            print("  SETUID/SETGID are missing from the bounding set (cap_drop?).")
     elif ns.get("viable"):
         print("  BWRAP: bwrap/nsjail (userns+pidns+fresh procfs) is viable here.")
         if not ns.get("bwrap"):
             print("    - bubblewrap is not installed in this image.")
-        print("    - installing bwrap + socat also switches ON the CLI's own sandbox.")
-        if ll.get("cause") in _SECCOMP_CAUSES:
-            if uid.get("grantable"):
+        if cli in ("inert", "fail"):
+            _say(
+                "- installing bwrap + socat also makes the CLI's own sandbox run "
+                f"(it is enabled by {ns.get('cli_by')}).",
+                "    ",
+                "      ",
+            )
+        if ll_unknown:
+            print("    - Landlock untested (its test child never ran): uid-per-user +")
+            print("      Landlock is not ruled out -- re-run before choosing this.")
+        elif ll.get("cause") in _SECCOMP_CAUSES:
+            if reachable:
                 print("    - Landlock failed only on seccomp: allowing landlock_* in")
                 print("      the profile makes the preferred uid-per-user + Landlock")
                 print("      reachable.")
+                _shared_problems(shared)
+            elif grantable:
+                _say(
+                    "- Landlock failed only on seccomp: allowing landlock_* in the "
+                    "profile makes LANDLOCK-ONLY reachable. uid-per-user also needs "
+                    f"{needs}: {stuck}.",
+                    "    ",
+                    "      ",
+                )
             else:
                 print("    - Landlock failed only on seccomp: allowing landlock_* in")
                 print("      the profile makes LANDLOCK-ONLY reachable (uid-per-user")
                 print("      still needs SETUID/SETGID in the bounding set).")
+    elif ll_unknown or ns_unknown:
+        lost = (["Landlock"] if ll_unknown else []) + (
+            [f"namespaces {', '.join(untested)}"] if untested else []
+        )
+        _say(
+            f"INCONCLUSIVE: the deciding tests never ran to an answer "
+            f"({'; '.join(lost)}: a test child failed to fork, was killed, or "
+            "raised), so the verdict cannot be read off them. Re-run (a "
+            "pids/nproc limit, or an OOM kill?).",
+            "  ",
+            "  ",
+        )
     else:
         print("  NO PATH: nothing is fully available as-is. Needed, in order:")
-        first, *rest = _LANDLOCK_REMEDY.get(ll.get("cause"), _LANDLOCK_DEFAULT)
+        first, *rest = _LANDLOCK_REMEDY.get(ll.get("cause"), _LANDLOCK_REMEDY["other"])
         print(f"    - {first}")
         for line in rest:
             print(f"      {line}")
-        if uid.get("grantable"):
+        if reachable:
             print("    - uid-per-user alone is buildable (SETUID/SETGID grantable): it")
             print("      closes F2 and cross-user reads, but without Landlock sessions")
             print("      still read every world-readable path.")
+            _shared_problems(shared)
+        elif grantable:
+            _say(f"- uid-per-user: {stuck}; it needs {needs}.", "    ", "      ")
         else:
             print("    - uid-per-user: keep SETUID/SETGID in the bounding set.")
-        untested = ns.get("untested", [])
-        failed = [k for k in ("userns", "pidns", "mountns", "procns") if not ns.get(k)]
+        failed = [k for k in four if not ns.get(k)]
         shown = [f"{k}?" if k in untested else k for k in failed]
         print(f"    - OR bwrap (missing: {', '.join(shown) or 'none'}):")
         if "userns" in failed:
@@ -1730,9 +2588,13 @@ def verdict(
                 )
                 print("      or a custom profile.")
             print("      --security-opt systempaths=unconfined unmasks /proc.")
-        if failed == ["procns"]:
+        if failed == ["procns"] and "procns" not in untested:
             print("      (only the fresh procfs failed: enableWeakerNestedSandbox /")
-            print("       CLAUDE_SANDBOX_WEAKER_NESTED binds this /proc instead.)")
+            print(
+                "       CLAUDE_SANDBOX_WEAKER_NESTED binds this /proc instead -- which"
+            )
+            print("       leaves F2 open: sandboxed commands still read the gateway's")
+            print("       /proc/<pid>/environ unless it is non-dumpable.)")
         if not ns.get("bwrap"):
             print("      install bubblewrap (+ socat for the CLI sandbox).")
         elif ns.get("cli_missing"):
@@ -1753,39 +2615,62 @@ def verdict(
         else:
             print(f"  there is no DAC isolation and no signal scoping (ABI {abi} < 6,")
             print("  needs 6.12): sessions can signal each other and the gateway.")
-        if shared.get("code_writable"):
-            paths = shared.get("code_writable_paths") or [shared.get("code", "")]
-            print("  Its ruleset must keep these read-only (this uid can write them,")
-            print("  and the gateway imports from them at startup):")
-            for p in paths:
-                print(f"    {_safe(p)}")
+        _ruleset(shared, ns, abi, bool(reachable))
     gw = ident.get("gw", "1")
     nd = proc.get("non_dumpable")
-    state = "unknown" if nd is None else ("yes" if nd else "no")
-    if ident.get("rivals"):
+    if kind == "unsure":
         state = "not concluded"
+    elif ident.get("hidden") and kind == "ok":
+        state = f"unknown; hidden ({ident['hidden']}) from the sessions' ids"
+    else:
+        state = "unknown" if nd is None else ("yes" if nd else "no")
     print(f"\n  /proc/{gw}/environ (F2): closed for sessions by a uid != the")
     print("  gateway's, a new PID ns with its own procfs, or Landlock on the")
     print("  session (every ABI, 5.13+: no scope flag needed). Zero-privilege")
     print("  interim for the gateway itself: PR_SET_DUMPABLE(0) hides its")
-    print(f"  environ/mem from same-uid sessions (here: non-dumpable = {state}).")
+    _say(
+        f"environ/mem from same-uid sessions (here: non-dumpable = {state}).",
+        "  ",
+        "  ",
+    )
     print("  Not isolation: exec'd CLI children are dumpable again, so each")
     print("  session's env stays readable to the others.")
-    cli = ns.get("cli_sandbox")
+    if proc.get("pid1_environ"):
+        comm = ident.get("pid1_comm") or "?"
+        _say(
+            f"!! /proc/1/environ is READABLE here too: PID 1 ({comm}) shares the "
+            "sessions' uid and holds the full container env, which the gateway's "
+            "PR_SET_DUMPABLE(0) does not cover. The mechanisms above close it"
+            + (
+                ", and so does a root start (the shim then runs as root)."
+                if comm in _INIT_SHIMS
+                else "."
+            )
+        )
     if cli == "inert":
         missing = ", ".join(ns.get("cli_missing", []))
         print(f"\n  CLI OS sandbox: inert here ({missing} missing): the CLI logs")
         print("  'Sandbox disabled' and runs Bash unconfined.")
+    elif cli == "fail":
+        missing = ", ".join(ns.get("cli_missing", []))
+        print()
+        _say(
+            f"CLI OS sandbox: FAILS here -- enabled by {ns.get('cli_by')}, "
+            f"sandbox.failIfUnavailable set by {ns.get('cli_fail_by')}, and "
+            f"{missing} missing: the CLI exits 1 at start, so every session fails.",
+            "  ",
+            "  ",
+        )
     elif cli == "broken":
-        denied = ", ".join(ns.get("cli_denied", []))
+        denied_s = ", ".join(ns.get("cli_denied", []))
         print("\n  CLI OS sandbox: BROKEN here -- bwrap and socat are present,")
-        print(f"  but {denied} denied.")
+        print(f"  but {denied_s} denied.")
         print("  Every sandboxed Bash call fails with a bwrap error, and nothing")
         print("  logs 'Sandbox disabled'.")
     elif cli == "unknown":
         unk = ", ".join(ns.get("cli_untested", []))
-        print(f"\n  CLI OS sandbox: UNKNOWN here -- {unk} untested (fork failed),")
-        print("  so whether sandboxed Bash would run cannot be concluded.")
+        print(f"\n  CLI OS sandbox: UNKNOWN here -- {unk} untested (the test never")
+        print("  ran), so whether sandboxed Bash would run cannot be concluded.")
 
 
 def main() -> int:
@@ -1797,15 +2682,16 @@ def main() -> int:
     # An inherited SIGCHLD=SIG_IGN would auto-reap the test children.
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
     print("Claude gateway isolation capability probe")
-    print("(run inside the prod container as the session/app user)")
+    print("(run inside the gateway container as the session/app user)")
     probe_kernel()
     ident = probe_identity()
     caps = probe_caps_seccomp(ident)
     proc = probe_proc_hardening(ident)
     ll = probe_landlock()
-    ns = probe_namespaces(caps)
-    uid = probe_setuid(caps)
-    shared = probe_shared_assets(ident)
+    settings = probe_cli_settings()
+    ns = probe_namespaces(caps, settings)
+    uid = probe_setuid(caps, ident)
+    shared = probe_shared_assets(ident, settings)
     verdict(ident, proc, ll, ns, uid, shared)
     return 0
 
