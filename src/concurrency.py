@@ -38,14 +38,16 @@ Operators on larger hosts should raise them; see ``.env.example``.
 
 Set either to ``0`` to disable that limit entirely.
 
-Admission **waits briefly, then fails fast**: a turn that finds either cap
-full joins a FIFO queue for up to ``TURN_QUEUE_TIMEOUT_SECONDS`` (default 30;
-``0`` disables the queue) and gets ``503`` with ``Retry-After`` only if no
-slot frees in time or ``TURN_QUEUE_MAX_WAITERS`` are already waiting. Nearly
-every collision is one turn ending moments later, so a short wait turns an
-error the user sees into a pause. The wait stays short on purpose: turns run
-for up to ``MAX_TIMEOUT`` (default 10 minutes), so an unbounded queue would
-tie up a connection far longer than any client is willing to wait.
+Admission **waits, then fails**: a turn that finds either cap full joins a
+FIFO queue for up to ``TURN_QUEUE_TIMEOUT_SECONDS`` (default 300; ``0``
+disables the queue) and gets ``503`` with ``Retry-After`` only if no slot
+frees in time or ``TURN_QUEUE_MAX_WAITERS`` (default 256) are already waiting.
+Collisions are usually one turn ending soon after, so waiting turns an error
+the user sees into a pause. The wait is bounded on purpose: turns run for up
+to ``MAX_TIMEOUT`` (default 10 minutes), so an unbounded queue would tie up a
+connection far longer than any client is willing to wait. While a turn waits
+no response headers are sent, so the client's (and any proxy's) read timeout
+must outlast it.
 
 A freed slot goes to the **oldest waiter that can take it** — one blocked
 only by its own per-user cap does not hold up anyone else's turn — and a new

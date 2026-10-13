@@ -89,10 +89,10 @@ MAX_CONCURRENT_TURNS_PER_USER = parse_int_env("MAX_CONCURRENT_TURNS_PER_USER", 3
 # A turn refused by either cap above waits up to this many seconds in a FIFO
 # queue for a slot instead of failing at once with 503: nearly every collision
 # is one turn ending moments later. 0 restores immediate (fail-fast) 503s.
-TURN_QUEUE_TIMEOUT_SECONDS = max(0, parse_int_env("TURN_QUEUE_TIMEOUT_SECONDS", 30))
+TURN_QUEUE_TIMEOUT_SECONDS = max(0, parse_int_env("TURN_QUEUE_TIMEOUT_SECONDS", 300))
 # How many turns may wait at once; the next one is refused with 503 straight
 # away (0 = no bound). A waiter holds only its buffered request body, not a CLI.
-TURN_QUEUE_MAX_WAITERS = max(0, parse_int_env("TURN_QUEUE_MAX_WAITERS", 32))
+TURN_QUEUE_MAX_WAITERS = max(0, parse_int_env("TURN_QUEUE_MAX_WAITERS", 256))
 
 # What happens when a brand-new session is requested at the MAX_LIVE_SESSIONS
 # cap and no expired session can be reclaimed. "reject" (default) refuses with
