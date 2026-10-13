@@ -548,15 +548,20 @@ class TestPluginResourceRoots:
 class TestOperatorAddDirs:
     """``CLAUDE_ADD_DIRS`` is also a CLI working directory (``--add-dir``), so the
     sandbox must grant it to read/exec too — otherwise the CLI lets a session
-    ``cd`` there while the hook refuses every Read/Bash on it (#234). Writes
-    stay confined to the workspace."""
+    ``cd`` there while the hook refuses every Read/Bash on it (#234). The write
+    tools stay confined to the workspace; Bash is not split into read and
+    write."""
 
     @pytest.fixture
     def shared(self, tmp_path: Path, monkeypatch) -> Path:
+        from src.backends.claude import workspace_sandbox as sandbox
+
         home = tmp_path / "home" / "app"
         (home / ".claude").mkdir(parents=True)
         monkeypatch.setenv("HOME", str(home))
         monkeypatch.delenv("CLAUDE_PLUGIN_CLONE_ROOT", raising=False)
+        # Keep the host's workspace base out of the overlap checks.
+        monkeypatch.setattr(sandbox.workspace_manager, "base_path", tmp_path / "ws")
         shared = tmp_path / "data" / "shared"
         (shared / "docs").mkdir(parents=True)
         (shared / "docs" / "guide.md").write_text("# guide")
@@ -645,6 +650,60 @@ class TestOperatorAddDirs:
         doc = {"file_path": str(shared / "docs" / "guide.md")}
         assert await _call(sandbox, "Read", doc) == {}
         assert _is_deny(await _call(sandbox, "Write", doc))
+
+    @pytest.mark.parametrize("entry", ["base", "base_parent", "other_user"])
+    async def test_entry_overlapping_workspace_base_opens_no_other_workspace(
+        self, shared, tmp_path, monkeypatch, entry
+    ):
+        # The workspace base holds every user's workspace. An operator entry
+        # that is it, inside it or an ancestor of it must not open another
+        # user's workspace; a separate entry still works.
+        from src.backends.claude import workspace_sandbox as sandbox
+
+        base = tmp_path / "srv" / "workspaces"
+        mine = base / "alice" / "claude"
+        theirs = base / "bob" / "claude"
+        mine.mkdir(parents=True)
+        theirs.mkdir(parents=True)
+        secret = theirs / "notes.md"
+        secret.write_text("not yours")
+        monkeypatch.setattr(sandbox.workspace_manager, "base_path", base)
+        target = {
+            "base": base,
+            "base_parent": base.parent,
+            "other_user": base / "bob",
+        }[entry]
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"{target},{shared}")
+        hook = make_workspace_sandbox_hook(mine)
+        attempts = [
+            ("Read", {"file_path": str(secret)}),
+            ("Grep", {"pattern": "x", "path": str(theirs)}),
+            ("Glob", {"pattern": "*", "path": str(theirs)}),
+            ("Bash", {"command": f"cat {secret}"}),
+        ]
+        for tool, tool_input in attempts:
+            assert _is_deny(await _call(hook, tool, tool_input)), (tool, tool_input)
+        doc = {"file_path": str(shared / "docs" / "guide.md")}
+        assert await _call(hook, "Read", doc) == {}
+
+    async def test_entry_containing_the_workspace_opens_no_sibling(
+        self, shared, tmp_path, monkeypatch
+    ):
+        # A cwd outside the workspace base: an entry that contains it also
+        # holds the other sessions' workspaces beside it.
+        custom = tmp_path / "srv" / "custom"
+        mine = custom / "alice"
+        theirs = custom / "bob"
+        mine.mkdir(parents=True)
+        theirs.mkdir(parents=True)
+        secret = theirs / "notes.md"
+        secret.write_text("not yours")
+        monkeypatch.setenv("CLAUDE_ADD_DIRS", f"{custom},{shared}")
+        hook = make_workspace_sandbox_hook(mine)
+        assert _is_deny(await _call(hook, "Read", {"file_path": str(secret)}))
+        assert _is_deny(await _call(hook, "Bash", {"command": f"cat {secret}"}))
+        doc = {"file_path": str(shared / "docs" / "guide.md")}
+        assert await _call(hook, "Read", doc) == {}
 
     def test_cli_and_hook_share_one_list(self, shared, tmp_path):
         from src.backends.claude.workspace_sandbox import operator_add_dirs

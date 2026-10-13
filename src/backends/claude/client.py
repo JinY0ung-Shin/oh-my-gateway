@@ -787,8 +787,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         allowed working directories for this session"). Add the
         plugin/skill/marketplace roots plus any operator-specified
         ``CLAUDE_ADD_DIRS`` (comma-separated) so those skills work. The sandbox
-        hook grants the same directories to read/exec; writes stay confined to
-        the workspace + the session's own ``$HOME/.claude/projects`` entry.
+        hook grants the same directories to read/exec, minus entries that would
+        open other users' state; the write tools stay confined to the
+        workspace + the session's own ``$HOME/.claude/projects`` entry, but the
+        hook does not split Bash into read and write.
         """
         dirs: List[str] = []
         seen: set[str] = set()
