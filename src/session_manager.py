@@ -20,7 +20,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,8 +37,6 @@ from src.constants import (
 )
 
 logger = logging.getLogger(__name__)
-
-_CWD_ENCODE_RE = re.compile(r"[/_.]")
 
 # Where the SDK stores per-session transcripts: ``<config dir>/projects``.
 # Resolved per call (``_projects_root``) via the shared config-dir resolver so a
@@ -63,16 +60,21 @@ def _encode_cwd(cwd) -> str:
     """Encode a workspace cwd to its on-disk Claude SDK directory name.
 
     The Claude SDK stores per-project transcripts under
-    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. The encoding
-    rule (verified against on-disk transcript directories): every ``/``,
-    ``_`` and ``.`` is replaced with ``-``.
+    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. This delegates to
+    the CLI's exact naming (``workspace_sandbox._project_dir_name``: every
+    non-alphanumeric UTF-16 unit becomes ``-``, a hash suffix past 200 units,
+    pinned in ``tests/test_cli_project_dir_name.py``). A hand-rolled
+    ``[/_.]`` rule left ``@`` intact, so an e-mail user's transcript lived in
+    a directory this lookup never opened and their sessions could not resume.
 
     The rule is **lossy** — distinct workspaces such as ``a_b``, ``a.b`` and
     ``a-b`` collapse to the same directory — so ``_try_rehydrate_from_jsonl``
     additionally verifies the transcript's recorded ``cwd`` against the
     requester's workspace before trusting it.
     """
-    return _CWD_ENCODE_RE.sub("-", str(cwd))
+    from src.backends.claude.workspace_sandbox import _project_dir_name
+
+    return _project_dir_name(str(cwd))
 
 
 def _session_jsonl_path(session_id: str, workspace) -> Path:
@@ -111,8 +113,8 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
                     line = json.loads(raw)
                 except (ValueError, json.JSONDecodeError):
                     return None  # corrupt — refuse to guess
-                # Ownership guard. ``_encode_cwd`` is lossy ('/', '_', '.' all
-                # collapse to '-'), so distinct workspaces — e.g. users "a_b",
+                # Ownership guard. ``_encode_cwd`` is lossy (every
+                # non-alphanumeric collapses to '-'), so distinct workspaces — e.g. users "a_b",
                 # "a.b" and "a-b" — share one on-disk transcript directory. The
                 # SDK records the REAL cwd on each turn line, so refuse to
                 # rehydrate a transcript whose recorded cwd does not match the

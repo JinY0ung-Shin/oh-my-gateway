@@ -84,6 +84,14 @@ def _uid_settings(monkeypatch, uid: int) -> None:
         monkeypatch.setenv(key, value)
 
 
+# ``_uid_settings(monkeypatch, os.getuid())`` makes the runner's own uid the
+# whole ephemeral slice; uid 0 is always reserved from the band, so as root
+# the probe finds no uid to spawn as.
+_needs_nonroot = pytest.mark.skipif(
+    os.getuid() == 0, reason="uid 0 is reserved from the band; run as non-root"
+)
+
+
 class TestDescribeLauncherExit:
     @pytest.mark.parametrize("code", [70, 113, 114, 115, 116, 117, 118, 127])
     def test_refusals_are_named(self, code):
@@ -97,6 +105,7 @@ class TestDescribeLauncherExit:
         assert landlock.describe_launcher_exit(code) is None
 
 
+@_needs_nonroot
 class TestProbeSpawn:
     """The probe's own spawn, with the launcher run mocked."""
 
@@ -210,6 +219,7 @@ class TestStartupDecision:
         monkeypatch.setattr(landlock, "_broker_reachable", lambda: True)
         monkeypatch.setattr(landlock, "_uid_session_problems", lambda: list(problems))
 
+    @_needs_nonroot
     def test_a_failing_probe_refuses_uid_mode(self, monkeypatch):
         _uid_settings(monkeypatch, os.getuid())
         self._broker_up(monkeypatch, ["a CLI spawned as a session uid exited 118"])
@@ -223,6 +233,7 @@ class TestStartupDecision:
         assert "exited 118" in errors[0]
         assert f"{landlock.FALLBACK_ENV}=landlock" in errors[0]
 
+    @_needs_nonroot
     def test_the_fallback_runs_landlock_and_says_why(self, monkeypatch, caplog):
         _uid_settings(monkeypatch, os.getuid())
         monkeypatch.setenv(landlock.FALLBACK_ENV, "landlock")

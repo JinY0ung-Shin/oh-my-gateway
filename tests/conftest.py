@@ -28,6 +28,9 @@ os.environ.setdefault("SYSINFO_REDACTION", "false")
 # tests/test_process_hardening.py checks the real effect in child processes.
 os.environ.setdefault("GATEWAY_NON_DUMPABLE", "false")
 
+# Throwaway HOME, no inherited CLAUDE_CONFIG_DIR (see the module docstring).
+from tests.fixtures import hermetic_home  # must precede every src import
+
 import pytest
 
 import src.main as main
@@ -68,6 +71,62 @@ def pytest_collection_modifyitems(config, items):
     if deselected:
         config.hook.pytest_deselected(items=deselected)
         items[:] = selected
+
+
+# What a leaking test writes: a ``projects/`` entry for its workspace, or the
+# plugin registry / settings files. Mtimes of transcripts inside existing
+# entries are not watched, so a developer's own concurrently running Claude
+# Code (writing its session jsonl) does not trip the guard.
+_WATCHED_FILES = (
+    "settings.json",
+    "plugins/installed_plugins.json",
+    "plugins/known_marketplaces.json",
+)
+
+
+def _claude_dir_snapshot(root):
+    try:
+        if root is None or not root.is_dir():
+            return None
+    except OSError:  # unreachable real HOME: nothing a test could write either
+        return None
+    try:
+        entries = frozenset(os.listdir(root / "projects"))
+    except OSError:
+        entries = frozenset()
+    files = {}
+    for rel in _WATCHED_FILES:
+        try:
+            files[rel] = (root / rel).stat().st_mtime_ns
+        except OSError:
+            files[rel] = None
+    return entries, files
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _guard_real_claude_home():
+    """Fail the run when a test wrote the developer's real Claude config dir.
+
+    HOME is redirected at import (top of this file), so this only trips when a
+    test or a subprocess it spawned rebuilt the real path itself.
+    ``GATEWAY_TEST_SKIP_HOME_GUARD=1`` disables the check.
+    """
+    root = hermetic_home.real_claude_dir()
+    before = _claude_dir_snapshot(root)
+    yield
+    if before is None or os.environ.get("GATEWAY_TEST_SKIP_HOME_GUARD") == "1":
+        return
+    after = _claude_dir_snapshot(root)
+    if after is None:
+        return
+    new_projects = sorted(after[0] - before[0])
+    changed = sorted(k for k in after[1] if after[1][k] != before[1][k])
+    if new_projects or changed:
+        pytest.fail(
+            f"tests modified the real Claude config dir {root}: "
+            f"new projects/ entries {new_projects}, changed files {changed}",
+            pytrace=False,
+        )
 
 
 def _cleanup_manager(manager):

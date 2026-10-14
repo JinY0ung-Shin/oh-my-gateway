@@ -426,6 +426,11 @@ uv run pytest --cov=src                            # with coverage
 
 - `pytest-asyncio` uses `asyncio_mode = "auto"`; do not add `@pytest.mark.asyncio` unless a test specifically needs it.
 - Mock SDK calls in tests and prefer the shared fixtures in `tests/conftest.py`.
+- The suite never touches the developer's real Claude config dir: `tests/fixtures/hermetic_home.py`
+  (imported by `conftest.py` before any `src` import) moves HOME to a temp dir and unsets
+  `CLAUDE_CONFIG_DIR`, and `_guard_real_claude_home` fails the run if the real dir still gains a
+  `projects/` entry or its `settings.json` / plugin registry changes
+  (`GATEWAY_TEST_SKIP_HOME_GUARD=1` skips the check).
 - Markers: `integration` (real subprocess with mock binary), `slow`, `e2e` (needs live server + credentials; excluded by default).
 - OpenCode/Codex are stale (frozen 2026-07): `tests/conftest.py` skips collection of their dedicated
   test files and deselects every test whose id mentions `opencode`/`codex` (~490 tests total; a
