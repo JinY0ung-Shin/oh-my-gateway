@@ -682,6 +682,15 @@ def _cleanup_sdk_transcript(session: Optional[Session]) -> None:
             transcript.parent.rmdir()
         except OSError:
             pass
+    except PermissionError as exc:
+        # Not silent: the stateless contract promises the transcript is gone.
+        logger.warning(
+            "Stateless agent transcript %s could not be removed: %s. Under "
+            "CLAUDE_ISOLATION_MODE=uid the session uid owns it, and removing it "
+            "needs the broker-delegated cleanup (a follow-up).",
+            transcript,
+            exc.strerror or exc,
+        )
     except OSError:
         logger.debug("Stateless agent transcript cleanup failed", exc_info=True)
     # Its session-env dir too: a confined CLI cannot sweep it (#241).

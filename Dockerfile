@@ -69,16 +69,19 @@ RUN --mount=type=secret,id=gateway_build_install_script,target=/tmp/gateway-buil
 # unprivileged app uid before running the server.
 COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py
 
-# Session OS-isolation launcher + broker + shared ruleset (CLAUDE_ISOLATION_MODE,
-# #241). Copied to a fixed, root-owned location OUTSIDE /app so the later
-# `chown -R app:app /app` can never make these privileged files agent-writable;
-# the gateway finds the launcher via GATEWAY_LANDLOCK_LAUNCHER (below) and the
-# entrypoint finds the broker beside itself. Without this copy, both landlock
-# and uid mode refuse to start (the gateway fails closed rather than run
-# unconfined). The modes stay off unless an operator sets CLAUDE_ISOLATION_MODE.
+# Session OS-isolation launcher + broker + shared ruleset + session shell
+# wrapper (CLAUDE_ISOLATION_MODE, #241). Copied to a fixed, root-owned location
+# OUTSIDE /app so the later `chown -R app:app /app` can never make these
+# privileged files agent-writable; the gateway finds the launcher via
+# GATEWAY_LANDLOCK_LAUNCHER (below), the entrypoint finds the broker beside
+# itself, and both find claude-session-bash (the confined CLI's Bash shell)
+# beside them. Without this copy, both landlock and uid mode refuse to start
+# (the gateway fails closed rather than run unconfined). The modes stay off
+# unless an operator sets CLAUDE_ISOLATION_MODE.
 COPY docker/landlock_launcher.py docker/isolation_broker.py docker/_landlock_rules.py \
-     /usr/local/bin/
+     docker/claude-session-bash /usr/local/bin/
 RUN chmod 0755 /usr/local/bin/landlock_launcher.py /usr/local/bin/isolation_broker.py \
+       /usr/local/bin/claude-session-bash \
     && chmod 0644 /usr/local/bin/_landlock_rules.py
 
 # The Claude CLI refuses --dangerously-skip-permissions under root, and the

@@ -559,6 +559,35 @@ def _error_result_text(message: Any) -> str:
     return ""
 
 
+async def _aclose_query(stream: Any) -> None:
+    """Close an SDK ``query()`` generator, bounded; best effort.
+
+    For a generator that cleans up on close this runs its teardown (stdin
+    EOF, then SIGTERM, then SIGKILL, ~20 s at worst), so it is capped like a
+    disconnect. The pinned SDK's top-level ``query()`` has no ``try/finally``,
+    though: closing it early does not stop its CLI. What keeps that CLI from
+    outliving the caller is draining the stream, whose end runs the SDK's own
+    inner ``finally`` (``transport.close()``). The cap needs
+    ``asyncio.timeout`` (Python 3.11+): ``asyncio.wait_for`` before 3.12 would
+    close the generator from another task, which its anyio cancel scopes
+    refuse, so without it the close is awaited uncapped. Never raises.
+    """
+    from src.constants import CLIENT_DISCONNECT_TIMEOUT_SECONDS
+
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    timeout = getattr(asyncio, "timeout", None)
+    try:
+        if timeout is None:
+            await aclose()
+        else:
+            async with timeout(CLIENT_DISCONNECT_TIMEOUT_SECONDS):
+                await aclose()
+    except Exception:
+        logger.debug("Closing the verify query failed", exc_info=True)
+
+
 class ClaudeCodeCLI(TokenEstimateMixin):
     """Gateway for Claude Agent SDK queries.
 
@@ -1456,17 +1485,25 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 verify_workspace = workspace_manager.resolve(None)
             options = self._build_sdk_options(max_turns=1, cwd=verify_workspace)
             messages = []
-            async for message in query(
-                prompt="Hello",
-                options=options,
-            ):
-                messages.append(message)
-                msg_type = getattr(message, "type", None) or (
-                    message.get("type") if isinstance(message, dict) else None
-                )
-                if msg_type == "assistant":
-                    break
-                last_error_result = _error_result_text(message) or last_error_result
+            stream = query(prompt="Hello", options=options)
+            try:
+                async for message in stream:
+                    messages.append(message)
+                    msg_type = getattr(message, "type", None) or (
+                        message.get("type") if isinstance(message, dict) else None
+                    )
+                    if msg_type == "assistant":
+                        break
+                    last_error_result = _error_result_text(message) or last_error_result
+            finally:
+                # The CLI must be stopped before the workspace below is
+                # removed: under uid isolation that ends the run's uid lease,
+                # which must not happen while the CLI still runs as that uid
+                # (#244 review). With the pinned SDK the loop drains the stream
+                # (its messages carry no ``type``, so the break never fires) and
+                # the SDK's own inner finally closes the CLI; closing here is a
+                # best-effort extra for a stream that does stop early.
+                await _aclose_query(stream)
 
             if last_error_result:
                 logger.error(

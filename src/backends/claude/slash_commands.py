@@ -195,8 +195,9 @@ def _build_preflight_options(
     Shared by the names and the details fetchers so they stay identical. Routes
     through the same cwd/confinement path a real session uses: ``cli_path`` is
     the launcher under confinement, and the per-workspace ro/rw lists (or, in
-    uid mode, the session uid's broker ticket — ``user`` keys it) ride
-    ``options.env`` so the confined catalog CLI can read ``~/.claude`` (#241).
+    uid mode, the session uid's broker ticket — ``user`` keys it, once that
+    user has a uid) ride ``options.env`` so the confined catalog CLI can read
+    ``~/.claude`` (#241).
     """
     from src.backends.claude import landlock
     from src.backends.claude.client import (
@@ -259,7 +260,9 @@ async def get_available_commands(
     """The registered command names for *cwd*, TTL-cached per cwd.
 
     ``user`` is whom the preflight runs as under ``uid`` isolation (the session
-    in *cwd*); the cache stays keyed on the cwd alone.
+    in *cwd*) once that user has a uid; before that it runs landlock-shaped
+    (``landlock.preflight_options_env``). The cache stays keyed on the cwd
+    alone.
     """
     async with _cache.lock:
         if not force and _cache.is_fresh(cwd):

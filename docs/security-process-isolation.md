@@ -1,7 +1,8 @@
 # 사용자별 프로세스 격리 (설계)
 
-> **상태: 설계/계획.** 아직 구현되지 않았다. 메커니즘 선택은 prod 호스트의 커널·권한에
-> 달려 있고, 그 사실은 `scripts/isolation_probe.py`를 prod 컨테이너에서 돌려 확정한다.
+> **상태: 설계/계획, 일부 구현.** Landlock 단독과 ①은 `CLAUDE_ISOLATION_MODE=landlock|uid`(#241)로 들어왔다(§3·§5·§6의
+> 구현 노트). uid 모드는 워크스페이스 소유권과 컨테이너 프로비저닝(§7 step 4) 전에는 쓸 수 없다. 메커니즘 선택은 prod
+> 호스트의 커널·권한에 달려 있고, 그 사실은 `scripts/isolation_probe.py`를 prod 컨테이너에서 돌려 확정한다.
 > 앱 계층(자격증명→워크스페이스/세션 스코프) 격리는 [security-user-isolation.md](security-user-isolation.md)를 보라.
 > 이 문서는 그 아래, **OS/프로세스 계층**(한 세션이 다른 세션·게이트웨이의 파일/메모리/비밀에
 > 닿지 못하게 하는 경계)을 다룬다.
@@ -90,6 +91,14 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 하드닝됐다: symlink를 따라가지 않고, 대상 uid 소유가 아닌 다중 링크 비디렉터리는 건너뛰며(그래서
 호스트 sysctl `fs.protected_hardlinks`에 의존하지 않는다), root 단계 인터프리터를 격리 모드(`python -I`)로
 돌려 app 사용자의 site 디렉터리를 읽지 않고, 읽기 전용·예기치 않은 경로가 있어도 기동을 실패시키지 않는다.
+`CLAUDE_ISOLATION_MODE=uid`면 이 단계는 세션 uid 소유 항목을 chown하지 않고, 그 안은 세션이 통제하므로 걷지도 않는다 —
+세션의 `projects/<name>`(transcript·메모리)이 0600/0700 그대로 app 소유가 되면 그 세션을 다시 잇지 못했다. 세션 uid는
+대역(게이트웨이와 같은 파싱)과 uid 레지스트리(`CLAUDE_ISOLATION_UID_REGISTRY`, 기본 `/app/data/isolation_uids.json`)에
+기록된 모든 uid에서 root·app uid·브로커 uid를 뺀 것이다 — 대역을 좁히면 named 사용자의 uid가 대역 밖에 남고, 게이트웨이는
+이 단계가 끝난 뒤에야 그 사용자 때문에 기동을 거부한다. 레지스트리는 src를 import하지 않고 root로 읽으며, symlink·일반
+파일 아님·16 MiB 초과·읽기 불가·형식 오류면 경고만 남기고 대역만 본다. 다른 모드는 전처럼 모두 app uid로 되돌린다(모드를
+바꾼 뒤 남은 uid 모드의 것까지). 단 uid를 요청하고 `CLAUDE_ISOLATION_FALLBACK=landlock`으로 내려가면 entrypoint는 그 폴백을 알 수
+없어, 세션 uid 소유 `projects/<name>`이 재기동 뒤에도 그대로 남고 landlock 모드(app uid) 세션은 거기 쓰지 못한다.
 
 > 운영 주의: 이미지는 `HOME=/home/app`을 전역으로 설정하므로 root로 `docker exec` 하면 그 HOME을 물려받아
 > root 도구가 app 소유 dotfile과 user site를 읽을 수 있다. 점검·디버깅은 `-u app`으로 붙는다(프로브 안내와 동일).
@@ -371,8 +380,12 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 > EOF면 SIGTERM → 첫 SIGTERM 5초 뒤 SIGKILL, CLI가 끝나면 남은 하위 프로세스를 자식이 없을 때까지 SIGKILL·reap한 뒤에야
 > 상태를 보낸다(CLI는 Bash 명령마다 따로 세션을 만들므로 그룹 kill만으론 `cmd &`가 샜다; `kill(-1)`은 같은 uid를 쓰는
 > 같은 사용자의 다른 세션까지 죽이므로 안 쓴다). 상주 브로커는 교차 uid로 시그널을 보내지 않는다 — CAP_KILL이 없어
-> EPERM이 조용히 삼켜지던 것이 리뷰 2의 #1이다. supervisor가 비정상 종료해 남긴 프로세스만 브로커(subreaper)가 그 uid로
-> 전환한 단명 자식으로 죽인다. ABI ≥ 6이면 두 모드 모두 `LANDLOCK_SCOPE_SIGNAL | ABSTRACT_UNIX_SOCKET`을 더한다. 남은 창:
+> EPERM이 조용히 삼켜지던 것이 리뷰 2의 #1이다. supervisor가 비정상 종료해 남긴 프로세스만 브로커(subreaper)가 단명
+> 자식으로 죽이는데, 그 자식은 그 uid를 effective uid로만 쥐고(supervisor와 같은 `(broker, U, broker)`, cap 0) 브로커는
+> 그것을 최대 2초 기다린다(`WNOHANG|WUNTRACED`). 그래서 ABI < 6에서도 U의 고아가 그 자식을 멈추거나 죽이지 못하고,
+> 단일 스레드인 상주 브로커가 세션이 시그널을 보낼 수 있는 프로세스를 기다리며 멈추지 않는다. 멈추거나 시간을 넘긴
+> 자식은 SIGKILL하고 최대 2초 더 기다려 거두며(그래도 남으면 reaper에 맡긴다), 그 pid들은 치우지 못했다고 로그에 남긴 채
+> 다시 시도하지 않는다. ABI ≥ 6이면 두 모드 모두 `LANDLOCK_SCOPE_SIGNAL | ABSTRACT_UNIX_SOCKET`을 더한다. 남은 창:
 > 런처를 SIGTERM 중계 없이 바로 SIGKILL하면(`agent_messages` wedge) CLI가 최대 5초 더 살아 위의 정리 경쟁이 남는다 —
 > 정리를 브로커로 라우팅하는 후속에서 닫는다.
 >
@@ -384,27 +397,23 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 >     `<ws>/.cli-tmp`를 못 만들었고, 브로커가 그 실패를 삼켜 CLI가 exit 1로 죽었다.
 >   - 그런데도 기동은 통과했다. 브로커 도달성만 봤기 때문이다.
 > - **바뀐 점:**
->   - `.cli-tmp`를 못 만들면 이제 바로 실패한다(브로커 자식 exit 118, 런처 exit 70).
+>   - `.cli-tmp`를 쓸 수 있는 디렉터리로 만들지 못하면 이제 바로 실패한다(브로커 자식 exit 118, 런처 exit 70). 그 자리의
+>     디렉터리 아닌 것(symlink·파일·FIFO·소켓)은 지우고 새로 만들며, 소유자 rwx를 잃은 자기 디렉터리와 그 안의 CLI
+>     `claude-<uid>`도 고친다 — `touch .cli-tmp`나 `chmod 000 .cli-tmp` 하나로 그 워크스페이스의 이후 spawn이 모두 막혔었다.
+>     다른 uid 소유의 것(예: landlock 형태로 돈 preflight가 게이트웨이 uid로 남긴 `.cli-tmp`)은 `<name>.stale-<n>`으로 옮기고
+>     새로 만든다(워크스페이스에 쓸 수 없으면 fail closed). 수리 방식은 §6 step 3의 구현 노트.
 >   - 게이트웨이는 브로커가 응답하면 기동 때 한 번, 세션과 같은 경로로 ephemeral uid의 `--version`을 띄워 본다.
 >     새 익명 워크스페이스, 같은 티켓과 경로 목록, 런처, 브로커를 그대로 쓴다.
 >   - 이어서 그 uid가 설정 디렉터리에 닿는지, `projects/<name>`을 만들 수 있는지를 mode bit로 확인한다.
 >   - 이 중 하나라도 실패하면 uid는 "사용 불가"다. 기동 오류가 나거나, `CLAUDE_ISOLATION_FALLBACK=landlock`이면
 >     landlock으로 내려간다. 출하 이미지에서는 이 프로브가 실패한다.
 > - **uid 모드를 쓰려면 남은 일:** 워크스페이스 소유권(§7 step 4)과 컨테이너 프로비저닝이 먼저다. 프로비저닝에는
->   세션 uid가 통과할 수 있는 공유 트리, 브로커 uid와 대역의 passwd 항목, 사용자별 config dir가 들어간다.
-
-> **구현 노트(PR #244 리뷰 4, 117a0d0 재리뷰).**
-> - **최소 ABI는 3(커널 6.2)이다.** 이 문서의 "ABI ≥ 2"는 그 이전 판단이다. ABI 1/2는 `LANDLOCK_ACCESS_FS_TRUNCATE`를
->   다루지 않아서, DAC가 허용하면 룰셋 밖 파일도 `truncate(2)`/`O_TRUNC`로 비울 수 있다. 그래서 두 모드 모두 ABI 2
->   호스트에서 기동을 거부한다(`MIN_LANDLOCK_ABI`, `docker/_landlock_rules.MIN_ABI`). 프로브도 ABI ≥ 3을 "usable"로 본다.
-> - **익명 uid는 lease다.** LRU 재활용은 살아 있는 런의 uid를 새 런에 줄 수 있었다. 이제 `_tmp_` 워크스페이스가 남아
->   있는 동안 uid가 묶이고, 다 차면 거절한다. 브로커도 다른 워크스페이스에서 살아 있는 uid를 거부한다.
-> - **§6.5 argv 노출:** 격리 모드에서 `--mcp-config`와 시스템 프롬프트는 세션 워크스페이스의 1회용 파일로 넘기고
->   `connect()` 뒤 지운다(CLI는 argv 파싱 때 읽는다 — `tests/test_cli_argv_files.py`). `--json-schema`는 파일 형태가
->   없어 남는다. 요청자의 `text.format` 스키마라 게이트웨이 비밀은 아니다.
-> - **런처 소유권은 기동 오류다.** 런처·`_landlock_rules.py`·모든 상위 디렉터리가 root 소유·비쓰기여야 한다.
->   dev 체크아웃만 `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true`로 경고로 낮춘다.
-> - **프로브 실행 실패는 실패다.** `can_enforce_landlock`이 프로브를 못 돌리면 기동을 거부한다.
+>   세션 uid가 통과할 수 있는 공유 트리, 브로커 uid와 대역의 passwd 항목, 사용자별 config dir(적어도 세션 uid가 쓸 수 있는
+>   `session-env`·`tasks` — 그 아래 `<session id>`는 브로커 자식이 세션 uid로 만든다)가 들어간다. 브로커가 세션 uid로
+>   transcript를 읽고 지우는 대행도 남았다: 게이트웨이는 세션 uid 소유 0600 transcript를 읽지도 지우지도 못해, 메모리에
+>   없는(만료·재기동) uid 모드 세션의 재개는 재시도로 풀리지 않는 HTTP 500 `transcript_unreadable`
+>   (`session_manager.TranscriptUnreadable`, 경로마다 경고 한 번)이고 stateless transcript 정리는 경고만 남긴다. 세션
+>   uid가 쓴 파일이 든 `session-env/<id>`·`tasks/<id>`도 같은 이유로 게이트웨이가 지우지 못해 남는다.
 >
 > **(V) userland은 passwd 항목을 요구한다.** 커널은 숫자 uid `setuid`에 `/etc/passwd`를 요구하지 않는다.
 > python `getpass.getuser()`는 **`LOGNAME`·`USER`·`LNAME`·`USERNAME`을 차례로 보고 하나라도 있으면** passwd를 보지
@@ -413,6 +422,21 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 > passwd 레코드가 실제로 필요한 건 `whoami`와 node `os.userInfo()`다(CLI 본체는 try/catch로 버티지만 모델이 쓴
 > 코드·쉘 도구가 깨진다). uid 대역의 passwd/group 항목을 이미지 빌드 때 또는 브로커가 만들거나 `nss_wrapper`를
 > 쓰고, allowlist에 `USER`/`LOGNAME`을 반드시 포함한다(§6.4).
+
+> **구현 노트(PR #244 리뷰 4, 117a0d0 재리뷰).**
+> - **최소 ABI는 3(커널 6.2)이다.** 이 문서의 "ABI ≥ 2"는 그 이전 판단이다. ABI 1/2는 `LANDLOCK_ACCESS_FS_TRUNCATE`를
+>   다루지 않아서, DAC가 허용하면 룰셋 밖 파일도 `truncate(2)`/`O_TRUNC`로 비울 수 있다. 그래서 두 모드 모두 ABI 2
+>   호스트에서 기동을 거부한다(`MIN_LANDLOCK_ABI`, `docker/_landlock_rules.MIN_ABI`). 프로브도 ABI ≥ 3을 "usable"로 본다.
+> - **익명 uid는 lease다.** LRU 재활용은 살아 있는 런의 uid를 새 런에 줄 수 있었다. 이제 런의 워크스페이스를 정리할 때
+>   (CLI를 멈춘 뒤) 반납하고, 지우지 못한 워크스페이스는 uid를 계속 쥔다. 다 차면 워크스페이스가 사라진 lease부터
+>   회수하고, 그래도 없으면 거절한다. 브로커도 다른 워크스페이스에서 살아 있는 uid와, 아직 정리하지 못했거나 정리를
+>   포기한 고아가 쥔 uid를 거부한다.
+> - **§6.5 argv 노출:** 격리 모드에서 `--mcp-config`와 시스템 프롬프트는 세션 워크스페이스의 1회용 파일로 넘기고
+>   `connect()` 뒤 지운다(CLI는 argv 파싱 때 읽는다 — `tests/test_cli_argv_files.py`). `--json-schema`는 파일 형태가
+>   없어 남는다. 요청자의 `text.format` 스키마라 게이트웨이 비밀은 아니다.
+> - **런처 소유권은 기동 오류다.** 런처·`_landlock_rules.py`·(있으면) `claude-session-bash`·모든 상위 디렉터리가 root
+>   소유·비쓰기여야 한다. dev 체크아웃만 `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true`로 경고로 낮춘다.
+> - **프로브 실행 실패는 실패다.** `can_enforce_landlock`이 프로브를 못 돌리면 기동을 거부한다.
 
 > **중간 선택지 — Landlock 단독(uid 전환 없음).** cap이 아예 없어도(①의 특권 브로커와 그 프로토콜이 통째로
 > 사라진다 — `cli_path` 런처가 그 자리에서 룰셋을 걸고 exec한다) Landlock은 open() 계층에서 파일 읽기(F1)를 가두고,
@@ -618,6 +642,39 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
   - `plugins/known_marketplaces.json`(`installLocation`·`source.path`), `plugins/installed_plugins.json`
     (`installPath`), `settings.json`의 `extraKnownMarketplaces.*.source.path`에 적힌 **절대 경로 전부**와,
     공유 자산이 **symlink면 그 대상 경로**까지 ro로 닿아야 한다.
+  - **구현(PR #244):** Landlock 목록의 공유 항목(가드의 공유 자산 이름, 파일 도구에는 열지 않고 CLI가 직접 읽고 실행하는
+    `rules`·`hooks`·`workflows`, `plugin_resource_roots()`, CLI 설정 파일, `CLAUDE_ADD_DIRS`)은 모두 `landlock._GrantFilter`를
+    거쳐 **풀린(resolved) 경로**로 들어간다 — 검사한 경로가 곧 허용되는 경로여야 한다(워크스페이스는 따로 검사한다 — §6
+    step 3의 구현 노트).
+    - 풀린 경로가 `/`이거나 config dir·`$HOME`·워크스페이스 base·`/app`·임시 디렉터리·시스템 루트(`/run`·`/var/run`·`/dev`·
+      `/sys`·`/root`·`/var/tmp`)이거나 그것을 품으면, 워크스페이스 base·`/app`·임시 디렉터리·시스템 루트 안이면, config dir
+      안의 공유 하위 트리·설정 파일 밖이면, config dir 밖의 `$HOME` 안이면 경고 한 번과 함께 빠진다. `$HOME` 안의 예외는
+      전역 설정 파일과 운영자가 정한 `CLAUDE_PLUGIN_CLONE_ROOT`(그 경로 자체가 symlink가 아닐 때) 안뿐이고, 두 예외 모두
+      워크스페이스 base·`/app`·시스템 루트 안에서는 듣지 않는다.
+    - 겹치는 루트: 같은 디렉터리인 루트들은 모두 적용돼 가장 엄한 쪽이 이긴다(`USER_WORKSPACES_DIR=$HOME`이면 `$HOME` 안이
+      모두 빠진다). 그 밖엔 가장 안쪽 루트의 규칙을 따르므로, 워크스페이스 base·`/app`·시스템 루트 안에 둔 config dir나
+      `$HOME`은 자기 규칙을 지키고, 임시 디렉터리 안(같은 디렉터리는 아닌)에 둔 `$HOME`은 예외까지 지킨다. `HOME=/`이면
+      config dir 밖 항목이 모두 `$HOME` 안으로 잡혀 위 예외 말고는 빠진다(fail closed — 실제 홈 디렉터리가 필요하다).
+    - 기본 clone 루트 `<cfg>/plugin-marketplaces`는 config dir 안의 허용 이름일 뿐 예외의 기준이 아니다. symlink면 가리키는
+      곳에서 판단하므로 심어 둔 `plugin-marketplaces -> ~/.ssh`는 아무것도 열지 않는다. 기본 clone 루트는 `CLAUDE_CONFIG_DIR`가
+      아니라 `$HOME`을 따르므로, `CLAUDE_CONFIG_DIR`를 다른 곳에 두면 `$HOME/.claude/plugin-marketplaces`의 clone은
+      `CLAUDE_PLUGIN_CLONE_ROOT`를 설정하지 않는 한 빠진다(§6 step 2의 세션별 config dir에서 함께 챙긴다).
+    - 파일 규칙은 inode를 허용하므로 파일 대상(`CLAUDE.md`·`settings*.json`·`.config.json`·`.claude.json`)은 링크가 하나뿐인
+      일반 파일이어야 한다 — 다른 사용자의 transcript에 하드 링크한 `CLAUDE.md`가 그 transcript를 모든 세션에 열었다.
+    - 런처와 브로커 자식은 게이트웨이가 준 항목(uid 모드는 티켓의 목록과 워크스페이스)을 `/`부터 성분마다 `O_NOFOLLOW`로
+      열어, 필터를 지난 뒤 바꿔치기한 링크도 허용하지 않는다: 어느 성분이든 symlink이거나 마지막 앞 성분이 디렉터리가
+      아니면 그 항목을 빼고 stderr에 `landlock: not granting '<path>': …`를 남기며, 없는 rw 디렉터리도 같은 식으로 성분마다
+      만들고, 링크가 둘 이상인 파일 대상도 뺀다. 자기 경로(`/usr`·`/etc` 같은 시스템 ro 경로, `/dev` 파일, `/dev/shm`, 실제
+      CLI 디렉터리, 셸 래퍼)만 링크를 따라 연다(merged-usr의 `/bin`·`/lib` 링크).
+    - 실제 CLI 디렉터리는 런처·브로커가 모든 세션에 ro+exec로 연다. 그래서 `check_config`는 그 디렉터리가 `/`·`$HOME`·
+      config dir·워크스페이스 base·`/app`·임시 디렉터리·시스템 루트이거나 그것을 품거나 워크스페이스 base 안이면 기동을
+      거부하고(`$HOME` 안은 괜찮다 — 네이티브 설치기의 `~/.local/share/claude/versions`), 런처(exit 70)와 브로커 자식
+      (exit 114)은 `/`이거나 워크스페이스를 품은 CLI 디렉터리를 다시 거부한다.
+    - 그래서 `agents -> .` 같은 링크나 `installLocation: /`, 워크스페이스 base를 품은 `CLAUDE_PLUGIN_CLONE_ROOT`는 모든 세션의
+      허용을 넓히지 못하고 그 항목이 빠지며(그 플러그인 스킬·훅이 confined 세션에서 사라진다), `skills -> /opt/shared-skills`
+      처럼 안전한 대상으로의 링크는 그대로 열린다. 게이트웨이 자신의 상태를 막는 deny-list일 뿐, 운영자가 다른 곳에 둔
+      비밀까지 아는 것은 아니다. 남은 틈: 허용된 디렉터리 **안**에 심은 하드 링크(예: `skills/x.jsonl` → 다른 사용자의
+      transcript)는 잡지 못한다 — 같은 파일시스템에 쓰는 비격리 writer가 있어야 심을 수 있다.
 - **쓰기 상태만 분리**한다: `projects/`, `plans/`, SDK가 쓰는 cache/history, 워크스페이스, 그리고 아래의
   `plugins/data`.
 - ⚠️ **`plugins/` 전체를 읽기 전용으로 두면 모든 플러그인 훅이 깨진다.** CLI 2.1.283은 훅마다
@@ -632,8 +689,11 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
   아니라 plugins 루트 전체(cache·registry·marketplaces)를 옮기므로 세션별 data 디렉터리는 사용자별 config dir 없이는
   불가능하다. 그래서 `plugins/data`는 **읽기 전용**으로 두고, 게이트웨이가 confined spawn마다
   `installed_plugins.json`의 각 플러그인에 대해 `plugins/data/<id>`를 미리 만든다(`landlock._ensure_plugin_data_dirs`;
-  CLI의 mkdir가 EEXIST로 통과해 훅이 돈다 — 그 안에 쓰는 훅만 EACCES로 실패). 같은 이유로 `~/.npm`·uv 캐시도 공유
-  rw에서 빼고 세션별 `<cwd>/.cli-tmp/{npm-cache,uv-cache}`(`npm_config_cache`·`UV_CACHE_DIR`)로 옮겼다.
+  CLI의 mkdir가 EEXIST로 통과해 훅이 돈다 — 그 안에 쓰는 훅만 EACCES로 실패). `plugins`나 `plugins/data`가 symlink면
+  만들지 않는다(심어 둔 링크가 가리키는 곳에 게이트웨이가 디렉터리를 만들게 된다; 경고 한 번, 미리 있지 않은 플러그인의
+  훅은 confined 세션에서 실패한다). 같은 이유로 `~/.npm`·uv 캐시도 공유 rw에서 빼고 세션별
+  `<cwd>/.cli-tmp/{npm-cache,uv-cache}`(`npm_config_cache`·`UV_CACHE_DIR`)로 옮겼고, 공유 `<cfg>/shell-snapshots`도
+  쓰기 불가로 둔다(모든 세션이 명령마다 자기 스냅숏을 source 한다 — §6 step 3의 구현 노트).
 - ⚠️ **`~/.claude/settings.json`은 세션별로 나누지 말 것 — 공유 *정책*이다.** admin이 관리하는 env 블록이
   여기 쓰이고(`claude_settings_env.py`, `user` setting source로 모든 세션에 적용), `claude plugin install
   --scope user`가 **플러그인 활성화(`enabledPlugins`)를 이 파일에 기록**한다. 세션마다 새 `settings.json`을
@@ -702,8 +762,14 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
    워크스페이스를 쓰거나 그 반대가 된다). 충돌 금지(레지스트리로 추적하고 충돌 시 거부). ①에선 게이트웨이가 정해
    티켓에 싣고, 브로커는 그 uid가 세션 uid 대역인지 검증한다(§3 A·B). `user`가 없는
    트래픽(`/v1/agents/messages`의 stateless 런, `/v1/responses`의 `user=None`)은 **각자 단기 uid**를
-   받아야 한다. ⚠️ 커널은 숫자 uid `setuid`에 `/etc/passwd` 레코드를 요구하지 않지만 **userland은
-   요구한다**(§3 — passwd/group 항목 또는 `nss_wrapper`, allowlist에 `USER`/`LOGNAME`).
+   받아야 한다(구현: 대역 맨 위의 ephemeral 구간에서 런마다 절대 워크스페이스 경로를 키로 하나를 메모리에서 임대하고
+   `WorkspaceManager.cleanup_temp_workspace`가 워크스페이스가 실제로 지워졌을 때 반납한다(지우지 못한 워크스페이스는 uid를
+   계속 쥔다). 모든 경로가 그 런의 CLI를 멈춘 뒤에야 워크스페이스를 지우므로 살아 있는 두 런은 uid를 공유하지 않는다 — 남은
+   틈은 `/v1/agents/messages`·try-run의 정상 경로 disconnect가 시간을 넘긴 경우(그 경로엔 kill이 없다), 요청이 클라이언트를
+   만들기 전에 도는 슬래시 preflight 중에 들어온 삭제, uid 모드에서 kill된 CLI의 프로세스를 브로커가 거두기까지의 약 5초다.
+   그 틈에서도 브로커가 다른 워크스페이스에서 살아 있는 uid와 고아가 쥔 uid의 spawn을 거부한다(`_check_uid_free`); 상한은 §8).
+   ⚠️ 커널은 숫자 uid `setuid`에 `/etc/passwd` 레코드를 요구하지 않지만 **userland은 요구한다**(§3 — passwd/group 항목
+   또는 `nss_wrapper`, allowlist에 `USER`/`LOGNAME`).
 2. **세션별 HOME/`CLAUDE_CONFIG_DIR`** 준비: 쓰기 가능한 per-session `.claude`(projects/plans/
    cache/history/`plugins/data`) + 공유 자산(§5의 clone 루트 — 교체되는 `<repo>-<hash>` 자식이 아니라 그 부모 —
    와 절대 경로 포함, `settings.json`은 공유 정책)을 ro로 연결. §5의 config-dir 소비자(transcript 경로·guard
@@ -739,10 +805,65 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
      `multiprocessing.Lock()` 같은 POSIX 세마포어가 `PermissionError`다(로컬 확인). 공유 `/dev/shm`을 rw로 주면
      Landlock-only(모두 uid 1000)에선 `/tmp`처럼 세션 간 통로가 된다(POSIX shm/세마포어 경로는 `/dev/shm` 바로
      아래로 고정이라 Landlock만으론 세션별로 가를 수 없다).
-     **구현(PR #244):** 두 캐시는 세션 쓰기 경로로 재지정했다 — 런처/브로커가 `npm_config_cache`·
-     `NPM_CONFIG_CACHE`·`UV_CACHE_DIR`을 `<cwd>/.cli-tmp/{npm-cache,uv-cache}`로 덮어쓰고, 공유
-     `~/.npm`·uv 캐시는 rw 규칙에서 뺐다(워크스페이스마다 새로 받는다). `/dev/shm`은 multiprocessing 때문에 rw로
-     남겼고, landlock 모드에선 같은 uid 세션끼리의 공유 면으로 문서화한다(uid 모드는 DAC로 갈린다).
+     **구현(PR #244):**
+     - **워크스페이스**는 confined spawn마다 `landlock._confined_workspace`가 검사한다 — 런처가 커널 cwd를 rw로 허용하므로,
+       워크스페이스 자리에 심은 `<base>/alice/claude -> ~/.claude` 링크가 그 사용자 세션에 config dir 전체를 rw로 열었다.
+       워크스페이스 base 안이면 정확히 `realpath(base)/<rel>`로 풀려야 하고(base 아래 어디에도 symlink가 없어야 한다; base
+       자체의 링크는 괜찮다), 게이트웨이 소유 preflight 디렉터리는 게이트웨이 uid 소유의 실제 디렉터리여야 하며, 그 밖의 cwd는
+       symlink나 디렉터리 아닌 것이면 안 된다. 어느 쪽이든 `/`이거나 §5 구현 노트의 루트(config dir·`$HOME`·워크스페이스
+       base·`/app`·임시 디렉터리·시스템 루트)이거나 그것을 품을 수 없고, base 밖의 cwd는 config dir·워크스페이스 base·`/app`·
+       시스템 루트 안일 수 없다. 아니면 `WorkspaceRefused`로 spawn하지 않는다: `/v1/responses`는 재시도로 풀리지 않는
+       HTTP 500 `workspace_refused`(메시지엔 경로가 없고 경로와 이유는 로그에 남는다), stateless 런은 `api_error` 이벤트다. 풀린 워크스페이스가 첫 rw 항목이자 uid 티켓의 워크스페이스이고, 런처는 커널
+       cwd(`os.getcwd()`)가 rw 항목 중 하나와 정확히 같지 않으면(rw 목록이 비어도) exit 70, 브로커 자식은 chdir 뒤 cwd가 티켓
+       워크스페이스와 다르면 exit 113으로 거부한다.
+     - **rw**는 워크스페이스, 자기 `projects/<name>`(풀린 cwd로 CLI가 짓는 이름 하나), `<cfg>/session-env/<session id>`와
+       `<cfg>/tasks/<session id>`(CLI의 Task 목록), `/dev/shm`뿐이다. 워크스페이스 밖의 rw 항목은 정확히 그 경로로 풀려야
+       하고(그 자리나 위에 symlink가 있으면 거부), 이미 있는 것이 디렉터리가 아니면 거부한다. 두 세션 디렉터리의 형제는
+       다른 세션의 `$CLAUDE_ENV_FILE` 스크립트(CLI가 Bash에 source 한다)와 Task 목록이라 부모는 열지 않는다. landlock
+       모드는 게이트웨이가 둘을 0700으로 미리 만들고, uid 모드는 브로커 자식이 세션 uid로 만든다(게이트웨이 소유 0700은
+       U가 쓰지 못하므로 부모가 U에게 쓰기 가능해야 한다 — §3 리뷰 3 노트).
+       confined CLI는 이것들을 치우지 못하므로 게이트웨이가 세션이 **끝났을 때만** 지운다: 명시적 삭제, 익명 세션의 모든
+       teardown, stateless 정리. named 세션이 만료·축출되거나 게이트웨이가 내려갈 때는 남긴다 — 이어지는 요청이 같은 id로
+       재개하고, 그때 SessionStart는 `source=resume`으로만 돌아 시작 훅이 그 env를 다시 만들지 않는다. 같은 id를 쥔 살아 있는
+       세션이 있으면 지우지 않고(`SessionManager._release_session_dirs`), 재개되지 않은 named 세션의 디렉터리는 남는다.
+       `tasks/<id>`는 confined 모드에서만 지운다(격리가 꺼져 있으면 CLI 자신의 것이다).
+     - **정리 순서:** 세션의 클라이언트를 만드는 동안(`begin_client_start` → `create_client` → `finish_client_start`)
+       teardown(삭제·만료·종료)은 워크스페이스·uid 임대·세션 디렉터리 제거를 그 클라이언트를 멈출 때까지 미루고, 축출은 그
+       세션을 건너뛰며, 그 사이 끝난 세션을 만들던 요청은 409 `session_ended`를 받는다. 세션 매니저의 모든 teardown은 disconnect
+       상한을 넘겨 살아남은 CLI를 SIGKILL한 뒤에야 무엇이든 지우고(`_stop_client`), `verify()`는 질의를 닫은 뒤 워크스페이스를
+       지운다. 첫 턴이 거부된 새 세션(예: 슬래시 400)은 바로 지우고, 이어지는 요청의 세션은 남긴다.
+     - **목록 형식:** `options.env`의 `GATEWAY_LANDLOCK_RO`/`GATEWAY_LANDLOCK_RW`는 절대 경로의 JSON 배열이다. 경로에 `:`가
+       들어갈 수 있어서다(`:`로 이은 목록은 `.../x:/secret`을 `/secret` 허용으로 바꿨다). 그 밖의 형태면 런처가 exit 70으로
+       거부한다. uid 모드에선 목록이 서명된 티켓 안에만 실린다.
+     - **세션 TMPDIR** `<cwd>/.cli-tmp`는 규칙이 아니다: cwd 아래라 이미 허용되고, 에이전트가 바꿀 수 있는 그 경로에 규칙을
+       걸면 `ln -s / .cli-tmp`가 탈출이 된다(`_add_rule`은 `O_PATH`로 링크를 따라간다). 그 자리가 쓸 수 있는 디렉터리가
+       아니면 spawn 때 다시 만들거나 고치고(§3 리뷰 3 노트), 못 하면 spawn이 바로 실패한다(70/118). 수리는 워크스페이스 fd
+       기준으로 하고 링크를 따라가지 않으며, 내보내는 TMPDIR은 실제로 고친 그 디렉터리다. 링크를 계속 바꿔 심는 경쟁자를 만나면
+       8번 만에 fail closed한다 — landlock 모드에선 세션의 분리된 자손을 아무도 치우지 않으므로, 에이전트가 띄운 경쟁자가 자기
+       워크스페이스의 이후 spawn을 계속 실패시킬 수 있다(uid 모드는 CLI가 끝나면 supervisor가 자손을 모두 치운다). 운영자의
+       `CLAUDE_CODE_TMPDIR`는 landlock 모드에서 워크스페이스 바로 아래 한 항목(`tmp`·`./tmp`·`<ws>/tmp`)일 때만 따르고, 그 밖의
+       값과 uid 모드에선 `.cli-tmp`다.
+     - **캐시:** 두 캐시는 세션 쓰기 경로로 재지정했다 — 런처/브로커가 `npm_config_cache`·`NPM_CONFIG_CACHE`·
+       `UV_CACHE_DIR`을 `<cwd>/.cli-tmp/{npm-cache,uv-cache}`로 덮어쓰고, 공유 `~/.npm`·uv 캐시는 rw 규칙에서 뺐다
+       (워크스페이스마다 새로 받는다).
+     - **git:** `GIT_CONFIG_GLOBAL=<cwd>/.cli-tmp/gitconfig`(`core.excludesFile`·`core.attributesFile`을 없는 tmp 경로로
+       돌린다; 물려받은 값도 덮는다). Landlock은 `access(2)`를 중재하지 않아, git이 거부된 `~/.gitconfig`나
+       `~/.config/git/ignore`를 읽을 수 있다고 보고 열다가 exit 128로 죽었다. 그 파일은 읽을 수 있고 비어 있지 않은 일반
+       파일이며 게이트웨이의 `excludesFile` 줄을 그대로 품는 동안만 그대로 둔다 — 그래서 세션 자신의 `git config --global`
+       변경이 남는다. 그 밖의 것(디렉터리, 빈 파일, 읽을 수 없는 파일)은 `gitconfig.broken-<n>`으로 옮기고 새 파일을 임시
+       이름 + rename으로 원자적으로 쓴다(그 자리의 디렉터리 하나가 그 워크스페이스의 이후 모든 세션에서 git을 exit 128로
+       만들었다). 운영 전역 git 설정은 `/etc/gitconfig`(ro)에 두되 위 두 키는 세션 파일이 덮는다(게이트웨이 env의 운영자
+       `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>`은 그래도 이긴다). 남은 틈: CLI 내부 git 도우미는
+       `GIT_CONFIG_GLOBAL=/dev/null`로 고정해 기본 excludes 파일을 여전히 읽는다.
+     - **세션 셸:** 공유 `<cfg>/shell-snapshots`는 일부러 쓰기 불가로 둔다(모든 세션이 명령마다 자기 스냅숏을 source
+       한다). 스냅숏이 없으면 CLI는 모든 Bash 호출을 `bash -c -l <cmd>`로 돌려, `/etc/profile`이 PATH를 되돌리고 거부된
+       `~/.profile`이 결과마다 `Permission denied`를 남겼다. 그래서 CLI가 bash를 고를 때는
+       `CLAUDE_CODE_SHELL=claude-session-bash`(root 소유, 이미지의 `/usr/local/bin`; 파일 자체가 ro 목록에 있다)로 두고, 이
+       래퍼가 맨 앞 `-c -l`을 `--norc -c`로 바꿔 CLI가 골랐을 bash를 exec한다(Debian bash는 env가 ssh처럼 보이면 login이
+       아닌 `bash -c`에서도 거부된 `~/.bashrc`를 읽는다; 다른 argv는 그대로이고 zsh는 손대지 않는다). 남은 틈: 플러그인
+       `bin/`의 PATH 추가와 CLI의 pkill 자기 보호는 스냅숏으로만 들어와 confined 세션엔 없다.
+     - **`/dev/shm`**은 multiprocessing 때문에 rw로 남겼고, landlock 모드에선 같은 uid 세션끼리의 공유 면으로 문서화한다
+       (uid 모드는 DAC로 갈린다).
    - **②**: `bwrap --unshare-user --unshare-pid --proc /proc --dev /dev --die-with-parent --new-session
      --ro-bind <공유 자산> … --bind <워크스페이스> …`로 깨끗한 env와 함께 실제 `claude` exec. ⚠️ **빠지면 F2가 안
      닫히는 플래그들**: `--unshare-user`(비setuid·무특권 bwrap이 pid/mount ns를 만들려면 user ns가 필수),
@@ -787,9 +908,8 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
    Bash 실패가 된다(또 권한 모드를 `default`로 강제한다). 단순 allowlist로는 못 지운다.
    보완(선택): 게이트웨이 전용 비밀을 기동 때 한 번 읽어 쥐고 `os.environ`에서 빼는 **단일 지점**을 두면, 런처를
    타지 않는 spawn 경로(`plugin_admin`의 `git`/`claude`, app-server, frozen 백엔드)까지 한 번에 줄어든다(슬래시
-   preflight는 런처를 타지만 `options.env`를 넘기지 않아 지금은 `child_env_mask()`가 안 걸린다 — ①에선 런처의
-   allowlist가 그 몫을 한다). 단 이것은 denylist라 비밀을 빠짐없이 나열해야 하고(`USER_API_KEYS`, `USAGE_LOG_DB_URL`, 호출마다 다시
-   읽는 `CLAUDE_PLUGIN_GIT_TOKEN` 등), 뺀 값도 `/proc/<게이트웨이>/environ`(exec 시점의 블록)엔 남는다(로컬 확인 —
+   preflight는 이제 세션과 같은 비밀 공란 `client.child_secret_env()`를 `options.env`로 받는다). 단 이것은 denylist라
+   비밀을 빠짐없이 나열해야 하고(`USER_API_KEYS`, `USAGE_LOG_DB_URL`, 호출마다 다시 읽는 `CLAUDE_PLUGIN_GIT_TOKEN` 등), 뺀 값도 `/proc/<게이트웨이>/environ`(exec 시점의 블록)엔 남는다(로컬 확인 —
    그래서 #232가 여전히 필요하다). 세션 allowlist를 대신하지 못한다.
 5. **argv 노출을 설계 단계에서 닫는다.** `/proc/<pid>/cmdline`은 누구나 읽어 ①에서도 교차 테넌트로 샌다
    (로컬 검증: Landlock 도메인의 다른 uid가 피해자 cmdline을 읽음). 거기엔 `--mcp-config` JSON(세션의
@@ -834,15 +954,17 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
 4. **(step 3과 한 묶음) 워크스페이스 uid 소유권** + `/app` 쓰기 차단(§6.3 — ro가 아니라 **룰셋 부재**/DAC) +
    `/proc` 하드닝. ⚠️ 세션이 만든 파일이 uid U 소유가 되면 **uid 1000 게이트웨이가 못 지우고 못 들어간다**:
    `workspace_manager.cleanup_temp_workspace`(rmtree, `ignore_errors=True`라 조용히 실패)와
-   `agent_messages._cleanup_sdk_transcript`가 stateless 정리 보장을 깨고, 업로드·`/files` 라우트는 U 소유
-   디렉터리에서 EACCES가 나며, **spawn 자체**도 걸린다: SDK가 게이트웨이 uid로 `options.cwd`에 `chdir`하고(§3 cwd
-   벽), 그 직전 게이트웨이의 `materialize_workspace_resources(cwd)`는 워크스페이스를 탐색조차 못 하면
-   `Path.is_dir()`의 `PermissionError`를 그대로 올려 세션 생성을 실패시키고(로컬 CPython 3.12·3.13 확인 — `is_dir`은
+   `agent_messages._cleanup_sdk_transcript`(경고는 남긴다)가 stateless 정리 보장을 깨고, 메모리에 없는 세션의
+   transcript rehydrate는 0600 transcript를 못 읽으며(지금은 `TranscriptUnreadable` → HTTP 500
+   `transcript_unreadable`), 업로드·`/files` 라우트는 U 소유 디렉터리에서 EACCES가 나며, **spawn 자체**도 걸린다: SDK가
+   게이트웨이 uid로 `options.cwd`에
+   `chdir`하고(§3 cwd 벽), 그 직전 게이트웨이의 `materialize_workspace_resources(cwd)`는 워크스페이스를 탐색조차 못
+   하면 `Path.is_dir()`의 `PermissionError`를 그대로 올려 세션 생성을 실패시키고(로컬 CPython 3.12·3.13 확인 — `is_dir`은
    `EACCES`를 다시 올리고 `ENOENT`·`ENOTDIR`·`EBADF`·`ELOOP`만 삼킨다), 탐색은 되고 쓰기만 막히면 `OSError`를 경고로
-   삼킨 채 mirror 갱신을 건너뛴다. 그래서 **U 소유 파일 상태의 읽기·쓰기(업로드·mirror 갱신)·정리**는 §3대로 브로커가
-   U로 전환한 단명 자식으로 대행하거나 의도한 group 권한으로 연다(`CAP_CHOWN`은 소유권 반환이 필요할 때만) — 삭제는
-   브로커가 그 세션의 CLI를 죽이고 거둔 **뒤에만** 한다(§3 C). 무특권 스톱갭 `PR_SET_DUMPABLE`(#232)과 entrypoint
-   하드닝(#233)은 이 단계와 독립적으로 이미 들어가 있다.
+   삼킨 채 mirror 갱신을 건너뛴다. 그래서 **U 소유 파일 상태의 읽기(transcript 포함)·쓰기(업로드·mirror 갱신)·정리**는
+   §3대로 브로커가 U로 전환한 단명 자식으로 대행하거나 의도한 group 권한으로 연다(`CAP_CHOWN`은 소유권 반환이 필요할
+   때만) — 삭제는 브로커가 그 세션의 CLI를 죽이고 거둔 **뒤에만** 한다(§3 C). 무특권 스톱갭 `PR_SET_DUMPABLE`(#232)과
+   entrypoint 하드닝(#233)은 이 단계와 독립적으로 이미 들어가 있다.
 5. **검증**: 2-사용자 파일 격리 테스트, 세션 uid가 게이트웨이의 environ **그리고 다른 세션 CLI 자식의
    environ**을 못 읽는지 확인(#232만으로는 앞의 것만 통과한다), **두 세션 간 loopback**(세션 A가 띄운 loopback
    리스너에 세션 B가 닿는지 — §3), ①·Landlock 단독에서 CLI 샌드박스가 꺼진 채 Bash가 도는지(§3 ⚠️), `-v` spawn이
@@ -872,11 +994,19 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
   자식인지 더 볼 수 있다). (4) 사용자별 uid에 같은 사용자의 세션이 동시에 여럿이면 U 단위가 아니라 **세션 단위**
   트리 kill이 필요하다(브로커가 세션별 CLI 트리를 따로 추적). (in-place file-cap 래퍼 대안을 택하면 §3의 N·종료
   `EPERM`·reaping(`init: true`)·secure exec 비용을 대신 떠안는다.)
-- uid 할당 대역과 수명(생성·회수), 동시 사용자 상한. 키는 `WorkspaceManager` resolved key와 일치(§6.1).
+- uid 할당 대역과 수명(생성·회수), 동시 사용자 상한. 키는 `WorkspaceManager` resolved key와 일치(§6.1). 지금은
+  named 사용자의 영속 uid를 회수하지 않아(후속) 안정 대역이 차면 새 named 사용자가 HTTP 500 `uid_band_exhausted`를
+  받고(재시도로 풀리지 않는다; 90%를 넘으면 경고), 슬래시/스킬 preflight는 그 사용자에게 uid가 생기기 전엔 게이트웨이
+  uid로 landlock 형태로 돌아 400으로 끝나는 요청이 uid를 쓰지 않는다. 익명 런의 임대(§6.1)는 그 런의 워크스페이스를
+  정리할 때까지라 `CLAUDE_ISOLATION_EPHEMERAL_UIDS`가 동시 익명 런(stateless 호출, TTL 동안의 익명 세션, try-run,
+  기동 프로브·`verify()`)의 상한이다(첫 턴이 거부된 새 세션은 바로 지워 TTL 동안 임대를 쥐지 않는다) — 다 차면 워크스페이스가 사라진 임대부터 회수하고, 그래도 없으면 재시도 가능한
+  503(`/v1/agents/messages`는 `api_error` 이벤트)이다.
 - 격리 단위: **사용자(테넌트)별**이 기본으로 충분(같은 사용자의 다른 세션은 기밀성 위협이 아님).
   단 `user`가 없는 stateless/익명 런은 각자 단기 uid(§6.1).
 - **resume와의 상호작용**: `/v1/responses`의 세션 재개가 턴을 넘어 **같은 uid/HOME로** 매핑되어야
-  한다(세션 매니저 ↔ uid 매핑의 안정성; transcript 경로 이전과 함께 — §5).
+  한다(세션 매니저 ↔ uid 매핑의 안정성; transcript 경로 이전과 함께 — §5). 지금은 메모리에 없는 uid 모드 세션을 잇지
+  못한다: 게이트웨이가 세션 uid 소유 0600 transcript를 읽지 못해 재시도로 풀리지 않는 HTTP 500 `transcript_unreadable`이고,
+  브로커의 대행 읽기가 후속이다(§7 step 4).
 - `BACKENDS` 값: codex/opencode가 켜져 있으면 그 spawn 경로는 런처 밖이다(§2).
 - prod가 init shim(compose `init: true`/`--init`)을 쓰는가 — 쓰면 PID 1은 docker-init이고 F2 대상과 브로커
   배치 전제가 게이트웨이 자식 기준으로 바뀐다(§1·§4).

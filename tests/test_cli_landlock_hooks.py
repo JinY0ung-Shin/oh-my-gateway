@@ -8,7 +8,7 @@ writable shared store lets one session plant what another's plugin hooks,
 creates two dirs: the plugin's ``${CLAUDE_PLUGIN_DATA}`` and, for SessionStart,
 the session's ``$CLAUDE_ENV_FILE`` dir. When either mkdir fails it does not run
 the hook ("Hook failed to run ... EACCES ... mkdir"). The gateway pre-creates
-both (``landlock._ensure_plugin_data_dirs`` / ``_session_env_dir``), so the
+both (``landlock._ensure_plugin_data_dirs`` / ``_session_dir``), so the
 hooks still run.
 
 These tests drive the real CLI through the launcher with the gateway's own
@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Dict, Optional
@@ -74,6 +75,12 @@ def confined_home(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith("CLAUDE_CODE_") or key in _HARNESS_ENV:
             monkeypatch.delenv(key)
+    # The grant filter refuses entries inside the system temp dir, and this
+    # whole CLI home (the plugin's marketplace included) lives under pytest's
+    # tmp dir there: give the gateway a temp dir of its own below it instead.
+    systmp = tmp_path / "systmp"
+    systmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(systmp))
     with FakeAnthropicAPI() as api:
         home = tmp_path / "home"
         env = api.cli_env(home)

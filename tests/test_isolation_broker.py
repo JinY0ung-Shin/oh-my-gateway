@@ -33,6 +33,17 @@ from pathlib import Path
 import pytest
 
 from src.backends.claude import uid_isolation as ui
+from tests.test_landlock_session_env import (
+    _BASH,
+    _GIT,
+    _GIT_PROBE,
+    _SHELL_PROBE,
+    _TMP_PROBE,
+    _WRAPPER,
+    _assert_git_works,
+    _git_home,
+    _plant,
+)
 
 _REPO = Path(__file__).resolve().parents[1]
 _BROKER = _REPO / "docker" / "isolation_broker.py"
@@ -94,6 +105,22 @@ elif mode == "fail-first-fork":
         if calls[0] == 1:
             raise OSError(errno.EAGAIN, "seam: fork failed")
         return real_fork()
+
+    os.fork = fork
+elif mode == "stop-orphan-killer":
+    # Stops the orphan killer the resident forks before it kills anything, as
+    # a session's orphan could stop a (U, U, U) killer without Landlock signal
+    # scoping (same-uid there is no credential split to refuse the signal).
+    import signal
+
+    real_fork = os.fork
+
+    def fork():
+        caller = sys._getframe(1).f_code.co_name
+        pid = real_fork()
+        if pid == 0 and caller == "_kill_as":
+            os.kill(os.getpid(), signal.SIGSTOP)
+        return pid
 
     os.fork = fork
 runpy.run_path(broker, run_name="__main__")
@@ -438,6 +465,129 @@ class TestBrokerProtocol:
         proc = _run(broker, ws, "print('ran')\n", ticket=ticket)
         assert proc.returncode == 0, proc.stderr
         assert "ran" in proc.stdout
+
+
+class TestCliChildSessionEnv:
+    """#244 review 4, uid mode: the broker's CLI child repairs a planted
+    .cli-tmp and sets the session shell and git global config exactly as the
+    launcher does in landlock mode (both through docker/_landlock_rules.py)."""
+
+    @pytest.mark.parametrize("kind", ["file", "fifo", "socket"])
+    def test_a_planted_cli_tmp_is_replaced(self, broker, tmp_path, kind):
+        # Used to be exit 118 on every later spawn in the workspace.
+        ws = _workspace(tmp_path)
+        _plant(ws / ".cli-tmp", kind)
+        for _ in range(2):
+            proc = _run(broker, ws, _TMP_PROBE)
+            assert proc.returncode == 0, (proc.stderr, broker.log_text())
+            assert proc.stdout.strip() == str(ws / ".cli-tmp")
+        assert (ws / ".cli-tmp").is_dir() and not (ws / ".cli-tmp").is_symlink()
+
+    @pytest.mark.parametrize(
+        "plant",
+        [
+            "import shutil; shutil.rmtree('.cli-tmp'); open('.cli-tmp', 'w')\n",
+            "import os; os.chmod('.cli-tmp', 0)\n",
+        ],
+    )
+    def test_a_session_cannot_lock_its_workspace(self, broker, tmp_path, plant):
+        ws = _workspace(tmp_path)
+        assert _run(broker, ws, plant).returncode == 0
+        proc = _run(broker, ws, _TMP_PROBE)
+        assert proc.returncode == 0, (proc.stderr, broker.log_text())
+        assert proc.stdout.strip() == str(ws / ".cli-tmp")
+
+    @pytest.mark.skipif(_BASH is None, reason="no system bash")
+    def test_bash_calls_run_without_a_login_shell(self, broker, tmp_path):
+        ws = _workspace(tmp_path)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".profile").write_text("PATH=/profile/reset\n")
+        path = f"{tmp_path / 'operator-bin'}:/usr/bin:/bin"
+        # SHELL names a bash: the CLI's pick, as in the image (no zsh).
+        proc = _run(broker, ws, _SHELL_PROBE, HOME=str(home), PATH=path, SHELL=_BASH)
+        assert proc.returncode == 0, (proc.stderr, broker.log_text())
+        r = json.loads(proc.stdout)
+        assert r["shell"] == str(_WRAPPER)
+        assert r["sibling"].startswith("DENY"), r  # the file, not docker/
+        assert r["wrapped"] == {"rc": 0, "out": f"NOLOGIN\nP={path}\n", "err": ""}
+        assert ".profile: Permission denied" in r["direct"]["err"], r  # control
+
+    @pytest.mark.skipif(_GIT is None, reason="no git")
+    def test_git_works_with_a_home_git_config(self, broker, tmp_path):
+        ws = _workspace(tmp_path)
+        home = tmp_path / "home"
+        home.mkdir()
+        _git_home(home)
+        proc = _run(
+            broker,
+            ws,
+            _GIT_PROBE,
+            HOME=str(home),
+            GIT_CONFIG_GLOBAL=str(home / ".gitconfig"),
+        )
+        assert proc.returncode == 0, (proc.stderr, broker.log_text())
+        _assert_git_works(json.loads(proc.stdout), ws / ".cli-tmp")
+
+    def test_a_workspace_planted_as_a_link_is_refused(self, broker, tmp_path):
+        # B (#244 review 4): chdir follows the link, the ruleset grants the
+        # name. The kernel's cwd must be exactly the ticket's workspace.
+        real = _workspace(tmp_path, "real")
+        link = tmp_path / "alice"
+        os.symlink(real, link)
+        proc = _run(broker, link, "print('ran')\n")
+        assert proc.returncode == 113, (proc.stderr, broker.log_text())
+        assert "ran" not in proc.stdout
+        assert "resolves to" in broker.log_text()
+
+    def test_a_linked_ticket_entry_is_not_granted(self, broker, tmp_path):
+        # G (#244 review 4): the ticket's entries, which the gateway resolved,
+        # are opened following no link; one swapped in later is refused.
+        ws = _workspace(tmp_path)
+        (ws / "in.txt").write_text("IN\n")
+        secret = tmp_path / "app"
+        secret.mkdir()
+        (secret / "secret.txt").write_text("SECRET\n")
+        agents = tmp_path / "agents"
+        os.symlink(secret, agents)
+        ticket = broker.ticket(ws, ro=[str(agents)])
+        proc = _run(broker, ws, _PROBE, ws, agents, ticket=ticket)
+        assert proc.returncode == 0, (proc.stderr, broker.log_text())
+        assert json.loads(proc.stdout)["out"].startswith("DENY")
+        assert "is a symlink" in proc.stderr
+        # Control: the same tree, named without the link, is granted.
+        ticket = broker.ticket(ws, ro=[str(secret)])
+        proc = _run(broker, ws, _PROBE, ws, secret, ticket=ticket)
+        assert json.loads(proc.stdout)["out"] == "OK"
+
+    def test_a_hard_linked_ticket_file_is_not_granted(self, broker, tmp_path):
+        ws = _workspace(tmp_path)
+        (ws / "in.txt").write_text("IN\n")
+        theirs = tmp_path / "bob"
+        theirs.mkdir()
+        (theirs / "t.jsonl").write_text("BOB\n")
+        shared = tmp_path / "shared"
+        shared.mkdir()
+        os.link(theirs / "t.jsonl", shared / "secret.txt")
+        ticket = broker.ticket(ws, ro=[str(shared / "secret.txt")])
+        proc = _run(broker, ws, _PROBE, ws, shared, ticket=ticket)
+        assert proc.returncode == 0, (proc.stderr, broker.log_text())
+        assert json.loads(proc.stdout)["out"].startswith("DENY")
+        assert "a file with 2 links" in proc.stderr
+
+    def test_a_real_cli_dir_holding_the_workspace_is_refused(
+        self, start_broker, tmp_path
+    ):
+        # The broker grants its own real CLI's dir, which the gateway's startup
+        # check cannot see: one holding the workspace is refused (exit 114).
+        shim = tmp_path / "claude"
+        shim.write_text('#!/bin/sh\nexec /usr/bin/python3 "$@"\n')
+        shim.chmod(0o755)
+        broker = start_broker(extra_env={"GATEWAY_REAL_CLI": str(shim)})
+        proc = _run(broker, _workspace(tmp_path), "print('ran')\n")
+        assert proc.returncode == 114, (proc.stderr, broker.log_text())
+        assert "ran" not in proc.stdout
+        assert "refusing to grant the real CLI's directory" in broker.log_text()
 
 
 class TestExitStatusMirroring:
@@ -935,8 +1085,9 @@ class TestCredentialSplit:
     """B1's credential layer as calls. The switch itself needs CAP_SETUID and is
     container-verify only, and the same-uid protocol tests skip it, so this pins
     the sequence: the supervisor keeps the broker's real and saved uid and takes
-    U only as its effective uid; the CLI child completes (U, U, U) on its own
-    and refuses to exec when it did not take."""
+    U only as its effective uid, and so does the resident's orphan killer; the
+    CLI child completes (U, U, U) on its own and refuses to exec when it did not
+    take."""
 
     U, G = 20005, 20006
 
@@ -1017,16 +1168,51 @@ class TestCredentialSplit:
         self._patch(broker_module, monkeypatch, resuid, resgid, groups)
         assert broker_module._finish_switch(self.U, self.G, False) is False
 
-    def test_backstop_helper_switches_fully(self, broker_module, monkeypatch):
+    def _orphan_killer(self, mod, monkeypatch, resuid, pids):
+        """Run _kill_as's forked side in-process; return (exit code, calls)."""
         u, g = self.U, self.G
-        calls = self._patch(broker_module, monkeypatch, (u, u, u), (g, g, g))
-        broker_module._switch_fully(u, g, False)
+
+        def exit_(code):
+            raise _Exit(code)
+
+        calls = self._patch(
+            mod,
+            monkeypatch,
+            resuid,
+            (g, g, g),
+            fork=lambda: 0,
+            _exit=exit_,
+            kill=lambda pid, sig: calls.append(("kill", pid, sig)),
+        )
+        with pytest.raises(_Exit) as exited:
+            mod._kill_as(u, g, pids, False)
+        return exited.value.code, calls
+
+    def test_orphan_killer_keeps_real_and_saved_uid(self, broker_module, monkeypatch):
+        # #11 (review 4): a (U, U, U) killer could be SIGSTOPped by the orphans
+        # it was sent for (no signal scoping below Landlock ABI 6) while the
+        # resident broker waited on it; it takes the supervisor's split.
+        b, u, g = os.getuid(), self.U, self.G
+        code, calls = self._orphan_killer(
+            broker_module, monkeypatch, (b, u, b), [101, 102]
+        )
+        assert code == 0
         assert calls == [
             ("setgroups", []),
             ("setresgid", g, g, g),
-            ("setresuid", u, u, u),
+            ("setresuid", b, u, b),
             ("drop_all_caps",),
+            ("kill", 101, signal.SIGKILL),
+            ("kill", 102, signal.SIGKILL),
         ]
+
+    def test_orphan_killer_kills_nothing_unless_the_split_took(
+        self, broker_module, monkeypatch
+    ):
+        u = self.U
+        code, calls = self._orphan_killer(broker_module, monkeypatch, (u, u, u), [101])
+        assert code == 1
+        assert not [c for c in calls if c[0] in ("kill", "drop_all_caps")]
 
     def test_cli_child_exits_115_before_anything_else(self, broker_module, monkeypatch):
         u, g, b = self.U, self.G, os.getuid()
@@ -1064,6 +1250,185 @@ class TestCredentialSplit:
             broker_module._exec_cli(req, [], "/bin/true", os.getpid(), False)
         assert exited.value.code == 115
         assert steps == []  # no setsid, chdir or exec on a failed switch
+
+
+# Drives the broker's _kill_as directly: a sleeping child stands in for an
+# orphan, and os.fork is wrapped so the killer _kill_as forks first reports its
+# pid, then stops itself or hangs when asked. argv: broker, mode (run, stop or
+# hang), timeout, uid, gid, same-uid flag. Prints the outcome as JSON.
+_KILL_AS_HARNESS = r"""
+import importlib.util, json, os, signal, sys, time
+spec = importlib.util.spec_from_file_location("broker_harness", sys.argv[1])
+broker = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(broker)
+mode, timeout = sys.argv[2], float(sys.argv[3])
+uid, gid, same = int(sys.argv[4]), int(sys.argv[5]), sys.argv[6] == "1"
+broker._KILLER_TIMEOUT = timeout
+victim = os.fork()
+if victim == 0:
+    time.sleep(60)
+    os._exit(0)
+r, w = os.pipe()
+real_fork = os.fork
+
+def fork():
+    pid = real_fork()
+    if pid == 0:
+        os.write(w, b"%d" % os.getpid())
+        if mode == "stop":
+            os.kill(os.getpid(), signal.SIGSTOP)
+        elif mode == "hang":
+            time.sleep(60)
+    return pid
+
+os.fork = fork
+start = time.monotonic()
+ok = broker._kill_as(uid, gid, [victim], same)
+elapsed = time.monotonic() - start
+os.close(w)
+killer = int(os.read(r, 32))
+try:
+    os.waitpid(killer, os.WNOHANG)
+    reaped = False
+except ChildProcessError:
+    reaped = True
+
+def victim_state():
+    done, status = os.waitpid(victim, os.WNOHANG)
+    if not done:
+        return "alive"
+    killed = os.WIFSIGNALED(status) and os.WTERMSIG(status) == signal.SIGKILL
+    return "killed" if killed else "exited"
+
+state, end = victim_state(), time.monotonic() + 5
+while ok and state == "alive" and time.monotonic() < end:
+    time.sleep(0.01)
+    state = victim_state()
+if state == "alive":
+    os.kill(victim, signal.SIGKILL)
+    os.waitpid(victim, 0)
+print(json.dumps({"ok": ok, "elapsed": elapsed, "reaped": reaped, "victim": state}))
+"""
+
+
+class TestOrphanKiller:
+    """#11 (PR #244 review 4): the orphan backstop can never wedge the
+    single-threaded resident broker. Its killer takes the supervisor's split
+    credentials, so a session cannot signal it (``TestCredentialSplit``), and
+    is waited for with a bound: a killer that stops or overruns is SIGKILLed and
+    reaped, and the sweep is reported failed rather than blocking every user."""
+
+    def _kill_as(self, mode, timeout, uid=None, gid=None, same=True):
+        uid = os.getuid() if uid is None else uid
+        gid = os.getgid() if gid is None else gid
+        argv = [str(_BROKER), mode, str(timeout), str(uid), str(gid), str(int(same))]
+        # Own group: a wedged run's stopped killer and victim die with it.
+        proc = subprocess.Popen(
+            [sys.executable, "-c", _KILL_AS_HARNESS, *argv],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            out, err = proc.communicate(timeout=20)
+        finally:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            proc.wait()
+        assert proc.returncode == 0, err
+        return json.loads(out)
+
+    def test_a_stopped_killer_is_killed_at_once(self):
+        result = self._kill_as("stop", timeout=30)
+        assert result["ok"] is False
+        assert result["elapsed"] < 5  # WUNTRACED saw the stop: no 30 s wait
+        assert result["reaped"]
+        assert result["victim"] == "alive"  # never killed: reported, not claimed
+
+    def test_an_overrunning_killer_is_killed_at_the_timeout(self):
+        result = self._kill_as("hang", timeout=0.5)
+        assert result["ok"] is False
+        assert 0.5 <= result["elapsed"] < 5
+        assert result["reaped"]
+        assert result["victim"] == "alive"
+
+    def test_a_working_killer_kills_and_is_reaped(self):
+        result = self._kill_as("run", timeout=30)
+        assert result["ok"] is True
+        assert result["reaped"]
+        assert result["victim"] == "killed"
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root could really switch")
+    def test_a_killer_that_cannot_switch_kills_nothing(self):
+        # The real set*id calls, unprivileged: they fail and the killer exits
+        # without signalling anything (never as the broker's own uid).
+        result = self._kill_as("run", timeout=30, uid=20005, gid=20005, same=False)
+        assert result["ok"] is False
+        assert result["reaped"]
+        assert result["victim"] == "alive"
+
+    @staticmethod
+    def _wait_log(broker, text, timeout=10.0):
+        deadline = time.monotonic() + timeout
+        while text not in broker.log_text():
+            if time.monotonic() >= deadline:
+                pytest.fail("%r never logged:\n%s" % (text, broker.log_text()))
+            time.sleep(0.05)
+
+    def test_a_stopped_killer_does_not_wedge_the_broker(self, start_broker, tmp_path):
+        import re
+
+        broker = start_broker(seam="stop-orphan-killer")
+        ws = _workspace(tmp_path)
+        pids = ws / "pids"
+        proc = _popen(broker, ws, _STUBBORN, pids)
+        cli = kid = None
+        try:
+            cli, kid, supervisor = map(int, _wait_file(pids, proc=proc).split())
+            os.kill(supervisor, signal.SIGKILL)  # survivors re-parent to the broker
+            assert proc.wait(timeout=10) == 70
+            self._wait_log(broker, "could not sweep orphans")
+            # Still serving: it answers at once. Every spawn here has the
+            # orphans' uid (same-uid test mode), and a uid stays refused while
+            # orphans a sweep gave up on still hold it, so it never runs
+            # beside them.
+            refused = _run(broker, _workspace(tmp_path, "ws2"), "print('ran')\n")
+            assert refused.returncode == 70
+            assert "ran" not in refused.stdout
+            self._wait_log(broker, "still has an unswept orphan")
+            assert broker.alive()
+            assert _alive(kid)  # the stopped killer never got to it
+            stopped = re.search(r"orphan killer (\d+) stopped", broker.log_text())
+            assert stopped, broker.log_text()
+            assert not Path("/proc/%s" % stopped.group(1)).exists()  # reaped
+            for pid in (cli, kid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass  # the CLI may already be gone; the kid is not
+            ws3 = _workspace(tmp_path, "ws3")
+            deadline = time.monotonic() + 10
+            while True:  # the broker reaps them on its next tick
+                ran = _run(broker, ws3, "print('ran')\n")
+                if ran.returncode == 0 or time.monotonic() > deadline:
+                    break
+                time.sleep(0.1)
+            assert ran.returncode == 0, ran.stderr
+            assert "ran" in ran.stdout  # and spawning again once they are gone
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            leftovers = [p for p in (cli, kid) if p is not None]
+            if broker.alive():  # a stopped killer, if the broker wedged on it
+                leftovers += [int(pid) for pid in _supervisors(broker)]
+            for pid in leftovers:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
 
 
 def _fd_links(pid: int) -> dict:

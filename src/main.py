@@ -420,6 +420,9 @@ app.add_middleware(
     allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    # A browser-side OpenAI client must read it to stop retrying the errors
+    # no retry can clear (src/routes/responses.py ``_NO_RETRY_HEADERS``).
+    expose_headers=["x-should-retry"],
 )
 
 # Add rate limiting error handler
@@ -716,10 +719,15 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
     if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
         # Caller already produced an OpenAI-style {"error": {...}} payload;
         # pass it through unchanged to avoid double-nesting.
-        return JSONResponse(status_code=exc.status_code, content=detail)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=detail,
+            headers=getattr(exc, "headers", None),
+        )
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"message": detail, "type": "api_error", "code": str(exc.status_code)}},
+        headers=getattr(exc, "headers", None),
     )
 
 

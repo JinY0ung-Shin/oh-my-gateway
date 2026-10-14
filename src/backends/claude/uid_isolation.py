@@ -39,7 +39,7 @@ import os
 import secrets
 import threading
 import time
-from collections import OrderedDict
+from collections import deque
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -62,9 +62,10 @@ _DEFAULT_UID_MAX = 29999
 # The broker's own dedicated uid, outside the default band (the entrypoint's
 # default must match: docker/entrypoint.py).
 _DEFAULT_BROKER_UID = 19999
-# Top slice of the band reserved for anonymous/stateless runs (recycled in
-# memory, never persisted) so they cannot exhaust the band — see the split in
-# :func:`_stable_band` / :func:`_ephemeral_band`.
+# Top slice of the band reserved for anonymous/stateless runs (leased in memory
+# for as long as the run's workspace lives, never persisted) so they cannot
+# exhaust the band — see the split in :func:`_stable_band` /
+# :func:`_ephemeral_band` and :class:`_EphemeralPool`.
 _DEFAULT_EPHEMERAL = 256
 
 _TICKET_TTL_SECONDS = 120  # a ticket is presented within one spawn; keep it short
@@ -125,6 +126,15 @@ class UidAllocationError(RuntimeError):
     """Raised when no uid can be assigned (range exhausted or invalid)."""
 
 
+class UidBandExhausted(UidAllocationError):
+    """Every uid of the stable (named-user) band is assigned.
+
+    Unlike a momentary shortage this lasts until an operator widens the band:
+    a named user keeps their uid for good (no reclamation yet), so a retry can
+    never succeed. The request path reports it as such, not "retry shortly".
+    """
+
+
 class UidRegistry:
     """A persisted ``user key -> uid`` map with sequential allocation.
 
@@ -160,7 +170,14 @@ class UidRegistry:
         self._used: set[int] = set()
         # Raw entries kept verbatim on persist but never resolved (see _load).
         self._held: Dict[str, object] = {}
+        # How many uids the band can hand out, and whether the "nearly full"
+        # warning is out for the current crossing (see _check_fill).
+        self._capacity = max(0, hi - lo + 1) - sum(
+            1 for u in self._reserved if lo <= u <= hi
+        )
+        self._fill_warned = False
         self._load()
+        self._check_fill()
 
     def _load(self) -> None:
         try:
@@ -174,7 +191,9 @@ class UidRegistry:
             ) from exc
         try:
             raw = json.loads(text)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
+            # RecursionError: a deeply nested document, which would otherwise
+            # escape registry_errors() as a traceback instead of this error.
             raise UidAllocationError(
                 f"uid registry {self._path} is corrupt ({exc}); refusing to "
                 "allocate uids rather than reassign them. Restore it from a "
@@ -271,6 +290,37 @@ class UidRegistry:
                 exc,
             )
 
+    # Warn once the stable band is this full: a named user's uid is never
+    # reclaimed yet, and a full band refuses every new named user.
+    _FILL_WARN_PERCENT = 90
+
+    def _check_fill(self) -> None:
+        """Warn once when the band crosses ``_FILL_WARN_PERCENT`` used (not on
+        every allocation after that; again only after it dropped below)."""
+        if self._capacity <= 0:
+            return
+        used = sum(
+            1
+            for u in self._used
+            if self._lo <= u <= self._hi and u not in self._reserved
+        )
+        full = used * 100 >= self._capacity * self._FILL_WARN_PERCENT
+        if full and not self._fill_warned:
+            logger.warning(
+                "uid registry %s: %d of the %d uids in the stable band [%d, %d] "
+                "are assigned to named users. They are never reclaimed, and a "
+                "full band refuses every new named user; widen %s/%s before it "
+                "fills up.",
+                self._path,
+                used,
+                self._capacity,
+                self._lo,
+                self._hi,
+                UID_MIN_ENV,
+                UID_MAX_ENV,
+            )
+        self._fill_warned = full
+
     def claimed_uids(self) -> Set[int]:
         """Every uid the registry file accounts for, honored or held."""
         with self._lock:
@@ -306,61 +356,121 @@ class UidRegistry:
                     self._map.pop(key, None)
                     self._used.discard(uid)
                     raise
+                self._check_fill()
                 return uid
-            raise UidAllocationError(
+            raise UidBandExhausted(
                 f"stable uid band [{self._lo}, {self._hi}] is exhausted "
                 f"({len(self._used)} in use); widen {UID_MIN_ENV}/{UID_MAX_ENV}"
             )
 
 
 class _EphemeralPool:
-    """In-memory ``key -> uid`` leases for anonymous/stateless runs.
+    """In-memory uid leases on the ephemeral band, for anonymous/stateless runs.
 
-    The key is the run's absolute ``_tmp_`` workspace path, and a lease lives
-    exactly as long as that directory: a uid is handed to another key only
-    after its workspace is gone (``cleanup_temp_workspace`` ran, so the run
-    ended). With every uid leased, :meth:`resolve` raises instead of recycling
-    a live one — two concurrent runs on one uid would share DAC access and
-    ``/dev/shm`` (#244 review 4). Never persisted, so the high-volume anonymous
-    path — every ``/v1/agents/messages`` call, each anonymous ``/v1/responses``
-    session, admin try-runs, startup ``verify()`` — cannot grow a file. A
-    workspace that cannot be removed keeps its uid, which fails closed (the
-    broker also refuses a uid still live in another workspace).
+    A run's key (its absolute workspace path: ``landlock._uid_spawn_env`` keys
+    an anonymous spawn on ``_absolute(cwd)``) holds one uid from its first
+    spawn until :meth:`release`, which ``WorkspaceManager.cleanup_temp_workspace``
+    calls when the run's workspace is removed. Every spawn of the run (the
+    session, a re-created client, its slash preflight) gets that lease, and no
+    other key gets the uid while it is held. Sharing a uid between two live
+    runs would give up the DAC split of ``/dev/shm`` and, below Landlock ABI 6,
+    the signal scoping (#244 review), so the lease follows the workspace rather
+    than one client: a session keeps its uid across re-created clients, and
+    the workspace (with the lease) goes only after the run's CLIs are stopped.
+    The session manager kills a CLI that outlived its capped disconnect, and a
+    session that ends while its client is still starting leaves the removal to
+    the request creating that client. Gaps remain: a ``/v1/agents/messages``
+    or admin try-run CLI is killed after its disconnect only when the caller
+    went away, so a normal-path disconnect that times out ends the lease with
+    that CLI possibly still running; a delete that lands during the slash
+    preflight a request runs before creating its client ends the lease under
+    that short catalog CLI; and in uid mode a killed CLI's own processes are
+    the broker's to reap, within about 5 s. A new key gets a free uid:
+    never-used ones first, then the one released longest ago, which keeps a
+    just-released uid out of use far longer than such stragglers live.
+
+    The pool's size bounds how many anonymous runs can be live at once, not
+    how many can run over time. When every uid is leased, the leases whose
+    workspace no longer exists are reclaimed first, which recovers a release
+    that never came. If none is free, the spawn fails with
+    :class:`UidAllocationError` (on ``/v1/responses`` a retryable 503) instead
+    of sharing a live uid. Never persisted, so the high-volume anonymous path
+    (every ``/v1/agents/messages`` call, each anonymous ``/v1/responses``
+    session, admin try-runs, startup ``verify()`` and the uid probe) cannot
+    grow a file. The broker is the authoritative backstop for the gaps above:
+    it refuses a uid that a live supervisor still holds for another workspace,
+    and any uid an orphan still holds (``isolation_broker._Broker._check_uid_free``).
     """
 
     def __init__(self, lo: int, hi: int, reserved: Optional[Set[int]] = None) -> None:
         reserved = set(reserved or ())
         self._uids = [u for u in range(lo, hi + 1) if u not in reserved]
-        self._free = list(self._uids)
-        self._leases: "OrderedDict[str, int]" = OrderedDict()
+        # Free uids in hand-out order: the never-used ones (ascending) stay
+        # ahead of released ones, which join at the back.
+        self._free: deque[int] = deque(self._uids)
+        self._leases: Dict[str, int] = {}
         self._lock = threading.Lock()
 
-    @staticmethod
-    def _released(key: str) -> bool:
-        return not os.path.lexists(key)
-
     def resolve(self, key: str) -> int:
+        """The uid leased to *key*, leasing a free one when it holds none."""
         with self._lock:
-            if key in self._leases:
-                self._leases.move_to_end(key)
-                return self._leases[key]
+            uid = self._leases.get(key)
+            if uid is not None:
+                return uid
             if not self._uids:
                 raise UidAllocationError(
                     "no ephemeral uids available; widen the band or raise "
                     f"{EPHEMERAL_UIDS_ENV}"
                 )
             if not self._free:
-                for old in [k for k in self._leases if self._released(k)]:
-                    self._free.append(self._leases.pop(old))
+                self._reclaim_stale_locked()
             if not self._free:
                 raise UidAllocationError(
                     f"all {len(self._uids)} ephemeral uids are leased to live "
-                    "anonymous workspaces; retry later or raise "
+                    "anonymous runs; retry once one finishes, or raise "
                     f"{EPHEMERAL_UIDS_ENV}"
                 )
-            uid = self._free.pop(0)
+            uid = self._free.popleft()
             self._leases[key] = uid
             return uid
+
+    def release(self, key: str) -> Optional[int]:
+        """End *key*'s lease; its uid is handed out again last. Returns the
+        released uid, ``None`` when *key* held no lease."""
+        with self._lock:
+            uid = self._leases.pop(key, None)
+            if uid is not None:
+                self._free.append(uid)
+            return uid
+
+    def _reclaim_stale_locked(self) -> None:
+        for key in [k for k in self._leases if _lease_workspace_gone(k)]:
+            uid = self._leases.pop(key)
+            self._free.append(uid)
+            logger.warning(
+                "Reclaimed ephemeral uid %d from %s: its workspace is gone but "
+                "the lease was never released",
+                uid,
+                key,
+            )
+
+
+def _lease_workspace_gone(key: str) -> bool:
+    """Whether the workspace an ephemeral lease is keyed on no longer exists.
+
+    Only a missing absolute path counts. A key that names no path is freed by
+    its release alone, and a path that cannot be checked (EACCES, EIO) keeps
+    its lease: handing a live run's uid to another run is what leases prevent.
+    """
+    if not os.path.isabs(key):
+        return False
+    try:
+        os.lstat(key)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
+    return False
 
 
 _registry: Optional[UidRegistry] = None
@@ -408,6 +518,20 @@ def get_ephemeral_pool() -> _EphemeralPool:
         return _ephemeral_pool
 
 
+def release_ephemeral(key: str) -> None:
+    """End an anonymous run's uid lease (see :class:`_EphemeralPool`).
+
+    Called once the run is over and its workspace removed, with the key its
+    spawns leased under (the absolute workspace path). A no-op when no
+    anonymous run leased a uid in this process (the pool is created on the
+    first lease, so the other modes never build it) and for a key that holds
+    no lease.
+    """
+    pool = _ephemeral_pool
+    if pool is not None:
+        pool.release(key)
+
+
 def reset_registry_cache() -> None:
     """Drop the memoized registry/pool (tests, or a band reconfiguration)."""
     global _registry, _ephemeral_pool
@@ -420,12 +544,32 @@ def resolve_uid(key: str, *, persist: bool = True) -> int:
     """Map a key to its per-user uid.
 
     ``persist=True`` (a named user) uses the durable stable band; ``persist=
-    False`` (an anonymous/stateless run) uses the recycled in-memory ephemeral
-    band, so it can never grow the registry file or exhaust the band.
+    False`` (an anonymous/stateless run) leases a uid of the in-memory
+    ephemeral band until :func:`release_ephemeral`, so it can never grow the
+    registry file, and two live runs never share a uid.
     """
     if persist:
         return get_registry().resolve(key)
     return get_ephemeral_pool().resolve(key)
+
+
+def existing_uid(key: str) -> Optional[int]:
+    """The durable uid already registered for the named user *key*, else ``None``.
+
+    Never allocates and never writes the registry, so a caller can ask before
+    deciding to spawn as the user at all (the slash-command preflight, which
+    runs before the request is validated). A held entry — one the band cannot
+    honor — raises the same :class:`UidAllocationError` as
+    :meth:`UidRegistry.resolve`, and so does a registry that cannot be loaded.
+    """
+    registry = get_registry()
+    with registry._lock:
+        uid = registry._map.get(key)
+        held = key in registry._held
+    if held:
+        # resolve() refuses a held key before it could allocate anything.
+        return registry.resolve(key)
+    return uid
 
 
 def registry_errors() -> List[str]:

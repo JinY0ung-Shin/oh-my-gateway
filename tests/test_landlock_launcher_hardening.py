@@ -13,15 +13,18 @@ import json
 import os
 import signal
 import socket
+import stat
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
 import pytest
 
 from src.backends.claude import landlock
+from tests.test_landlock_session_env import _TMP_PROBE, _plant
 
 _REPO = Path(__file__).resolve().parents[1]
 _LAUNCHER = _REPO / "docker" / "landlock_launcher.py"
@@ -32,7 +35,7 @@ _ST_EXITED, _ST_SIGNALED, _ST_REFUSED = 1, 2, 3
 
 def _skip_reason() -> str:
     if landlock.landlock_abi() < landlock.MIN_LANDLOCK_ABI:
-        return "Landlock ABI < 2"
+        return f"Landlock ABI < {landlock.MIN_LANDLOCK_ABI}"
     if not os.access(_SYS_PY, os.X_OK):
         return "no /usr/bin/python3"
     return ""
@@ -53,8 +56,8 @@ def _env(ws: Path, **extra) -> dict:
         "PATH": "/usr/bin:/bin",
         "PWD": str(ws),
         landlock.REAL_CLI_ENV: _SYS_PY,
-        landlock.RW_ENV: str(ws),
-        landlock.RO_ENV: "",
+        landlock.RW_ENV: json.dumps([str(ws)]),
+        landlock.RO_ENV: json.dumps([]),
         **extra,
     }
 
@@ -99,7 +102,7 @@ class TestStartsIsolated:
         # The attack: rewrite the rw list before the launcher reads it.
         (Path(user_site) / "evil.pth").write_text(
             "import os; open(%r, 'w').write('pth'); "
-            "os.environ['GATEWAY_LANDLOCK_RW'] = '/'\n" % str(markers / "pth")
+            "os.environ['GATEWAY_LANDLOCK_RW'] = '[\"/\"]'\n" % str(markers / "pth")
         )
         pypath = tmp_path / "pypath"
         pypath.mkdir()
@@ -174,7 +177,7 @@ class TestTrustedPaths:
     @pytest.mark.parametrize("var", [landlock.RW_ENV, landlock.RO_ENV])
     def test_relative_rule_path_is_refused(self, ws, var):
         proc = _confined(
-            ws, "print('ran')\n", env=_env(ws, **{var: str(ws) + os.pathsep + "data"})
+            ws, "print('ran')\n", env=_env(ws, **{var: json.dumps([str(ws), "data"])})
         )
         assert proc.returncode == 70
         assert "ran" not in proc.stdout
@@ -199,6 +202,327 @@ class TestTrustedPaths:
         assert proc.returncode == 70
         assert "ran" not in proc.stdout
         assert "cannot create the session tmp dir" in proc.stderr
+
+
+@pytest.fixture
+def gateway_landlock(monkeypatch, tmp_path):
+    """The gateway in landlock mode with a scratch config dir; yields it."""
+    cfg = tmp_path / "cfg"
+    cfg.mkdir()
+    # The grant filter refuses entries inside the system temp dir, where all
+    # of tmp_path lives: give the gateway a temp dir of its own below it.
+    systmp = tmp_path / "systmp"
+    systmp.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(systmp))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+    monkeypatch.setenv(landlock.MODE_ENV, "landlock")
+    for var in (landlock.FALLBACK_ENV, "CLAUDE_ADD_DIRS", "CLAUDE_PLUGIN_CLONE_ROOT"):
+        monkeypatch.delenv(var, raising=False)
+    landlock.reset_mode_cache()
+    yield cfg
+    landlock.reset_mode_cache()
+
+
+_READ_ARGS = (
+    "import json, sys\n"
+    "def r(p):\n"
+    "    try:\n"
+    "        return open(p).read().strip()\n"
+    "    except OSError as e: return 'DENY:%d' % e.errno\n"
+    "print(json.dumps([r(p) for p in sys.argv[1:]]))\n"
+)
+
+
+class TestPathListEncoding:
+    """#244 review 4: the lists are JSON arrays — a ':' in a path used to split
+    one grant into others (every spawn refused, or a grant of what follows)."""
+
+    def test_colon_paths_from_the_gateway_are_granted(self, gateway_landlock, tmp_path):
+        # An admin marketplace cloned from https://git.internal:8443, in a
+        # workspace base whose name has a ':' too.
+        clone = tmp_path / "clones" / "git.internal:8443-abcd"
+        clone.mkdir(parents=True)
+        (clone / "SKILL.md").write_text("SKILL\n")
+        (gateway_landlock / "plugins").mkdir()
+        (gateway_landlock / "plugins" / "known_marketplaces.json").write_text(
+            json.dumps({"m": {"installLocation": str(clone)}})
+        )
+        ws = tmp_path / "ws:2026" / "alice"
+        ws.mkdir(parents=True)
+        env = landlock.options_env(ws)
+        assert str(clone) in json.loads(env[landlock.RO_ENV])
+        assert str(ws) in json.loads(env[landlock.RW_ENV])
+        env.update({"PATH": "/usr/bin:/bin", landlock.REAL_CLI_ENV: _SYS_PY})
+        probe = _READ_ARGS + "open('w.txt', 'w').write('x')\n"
+        proc = _confined(ws, probe, clone / "SKILL.md", env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout) == ["SKILL"]
+        assert (ws / "w.txt").read_text() == "x"
+
+    def test_a_colon_slash_entry_grants_only_itself(self, ws, tmp_path):
+        secret = tmp_path / "secret"
+        secret.mkdir()
+        (secret / "s.txt").write_text("SECRET\n")
+        weird = Path(f"{tmp_path}/mk/x:{secret}")  # split on ':' -> grants secret/
+        weird.mkdir(parents=True)
+        (weird / "in.txt").write_text("IN\n")
+        env = _env(ws, **{landlock.RO_ENV: json.dumps([str(weird)])})
+        proc = _confined(ws, _READ_ARGS, weird / "in.txt", secret / "s.txt", env=env)
+        assert proc.returncode == 0, proc.stderr
+        got = json.loads(proc.stdout)
+        assert got[0] == "IN"
+        assert got[1].startswith("DENY"), got
+
+    @pytest.mark.parametrize("var", [landlock.RW_ENV, landlock.RO_ENV])
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "/abs/path",  # the old ':'-joined format
+            "not json",
+            '"/abs"',
+            '{"p": "/abs"}',
+            "[1]",
+            '["/abs", null]',
+            '[""]',
+            '["/a\\u0000b"]',
+            '["/\\ud800"]',  # not encodable as a file name
+        ],
+    )
+    def test_anything_but_a_list_of_paths_is_refused(self, ws, var, value):
+        proc = _confined(ws, "print('ran')\n", env=_env(ws, **{var: value}))
+        assert proc.returncode == 70
+        assert "ran" not in proc.stdout
+        assert "refusing it" in proc.stderr
+
+    @pytest.mark.parametrize("value", [None, "", "  ", "[]"])
+    def test_an_unset_or_empty_ro_list_is_no_entry(self, ws, value):
+        env = _env(ws)
+        env.pop(landlock.RO_ENV)
+        if value is not None:
+            env[landlock.RO_ENV] = value
+        proc = _confined(ws, "open('w.txt', 'w').write('x')\n", env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert (ws / "w.txt").read_text() == "x"
+
+
+class TestWorkspaceIsTheGateways:
+    """B (#244 review 4): the launcher granted rw on os.getcwd() — after the
+    SDK's chdir followed a workspace planted as a link (``alice -> ~/.claude``,
+    ``alice -> <base>``), that was the link's target: the whole config dir, or
+    every user's workspace. The kernel's cwd must now be exactly the gateway's
+    first rw entry — the workspace, which the gateway resolves."""
+
+    @pytest.mark.parametrize("rw", [None, "", "[]", "elsewhere"])
+    def test_a_spawn_without_its_workspace_in_rw_is_refused(self, ws, tmp_path, rw):
+        env = _env(ws)
+        env.pop(landlock.RW_ENV)
+        if rw == "elsewhere":
+            env[landlock.RW_ENV] = json.dumps([str(tmp_path)])
+        elif rw is not None:
+            env[landlock.RW_ENV] = rw
+        proc = _confined(ws, "print('ran')\n", env=env)
+        assert proc.returncode == 70
+        assert "ran" not in proc.stdout
+        assert "not the gateway's workspace grant" in proc.stderr
+
+    def test_a_cwd_that_is_a_later_rw_entry_is_refused(self, ws, tmp_path):
+        # The session's own projects dir is rw too, but it is not the workspace:
+        # a cwd there must not pass for one (#244 review 4, round-2 N-B).
+        own = tmp_path / "projects-own"
+        own.mkdir()
+        env = _env(ws)
+        env[landlock.RW_ENV] = json.dumps([str(own), str(ws)])
+        proc = _confined(ws, "print('ran')\n", env=env)
+        assert proc.returncode == 70
+        assert "ran" not in proc.stdout
+        assert "not the gateway's workspace grant" in proc.stderr
+
+    @pytest.mark.parametrize("target", ["cfg", "base"])
+    def test_a_workspace_planted_as_a_link_is_refused(self, tmp_path, target):
+        base = tmp_path / "base"
+        (base / "bob").mkdir(parents=True)
+        (base / "bob" / "secret.txt").write_text("BOB\n")
+        cfg = tmp_path / "cfg"
+        cfg.mkdir()
+        alice = base / "alice"
+        os.symlink(cfg if target == "cfg" else base, alice)
+        # The SDK chdirs into the gateway's name; the kernel's cwd is the target.
+        proc = _confined(alice, _READ_ARGS, base / "bob" / "secret.txt")
+        assert proc.returncode == 70, proc.stdout
+        assert "not the gateway's workspace grant" in proc.stderr
+
+    def test_a_real_cli_dir_holding_the_workspace_is_refused(self, ws, tmp_path):
+        # The launcher grants the real CLI's dir itself, past the gateway's
+        # filter: a CLI at <dir>/claude would hand the session all of <dir>.
+        shim = tmp_path / "claude"
+        shim.write_text('#!/bin/sh\nexec /usr/bin/python3 "$@"\n')
+        shim.chmod(0o755)
+        env = _env(ws, **{landlock.REAL_CLI_ENV: str(shim)})
+        proc = _confined(ws, "print('ran')\n", env=env)
+        assert proc.returncode == 70
+        assert "ran" not in proc.stdout
+        assert "refusing to grant the real CLI's directory" in proc.stderr
+
+    def test_the_resolved_workspace_runs(self, tmp_path):
+        real = tmp_path / "real"
+        real.mkdir()
+        os.symlink(real, tmp_path / "alice")
+        env = _env(tmp_path / "alice", **{landlock.RW_ENV: json.dumps([str(real)])})
+        proc = _confined(tmp_path / "alice", "open('w.txt', 'w').write('x')\n", env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert (real / "w.txt").read_text() == "x"
+
+
+class TestGatewayEntriesFollowNoLink:
+    """G (#244 review 4): the gateway's entries were opened following links,
+    so a link swapped in after the gateway checked an entry — ``agents ->
+    /app``, a planted ``projects/<name>`` into bob's workspace — widened the
+    grant. Each is now walked from / following none; a refused one is logged
+    and not granted."""
+
+    def test_a_linked_ro_entry_is_not_granted(self, ws, tmp_path):
+        secret = tmp_path / "app"
+        secret.mkdir()
+        (secret / "creds.txt").write_text("APP-SECRET\n")
+        agents = tmp_path / "cfg" / "agents"
+        agents.parent.mkdir()
+        os.symlink(secret, agents)
+        env = _env(ws, **{landlock.RO_ENV: json.dumps([str(agents)])})
+        proc = _confined(ws, _READ_ARGS, agents / "creds.txt", env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)[0].startswith("DENY")
+        assert "not granting" in proc.stderr and "is a symlink" in proc.stderr
+        # Control: the same tree, named without the link, is granted.
+        env = _env(ws, **{landlock.RO_ENV: json.dumps([str(secret)])})
+        proc = _confined(ws, _READ_ARGS, secret / "creds.txt", env=env)
+        assert json.loads(proc.stdout) == ["APP-SECRET"]
+
+    def test_a_link_above_the_entry_is_not_followed(self, ws, tmp_path):
+        real = tmp_path / "cfg-real"
+        (real / "skills").mkdir(parents=True)
+        (real / "skills" / "s.md").write_text("S\n")
+        os.symlink(real, tmp_path / "cfg")
+        entry = tmp_path / "cfg" / "skills"
+        env = _env(ws, **{landlock.RO_ENV: json.dumps([str(entry)])})
+        proc = _confined(ws, _READ_ARGS, real / "skills" / "s.md", env=env)
+        assert json.loads(proc.stdout)[0].startswith("DENY"), proc.stderr
+
+    def test_a_linked_rw_entry_is_not_granted(self, ws, tmp_path):
+        bob = tmp_path / "bob"
+        bob.mkdir()
+        own = tmp_path / "projects" / "alice"
+        own.parent.mkdir()
+        os.symlink(bob, own)
+        env = _env(ws, **{landlock.RW_ENV: json.dumps([str(ws), str(own)])})
+        probe = "import sys\nopen(sys.argv[1], 'w').write('x')\n"
+        proc = _confined(ws, probe, own / "plant.txt", env=env)
+        assert proc.returncode != 0
+        assert "PermissionError" in proc.stderr
+        assert not (bob / "plant.txt").exists()
+
+    def test_a_hard_linked_file_entry_is_not_granted(self, ws, tmp_path):
+        # A file rule grants the inode: a link added after the gateway checked
+        # the entry (CLAUDE.md -> another user's transcript) must not count.
+        theirs = tmp_path / "projects" / "bob" / "t.jsonl"
+        theirs.parent.mkdir(parents=True)
+        theirs.write_text("BOB-TRANSCRIPT\n")
+        claude_md = tmp_path / "cfg" / "CLAUDE.md"
+        claude_md.parent.mkdir()
+        os.link(theirs, claude_md)
+        env = _env(ws, **{landlock.RO_ENV: json.dumps([str(claude_md)])})
+        proc = _confined(ws, _READ_ARGS, claude_md, env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)[0].startswith("DENY")
+        assert "a file with 2 links" in proc.stderr
+        # Control: once it is a file of its own, it is granted.
+        os.unlink(claude_md)
+        claude_md.write_text("SHARED\n")
+        proc = _confined(ws, _READ_ARGS, claude_md, env=env)
+        assert json.loads(proc.stdout) == ["SHARED"]
+
+    def test_a_missing_rw_entry_is_made_following_no_link(self, ws, tmp_path):
+        target = tmp_path / "target"
+        target.mkdir()
+        os.symlink(target, tmp_path / "link")
+        made = tmp_path / "made" / "dir"
+        rw = [str(ws), str(tmp_path / "link" / "new"), str(made)]
+        env = _env(ws, **{landlock.RW_ENV: json.dumps(rw)})
+        proc = _confined(ws, "open(%r, 'w').write('x')\n" % str(made / "f"), env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert list(target.iterdir()) == []  # never made through the link
+        assert (made / "f").read_text() == "x"
+
+
+class TestPlantedCliTmp:
+    """#244 review 4: a regular file, FIFO or socket at .cli-tmp, or a .cli-tmp
+    made unusable (chmod 000), failed every later spawn in the workspace (exit
+    70, or the CLI's own exit 1) until an operator stepped in."""
+
+    @pytest.mark.parametrize("kind", ["file", "fifo", "socket"])
+    def test_a_planted_entry_is_replaced(self, ws, kind):
+        _plant(ws / ".cli-tmp", kind)
+        for _ in range(2):
+            proc = _confined(ws, _TMP_PROBE)
+            assert proc.returncode == 0, proc.stderr
+            assert proc.stdout.strip() == str(ws / ".cli-tmp")
+        assert stat.S_ISDIR(os.lstat(ws / ".cli-tmp").st_mode)
+
+    @pytest.mark.parametrize(
+        "plant",
+        [
+            # the reported trigger, from inside a confined session
+            "import shutil; shutil.rmtree('.cli-tmp'); open('.cli-tmp', 'w')\n",
+            # its sibling: the CLI then dies on its own mkdir (exit 1)
+            "import os; os.chmod('.cli-tmp', 0)\n",
+        ],
+    )
+    def test_a_session_cannot_lock_its_workspace(self, ws, plant):
+        proc = _confined(ws, plant)
+        assert proc.returncode == 0, proc.stderr
+        proc = _confined(ws, _TMP_PROBE)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == str(ws / ".cli-tmp")
+
+    def test_a_configured_tmpdir_is_repaired_and_absolute(self, ws):
+        # An operator CLAUDE_CODE_TMPDIR naming one entry in the cwd (here
+        # relative) is kept, made absolute — the git config path derives from
+        # it — and repaired.
+        _plant(ws / "optmp", "file")
+        proc = _confined(ws, _TMP_PROBE, env=_env(ws, CLAUDE_CODE_TMPDIR="optmp"))
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == str(ws / "optmp")
+        assert (ws / "optmp" / "gitconfig").is_file()
+
+    @pytest.mark.parametrize(
+        "configured, used",
+        [
+            ("optmp", "optmp"),
+            ("./optmp", "optmp"),
+            ("{ws}/optmp", "optmp"),
+            ("a/b", ".cli-tmp"),
+            ("{ws}/a/b", ".cli-tmp"),
+            ("../optmp", ".cli-tmp"),
+            (".", ".cli-tmp"),
+            ("/tmp/optmp", ".cli-tmp"),
+        ],
+    )
+    def test_a_configured_tmpdir_must_be_one_entry(self, ws, configured, used):
+        env = _env(ws, CLAUDE_CODE_TMPDIR=configured.format(ws=ws))
+        proc = _confined(ws, _TMP_PROBE, env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == str(ws / used)
+
+    def test_a_configured_path_through_a_link_stays_inside(self, ws, tmp_path):
+        # N2: `a` swapped for a link after the old realpath check steered the
+        # unconfined launcher's unlink, mkdir and git config write outside the
+        # workspace. A value of more than one entry is not used at all.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        os.symlink(outside, ws / "a")
+        proc = _confined(ws, _TMP_PROBE, env=_env(ws, CLAUDE_CODE_TMPDIR="a/b"))
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == str(ws / ".cli-tmp")
+        assert list(outside.iterdir()) == []
 
 
 class TestSessionEnv:

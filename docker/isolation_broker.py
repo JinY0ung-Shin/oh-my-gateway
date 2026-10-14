@@ -88,7 +88,7 @@ _EXIT_LANDLOCK = 114
 _EXIT_CREDS = 115
 _EXIT_ORPHANED = 116
 _EXIT_SETUP = 117
-_EXIT_TMPDIR = 118  # cannot make <workspace>/.cli-tmp (workspace not writable)
+_EXIT_TMPDIR = 118  # <workspace>/.cli-tmp cannot be made a dir (unwritable ws)
 
 _libc = ctypes.CDLL(None, use_errno=True)
 
@@ -582,24 +582,29 @@ _ENV_STRIP = (
 
 
 def _child_ro_rw(real_cli, workspace, ticket_ro, ticket_rw):
+    """``(ro, rw)`` of the broker's own, opened following links, and
+    ``(gateway_ro, gateway_rw)``: the ticket's workspace and lists, which the
+    gateway resolved, opened following none (``ll.build_and_restrict``)."""
     ro = list(ll.SYSTEM_RO)
     ro.append(os.path.dirname(os.path.realpath(real_cli)))
-    ro.extend(ticket_ro)
+    # The session shell wrapper the CLI execs for every Bash call (set in
+    # _child_env): the file, never its directory.
+    ro.append(ll.SESSION_SHELL)
     # <workspace>/.cli-tmp is NOT a separate rule: it rides beneath the granted
     # workspace, and a rule on that agent-controlled path is a symlink-escape
-    # vector (see ll.safe_tmpdir). TMPDIR is set in _child_env to match.
+    # vector (see ll.session_tmpdir). TMPDIR is set in _child_env to match.
     # /dev/shm stays rw for POSIX semaphores (multiprocessing, joblib); landlock
     # mode shares it across same-uid sessions, here DAC separates it.
-    rw = [workspace, "/dev/shm"]
-    rw.extend(ticket_rw)
-    return ro, rw
+    rw = ["/dev/shm"]
+    return ro, rw, list(ticket_ro), [workspace, *ticket_rw]
 
 
 def _child_env(env, env_allow, workspace, tmp):
     """The CLI's environment: the launcher-passed env (already secret-scrubbed
     by the gateway), narrowed to the ticket allowlist when one is given, with
-    the isolation plumbing stripped, a workspace-local TMPDIR and tool caches,
-    and PWD naming the directory the CLI actually runs in."""
+    the isolation plumbing stripped, a workspace-local TMPDIR, tool caches and
+    git global config, the session shell (as the launcher sets them in
+    landlock mode), and PWD naming the directory the CLI actually runs in."""
     if env_allow:
         allow = set(env_allow)
         out = {k: v for k, v in env.items() if k in allow}
@@ -608,6 +613,7 @@ def _child_env(env, env_allow, workspace, tmp):
     for name in _ENV_STRIP:
         out.pop(name, None)
     out.update(ll.session_tmp_env(tmp))
+    out.update(ll.session_shell_env(out))
     out["PWD"] = workspace
     return out
 
@@ -661,16 +667,37 @@ def _exec_cli(req, fds, real_cli, supervisor, test_same_uid):
         os._exit(_EXIT_CREDS)
     try:
         os.chdir(workspace)
+        # chdir follows links, the ruleset grants the workspace as named: a
+        # workspace planted as a link (to the config dir, the workspace base)
+        # would confine the CLI somewhere else than it is granted. The gateway
+        # sends it resolved, so the kernel's cwd must be exactly it.
+        cwd = os.getcwd()
     except OSError as exc:
         _log("cannot enter the workspace %r: %s" % (workspace, exc))
         os._exit(_EXIT_CHDIR)
+    if cwd != workspace:
+        _log("the workspace %r resolves to %r; refusing it" % (workspace, cwd))
+        os._exit(_EXIT_CHDIR)
+    # The ruleset grants the real CLI's dir, which the gateway never sees.
+    cli_dir = os.path.dirname(os.path.realpath(real_cli))
+    problem = ll.cli_dir_problem(cli_dir, workspace)
+    if problem:
+        _log("refusing to grant the real CLI's directory %r: %s" % (cli_dir, problem))
+        os._exit(_EXIT_LANDLOCK)
     try:
-        tmp = ll.safe_tmpdir(workspace)  # a real dir, replacing any symlink
+        # Bound to "." — the cwd just checked — and repaired following no link.
+        dot = os.open(".", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            tmp = ll.safe_tmpdir(workspace, cwd_fd=dot)
+        finally:
+            os.close(dot)
     except OSError as exc:
         _log("cannot create the session tmp dir in %r: %s" % (workspace, exc))
         os._exit(_EXIT_TMPDIR)
     try:
-        ro, rw = _child_ro_rw(real_cli, workspace, req["ro"], req["rw"])
+        ro, rw, gateway_ro, gateway_rw = _child_ro_rw(
+            real_cli, workspace, req["ro"], req["rw"]
+        )
         env = _child_env(req["env"], req["env_allow"], workspace, tmp)
         _dup_onto_stdio(fds)
         ll.restore_exec_signals()
@@ -678,7 +705,7 @@ def _exec_cli(req, fds, real_cli, supervisor, test_same_uid):
         _log("CLI child setup failed: %s" % exc)
         os._exit(_EXIT_SETUP)
     try:
-        ll.build_and_restrict(ro, rw)
+        ll.build_and_restrict(ro, rw, gateway_ro=gateway_ro, gateway_rw=gateway_rw)
     except ll.LandlockError as exc:
         _log(str(exc))
         os._exit(_EXIT_LANDLOCK)
@@ -691,20 +718,70 @@ def _exec_cli(req, fds, real_cli, supervisor, test_same_uid):
 
 # --- the resident broker -----------------------------------------------------
 
+_KILLER_TIMEOUT = 2.0  # the orphan killer's whole run: a uid switch and kill()s
 
-def _switch_fully(uid, gid, test_same_uid):
-    if not (test_same_uid and (uid, gid) == (os.getuid(), os.getgid())):
-        os.setgroups([])
-        os.setresgid(gid, gid, gid)
-        os.setresuid(uid, uid, uid)
-    ll.drop_all_caps()
+
+def _kill_orphans(uid, gid, pids, test_same_uid):
+    """The orphan killer's side of :func:`_kill_as`: SIGKILL uid U's *pids*.
+
+    It takes the supervisor's credentials (:func:`_become_supervisor`), not
+    ``(U, U, U)``: the effective uid U is all kill(2) needs to reach U's
+    processes, and with the real and saved uid left the broker's, none of them
+    can signal it back. A fully switched killer could be SIGSTOPped by the very
+    orphans it was sent for on a kernel without Landlock signal scoping
+    (ABI < 6), while the single-threaded broker waited on it. The broker itself
+    can still SIGKILL it: same real uid, no CAP_KILL needed.
+    """
+    _become_supervisor(uid, gid, test_same_uid)
+    for pid in pids:
+        _signal_pid(pid, signal.SIGKILL)
+
+
+def _reap_killer(helper):
+    """Wait for the orphan killer, bounded; return whether it exited 0.
+
+    The resident loop is single-threaded, so an untimed ``waitpid`` on a child
+    that never exits would stop it accepting, spawning and reaping for every
+    user — and a plain ``waitpid`` never returns for a stopped child.
+    ``WUNTRACED`` reports a stop at once; a killer that stops or overruns
+    ``_KILLER_TIMEOUT`` is SIGKILLed and reaped instead, and the sweep is
+    reported failed.
+    """
+    end = time.monotonic() + _KILLER_TIMEOUT
+    delay = 0.001
+    while True:
+        try:
+            pid, status = os.waitpid(helper, os.WNOHANG | os.WUNTRACED)
+        except ChildProcessError:
+            return False
+        if pid == helper and not os.WIFSTOPPED(status):
+            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+        if pid == helper or time.monotonic() >= end:
+            break
+        time.sleep(delay)
+        delay = min(delay * 2, 0.05)
+    why = "stopped" if pid == helper else "overran %.1fs" % _KILLER_TIMEOUT
+    _log("orphan killer %d %s; killing it" % (helper, why))
+    _signal_pid(helper, signal.SIGKILL)
+    end = time.monotonic() + _KILLER_TIMEOUT
+    while time.monotonic() < end:
+        try:
+            if os.waitpid(helper, os.WNOHANG)[0] == helper:
+                return False
+        except ChildProcessError:
+            return False
+        time.sleep(0.01)
+    # SIGKILL is pending: it can start no further kill(); _reap collects it.
+    _log("orphan killer %d is not dead yet; leaving it to the reaper" % helper)
+    return False
 
 
 def _kill_as(uid, gid, pids, test_same_uid):
-    """SIGKILL *pids* from a short-lived child switched to their own uid (the
-    broker holds no CAP_KILL); return whether it managed to. Waited for
-    synchronously, so none of *pids* can be reaped — and its pid recycled —
-    before the signal lands."""
+    """SIGKILL *pids* from a short-lived child that takes their uid as its
+    effective uid (the broker holds no CAP_KILL); return whether it managed to.
+    Waited for before returning (bounded, :func:`_reap_killer`), so none of
+    *pids* can be reaped — and its pid recycled — while the child can still
+    signal it."""
     try:
         helper = os.fork()
     except OSError as exc:
@@ -713,20 +790,13 @@ def _kill_as(uid, gid, pids, test_same_uid):
     if helper == 0:
         code = 1
         try:
-            _switch_fully(uid, gid, test_same_uid)
-            for pid in pids:
-                _signal_pid(pid, signal.SIGKILL)
+            _kill_orphans(uid, gid, pids, test_same_uid)
             code = 0
+        except Exception as exc:
+            _log("the orphan killer for uid %d failed: %s" % (uid, exc))
         finally:
             os._exit(code)
-    while True:
-        try:
-            _pid, status = os.waitpid(helper, 0)
-            return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
-        except InterruptedError:
-            continue
-        except ChildProcessError:
-            return False
+    return _reap_killer(helper)
 
 
 class _Pending:
@@ -884,15 +954,19 @@ class _Broker:
         (#244 review 4). The gateway's lease pool should never ask; this is
         the authoritative backstop, and it also covers an anonymous workspace
         removed before its CLI finished dying. An unswept orphan of a dead
-        supervisor holds its uid the same way until the sweep kills it.
+        supervisor holds its uid the same way until the sweep kills it — or
+        for as long as it lives once a sweep gave up on it (``untargetable``:
+        a stopped or overrunning killer is not retried).
         """
         for held_uid, held_ws in self.supervisors.values():
             if held_uid == uid and held_ws != workspace:
                 raise ValueError(
                     "uid %d is still live for another workspace" % uid
                 )
-        if self.orphan_check:
-            for pid in _children() - set(self.supervisors):
+        if self.orphan_check or self.untargetable:
+            children = _children()
+            self.untargetable &= children  # forget reaped pids: they may be reused
+            for pid in children - set(self.supervisors):
                 ids = _proc_ids(pid)
                 if ids is not None and ids[0] == uid:
                     raise ValueError(
@@ -960,9 +1034,10 @@ class _Broker:
 
     def _sweep_orphans(self):
         """Backstop for a supervisor that died before its sweep finished: the
-        session's survivors re-parent to this subreaper, so kill them as their
-        own in-band uid (one short-lived child per uid). Their children then
-        re-parent here in turn and are caught on a later tick."""
+        session's survivors re-parent to this subreaper, so kill them with
+        their own in-band uid as the effective uid (one short-lived killer per
+        uid, :func:`_kill_as`). Their children then re-parent here in turn and
+        are caught on a later tick."""
         targets = {}
         children = _children()
         self.untargetable &= children  # forget reaped pids: they may be reused

@@ -9,12 +9,14 @@ test_isolation_broker.py.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -92,8 +94,9 @@ class TestUidRegistry:
 
 
 class TestReviewFixes:
-    """Fixes from the PR #244 review: ephemeral recycling (#9), reserved-uid
-    exclusion + band validation (#15), registry path, persist fail-closed."""
+    """Fixes from the PR #244 review: an ephemeral path that never touches the
+    registry (#9; its leases are TestEphemeralLeases), reserved-uid exclusion +
+    band validation (#15), registry path, persist fail-closed."""
 
     def test_default_registry_path_is_data_volume(self):
         # /app/data (durable volume), never /app/src/data (code tree).
@@ -143,8 +146,11 @@ class TestReviewFixes:
         monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(reg_path))
         monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
         monkeypatch.setenv(ui.UID_MAX_ENV, "20100")
+        # 50 runs, one after another, on a 25-uid ephemeral slice: each lease
+        # ends with its run, so sequential runs never exhaust it.
         for i in range(50):
             ui.resolve_uid(f"anon{i}", persist=False)
+            ui.release_ephemeral(f"anon{i}")
         # Nothing persisted: the ephemeral path never writes the registry file.
         assert not reg_path.exists()
 
@@ -207,6 +213,17 @@ class TestRegistryFailClosed:
             ui.UidRegistry(path, 20000, 20005)
         # the file is left untouched for the operator to restore
         assert path.read_bytes() == content.encode("utf-8", "surrogateescape")
+
+    def test_deeply_nested_registry_refuses_cleanly(self, monkeypatch, tmp_path):
+        # json.loads raises RecursionError, not ValueError, on deep nesting;
+        # it must surface as the registry error, not a startup traceback.
+        path = tmp_path / "uids.json"
+        path.write_text("[" * 100_000 + "]" * 100_000)
+        with pytest.raises(ui.UidAllocationError):
+            ui.UidRegistry(path, 20000, 20005)
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and "corrupt" in errs[0]
 
     def test_unreadable_registry_refuses(self, tmp_path):
         if os.geteuid() == 0:
@@ -331,6 +348,217 @@ class TestRegistryFailClosed:
         with pytest.raises(ui.UidAllocationError):
             reg.resolve("alice")
         assert victim.read_text() == "keep"
+
+
+class TestEphemeralLeases:
+    """PR #244 review 4 (#7): an anonymous run keeps its uid while it lives.
+
+    The pool recycled the uid of the least-recently-*resolved* key, with no
+    notion of whether that run was alive and no release. A live anonymous
+    session resolves only when its client is created, so 256 later stateless
+    runs took its uid while its CLI still ran: two principals on one uid.
+    """
+
+    @staticmethod
+    def _pool(size: int) -> ui._EphemeralPool:
+        return ui._EphemeralPool(20000, 20000 + size - 1)
+
+    @staticmethod
+    def _ws(tmp_path, name: str) -> str:
+        path = tmp_path / name
+        path.mkdir()
+        return str(path)
+
+    @pytest.fixture
+    def uid_env(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+
+    @staticmethod
+    def _spawn_uid(workspace) -> int:
+        """The uid an anonymous spawn in *workspace* runs as, keyed exactly as
+        ``landlock.options_env`` keys it."""
+        from src.backends.claude import landlock
+
+        cwd = landlock._absolute(workspace)
+        return landlock._uid_spawn_env(cwd, [], [], user=None)[1]
+
+    def test_a_lease_is_stable_and_distinct_per_key(self, tmp_path):
+        pool = self._pool(3)
+        a, b = self._ws(tmp_path, "a"), self._ws(tmp_path, "b")
+        ua, ub = pool.resolve(a), pool.resolve(b)
+        assert ua != ub
+        assert pool.resolve(a) == ua  # every spawn of one run: the same uid
+
+    def test_a_full_pool_refuses_instead_of_sharing_a_live_uid(self, tmp_path):
+        pool = self._pool(3)
+        live = [self._ws(tmp_path, f"ws{i}") for i in range(3)]
+        uids = [pool.resolve(key) for key in live]
+        with pytest.raises(ui.UidAllocationError) as excinfo:
+            pool.resolve(self._ws(tmp_path, "ws3"))
+        # The plain, retryable kind: on /v1/responses a 503 "retry shortly".
+        assert type(excinfo.value) is ui.UidAllocationError
+        assert "leased to live anonymous runs" in str(excinfo.value)
+        assert [pool.resolve(key) for key in live] == uids  # nobody lost theirs
+
+    def test_release_frees_the_uid(self, tmp_path):
+        pool = self._pool(1)
+        a, b = self._ws(tmp_path, "a"), self._ws(tmp_path, "b")
+        ua = pool.resolve(a)
+        assert pool.release(a) == ua
+        assert pool.release(a) is None  # a second release is a no-op
+        assert pool.resolve(b) == ua
+
+    def test_never_used_uids_first_then_least_recently_released(self, tmp_path):
+        pool = self._pool(3)
+        keys = [self._ws(tmp_path, f"ws{i}") for i in range(5)]
+        u0, u1 = pool.resolve(keys[0]), pool.resolve(keys[1])
+        pool.release(keys[1])
+        pool.release(keys[0])
+        assert pool.resolve(keys[2]) not in (u0, u1)  # the never-used one
+        assert pool.resolve(keys[3]) == u1  # released first
+        assert pool.resolve(keys[4]) == u0
+
+    def test_a_full_pool_reclaims_a_lease_whose_workspace_is_gone(
+        self, tmp_path, caplog
+    ):
+        pool = self._pool(2)
+        gone, live = self._ws(tmp_path, "gone"), self._ws(tmp_path, "live")
+        u_gone, u_live = pool.resolve(gone), pool.resolve(live)
+        os.rmdir(gone)  # removed, but its release never came
+        with caplog.at_level(logging.WARNING, logger=ui.__name__):
+            assert pool.resolve(self._ws(tmp_path, "new")) == u_gone
+        assert "never released" in caplog.text
+        assert pool.resolve(live) == u_live  # an existing workspace keeps it
+        with pytest.raises(ui.UidAllocationError):
+            pool.resolve(self._ws(tmp_path, "newer"))
+
+    def test_a_key_that_names_no_path_is_never_reclaimed(self, tmp_path):
+        pool = self._pool(1)
+        uid = pool.resolve("not-a-path")
+        with pytest.raises(ui.UidAllocationError):
+            pool.resolve(self._ws(tmp_path, "other"))
+        pool.release("not-a-path")
+        assert pool.resolve(str(tmp_path / "other")) == uid
+
+    def test_a_workspace_that_cannot_be_checked_keeps_its_lease(self, tmp_path):
+        if os.geteuid() == 0:
+            pytest.skip("root searches a 000 directory")
+        locked = tmp_path / "locked"
+        (locked / "ws").mkdir(parents=True)
+        pool = self._pool(1)
+        uid = pool.resolve(str(locked / "ws"))
+        locked.chmod(0)  # lstat of the workspace: EACCES, not ENOENT
+        try:
+            with pytest.raises(ui.UidAllocationError):
+                pool.resolve(self._ws(tmp_path, "other"))
+        finally:
+            locked.chmod(0o700)
+        assert pool.resolve(str(locked / "ws")) == uid
+
+    def test_a_live_session_keeps_its_uid_through_many_stateless_runs(
+        self, uid_env, tmp_path
+    ):
+        # The review's scenario on the default band (256 ephemeral uids): an
+        # anonymous session's CLI lives for its whole TTL without resolving
+        # again while far more stateless runs come and go.
+        from src.workspace_manager import WorkspaceManager
+
+        wm = WorkspaceManager(base_path=tmp_path / "workspaces")
+        session_ws = wm.resolve(None)
+        session_uid = self._spawn_uid(session_ws)
+        for _ in range(ui._ephemeral_count() + 44):
+            run_ws = wm.resolve(None)
+            assert self._spawn_uid(run_ws) != session_uid
+            wm.cleanup_temp_workspace(run_ws)  # the run is over
+        assert self._spawn_uid(session_ws) == session_uid
+
+    def test_workspace_cleanup_ends_the_lease_a_spawn_took(
+        self, uid_env, monkeypatch, tmp_path
+    ):
+        from src.workspace_manager import WorkspaceManager
+
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20009")
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "1")
+        # A relative base, as USER_WORKSPACES_DIR may be: the spawn keys on the
+        # absolute path, and the release must find that same key.
+        monkeypatch.chdir(tmp_path)
+        wm = WorkspaceManager(base_path=Path("workspaces"))
+        first = wm.resolve(None)
+        uid = self._spawn_uid(first)
+        with pytest.raises(ui.UidAllocationError):  # its only uid is leased
+            self._spawn_uid(wm.resolve(None))
+        wm.cleanup_temp_workspace(first)
+        assert not first.exists()
+        assert self._spawn_uid(wm.resolve(None)) == uid
+
+    def test_cleanup_of_a_vanished_workspace_still_ends_its_lease(
+        self, uid_env, tmp_path
+    ):
+        from src.workspace_manager import WorkspaceManager
+
+        wm = WorkspaceManager(base_path=tmp_path / "workspaces")
+        ws = wm.resolve(None)
+        uid = self._spawn_uid(ws)
+        ws.rmdir()
+        wm.cleanup_temp_workspace(ws)
+        assert ui.get_ephemeral_pool().release(os.path.abspath(ws)) is None
+        assert uid in ui.get_ephemeral_pool()._free
+
+    def test_a_workspace_cleanup_cannot_remove_keeps_its_lease(
+        self, uid_env, monkeypatch, tmp_path
+    ):
+        # Files the session uid wrote that the gateway's uid cannot delete:
+        # handing that uid to another run would give it the leftovers' owner.
+        import src.workspace_manager as wm_mod
+        from src.workspace_manager import WorkspaceManager
+
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20009")
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "1")
+        wm = WorkspaceManager(base_path=tmp_path / "workspaces")
+        ws = wm.resolve(None)
+        uid = self._spawn_uid(ws)
+        with monkeypatch.context() as m:
+            m.setattr(wm_mod.shutil, "rmtree", lambda *a, **k: None)
+            wm.cleanup_temp_workspace(ws)
+        assert ws.is_dir()
+        with pytest.raises(ui.UidAllocationError):  # still leased: fail closed
+            self._spawn_uid(wm.resolve(None))
+        shutil.rmtree(ws)  # removed later (broker cleanup): reclaimed when full
+        assert self._spawn_uid(wm.resolve(None)) == uid
+
+    def test_named_workspaces_are_not_released(self, uid_env, tmp_path):
+        from src.workspace_manager import WorkspaceManager
+
+        wm = WorkspaceManager(base_path=tmp_path / "workspaces")
+        named = wm.resolve("alice")
+        # Never a pool key in practice; pinned anyway: only _tmp_ runs end here.
+        uid = ui.resolve_uid(os.path.abspath(named), persist=False)
+        wm.cleanup_temp_workspace(named)
+        assert named.is_dir()
+        assert ui.resolve_uid(os.path.abspath(named), persist=False) == uid
+
+    def test_release_without_a_pool_is_a_noop(self):
+        ui.release_ephemeral("/nowhere")
+        assert ui._ephemeral_pool is None  # the other modes never build it
+
+    def test_a_failing_release_never_breaks_workspace_cleanup(
+        self, monkeypatch, tmp_path, caplog
+    ):
+        from src.workspace_manager import WorkspaceManager
+
+        def boom(_key):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(ui, "release_ephemeral", boom)
+        wm = WorkspaceManager(base_path=tmp_path / "workspaces")
+        ws = wm.resolve(None)
+        with caplog.at_level(logging.WARNING):
+            wm.cleanup_temp_workspace(ws)
+        assert not ws.exists()
+        assert "uid lease" in caplog.text
 
 
 class TestBandsReview2:
