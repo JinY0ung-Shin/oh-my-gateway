@@ -392,6 +392,19 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 >     landlock으로 내려간다. 출하 이미지에서는 이 프로브가 실패한다.
 > - **uid 모드를 쓰려면 남은 일:** 워크스페이스 소유권(§7 step 4)과 컨테이너 프로비저닝이 먼저다. 프로비저닝에는
 >   세션 uid가 통과할 수 있는 공유 트리, 브로커 uid와 대역의 passwd 항목, 사용자별 config dir가 들어간다.
+
+> **구현 노트(PR #244 리뷰 4, 117a0d0 재리뷰).**
+> - **최소 ABI는 3(커널 6.2)이다.** 이 문서의 "ABI ≥ 2"는 그 이전 판단이다. ABI 1/2는 `LANDLOCK_ACCESS_FS_TRUNCATE`를
+>   다루지 않아서, DAC가 허용하면 룰셋 밖 파일도 `truncate(2)`/`O_TRUNC`로 비울 수 있다. 그래서 두 모드 모두 ABI 2
+>   호스트에서 기동을 거부한다(`MIN_LANDLOCK_ABI`, `docker/_landlock_rules.MIN_ABI`). 프로브도 ABI ≥ 3을 "usable"로 본다.
+> - **익명 uid는 lease다.** LRU 재활용은 살아 있는 런의 uid를 새 런에 줄 수 있었다. 이제 `_tmp_` 워크스페이스가 남아
+>   있는 동안 uid가 묶이고, 다 차면 거절한다. 브로커도 다른 워크스페이스에서 살아 있는 uid를 거부한다.
+> - **§6.5 argv 노출:** 격리 모드에서 `--mcp-config`와 시스템 프롬프트는 세션 워크스페이스의 1회용 파일로 넘기고
+>   `connect()` 뒤 지운다(CLI는 argv 파싱 때 읽는다 — `tests/test_cli_argv_files.py`). `--json-schema`는 파일 형태가
+>   없어 남는다. 요청자의 `text.format` 스키마라 게이트웨이 비밀은 아니다.
+> - **런처 소유권은 기동 오류다.** 런처·`_landlock_rules.py`·모든 상위 디렉터리가 root 소유·비쓰기여야 한다.
+>   dev 체크아웃만 `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true`로 경고로 낮춘다.
+> - **프로브 실행 실패는 실패다.** `can_enforce_landlock`이 프로브를 못 돌리면 기동을 거부한다.
 >
 > **(V) userland은 passwd 항목을 요구한다.** 커널은 숫자 uid `setuid`에 `/etc/passwd`를 요구하지 않는다.
 > python `getpass.getuser()`는 **`LOGNAME`·`USER`·`LNAME`·`USERNAME`을 차례로 보고 하나라도 있으면** passwd를 보지

@@ -225,10 +225,17 @@ uv run pytest --cov=src                            # with coverage
   rule). `/etc` and `/usr` stay ro (the CLI/libc need them; a passwd entry is required), so
   acceptance is "a path **outside the ruleset**", not `/etc/passwd`. **`/proc` stays ro too (the
   bundled CLI aborts without it), so in both modes a session can read every process's command line
-  (`/proc/<pid>/cmdline`)**: other sessions' `--mcp-config` JSON (with `MCP_FORWARD_CONTEXT`
-  `{{header:…}}` values), their system prompt (`Current user:`) and `--json-schema`. That is the argv
-  exposure of `docs/security-process-isolation.md` §6.5, not closed yet: moving those into files is
-  a follow-up. `environ`, `mem` and the fds of processes outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher refuses
+  (`/proc/<pid>/cmdline`)** — world-readable whatever the uid. So with confinement on,
+  `create_client` moves the `--mcp-config` JSON (with `MCP_FORWARD_CONTEXT` `{{header:…}}` values)
+  and the system prompt (`Current user:`) into per-spawn workspace files (`argv_files.externalize`:
+  `O_EXCL|O_NOFOLLOW` under a workspace dir fd, 0600 landlock / 0644 uid; `--system-prompt-file`,
+  `--append-system-prompt-file` via `extra_args`) and removes them once `connect()` returns —
+  the CLI reads them while parsing argv and never again (`tests/test_cli_argv_files.py` pins
+  that against the bundled CLI: MCP header + prompt still arrive after the delete, the live
+  cmdline holds only paths; when a CLI bump reads them lazily, keep the files for the session).
+  An in-process `sdk` MCP server keeps the dict (the SDK needs it), and `--json-schema` has no file
+  form so the request's own `text.format` schema stays on the command line — the rest of the argv
+  exposure of `docs/security-process-isolation.md` §6.5. `environ`, `mem` and the fds of processes outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher refuses
   a relative one (exit 70) and uses `os.getcwd()`, never `$PWD` — a relative `USER_WORKSPACES_DIR`
   once granted `<ws>/<ws>`. A rule target that is a regular file (e.g. the user `CLAUDE.md`) gets
   file-only rights — the dir-only `READ_DIR` bit is EINVAL for a file and would abort the whole
@@ -254,12 +261,19 @@ uv run pytest --cov=src                            # with coverage
   (`tests/test_cli_slash_preflight.py` pins identical catalogs, no side effects, a helper that does
   run seeing no gateway secret, and the uid-mode preflight through the broker). The image ships
   launcher+broker+`_landlock_rules` at `/usr/local/bin` (root-owned, outside `/app` so
-  `chown -R app /app` can't make them agent-writable) and sets `GATEWAY_LANDLOCK_LAUNCHER`. This is
+  `chown -R app /app` can't make them agent-writable) and sets `GATEWAY_LANDLOCK_LAUNCHER`; startup
+  **refuses** a launcher a session could replace — it, its sibling `_landlock_rules.py` and every
+  ancestor dir must be root-owned and not group/other-writable (sticky dirs pass;
+  `landlock.launcher_write_problems`), and `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true` downgrades
+  that to a warning for a dev checkout (`tests/conftest.py` sets it). This is
   the no-privilege **interim** of `docs/security-process-isolation.md` §3: no uid switch, so no
   cross-session DAC isolation (that is `uid` mode). Fail-closed:
   `config_check._check_landlock_confinement` refuses startup if the launcher/real CLI cannot resolve,
   Landlock cannot actually be **enforced** (a forked probe builds+`restrict_self`es a real ruleset,
-  not just an ABI query — a seccomp filter blocking `add_rule`/`restrict_self` is caught), the uid
+  not just an ABI query — a seccomp filter blocking `add_rule`/`restrict_self` is caught, and a
+  probe that cannot run counts as a failure), the ABI is below `MIN_LANDLOCK_ABI` = 3 (kernel 6.2:
+  ABI 1/2 handle no `TRUNCATE`, so a session could still truncate a DAC-writable file outside the
+  ruleset; mirrored by `docker/_landlock_rules.MIN_ABI`, parity-tested), the uid
   band is unusable, or the mode is a typo (an invalid `CLAUDE_ISOLATION_MODE` is refused even under
   `SKIP_CONFIG_CHECK`); the CLI's own bwrap sandbox is forced off (`_configure_sandbox`) because it
   cannot start inside a Landlock domain, and `_check_isolation_sandbox_conflict` warns when that
@@ -325,16 +339,21 @@ uv run pytest --cov=src                            # with coverage
   `test_wait_knob_parses_like_the_gateway` — a broker that never comes up delays startup ~2× before
   the gateway fails closed). The
   broker execs the CLI with the launcher-passed env (the SDK's child env) — not the broker's —
-  filtered + plumbing-stripped, `PWD` = workspace. Anonymous/stateless runs use a **recycled
-  in-memory ephemeral uid band** (`_EphemeralPool`, top `CLAUDE_ISOLATION_EPHEMERAL_UIDS` of the
-  band; an empty one is a startup error) so they cannot grow the persisted registry or exhaust it;
-  named users get durable uids. The registry fails **closed**: a corrupt/unreadable
+  filtered + plumbing-stripped, `PWD` = workspace. Anonymous/stateless runs use an **in-memory
+  ephemeral uid band** (`_EphemeralPool`, top `CLAUDE_ISOLATION_EPHEMERAL_UIDS` of the band; an empty
+  one is a startup error) so they cannot grow the persisted registry. A uid is **leased** for as long
+  as its `_tmp_` workspace exists and is handed to another run only after the workspace is gone; with
+  every uid leased the spawn is refused (`UidAllocationError`), never shared — two live runs on one
+  uid would share DAC access and `/dev/shm`. The broker backs that up: it refuses a uid a live
+  supervisor (or an unswept orphan) holds for a different workspace (`_check_uid_free`). An
+  anonymous workspace uid mode cannot delete keeps its uid (fail closed until broker cleanup
+  lands). Named users get durable uids. The registry fails **closed**: a corrupt/unreadable
   `isolation_uids.json` refuses uid-mode startup (`_check_uid_registry`) instead of loading empty
   and reassigning uids; entries it cannot honor (out of band, reserved, shared — e.g. after
   narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too, and their
   uids are excluded from the ephemeral pool (else an anonymous run would get a named user's files);
   writes are fsync'd 0600, and a failing directory fsync after the replace keeps the grant.
-  `effective_mode()` self-detects at startup: Landlock ABI≥2, the broker reachable, and the
+  `effective_mode()` self-detects at startup: Landlock ABI≥3, the broker reachable, and the
   **startup probe** passed. Once the broker answers, `install_process_env` runs
   `_probe_uid_sessions`:
   - it spawns the real CLI `--version` through the launcher and broker, as an ephemeral session

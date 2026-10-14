@@ -38,7 +38,7 @@
       세 uid 대역(app 1000·브로커·사용자)은 서로 겹치지 않는다. 브로커 gid는 기본값이 APP_GID다
       (소켓 그룹이라 의도된 것이다). 브로커는 uid와 gid 모두에서 0·APP_UID·APP_GID·자기 uid/gid를
       세션에 주지 않는다.
-- [ ] 커널 Landlock **ABI ≥ 2**(≥ 5.19). `scripts/isolation_probe.py`의 `=> Landlock usable` 확인.
+- [ ] 커널 Landlock **ABI ≥ 3**(≥ 6.2; ABI 2는 truncate를 못 막아 기동 거부). `scripts/isolation_probe.py`의 `=> Landlock usable (ABI>=3)` 확인.
       프로브 스크립트는 이미지에 들어 있지 않으니(`scripts/`를 복사하지 않는다) `docker cp`로 넣어
       실행한다. ABI ≥ 6이면 시그널·추상 유닉스 소켓 scoping도 켜진다.
 - [ ] 브로커 소켓 경로가 절대 경로이고, 그 **부모 경로가 모두 root 소유·그룹/기타 쓰기 불가**(sticky
@@ -151,7 +151,9 @@ supervisor가 수행), detached 하위 프로세스 sweep, 소켓 권한 0660/�
 상주 부모에서 검증(만료 시 정리)·peer uid 고정·uid/gid 대역 강제(0·app·broker 제외, same-uid 지름길
 없음), 상주 브로커의 잘못된 헤더·정체 피어·fork 실패 내성, 종료 코드/시그널 분리 전송, 기동 준비 대기,
 티켓 시크릿을 게이트웨이 환경변수에서 제거, 레지스트리 fail-closed, 공유 캐시 쓰기 제거, 익명/stateless
-런의 ephemeral uid 재활용(대역 소진 방지).
+런의 ephemeral uid lease(워크스페이스가 사라진 뒤에만 재사용, 다 차면 거절; 브로커가 다른 워크스페이스에서 살아 있는
+uid를 거부), 최소 Landlock ABI 3, 세션이 바꿀 수 있는 런처의 기동 거부, 격리 모드의 `--mcp-config`·시스템 프롬프트
+파일화(§6.5, `--json-schema`는 남음).
 
 아직 미완:
 

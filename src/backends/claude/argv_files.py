@@ -72,8 +72,9 @@ class ArgvFiles:
                 except FileNotFoundError:
                     pass
                 except OSError as exc:
-                    logger.warning("argv file %s/%s not removed: %s",
-                                   self.workspace, name, exc)
+                    logger.warning(
+                        "argv file %s/%s not removed: %s", self.workspace, name, exc
+                    )
         finally:
             os.close(dir_fd)
         self.names = []
