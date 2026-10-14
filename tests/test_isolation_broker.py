@@ -420,6 +420,29 @@ class TestExitStatusMirroring:
         proc = _run(broker, _workspace(tmp_path), script)
         assert proc.returncode == -sig, proc.stderr
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits")
+    def test_an_unwritable_workspace_has_its_own_status(self, broker, tmp_path):
+        # A session uid that cannot write its workspace used to exec the CLI
+        # anyway, which then died on its tmpdir mkdir with a bare exit 1 (#244
+        # review 3: every uid-mode turn in the shipped image).
+        ws = _workspace(tmp_path)
+        (ws / "cli.py").write_text("print('ran')\n")
+        ws.chmod(0o555)
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(_LAUNCHER), str(ws / "cli.py")],
+                cwd=str(ws),
+                env=_launcher_env(broker, ws),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            ws.chmod(0o755)
+        assert proc.returncode == 118, proc.stderr
+        assert "ran" not in proc.stdout
+        assert "cannot create the session tmp dir" in broker.log_text()
+
 
 class TestTeardown:
     """B1/B2/B6: the supervisor owns teardown, sweeps every descendant, and

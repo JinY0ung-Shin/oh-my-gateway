@@ -57,10 +57,12 @@ def _reset_isolation_env(monkeypatch, tmp_path_factory):
     # the config dir: keep that out of the developer's real ~/.claude.
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path_factory.mktemp("claude-cfg")))
     landlock.reset_mode_cache()
+    landlock.reset_uid_probe()
     ui.reset_captured_secret()
     ui.reset_registry_cache()
     yield
     landlock.reset_mode_cache()
+    landlock.reset_uid_probe()
     ui.reset_captured_secret()
     ui.reset_registry_cache()
 
@@ -972,6 +974,9 @@ class TestBrokerWait:
         # install_process_env writes these into os.environ; restore them.
         monkeypatch.delenv(landlock.REAL_CLI_ENV, raising=False)
         monkeypatch.delenv("CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK", raising=False)
+        # A bare listening socket, not a broker: the session spawn probe that
+        # follows a successful wait is tested in test_uid_startup_probe.py.
+        monkeypatch.setattr(landlock, "_probe_uid_sessions", lambda: None)
         landlock.reset_mode_cache()
         return sock
 

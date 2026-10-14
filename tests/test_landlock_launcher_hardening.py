@@ -180,6 +180,26 @@ class TestTrustedPaths:
         assert "ran" not in proc.stdout
         assert "is not an absolute path" in proc.stderr
 
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores the mode bits")
+    def test_an_unmakeable_tmpdir_is_refused_with_the_reason(self, ws):
+        # Used to be swallowed; the CLI then died on its own mkdir (#244 review 3).
+        (ws / "probe.py").write_text("print('ran')\n")
+        ws.chmod(0o555)
+        try:
+            proc = subprocess.run(
+                [sys.executable, str(_LAUNCHER), "-I", str(ws / "probe.py")],
+                cwd=str(ws),
+                env=_env(ws),
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        finally:
+            ws.chmod(0o755)
+        assert proc.returncode == 70
+        assert "ran" not in proc.stdout
+        assert "cannot create the session tmp dir" in proc.stderr
+
 
 class TestSessionEnv:
     """B10: npm/uv caches go to the session tmp dir, overriding inherited ones."""

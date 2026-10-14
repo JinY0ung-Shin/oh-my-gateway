@@ -1441,10 +1441,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # failure (``_build_sdk_options`` raising) must surface its own error,
         # not an UnboundLocalError from the diagnostic bookkeeping.
         last_error_result = ""
+        verify_workspace: Optional[Path] = None
+        from . import landlock
+
         try:
             logger.info("Testing Claude Agent SDK...")
 
-            options = self._build_sdk_options(max_turns=1)
+            # In uid mode the CLI runs as a session uid, which cannot enter the
+            # gateway-private temp dir self.cwd falls back to (exit 113): verify
+            # in a fresh workspace from the workspace manager, like a session.
+            if landlock.effective_mode() == "uid":
+                from src.workspace_manager import workspace_manager
+
+                verify_workspace = workspace_manager.resolve(None)
+            options = self._build_sdk_options(max_turns=1, cwd=verify_workspace)
             messages = []
             async for message in query(
                 prompt="Hello",
@@ -1476,12 +1486,33 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             detail = f"{e}"
             if last_error_result and last_error_result not in detail:
                 detail = f"{detail} (CLI result: {last_error_result})"
+            # Under confinement a launcher/broker refusal is not an install
+            # problem: name it instead of the npm hints below.
+            refusal = (
+                landlock.describe_launcher_exit(getattr(e, "exit_code", None))
+                if landlock.confine_enabled()
+                else None
+            )
+            if refusal:
+                logger.error(
+                    "Claude Agent SDK verification failed under %s=%s: %s (%s)",
+                    landlock.MODE_ENV,
+                    landlock.effective_mode(),
+                    refusal,
+                    detail,
+                )
+                return False
             logger.error(f"Claude Agent SDK verification failed: {detail}")
             logger.warning("Please ensure Claude Code is installed and authenticated:")
             logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
             logger.warning("  2. Set ANTHROPIC_AUTH_TOKEN environment variable")
             logger.warning("  3. Test: claude --print 'Hello'")
             return False
+        finally:
+            if verify_workspace is not None:
+                from src.workspace_manager import workspace_manager
+
+                workspace_manager.cleanup_temp_workspace(verify_workspace)
 
     # Backward-compatible alias — existing code calls verify_cli().
     verify_cli = verify

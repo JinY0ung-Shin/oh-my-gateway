@@ -376,6 +376,23 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 > 런처를 SIGTERM 중계 없이 바로 SIGKILL하면(`agent_messages` wedge) CLI가 최대 5초 더 살아 위의 정리 경쟁이 남는다 —
 > 정리를 브로커로 라우팅하는 후속에서 닫는다.
 >
+> **구현 노트(PR #244 리뷰 3, 로컬 컨테이너 실측 2026-10-14).**
+> - **실측 결과:**
+>   - 위 배치(브로커 cap·securebits, supervisor `(broker, U, broker)`, CLI `(U,U,U)`, 종료 정리)는 d86a886 이미지에서
+>     그대로 확인됐다. 런처 SIGKILL 뒤 정리는 1초 미만이었고, 5초는 SIGTERM을 무시하는 CLI에만 걸리는 상한이다.
+>   - **출하 이미지에서는 uid 모드 턴이 하나도 돌지 않았다.** 워크스페이스가 app 소유 0755라 세션 uid가
+>     `<ws>/.cli-tmp`를 못 만들었고, 브로커가 그 실패를 삼켜 CLI가 exit 1로 죽었다.
+>   - 그런데도 기동은 통과했다. 브로커 도달성만 봤기 때문이다.
+> - **바뀐 점:**
+>   - `.cli-tmp`를 못 만들면 이제 바로 실패한다(브로커 자식 exit 118, 런처 exit 70).
+>   - 게이트웨이는 브로커가 응답하면 기동 때 한 번, 세션과 같은 경로로 ephemeral uid의 `--version`을 띄워 본다.
+>     새 익명 워크스페이스, 같은 티켓과 경로 목록, 런처, 브로커를 그대로 쓴다.
+>   - 이어서 그 uid가 설정 디렉터리에 닿는지, `projects/<name>`을 만들 수 있는지를 mode bit로 확인한다.
+>   - 이 중 하나라도 실패하면 uid는 "사용 불가"다. 기동 오류가 나거나, `CLAUDE_ISOLATION_FALLBACK=landlock`이면
+>     landlock으로 내려간다. 출하 이미지에서는 이 프로브가 실패한다.
+> - **uid 모드를 쓰려면 남은 일:** 워크스페이스 소유권(§7 step 4)과 컨테이너 프로비저닝이 먼저다. 프로비저닝에는
+>   세션 uid가 통과할 수 있는 공유 트리, 브로커 uid와 대역의 passwd 항목, 사용자별 config dir가 들어간다.
+>
 > **(V) userland은 passwd 항목을 요구한다.** 커널은 숫자 uid `setuid`에 `/etc/passwd`를 요구하지 않는다.
 > python `getpass.getuser()`는 **`LOGNAME`·`USER`·`LNAME`·`USERNAME`을 차례로 보고 하나라도 있으면** passwd를 보지
 > 않는다(CPython 3.12 `getpass.py`와 로컬 이미지의 Python 3.12.13으로 확인). 다만 출하된 env(이미지 ENV·entrypoint·

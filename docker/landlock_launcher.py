@@ -98,14 +98,15 @@ def _session_tmpdir(cwd):
     """
     real_cwd = os.path.realpath(cwd)
     configured = os.environ.get("CLAUDE_CODE_TMPDIR", "").strip()
-    if configured and os.path.realpath(configured).startswith(real_cwd + os.sep):
-        tmp = configured
-        try:
+    try:
+        if configured and os.path.realpath(configured).startswith(real_cwd + os.sep):
+            tmp = configured
             os.makedirs(tmp, exist_ok=True)
-        except OSError:
-            pass
-    else:
-        tmp = ll.safe_tmpdir(real_cwd)
+        else:
+            tmp = ll.safe_tmpdir(real_cwd)
+    except OSError as exc:
+        # The CLI cannot start without it; say why instead of its bare exit 1.
+        _die("cannot create the session tmp dir in %r: %s" % (real_cwd, exc))
     os.environ.update(ll.session_tmp_env(tmp))
     return tmp
 

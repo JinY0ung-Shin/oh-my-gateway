@@ -207,7 +207,8 @@ uv run pytest --cov=src                            # with coverage
   confined CLI logs a harmless `Failed to save config with lock`). RW is only the workspace, the
   session's own `projects/<name>`, `<cfg>/session-env/<session id>` (pre-created 0700 when the id is
   known — never `session-env` itself: its siblings are other sessions' `$CLAUDE_ENV_FILE` scripts the
-  CLI sources into Bash) and `/dev/shm` (POSIX semaphores — multiprocessing/joblib; in landlock mode a
+  CLI sources into Bash; a confined CLI cannot sweep it, so the gateway removes it when the session
+  ends — delete, expiry, eviction, shutdown, stateless cleanup) and `/dev/shm` (POSIX semaphores — multiprocessing/joblib; in landlock mode a
   surface every same-uid session shares). **No shared cache is writable**: a session-writable
   `~/.npm`, uv cache or `plugins/data` is a cross-session plant channel (other sessions' `npx -y` /
   `uv run` / plugin hooks execute from them), so the launcher/broker point `npm_config_cache`,
@@ -219,10 +220,15 @@ uv run pytest --cov=src                            # with coverage
   present the hook runs and only its writes there fail. The CLI's only knob,
   `CLAUDE_CODE_PLUGIN_CACHE_DIR`, moves the whole plugins root, so a per-session data dir needs
   per-user config dirs. `CLAUDE_ADD_DIRS` rides the #240 filter (`_operator_add_dir_roots`), never
-  the raw strings. A confined script reaches what a file tool may plus `/dev/shm` — `/app` is never
-  listed (code + `/app/data` creds denied by rule absence, not a ro rule). `/etc` and `/usr` stay ro
-  (the CLI/libc need them; a passwd entry is required), so acceptance is "a path **outside the
-  ruleset**", not `/etc/passwd`. Every list entry leaves the gateway absolute and the launcher refuses
+  the raw strings. A confined script reaches what a file tool may plus `/dev/shm` and the read-only
+  system roots — `/app` is never listed (code + `/app/data` creds denied by rule absence, not a ro
+  rule). `/etc` and `/usr` stay ro (the CLI/libc need them; a passwd entry is required), so
+  acceptance is "a path **outside the ruleset**", not `/etc/passwd`. **`/proc` stays ro too (the
+  bundled CLI aborts without it), so in both modes a session can read every process's command line
+  (`/proc/<pid>/cmdline`)**: other sessions' `--mcp-config` JSON (with `MCP_FORWARD_CONTEXT`
+  `{{header:…}}` values), their system prompt (`Current user:`) and `--json-schema`. That is the argv
+  exposure of `docs/security-process-isolation.md` §6.5, not closed yet: moving those into files is
+  a follow-up. `environ`, `mem` and the fds of processes outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher refuses
   a relative one (exit 70) and uses `os.getcwd()`, never `$PWD` — a relative `USER_WORKSPACES_DIR`
   once granted `<ws>/<ws>`. A rule target that is a regular file (e.g. the user `CLAUDE.md`) gets
   file-only rights — the dir-only `READ_DIR` bit is EINVAL for a file and would abort the whole
@@ -232,7 +238,8 @@ uv run pytest --cov=src                            # with coverage
   `TMPDIR`/`CLAUDE_CODE_TMPDIR` point at `<cwd>/.cli-tmp`
   (off the shared `/tmp`), which is **not** a Landlock rule: it rides beneath the granted cwd and is
   symlink-stripped first, because a rule on that agent-controlled path was a `ln -s / .cli-tmp`
-  escape (`_add_rule` opens targets with `O_PATH`, following the link). The slash/skill preflight
+  escape (`_add_rule` opens targets with `O_PATH`, following the link). Failing to make it is fatal
+  (launcher exit 70, broker child exit 118), not an opaque CLI exit 1 later. The slash/skill preflight
   (`slash_commands._build_preflight_options`) is confined exactly like a session in that workspace
   (uid mode: through the broker as the request user's uid — `user` is threaded from the responses
   route and `create_client`; a no-cwd preflight stays landlock-shaped in a private per-process
@@ -302,7 +309,8 @@ uv run pytest --cov=src                            # with coverage
   named user's other sessions share the uid), and only then reports the status. If a supervisor dies
   abnormally, the resident broker (also a subreaper) kills what it left as their own uid
   (`_sweep_orphans`). Gap: a direct launcher SIGKILL with no relayed SIGTERM (the `agent_messages`
-  wedge path) leaves the CLI up to 5 s, so stateless cleanup can race it. **Wire format** after the
+  wedge path) leaves a CLI that ignores SIGTERM up to 5 s, so stateless cleanup can race it. A local
+  container run measured under 1 s, background jobs included. **Wire format** after the
   `=I` length + JSON header (3 fds on its first byte): fixed `=Ii` `(kind, value)` records —
   launcher→broker `(1, signum)` relay; broker→launcher `(1, code)` EXITED, `(2, signum)` SIGNALED,
   `(3, 0)` REFUSED. The launcher mirrors exactly (a 128+N single int once turned exit(130) into -2 and
@@ -325,15 +333,31 @@ uv run pytest --cov=src                            # with coverage
   and reassigning uids; entries it cannot honor (out of band, reserved, shared — e.g. after
   narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too, and their
   uids are excluded from the ephemeral pool (else an anonymous run would get a named user's files);
-  writes are fsync'd 0600, and a failing directory fsync after the replace keeps the grant. `effective_mode()` self-detects at startup (Landlock
-  ABI≥2 + broker reachable); unavailable uid is a hard `check_config` error **unless**
-  `CLAUDE_ISOLATION_FALLBACK=landlock`. Residual (container provisioning): the session uid silently
-  gets no access to a rule path it cannot traverse — under an app-owned 0700 `/home/app` that is the
-  shared `~/.claude` assets, `session-env/<id>` and `plugins/data` — and app-owned workspaces /
-  project dirs are not writable by U until per-user workspace ownership lands. **The privileged
-  cross-uid switch, the cap/securebits lockdown and `docker/entrypoint.py:launch_isolation_broker`
-  are container-only — unverifiable on this dev box, gated fail-closed, verify with the probe +
-  acceptance tests (`docs/isolation-uid-verification.md`) before enabling uid in prod.** Remaining
+  writes are fsync'd 0600, and a failing directory fsync after the replace keeps the grant.
+  `effective_mode()` self-detects at startup: Landlock ABI≥2, the broker reachable, and the
+  **startup probe** passed. Once the broker answers, `install_process_env` runs
+  `_probe_uid_sessions`:
+  - it spawns the real CLI `--version` through the launcher and broker, as an ephemeral session
+    uid, in a fresh anonymous workspace from the workspace manager;
+  - it checks with mode bits (no ACLs) that this uid can reach the config dir and create its
+    `projects/<name>`.
+
+  Unavailable uid is a hard `check_config` error naming the reason, **unless**
+  `CLAUDE_ISOLATION_FALLBACK=landlock`. The probe is skipped when the secret, the bands or the
+  registry are broken, so their own errors stand. In uid mode, `verify()` also runs in such a
+  workspace and names a launcher/broker refusal (`landlock.describe_launcher_exit`) instead of
+  printing npm install hints.
+
+  **With the shipped image the probe fails and uid mode refuses to start.** A local container run
+  (2026-10-14) served no turn: the session uid cannot write the app-owned 0755 workspace, so the CLI
+  died on `.cli-tmp`, while startup passed and every request got a 503. `/home/app` is 0700, which
+  hides the shared `~/.claude` assets, `session-env/<id>` and `plugins/data`. The image has no
+  passwd entries for the broker uid or the band. uid mode becomes usable only when per-user
+  workspace ownership and container provisioning land; `landlock` is the boundary to run today.
+  That run did verify the privileged layout: broker caps exactly SETUID|SETGID with securebits
+  locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`, and teardown.
+  Re-run `docs/isolation-uid-verification.md` in the deployment container before enabling uid in
+  prod. Remaining
   hardening (seccomp arg filter on set*id, bounding-set drop, per-user workspace ownership + broker
   cleanup) is a container/follow-up step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py`
   never import `/app/src` (session-writable + privileged); the broker's ticket-verify is duplicated

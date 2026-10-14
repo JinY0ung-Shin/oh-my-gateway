@@ -84,6 +84,36 @@ _DEFAULT_LAUNCHER = (
 
 _effective_mode_cache: Optional[str] = None
 
+# What the uid-mode startup probe (:func:`_probe_uid_sessions`) found: ``None``
+# when it has not run (tests, or a precondition ``check_config`` reports on its
+# own), otherwise the reasons a session uid cannot run the CLI here — empty when
+# the probe spawn worked.
+_uid_probe_problems: Optional[List[str]] = None
+
+# Exit statuses of a confined spawn that never reached the CLI
+# (docker/landlock_launcher.py ``_die``; docker/isolation_broker.py ``_EXIT_*``).
+_LAUNCHER_EXITS = {
+    70: "the isolation launcher or broker refused the spawn",
+    113: "the session uid cannot enter the workspace",
+    114: "the Landlock ruleset could not be applied",
+    115: "the switch to the session uid did not take",
+    116: "the spawn's supervisor exited before the CLI started",
+    117: "the confined CLI child failed during setup",
+    118: (
+        "the session uid cannot create <workspace>/.cli-tmp (the workspace is "
+        "not writable by it)"
+    ),
+    127: "the real CLI could not be executed",
+}
+
+
+def describe_launcher_exit(code: Optional[int]) -> Optional[str]:
+    """What a confined spawn's exit status means, when it is the launcher's or
+    the broker's own refusal rather than the CLI's; ``None`` otherwise."""
+    if code is None:
+        return None
+    return _LAUNCHER_EXITS.get(code)
+
 
 def isolation_mode() -> str:
     """The configured isolation mode (lowercased); ``off`` when unset."""
@@ -131,10 +161,11 @@ def _broker_reachable() -> bool:
 
 
 def uid_mode_available() -> bool:
-    """Whether ``uid`` mode can actually run here: Landlock usable and the
-    broker reachable (the broker being up means the entrypoint gave it the
-    privilege to switch uid)."""
-    return landlock_abi() >= 2 and _broker_reachable()
+    """Whether ``uid`` mode can actually run here: Landlock usable, the broker
+    reachable (the broker being up means the entrypoint gave it the privilege
+    to switch uid) and — once startup has probed it — a CLI spawned as a
+    session uid actually started (:func:`_probe_uid_sessions`)."""
+    return landlock_abi() >= 2 and _broker_reachable() and not _uid_probe_problems
 
 
 def _broker_wait_seconds() -> float:
@@ -205,10 +236,12 @@ def effective_mode() -> str:
     if mode == "uid" and not uid_mode_available():
         fallback = (os.getenv(FALLBACK_ENV) or "").strip().lower()
         if fallback == "landlock":
+            why = "; ".join(_uid_probe_problems or ["Landlock ABI or broker"])
             logger.warning(
-                "%s=uid is not available (Landlock ABI or broker); falling back "
-                "to landlock per %s=landlock",
+                "%s=uid is not available (%s); falling back to landlock per "
+                "%s=landlock",
                 MODE_ENV,
+                why,
                 FALLBACK_ENV,
             )
             resolved = "landlock"
@@ -217,9 +250,19 @@ def effective_mode() -> str:
 
 
 def reset_mode_cache() -> None:
-    """Clear the memoized effective mode (tests, or a deliberate re-resolve)."""
+    """Clear the memoized effective mode (tests, or a deliberate re-resolve).
+
+    Keeps the startup probe's result: :func:`install_process_env` re-resolves
+    the mode right after probing (:func:`reset_uid_probe` clears that, tests).
+    """
     global _effective_mode_cache
     _effective_mode_cache = None
+
+
+def reset_uid_probe() -> None:
+    """Forget the uid-mode startup probe's result (tests)."""
+    global _uid_probe_problems
+    _uid_probe_problems = None
 
 
 def confine_enabled() -> bool:
@@ -293,7 +336,8 @@ def install_process_env() -> None:
     starts it just before the gateway, and the availability resolved here is
     kept for the process lifetime, so an unlucky first connect would otherwise
     fall back to landlock (or refuse startup) for good. :func:`effective_mode`
-    itself never blocks.
+    itself never blocks. Once the broker answers, one probe spawn checks that a
+    session uid can actually run the CLI here (:func:`_probe_uid_sessions`).
     """
     if isolation_mode() == "uid" and broker_socket_path() and landlock_abi() >= 2:
         timeout = _broker_wait_seconds()
@@ -303,6 +347,8 @@ def install_process_env() -> None:
                 broker_socket_path(),
                 timeout,
             )
+        else:
+            _probe_uid_sessions()
         reset_mode_cache()
     # Resolve and lock the effective mode once, before the first spawn, and log
     # it (a uid->landlock fallback is surfaced here, not silently per-call).
@@ -319,6 +365,162 @@ def install_process_env() -> None:
         os.environ[REAL_CLI_ENV] = real_cli
     if not (os.environ.get(_SKIP_VERSION_CHECK_ENV) or "").strip():
         os.environ[_SKIP_VERSION_CHECK_ENV] = "1"
+
+
+# How long the startup probe's spawn (a ``--version`` CLI start) may take.
+_UID_PROBE_TIMEOUT_SECONDS = 30.0
+
+
+def _probe_uid_sessions() -> None:
+    """Spawn one CLI the way a uid-mode session would, once, at startup.
+
+    A reachable broker says nothing about whether a session uid can work in
+    this container's layout: with the shipped image every turn failed (the
+    session uid cannot write the app-owned workspace) while startup looked
+    healthy and every request got a 503. So startup runs the real spawn path —
+    a fresh anonymous workspace from the workspace manager, the ticket and path
+    lists a session gets, the launcher, the broker, the uid switch, Landlock —
+    with ``--version`` (no network, no model), and checks that the session uid
+    can reach the Claude config dir and create its transcript dir there. Any
+    problem makes uid mode unavailable: a startup error, or the landlock
+    fallback when the operator allowed one (:func:`effective_mode`).
+
+    Skipped when the ticket secret, the uid bands or the registry are unusable:
+    :func:`check_config` reports those with their own, clearer errors.
+    """
+    global _uid_probe_problems
+    from . import uid_isolation as ui
+
+    if not ui.ticket_secret() or ui.validate_bands() or ui.registry_errors():
+        _uid_probe_problems = None
+        return
+    try:
+        problems = _uid_session_problems()
+    except Exception as exc:  # the probe itself must never crash startup
+        problems = [f"the uid-mode startup probe could not run: {exc}"]
+    for problem in problems:
+        logger.error("uid isolation cannot run sessions here: %s", problem)
+    _uid_probe_problems = problems
+
+
+def _uid_session_problems() -> List[str]:
+    """Why a uid-mode session cannot run here (empty list when it can)."""
+    import subprocess
+
+    from src.workspace_manager import workspace_manager
+
+    from . import workspace_sandbox as ws
+    from .client import child_secret_env
+
+    workspace = workspace_manager.resolve(None)
+    cwd = _absolute(workspace)
+    try:
+        ro, rw = _ro_rw_roots(Path(cwd))
+        env, uid = _uid_spawn_env(cwd, ro, rw, user=None)
+        # The broker gives the session the gid equal to its uid.
+        problems = _session_dir_problems(uid, uid)
+        try:
+            result = subprocess.run(
+                [launcher_path(), "--version"],
+                cwd=cwd,
+                env={**os.environ, **child_secret_env(), **env},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=_UID_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return [
+                "a CLI spawned as a session uid did not finish `--version` within "
+                f"{_UID_PROBE_TIMEOUT_SECONDS:.0f} s",
+                *problems,
+            ]
+        if result.returncode != 0:
+            meaning = describe_launcher_exit(result.returncode) or "the CLI failed"
+            detail = _last_line(result.stderr)
+            problems.insert(
+                0,
+                f"a CLI spawned as a session uid exited {result.returncode}: "
+                f"{meaning}" + (f" ({detail})" if detail else ""),
+            )
+        return problems
+    finally:
+        workspace_manager.cleanup_temp_workspace(Path(cwd))
+        # The probe workspace's projects/ entry, if the spawn created one.
+        for root in ws._writable_extra_roots(Path(cwd)):
+            try:
+                os.rmdir(root)
+            except OSError:
+                pass
+
+
+def _last_line(raw: bytes) -> str:
+    lines = [ln.strip() for ln in raw.decode("utf-8", "replace").splitlines()]
+    lines = [ln for ln in lines if ln]
+    return lines[-1][:300] if lines else ""
+
+
+def _dac_allows(path: Path, uid: int, gid: int, want: int) -> bool:
+    """Whether mode bits give *uid*/*gid* (no supplementary groups — the broker
+    drops them) the ``R_OK``/``W_OK``/``X_OK`` bits in *want* on *path*.
+    POSIX ACLs are not evaluated."""
+    st = os.stat(path)
+    if st.st_uid == uid:
+        bits = st.st_mode >> 6
+    elif st.st_gid == gid:
+        bits = st.st_mode >> 3
+    else:
+        bits = st.st_mode
+    return bits & want == want
+
+
+def _describe_mode(path: Path) -> str:
+    st = os.stat(path)
+    return f"{path} is mode {st.st_mode & 0o7777:04o}, owner uid {st.st_uid}"
+
+
+def _first_unsearchable(path: Path, uid: int, gid: int) -> Optional[str]:
+    """The first directory on the way to *path* (itself included) the session
+    uid may not search, described; ``None`` when every one is searchable or the
+    path does not exist."""
+    walks = [path, Path(os.path.realpath(path))]
+    for target in walks:
+        for step in [*reversed(target.parents), target]:
+            try:
+                if not _dac_allows(step, uid, gid, os.X_OK):
+                    return _describe_mode(step)
+            except OSError:
+                return None
+    return None
+
+
+def _session_dir_problems(uid: int, gid: int) -> List[str]:
+    """Whether a session uid can reach the Claude config dir and create its
+    ``projects/<name>`` transcript dir there (mode bits only)."""
+    from . import workspace_sandbox as ws
+
+    claude_home = ws._claude_home()
+    if claude_home is None or not claude_home.exists():
+        return []
+    blocked = _first_unsearchable(claude_home, uid, gid)
+    if blocked is not None:
+        return [
+            f"a session uid cannot reach the Claude config dir {claude_home} "
+            f"({blocked}), so sessions would run without the user settings, "
+            "skills and plugins and could not keep transcripts"
+        ]
+    projects = claude_home / "projects"
+    target = projects if projects.is_dir() else claude_home
+    try:
+        writable = _dac_allows(target, uid, gid, os.W_OK | os.X_OK)
+    except OSError:
+        return []
+    if not writable:
+        return [
+            f"a session uid cannot create its transcript dir in {projects} "
+            f"({_describe_mode(target)}), so /v1/responses sessions could not "
+            "be resumed"
+        ]
+    return []
 
 
 def landlock_abi() -> int:
@@ -706,31 +908,39 @@ def options_env(
     ro, rw = _ro_rw_roots(Path(cwd), session_id)
 
     if mode == "uid":
-        from . import uid_isolation as ui
-
-        # Key the uid on the user when known, else on the (per-run) workspace so
-        # concurrent anonymous runs still get distinct uids. A named user gets a
-        # durable uid (persist=True); an anonymous/stateless run uses the
-        # recycled in-memory ephemeral band (persist=False) so it cannot grow
-        # the registry or exhaust the band (#241 review). The absolute path, so
-        # a session and its preflight land on the same uid however the cwd was
-        # spelled.
-        key = user or cwd
-        uid = ui.resolve_uid(key, persist=bool(user))
-        ticket = ui.mint_ticket(
-            uid=uid,
-            workspace=cwd,
-            ro=ro,
-            rw=rw,
-            env_allow=[],  # pass-through (gateway already scrubbed secrets)
-        )
-        return {
-            MODE_ENV: "uid",
-            TICKET_ENV: ticket,
-            BROKER_SOCKET_ENV: broker_socket_path(),
-        }
+        return _uid_spawn_env(cwd, ro, rw, user)[0]
 
     return _landlock_env(ro, rw)
+
+
+def _uid_spawn_env(
+    cwd: str, ro: List[str], rw: List[str], user: Optional[str]
+) -> Tuple[Dict[str, str], int]:
+    """The uid-mode ``options.env`` for a spawn in *cwd*, and the uid it runs as."""
+    from . import uid_isolation as ui
+
+    # Key the uid on the user when known, else on the (per-run) workspace so
+    # concurrent anonymous runs still get distinct uids. A named user gets a
+    # durable uid (persist=True); an anonymous/stateless run uses the
+    # recycled in-memory ephemeral band (persist=False) so it cannot grow
+    # the registry or exhaust the band (#241 review). The absolute path, so
+    # a session and its preflight land on the same uid however the cwd was
+    # spelled.
+    key = user or cwd
+    uid = ui.resolve_uid(key, persist=bool(user))
+    ticket = ui.mint_ticket(
+        uid=uid,
+        workspace=cwd,
+        ro=ro,
+        rw=rw,
+        env_allow=[],  # pass-through (gateway already scrubbed secrets)
+    )
+    env = {
+        MODE_ENV: "uid",
+        TICKET_ENV: ticket,
+        BROKER_SOCKET_ENV: broker_socket_path(),
+    }
+    return env, uid
 
 
 def preflight_options_env(
@@ -784,6 +994,16 @@ def check_config() -> List[str]:
     # uid mode that could not be satisfied (and was not allowed to fall back to
     # landlock) is a hard startup error — never a silent drop.
     if requested == "uid" and mode == "uid" and not uid_mode_available():
+        if _uid_probe_problems:
+            errors.append(
+                f"{MODE_ENV}=uid but a session uid cannot run the CLI here: "
+                + "; ".join(_uid_probe_problems)
+                + ". uid mode needs per-user workspace ownership and container "
+                "provisioning this image does not provide yet (see "
+                "docs/isolation-uid-verification.md); set "
+                f"{FALLBACK_ENV}=landlock to run the Landlock boundary instead."
+            )
+            return errors
         why = []
         if landlock_abi() < 2:
             why.append("Landlock ABI < 2 (kernel >= 5.19 needed)")

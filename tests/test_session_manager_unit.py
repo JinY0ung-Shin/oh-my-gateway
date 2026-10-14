@@ -234,6 +234,33 @@ class TestSessionManager:
         client.disconnect.assert_awaited_once()
         assert not workspace.exists()
 
+    @pytest.mark.parametrize("how", ["delete", "delete_async", "expire"])
+    async def test_ending_a_session_removes_its_session_env_dir(
+        self, manager, tmp_path, monkeypatch, how
+    ):
+        """The gateway pre-creates ``session-env/<id>`` for a confined CLI,
+        which cannot sweep it; every ended session used to leave one (#244
+        review 3). Only that session's entry goes."""
+        cfg = tmp_path / "cfg"
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg))
+        mine = cfg / "session-env" / "ending-session"
+        other = cfg / "session-env" / "other-session"
+        mine.mkdir(parents=True)
+        other.mkdir()
+        (mine / "hook-env.sh").write_text("export A=1\n")
+
+        session = manager.get_or_create_session("ending-session")
+        if how == "delete":
+            assert manager.delete_session("ending-session") is True
+        elif how == "delete_async":
+            assert await manager.delete_session_async("ending-session") is True
+        else:
+            session.expires_at = utc_now() - timedelta(seconds=1)
+            assert manager._purge_all_expired_sync() == 1
+
+        assert not mine.exists()
+        assert other.is_dir()
+
     def test_list_sessions_returns_active_sessions(self, manager):
         """list_sessions() returns list of active sessions."""
         manager.get_or_create_session("session-1")

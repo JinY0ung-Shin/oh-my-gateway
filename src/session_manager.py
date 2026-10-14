@@ -516,8 +516,7 @@ class SessionManager:
                 task.add_done_callback(self._evict_tasks.discard)
             else:
                 del self.sessions[session.session_id]
-                if session.workspace:
-                    self._cleanup_workspace(session.workspace)
+                self._release_session_dirs(session)
             metrics.record_session_evicted()
             logger.info(
                 "Evicted LRU session %s (idle %.0fs) to admit a new session; "
@@ -558,8 +557,7 @@ class SessionManager:
                         exc_info=True,
                     )
                 session.client = None
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+            self._release_session_dirs(session)
         except Exception:
             logger.exception(
                 "Eviction teardown failed for session %s", session.session_id
@@ -620,8 +618,7 @@ class SessionManager:
                             "Client disconnect failed for session %s", sid, exc_info=True
                         )
                     session.client = None
-                if session.workspace:
-                    self._cleanup_workspace(session.workspace)
+                self._release_session_dirs(session)
             except Exception:
                 logger.exception("Expiry teardown failed for session %s", sid)
 
@@ -650,12 +647,30 @@ class SessionManager:
             if session.client is not None:
                 # Defer to the async cleanup cycle so the client can be awaited.
                 continue
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+            self._release_session_dirs(session)
             del self.sessions[sid]
             logger.info(f"Cleaned up expired session: {sid}")
             removed += 1
         return removed
+
+    def _release_session_dirs(self, session: "Session") -> None:
+        """Remove what a finished session leaves on disk.
+
+        Its temp workspace, and its ``session-env/<session id>`` dir: the gateway
+        pre-creates that one for a confined CLI, which cannot sweep it itself,
+        so every ``/v1/responses`` session used to leave one behind (#241). The
+        CLI's session id is the gateway's.
+        """
+        if session.workspace:
+            self._cleanup_workspace(session.workspace)
+        try:
+            from src.backends.claude import landlock
+
+            landlock.remove_session_env_dir(session.session_id)
+        except Exception:
+            logger.debug(
+                "session-env cleanup skipped for %s", session.session_id, exc_info=True
+            )
 
     def _cleanup_workspace(self, workspace_path: str) -> None:
         """Remove temporary workspace directory on session expiry."""
@@ -790,8 +805,7 @@ class SessionManager:
         Must be called while holding ``self.lock``.
         """
         for session in self.sessions.values():
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+            self._release_session_dirs(session)
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -927,8 +941,7 @@ class SessionManager:
                 "from async callers",
                 session_id,
             )
-        if session.workspace:
-            self._cleanup_workspace(session.workspace)
+        self._release_session_dirs(session)
         logger.info(f"Deleted session: {session_id}")
         return True
 
@@ -950,8 +963,7 @@ class SessionManager:
                 logger.debug("Client disconnect timed out or failed", exc_info=True)
             session.client = None
 
-        if session.workspace:
-            self._cleanup_workspace(session.workspace)
+        self._release_session_dirs(session)
 
         logger.info(f"Deleted session: {session_id}")
         return True

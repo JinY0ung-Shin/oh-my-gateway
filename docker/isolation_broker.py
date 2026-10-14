@@ -88,6 +88,7 @@ _EXIT_LANDLOCK = 114
 _EXIT_CREDS = 115
 _EXIT_ORPHANED = 116
 _EXIT_SETUP = 117
+_EXIT_TMPDIR = 118  # cannot make <workspace>/.cli-tmp (workspace not writable)
 
 _libc = ctypes.CDLL(None, use_errno=True)
 
@@ -665,6 +666,10 @@ def _exec_cli(req, fds, real_cli, supervisor, test_same_uid):
         os._exit(_EXIT_CHDIR)
     try:
         tmp = ll.safe_tmpdir(workspace)  # a real dir, replacing any symlink
+    except OSError as exc:
+        _log("cannot create the session tmp dir in %r: %s" % (workspace, exc))
+        os._exit(_EXIT_TMPDIR)
+    try:
         ro, rw = _child_ro_rw(real_cli, workspace, req["ro"], req["rw"])
         env = _child_env(req["env"], req["env_allow"], workspace, tmp)
         _dup_onto_stdio(fds)

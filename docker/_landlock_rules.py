@@ -165,14 +165,16 @@ def safe_tmpdir(cwd):
     would grant the link's target. Without a rule, Landlock resolves the real
     path at ``open()`` and a symlink out of the workspace is simply denied. We
     still unlink any symlink and remake a real dir so the CLI's temp writes
-    land inside the sandbox rather than failing. Caller sets TMPDIR to this."""
+    land inside the sandbox rather than failing. Caller sets TMPDIR to this.
+
+    Raises ``OSError`` when the dir cannot be made: the CLI cannot start
+    without its tmpdir (it exits 1 on the failed ``mkdir``), and swallowing the
+    error here hid the cause — e.g. a uid-mode session uid that cannot write an
+    app-owned workspace."""
     tmp = os.path.join(cwd, ".cli-tmp")
-    try:
-        if os.path.islink(tmp):
-            os.unlink(tmp)
-        os.makedirs(tmp, exist_ok=True)
-    except OSError:
-        pass
+    if os.path.islink(tmp):
+        os.unlink(tmp)
+    os.makedirs(tmp, exist_ok=True)
     return tmp
 
 
