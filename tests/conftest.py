@@ -28,6 +28,12 @@ os.environ.setdefault("SYSINFO_REDACTION", "false")
 # tests/test_process_hardening.py checks the real effect in child processes.
 os.environ.setdefault("GATEWAY_NON_DUMPABLE", "false")
 
+# Isolation-mode startup refuses a launcher a session could replace: it and
+# every ancestor must be root-owned (landlock.launcher_write_problems). A
+# checkout's docker/landlock_launcher.py is owned by whoever cloned it, so tests
+# that enable a mode take the dev opt-out; the ownership tests unset it.
+os.environ.setdefault("CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER", "true")
+
 # Throwaway HOME, no inherited CLAUDE_CONFIG_DIR (see the module docstring).
 from tests.fixtures import hermetic_home  # must precede every src import
 

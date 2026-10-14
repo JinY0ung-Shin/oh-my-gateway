@@ -254,8 +254,8 @@ _BROKER = _REPO / "docker" / "isolation_broker.py"
 
 
 def _same_uid_broker_unusable() -> str:
-    if landlock.landlock_abi() < 2:
-        return f"Landlock ABI {landlock.landlock_abi()} < 2"
+    if landlock.landlock_abi() < landlock.MIN_LANDLOCK_ABI:
+        return f"Landlock ABI {landlock.landlock_abi()} < {landlock.MIN_LANDLOCK_ABI}"
     if os.getuid() == 0 or os.getuid() != os.getgid():
         return "the --test-same-uid broker needs a non-root uid equal to its gid"
     return ""

@@ -2015,10 +2015,26 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             session.session_id,
         )
 
+        # A confined session can read every CLI's /proc/<pid>/cmdline: move the
+        # MCP config and system prompt into workspace files for the spawn, and
+        # remove them once the CLI has parsed its arguments (#241 §6.5).
+        from . import argv_files as argv_files_mod
+        from . import landlock
+
+        argv_files = None
+        if landlock.confine_enabled():
+            argv_files = argv_files_mod.externalize(
+                options, shared_uid=landlock.effective_mode() != "uid"
+            )
+
         # Auth and credential isolation ride options.env (_configure_sdk_env);
         # os.environ is shared by every concurrent connect and stays untouched.
         client = ClaudeSDKClient(options=options)
-        await client.connect(prompt=None)
+        try:
+            await client.connect(prompt=None)
+        finally:
+            if argv_files is not None:
+                argv_files.cleanup()
 
         return client
 

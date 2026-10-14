@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -35,8 +36,8 @@ _SYSTEM_PYTHON = "/usr/bin/python3"
 
 
 def _landlock_skip() -> str:
-    if landlock.landlock_abi() < 2:
-        return f"Landlock ABI {landlock.landlock_abi()} < 2"
+    if landlock.landlock_abi() < landlock.MIN_LANDLOCK_ABI:
+        return f"Landlock ABI {landlock.landlock_abi()} < {landlock.MIN_LANDLOCK_ABI}"
     return ""
 
 
@@ -234,6 +235,111 @@ class TestFailClosed:
         errors = landlock.check_config()
         assert any("Landlock cannot be enforced" in e for e in errors)
 
+    def test_abi_2_is_refused(self, confine_on, monkeypatch):
+        # #244 review 4: ABI 2 has no TRUNCATE right, so a confined session
+        # could still truncate DAC-writable files outside the ruleset.
+        monkeypatch.setattr(landlock, "landlock_abi", lambda: 2)
+        errors = landlock.check_config()
+        assert any(
+            "Landlock cannot be enforced" in e and "ABI >= 3" in e for e in errors
+        )
+
+    def test_a_probe_that_cannot_run_fails_closed(self, monkeypatch):
+        # #244 review 4: an enforcement probe that raised used to count as a
+        # pass.
+        monkeypatch.setattr(landlock, "landlock_abi", lambda: 7)
+
+        def boom(*_a, **_k):
+            raise OSError("no interpreter")
+
+        monkeypatch.setattr(subprocess, "run", boom)
+        ok, why = landlock.can_enforce_landlock()
+        assert not ok
+        assert "could not run" in why
+
+    @staticmethod
+    def _launcher_tree(tmp_path, *, mode=0o755):
+        d = tmp_path / "bin"
+        d.mkdir()
+        launcher = d / "landlock_launcher.py"
+        launcher.write_text("#!/usr/bin/env python3\n")
+        launcher.chmod(mode)
+        (d / "_landlock_rules.py").write_text("")
+        return launcher
+
+    def test_a_replaceable_launcher_is_an_error(
+        self, confine_on, monkeypatch, tmp_path
+    ):
+        # #244 review 4: an agent-writable launcher was only a warning.
+        monkeypatch.delenv(landlock.ALLOW_UNSAFE_LAUNCHER_ENV, raising=False)
+        launcher = self._launcher_tree(tmp_path, mode=0o777)
+        monkeypatch.setenv(landlock.LAUNCHER_ENV, str(launcher))
+        errors = landlock.check_config()
+        assert any(
+            "could be replaced by a session" in e and str(launcher) in e
+            for e in errors
+        )
+
+    def test_the_dev_opt_out_only_warns(
+        self, confine_on, monkeypatch, tmp_path, caplog
+    ):
+        monkeypatch.setenv(landlock.ALLOW_UNSAFE_LAUNCHER_ENV, "true")
+        launcher = self._launcher_tree(tmp_path, mode=0o777)
+        monkeypatch.setenv(landlock.LAUNCHER_ENV, str(launcher))
+        with caplog.at_level("WARNING", logger=landlock.__name__):
+            errors = landlock.check_config()
+        assert not any("could be replaced" in e for e in errors)
+        assert "could be replaced by a session" in caplog.text
+
+    def test_write_problems_cover_file_sibling_and_ancestors(
+        self, monkeypatch, tmp_path
+    ):
+        launcher = self._launcher_tree(tmp_path)
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **k):
+            st = real_stat(self, *a, **k)
+            values = list(st)
+            if self == launcher.parent / "_landlock_rules.py":
+                values[stat.ST_MODE] = stat.S_IFREG | 0o666
+            elif self == launcher.parent:
+                values[stat.ST_UID] = 1000
+            else:
+                values[stat.ST_UID] = 0  # everything else root-owned
+                values[stat.ST_MODE] &= ~0o022 | stat.S_ISVTX
+            return os.stat_result(values)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        problems = landlock.launcher_write_problems(launcher)
+        assert any("_landlock_rules.py" in p and "0666" in p for p in problems)
+        assert any(f"directory {launcher.parent} " in p for p in problems)
+        assert not any(p.startswith(f"{launcher} ") for p in problems)
+
+    def test_a_sticky_world_writable_ancestor_is_allowed(
+        self, monkeypatch, tmp_path
+    ):
+        launcher = self._launcher_tree(tmp_path)
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **k):
+            values = list(real_stat(self, *a, **k))
+            values[stat.ST_UID] = 0
+            if self == launcher.parent.parent:
+                values[stat.ST_MODE] = stat.S_IFDIR | stat.S_ISVTX | 0o777
+            else:
+                values[stat.ST_MODE] &= ~0o022
+            return os.stat_result(values)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        assert landlock.launcher_write_problems(launcher) == []
+
+    def test_the_shipped_layout_passes(self):
+        # The image's /usr/local/bin copies; skipped where they are absent.
+        launcher = Path("/usr/local/bin/landlock_launcher.py")
+        if not launcher.exists():
+            pytest.skip("no image layout here")
+        assert landlock.launcher_write_problems(launcher) == []
+
     def test_config_check_surfaces_errors_as_config_issues(
         self, confine_on, monkeypatch
     ):
@@ -357,6 +463,61 @@ class TestLauncherConfines:
         assert r["out_read"].startswith("DENY")  # sibling dir denied
         assert r["out_write"].startswith("DENY")
         assert r["repo_read"].startswith("DENY")  # gateway code (/app) denied
+
+    _TRUNCATE_PROBE = (
+        "import json, os, sys\n"
+        "def t(p):\n"
+        "    try:\n"
+        "        os.truncate(p, 0); return 'OK'\n"
+        "    except OSError as e: return 'DENY:' + str(e.errno)\n"
+        "print(json.dumps({'in': t(sys.argv[1]), 'ro': t(sys.argv[2]),"
+        " 'out': t(sys.argv[3])}))\n"
+    )
+
+    def test_truncate_outside_the_writable_set_is_denied(self, tmp_path):
+        # #244 review 4: DAC allows these truncates (same uid, 0644 files), so
+        # only Landlock's TRUNCATE right (ABI >= 3) can refuse them.
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        (ws / "probe.py").write_text(self._TRUNCATE_PROBE)
+        mine = ws / "mine.txt"
+        ro_dir = tmp_path / "ro"
+        ro_dir.mkdir()
+        shared = ro_dir / "shared.txt"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.txt"
+        for f in (mine, shared, secret):
+            f.write_text("KEEP\n")
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "PWD": str(ws),
+            landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
+            landlock.RW_ENV: str(ws),
+            landlock.RO_ENV: str(ro_dir),
+        }
+        proc = subprocess.run(
+            [
+                sys.executable,
+                str(_LAUNCHER),
+                str(ws / "probe.py"),
+                str(mine),
+                str(shared),
+                str(secret),
+            ],
+            cwd=str(ws),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        r = json.loads(proc.stdout)
+        assert r["in"] == "OK"
+        assert r["ro"].startswith("DENY")
+        assert r["out"].startswith("DENY")
+        assert shared.read_text() == "KEEP\n"
+        assert secret.read_text() == "KEEP\n"
 
     def test_fail_closed_without_real_cli(self, tmp_path):
         ws = tmp_path / "ws"
@@ -1111,6 +1272,7 @@ class TestTicketFreshAtConnect:
 
         monkeypatch.setattr(client_module, "ClaudeSDKClient", _FakeClient)
         session = Session(session_id=str(uuid.uuid4()))
+        (tmp_path / "ws").mkdir()  # a real spawn's cwd exists (argv files go there)
         await cli.create_client(session, cwd=str(tmp_path / "ws"), user="alice")
 
         assert len(minted) == 2 and presented == [minted[-1]]

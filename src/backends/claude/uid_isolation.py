@@ -133,8 +133,8 @@ class UidRegistry:
     free uid in the band, skips the reserved uids, and never reuses one still
     mapped. Thread-safe for the gateway's concurrent session creation. Only
     stable (named-user) keys live here — anonymous/stateless runs use the
-    in-memory :class:`_EphemeralPool` so they cannot grow this file or exhaust
-    the band.
+    in-memory :class:`_EphemeralPool` so they cannot grow this file or use up
+    the stable band.
 
     Fail-closed on a damaged file (#241 review): a registry that exists but
     cannot be read or parsed raises :class:`UidAllocationError` instead of
@@ -314,39 +314,52 @@ class UidRegistry:
 
 
 class _EphemeralPool:
-    """In-memory ``key -> uid`` ring for anonymous/stateless runs.
+    """In-memory ``key -> uid`` leases for anonymous/stateless runs.
 
-    Hands out distinct uids from the ephemeral band until it is full, then
-    recycles the least-recently-used mapping. Never persisted and never raises
-    on exhaustion (it recycles), so the high-volume anonymous path — every
-    ``/v1/agents/messages`` call, each anonymous ``/v1/responses`` session,
-    admin try-runs, startup ``verify()`` — cannot grow a file or permanently
-    exhaust the band. A recycled uid can at most be shared by more than
-    ``size`` concurrent anonymous runs, which Landlock still confines to their
-    own per-spawn workspace.
+    The key is the run's absolute ``_tmp_`` workspace path, and a lease lives
+    exactly as long as that directory: a uid is handed to another key only
+    after its workspace is gone (``cleanup_temp_workspace`` ran, so the run
+    ended). With every uid leased, :meth:`resolve` raises instead of recycling
+    a live one — two concurrent runs on one uid would share DAC access and
+    ``/dev/shm`` (#244 review 4). Never persisted, so the high-volume anonymous
+    path — every ``/v1/agents/messages`` call, each anonymous ``/v1/responses``
+    session, admin try-runs, startup ``verify()`` — cannot grow a file. A
+    workspace that cannot be removed keeps its uid, which fails closed (the
+    broker also refuses a uid still live in another workspace).
     """
 
     def __init__(self, lo: int, hi: int, reserved: Optional[Set[int]] = None) -> None:
         reserved = set(reserved or ())
         self._uids = [u for u in range(lo, hi + 1) if u not in reserved]
-        self._lru: "OrderedDict[str, int]" = OrderedDict()
+        self._free = list(self._uids)
+        self._leases: "OrderedDict[str, int]" = OrderedDict()
         self._lock = threading.Lock()
+
+    @staticmethod
+    def _released(key: str) -> bool:
+        return not os.path.lexists(key)
 
     def resolve(self, key: str) -> int:
         with self._lock:
-            if key in self._lru:
-                self._lru.move_to_end(key)
-                return self._lru[key]
+            if key in self._leases:
+                self._leases.move_to_end(key)
+                return self._leases[key]
             if not self._uids:
                 raise UidAllocationError(
                     "no ephemeral uids available; widen the band or raise "
                     f"{EPHEMERAL_UIDS_ENV}"
                 )
-            if len(self._lru) < len(self._uids):
-                uid = self._uids[len(self._lru)]
-            else:
-                _old, uid = self._lru.popitem(last=False)  # recycle LRU
-            self._lru[key] = uid
+            if not self._free:
+                for old in [k for k in self._leases if self._released(k)]:
+                    self._free.append(self._leases.pop(old))
+            if not self._free:
+                raise UidAllocationError(
+                    f"all {len(self._uids)} ephemeral uids are leased to live "
+                    "anonymous workspaces; retry later or raise "
+                    f"{EPHEMERAL_UIDS_ENV}"
+                )
+            uid = self._free.pop(0)
+            self._leases[key] = uid
             return uid
 
 

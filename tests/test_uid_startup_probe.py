@@ -266,7 +266,7 @@ class TestStartupDecision:
 
 
 _needs_same_uid_broker = pytest.mark.skipif(
-    landlock.landlock_abi() < 2
+    landlock.landlock_abi() < landlock.MIN_LANDLOCK_ABI
     or not os.access(_SYS_PY, os.X_OK)
     or os.geteuid() == 0
     or os.getgid() != os.getuid(),

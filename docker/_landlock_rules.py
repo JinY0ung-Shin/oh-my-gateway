@@ -55,6 +55,13 @@ _ACCESS_BY_ABI = {
 # supervisor to escape teardown; in both modes it blocks cross-session signals
 # and the abstract-socket namespace, which has no DAC at all.
 _SCOPE_ABI = 6
+
+# The lowest ABI either mode accepts. ABI 1/2 do not handle TRUNCATE, so there
+# truncate(2)/O_TRUNC on a file outside the ruleset that DAC lets the session
+# write (a shared asset, /app/data) still succeeds — the read-only and
+# "outside the ruleset" guarantees would not hold (#244 review 4). Mirrored by
+# ``src.backends.claude.landlock.MIN_LANDLOCK_ABI`` (parity-tested).
+MIN_ABI = 3
 _SCOPE_ABSTRACT_UNIX_SOCKET = 1 << 0
 _SCOPE_SIGNAL = 1 << 1
 
@@ -263,15 +270,16 @@ def drop_all_caps():
 def build_and_restrict(ro_dirs, rw_dirs, ro_files=RO_FILES, rw_files=RW_FILES):
     """Create a ruleset from the given paths, then NO_NEW_PRIVS + restrict_self.
 
-    Requires ABI >= 2 (kernel >= 5.19); raises :class:`LandlockError` otherwise
+    Requires ABI >= MIN_ABI (3, kernel >= 6.2); raises :class:`LandlockError` otherwise
     so the caller fails closed. Read-write dirs are created first (a rule needs
     an existing path to O_PATH-open); absent read-only paths are skipped. On
     ABI >= 6 the domain is also scoped (signals, abstract unix sockets).
     """
     a = abi()
-    if a < 2:
+    if a < MIN_ABI:
         raise LandlockError(
-            "Landlock ABI %d < 2 (need kernel >= 5.19); cannot confine" % a
+            "Landlock ABI %d < %d (need kernel >= 6.2 for truncate control); "
+            "cannot confine" % (a, MIN_ABI)
         )
     handled = _rights_mask(a)
     if a >= _SCOPE_ABI:

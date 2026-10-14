@@ -364,8 +364,8 @@ def _landlock_unusable() -> Optional[str]:
     from src.backends.claude import landlock
 
     abi = landlock.landlock_abi()
-    if abi < 2:
-        return f"Landlock ABI {abi} < 2 (need kernel >= 5.19)"
+    if abi < landlock.MIN_LANDLOCK_ABI:
+        return f"Landlock ABI {abi} < {landlock.MIN_LANDLOCK_ABI} (need kernel >= 6.2)"
     launcher = Path(landlock.launcher_path())
     if not (launcher.is_file() and os.access(launcher, os.X_OK)):
         return f"launcher {launcher} not executable"

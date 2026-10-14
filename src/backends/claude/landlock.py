@@ -38,9 +38,12 @@ import math
 import os
 import re
 import shutil
+import stat
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
+
+from src.env_utils import parse_bool_env
 
 logger = logging.getLogger(__name__)
 
@@ -63,7 +66,7 @@ _BROKER_POLL_SECONDS = 0.2
 
 # The single operator knob for session isolation:
 #   off      — no OS boundary (default)
-#   landlock — Landlock ruleset, no privilege (kernel >= 5.19)
+#   landlock — Landlock ruleset, no privilege (ABI >= 3, kernel >= 6.2)
 #   uid      — uid-per-user broker + Landlock (DAC + signal isolation too)
 # Both landlock and uid apply the Landlock ruleset. An unknown value is rejected
 # fail-closed in :func:`check_config`.
@@ -165,7 +168,7 @@ def uid_mode_available() -> bool:
     reachable (the broker being up means the entrypoint gave it the privilege
     to switch uid) and — once startup has probed it — a CLI spawned as a
     session uid actually started (:func:`_probe_uid_sessions`)."""
-    return landlock_abi() >= 2 and _broker_reachable() and not _uid_probe_problems
+    return landlock_abi() >= MIN_LANDLOCK_ABI and _broker_reachable() and not _uid_probe_problems
 
 
 def _broker_wait_seconds() -> float:
@@ -339,7 +342,7 @@ def install_process_env() -> None:
     itself never blocks. Once the broker answers, one probe spawn checks that a
     session uid can actually run the CLI here (:func:`_probe_uid_sessions`).
     """
-    if isolation_mode() == "uid" and broker_socket_path() and landlock_abi() >= 2:
+    if isolation_mode() == "uid" and broker_socket_path() and landlock_abi() >= MIN_LANDLOCK_ABI:
         timeout = _broker_wait_seconds()
         if not _wait_for_broker(timeout):
             logger.warning(
@@ -523,6 +526,14 @@ def _session_dir_problems(uid: int, gid: int) -> List[str]:
     return []
 
 
+# The lowest Landlock ABI either mode accepts: ABI 3 (kernel >= 6.2) is the
+# first that handles TRUNCATE, so below it a confined session could still
+# truncate files outside the ruleset that DAC lets it write (#244 review 4).
+# Mirrors ``docker/_landlock_rules.MIN_ABI`` (parity-tested).
+MIN_LANDLOCK_ABI = 3
+_MIN_ABI_TEXT = f"ABI >= {MIN_LANDLOCK_ABI}, kernel >= 6.2"
+
+
 def landlock_abi() -> int:
     """The kernel's Landlock ABI, or 0/-1 when unavailable.
 
@@ -576,7 +587,7 @@ def can_enforce_landlock() -> Tuple[bool, str]:
     so startup fails closed instead of every turn failing (#241 review).
     """
     abi = landlock_abi()
-    if abi < 2:
+    if abi < MIN_LANDLOCK_ABI:
         return False, (
             f"Landlock ABI {abi}"
             if abi >= 0
@@ -591,8 +602,10 @@ def can_enforce_landlock() -> Tuple[bool, str]:
             capture_output=True,
             timeout=15,
         )
-    except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover
-        return True, f"could not run a Landlock probe ({exc})"
+    except (OSError, subprocess.SubprocessError) as exc:
+        # Fail closed: an enforcement check that could not run proved nothing
+        # (#244 review 4).
+        return False, f"the Landlock enforcement probe could not run ({exc})"
     if result.returncode == 0:
         return True, ""
     return False, (
@@ -606,33 +619,80 @@ def isolation_mode_is_valid() -> bool:
     return isolation_mode() in _KNOWN_MODES
 
 
-def _warn_if_launcher_agent_writable(launcher: Path) -> None:
-    """Warn (not fail) if the launcher is agent-writable.
+# Dev-checkout opt-out for :func:`launcher_write_problems`: a checkout's
+# ``docker/landlock_launcher.py`` is owned by the developer, so with this set the
+# violations are logged instead of refusing startup. Never set it in production.
+ALLOW_UNSAFE_LAUNCHER_ENV = "CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER"
 
-    The launcher is privileged — it applies the ruleset / hands off to the
-    broker — so an agent-writable copy (group/other-writable, or owned by the
-    app uid, e.g. a ``docker/`` tree copied under ``/app`` and chowned to
-    ``app``) would let a session rewrite it. ``check_config`` cannot hard-fail
-    here (a dev checkout runs as a normal user that owns the file), so it warns.
+
+def _describe_owner_mode(st: os.stat_result) -> str:
+    return f"uid {st.st_uid}, mode {stat.S_IMODE(st.st_mode):04o}"
+
+
+def launcher_write_problems(launcher: Path) -> List[str]:
+    """Why a session could replace the launcher (empty when it cannot).
+
+    The launcher is the boundary — it applies the ruleset / hands off to the
+    broker — so whoever can rewrite it, or the ``_landlock_rules.py`` it loads
+    from its own directory, or rename either away in any ancestor directory,
+    removes confinement from the next spawn. Every one of those must be
+    root-owned and not group/other-writable (a sticky directory such as /tmp
+    stops others replacing a root-owned entry, so it is allowed). Owned by the
+    gateway's or app's uid is a violation even with mode 0755: that owner can
+    chmod it (#244 review 4).
     """
-    try:
-        st = launcher.stat()
-    except OSError:
-        return
-    if st.st_mode & 0o022:
+    problems: List[str] = []
+    for target in (launcher, launcher.parent / "_landlock_rules.py"):
+        try:
+            st = target.stat()
+        except OSError as exc:
+            problems.append(f"{target} cannot be checked ({exc.strerror})")
+            continue
+        if st.st_uid != 0 or st.st_mode & 0o022:
+            problems.append(
+                f"{target} is not root-owned and non-writable "
+                f"({_describe_owner_mode(st)})"
+            )
+    seen = set()
+    for directory in launcher.parents:
+        if directory in seen:
+            continue
+        seen.add(directory)
+        try:
+            st = directory.stat()
+        except OSError as exc:
+            problems.append(f"{directory} cannot be checked ({exc.strerror})")
+            continue
+        writable = st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX
+        if st.st_uid != 0 or writable:
+            problems.append(
+                f"the directory {directory} is not root-owned and non-writable "
+                f"({_describe_owner_mode(st)})"
+            )
+    return problems
+
+
+def _launcher_ownership_errors(launcher: Path) -> List[str]:
+    """Startup errors for an agent-replaceable launcher (the dev opt-out turns
+    them into a warning)."""
+    problems = launcher_write_problems(launcher)
+    if not problems:
+        return []
+    if parse_bool_env(ALLOW_UNSAFE_LAUNCHER_ENV):
         logger.warning(
-            "isolation launcher %s is group/other-writable; ship it root-owned "
-            "and non-agent-writable (outside /app)",
+            "isolation launcher %s could be replaced by a session (%s); allowed "
+            "by %s — a dev checkout only, never production",
             launcher,
+            "; ".join(problems),
+            ALLOW_UNSAFE_LAUNCHER_ENV,
         )
-    raw = (os.getenv("APP_UID") or "").strip()
-    if raw.isdigit() and st.st_uid == int(raw):
-        logger.warning(
-            "isolation launcher %s is owned by the app uid %s; a session could "
-            "rewrite it — ship it root-owned outside /app",
-            launcher,
-            raw,
-        )
+        return []
+    return [
+        f"{MODE_ENV}={isolation_mode()} but the launcher could be replaced by a "
+        "session: " + "; ".join(problems) + ". Ship it (and _landlock_rules.py) "
+        "root-owned and non-writable outside /app, as the image does at "
+        f"/usr/local/bin, or set {ALLOW_UNSAFE_LAUNCHER_ENV}=true in a dev checkout."
+    ]
 
 
 def _absolute(path) -> str:
@@ -1005,8 +1065,8 @@ def check_config() -> List[str]:
             )
             return errors
         why = []
-        if landlock_abi() < 2:
-            why.append("Landlock ABI < 2 (kernel >= 5.19 needed)")
+        if landlock_abi() < MIN_LANDLOCK_ABI:
+            why.append(f"Landlock ABI < {MIN_LANDLOCK_ABI} ({_MIN_ABI_TEXT} needed)")
         if not broker_socket_path():
             why.append(f"{BROKER_SOCKET_ENV} is unset")
         elif not _broker_reachable():
@@ -1043,7 +1103,7 @@ def check_config() -> List[str]:
             "landlock_launcher.py (chmod +x)."
         )
     else:
-        _warn_if_launcher_agent_writable(launcher)
+        errors.extend(_launcher_ownership_errors(launcher.resolve()))
 
     if resolve_real_cli() is None:
         errors.append(
@@ -1056,7 +1116,7 @@ def check_config() -> List[str]:
     if not ok:
         errors.append(
             f"{MODE_ENV}={mode} but Landlock cannot be enforced here ({why}; need "
-            "ABI >= 2, kernel >= 5.19). Confinement cannot be enforced."
+            f"{_MIN_ABI_TEXT}). Confinement cannot be enforced."
         )
 
     return errors

@@ -28,7 +28,7 @@ It answers which per-user isolation mechanism is available in THIS container:
     spawn broker the root entrypoint forks before its drop -- or file caps on
     the broker binary under a non-root start; never held by the gateway
     itself, whose children would inherit them)
-  * Landlock filesystem confinement (needs ABI >= 2: kernel >= 5.19 or a distro
+  * Landlock filesystem confinement (needs ABI >= 3: kernel >= 6.2 or a distro
     backport, the landlock LSM, and a seccomp profile that allows the syscalls)
   * bubblewrap/nsjail namespaces (needs userns + a fresh procfs in a new PID ns)
 plus whether the gateway's environ is readable (the reported finding, F2),
@@ -585,12 +585,12 @@ def probe_kernel() -> None:
     _kv("/proc/version", _line("/proc/version")[:80])
     ver = _kernel_version()
     if ver is None:
-        _kv("mainline ABI-2 floor (>=5.19)", "unknown")
+        _kv("mainline ABI-3 floor (>=6.2)", "unknown")
         return
-    # Mainline got ABI 2 (LANDLOCK_ACCESS_FS_REFER) in 5.19, but distro kernels
+    # Mainline got ABI 3 (LANDLOCK_ACCESS_FS_TRUNCATE) in 6.2, but distro kernels
     # backport Landlock (RHEL 9's 5.14 reports ABI 6): the syscall below decides.
-    ge = "yes" if ver >= (5, 19) else "no"
-    _kv("mainline ABI-2 floor (>=5.19)", f"{ge}  (informational; backports exist)")
+    ge = "yes" if ver >= (6, 2) else "no"
+    _kv("mainline ABI-3 floor (>=6.2)", f"{ge}  (informational; backports exist)")
 
 
 def probe_identity() -> dict:
@@ -923,7 +923,7 @@ def probe_landlock() -> dict:
     if not _LANDLOCK_NR_KNOWN:
         out["cause"] = "arch"
         _kv("landlock_create_ruleset", f"NOT TRIED (syscall number differs on {_MACH})")
-        _kv("=> Landlock usable (ABI>=2)", "unknown")
+        _kv("=> Landlock usable (ABI>=3)", "unknown")
         return out
 
     def t_landlock():
@@ -984,11 +984,11 @@ def probe_landlock() -> dict:
         if kind == "seccomp":
             out["cause"] = "seccomp-kill"
             _kv("landlock_create_ruleset", f"{text} => seccomp kills it")
-            _kv("=> Landlock usable (ABI>=2)", False)
+            _kv("=> Landlock usable (ABI>=3)", False)
         else:
             out["cause"] = "untested"
             _kv("landlock_create_ruleset", text or f"UNKNOWN ({reply})")
-            _kv("=> Landlock usable (ABI>=2)", "unknown")
+            _kv("=> Landlock usable (ABI>=3)", "unknown")
         return out
     # The syscall is authoritative: it returns an ABI version (>=1) only when
     # Landlock is compiled AND active in the running kernel's LSM stack.
@@ -997,8 +997,8 @@ def probe_landlock() -> dict:
     # the syscall: runc answers ENOSYS for numbers above the highest one a profile
     # names, and Docker <= 20.10.17's built-in profile predates landlock_*.
     out["abi"] = abi if abi >= 1 else 0
-    if abi >= 2:
-        _kv("landlock ABI version", f"{abi}  (>=2: cross-dir rename/link confinable)")
+    if abi >= 3:
+        _kv("landlock ABI version", f"{abi}  (>=3: rename/link + truncate confinable)")
         # 444 answering a version is not proof 445/446 run: a seccomp profile can
         # allow the query and block the enforce syscalls. Verify the whole chain.
         ok_enf, d_enf = _in_child(t_landlock_enforce)
@@ -1020,6 +1020,12 @@ def probe_landlock() -> dict:
         else:
             out["cause"] = "other"
             _kv("landlock enforce", f"FAILED ({d_enf}) => not usable")
+    elif abi == 2:
+        # ABI 2 (kernel 5.19-6.1) has no LANDLOCK_ACCESS_FS_TRUNCATE: truncate(2)
+        # on a DAC-writable file outside the ruleset still succeeds, so the
+        # gateway refuses it (MIN_LANDLOCK_ABI = 3, #244 review 4).
+        out["cause"] = "abi2"
+        _kv("landlock ABI version", "2  (no TRUNCATE: files outside the ruleset truncatable)")
     elif abi == 1:
         # ABI 1 (kernel 5.13-5.18) lacks LANDLOCK_ACCESS_FS_REFER, so ANY ruleset
         # forces cross-directory rename/link to EXDEV: git object finalize,
@@ -1058,7 +1064,7 @@ def probe_landlock() -> dict:
         _kv("TCP bind/connect port rules", tcp)
         scoped = "yes (ABI>=6)" if abi >= 6 else f"no (ABI {abi} < 6)"
         _kv("signal/abstract-socket scoping", scoped)
-    _kv("=> Landlock usable (ABI>=2)", out["usable"])
+    _kv("=> Landlock usable (ABI>=3)", out["usable"])
     return out
 
 
@@ -2279,8 +2285,12 @@ _LANDLOCK_REMEDY = {
     ),
     "lsm": ("Landlock: compiled in but off -- add 'landlock' to lsm=.",),
     "abi1": (
-        "Landlock: kernel has ABI 1 only; need >=5.19 (ABI 2) so",
-        "cross-dir rename/link is not forced to EXDEV.",
+        "Landlock: kernel has ABI 1 only; need >=6.2 (ABI 3) so",
+        "cross-dir rename/link is not forced to EXDEV and truncate is confined.",
+    ),
+    "abi2": (
+        "Landlock: kernel has ABI 2; need >=6.2 (ABI 3) so truncate(2) on",
+        "files outside the ruleset is denied (the gateway refuses ABI 2).",
     ),
     "kernel": (
         "Landlock: the running kernel lacks it (< 5.13) -- upgrade, or use",
@@ -2453,7 +2463,7 @@ def verdict(
         _say(f"!! {why}; the F2/uid results above are not the sessions'. Re-run:")
         print(f"       {_rerun_cmd(ident)}")
     _gaps(shared)
-    ll_ok = ll.get("usable")  # ABI >= 2 AND the create/enforce chain succeeded
+    ll_ok = ll.get("usable")  # ABI >= 3 AND the create/enforce chain succeeded
     ll_unknown = ll.get("cause") == "untested"
     four = ("userns", "pidns", "mountns", "procns")
     untested = ns.get("untested", [])

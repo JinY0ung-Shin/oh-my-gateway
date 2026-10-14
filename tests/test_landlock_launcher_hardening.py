@@ -31,7 +31,7 @@ _ST_EXITED, _ST_SIGNALED, _ST_REFUSED = 1, 2, 3
 
 
 def _skip_reason() -> str:
-    if landlock.landlock_abi() < 2:
+    if landlock.landlock_abi() < landlock.MIN_LANDLOCK_ABI:
         return "Landlock ABI < 2"
     if not os.access(_SYS_PY, os.X_OK):
         return "no /usr/bin/python3"
@@ -388,3 +388,29 @@ def test_uid_launcher_mirrors_the_broker_status(tmp_path, ws, reply, returncode)
         assert "GATEWAY_ISOLATION_TICKET" not in fake.header["env"]
     finally:
         fake.close()
+
+
+def test_min_abi_matches_the_gateway():
+    """``docker/_landlock_rules.MIN_ABI`` and the gateway's startup floor are one
+    number (the broker/launcher cannot import ``src``)."""
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_landlock_rules_parity", _REPO / "docker" / "_landlock_rules.py"
+    )
+    rules = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rules)
+    assert rules.MIN_ABI == landlock.MIN_LANDLOCK_ABI == 3
+
+
+def test_the_rules_module_refuses_abi_2(monkeypatch):
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "_landlock_rules_abi2", _REPO / "docker" / "_landlock_rules.py"
+    )
+    rules = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rules)
+    monkeypatch.setattr(rules, "abi", lambda: 2)
+    with pytest.raises(rules.LandlockError, match="ABI 2 < 3"):
+        rules.build_and_restrict([], [])

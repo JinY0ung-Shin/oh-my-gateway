@@ -49,8 +49,10 @@ def _landlock_abi() -> int:
 
 
 def _landlock_skip() -> str:
-    if _landlock_abi() < 2:
-        return "Landlock ABI < 2"
+    from src.backends.claude import landlock
+
+    if _landlock_abi() < landlock.MIN_LANDLOCK_ABI:
+        return f"Landlock ABI < {landlock.MIN_LANDLOCK_ABI}"
     if not os.access(_SYS_PY, os.X_OK):
         return "no /usr/bin/python3"
     return ""
@@ -378,6 +380,39 @@ class TestBrokerProtocol:
         assert second.returncode == 70
         assert "refused" in second.stderr
         assert "ran" not in second.stdout
+
+    def test_a_live_uid_is_refused_for_another_workspace(self, broker, tmp_path):
+        """#244 review 4: a uid still running for one workspace is never handed
+        to a run in another one, whatever the gateway's pool asked for; the same
+        workspace (a named user's next session) and a finished run's uid are."""
+        ws_a = _workspace(tmp_path, "a")
+        ws_b = _workspace(tmp_path, "b")
+        pidfile = ws_a / "cli.pid"
+        script = (
+            "import os, sys, time\n"
+            "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+            "time.sleep(60)\n"
+        )
+        holder = _popen(broker, ws_a, script, pidfile)
+        try:
+            _wait_file(pidfile, proc=holder)
+            other = _run(broker, ws_b, "print('ran')\n")
+            assert other.returncode == 70
+            assert "ran" not in other.stdout
+            assert "still live for another workspace" in broker.log_text()
+            same = _run(broker, ws_a, "print('ran')\n")
+            assert same.returncode == 0, same.stderr
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+        deadline = time.monotonic() + 10
+        while True:
+            after = _run(broker, ws_b, "print('ran')\n")
+            if after.returncode == 0 or time.monotonic() > deadline:
+                break
+            time.sleep(0.1)  # the supervisor is reaped on the broker's next tick
+        assert after.returncode == 0, after.stderr
+        assert "ran" in after.stdout
 
     def test_forged_ticket_refused(self, broker, tmp_path, monkeypatch):
         ws = _workspace(tmp_path)

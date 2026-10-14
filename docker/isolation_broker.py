@@ -769,7 +769,7 @@ class _Broker:
         self.peers = peers
         self.test_same_uid = test_same_uid
         self.pending = {}  # fd -> _Pending
-        self.supervisors = {}  # pid -> session uid
+        self.supervisors = {}  # pid -> (session uid, workspace)
         self.seen = {}  # spent nonce -> its ticket's exp
         self.clock = 0.0  # high-water wall clock for ticket expiry
         self.orphan_check = False
@@ -871,7 +871,33 @@ class _Broker:
         payload = verify_ticket(header["ticket"], self.secret, self.seen, self.clock)
         req = _spawn_request(header, payload)
         _authorize(req["uid"], req["gid"], self.test_same_uid)
+        self._check_uid_free(req["uid"], req["workspace"])
         self._spawn(pending, req, bytes(pending.buf[4 + hlen :]))
+
+    def _check_uid_free(self, uid, workspace):
+        """Refuse a uid still live for a different workspace.
+
+        A uid belongs to one key, and a key to one workspace (a named user's
+        dir, or one anonymous ``_tmp_`` run), so a live supervisor holding
+        *uid* elsewhere means the gateway reassigned it while that run was
+        still alive — the two would share DAC access and ``/dev/shm``
+        (#244 review 4). The gateway's lease pool should never ask; this is
+        the authoritative backstop, and it also covers an anonymous workspace
+        removed before its CLI finished dying. An unswept orphan of a dead
+        supervisor holds its uid the same way until the sweep kills it.
+        """
+        for held_uid, held_ws in self.supervisors.values():
+            if held_uid == uid and held_ws != workspace:
+                raise ValueError(
+                    "uid %d is still live for another workspace" % uid
+                )
+        if self.orphan_check:
+            for pid in _children() - set(self.supervisors):
+                ids = _proc_ids(pid)
+                if ids is not None and ids[0] == uid:
+                    raise ValueError(
+                        "uid %d still has an unswept orphan (pid %d)" % (uid, pid)
+                    )
 
     def _spawn(self, pending, req, leftover):
         self.pending.pop(pending.fd, None)
@@ -899,7 +925,7 @@ class _Broker:
                 _log("supervisor crashed: %r" % exc)
             finally:
                 os._exit(code)
-        self.supervisors[pid] = req["uid"]
+        self.supervisors[pid] = (req["uid"], req["workspace"])
         pending.close()
 
     def _refuse(self, pending, reason):
@@ -921,7 +947,8 @@ class _Broker:
                 return
             if pid == 0:
                 return
-            uid = self.supervisors.pop(pid, None)
+            held = self.supervisors.pop(pid, None)
+            uid = held[0] if held is not None else None
             if uid is not None and not (
                 os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
             ):

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -101,19 +102,41 @@ class TestReviewFixes:
         assert p.parent.name == "data"
         assert p.parent.parent.name != "src"
 
-    def test_ephemeral_pool_recycles_and_never_exhausts(self, monkeypatch, tmp_path):
+    def _three_slot_pool(self, monkeypatch, tmp_path):
         monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
         monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
         monkeypatch.setenv(ui.UID_MAX_ENV, "20010")
         monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "3")
-        pool = ui.get_ephemeral_pool()
-        first = [pool.resolve(f"ws{i}") for i in range(3)]
-        assert len(set(first)) == 3  # distinct while the ring has room
-        # A 4th distinct key recycles the LRU rather than raising.
-        fourth = pool.resolve("ws3")
-        assert fourth == first[0]
-        # A repeated key is stable while still in the ring.
-        assert pool.resolve("ws3") == fourth
+        return ui.get_ephemeral_pool()
+
+    @staticmethod
+    def _workspace(tmp_path, i):
+        ws = tmp_path / f"_tmp_{i}"
+        ws.mkdir()
+        return str(ws)
+
+    def test_ephemeral_pool_never_shares_a_live_uid(self, monkeypatch, tmp_path):
+        # #244 review 4: with the band full the pool used to recycle the LRU
+        # uid while its run was still alive, so pool size + 1 concurrent
+        # anonymous runs put two of them on one uid.
+        pool = self._three_slot_pool(monkeypatch, tmp_path)
+        live = [self._workspace(tmp_path, i) for i in range(4)]
+        first = [pool.resolve(ws) for ws in live[:3]]
+        assert len(set(first)) == 3
+        with pytest.raises(ui.UidAllocationError, match="leased"):
+            pool.resolve(live[3])
+        # A repeated key keeps its lease.
+        assert pool.resolve(live[1]) == first[1]
+
+    def test_a_removed_workspace_releases_its_uid(self, monkeypatch, tmp_path):
+        pool = self._three_slot_pool(monkeypatch, tmp_path)
+        live = [self._workspace(tmp_path, i) for i in range(4)]
+        first = [pool.resolve(ws) for ws in live[:3]]
+        shutil.rmtree(live[1])  # cleanup_temp_workspace: that run ended
+        assert pool.resolve(live[3]) == first[1]
+        # The others are still leased: nothing else frees up.
+        with pytest.raises(ui.UidAllocationError):
+            pool.resolve(self._workspace(tmp_path, 4))
 
     def test_anonymous_runs_do_not_touch_the_registry(self, monkeypatch, tmp_path):
         reg_path = tmp_path / "uids.json"
