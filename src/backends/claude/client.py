@@ -221,7 +221,17 @@ def _get_cli_path() -> Optional[str]:
     requires an explicit ``cli_path``. Fail safe: a CLAUDE_CLI_PATH that is not
     an executable file is ignored with a warning rather than breaking session
     creation.
+
+    With Landlock confinement on (#241), ``cli_path`` instead points at the
+    fixed launcher stub, which applies the ruleset and then execs the real CLI
+    (operator override or bundled — resolved by ``landlock.resolve_real_cli``).
+    Startup fails closed if that launcher/real CLI cannot be resolved
+    (``landlock.check_config``), so returning it here is safe.
     """
+    from . import landlock
+
+    if landlock.confine_enabled():
+        return landlock.launcher_path()
     if not CLAUDE_CLI_PATH:
         return None
     path = Path(CLAUDE_CLI_PATH)
@@ -304,6 +314,59 @@ def _get_max_buffer_size() -> int:
         )
         return GATEWAY_MAX_BUFFER_SIZE_DEFAULT
     return value
+
+
+# Other backends' credentials, blanked in every Claude CLI child on top of the
+# auth provider's mode-specific list (child_secret_env).
+_ISOLATION_VARS = ["OPENAI_API_KEY"]
+
+
+def _isolation_vars() -> List[str]:
+    """``_ISOLATION_VARS`` merged with the auth provider's mode-specific list."""
+    # src.auth first: it builds its auth manager at import, which imports the
+    # provider module, so importing the provider module first is a cycle (the
+    # slash preflight can run before anything has loaded src.auth).
+    import src.auth  # noqa: F401
+    from src.backends.claude.auth import ClaudeAuthProvider
+
+    merged = list(_ISOLATION_VARS)
+    try:
+        for key in ClaudeAuthProvider().get_isolation_vars():
+            if key not in merged:
+                merged.append(key)
+    except Exception:  # pragma: no cover - provider construction is env-only
+        logger.debug("auth provider isolation vars unavailable", exc_info=True)
+    return merged
+
+
+def child_secret_env() -> Dict[str, str]:
+    """``options.env`` blanks for every gateway-side secret a CLI child must not see.
+
+    One list for every Claude CLI child the gateway spawns — session turns and
+    ``verify()`` (``_configure_sdk_env``) and the slash-command catalog/preflight
+    (``slash_commands``) — because each child runs workspace-controlled code:
+    a session its tools and hooks, the preflight a workspace ``apiKeyHelper``
+    from ``.claude/settings.json`` (#241 review: it saw ``ADMIN_API_KEY``).
+
+    * gateway-only secrets (``ADMIN_API_KEY``, ``API_KEY``, the
+      ``SYSINFO_CHILD_ENV_MASK`` names) while ``SYSINFO_REDACTION`` is on;
+    * other backends' credentials plus whatever the auth provider says must not
+      reach the CLI in the chosen auth mode (api_key mode: a leftover
+      ``CLAUDE_CODE_OAUTH_TOKEN``). The CLI reads a blank token as unset
+      (tests/test_cli_blank_oauth_token.py);
+    * the uid-isolation ticket secret: a child holding it could forge broker
+      tickets. The launcher presents a pre-minted ticket, not the secret, and
+      the broker holds its own copy.
+
+    Blanked through ``options.env``, never by popping ``os.environ`` around
+    ``connect()``: the SDK copies ``os.environ`` into the child only after
+    awaiting its ``claude -v`` check, so an overlapping session's restore leaked
+    them into another session's CLI (tests/test_sdk_env_race.py).
+    """
+    env = dict(child_env_mask())
+    env.update(dict.fromkeys(_isolation_vars(), ""))
+    env["GATEWAY_ISOLATION_TICKET_SECRET"] = ""
+    return env
 
 
 _BUFFER_OVERFLOW_MARKER = "JSON message exceeded maximum buffer size"
@@ -494,6 +557,35 @@ def _error_result_text(message: Any) -> str:
     if getattr(message, "is_error", False) and hasattr(message, "result"):
         return str(getattr(message, "result", "") or "")
     return ""
+
+
+async def _aclose_query(stream: Any) -> None:
+    """Close an SDK ``query()`` generator, bounded; best effort.
+
+    For a generator that cleans up on close this runs its teardown (stdin
+    EOF, then SIGTERM, then SIGKILL, ~20 s at worst), so it is capped like a
+    disconnect. The pinned SDK's top-level ``query()`` has no ``try/finally``,
+    though: closing it early does not stop its CLI. What keeps that CLI from
+    outliving the caller is draining the stream, whose end runs the SDK's own
+    inner ``finally`` (``transport.close()``). The cap needs
+    ``asyncio.timeout`` (Python 3.11+): ``asyncio.wait_for`` before 3.12 would
+    close the generator from another task, which its anyio cancel scopes
+    refuse, so without it the close is awaited uncapped. Never raises.
+    """
+    from src.constants import CLIENT_DISCONNECT_TIMEOUT_SECONDS
+
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    timeout = getattr(asyncio, "timeout", None)
+    try:
+        if timeout is None:
+            await aclose()
+        else:
+            async with timeout(CLIENT_DISCONNECT_TIMEOUT_SECONDS):
+                await aclose()
+    except Exception:
+        logger.debug("Closing the verify query failed", exc_info=True)
 
 
 class ClaudeCodeCLI(TokenEstimateMixin):
@@ -706,7 +798,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 filtered.extend(f"Skill({name}:*)" for name in granular)
         options.allowed_tools = filtered
 
-    async def _apply_skills_allowlist(self, options: ClaudeAgentOptions) -> None:
+    async def _apply_skills_allowlist(
+        self, options: ClaudeAgentOptions, user: Optional[str] = None
+    ) -> None:
         """Resolve ``options.skills`` into the session's effective allowlist.
 
         The SDK ``skills`` allowlist is the only surface that removes a skill
@@ -734,6 +828,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         Discovered names the SDK would reject (a skill directory such as
         ``weird (v2)``, an MCP prompt command such as ``server:prompt (MCP)``)
         are left out: one of them in the allowlist makes ``connect()`` raise.
+
+        ``user`` is the session's user: under ``uid`` isolation the discovery
+        preflight runs in the session workspace as that user's uid.
         """
         granular = isinstance(options.skills, list)
         if not granular and not HIDDEN_SKILLS:
@@ -750,7 +847,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             requested = set(options.skills or [])
             resolved = set(requested)
             try:
-                names = await slash_commands.get_available_commands(cwd)
+                names = await slash_commands.get_available_commands(cwd, user=user)
                 if any(
                     not any(d == r or d.endswith(":" + r) for d in names)
                     for r in requested
@@ -758,7 +855,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     # A requested skill may have been installed after the
                     # 60s discovery cache was populated — refresh once.
                     names = await slash_commands.get_available_commands(
-                        cwd, force=True
+                        cwd, force=True, user=user
                     )
                 resolved |= {
                     d
@@ -773,7 +870,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.skills = _drop_unusable_skill_names(n for n in resolved if keep(n))
             return
 
-        names = await slash_commands.get_available_commands(cwd)
+        names = await slash_commands.get_available_commands(cwd, user=user)
         options.skills = _drop_unusable_skill_names(n for n in names if keep(n))
 
     def _configure_add_dirs(self, options: ClaudeAgentOptions) -> None:
@@ -823,7 +920,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         * ``True`` — force-enable sandbox with env-configured parameters.
         * ``False`` — force-disable sandbox explicitly (honored even when the
           workspace sandbox is on).
+
+        Landlock confinement (#241) overrides all of the above: bwrap cannot
+        start inside a Landlock domain (it needs mount/pivot_root the domain
+        denies), so the CLI's own OS sandbox must be off or every sandboxed
+        Bash call would fail. See ``docs/security-process-isolation.md`` §3.
         """
+        from . import landlock
+
+        if landlock.confine_enabled():
+            options.sandbox = SandboxSettings(enabled=False)
+            return
+
         effective_enabled = CLAUDE_SANDBOX_ENABLED
         if effective_enabled is None and sandbox_enabled():
             effective_enabled = True
@@ -1131,22 +1239,13 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             window = runtime_config.get("auto_compact_window")
             sdk_env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(window) if window else ""
 
-        # Gateway-only secrets (ADMIN_API_KEY, API_KEY, …) are blanked in the
-        # child: the CLI never needs them, and a shell inside the agent would
-        # otherwise inherit them from the gateway process.
-        sdk_env.update(child_env_mask())
-
-        # Other backends' credentials, plus whatever the auth provider says must
-        # not reach the CLI in the chosen auth mode (api_key mode: a leftover
-        # CLAUDE_CODE_OAUTH_TOKEN), are blanked the same way for the children
-        # built from these options (sessions and verify()). The slash-command
-        # catalog/preflight builds bare options and still inherits them (#230).
-        # Never by popping them from os.environ around connect(): the SDK copies
-        # os.environ into the child only after awaiting its `claude -v` check, so
-        # an overlapping session's restore leaked them into another session's
-        # CLI (tests/test_sdk_env_race.py). The CLI reads a blank token as unset
-        # (tests/test_cli_blank_oauth_token.py).
-        sdk_env.update(dict.fromkeys(self._isolation_vars(), ""))
+        # Gateway-only secrets (ADMIN_API_KEY, API_KEY, …), other backends'
+        # credentials, the auth mode's leftovers and the uid-isolation ticket
+        # secret are blanked in the child: the CLI never needs them, and a shell
+        # inside the agent would otherwise inherit them from the gateway
+        # process. The same blanks go to the slash-command preflight
+        # (child_secret_env).
+        sdk_env.update(child_secret_env())
 
         if sdk_env:
             options.env.update(sdk_env)
@@ -1235,8 +1334,45 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_task_budget(options, task_budget)
         self._configure_metadata_env(options, extra_env)
         self._configure_sdk_env(options)
+        self._configure_confinement(options, effective_cwd, user, session_id or resume)
 
         return options
+
+    def _configure_confinement(
+        self,
+        options: ClaudeAgentOptions,
+        effective_cwd: Optional[Path],
+        user: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """Confine the spawn through the isolation launcher (#241).
+
+        No-op unless confinement is on. ``cli_path`` already points at the
+        launcher (``_get_cli_path``); here we add, through ``options.env`` (so
+        they ride the clean child env the SDK builds), either the per-workspace
+        read-only / read-write path lists (landlock mode) or the signed per-user
+        broker ticket (uid mode), which carries the same lists signed to the
+        broker (``landlock.options_env`` documents what they grant). ``user``
+        keys the per-user uid; ``session_id`` (the CLI's ``--session-id`` or
+        ``--resume`` id) grants that session's own ``session-env`` dir.
+
+        ``options.cwd`` becomes absolute like the path lists: the SDK copies it
+        into the child's ``PWD``, which the launcher reads as the cwd it grants.
+        Called again right before ``connect()`` by ``create_client`` so a
+        uid-mode ticket is fresh when the broker sees it.
+        """
+        from . import landlock
+
+        env = (
+            landlock.options_env(Path(effective_cwd), user=user, session_id=session_id)
+            if effective_cwd
+            else {}
+        )
+        if env:
+            options.cwd = Path(os.path.abspath(effective_cwd))
+            if options.env is None:
+                options.env = {}
+            options.env.update(env)
 
     # ------------------------------------------------------------------
     # SDK message conversion (SDK types -> plain dicts)
@@ -1319,25 +1455,6 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         return converted
 
     # ------------------------------------------------------------------
-    # Environment management
-    # ------------------------------------------------------------------
-
-    # Env vars from other backends blanked for session/verify() CLI children
-    # (_configure_sdk_env); the slash-command preflight still inherits them.
-    _ISOLATION_VARS = ["OPENAI_API_KEY"]
-
-    def _isolation_vars(self) -> List[str]:
-        """Class defaults merged with the auth provider's mode-specific list."""
-        merged = list(self._ISOLATION_VARS)
-        try:
-            for key in self.get_auth_provider().get_isolation_vars():
-                if key not in merged:
-                    merged.append(key)
-        except Exception:  # pragma: no cover - provider construction is env-only
-            logger.debug("auth provider isolation vars unavailable", exc_info=True)
-        return merged
-
-    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -1353,22 +1470,40 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # failure (``_build_sdk_options`` raising) must surface its own error,
         # not an UnboundLocalError from the diagnostic bookkeeping.
         last_error_result = ""
+        verify_workspace: Optional[Path] = None
+        from . import landlock
+
         try:
             logger.info("Testing Claude Agent SDK...")
 
-            options = self._build_sdk_options(max_turns=1)
+            # In uid mode the CLI runs as a session uid, which cannot enter the
+            # gateway-private temp dir self.cwd falls back to (exit 113): verify
+            # in a fresh workspace from the workspace manager, like a session.
+            if landlock.effective_mode() == "uid":
+                from src.workspace_manager import workspace_manager
+
+                verify_workspace = workspace_manager.resolve(None)
+            options = self._build_sdk_options(max_turns=1, cwd=verify_workspace)
             messages = []
-            async for message in query(
-                prompt="Hello",
-                options=options,
-            ):
-                messages.append(message)
-                msg_type = getattr(message, "type", None) or (
-                    message.get("type") if isinstance(message, dict) else None
-                )
-                if msg_type == "assistant":
-                    break
-                last_error_result = _error_result_text(message) or last_error_result
+            stream = query(prompt="Hello", options=options)
+            try:
+                async for message in stream:
+                    messages.append(message)
+                    msg_type = getattr(message, "type", None) or (
+                        message.get("type") if isinstance(message, dict) else None
+                    )
+                    if msg_type == "assistant":
+                        break
+                    last_error_result = _error_result_text(message) or last_error_result
+            finally:
+                # The CLI must be stopped before the workspace below is
+                # removed: under uid isolation that ends the run's uid lease,
+                # which must not happen while the CLI still runs as that uid
+                # (#244 review). With the pinned SDK the loop drains the stream
+                # (its messages carry no ``type``, so the break never fires) and
+                # the SDK's own inner finally closes the CLI; closing here is a
+                # best-effort extra for a stream that does stop early.
+                await _aclose_query(stream)
 
             if last_error_result:
                 logger.error(
@@ -1388,12 +1523,33 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             detail = f"{e}"
             if last_error_result and last_error_result not in detail:
                 detail = f"{detail} (CLI result: {last_error_result})"
+            # Under confinement a launcher/broker refusal is not an install
+            # problem: name it instead of the npm hints below.
+            refusal = (
+                landlock.describe_launcher_exit(getattr(e, "exit_code", None))
+                if landlock.confine_enabled()
+                else None
+            )
+            if refusal:
+                logger.error(
+                    "Claude Agent SDK verification failed under %s=%s: %s (%s)",
+                    landlock.MODE_ENV,
+                    landlock.effective_mode(),
+                    refusal,
+                    detail,
+                )
+                return False
             logger.error(f"Claude Agent SDK verification failed: {detail}")
             logger.warning("Please ensure Claude Code is installed and authenticated:")
             logger.warning("  1. Install: npm install -g @anthropic-ai/claude-code")
             logger.warning("  2. Set ANTHROPIC_AUTH_TOKEN environment variable")
             logger.warning("  3. Test: claude --print 'Hello'")
             return False
+        finally:
+            if verify_workspace is not None:
+                from src.workspace_manager import workspace_manager
+
+                workspace_manager.cleanup_temp_workspace(verify_workspace)
 
     # Backward-compatible alias — existing code calls verify_cli().
     verify_cli = verify
@@ -1871,7 +2027,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if effort and effort != "none":
             options.effort = effort
             options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
-        await self._apply_skills_allowlist(options)
+        await self._apply_skills_allowlist(options, user)
         await self._attach_mcp_progress_relay(options, session)
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
@@ -1885,10 +2041,37 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         if post_tool_use:
             options.hooks["PostToolUse"] = post_tool_use
 
+        # A uid-mode broker ticket expires two minutes after it is minted, and
+        # the awaits above (skill discovery serialized under the global preflight
+        # lock, the relay probe) can outlast that under a burst: the broker
+        # would refuse the spawn. Mint it again right before the spawn (#241).
+        self._configure_confinement(
+            options,
+            Path(options.cwd) if options.cwd else None,
+            user,
+            session.session_id,
+        )
+
+        # A confined session can read every CLI's /proc/<pid>/cmdline: move the
+        # MCP config and system prompt into workspace files for the spawn, and
+        # remove them once the CLI has parsed its arguments (#241 §6.5).
+        from . import argv_files as argv_files_mod
+        from . import landlock
+
+        argv_files = None
+        if landlock.confine_enabled():
+            argv_files = argv_files_mod.externalize(
+                options, shared_uid=landlock.effective_mode() != "uid"
+            )
+
         # Auth and credential isolation ride options.env (_configure_sdk_env);
         # os.environ is shared by every concurrent connect and stays untouched.
         client = ClaudeSDKClient(options=options)
-        await client.connect(prompt=None)
+        try:
+            await client.connect(prompt=None)
+        finally:
+            if argv_files is not None:
+                argv_files.cleanup()
 
         return client
 

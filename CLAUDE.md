@@ -186,7 +186,313 @@ uv run pytest --cov=src                            # with coverage
   the callback refuses Bash / `blocked_path` asks. Under `bypassPermissions` the read block's asks
   are the only Bash asks left, and they **still reach `can_use_tool`** despite the SDK's
   `CanUseToolShadowedWarning`. A script the agent writes and runs still reads anything (needs an
-  OS boundary). `tests/test_cli_read_boundary.py` pins all of it against the bundled CLI.
+  OS boundary — see Landlock confinement next). `tests/test_cli_read_boundary.py` pins all of it
+  against the bundled CLI.
+- Landlock confinement (#241, `CLAUDE_ISOLATION_MODE=off|landlock|uid`; `uid` is the next gotcha):
+  the OS boundary that closes the written-script read path (F1) the read boundary cannot.
+  One operator knob picks the mode; `confine_enabled()` is true for the Landlock modes, an unknown
+  value fails closed at startup. When on, `_get_cli_path` points `cli_path`
+  at a fixed launcher (`docker/landlock_launcher.py`, root-owned) instead of the real CLI; the
+  launcher starts isolated from its first instruction (`#!/usr/bin/env -S python3 -I` — a later
+  re-exec guard is too late, user-site `.pth`/`PYTHON*` would already have run; the in-script guard
+  stays only for an explicit `python3 launcher.py`; cwd is the agent workspace — never import from
+  it), applies a Landlock ruleset, and execs the real CLI (operator `CLAUDE_CLI_PATH` or SDK bundle,
+  resolved by `landlock.resolve_real_cli`). Landlock is inherited across `execve`, so Bash, a script
+  the agent wrote, and stdio MCP are all confined at `open()`. The per-workspace ro/rw path lists
+  ride `options.env` (`landlock.options_env`, JSON arrays: a granted path may contain `:`) and are
+  built from the guard's shared asset names (skills, plugins, agents, commands, output-styles,
+  `CLAUDE.md`) plus the Landlock-only `rules`, `hooks` and `workflows` (the CLI loads user rules and
+  runs user hook scripts from them; the file-tool guard still denies them), `plugin_resource_roots()`
+  and the CLI's own config files read-only (`<cfg>/settings.json`, `settings.local.json`, the legacy
+  `<cfg>/.config.json`, and `claude_config_paths.global_config_file()` = `$CLAUDE_CONFIG_DIR/.claude.json`
+  else `$HOME/.claude.json`, never `<cfg>.parent` — so the confined CLI logs a harmless
+  `Failed to save config with lock`). **Every entry goes through `_GrantFilter`**: it is resolved,
+  the resolved path is what gets granted, and it is refused (warned once) when it is or contains the
+  config dir, `$HOME`, the workspace base, the app root (`/app`) or the temp dir, lies inside the
+  workspace base, `/app`, the temp dir, `/run`, `/var/run`, `/dev`, `/sys`, `/root` or `/var/tmp`,
+  or lies inside the config dir or `$HOME` outside the shared subtrees and the global config file.
+  Refusals for the workspace base, `/app` and the system roots beat every exemption, and roots that
+  are the same directory apply the strictest rule (`USER_WORKSPACES_DIR=$HOME` still refuses another
+  user's workspace); only an operator `CLAUDE_PLUGIN_CLONE_ROOT` exempts paths under `$HOME` (the
+  default `<cfg>/plugin-marketplaces` is just a shared subtree name, so a planted
+  `plugin-marketplaces -> ~/.ssh` grants nothing); a file grant must be a single-link regular file;
+  `HOME=/` fails closed. The workspace itself goes through `_confined_workspace`: a
+  workspace-manager workspace must resolve to exactly `realpath(base)/<rel>` and a gateway-owned
+  preflight dir must be a real dir the gateway owns, else `WorkspaceRefused` refuses the spawn; the
+  resolved workspace is the first rw entry and the ticket's workspace, and the launcher (exit 70) /
+  broker child (exit 113) refuse a spawn whose kernel cwd is not exactly it. (A symlinked base
+  passes, but the CLI names its transcript dir after the resolved cwd while the gateway's
+  transcript lookup, `session_manager._encode_cwd`, uses the lexical workspace: a re-created client
+  then starts fresh instead of resuming, and rehydrate 404s — pre-existing.) The launcher and broker
+  open every gateway-provided entry without following any symlink (a component walk with
+  `O_NOFOLLOW`) and refuse a hard-linked file target, so a swap after the filter is not granted; the
+  system roots, `/dev` files, `/dev/shm`, the real-CLI dir and the shell wrapper keep a following open
+  (merged-usr `/lib` links). `check_config` refuses a real-CLI dir that is or contains `/`, `$HOME`,
+  the config dir, the workspace base, `/app`, the temp dir or a system root, or lies in the
+  workspace base, and a workspace base, config dir, `$HOME` or app root under a root the launcher
+  grants every session read-only (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/opt`, `/proc`
+  — e.g. `USER_WORKSPACES_DIR=/opt/ws`) (the launcher/broker re-check
+  `/` and holding the workspace). So a planted link (`agents -> .`, `settings.local.json -> /`, a
+  workspace dir `-> ~/.claude`) or a broad registry/env root (`installLocation: /`,
+  `CLAUDE_PLUGIN_CLONE_ROOT=/data` holding the workspace base) cannot widen every session's grant,
+  while a link to a safe target (`skills -> /opt/shared-skills`) still works. It is a deny-list of
+  the gateway's own state, not of every secret on the host, and a hard link an unconfined writer
+  plants *inside* a granted dir (e.g. `skills/x.jsonl` → another user's transcript) is not detected.
+  RW is only the workspace, the session's own `projects/<name>` (one, for the resolved cwd the CLI
+  names it after; a planted link there is refused), `<cfg>/session-env/<session id>` and
+  `<cfg>/tasks/<session id>` (the CLI's Task list) —
+  pre-created 0700 by the gateway in landlock mode, created by the broker child as the session uid in
+  uid mode, never `session-env` or `tasks` themselves: their siblings are other sessions'
+  `$CLAUDE_ENV_FILE` scripts the CLI sources into Bash and other sessions' task lists. A confined CLI
+  cannot sweep them, so the gateway removes both once the session is **finished** — explicit delete,
+  any teardown of an anonymous session, stateless cleanup — but not when a named session expires, is
+  evicted or the gateway shuts down (a continuation resumes the same id, and SessionStart then runs
+  with `source=resume` only), and never while a live session holds the id
+  (`SessionManager._release_session_dirs`); the dirs of named sessions never resumed stay behind,
+  and in uid mode the app-uid gateway cannot remove what the session uid wrote there (the same
+  broker-cleanup follow-up as its transcripts). While a session's client is starting
+  (`begin_client_start` → `create_client` → `finish_client_start`), a teardown defers removing its
+  workspace, lease and dirs until that client is stopped, and a session deleted meanwhile answers
+  409 `session_ended`; every session-manager teardown SIGKILLs a CLI that outlived its capped
+  disconnect (`_stop_client`) before anything is removed. A new session whose first turn is refused
+  (e.g. a slash 400) is deleted at once.
+  RW also covers `/dev/shm` (POSIX semaphores — multiprocessing/joblib; in landlock mode a
+  surface every same-uid session shares). **No shared cache is writable**: a session-writable
+  `~/.npm`, uv cache or `plugins/data` is a cross-session plant channel (other sessions' `npx -y` /
+  `uv run` / plugin hooks execute from them), so the launcher/broker point `npm_config_cache`,
+  `NPM_CONFIG_CACHE` and `UV_CACHE_DIR` under `<cwd>/.cli-tmp` (per-workspace downloads: they count
+  against `USER_WORKSPACE_QUOTA_MB`, and a stateless run starts cold every request), and
+  `plugins/data` stays read-only with the gateway pre-creating `plugins/data/<id>` for each
+  `installed_plugins.json` key on every confined spawn (`_ensure_plugin_data_dirs`): the CLI mkdirs
+  `$CLAUDE_PLUGIN_DATA` before every plugin hook and **skips the hook on EACCES**; with the dir
+  present the hook runs and only its writes there fail. The CLI's only knob,
+  `CLAUDE_CODE_PLUGIN_CACHE_DIR`, moves the whole plugins root, so a per-session data dir needs
+  per-user config dirs. `CLAUDE_ADD_DIRS` rides the #240 filter (`_operator_add_dir_roots`) and then
+  `_GrantFilter`, never the raw strings. A confined script reaches what a file tool may plus `/dev/shm` and the read-only
+  system roots — `/app` is never listed (code + `/app/data` creds denied by rule absence, not a ro
+  rule). `/etc` and `/usr` stay ro (the CLI/libc need them; a passwd entry is required), so
+  acceptance is "a path **outside the ruleset**", not `/etc/passwd`. **`/proc` stays ro too (the
+  bundled CLI aborts without it), so in both modes a session can read every process's command line
+  (`/proc/<pid>/cmdline`)** — world-readable whatever the uid. So with confinement on,
+  `create_client` moves the `--mcp-config` JSON (with `MCP_FORWARD_CONTEXT` `{{header:…}}` values)
+  and the system prompt (`Current user:`) into per-spawn workspace files (`argv_files.externalize`:
+  `O_EXCL|O_NOFOLLOW` under a workspace dir fd, 0600 landlock / 0644 uid; `--system-prompt-file`,
+  `--append-system-prompt-file` via `extra_args`) and removes them once `connect()` returns —
+  the CLI reads them while parsing argv and never again (`tests/test_cli_argv_files.py` pins
+  that against the bundled CLI: MCP header + prompt still arrive after the delete, the live
+  cmdline holds only paths; when a CLI bump reads them lazily, keep the files for the session).
+  An in-process `sdk` MCP server keeps the dict (the SDK needs it), and `--json-schema` has no file
+  form so the request's own `text.format` schema stays on the command line — the rest of the argv
+  exposure of `docs/security-process-isolation.md` §6.5. `environ`, `mem` and the fds of processes
+  outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher
+  refuses anything but a JSON array of absolute paths (exit 70) and uses `os.getcwd()`, never
+  `$PWD` — a relative `USER_WORKSPACES_DIR` once granted `<ws>/<ws>`, and the old `:`-joined lists
+  turned `.../x:/secret` into a grant of `/secret`. A rule target that is a regular file (e.g. the user `CLAUDE.md`) gets
+  file-only rights — the dir-only `READ_DIR` bit is EINVAL for a file and would abort the whole
+  build. On ABI ≥ 6 both modes add `LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`: a
+  confined process cannot signal (or reach an abstract socket of) anything outside its domain, so
+  sessions cannot signal each other even in landlock mode; below ABI 6 there is no scoping.
+  `TMPDIR`/`CLAUDE_CODE_TMPDIR` point at `<cwd>/.cli-tmp`
+  (off the shared `/tmp`), which is **not** a Landlock rule: it rides beneath the granted cwd and is
+  rebuilt first when it is not a real directory we can use (symlink, file, FIFO, socket, lost owner
+  bits — and the CLI's own `claude-<uid>` inside it likewise; one owned by another uid moves aside
+  to `<name>.stale-<n>`), because a rule on that agent-controlled path was a `ln -s / .cli-tmp`
+  escape (`_add_rule` opens targets with `O_PATH`, following the link) and a `touch .cli-tmp` locked
+  the workspace out for good. The repair runs fd-relative from the workspace and never follows a
+  link (an agent racing it with re-planted links only makes its own spawns fail closed after 8
+  tries; nothing sweeps a landlock-mode session's detached jobs), and an operator
+  `CLAUDE_CODE_TMPDIR` is honored (landlock mode only; the broker always uses `.cli-tmp`) only as a
+  single entry directly in the workspace. Failing to make
+  it is fatal (launcher exit 70, broker child exit 118), not an opaque CLI exit 1 later. The same
+  shared helpers (`_landlock_rules.session_tmp_env` / `session_shell_env`, launcher and broker child
+  alike) set two more overrides. `GIT_CONFIG_GLOBAL=<cwd>/.cli-tmp/gitconfig`, pointing
+  `core.excludesFile`/`core.attributesFile` at absent tmp paths (kept only while it is a readable,
+  non-empty regular file still carrying that `excludesFile` line, so the session's own
+  `git config --global` edits persist; anything else moves aside to `gitconfig.broken-<n>` and is
+  rewritten atomically): Landlock does not mediate `access(2)`, so git took a denied `~/.gitconfig`
+  or `~/.config/git/ignore` for readable and exited 128. Operator-wide git config belongs in
+  `/etc/gitconfig` — except those two keys, which the session's global file overrides; the CLI's
+  internal git helpers pin `GIT_CONFIG_GLOBAL=/dev/null` and still read the default excludes file.
+  And, when the CLI would
+  pick bash, `CLAUDE_CODE_SHELL=claude-session-bash` (root-owned, `/usr/local/bin` in the image; the
+  file itself is in the ro list): with no writable `<cfg>/shell-snapshots` — shared, so never made
+  writable, since every session sources its snapshot before each command — the CLI runs every Bash
+  call as `bash -c -l`, whose `/etc/profile` reset PATH and whose denied `~/.profile` put
+  `Permission denied` in every result; the wrapper turns exactly that leading `-c -l` into
+  `--norc -c` (Debian's bash otherwise reads `~/.bashrc` when the env looks like ssh; a zsh choice
+  is left alone). Plugin `bin/` dirs on PATH and the CLI's pkill self-guard come only through the
+  snapshot, so they stay off under confinement. The slash/skill preflight
+  (`slash_commands._build_preflight_options`) is confined exactly like a session in that workspace
+  (uid mode: through the broker as the request user's uid once that user has one — `user` is
+  threaded from the responses route and `create_client`; a named user with no uid yet stays
+  landlock-shaped as the gateway uid, so a request that then fails 400 allocates nothing, and so
+  does a no-cwd preflight in a private per-process `mkdtemp` dir) and in **every** mode runs with
+  `--strict-mcp-config` (zero servers),
+  `--settings {"disableAllHooks": true, "apiKeyHelper": "", …}` (every startup settings command —
+  `apiKeyHelper`, `proxyAuthHelper`, `awsCredentialExport`, `awsAuthRefresh`, `gcpAuthRefresh`,
+  `otelHeadersHelper` — blanked; a flag value outranks the workspace's) and the same secret blanks a
+  session child gets (`client.child_secret_env`: `ADMIN_API_KEY`, `API_KEY`, the
+  `SYSINFO_CHILD_ENV_MASK` names, other backends' and auth-mode credentials, the ticket secret): it
+  only reads the catalog, and with plain options the CLI ran workspace/plugin hooks, started
+  `.mcp.json` servers and ran a workspace `apiKeyHelper` that saw `ADMIN_API_KEY`
+  (`tests/test_cli_slash_preflight.py` pins identical catalogs, no side effects, a helper that does
+  run seeing no gateway secret, and the uid-mode preflight through the broker). The image ships
+  launcher+broker+`_landlock_rules`+`claude-session-bash` at `/usr/local/bin` (root-owned, outside
+  `/app` so `chown -R app /app` can't make them agent-writable) and sets `GATEWAY_LANDLOCK_LAUNCHER`;
+  startup **refuses** a launcher a session could replace — it, its sibling `_landlock_rules.py`, the
+  sibling `claude-session-bash` when present, and every ancestor dir must be root-owned and not
+  group/other-writable (sticky dirs pass;
+  `landlock.launcher_write_problems`), and `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true` downgrades
+  that to a warning for a dev checkout (`tests/conftest.py` sets it). This is
+  the no-privilege **interim** of `docs/security-process-isolation.md` §3: no uid switch, so no
+  cross-session DAC isolation (that is `uid` mode). Fail-closed:
+  `config_check._check_landlock_confinement` refuses startup if the launcher/real CLI cannot resolve,
+  Landlock cannot actually be **enforced** (a forked probe builds+`restrict_self`es a real ruleset,
+  not just an ABI query — a seccomp filter blocking `add_rule`/`restrict_self` is caught, and a
+  probe that cannot run counts as a failure), the ABI is below `MIN_LANDLOCK_ABI` = 3 (kernel 6.2:
+  ABI 1/2 handle no `TRUNCATE`, so a session could still truncate a DAC-writable file outside the
+  ruleset; mirrored by `docker/_landlock_rules.MIN_ABI`, parity-tested), the uid
+  band is unusable, or the mode is a typo (an invalid `CLAUDE_ISOLATION_MODE` is refused even under
+  `SKIP_CONFIG_CHECK`); the CLI's own bwrap sandbox is forced off (`_configure_sandbox`) because it
+  cannot start inside a Landlock domain, and `_check_isolation_sandbox_conflict` warns when that
+  overrides an explicit `CLAUDE_SANDBOX_ENABLED=true` or a managed policy enables the sandbox (the
+  gateway's `--settings` cannot outrank it; with bwrap present every sandboxed Bash call would fail).
+  Startup installs `GATEWAY_REAL_CLI` + `CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK=1` in
+  the process env (`landlock.install_process_env`, for the SDK's option-less `-v` spawn). Unit:
+  `tests/test_landlock_confine.py` (launcher + wiring, no bundled CLI) and
+  `tests/test_landlock_launcher_hardening.py`; the bundled-CLI closure + workspace-work proof is
+  `tests/test_cli_read_boundary.py::TestLandlockConfinement` (the kept `test_known_gap_*` is its
+  non-vacuous control), and `tests/test_cli_landlock_hooks.py` proves plugin/SessionStart hooks
+  still run confined. Bundled-CLI experiments must use an explicit env dict (HOME and
+  `CLAUDE_CONFIG_DIR` under a tmp dir, `ANTHROPIC_BASE_URL` → `tests/fixtures/fake_anthropic_api.py`):
+  the Bash tool's zsh does not word-split `$VARS`, and an `env -i $ENVS claude …` once ran with the
+  real HOME and wrote the developer's `~/.claude`.
+- `uid` mode (#241 PR-C) adds per-user uid + DAC isolation on top of the Landlock ruleset.
+  The gateway body stays unprivileged; a resident **broker** (`docker/isolation_broker.py`, holds
+  only SETUID/SETGID, dedicated uid `CLAUDE_ISOLATION_BROKER_UID` default 19999 — outside the default
+  band 20000–29999) forks a per-spawn **supervisor** per CLI, which applies the **same**
+  `docker/_landlock_rules.py` ruleset to the CLI child *after* the switch. The launcher's uid branch
+  hands the broker the SDK's fds (`SCM_RIGHTS`) + a signed single-use ticket
+  (`uid_isolation.mint_ticket`, HMAC + nonce + exp; `GATEWAY_ISOLATION_TICKET_SECRET` is
+  entrypoint-generated and shared with gateway+broker; the gateway moves it out of its own
+  `os.environ` at startup (`capture_ticket_secret`, before any spawn — the frozen codex/opencode
+  clients copy `os.environ`) and still blanks it per spawn). `create_client` re-mints the ticket
+  right before `connect()` (120 s TTL; the skills preflight awaits a global lock in between). The
+  resident loop is single-threaded `select.poll` (it forks): `SO_PEERCRED` pinned to
+  `GATEWAY_ISOLATION_PEER_UID` before reading a byte, ≤ 32 handshakes in flight, a 10 s total
+  deadline each, an 8 MiB header cap, a strict `{ticket: str, argv: [str], env: {str: str}}` schema,
+  and any per-connection exception or fork failure answers REFUSED and keeps serving (one malformed
+  header used to kill the only broker). It verifies the ticket **in the resident parent** (nonce→exp
+  store, pruned at expiry, so single use is authoritative) and `_authorize` keeps uid **and** gid in
+  the band and outside {0, APP_UID, APP_GID, the broker's own uid/euid/gid/egid}; relative
+  workspace/ro/rw entries are refused. The only same-uid path is the argv-only test flag
+  `--test-same-uid` (the entrypoint never passes it), which lets the whole protocol (fd passing,
+  supervisor tree, Landlock, exit mirroring, ticket refusal/parity, teardown) run unprivileged in
+  `tests/test_isolation_broker.py`, `tests/test_landlock_launcher_hardening.py`,
+  `tests/test_entrypoint_broker.py` and `tests/test_uid_isolation.py`. **Teardown** never depends on
+  a cross-uid `kill()` (a CAP_KILL-less broker gets EPERM): the supervisor runs `setgroups([])`,
+  `setresgid(G,G,G)`, `setresuid(broker, U, broker)` and drops all caps, so it can signal the
+  uid-U tree while uid-U processes can neither signal nor ptrace it; the CLI child completes
+  `(U,U,U)` itself and asserts it (exit 115 otherwise). The launcher link is the control channel:
+  relayed SIGTERM/SIGINT go to the CLI's group; on EOF the group gets SIGTERM, then SIGKILL 5 s after
+  the first SIGTERM; once the CLI exits, `_sweep` (the supervisor is a subreaper) SIGKILLs every
+  remaining descendant and loops until none is left — the CLI starts each Bash command detached in
+  its own session, so killing only the CLI's group leaked `cmd &`/setsid jobs — never `kill(-1)` (a
+  named user's other sessions share the uid), and only then reports the status. If a supervisor dies
+  abnormally, the resident broker (also a subreaper) kills what it left from a short-lived killer
+  with the supervisor's `(broker, U, broker)` credentials and caps 0 (`_sweep_orphans`/`_kill_as`),
+  so U's orphans cannot stop or kill it even below ABI 6, and waits for it a bounded time
+  (`WNOHANG|WUNTRACED`, 2 s, plus up to 2 s to reap it after a SIGKILL): a stopped or overrunning
+  killer is SIGKILLed and reaped, and its pids are logged as not swept and not retried — the
+  single-threaded resident never blocks on a process a session can signal. Gap: a direct launcher SIGKILL with no relayed SIGTERM (the `agent_messages`
+  wedge path) leaves a CLI that ignores SIGTERM up to 5 s, so stateless cleanup can race it. A local
+  container run measured under 1 s, background jobs included. **Wire format** after the
+  `=I` length + JSON header (3 fds on its first byte): fixed `=Ii` `(kind, value)` records —
+  launcher→broker `(1, signum)` relay; broker→launcher `(1, code)` EXITED, `(2, signum)` SIGNALED,
+  `(3, 0)` REFUSED. The launcher mirrors exactly (a 128+N single int once turned exit(130) into -2 and
+  exit(148) into a self-SIGTSTP); a stop/ignore-default signal exits 128+N instead of being
+  self-raised; REFUSED/invalid/no status exit 70. The broker binds a `0660` socket with the gateway's
+  gid (`CLAUDE_ISOLATION_BROKER_GID` defaults to `APP_GID`) in a broker-owned `0750` dir that the
+  entrypoint creates fresh (or adopts only if already the broker's), behind a root-owned
+  non-writable parent chain, through an `O_NOFOLLOW` fd (a socket under `/tmp` is refused, not
+  chmodded); the entrypoint then waits for the broker to accept before exec'ing the gateway, and
+  `install_process_env` waits again (`CLAUDE_ISOLATION_BROKER_WAIT_SECONDS`, default 10, capped at
+  300, non-finite → default; one parser on both sides, pinned equal by
+  `test_wait_knob_parses_like_the_gateway` — a broker that never comes up delays startup ~2× before
+  the gateway fails closed). The
+  broker execs the CLI with the launcher-passed env (the SDK's child env) — not the broker's —
+  filtered + plumbing-stripped, `PWD` = workspace. Anonymous/stateless runs **lease** a uid from an
+  in-memory ephemeral band (`_EphemeralPool`, top `CLAUDE_ISOLATION_EPHEMERAL_UIDS` of the band; an
+  empty one is a startup error), keyed by the absolute workspace path and released by
+  `WorkspaceManager.cleanup_temp_workspace` once the workspace is gone (when the pool is full, leases
+  whose workspace is gone are reclaimed first), which every path runs only after the run's CLI is
+  stopped, so no uid is shared by two live runs. In the known gaps (a stateless or try-run
+  disconnect that times out without the cancelled path's kill, and a delete during a continuation's
+  slash preflight) the uid can be handed out while the old CLI still runs, and the broker backs the
+  pool up: it refuses a uid a live supervisor holds for a different workspace, and any uid an
+  orphan still holds — one not swept yet, or one a sweep gave up on (`_check_uid_free`). That
+  check assumes one workspace per uid: a named user whose orphan a sweep gave up on cannot spawn
+  until it exits, and one live in two workspaces at once (a legacy `base/<user>` resume beside a
+  `base/<user>/claude` session) is refused in the second. An anonymous workspace uid mode cannot
+  delete keeps its uid (fail closed until broker cleanup lands). Today a session uid cannot write
+  its workspace; once it can, every anonymous workspace is such a one and the pool drains after
+  `CLAUDE_ISOLATION_EPHEMERAL_UIDS` runs, so broker-delegated cleanup must land with workspace
+  ownership. Nothing removes a run's `/dev/shm` objects, so the next run leased that uid can read
+  them. The persisted registry never grows, and with every uid leased a new anonymous run gets
+  the retryable 503 (an `api_error` event on `/v1/agents/messages`). Named users get durable uids,
+  never reclaimed (follow-up): a full stable
+  band raises `UidBandExhausted` → HTTP 500 `uid_band_exhausted`, not "retry shortly", with a warning
+  once it crosses 90%. The registry fails **closed**: a corrupt/unreadable
+  `isolation_uids.json` refuses uid-mode startup (`_check_uid_registry`) instead of loading empty
+  and reassigning uids; entries it cannot honor (out of band, reserved, shared — e.g. after
+  narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too, and their
+  uids are excluded from the ephemeral pool (else an anonymous run would get a named user's files);
+  writes are fsync'd 0600, and a failing directory fsync after the replace keeps the grant.
+  `effective_mode()` self-detects at startup: Landlock ABI≥3, the broker reachable, and the
+  **startup probe** passed. Once the broker answers, `install_process_env` runs
+  `_probe_uid_sessions`:
+  - it spawns the real CLI `--version` through the launcher and broker, as an ephemeral session
+    uid, in a fresh anonymous workspace from the workspace manager;
+  - it checks with mode bits (no ACLs) that this uid can reach the config dir and create its
+    `projects/<name>`.
+
+  Unavailable uid is a hard `check_config` error naming the reason, **unless**
+  `CLAUDE_ISOLATION_FALLBACK=landlock`. The probe is skipped when the secret, the bands or the
+  registry are broken, so their own errors stand. In uid mode, `verify()` also runs in such a
+  workspace and names a launcher/broker refusal (`landlock.describe_launcher_exit`) instead of
+  printing npm install hints.
+
+  **With the shipped image the probe fails and uid mode refuses to start.** A local container run
+  (2026-10-14) served no turn: the session uid cannot write the app-owned 0755 workspace, so the CLI
+  died on `.cli-tmp`, while startup passed and every request got a 503. `/home/app` is 0700, which
+  hides the shared `~/.claude` assets, `session-env/<id>` and `plugins/data`. The image has no
+  passwd entries for the broker uid or the band. uid mode becomes usable only when per-user
+  workspace ownership and container provisioning land; `landlock` is the boundary to run today.
+  That run did verify the privileged layout: broker caps exactly SETUID|SETGID with securebits
+  locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`, and teardown.
+  Re-run `docs/isolation-uid-verification.md` in the deployment container before enabling uid in
+  prod. In uid mode the root entrypoint no longer re-owns (or walks) `~/.claude` entries owned by a
+  session uid (the band and every uid the registry records, minus root, the app uid and the broker
+  uid — the registry read as root without importing src, a symlinked, non-regular, oversized or
+  malformed one ignored with a warning; other modes still hand everything back to the app uid). The
+  gateway cannot read or unlink a session uid's 0600 transcript, so resuming an expired uid-mode
+  session is an explicit, non-retryable 500 `transcript_unreadable`
+  (`session_manager.TranscriptUnreadable`, warned once per path) and stateless transcript cleanup
+  warns; the broker doing both as the session uid belongs to the workspace-ownership follow-up. A
+  refused workspace (`landlock.WorkspaceRefused`) is a non-retryable 500 `workspace_refused` too.
+  These, `uid_band_exhausted` and the 409 `session_ended` carry `x-should-retry: false`: OpenAI
+  SDKs retry 408/409/429 and every 5xx on their own otherwise (a retried `session_ended` would
+  silently start a fresh conversation), CORS exposes the header to browser clients, and the
+  OpenAI-style `HTTPException` handler in `src/main.py` now passes exception headers through (it
+  used to drop them, `WWW-Authenticate` on the 401s included). A 429 still goes through the
+  rate-limit handler instead, which keeps its own body and `Retry-After` (the archive 429's code
+  and `Retry-After` are lost there — pre-existing).
+  Remaining
+  hardening (seccomp arg filter on set*id, bounding-set drop, per-user workspace ownership + broker
+  cleanup) is a container/follow-up step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py`
+  never import `/app/src` (session-writable + privileged); the broker's ticket-verify is duplicated
+  from `uid_isolation` and kept in lockstep by `test_isolation_broker.py::TestTicketVerify`
+  (valid/tampered/expired/replayed cross-check + identical `ValueError` refusals).
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values
@@ -208,10 +514,11 @@ uv run pytest --cov=src                            # with coverage
   out, blank stays on, failure only logs): its `/proc/<pid>/` entries turn root-owned, so a
   same-uid process (a session's Bash, hook or MCP server) gets EACCES on its `environ`, `mem`
   and `fd/`. What that adds is narrow. The SDK builds the CLI child env as
-  `{**os.environ, **options.env}`; for session CLI children the gateway first blanks
-  `ADMIN_API_KEY`, `API_KEY` and the `SYSINFO_CHILD_ENV_MASK` names (`child_env_mask()`, only
-  while `SYSINFO_REDACTION` is on) and always blanks `OPENAI_API_KEY` (plus
-  `CLAUDE_CODE_OAUTH_TOKEN` in api-key auth; `_configure_sdk_env` / `_isolation_vars`) in
+  `{**os.environ, **options.env}`; for session CLI children and the slash/skill preflight the
+  gateway first blanks `ADMIN_API_KEY`, `API_KEY` and the `SYSINFO_CHILD_ENV_MASK` names
+  (`child_env_mask()`, only while `SYSINFO_REDACTION` is on) and always blanks `OPENAI_API_KEY`
+  (plus `CLAUDE_CODE_OAUTH_TOKEN` in api-key auth) and the uid ticket secret — one list,
+  `client.child_secret_env()`, used by `_configure_sdk_env` and `_build_preflight_options` — in
   `options.env` — never by popping `os.environ` around `connect()`: the SDK copies `os.environ`
   only after awaiting its `claude -v` check, so an overlapping session creation used to hand the
   popped values to another session's CLI (`tests/test_sdk_env_race.py`; a blank token reads as
@@ -249,6 +556,11 @@ uv run pytest --cov=src                            # with coverage
 
 - `pytest-asyncio` uses `asyncio_mode = "auto"`; do not add `@pytest.mark.asyncio` unless a test specifically needs it.
 - Mock SDK calls in tests and prefer the shared fixtures in `tests/conftest.py`.
+- The suite never touches the developer's real Claude config dir: `tests/fixtures/hermetic_home.py`
+  (imported by `conftest.py` before any `src` import) moves HOME to a temp dir and unsets
+  `CLAUDE_CONFIG_DIR`, and `_guard_real_claude_home` fails the run if the real dir still gains a
+  `projects/` entry or its `settings.json` / plugin registry changes
+  (`GATEWAY_TEST_SKIP_HOME_GUARD=1` skips the check).
 - Markers: `integration` (real subprocess with mock binary), `slow`, `e2e` (needs live server + credentials; excluded by default).
 - OpenCode/Codex are stale (frozen 2026-07): `tests/conftest.py` skips collection of their dedicated
   test files and deselects every test whose id mentions `opencode`/`codex` (~490 tests total; a

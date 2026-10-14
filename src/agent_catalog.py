@@ -166,8 +166,12 @@ def _user_scope_dir() -> Optional[Path]:
         return None
     if "user" not in sources:
         return None
-    home = Path.home()
-    return home / ".claude" if home.is_dir() else None
+    from src.claude_config_paths import config_dir
+
+    base = config_dir()
+    # Preserve the old gate: return the dir only when its parent (the home dir,
+    # or the CLAUDE_CONFIG_DIR parent) exists; the dir itself need not.
+    return base if base.parent.is_dir() else None
 
 
 def _plugin_entries(kind: str) -> List[Dict[str, str]]:

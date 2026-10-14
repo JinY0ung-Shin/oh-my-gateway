@@ -174,9 +174,20 @@ def _bash(command: str) -> Tuple[str, Dict[str, Any]]:
 
 
 async def _run(
-    tmp_path: Path, calls: List[Tuple[str, Dict[str, Any]]], mode: str
+    tmp_path: Path,
+    calls: List[Tuple[str, Dict[str, Any]]],
+    mode: str,
+    *,
+    confine: bool = False,
 ) -> Tuple[List[str], List[str]]:
-    """Run *calls* in one turn with the gateway's options; tool results + asks."""
+    """Run *calls* in one turn with the gateway's options; tool results + asks.
+
+    With ``confine=True`` the CLI is spawned through the Landlock launcher
+    (#241) with the gateway's own path lists (``landlock.options_env``, the
+    ``landlock_on`` fixture points the gateway at the test HOME): the
+    workspace, the session's project and session-env dirs are read-write, the
+    shared assets read-only, everything else is denied.
+    """
     workspace = tmp_path / "ws"
     workspace.mkdir()
     (workspace / "in.txt").write_text(f"{INSIDE}\n")
@@ -198,7 +209,7 @@ async def _run(
         return {"text": "done"}
 
     cli = _make_cli()
-    built = cli._build_sdk_options(permission_mode=mode)
+    built = cli._build_sdk_options(permission_mode=mode, cwd=workspace)
     gateway_cb = cli._make_ask_user_can_use_tool(SimpleNamespace())
     asked: List[str] = []
 
@@ -211,6 +222,30 @@ async def _run(
     env = {"CLAUDE_CODE_HARBOR_KITE": "0"}
     if os.geteuid() == 0:  # the CLI refuses bypassPermissions as root otherwise
         env["IS_SANDBOX"] = "1"
+    session_id = str(uuid.uuid4())
+    cli_path = None
+    if confine:
+        import sys
+
+        from src.backends.claude import landlock
+
+        cli_path = landlock.launcher_path()
+        (tmp_path / "home" / ".claude").mkdir(parents=True, exist_ok=True)
+        # The lists a session gets: everything else — the sibling 'outside'
+        # dir, the gateway code — is denied by omission.
+        confinement = landlock.options_env(workspace, session_id=session_id)
+        assert confinement[landlock.MODE_ENV] == "landlock", confinement
+        assert confinement[landlock.REAL_CLI_ENV], "no real CLI to confine"
+        # sys.prefix is the dev venv, which lives UNDER the repo root. In
+        # production ``python3`` is /usr/bin/python3 (already in the launcher's
+        # ro system roots); here the CLI's Bash resolves it to the venv python,
+        # so grant the venv read-only — only then does python actually start and
+        # the closure tests prove the OUTSIDE read is blocked, not that python
+        # failed to boot. It is a subtree, so the repo's src/ and data/ stay
+        # denied (the /app protection the other tests check).
+        ro = json.loads(confinement[landlock.RO_ENV])  # a JSON array
+        confinement[landlock.RO_ENV] = json.dumps([*ro, sys.prefix])
+        env.update(confinement)
     with FakeAnthropicAPI(plan) as api:
         options = ClaudeAgentOptions(
             cwd=str(workspace),
@@ -219,8 +254,9 @@ async def _run(
             permission_mode=built.permission_mode,
             settings=built.settings,
             max_turns=len(calls) + 2,
-            session_id=str(uuid.uuid4()),
+            session_id=session_id,
             can_use_tool=can_use_tool,
+            **({"cli_path": cli_path} if cli_path else {}),
         )
         client = ClaudeSDKClient(options=options)
         await asyncio.wait_for(client.connect(), timeout=_TURN_TIMEOUT)
@@ -308,9 +344,12 @@ class TestBundledCliReadBoundary:
     async def test_known_gap_a_workspace_script_reads_outside(
         self, tmp_path, boundary_on
     ):
-        # The CLI cannot see inside a script file. Only an OS boundary closes
-        # this (#234); when this starts failing, the CLI closed it — update the
-        # docs that describe the gap.
+        # Control (#241): the read boundary alone cannot see inside a script the
+        # agent wrote, so the written-script read path stays open WITHOUT an OS
+        # boundary. This keeps TestLandlockConfinement below non-vacuous: that
+        # class runs the same script under the Landlock launcher and asserts the
+        # secret no longer comes back. If this ever stops leaking on its own,
+        # the CLI closed the gap — update the docs that describe it.
         results, _ = await _run(tmp_path, [_bash("python3 rd.py")], "default")
         assert SECRET in results[0], results[0]
 
@@ -320,3 +359,99 @@ class TestBundledCliReadBoundary:
         # Proves the tests above are not vacuous.
         results, _ = await _run(tmp_path, [_bash("cat @OUT/secret.txt")], "default")
         assert SECRET in results[0], results[0]
+
+
+def _landlock_unusable() -> Optional[str]:
+    from src.backends.claude import landlock
+
+    abi = landlock.landlock_abi()
+    if abi < landlock.MIN_LANDLOCK_ABI:
+        return f"Landlock ABI {abi} < {landlock.MIN_LANDLOCK_ABI} (need kernel >= 6.2)"
+    launcher = Path(landlock.launcher_path())
+    if not (launcher.is_file() and os.access(launcher, os.X_OK)):
+        return f"launcher {launcher} not executable"
+    return None
+
+
+@pytest.fixture
+def landlock_on(_no_inherited_claude_env, monkeypatch, tmp_path):
+    """Landlock mode, with the gateway's config dir at the CLI's test HOME."""
+    from src.backends.claude import landlock
+
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(home / ".claude"))
+    monkeypatch.setenv(landlock.MODE_ENV, "landlock")
+    landlock.reset_mode_cache()
+    yield
+    landlock.reset_mode_cache()
+
+
+@pytest.mark.integration
+@pytest.mark.usefixtures("landlock_on")
+@pytest.mark.filterwarnings("ignore::claude_agent_sdk.types.CanUseToolShadowedWarning")
+@pytest.mark.skipif(bool(_landlock_unusable()), reason=_landlock_unusable() or "")
+class TestLandlockConfinement:
+    """The OS boundary (#241, PR-A): a Landlock ruleset inherited across execve
+    confines every CLI descendant's file access, closing the written-script read
+    path the command-line checks cannot — while workspace work still runs."""
+
+    async def test_written_script_cannot_read_outside(self, tmp_path, boundary_on):
+        # The exact scenario of the control known-gap test, now confined: the
+        # agent writes rd.py into its workspace and runs it; the outside read
+        # must come back empty/denied, not the secret.
+        results, _ = await _run(
+            tmp_path, [_bash("python3 rd.py")], "default", confine=True
+        )
+        assert not _leaks(results[0]), results[0]
+
+    async def test_confined_direct_bash_read_outside_also_blocked(
+        self, tmp_path, boundary_on
+    ):
+        # Beyond the written script: a plain outside read is denied at the OS
+        # layer too (belt-and-suspenders with the read boundary's own refusal).
+        results, _ = await _run(
+            tmp_path, [_bash("cat @OUT/secret.txt")], "default", confine=True
+        )
+        assert not _leaks(results[0]), results[0]
+
+    async def test_confined_workspace_work_still_runs(self, tmp_path, boundary_on):
+        # Confinement must not break ordinary in-workspace work: reading a file,
+        # running a script that reads an in-workspace file, and writing.
+        calls = [
+            _bash("cat in.txt"),
+            _bash("python3 ok.py"),
+            _bash("echo written > out.txt && cat out.txt"),
+        ]
+        results, _ = await _run(tmp_path, calls, "default", confine=True)
+        assert all(INSIDE in r for r in results[:2]), results
+        assert "written" in results[2], results[2]
+
+    async def test_confined_bash_is_not_a_login_shell(
+        self, tmp_path, boundary_off, monkeypatch
+    ):
+        # #244 review 4: confined, the CLI cannot write its shell snapshot and
+        # ran every Bash call as `bash -c -l`, so a ~/.profile (which the
+        # ruleset denies) put "Permission denied" into every result and a PATH
+        # reset in /etc/profile dropped operator PATH entries. The launcher
+        # points CLAUDE_CODE_SHELL at docker/claude-session-bash, which drops
+        # the -l. The other tests' HOME has no .profile, so they never saw it.
+        # (boundary_off: the read boundary refuses `echo $PATH` as unverifiable.)
+        bash = next(
+            (b for b in ("/bin/bash", "/usr/bin/bash") if os.access(b, os.X_OK)), None
+        )
+        if bash is None:
+            pytest.skip("no system bash")
+        # SHELL names a bash, so it is the CLI's pick as in the image (no zsh);
+        # a zsh the CLI would pick is left alone.
+        monkeypatch.setenv("SHELL", bash)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".profile").write_text("PATH=/profile/reset\n")
+        marker = str(tmp_path / "operator-bin")
+        monkeypatch.setenv("PATH", f"{marker}{os.pathsep}{os.environ['PATH']}")
+        probe = "shopt -q login_shell && echo LOGIN || echo NOLOGIN; echo P=$PATH"
+        results, _ = await _run(tmp_path, [_bash(probe)], "default", confine=True)
+        assert "NOLOGIN" in results[0], results[0]
+        assert "Permission denied" not in results[0], results[0]
+        assert f"P={marker}{os.pathsep}" in results[0], results[0]

@@ -1023,7 +1023,16 @@ class TestRegistryResetWithClient:
         body = ResponseCreateRequest(model=DEFAULT_MODEL, input="hello")
         resolved = ResolvedModel(DEFAULT_MODEL, "claude", DEFAULT_MODEL)
 
-        with patch("src.routes.responses.get_mcp_servers", return_value={}):
+        import src.routes.responses as responses_module
+
+        with (
+            patch("src.routes.responses.get_mcp_servers", return_value={}),
+            # A started client is handed over only to a session the manager
+            # still holds (SessionManager.finish_client_start).
+            patch.dict(
+                responses_module.session_manager.sessions, {"sess-outbox": session}
+            ),
+        ):
             await _ensure_response_session_client(
                 body, resolved, backend, session, "sess-outbox", False, None, "/tmp/ws"
             )

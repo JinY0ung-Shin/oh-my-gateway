@@ -116,18 +116,22 @@ def _resolve_within_any(roots: list[Path], candidate: str) -> Optional[Path]:
 
 
 def _claude_home() -> Optional[Path]:
-    """Resolve ``$HOME/.claude``, or ``None`` when ``$HOME`` is unset.
+    """Resolve the Claude config dir, or ``None`` when it cannot be located.
 
-    Only ``$HOME/.claude`` is allowed — not all of ``$HOME`` — so ``~/.ssh`` and
-    other home paths stay denied (issue #115). Returns ``None`` when ``$HOME`` is
-    unset so the canonical state dir is not silently inferred; the gateway
-    process always has ``$HOME`` set (``/home/app`` in the container).
+    Only ``.claude`` is allowed — not all of ``$HOME`` — so ``~/.ssh`` and other
+    home paths stay denied (issue #115). Uses the shared resolver's strict
+    variant (``$CLAUDE_CONFIG_DIR`` else ``$HOME/.claude``), which returns
+    ``None`` when ``$HOME`` is unset and unoverridden so the canonical state dir
+    is not silently inferred; the gateway process always has ``$HOME`` set
+    (``/home/app`` in the container).
     """
-    home = os.getenv("HOME")
-    if not home:
+    from src.claude_config_paths import config_dir_strict
+
+    base = config_dir_strict()
+    if base is None:
         return None
     try:
-        return (Path(home) / ".claude").resolve()
+        return base.resolve()
     except (OSError, RuntimeError, ValueError):
         return None
 

@@ -17,7 +17,7 @@ async def test_available_command_cache_never_crosses_workspace_boundary(monkeypa
     a.mkdir()
     b.mkdir()
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         key = str(cwd)
         calls.append(key)
         return {"alice-only"} if cwd == a else {"bob-only"}
@@ -41,7 +41,7 @@ async def test_validate_prompt_does_not_accept_other_users_project_skill(monkeyp
     a.mkdir()
     b.mkdir()
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         return {"private-review"} if cwd == a else {"help"}
 
     monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
@@ -64,7 +64,7 @@ async def test_command_details_cache_is_scoped_by_workspace(monkeypatch, tmp_pat
     a.mkdir()
     b.mkdir()
 
-    async def _fake_fetch(cwd):
+    async def _fake_fetch(cwd, user=None):
         calls.append(str(cwd))
         name = "alice-only" if cwd == a else "bob-only"
         return {name: {"description": name, "argument_hint": ""}}

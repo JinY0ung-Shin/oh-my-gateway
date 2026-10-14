@@ -20,7 +20,6 @@ Key data sources:
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -53,9 +52,9 @@ def _plugins_root() -> Optional[Path]:
     gateway reads the same registry the CLI it spawns will read; defaults to
     ``~/.claude/plugins``.
     """
-    override = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
-    base = Path(override) if override else Path.home() / ".claude"
-    p = base / "plugins"
+    from src.claude_config_paths import config_dir
+
+    p = config_dir() / "plugins"
     return p if p.is_dir() else None
 
 
@@ -148,12 +147,9 @@ def _marketplace_anchors() -> List[Path]:
     root = _plugins_root()
     if root is not None:
         anchors.append(root / "marketplaces")
-    configured = os.environ.get("CLAUDE_PLUGIN_CLONE_ROOT", "").strip()
-    if configured:
-        anchors.append(Path(configured))
-    else:
-        home = os.environ.get("HOME", "").strip() or str(Path.home())
-        anchors.append(Path(home) / ".claude" / "plugin-marketplaces")
+    from src.claude_config_paths import plugin_clone_root
+
+    anchors.append(plugin_clone_root())
     return anchors
 
 

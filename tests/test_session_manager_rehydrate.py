@@ -22,6 +22,22 @@ def test_encode_cwd_handles_repeated_separators():
     assert _encode_cwd("/_./") == "----"
 
 
+def test_encode_cwd_matches_cli_naming_for_email_users():
+    # The CLI replaces every non-alphanumeric (``@`` included); the old
+    # ``[/_.]`` rule kept ``@`` and looked in a directory the CLI never wrote.
+    assert (
+        _encode_cwd("/ws/john.smith@corp.com") == "-ws-john-smith-corp-com"
+    )
+
+
+def test_encode_cwd_delegates_to_cli_project_dir_name():
+    from src.backends.claude.workspace_sandbox import _project_dir_name
+
+    long_cwd = "/ws/" + "u" * 300
+    assert _encode_cwd(long_cwd) == _project_dir_name(long_cwd)
+    assert len(_encode_cwd(long_cwd)) > 200
+
+
 def _write_jsonl(p: Path, lines: list[dict]) -> None:
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("w") as fh:

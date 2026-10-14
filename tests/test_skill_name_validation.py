@@ -213,7 +213,7 @@ CATALOG = {
 
 @pytest.fixture
 def fake_catalog(monkeypatch):
-    async def _fake_available(cwd=None, force=False):
+    async def _fake_available(cwd=None, force=False, user=None):
         return set(CATALOG)
 
     monkeypatch.setattr(slash_commands, "get_available_commands", _fake_available)

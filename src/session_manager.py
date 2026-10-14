@@ -20,7 +20,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -39,24 +38,43 @@ from src.constants import (
 
 logger = logging.getLogger(__name__)
 
-_CWD_ENCODE_RE = re.compile(r"[/_.]")
-_PROJECTS_ROOT: Path = Path.home() / ".claude" / "projects"
+# Where the SDK stores per-session transcripts: ``<config dir>/projects``.
+# Resolved per call (``_projects_root``) via the shared config-dir resolver so a
+# per-session config dir (PR-C) is honored, instead of being frozen at import.
+# ``None`` means "resolve from the environment"; a test may set this attribute
+# to pin the root (the historical seam ``monkeypatch.setattr(session_manager,
+# "_PROJECTS_ROOT", tmp_path)`` keeps working).
+_PROJECTS_ROOT: Optional[Path] = None
+
+
+def _projects_root() -> Path:
+    """The ``projects`` root, honoring a test override of ``_PROJECTS_ROOT``."""
+    if _PROJECTS_ROOT is not None:
+        return _PROJECTS_ROOT
+    from src.claude_config_paths import projects_root
+
+    return projects_root()
 
 
 def _encode_cwd(cwd) -> str:
     """Encode a workspace cwd to its on-disk Claude SDK directory name.
 
     The Claude SDK stores per-project transcripts under
-    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. The encoding
-    rule (verified against on-disk transcript directories): every ``/``,
-    ``_`` and ``.`` is replaced with ``-``.
+    ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``. This delegates to
+    the CLI's exact naming (``workspace_sandbox._project_dir_name``: every
+    non-alphanumeric UTF-16 unit becomes ``-``, a hash suffix past 200 units,
+    pinned in ``tests/test_cli_project_dir_name.py``). A hand-rolled
+    ``[/_.]`` rule left ``@`` intact, so an e-mail user's transcript lived in
+    a directory this lookup never opened and their sessions could not resume.
 
     The rule is **lossy** — distinct workspaces such as ``a_b``, ``a.b`` and
     ``a-b`` collapse to the same directory — so ``_try_rehydrate_from_jsonl``
     additionally verifies the transcript's recorded ``cwd`` against the
     requester's workspace before trusting it.
     """
-    return _CWD_ENCODE_RE.sub("-", str(cwd))
+    from src.backends.claude.workspace_sandbox import _project_dir_name
+
+    return _project_dir_name(str(cwd))
 
 
 def _session_jsonl_path(session_id: str, workspace) -> Path:
@@ -64,7 +82,7 @@ def _session_jsonl_path(session_id: str, workspace) -> Path:
 
     Path layout: ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``.
     """
-    return _PROJECTS_ROOT / _encode_cwd(workspace) / f"{session_id}.jsonl"
+    return _projects_root() / _encode_cwd(workspace) / f"{session_id}.jsonl"
 
 
 def _session_jsonl_exists(session: "Session") -> bool:
@@ -74,17 +92,58 @@ def _session_jsonl_exists(session: "Session") -> bool:
     return _session_jsonl_path(session.session_id, session.workspace).is_file()
 
 
+class TranscriptUnreadable(Exception):
+    """A session transcript is on disk, but the gateway may not read it.
+
+    Under ``CLAUDE_ISOLATION_MODE=uid`` the CLI runs as the session uid and
+    writes ``<session id>.jsonl`` mode 0600, so the gateway's own uid gets
+    EACCES. Resuming such a session needs the broker to read the transcript
+    as that uid, which is a follow-up. Raised instead of the silent ``None``
+    that answered 404 "not found or expired" for a session that is on disk.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"session transcript {path} is not readable by the gateway")
+        self.path = path
+
+
+# Transcript paths whose EACCES was logged at WARNING already. Bounded: once
+# full it starts over, so each path then warns once more.
+_UNREADABLE_WARNED: set = set()
+_UNREADABLE_WARNED_MAX = 4096
+
+
+def _warn_unreadable_transcript(path: Path, exc: OSError) -> None:
+    key = str(path)
+    if key in _UNREADABLE_WARNED:
+        logger.debug("Session transcript %s is still unreadable: %s", path, exc)
+        return
+    if len(_UNREADABLE_WARNED) >= _UNREADABLE_WARNED_MAX:
+        _UNREADABLE_WARNED.clear()
+    _UNREADABLE_WARNED.add(key)
+    logger.warning(
+        "Cannot rehydrate a session from %s: %s. The gateway's uid may not read "
+        "the transcript. Under CLAUDE_ISOLATION_MODE=uid the session uid owns "
+        "it, and resuming such a session needs the broker to read it as that "
+        "uid (a follow-up).",
+        path,
+        exc.strerror or exc,
+    )
+
+
 def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> Optional["Session"]:
     """Reconstruct a Session from the Claude SDK on-disk jsonl, if present.
 
     Returns None when the jsonl file is missing, unreadable, or malformed
     enough that we can't establish a turn count. The caller treats None as
-    cache-miss-and-on-disk-miss → existing 404 path.
+    cache-miss-and-on-disk-miss → existing 404 path. A transcript the
+    gateway is not *permitted* to read raises :class:`TranscriptUnreadable`
+    instead (logged once per path), so the caller can say so.
     """
     if not user or not cwd:
         return None
+    jsonl_path = _session_jsonl_path(session_id, cwd)
     try:
-        jsonl_path = _session_jsonl_path(session_id, cwd)
         if not jsonl_path.is_file():
             return None
         expected_cwd = Path(cwd)
@@ -95,8 +154,8 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
                     line = json.loads(raw)
                 except (ValueError, json.JSONDecodeError):
                     return None  # corrupt — refuse to guess
-                # Ownership guard. ``_encode_cwd`` is lossy ('/', '_', '.' all
-                # collapse to '-'), so distinct workspaces — e.g. users "a_b",
+                # Ownership guard. ``_encode_cwd`` is lossy (every
+                # non-alphanumeric collapses to '-'), so distinct workspaces — e.g. users "a_b",
                 # "a.b" and "a-b" — share one on-disk transcript directory. The
                 # SDK records the REAL cwd on each turn line, so refuse to
                 # rehydrate a transcript whose recorded cwd does not match the
@@ -142,6 +201,9 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
             workspace=str(cwd),
             user=user,
         )
+    except PermissionError as exc:
+        _warn_unreadable_transcript(jsonl_path, exc)
+        raise TranscriptUnreadable(jsonl_path) from exc
     except OSError:
         return None
 
@@ -164,6 +226,55 @@ def _cancel_idle_reader(session: "Session") -> None:
         if not task.done():
             task.cancel()
         session.idle_reader_task = None
+
+
+# How long a CLI that outlived its capped disconnect gets to die once killed.
+_KILL_WAIT_SECONDS = 5.0
+
+
+def _client_process(client: Any) -> Any:
+    """The CLI subprocess behind an SDK client, or ``None``.
+
+    Private SDK attributes, by necessity: nothing public tells whether a
+    disconnect that timed out left the process running.
+    """
+    return getattr(getattr(client, "_transport", None), "_process", None)
+
+
+async def _stop_client(client: Any, what: str) -> None:
+    """Disconnect *client* within the shared cap, and make sure its CLI is gone.
+
+    The SDK's ``close()`` escalates to SIGKILL well inside
+    ``CLIENT_DISCONNECT_TIMEOUT_SECONDS`` (#147), so a CLI still running after
+    the cap means the disconnect wedged before it got there. Left alone, that
+    CLI would outlive its session, while the teardown that follows removes its
+    workspace and so (uid isolation) ends its uid lease, which another run could
+    then get. So it is killed. Never raises.
+    """
+    try:
+        await asyncio.wait_for(
+            client.disconnect(), timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS
+        )
+    except Exception:
+        logger.debug(
+            "Client disconnect timed out or failed for %s", what, exc_info=True
+        )
+    process = _client_process(client)
+    if process is None or getattr(process, "returncode", 0) is not None:
+        return
+    logger.warning(
+        "The CLI (pid %s) of %s outlived its disconnect; killing it",
+        getattr(process, "pid", "?"),
+        what,
+    )
+    try:
+        with contextlib.suppress(ProcessLookupError):
+            process.kill()
+        await asyncio.wait_for(process.wait(), timeout=_KILL_WAIT_SECONDS)
+    except Exception:
+        logger.warning(
+            "Could not confirm that the CLI of %s exited", what, exc_info=True
+        )
 
 
 def _max_live_sessions() -> int:
@@ -233,6 +344,15 @@ class Session:
 
     # ClaudeSDKClient integration
     client: Optional[Any] = None
+    # True while a request is creating this session's client: ``create_client``
+    # is in flight, so a CLI may already run while ``client`` is still None.
+    # Eviction skips the session, and a teardown that removes it meanwhile
+    # (a delete, an expiry, shutdown) leaves its dirs (and their uid lease) to
+    # that request, which stops the new client before releasing them
+    # (``SessionManager.finish_client_start``). ``deferred_release`` keeps the
+    # deferred teardown's *finished* flag until then.
+    client_starting: bool = field(default=False, repr=False, compare=False)
+    deferred_release: Optional[bool] = field(default=None, repr=False, compare=False)
     input_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
     input_response: Optional[str] = None
     pending_tool_call: Optional[Dict[str, Any]] = None
@@ -449,7 +569,9 @@ class SessionManager:
         or paused on an ``AskUserQuestion`` (``pending_tool_call`` /
         ``input_event``, the same pair ``resume_idle_reader`` and
         ``_clear_stale_pending_tool_call`` gate on — the turn's continuation
-        is coming back for this exact session). Also skips sessions accessed
+        is coming back for this exact session), or still creating the client
+        a turn will run on (``client_starting``: its CLI may run already, and
+        the request would fail once it is up). Also skips sessions accessed
         within ``SESSION_EVICTION_MIN_IDLE_SECONDS`` (without that floor, a
         burst of cap+1 newcomers would cascade-evict each other). When
         nothing qualifies the caller falls through to the normal reject
@@ -480,6 +602,8 @@ class SessionManager:
                 continue
             if session.pending_tool_call is not None or session.input_event is not None:
                 continue
+            if session.client_starting is True:
+                continue
             idle = now - session.last_accessed
             if not session.is_expired() and idle < min_idle:
                 # The floor only protects *live* sessions (its purpose is to
@@ -500,8 +624,7 @@ class SessionManager:
                 task.add_done_callback(self._evict_tasks.discard)
             else:
                 del self.sessions[session.session_id]
-                if session.workspace:
-                    self._cleanup_workspace(session.workspace)
+                self._release_session_dirs(session, locked=True)
             metrics.record_session_evicted()
             logger.info(
                 "Evicted LRU session %s (idle %.0fs) to admit a new session; "
@@ -516,6 +639,7 @@ class SessionManager:
     async def _teardown_evicted(self, session: "Session") -> None:
         """Disconnect and clean up an evicted session outside the lock.
 
+        Also serves a session a lookup found expired (``_remove_if_expired``).
         Mirrors the expiry sweep's sequence in ``_purge_all_expired``, with
         the same disconnect cap as ``async_shutdown``
         (``CLIENT_DISCONNECT_TIMEOUT_SECONDS`` — sized so the SDK's own
@@ -530,20 +654,11 @@ class SessionManager:
         try:
             _cancel_idle_reader(session)
             if session.client is not None:
-                try:
-                    await asyncio.wait_for(
-                        session.client.disconnect(),
-                        timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
-                    )
-                except Exception:
-                    logger.debug(
-                        "Client disconnect timed out or failed for evicted session %s",
-                        session.session_id,
-                        exc_info=True,
-                    )
+                await _stop_client(
+                    session.client, f"evicted session {session.session_id}"
+                )
                 session.client = None
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+            self._release_session_dirs(session)
         except Exception:
             logger.exception(
                 "Eviction teardown failed for session %s", session.session_id
@@ -552,11 +667,29 @@ class SessionManager:
     def _remove_if_expired(self, session_id: str) -> bool:
         """Remove *session_id* if present and expired.
 
-        Returns ``True`` when the session was expired and removed.
+        Returns ``True`` when the session was expired and removed. Caller holds
+        the lock. What the session holds is released as on the expiry sweep:
+        a lookup that found it expired first used to drop it with its CLI still
+        running, its temp workspace on disk and, under uid isolation, its
+        ephemeral uid leased for good. A client is disconnected in a background
+        teardown, since that has to be awaited; without a running loop none can
+        be scheduled, and the session is dropped as before.
         """
         session = self.sessions.get(session_id)
         if session is not None and session.is_expired():
             del self.sessions[session_id]
+            if session.client is None:
+                _cancel_idle_reader(session)
+                self._release_session_dirs(session, locked=True)
+            else:
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    task = loop.create_task(self._teardown_evicted(session))
+                    self._evict_tasks.add(task)
+                    task.add_done_callback(self._evict_tasks.discard)
             logger.info(f"Removed expired session: {session_id}")
             return True
         return False
@@ -588,24 +721,14 @@ class SessionManager:
             try:
                 _cancel_idle_reader(session)
                 if session.client is not None:
-                    try:
-                        # Capped like every other awaited disconnect here (see
-                        # async_shutdown): disconnect() can hang on a dead
-                        # anyio channel, and a wedged sweep would block all
-                        # future out-of-band sweeps AND the periodic cleanup
-                        # loop — session expiry would stop for the process
-                        # lifetime.
-                        await asyncio.wait_for(
-                            session.client.disconnect(),
-                            timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "Client disconnect failed for session %s", sid, exc_info=True
-                        )
+                    # Capped like every other awaited disconnect here (see
+                    # async_shutdown): disconnect() can hang on a dead anyio
+                    # channel, and a wedged sweep would block all future
+                    # out-of-band sweeps AND the periodic cleanup loop —
+                    # session expiry would stop for the process lifetime.
+                    await _stop_client(session.client, f"expired session {sid}")
                     session.client = None
-                if session.workspace:
-                    self._cleanup_workspace(session.workspace)
+                self._release_session_dirs(session)
             except Exception:
                 logger.exception("Expiry teardown failed for session %s", sid)
 
@@ -634,12 +757,92 @@ class SessionManager:
             if session.client is not None:
                 # Defer to the async cleanup cycle so the client can be awaited.
                 continue
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+            self._release_session_dirs(session, locked=True)
             del self.sessions[sid]
             logger.info(f"Cleaned up expired session: {sid}")
             removed += 1
         return removed
+
+    def _release_session_dirs(
+        self, session: "Session", *, finished: bool = False, locked: bool = False
+    ) -> None:
+        """Remove what a session leaving the manager owns on disk.
+
+        Always its temp workspace (only an anonymous ``_tmp_`` one is removed).
+        Its ``session-env/<session id>`` dir (the CLI's ``$CLAUDE_ENV_FILE``
+        hook scripts; the CLI's session id is the gateway's) only once the
+        session is finished: *finished* (an explicit delete), or any teardown
+        of an anonymous session, which nothing can resume. A named session torn
+        down by expiry, eviction or shutdown keeps it: a later continuation
+        rehydrates the same id, and the resumed CLI fires SessionStart with
+        ``source=resume`` only, so startup hooks do not run again to restore
+        the env they gave Bash (#244 review). In the confined modes the dir of
+        a named session that is never resumed stays behind (a few small files;
+        the CLI's own ``cleanupPeriodDays`` sweep cannot reach it from inside
+        Landlock, #241).
+
+        Nothing is removed while a request is still creating the session's
+        client (``client_starting``): its CLI may run already, in that workspace
+        and under that uid lease. The teardown is recorded instead, and the
+        request releases the dirs once it has stopped the new client
+        (:meth:`finish_client_start`).
+
+        *locked*: the caller holds ``self.lock``, which is not re-entrant.
+        """
+        if locked:
+            deferred = self._defer_release_locked(session, finished)
+        else:
+            with self.lock:
+                deferred = self._defer_release_locked(session, finished)
+        if deferred:
+            return
+        if session.workspace:
+            self._cleanup_workspace(session.workspace)
+        if session.user and not finished:
+            return
+        if locked:
+            self._remove_session_env_locked(session)
+        else:
+            with self.lock:
+                self._remove_session_env_locked(session)
+
+    @staticmethod
+    def _defer_release_locked(session: "Session", finished: bool) -> bool:
+        """Record a teardown that has to wait for a client still starting
+        (see :meth:`_release_session_dirs`); ``False`` when none is. Caller
+        holds ``self.lock``."""
+        if getattr(session, "client_starting", False) is not True:
+            return False
+        previous = getattr(session, "deferred_release", None)
+        session.deferred_release = finished or bool(previous)
+        logger.info(
+            "Session %s ended while its client was starting; its dirs wait for "
+            "that client to be stopped",
+            session.session_id,
+        )
+        return True
+
+    def _remove_session_env_locked(self, session: "Session") -> None:
+        """Remove *session*'s ``session-env`` dir unless a live session now
+        owns its id. Caller holds ``self.lock``.
+
+        A continuation can rehydrate the same id (a new :class:`Session` whose
+        CLI is granted that same dir) while the old incarnation's teardown
+        awaits its disconnect. Removing the dir then pulls it from under the
+        live CLI (#244 review). The check and the removal both run under the
+        lock, so no rehydrate can slip in between.
+        """
+        current = self.sessions.get(session.session_id)
+        if current is not None and current is not session:
+            return
+        try:
+            from src.backends.claude import landlock
+
+            landlock.remove_session_env_dir(session.session_id)
+        except Exception:
+            logger.debug(
+                "session-env cleanup skipped for %s", session.session_id, exc_info=True
+            )
 
     def _cleanup_workspace(self, workspace_path: str) -> None:
         """Remove temporary workspace directory on session expiry."""
@@ -747,13 +950,7 @@ class SessionManager:
             _cancel_idle_reader(session)
             if session.client is None:
                 return
-            try:
-                await asyncio.wait_for(
-                    session.client.disconnect(),
-                    timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                logger.debug("Client disconnect timed out or failed", exc_info=True)
+            await _stop_client(session.client, f"session {session.session_id}")
             session.client = None
 
         if sessions_snapshot:
@@ -774,8 +971,7 @@ class SessionManager:
         Must be called while holding ``self.lock``.
         """
         for session in self.sessions.values():
-            if session.workspace:
-                self._cleanup_workspace(session.workspace)
+            self._release_session_dirs(session, locked=True)
 
     # ------------------------------------------------------------------
     # Session CRUD
@@ -844,6 +1040,9 @@ class SessionManager:
         evict someone else's live session), and the route would 404 the
         request right after anyway. Live cache hits are returned regardless;
         the route's own turn validation owns that case.
+
+        Raises :class:`TranscriptUnreadable` when the transcript is on disk
+        but the gateway may not read it (uid isolation).
         """
         with self.lock:
             self._remove_if_expired(session_id)
@@ -857,7 +1056,11 @@ class SessionManager:
             # checks without user/cwd) must not pollute the metric.
             if not user or not cwd:
                 return None
-            session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
+            try:
+                session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
+            except TranscriptUnreadable:
+                self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
+                raise
             if session is not None and max_turn is not None and max_turn > session.turn_counter:
                 self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
                 return None
@@ -911,13 +1114,20 @@ class SessionManager:
                 "from async callers",
                 session_id,
             )
-        if session.workspace:
-            self._cleanup_workspace(session.workspace)
+        self._release_session_dirs(session, finished=True)
         logger.info(f"Deleted session: {session_id}")
         return True
 
-    async def delete_session_async(self, session_id: str) -> bool:
-        """Delete a session, disconnecting its client and cleaning temp workspace."""
+    async def delete_session_async(
+        self, session_id: str, *, finished: bool = True
+    ) -> bool:
+        """Delete a session, disconnecting its client and cleaning temp workspace.
+
+        ``finished=False`` is for a caller whose named session a later
+        continuation may still resume (a failed client creation): its CLI
+        ``session-env`` dir then stays, as on expiry (see
+        :meth:`_release_session_dirs`).
+        """
         with self.lock:
             session = self.sessions.pop(session_id, None)
         if session is None:
@@ -925,20 +1135,63 @@ class SessionManager:
 
         _cancel_idle_reader(session)
         if session.client is not None:
-            try:
-                await asyncio.wait_for(
-                    session.client.disconnect(),
-                    timeout=CLIENT_DISCONNECT_TIMEOUT_SECONDS,
-                )
-            except Exception:
-                logger.debug("Client disconnect timed out or failed", exc_info=True)
+            await _stop_client(session.client, f"session {session_id}")
             session.client = None
 
-        if session.workspace:
-            self._cleanup_workspace(session.workspace)
+        self._release_session_dirs(session, finished=finished)
 
         logger.info(f"Deleted session: {session_id}")
         return True
+
+    def begin_client_start(self, session: Session) -> None:
+        """Mark that the caller is creating *session*'s client (``create_client``).
+
+        Until :meth:`finish_client_start`, eviction skips the session and a
+        teardown leaves its dirs alone (see ``Session.client_starting``).
+        """
+        with self.lock:
+            session.client_starting = True
+
+    async def finish_client_start(
+        self, session_id: str, session: Session, client: Any
+    ) -> bool:
+        """End a :meth:`begin_client_start`, handing over the new *client*.
+
+        ``True`` when the manager still holds *session*: *client* (``None``
+        when its creation failed) becomes its client, under the lock, so a
+        teardown from now on sees and stops it. ``False`` when the session
+        ended while the client was starting (a delete, an expiry, shutdown):
+        nothing holds the session any more, so *client* is stopped here (the
+        disconnect cap, then a kill), and only then are the session's dirs
+        released, with the deferred teardown's *finished* flag. Removing the
+        workspace (under uid isolation, the uid lease) before that would hand
+        the uid of a running CLI to the next run (#244 review). Never raises.
+        """
+        with self.lock:
+            live = self.sessions.get(session_id) is session
+            if live:
+                if client is not None:
+                    session.client = client
+                session.client_starting = False
+                session.deferred_release = None
+                return True
+        # The session ended. ``client_starting`` stays set while the new client
+        # is stopped: a teardown that only now gets to run (the expiry sweep
+        # releases from a later task) must still defer to us, or it would
+        # release the workspace and uid lease under a CLI still running.
+        if client is not None:
+            logger.warning(
+                "Session %s ended while its client was starting; stopping the "
+                "new client",
+                session_id,
+            )
+            await _stop_client(client, f"ended session {session_id}")
+        with self.lock:
+            session.client_starting = False
+            finished = bool(getattr(session, "deferred_release", None))
+            session.deferred_release = None
+        self._release_session_dirs(session, finished=finished)
+        return False
 
     def oldest_active_turn_silence(self) -> float:
         """Longest current no-progress stretch across in-flight turns, 0.0 when none.

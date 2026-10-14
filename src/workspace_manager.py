@@ -207,6 +207,22 @@ def _await_publication(workspace: Path) -> None:
         time.sleep(_WAIT_POLL_SECONDS)
 
 
+def _release_uid_lease(workspace: Path) -> None:
+    """End the ephemeral uid lease of the anonymous run that used *workspace*.
+
+    Spawns lease under the absolute workspace path (``landlock._absolute``).
+    A no-op unless uid isolation leased a uid. Never raises into a cleanup.
+    """
+    try:
+        from src.backends.claude import uid_isolation
+
+        uid_isolation.release_ephemeral(os.path.abspath(str(workspace)))
+    except Exception:
+        logger.warning(
+            "Could not release the uid lease of %s", workspace, exc_info=True
+        )
+
+
 class WorkspaceManager:
     """Manages per-user working directories.
 
@@ -311,15 +327,39 @@ class WorkspaceManager:
     def cleanup_temp_workspace(self, workspace: Path) -> None:
         """Remove a temporary workspace directory.
 
-        Only directories whose name starts with ``_tmp_`` are removed.
+        Only directories whose name starts with ``_tmp_`` are removed. Under
+        uid isolation the anonymous run that used the workspace holds an
+        ephemeral uid leased on its path, and the lease ends here once the
+        directory is gone (also when it already was). A workspace that could
+        not be removed — files the session uid wrote, which the gateway's uid
+        cannot delete — keeps its uid: fail closed until broker-delegated
+        cleanup lands. So callers clean up only after
+        stopping the run's CLI: the session manager for anonymous sessions (it
+        kills a CLI that outlived its capped disconnect, and leaves a session
+        whose client is still starting to that request), ``verify()`` (after
+        closing its query) and the uid startup probe (``subprocess.run`` kills
+        on timeout). The ``/v1/agents/messages`` and admin try-run teardowns
+        disconnect first but kill a surviving CLI only when the caller went
+        away, so after a normal-path disconnect that timed out the lease ends
+        while that CLI may still run (see ``uid_isolation._EphemeralPool``).
         """
-        if not workspace.exists():
-            return
         if not workspace.name.startswith("_tmp_"):
-            logger.debug("Skipping cleanup of non-temporary workspace: %s", workspace)
+            if workspace.exists():
+                logger.debug(
+                    "Skipping cleanup of non-temporary workspace: %s", workspace
+                )
             return
-        shutil.rmtree(workspace, ignore_errors=True)
-        logger.info("Cleaned up temporary workspace: %s", workspace)
+        if workspace.exists():
+            shutil.rmtree(workspace, ignore_errors=True)
+            logger.info("Cleaned up temporary workspace: %s", workspace)
+        if os.path.lexists(workspace):
+            logger.warning(
+                "Temporary workspace %s could not be fully removed; its uid "
+                "lease (uid isolation) is kept",
+                workspace,
+            )
+            return
+        _release_uid_lease(workspace)
 
     def sweep_orphan_temp_workspaces(self, max_age_seconds: float) -> int:
         """Remove ``_tmp_*`` workspaces older than *max_age_seconds*.

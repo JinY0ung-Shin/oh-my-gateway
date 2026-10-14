@@ -1710,7 +1710,7 @@ class TestValidateBackendPromptSlashError:
     def test_slash_command_error_returns_400(self, isolated_session_manager):
         from src.backends.claude.slash_commands import SlashCommandError
 
-        async def fake_validate(resolved, prompt, workspace_str):
+        async def fake_validate(resolved, prompt, workspace_str, user=None):
             raise HTTPException(
                 status_code=400,
                 detail={
@@ -1761,6 +1761,8 @@ class TestEnsureResponseSessionClientBaseSysPrompt:
         session = MagicMock()
         session.client = None
         session.base_system_prompt = "custom base prompt"
+        # The new client is handed over only to a session the manager holds.
+        isolated_session_manager.sessions["sess-1"] = session
 
         async def run():
             with patch("src.routes.responses.get_mcp_servers", return_value={}):
