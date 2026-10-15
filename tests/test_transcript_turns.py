@@ -3,11 +3,12 @@
 Under ``CLAUDE_ISOLATION_MODE=uid`` the broker reads a transcript as the session
 uid and returns only this count, and it must not import the gateway tree, so
 ``docker/isolation_broker.py`` carries a verbatim copy of the rule in
-``src/backends/claude/transcript_turns.py``. These tests keep the two equal:
-the function's source text and constants, and a corpus of the CLI's line shapes
-fed to both through the same text-mode file iteration (``encoding="utf-8"``,
-``newline=None``), and through the broker's whole read path
-(``_read_transcript``, in-process as this test's uid) as well.
+``src/backends/claude/transcript_turns.py`` — the counter, ``bounded_lines``
+and their constants. These tests keep the two equal: the functions' source
+text and the constants, and a corpus of the CLI's line shapes fed to both
+through the same text-mode file iteration (``encoding="utf-8"``,
+``newline=None``, each copy's ``bounded_lines``), and through the broker's
+whole read path (``_read_transcript``, in-process as this test's uid) as well.
 """
 
 from __future__ import annotations
@@ -179,26 +180,32 @@ CASES = [
 ]
 
 
-def _evaluate(fn, path: Path, cwd: str = _CWD) -> int:
-    """*fn* over the file as both callers read it: a text-mode iteration with
-    universal newlines, where a UnicodeDecodeError while iterating means
-    CORRUPT (the contract in ``transcript_turns``)."""
-    with open(path, "r", encoding="utf-8", newline=None) as lines:
+def _evaluate(rule, path: Path, cwd: str = _CWD, **bound) -> int:
+    """*rule*'s counter over the file as both callers read it: a text-mode
+    iteration with universal newlines through the same copy's
+    ``bounded_lines`` (*bound*: its ``max_line``), where a UnicodeDecodeError
+    while iterating means CORRUPT (the contract in ``transcript_turns``)."""
+    with open(path, "r", encoding="utf-8", newline=None) as fh:
         try:
-            return fn(lines, cwd)
+            return rule.count_transcript_turns(rule.bounded_lines(fh, **bound), cwd)
         except UnicodeDecodeError:
             return gateway.TRANSCRIPT_CORRUPT
 
 
-def test_the_copy_is_verbatim(broker):
-    assert inspect.getsource(broker.count_transcript_turns) == inspect.getsource(
-        gateway.count_transcript_turns
-    )
+@pytest.mark.parametrize("name", ["count_transcript_turns", "bounded_lines"])
+def test_the_copy_is_verbatim(broker, name):
+    copy = inspect.getsource(getattr(broker, name))
+    assert copy == inspect.getsource(getattr(gateway, name))
+
+
+def test_the_constants_match(broker):
     for name in (
         "TRANSCRIPT_MISSING",
         "TRANSCRIPT_MISMATCH",
         "TRANSCRIPT_CORRUPT",
         "TRANSCRIPT_UNREADABLE",
+        "MAX_TRANSCRIPT_BYTES",
+        "MAX_LINE_CHARS",
     ):
         assert getattr(broker, name) == getattr(gateway, name), name
 
@@ -209,8 +216,8 @@ def test_the_copy_is_verbatim(broker):
 def test_both_copies_agree(broker, tmp_path, data, expected):
     path = tmp_path / "s.jsonl"
     path.write_bytes(data)
-    assert _evaluate(gateway.count_transcript_turns, path) == expected
-    assert _evaluate(broker.count_transcript_turns, path) == expected
+    assert _evaluate(gateway, path) == expected
+    assert _evaluate(broker, path) == expected
     # And the broker's whole read: the nofollow walk, the open, the checks.
     assert broker._read_transcript(os.path.realpath(path), _CWD) == expected
 
@@ -221,7 +228,40 @@ def test_deep_nesting_reads_as_corrupt_in_both(broker, tmp_path):
     # such line), and so does the broker's read.
     path = tmp_path / "s.jsonl"
     path.write_bytes(_text(PROMPT) + b"[" * 100000 + b"]" * 100000 + b"\n")
-    for fn in (gateway.count_transcript_turns, broker.count_transcript_turns):
-        assert _evaluate(fn, path) == gateway.TRANSCRIPT_CORRUPT
+    for rule in (gateway, broker):
+        assert _evaluate(rule, path) == gateway.TRANSCRIPT_CORRUPT
     read = broker._read_transcript(os.path.realpath(path), _CWD)
     assert read == gateway.TRANSCRIPT_CORRUPT
+
+
+@pytest.mark.parametrize(
+    "tail, expected",
+    [
+        (b"x" * 4096 + b"\n", -3),  # a line over the bound: not read past it
+        (b"x" * 4096, -3),  # the same without a newline (a sparse file's end)
+        (_text(_user("y" * 20)), 2),  # well within the bound: counted
+    ],
+    ids=["over-long", "over-long-unterminated", "within"],
+)
+def test_a_line_over_the_bound_is_corrupt_in_both(broker, tmp_path, tail, expected):
+    # A small explicit bound stands in for MAX_LINE_CHARS (64 Mi characters);
+    # it still holds the CLI's own lines here (some 330 characters).
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(_text(PROMPT) + tail)
+    assert len(_text(PROMPT)) < 2048
+    for rule in (gateway, broker):
+        assert _evaluate(rule, path, max_line=2048) == expected, rule.__name__
+
+
+def test_the_bound_stops_reading(broker):
+    # Nothing after an over-long line is read, in either copy.
+    for rule in (gateway, broker):
+        reads = []
+
+        class _File:
+            def readline(self, limit):
+                reads.append(limit)
+                return "z" * limit  # an endless line
+
+        assert list(rule.bounded_lines(_File(), max_line=8)) == [""]
+        assert reads == [9]

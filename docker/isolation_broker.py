@@ -43,16 +43,18 @@ Flow per op (the gateway itself connects, as its own uid —
    ``"spawn"`` is a spawn); each op's fields have a strict schema (an unknown
    one refuses the ticket), every path is absolute and normalized, and the
    uid/gid pass :func:`_authorize`. A cleanup waits while its uid is in use —
-   a live session in its workspace, any live session when ``/dev/shm`` is to
-   be swept, an unswept orphan, another workspace cleanup of the uid: refused
-   at once, or parked (connection held, at most ``wait`` <= 30 seconds and
-   ``_MAX_PARKED`` requests) and run once the uid is free. While a workspace
-   cleanup of a uid runs, a spawn of that uid is refused.
+   a live session in its workspace, any live session when the uid's IPC
+   objects are to be swept or its state expired, an unswept orphan, another
+   workspace cleanup of the uid: refused at once, or parked (connection held,
+   at most ``wait`` <= 30 seconds and ``_MAX_PARKED`` requests) and run once
+   the uid is free. While a workspace cleanup of a uid runs, a spawn of that
+   uid is refused.
 6. A forked **helper** takes the supervisor's credentials
    (:func:`_become_supervisor`), arms an alarm, does the work and answers with
    one record before exiting: ``(ST_EXITED, 0)`` or ``(ST_EXITED, 1)`` for a
-   cleanup (its steps clear, remove, expire and shm, in that order; 1 when any
-   step failed), ``(ST_TRANSCRIPT, n)`` for a transcript (``n >= 0`` user
+   cleanup (its steps clear, remove, expire and shm — the uid's /dev/shm
+   entries, SysV IPC objects and POSIX message queues — in that order; 1 when
+   any step failed), ``(ST_TRANSCRIPT, n)`` for a transcript (``n >= 0`` user
    turns, or a negative ``TRANSCRIPT_*`` code), ``(ST_REFUSED, 0)`` when the
    switch failed. The resident tracks and reaps helpers like supervisors.
 
@@ -80,10 +82,12 @@ Security notes:
   a directory is only ever chmodded (owner ``rwx`` back) when U owns it. A
   transcript read returns a count, never content. The spawn path refuses any
   ticket whose ``op`` is not ``"spawn"``, so an op ticket can never start a CLI.
-* **/dev/shm**: the shm step removes only the entries U owns. Under the
-  test-only ``--test-same-uid`` flag U is the developer's own uid, so then it
-  sweeps ``GATEWAY_ISOLATION_TEST_SHM_DIR`` or nothing — never ``/dev/shm`` —
-  and every path an op touches must lie in the temp dir.
+* **IPC objects**: the shm step removes only what U owns (the /dev/shm and
+  /dev/mqueue entries) or owns or created (SysV objects, through IPC_RMID as
+  U). Under the test-only ``--test-same-uid`` flag U is the developer's own
+  uid, so then it sweeps ``GATEWAY_ISOLATION_TEST_SHM_DIR`` or nothing — never
+  ``/dev/shm``, SysV IPC or ``/dev/mqueue`` — and every path an op touches
+  must lie in the temp dir.
 """
 
 import array
@@ -104,7 +108,7 @@ import sys
 import tempfile
 import time
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import Iterable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import _landlock_rules as ll  # noqa: E402
@@ -145,12 +149,16 @@ _MIN_EXPIRE_AGE = 3600  # seconds
 _MAX_PARKED = 64  # cleanups waiting at once, beside the handshake bound
 _PARK_RECHECK = 0.1  # seconds between two looks at a waiting cleanup
 _CLEANUP_ALARM = 60  # seconds: a cleanup helper's whole run
-_TRANSCRIPT_ALARM = 20  # seconds: a transcript helper's whole run
-_TRANSCRIPT_MAX = 256 << 20  # bytes
+_TRANSCRIPT_ALARM = 60  # seconds: a transcript helper's whole run
 _EXPIRE_SCAN_CAP = 10000  # entries the age check of one entry looks at
 _MAX_DEPTH = 64  # directory fds one walk holds open (deeper ones move up)
 _MAX_LOGGED = 20  # failures one cleanup logs one by one
 _SHM_DIR = "/dev/shm"
+_MQUEUE_DIR = "/dev/mqueue"  # POSIX message queues, when mounted
+_SYSVIPC_DIR = "/proc/sysvipc"
+# The SysV IPC tables there and each one's id column (their layouts differ).
+_SYSVIPC_TABLES = (("shm", "shmid"), ("sem", "semid"), ("msg", "msqid"))
+_IPC_RMID = 0
 # Test-only: the directory (in the temp dir) the cleanup op's shm step sweeps
 # under --test-same-uid, where the session uid is the developer's own (unset:
 # the step is skipped). Ignored without the flag.
@@ -979,14 +987,24 @@ def _exec_cli(req, fds, real_cli, supervisor, test_same_uid):
 # --- transcript turns (a copy of src/backends/claude/transcript_turns.py) ----
 #
 # The broker must not import the gateway tree, so the rule the gateway applies
-# to a transcript it may read itself is copied here verbatim, constants
-# included. tests/test_transcript_turns.py keeps the two equal (a shared corpus
-# and the function's source text): change both together.
+# to a transcript it may read itself — the counter, the line bound and their
+# constants — is copied here verbatim. tests/test_transcript_turns.py keeps the
+# two equal (a shared corpus and the functions' source text): change both
+# together.
 
 TRANSCRIPT_MISSING = -1
 TRANSCRIPT_MISMATCH = -2
 TRANSCRIPT_CORRUPT = -3
 TRANSCRIPT_UNREADABLE = -4
+
+# Bounds on what a reader takes in. A transcript is session-writable (a session
+# uid may replace its own with a sparse file holding one endless "line"), and
+# both the gateway and the broker's helper read it into memory: the caller
+# refuses a file larger than MAX_TRANSCRIPT_BYTES (UNREADABLE) and iterates
+# through :func:`bounded_lines`, which turns a line longer than MAX_LINE_CHARS
+# into CORRUPT instead of reading all of it. The CLI writes neither.
+MAX_TRANSCRIPT_BYTES = 1 << 30
+MAX_LINE_CHARS = 64 << 20
 
 
 def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
@@ -1041,6 +1059,23 @@ def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
     return turns
 
 
+def bounded_lines(fh, max_line: int = MAX_LINE_CHARS) -> Iterator[str]:
+    """The lines of the text file *fh*, at most *max_line* characters each.
+
+    A longer line is not read past the bound: it is yielded as ``""``, which
+    :func:`count_transcript_turns` counts as CORRUPT, and iteration stops.
+    Mirrored by ``docker/isolation_broker.py`` like the counter.
+    """
+    while True:
+        line = fh.readline(max_line + 1)
+        if not line:
+            return
+        if len(line) > max_line:
+            yield ""
+            return
+        yield line
+
+
 # --- path walking (both ops) -------------------------------------------------
 #
 # The op helpers run no session code, so they are not Landlock-confined: what
@@ -1088,9 +1123,10 @@ def _read_transcript(path, cwd):
     turns against the workspace *cwd* (:func:`count_transcript_turns`), or a
     negative code. MISSING: a component or the file is absent, or a directory
     component is not one (a symlink: the walk follows none). UNREADABLE: the
-    file is not a regular one (a FIFO, a directory, a symlink), is over 256
-    MiB, or cannot be opened or read. CORRUPT also covers a file that is not
-    UTF-8 or nests too deep for the JSON parser."""
+    file is not a regular one (a FIFO, a directory, a symlink), is larger than
+    ``MAX_TRANSCRIPT_BYTES``, or cannot be opened or read. CORRUPT also covers
+    a file that is not UTF-8 and a line over ``MAX_LINE_CHARS``
+    (:func:`bounded_lines`)."""
     try:
         parent, name = _walk_parent(path)
     except (FileNotFoundError, NotADirectoryError):
@@ -1108,7 +1144,7 @@ def _read_transcript(path, cwd):
     lines = None
     try:
         st = os.fstat(fd)
-        if stat.S_ISREG(st.st_mode) and st.st_size <= _TRANSCRIPT_MAX:
+        if stat.S_ISREG(st.st_mode) and st.st_size <= MAX_TRANSCRIPT_BYTES:
             lines = os.fdopen(fd, "r", encoding="utf-8", newline=None)
     except (OSError, ValueError):
         pass
@@ -1117,7 +1153,7 @@ def _read_transcript(path, cwd):
         return TRANSCRIPT_UNREADABLE
     with lines:
         try:
-            return count_transcript_turns(lines, cwd)
+            return count_transcript_turns(bounded_lines(lines), cwd)
         except (UnicodeDecodeError, RecursionError):
             return TRANSCRIPT_CORRUPT
         except (OSError, MemoryError):
@@ -1533,24 +1569,23 @@ def _shm_dir(test_same_uid, environ=None):
     return None
 
 
-def _sweep_shm(shm_dir, uid, log):
-    """The ``shm`` step: every entry directly in *shm_dir* that U owns goes (a
-    directory with all it holds), following no symlink — what a run left there
-    would otherwise be readable by the next run leased its uid."""
-    if shm_dir is None:
-        _log(
-            "cleanup for uid %d: shm step skipped in test mode (%s is not set)"
-            % (uid, _TEST_SHM_ENV)
-        )
-        return
+def _sweep_owned(directory, uid, log, missing_ok=False):
+    """Every entry directly in *directory* that U owns goes (a directory with
+    all it holds), following no symlink. The directory itself is a fixed
+    system path no session controls, opened following links; with
+    *missing_ok* an absent one (nothing mounted there) has nothing to sweep."""
     try:
-        fd = os.open(shm_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except FileNotFoundError as exc:
+        if not missing_ok:
+            log.fail("cannot open %r" % directory, exc)
+        return
     except OSError as exc:
-        log.fail("cannot open %r" % shm_dir, exc)
+        log.fail("cannot open %r" % directory, exc)
         return
     try:
-        for name in _names(fd, shm_dir, log):
-            path = "%s/%s" % (shm_dir, name)
+        for name in _names(fd, directory, log):
+            path = "%s/%s" % (directory, name)
             try:
                 st = _lstat_at(fd, name)
             except OSError as exc:
@@ -1562,15 +1597,118 @@ def _sweep_shm(shm_dir, uid, log):
         os.close(fd)
 
 
+def _sweep_shm(shm_dir, uid, log):
+    """U's entries directly in *shm_dir* (:func:`_shm_dir`; ``None`` skips)."""
+    if shm_dir is None:
+        _log(
+            "cleanup for uid %d: shm step skipped in test mode (%s is not set)"
+            % (uid, _TEST_SHM_ENV)
+        )
+        return
+    _sweep_owned(shm_dir, uid, log)
+
+
+def _sysvipc_owned(directory, uid):
+    """The SysV IPC objects *uid* owns or created, from the ``/proc/sysvipc``
+    tables in *directory*: ``(objects, problems)``. *objects* lists ``(kind,
+    id)`` — kind ``shm``, ``sem`` or ``msg`` — and *problems* ``(kind,
+    error)`` for a table that cannot be read or whose header lacks a needed
+    column. Columns are keyed by each table's header line, never by position:
+    the three tables differ and kernels add columns. A line that does not fit
+    its header is skipped; a missing table (no SysV IPC) holds nothing."""
+    objects, problems = [], []
+    for kind, id_column in _SYSVIPC_TABLES:
+        try:
+            with open(os.path.join(directory, kind), "rb") as table:
+                lines = table.read().decode("ascii", "replace").splitlines()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            problems.append((kind, exc))
+            continue
+        columns = lines[0].split() if lines else []
+        wanted = (id_column, "uid", "cuid")
+        if not set(wanted) <= set(columns):
+            problems.append((kind, ValueError("no %s/uid/cuid header" % id_column)))
+            continue
+        at = [columns.index(name) for name in wanted]
+        for line in lines[1:]:
+            values = line.split()
+            if len(values) != len(columns):
+                continue  # not a row of this table
+            try:
+                ipc_id, owner, creator = (int(values[i]) for i in at)
+            except ValueError:
+                continue
+            if ipc_id >= 0 and uid in (owner, creator):
+                objects.append((kind, ipc_id))
+    return objects, problems
+
+
+def _ipc_remove(kind, ipc_id):
+    """``IPC_RMID`` on the one SysV object *kind*/*ipc_id*, as the helper's
+    effective uid (which the kernel checks against the object's owner and
+    creator). Returns False when it is gone already (EINVAL, EIDRM); raises
+    ``OSError`` otherwise, e.g. EPERM for an object U neither owns nor made."""
+    if kind == "shm":
+        rc = _libc.shmctl(ctypes.c_int(ipc_id), ctypes.c_int(_IPC_RMID), None)
+    elif kind == "sem":  # semctl is variadic; IPC_RMID reads no fourth argument
+        rc = _libc.semctl(
+            ctypes.c_int(ipc_id),
+            ctypes.c_int(0),
+            ctypes.c_int(_IPC_RMID),
+            ctypes.c_int(0),
+        )
+    elif kind == "msg":
+        rc = _libc.msgctl(ctypes.c_int(ipc_id), ctypes.c_int(_IPC_RMID), None)
+    else:
+        raise ValueError("not a SysV IPC kind: %r" % (kind,))
+    if rc == 0:
+        return True
+    err = ctypes.get_errno()
+    if err in (errno.EINVAL, errno.EIDRM):
+        return False
+    raise OSError(err, os.strerror(err))
+
+
+def _sweep_sysvipc(directory, uid, log):
+    """U's SysV shared memory segments, semaphore sets and message queues
+    (owner or creator U), removed as U."""
+    objects, problems = _sysvipc_owned(directory, uid)
+    for kind, exc in problems:
+        log.fail("cannot read %s" % os.path.join(directory, kind), exc)
+    for kind, ipc_id in objects:
+        try:
+            _ipc_remove(kind, ipc_id)
+        except OSError as exc:
+            log.fail("cannot remove SysV %s %d" % (kind, ipc_id), exc)
+
+
+def _sweep_ipc(uid, test_same_uid, log):
+    """The ``shm`` step: the IPC objects a run leaves behind, which outlive it
+    and which the next run leased its uid could open — Landlock mediates
+    none of SysV IPC. U's entries directly in /dev/shm, its SysV shared memory,
+    semaphores and message queues, and its POSIX message queues in
+    /dev/mqueue when that is mounted. Under the test-only ``--test-same-uid``
+    flag U is the developer's own uid: only a test shm dir is swept
+    (:func:`_shm_dir`), and SysV IPC and /dev/mqueue are left alone."""
+    _sweep_shm(_shm_dir(test_same_uid), uid, log)
+    if test_same_uid:
+        _log("cleanup for uid %d: SysV IPC and /dev/mqueue skipped in test mode" % uid)
+        return
+    _sweep_sysvipc(_SYSVIPC_DIR, uid, log)
+    _sweep_owned(_MQUEUE_DIR, uid, log, missing_ok=True)
+
+
 # --- the op helpers ----------------------------------------------------------
 
 
 def _run_cleanup(sock, req, test_same_uid):
     """A cleanup helper's whole life, forked by the resident: become U as a
-    supervisor does, then clear, remove, expire and sweep shm (each step runs
-    whatever an earlier one hit), and answer ``(ST_EXITED, 0)`` — or 1 when
-    anything failed. The alarm ends a cleanup that hangs; the gateway then sees
-    the link close without a record."""
+    supervisor does, then clear, remove, expire and sweep the uid's IPC objects
+    (each step runs whatever an earlier one hit), and answer ``(ST_EXITED, 0)``
+    — or 1 when anything failed. The alarm ends a cleanup that hangs; the
+    gateway then sees the link close without a record."""
     uid = req["uid"]
     try:
         _become_supervisor(uid, req["gid"], test_same_uid)
@@ -1588,7 +1726,7 @@ def _run_cleanup(sock, req, test_same_uid):
         if req["expire"] is not None:
             _expire_step(req["expire"], log)
         if req["shm"]:
-            _sweep_shm(_shm_dir(test_same_uid), uid, log)
+            _sweep_ipc(uid, test_same_uid, log)
     except Exception as exc:  # a definite answer rather than a closed link
         log.fail("the cleanup stopped", repr(exc))
     log.summary()
@@ -1929,12 +2067,16 @@ class _Broker:
 
     def _cleanup_busy(self, req):
         """Why the cleanup *req* may not run yet, or ``None``: the uid's files
-        may still be in use — by a live session in its workspace (in any
-        workspace when /dev/shm is swept: all of the uid's sessions share it),
-        an unswept orphan, or another workspace cleanup of the uid."""
-        uid, workspace, shm = req["uid"], req["workspace"], req["shm"]
+        may still be in use — by a live session in its workspace, or in any
+        workspace when the cleanup sweeps the uid's IPC objects (all of its
+        sessions share them) or expires its state (a long-lived session's
+        ``session-env/<id>`` keeps an old mtime) — by an unswept orphan, or by
+        another workspace cleanup of the uid."""
+        uid, workspace = req["uid"], req["workspace"]
+        expire = req["expire"]
+        whole_uid = req["shm"] or bool(expire and (expire["units"] or expire["nested"]))
         for held_uid, held_ws in self.supervisors.values():
-            if held_uid == uid and (shm or (workspace and held_ws == workspace)):
+            if held_uid == uid and (whole_uid or (workspace and held_ws == workspace)):
                 return "uid %d still has a live session" % uid
         if any(c_uid == uid and c_ws for c_uid, c_ws in self.cleaners.values()):
             return "another cleanup of uid %d is running" % uid

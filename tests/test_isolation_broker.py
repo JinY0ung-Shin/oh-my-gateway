@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import array
 import asyncio
+import ctypes
+import errno
 import hashlib
 import hmac
 import importlib.util
@@ -1782,6 +1784,35 @@ def _real_shm_canary():
     return canary
 
 
+_LIBC = ctypes.CDLL(None, use_errno=True)
+_IPC_CREAT, _IPC_RMID = 0o1000, 0
+
+
+def _make_sysv(kind):
+    """A new SysV object of this test's own (IPC_PRIVATE: a fresh one each
+    call) as ``(kind, id)``, or ``None`` where the kernel offers none."""
+    if not Path("/proc/sysvipc").is_dir():
+        return None
+    flags = _IPC_CREAT | 0o600
+    if kind == "shm":
+        ipc_id = _LIBC.shmget(0, ctypes.c_size_t(4096), flags)
+    elif kind == "sem":
+        ipc_id = _LIBC.semget(0, 1, flags)
+    else:
+        ipc_id = _LIBC.msgget(0, flags)
+    return None if ipc_id < 0 else (kind, ipc_id)
+
+
+def _rmid(kind, ipc_id):
+    """Remove one SysV object this test made, by its explicit id."""
+    if kind == "shm":
+        _LIBC.shmctl(ipc_id, _IPC_RMID, None)
+    elif kind == "sem":
+        _LIBC.semctl(ipc_id, 0, _IPC_RMID, 0)
+    else:
+        _LIBC.msgctl(ipc_id, _IPC_RMID, None)
+
+
 _HOLD = (
     "import os, sys, time\n"
     "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
@@ -2160,14 +2191,22 @@ class TestCleanupOp:
         marker.write_text("mine")
         assert marker.stat().st_uid == os.getuid()
         canary = _real_shm_canary()
+        segment = _make_sysv("shm")  # ours: a real sweep would remove it
         try:
             assert _cleanup(broker, shm=True) == (_ST_EXITED, 0), broker.log_text()
-            assert "shm step skipped in test mode" in broker.log_text()
+            log = broker.log_text()
+            assert "shm step skipped in test mode" in log
+            assert "SysV IPC and /dev/mqueue skipped in test mode" in log
             assert marker.read_text() == "mine"
             assert canary is None or canary.read_text() == "canary"
+            if segment is not None:
+                mine, _ = broker_module._sysvipc_owned("/proc/sysvipc", os.getuid())
+                assert segment in mine  # never touched
         finally:
             if canary is not None:
                 canary.unlink(missing_ok=True)
+            if segment is not None:
+                _rmid(*segment)
 
     @pytest.mark.skipif(
         os.getgid() != os.getuid(), reason="gateway tickets carry no gid (gid=uid)"
@@ -2329,6 +2368,35 @@ class TestCleanupLiveness:
             holder.kill()
             holder.wait(timeout=5)
 
+    def test_expiring_state_waits_for_every_session_of_the_uid(
+        self, broker, tmp_path
+    ):
+        # A long-lived session's session-env/<id> keeps the mtime it was made
+        # with: an expire must not run under any live session of the uid.
+        env = tmp_path / "cfg" / "session-env"
+        (env / "live-sid").mkdir(parents=True)
+        old = time.time() - 10 * 86400
+        os.utime(env / "live-sid", (old, old))
+        ws = _workspace(tmp_path)
+        holder = _popen(broker, ws, _HOLD, ws / "cli.pid")
+        expire = {"older_than": 3600, "units": [str(env)]}
+        try:
+            _wait_file(ws / "cli.pid", proc=holder)
+            assert _cleanup(broker, expire=expire) == (_ST_REFUSED, 0)
+            assert "uid %d still has a live session" % os.getuid() in broker.log_text()
+            other = tmp_path / "elsewhere"  # nor in another workspace's name
+            assert _cleanup(broker, other, expire=expire) == (_ST_REFUSED, 0)
+            # An expire that names no directory touches no state: not held up.
+            assert _cleanup(broker, expire={"older_than": 3600}) == (_ST_EXITED, 0)
+            conn = _op_send(broker, _cleanup_ticket(broker, expire=expire, wait=10))
+            assert not select.select([conn], [], [], 0.5)[0]  # parked
+            assert (env / "live-sid").exists()
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+        assert _op_reply(conn) == (_ST_EXITED, 0), broker.log_text()
+        assert not (env / "live-sid").exists()  # expired once the session ended
+
     def test_a_workspace_cleanup_holds_the_uid_while_it_runs(
         self, start_broker, tmp_path
     ):
@@ -2482,7 +2550,7 @@ class TestTranscriptOp:
             t.mkdir()
         elif kind == "sparse":
             with open(t, "wb") as f:
-                f.truncate((256 << 20) + 1)  # over the cap: never read
+                f.truncate((1 << 30) + 1)  # over MAX_TRANSCRIPT_BYTES: never read
         else:
             t.symlink_to(_jsonl(tmp_path / "real.jsonl", _PROMPT))
         start = time.monotonic()
@@ -2613,7 +2681,7 @@ class TestOpHelperCredentials:
         }
         sock = self._Sock()
         assert broker_module._run_transcript(sock, req, False) == 0
-        assert calls == [*self._split(), ("alarm", 20)]
+        assert calls == [*self._split(), ("alarm", 60)]
         assert sock.sent == _REC.pack(_ST_TRANSCRIPT, 1)
 
 
@@ -2805,3 +2873,226 @@ class TestSessionEnv:
         assert result["env"]["GIT_CONFIG_KEY_0"] == "core.pager"  # still applies
         if _GIT:
             assert result["safe"][-2:] == [str(ws), str(ws) + "/*"]
+
+
+# --- the shm step's SysV IPC and /dev/mqueue parts ----------------------------
+#
+# Landlock does not mediate SysV IPC, so a run's segments, semaphores and
+# queues outlive it for the next run leased its uid. A same-uid test runs as
+# the developer: nothing here sweeps their real objects. The parser reads fake
+# tables (or the live ones, read-only), the removal helper gets the explicit
+# ids of objects this test made, and every sweeper is a recorder when the
+# wiring is tested.
+
+_SHM_HEADER = (
+    "       key      shmid perms                  size  cpid  lpid nattch   uid"
+    "   gid  cuid  cgid      atime      dtime      ctime                   rss"
+    "                  swap"
+)
+_SEM_HEADER = (
+    "       key      semid perms      nsems   uid   gid  cuid  cgid      otime"
+    "      ctime"
+)
+_MSG_HEADER = (
+    "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid"
+    "  cuid  cgid      stime      rtime      ctime"
+)
+
+
+def _row(header, **values):
+    """A table row for *header*: each named column's value, 0 elsewhere."""
+    return "  ".join(str(values.get(name, 0)) for name in header.split())
+
+
+def _tables(root: Path, **tables) -> str:
+    root.mkdir()
+    for kind, lines in tables.items():
+        (root / kind).write_text("\n".join(lines) + "\n")
+    return str(root)
+
+
+class TestSysvipcTables:
+    """``_sysvipc_owned``: columns keyed by each table's header line."""
+
+    U = 20005
+
+    def test_the_three_layouts(self, broker_module, tmp_path):
+        u = self.U
+        tables = _tables(
+            tmp_path / "sysvipc",
+            shm=[
+                _SHM_HEADER,
+                _row(_SHM_HEADER, shmid=17, uid=u, cuid=u, size=4096),
+                _row(_SHM_HEADER, shmid=18, uid=1000, cuid=u),  # U made it
+                _row(_SHM_HEADER, shmid=19, uid=20006, cuid=20006),
+                "garbage",
+                _row(_SHM_HEADER, shmid=20, uid=u) + "  extra",  # does not fit
+                _row(_SHM_HEADER, shmid="x", uid=u),
+                "",
+            ],
+            sem=[
+                _SEM_HEADER,
+                _row(_SEM_HEADER, semid=5, uid=u, nsems=1),
+                _row(_SEM_HEADER, semid=6),
+            ],
+            msg=[
+                _MSG_HEADER,
+                _row(_MSG_HEADER, msqid=4, uid=20006, cuid=20006),
+                _row(_MSG_HEADER, msqid=3, cuid=u),
+            ],
+        )
+        objects, problems = broker_module._sysvipc_owned(tables, u)
+        assert objects == [("shm", 17), ("shm", 18), ("sem", 5), ("msg", 3)]
+        assert problems == []
+
+    def test_a_reordered_header_still_parses(self, broker_module, tmp_path):
+        header = "   uid  cuid      shmid       key perms nattch"
+        tables = _tables(
+            tmp_path / "sysvipc",
+            shm=[
+                header,
+                _row(header, uid=self.U, shmid=9),
+                _row(header, cuid=self.U, shmid=10),
+                _row(header, uid=7, cuid=7, shmid=11),
+            ],
+        )
+        assert broker_module._sysvipc_owned(tables, self.U) == (
+            [("shm", 9), ("shm", 10)],
+            [],
+        )
+
+    def test_odd_tables(self, broker_module, tmp_path):
+        root = tmp_path / "sysvipc"
+        root.mkdir()
+        (root / "shm").write_text("   key   shmid perms   uid   gid\n")  # no cuid
+        (root / "sem").mkdir()  # not readable as a table
+        # no msg table: a kernel without it has none
+        objects, problems = broker_module._sysvipc_owned(str(root), self.U)
+        assert objects == []
+        assert [kind for kind, _error in problems] == ["shm", "sem"]
+        none = broker_module._sysvipc_owned(str(tmp_path / "none"), self.U)
+        assert none == ([], [])
+
+    def test_the_live_tables_parse(self, broker_module):
+        segment = _make_sysv("shm")
+        if segment is None:
+            pytest.skip("no SysV IPC here")
+        try:  # read-only: the parse of the kernel's own tables
+            mine, problems = broker_module._sysvipc_owned("/proc/sysvipc", os.getuid())
+            assert problems == []
+            assert segment in mine
+        finally:
+            _rmid(*segment)
+
+
+class TestSysvipcRemoval:
+    """The removal helper on objects this test made, by their explicit ids
+    only — never a sweep of the uid (the developer's own)."""
+
+    def test_removes_exactly_the_named_objects(self, broker_module):
+        made = []
+        try:
+            for kind in ("shm", "sem", "msg"):
+                made.append(_make_sysv(kind))
+                if made[-1] is None:
+                    made.pop()
+                    pytest.skip("no SysV %s here" % kind)
+            for kind, ipc_id in made:
+                assert broker_module._ipc_remove(kind, ipc_id) is True
+                assert broker_module._ipc_remove(kind, ipc_id) is False  # gone
+            mine, _ = broker_module._sysvipc_owned("/proc/sysvipc", os.getuid())
+            assert not set(made) & set(mine)
+        finally:
+            for obj in made:
+                _rmid(*obj)
+
+    def test_an_unknown_kind_is_refused(self, broker_module):
+        with pytest.raises(ValueError):
+            broker_module._ipc_remove("pipe", 1)
+
+    def test_a_sweep_counts_each_failure(self, broker_module, monkeypatch, tmp_path):
+        u = TestSysvipcTables.U
+        removed = []
+
+        def remove(kind, ipc_id):  # never the real IPC_RMID on a made-up id
+            removed.append((kind, ipc_id))
+            if ipc_id == 2:
+                raise PermissionError(errno.EPERM, "neither its owner nor creator")
+            return True
+
+        monkeypatch.setattr(broker_module, "_ipc_remove", remove)
+        tables = _tables(
+            tmp_path / "sysvipc",
+            shm=[
+                _SHM_HEADER,
+                _row(_SHM_HEADER, shmid=1, uid=u),
+                _row(_SHM_HEADER, shmid=2, uid=u),
+            ],
+            sem=["no header here"],
+        )
+        log = broker_module._Failures(u)
+        broker_module._sweep_sysvipc(tables, u, log)
+        assert removed == [("shm", 1), ("shm", 2)]
+        assert log.count == 2  # the EPERM and the unreadable sem table
+
+
+class TestIpcSweep:
+    """The shm step's parts, wired (in-process, every sweeper a recorder:
+    nothing real is swept), and the entry sweep /dev/mqueue gets."""
+
+    def _record(self, mod, monkeypatch):
+        calls = []
+
+        def shm(directory, uid, log):
+            calls.append(("shm", directory, uid))
+
+        def sysvipc(directory, uid, log):
+            calls.append(("sysvipc", directory, uid))
+
+        def owned(directory, uid, log, missing_ok=False):
+            calls.append(("owned", directory, uid, missing_ok))
+
+        monkeypatch.setattr(mod, "_sweep_shm", shm)
+        monkeypatch.setattr(mod, "_sweep_sysvipc", sysvipc)
+        monkeypatch.setattr(mod, "_sweep_owned", owned)
+        return calls
+
+    def test_production_sweeps_every_kind(self, broker_module, monkeypatch):
+        calls = self._record(broker_module, monkeypatch)
+        broker_module._sweep_ipc(20005, False, broker_module._Failures(20005))
+        assert calls == [
+            ("shm", "/dev/shm", 20005),
+            ("sysvipc", "/proc/sysvipc", 20005),
+            ("owned", "/dev/mqueue", 20005, True),
+        ]
+
+    def test_test_mode_leaves_sysv_and_mqueue_alone(
+        self, broker_module, monkeypatch, capsys, tmp_path
+    ):
+        calls = self._record(broker_module, monkeypatch)
+        shm = str(tmp_path / "shm")
+        monkeypatch.setenv(_TEST_SHM_ENV, shm)
+        uid = os.getuid()
+        broker_module._sweep_ipc(uid, True, broker_module._Failures(uid))
+        assert calls == [("shm", shm, uid)]
+        err = capsys.readouterr().err
+        assert "SysV IPC and /dev/mqueue skipped in test mode" in err
+
+    def test_owned_entries_go_unfollowed(self, broker_module, tmp_path):
+        queues = tmp_path / "mqueue"  # standing in for /dev/mqueue
+        queues.mkdir()
+        (queues / "mq-a").write_text("")
+        outside = _outside(tmp_path)
+        os.symlink(outside / "victim", queues / "link")
+        uid = os.getuid()
+        log = broker_module._Failures(uid)
+        broker_module._sweep_owned(str(queues), uid + 1, log, missing_ok=True)
+        assert sorted(os.listdir(queues)) == ["link", "mq-a"]  # not that uid's
+        broker_module._sweep_owned(str(queues), uid, log, missing_ok=True)
+        assert log.count == 0 and list(queues.iterdir()) == []
+        assert (outside / "victim").read_text() == "v"
+        missing = str(tmp_path / "none")
+        broker_module._sweep_owned(missing, uid, log, missing_ok=True)
+        assert log.count == 0  # nothing mounted there: nothing to sweep
+        broker_module._sweep_owned(missing, uid, log)
+        assert log.count == 1  # /dev/shm must exist
