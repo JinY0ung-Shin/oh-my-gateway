@@ -790,3 +790,161 @@ def test_overdeep_trees_are_left_alone_without_raising(tmp_path, monkeypatch):
     assert not (native / "a" / "b" / "c" / "d").exists()
     # A stale tree deeper than the limit stays instead of being walked.
     assert (stale / "x.md").is_file()
+
+
+# --- clearing mirrors before a one-time ACL grant, and inspecting them ---------
+
+
+def test_clear_managed_mirrors_drops_mirror_names_and_materialize_restores_them(
+    tmp_path,
+):
+    """The ACL grant skips files with more than one link; clearing the mirror
+    first leaves each canonical file with one, and materializing re-links it."""
+    workspace = _managed_workspace(tmp_path)
+    skill = workspace / "skills" / "review" / "SKILL.md"
+    agent = workspace / "agents" / "reviewer.md"
+    _write(skill, "skill\n")
+    _write(agent, "agent\n")
+    ensure_workspace_resources(workspace)
+    assert os.stat(skill).st_nlink == os.stat(agent).st_nlink == 2
+    outside = tmp_path / "outside"
+    _write(outside / "victim.md", "victim\n")
+    before = _tree(outside)
+    native = workspace / ".claude"
+    (native / "skills" / "out").symlink_to(outside, target_is_directory=True)
+    os.mkfifo(native / "agents" / "pipe")
+
+    _within_deadline(
+        lambda: wr.clear_managed_mirrors(workspace), native / "agents" / "pipe"
+    )
+
+    for kind in ("skills", "agents"):
+        assert [p.name for p in (native / kind).iterdir()] == [MARKER]
+        assert wr.is_managed_mirror(workspace, kind)
+    assert skill.read_text(encoding="utf-8") == "skill\n"
+    assert agent.read_text(encoding="utf-8") == "agent\n"
+    assert os.stat(skill).st_nlink == os.stat(agent).st_nlink == 1
+    assert _tree(outside) == before
+
+    wr.materialize_workspace_resources(workspace)
+
+    assert os.path.samestat(
+        os.stat(skill), os.lstat(native / "skills" / "review" / "SKILL.md")
+    )
+    assert os.path.samestat(os.stat(agent), os.lstat(native / "agents" / "reviewer.md"))
+
+
+def test_clear_managed_mirrors_leaves_unmanaged_native_dirs_alone(tmp_path):
+    workspace = tmp_path / "workspace"
+    _write(workspace / "skills" / "visible" / "SKILL.md", "visible\n")
+    # Operator-managed: no marker at all.
+    _write(workspace / ".claude" / "skills" / "native" / "SKILL.md", "native\n")
+    # A marker the gateway refuses (a second name) makes it unmanaged as well.
+    _write(workspace / ".claude" / "agents" / "keep.md", "keep\n")
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious\n", encoding="utf-8")
+    os.link(victim, workspace / ".claude" / "agents" / MARKER)
+    before = _tree(workspace)
+
+    wr.clear_managed_mirrors(workspace)
+
+    assert _tree(workspace) == before
+    assert victim.read_text(encoding="utf-8") == "precious\n"
+
+
+@pytest.mark.parametrize("linked", [".claude", ".claude/skills"])
+def test_clear_managed_mirrors_never_follows_a_symlinked_claude_or_native_dir(
+    tmp_path, linked
+):
+    workspace = tmp_path / "workspace"
+    _write(workspace / "skills" / "review" / "SKILL.md", "skill\n")
+    outside = tmp_path / "outside"
+    # What the link leads to looks exactly like a managed mirror.
+    looks_managed = outside / "skills" if linked == ".claude" else outside
+    _write(looks_managed / "stale.md", "stale\n")
+    (looks_managed / MARKER).write_bytes(b"")
+    before = _tree(outside)
+    link = workspace / linked
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(outside, target_is_directory=True)
+
+    wr.clear_managed_mirrors(workspace)
+
+    assert _tree(outside) == before
+    assert link.is_symlink()
+    assert not wr.is_managed_mirror(workspace, "skills")
+
+
+@_not_root
+def test_clear_managed_mirrors_skips_what_it_cannot_remove(
+    tmp_path, lock_mode, monkeypatch
+):
+    monkeypatch.setattr(wr, "_MAX_DEPTH", 2)
+    workspace = _managed_workspace(tmp_path)
+    _write(workspace / "skills" / "a" / "SKILL.md", "a\n")
+    _write(workspace / "skills" / "b" / "SKILL.md", "b\n")
+    ensure_workspace_resources(workspace)
+    native = workspace / ".claude" / "skills"
+    _write(native / "deep" / "1" / "2" / "3" / "x.md", "x\n")
+    lock_mode(native / "a")
+
+    wr.clear_managed_mirrors(workspace)
+
+    # "a" cannot be listed and "deep" is deeper than the limit: both stay, the
+    # rest is cleared, and nothing raised.
+    assert sorted(p.name for p in native.iterdir()) == [MARKER, "a", "deep"]
+    assert os.stat(workspace / "skills" / "b" / "SKILL.md").st_nlink == 1
+
+
+def test_is_managed_mirror_applies_the_materialization_rule(tmp_path):
+    workspace = _managed_workspace(tmp_path)
+    assert wr.is_managed_mirror(workspace, "skills") is True
+    assert wr.is_managed_mirror(workspace, "agents") is True
+    # Only the two resource kinds, by name; never a path walked through links.
+    for kind in ("plans", "", ".", "..", "skills/../agents", "/etc", None):
+        assert wr.is_managed_mirror(workspace, kind) is False
+    assert wr.is_managed_mirror(tmp_path / "missing", "skills") is False
+
+    marker = workspace / ".claude" / "skills" / MARKER
+    victim = tmp_path / "victim.txt"
+    victim.write_text("precious\n", encoding="utf-8")
+    marker.unlink()
+    marker.symlink_to(victim)
+    assert wr.is_managed_mirror(workspace, "skills") is False
+    marker.unlink()
+    os.link(victim, marker)
+    assert wr.is_managed_mirror(workspace, "skills") is False
+    marker.unlink()
+    assert wr.is_managed_mirror(workspace, "skills") is False
+    assert wr.is_managed_mirror(workspace, "agents") is True
+
+
+@_not_root
+@pytest.mark.parametrize(
+    "locked, expected",
+    [(".claude", (False, False)), (".claude/skills", (False, True))],
+)
+def test_is_managed_mirror_reads_an_unreadable_mirror_as_false(
+    tmp_path, lock_mode, locked, expected
+):
+    workspace = _managed_workspace(tmp_path)
+    lock_mode(workspace / locked)
+
+    assert (
+        wr.is_managed_mirror(workspace, "skills"),
+        wr.is_managed_mirror(workspace, "agents"),
+    ) == expected
+
+
+def test_mirror_helpers_never_raise(tmp_path, monkeypatch, caplog):
+    def boom(*args):
+        raise RuntimeError("unexpected failure")
+
+    monkeypatch.setattr(wr, "_clear_managed_mirrors", boom)
+    monkeypatch.setattr(wr, "_is_managed_mirror", boom)
+    with caplog.at_level(logging.WARNING, logger=wr.__name__):
+        wr.clear_managed_mirrors(tmp_path)
+        assert wr.is_managed_mirror(tmp_path, "skills") is False
+
+    failures = [r for r in caplog.records if r.name == wr.__name__ and r.exc_info]
+    assert [str(r.exc_info[1]) for r in failures] == ["unexpected failure"] * 2

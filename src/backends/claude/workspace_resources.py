@@ -735,6 +735,83 @@ def _materialize(workspace: Path) -> None:
             _materialize_resource(workspace, root_fd, claude_fd, name)
 
 
+# --- mirror inspection and clearing --------------------------------------------
+
+
+def _is_managed_mirror(workspace: Path, kind: str) -> bool:
+    if kind not in _RESOURCE_DIRS:
+        return False  # a name, never a path walked through intermediate links
+    with ExitStack() as stack:
+        root_fd = os.open(workspace, _ROOT_FLAGS)
+        stack.callback(os.close, root_fd)
+        claude_fd = _open_dir_at(root_fd, _CLAUDE_DIR)
+        stack.callback(os.close, claude_fd)
+        native_fd = _open_dir_at(claude_fd, kind)
+        stack.callback(os.close, native_fd)
+        return _managed(native_fd)
+
+
+def _skip_uncleared(where: Path, exc: OSError) -> None:
+    """Log why ``where`` cannot be entered, unless there is no mirror there."""
+    if exc.errno not in (errno.ENOENT, *_NOT_A_DIRECTORY):
+        logger.warning(
+            "Cannot clear Claude workspace resource mirrors in %s: %s",
+            where,
+            _reason(exc),
+        )
+
+
+def _clear_mirror(workspace: Path, claude_fd: int, name: str) -> None:
+    native = workspace / _CLAUDE_DIR / name
+    try:
+        native_fd = _open_dir_at(claude_fd, name)
+    except OSError as exc:
+        _skip_uncleared(native, exc)
+        return
+    try:
+        if not _managed(native_fd):
+            return  # operator-managed, or a marker the gateway refuses
+        try:
+            entries = _scan(native_fd)
+        except OSError as exc:
+            logger.warning(
+                "Cannot read Claude mirror directory %s (%s); leaving it unchanged",
+                native,
+                _reason(exc),
+            )
+            return
+        for entry, _ in entries:
+            if entry == _MANAGED_MARKER:
+                continue
+            try:
+                _remove_at(native_fd, entry)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to remove Claude mirror entry %s: %s",
+                    native / entry,
+                    _reason(exc),
+                )
+    finally:
+        os.close(native_fd)
+
+
+def _clear_managed_mirrors(workspace: Path) -> None:
+    with ExitStack() as stack:
+        try:
+            root_fd = os.open(workspace, _ROOT_FLAGS)
+        except OSError:
+            return  # no workspace: nothing to clear
+        stack.callback(os.close, root_fd)
+        try:
+            claude_fd = _open_dir_at(root_fd, _CLAUDE_DIR)
+        except OSError as exc:
+            _skip_uncleared(workspace / _CLAUDE_DIR, exc)
+            return
+        stack.callback(os.close, claude_fd)
+        for name in _RESOURCE_DIRS:
+            _clear_mirror(workspace, claude_fd, name)
+
+
 # --- public API ----------------------------------------------------------------
 
 
@@ -778,3 +855,49 @@ def ensure_workspace_resources(workspace: Path) -> None:
     """Prepare then materialize resources; convenient for migrations/tests."""
     prepare_workspace_resources(workspace)
     materialize_workspace_resources(workspace)
+
+
+def is_managed_mirror(workspace: Path, kind: str) -> bool:
+    """Whether ``workspace/.claude/<kind>`` is a gateway-managed mirror.
+
+    The rule materialization applies: ``kind`` is ``skills`` or ``agents``, both
+    directories are reached from the root by fds without following a symlink,
+    and the marker is a single-link regular file by ``lstat``. Any error -- the
+    session can make these directories unreadable -- reads as ``False``. It never
+    raises.
+    """
+    try:
+        return _is_managed_mirror(Path(workspace), kind)
+    except OSError:
+        return False
+    except Exception:
+        logger.warning(
+            "Failed to inspect Claude workspace resource mirror %s in %s",
+            kind,
+            workspace,
+            exc_info=True,
+        )
+        return False
+
+
+def clear_managed_mirrors(workspace: Path) -> None:
+    """Empty each gateway-managed ``.claude/{skills,agents}`` mirror, marker kept.
+
+    For the one-time ACL grant of a legacy workspace's tree to its session uid:
+    the grant skips files with more than one link, and every mirrored file is a
+    hard link of its canonical file. Dropping the mirror's names first leaves the
+    canonical files with a single link; :func:`materialize_workspace_resources`
+    re-links them after the grant (an ACL belongs to the inode, so the mirror
+    shares it). Only a managed mirror is emptied, with the same never-following,
+    depth-capped removal materialization uses, and never the canonical tree. It
+    never raises.
+    """
+    workspace = Path(workspace)
+    try:
+        _clear_managed_mirrors(workspace)
+    except Exception:
+        logger.warning(
+            "Failed to clear Claude workspace resource mirrors in %s",
+            workspace,
+            exc_info=True,
+        )
