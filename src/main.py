@@ -427,9 +427,9 @@ async def lifespan(app: FastAPI):
     await usage_logger.close()
 
 
-# First uid-mode retention sweep this long after startup, then once a day.
+# First uid-mode retention sweep this long after startup, then every hour: a
+# sweep expires each uid once a day and retries the ones the broker refused.
 _UID_RETENTION_FIRST_DELAY_SECONDS = 300.0
-_UID_RETENTION_INTERVAL_SECONDS = 24 * 3600.0
 
 
 async def _uid_retention_loop() -> None:
@@ -441,10 +441,11 @@ async def _uid_retention_loop() -> None:
     delay = _UID_RETENTION_FIRST_DELAY_SECONDS
     while True:
         await asyncio.sleep(delay)
-        delay = _UID_RETENTION_INTERVAL_SECONDS
+        delay = uid_cleanup.RETENTION_RETRY_SECONDS
         try:
             swept = await asyncio.to_thread(uid_cleanup.retention_sweep)
-            logger.info("uid isolation retention sweep: %d uid(s) swept", swept)
+            if swept:
+                logger.info("uid isolation retention sweep: %d uid(s) swept", swept)
         except Exception:
             logger.warning("uid isolation retention sweep failed", exc_info=True)
 

@@ -203,6 +203,9 @@ def per_uid(monkeypatch, tmp_path, cfg, ops, reclaimer, pool, shm):
     base.mkdir()
     monkeypatch.setenv(cp.CONFIG_BASE_ENV, str(base))
     assert uid_layout.enabled()
+    # The retention sweep's per-uid schedule is process state.
+    monkeypatch.setattr(uid_cleanup, "_retention_ran", {})
+    monkeypatch.setattr(uid_cleanup, "_retention_refused", {})
     return SimpleNamespace(base=base, cfg=cfg, ops=ops, reclaimer=reclaimer)
 
 
@@ -1349,13 +1352,42 @@ class TestRetentionSweep:
 
     def test_failures_are_logged_and_not_counted(self, users, caplog):
         users.ops.fail = 1
-        with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
+        with caplog.at_level(logging.INFO, logger=uid_cleanup.__name__):
             assert uid_cleanup.retention_sweep() == 0
-        assert "Retention sweep of uid" in caplog.text
-        users.ops.result = False
+        assert "Retention sweep of uid" in caplog.text and "deferred" in caplog.text
+        users.ops.result = False  # refused before: tried again at once
         with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
             assert uid_cleanup.retention_sweep() == 0
         assert "left expired entries" in caplog.text
+
+    def test_each_uid_runs_once_a_period_and_a_refused_one_is_retried(self, users):
+        hour, period = uid_cleanup.RETENTION_RETRY_SECONDS, (
+            uid_cleanup.RETENTION_PERIOD_SECONDS
+        )
+        users.ops.fail = 1  # a live session of alice: the broker refuses
+        assert uid_cleanup.retention_sweep(now=0.0) == 0
+        assert uid_cleanup.retention_sweep(now=hour) == 1  # a quiet hour
+        assert uid_cleanup.retention_sweep(now=2 * hour) == 0  # done today
+        assert len(users.ops.calls) == 2
+        assert uid_cleanup.retention_sweep(now=hour + period) == 1
+        assert len(users.ops.calls) == 3
+
+    def test_a_uid_refused_for_two_periods_is_warned_about(self, users, caplog):
+        hour, period = uid_cleanup.RETENTION_RETRY_SECONDS, (
+            uid_cleanup.RETENTION_PERIOD_SECONDS
+        )
+        users.ops.fail = 10**6  # a session that never ends
+        with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
+            for step in range(0, int(2 * period / hour)):
+                uid_cleanup.retention_sweep(now=step * hour)
+            assert caplog.text == ""
+            uid_cleanup.retention_sweep(now=2 * period)
+            assert "has been refused for 48 hours" in caplog.text
+            caplog.clear()
+            uid_cleanup.retention_sweep(now=2 * period + hour)
+            assert caplog.text == ""  # once a period
+            uid_cleanup.retention_sweep(now=3 * period)
+            assert "has been refused for 72 hours" in caplog.text
 
 
 class TestRetentionNeedsTheUserSettingSource:

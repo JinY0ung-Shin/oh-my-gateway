@@ -68,6 +68,13 @@ _SYNC_BUDGET_SECONDS = 30.0
 _WIPE_WAIT_SECONDS = 10
 _OP_TIMEOUT_SECONDS = 75.0  # above the broker cleaner's 60 s alarm
 _DEFAULT_RETENTION_DAYS = 30
+# How often each named uid's old state is expired, and how often the gateway
+# runs the sweep (:func:`retention_sweep`): an expiry the broker refused is
+# tried again on the next run.
+RETENTION_PERIOD_SECONDS = 24 * 3600.0
+RETENTION_RETRY_SECONDS = 3600.0
+# A uid whose expiry was refused this long is warned about, once a period.
+_RETENTION_STARVED_SECONDS = 2 * RETENTION_PERIOD_SECONDS
 _SHM_DIR = "/dev/shm"
 # Where the kernel lists the SysV IPC objects and the POSIX message queues
 # (module level, so tests can point them at fake tables).
@@ -1005,7 +1012,13 @@ def _retention_days() -> int:
     return _DEFAULT_RETENTION_DAYS
 
 
-def retention_sweep() -> int:
+# uid -> when (time.monotonic) its last expiry ran to a result, this process.
+_retention_ran: Dict[int, float] = {}
+# uid -> [when its expiry was first refused since it last ran, last warning].
+_retention_refused: Dict[int, List[float]] = {}
+
+
+def retention_sweep(now: Optional[float] = None) -> int:
     """Expire every named user's old per-uid state, as that user's uid.
 
     The CLI's own ``cleanupPeriodDays`` sweep runs only when a CLI of the uid
@@ -1016,6 +1029,14 @@ def retention_sweep() -> int:
     mtime is older than the period. Per-uid layouts only, and only with the
     ``user`` setting source (``CLAUDE_SETTING_SOURCES``), the one the CLI's
     own cleanup needs; 0 otherwise.
+
+    Each uid is expired once per :data:`RETENTION_PERIOD_SECONDS`; the gateway
+    calls this every :data:`RETENTION_RETRY_SECONDS`, and the broker expires
+    nothing while a session of the uid is live (a long-lived session keeps an
+    old ``session-env/<id>``), so a refused uid is tried again on the next
+    call: a user who is active whenever the daily sweep comes round is swept
+    at a quieter hour. One with a live session at every attempt is not — it
+    is warned about once it has been refused for two periods.
     Returns how many uids were swept; logs the failures. Blocks for one broker
     round trip per uid: run it off the event loop.
     """
@@ -1037,8 +1058,12 @@ def retention_sweep() -> int:
         logger.debug("uid retention sweep skipped: no user setting source")
         return 0
     older_than = _retention_days() * 86400
+    now = time.monotonic() if now is None else now
     swept = 0
     for uid in ui.named_uids():
+        ran = _retention_ran.get(uid)
+        if ran is not None and now - ran < RETENTION_PERIOD_SECONDS:
+            continue
         config = cp.user_config_dir(uid)
         if config is None or not config.is_dir():
             continue
@@ -1053,14 +1078,43 @@ def retention_sweep() -> int:
             continue
         expire = {"older_than": older_than, "units": units, "nested": nested}
         try:
-            if broker_ops.cleanup(uid, expire=expire):
-                swept += 1
-            else:
-                logger.warning(
-                    "Retention sweep of uid %d left expired entries (the broker "
-                    "logs which)",
-                    uid,
-                )
+            done = broker_ops.cleanup(uid, expire=expire)
         except Exception as exc:
-            logger.warning("Retention sweep of uid %d failed: %s", uid, exc)
+            _retention_was_refused(uid, now, exc)
+            continue
+        _retention_ran[uid] = now
+        _retention_refused.pop(uid, None)
+        if done:
+            swept += 1
+        else:
+            logger.warning(
+                "Retention sweep of uid %d left expired entries (the broker "
+                "logs which)",
+                uid,
+            )
     return swept
+
+
+def _retention_was_refused(uid: int, now: float, exc: Exception) -> None:
+    """Log a refused expiry of *uid*: quietly while it is retried, a warning
+    once a period after it has been refused for two."""
+    record = _retention_refused.setdefault(uid, [now, now - RETENTION_PERIOD_SECONDS])
+    first, warned = record
+    if now - first >= _RETENTION_STARVED_SECONDS and now - warned >= (
+        RETENTION_PERIOD_SECONDS
+    ):
+        record[1] = now
+        logger.warning(
+            "Retention sweep of uid %d has been refused for %.0f hours (a "
+            "session of the uid was live at every attempt, or the broker "
+            "refuses it): %s",
+            uid,
+            (now - first) / 3600,
+            exc,
+        )
+    else:
+        logger.info(
+            "Retention sweep of uid %d deferred (retried within the hour): %s",
+            uid,
+            exc,
+        )
