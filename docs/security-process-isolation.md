@@ -3,6 +3,8 @@
 > **상태: 설계/계획, 일부 구현.** Landlock 단독과 ①은 `CLAUDE_ISOLATION_MODE=landlock|uid`(#241)로 들어왔다(§3·§5·§6의
 > 구현 노트). uid 모드는 워크스페이스 소유권과 컨테이너 프로비저닝(§7 step 4) 전에는 쓸 수 없다. 메커니즘 선택은 prod
 > 호스트의 커널·권한에 달려 있고, 그 사실은 `scripts/isolation_probe.py`를 prod 컨테이너에서 돌려 확정한다.
+> uid 모드를 쓰게 만드는 남은 두 선행 작업(워크스페이스 uid 소유권·정리 대행, 사용자별 config dir — §7 step 2·4)의
+> 상세 설계는 [isolation-uid-ownership-design.md](isolation-uid-ownership-design.md)를 보라.
 > 앱 계층(자격증명→워크스페이스/세션 스코프) 격리는 [security-user-isolation.md](security-user-isolation.md)를 보라.
 > 이 문서는 그 아래, **OS/프로세스 계층**(한 세션이 다른 세션·게이트웨이의 파일/메모리/비밀에
 > 닿지 못하게 하는 경계)을 다룬다.
@@ -957,14 +959,16 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
 ## 7. 단계별 계획
 
 1. **(#231)** 역량 프로브 + 본 설계 문서. prod에서 프로브 실행 → 메커니즘 확정.
-2. **세션별 HOME 리팩터** (공유 ro 자산 보존). 가장 공유-스킬 민감한 부분 — 먼저, 독립적으로. 지금 config/plugin
-   루트는 아홉 곳이 서로 다른 우선순위로 따로 푼다(`session_manager`의 `_PROJECTS_ROOT`, `workspace_sandbox`의
+2. **세션별 HOME 리팩터** (공유 ro 자산 보존). 가장 공유-스킬 민감한 부분 — 먼저, 독립적으로. config/plugin
+   루트를 아홉 곳이 서로 다른 우선순위로 따로 풀던 것(`session_manager`의 `_PROJECTS_ROOT`, `workspace_sandbox`의
    `_claude_home`, `plugin_service`의 `_plugins_root`와 clone anchor, `plugin_admin_service`의 `clone_root`와
    `known_marketplaces.json` 조회, `docker/install_plugins.py`의 `clone_root`, `claude_settings_env`의 `settings_path`,
-   `agent_catalog`의 user scope). 목록을 하나씩 고치지 말고, CLI의 우선순위(`CLAUDE_CONFIG_DIR` → `$HOME/.claude`;
-   플러그인 루트는 `CLAUDE_CODE_PLUGIN_CACHE_DIR`/`SEED_DIR`; clone 루트)를 따르는 **리졸버 하나**를 두고 모든 소비자가
-   그것을 부르게 한다. §5의 config-dir 소비자(transcript 경로·guard 루트·`--add-dir`)와 `settings.json`/`plugins/data`
-   writer도 그 리졸버 위에서 함께 이전·수정.
+   `agent_catalog`의 user scope)은 CLI의 우선순위(`CLAUDE_CONFIG_DIR` → `$HOME/.claude`)와 clone 루트를 따르는
+   **리졸버 하나**(`src/claude_config_paths.py`, #244의 PR-B)로 이미 모였다. `docker/install_plugins.py`만 src를
+   import하지 않아 자체 사본을 유지하고, 플러그인 루트의 `CLAUDE_CODE_PLUGIN_CACHE_DIR`/`SEED_DIR`은 아직 아무 곳도
+   다루지 않는다. 남은 일은 그 리졸버를 uid별 config dir과 공유 트리로 매개변수화하고, §5의 config-dir
+   소비자(transcript 경로·guard 루트·`--add-dir`)와 `settings.json`/`plugins/data` writer를 그 위에서 이전·수정하는
+   것이다(상세: [isolation-uid-ownership-design.md](isolation-uid-ownership-design.md) §4.4).
 3. **`cli_path` 고정 런처 스텁 + 가둔 상주 브로커** (① uid+Landlock; ②·Landlock 단독은 특권 없이 런처가 그 자리에서).
    특권 배치는 §3 B·A: SDK의 파이프를 넘기는 무특권 스텁, spawn·종료·정리·reaping을 모두 맡는 브로커, 게이트웨이의
    제어 채널 점유 + spawn별 1회용 티켓(§2의 신원 전달 채널과 "세션 아닌 spawn" 처리를 겸한다), 게이트웨이 NNP,
