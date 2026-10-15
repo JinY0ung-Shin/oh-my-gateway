@@ -389,6 +389,9 @@ def _ensure_global_config(state_fd: int) -> None:
 # by resolved path → uid.
 _granted_anonymous: Dict[str, int] = {}
 _GRANTED_ANONYMOUS_MAX = 4096
+# (workspace, uid) whose tree grant this process tried and could not complete
+# (errors or the entry cap): not re-walked on every spawn, retried on restart.
+_tree_attempted: Set[Tuple[str, int]] = set()
 
 
 def grant_workspace(workspace: str, uid: int, *, named: bool) -> None:
@@ -412,11 +415,13 @@ def grant_workspace(workspace: str, uid: int, *, named: bool) -> None:
         if os.fstat(fd).st_uid != _app_uid():
             raise refused(f"the workspace {workspace} is not owned by the gateway uid")
         _grant_writable(fd, uid)
-        if not _tree_granted(workspace, uid, named):
+        attempt = (workspace, uid)
+        if attempt not in _tree_attempted and not _tree_granted(workspace, uid, named):
             started = time.monotonic()
             stats = posix_acl.grant_tree(fd, uid, _app_uid(), owner=_app_uid())
             took = time.monotonic() - started
-            log = logger.warning if stats.truncated or stats.errors else logger.info
+            complete = not stats.truncated and not stats.errors
+            log = logger.info if complete else logger.warning
             log(
                 "uid isolation: granted the existing tree of %s to uid %d in "
                 "%.2fs (%d dirs, %d files, %d skipped, %d errors%s)",
@@ -429,7 +434,12 @@ def grant_workspace(workspace: str, uid: int, *, named: bool) -> None:
                 stats.errors,
                 ", truncated" if stats.truncated else "",
             )
-            _mark_tree_granted(workspace, uid, named)
+            # Recorded only when complete, so a gateway restart tries again;
+            # within this process it is not re-walked on every spawn.
+            if complete:
+                _mark_tree_granted(workspace, uid, named)
+            elif len(_tree_attempted) < _GRANTED_ANONYMOUS_MAX:
+                _tree_attempted.add(attempt)
     except posix_acl.AclUnsupported as exc:
         raise refused(
             f"the workspace {workspace} does not support POSIX ACLs ({exc}); uid "
@@ -520,16 +530,48 @@ def _write_file_at(directory: str, name: str, data: bytes) -> None:
 _clean_for: Dict[int, str] = {}
 
 
+_PRISTINE_GLOBAL_CONFIG = (b"{}", b"")
+
+
+def _pristine_global_config(state_dir: str) -> bool:
+    """Whether ``state/.claude.json`` is still the ``{}`` the gateway wrote
+    (a run's CLI writes its whole global config there, cwd history included)."""
+    try:
+        dfd = os.open(state_dir, _DIR_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        fd = os.open(GLOBAL_CONFIG, _FILE_NOFOLLOW, dir_fd=dfd)
+    except OSError:
+        return False
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > 16:
+            return False
+        return os.read(fd, 32).strip() in _PRISTINE_GLOBAL_CONFIG
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
 def _has_leftovers(uid: int) -> bool:
     """Whether ``P(uid)``'s writable dirs or ``/dev/shm`` hold anything of a
-    previous run (the gateway can list them: they are its own dirs)."""
+    previous run (the gateway can list them: they are its own dirs). The
+    gateway's own untouched ``state/.claude.json`` does not count."""
     for path in ephemeral_clear_targets(uid):
         try:
-            if os.listdir(path):
-                return True
+            entries = os.listdir(path)
         except FileNotFoundError:
             continue
         except OSError:
+            return True
+        if os.path.basename(path) == "state" and entries == [GLOBAL_CONFIG]:
+            if _pristine_global_config(path):
+                continue
+        if entries:
             return True
     try:
         with os.scandir(_SHM_DIR) as entries:
@@ -848,11 +890,12 @@ def prepare_spawn(
     """Make *uid*'s config dir and the resolved *workspace* ready for a spawn.
 
     Runs before every per-uid spawn (sessions, the slash preflight, ``verify()``
-    and the startup probe): the per-uid config dir (:func:`ensure_user_config`),
-    the workspace grant (:func:`grant_workspace`), then for a named user the
-    one-time legacy migration (:func:`migrate_legacy`) and for an anonymous run
-    the clean-start check of its ephemeral uid (:func:`ensure_clean_ephemeral`,
-    *key* being its lease key). Returns the spawn's layout. Raises
+    and the startup probe): for an anonymous run first the clean-start check
+    of its ephemeral uid (:func:`ensure_clean_ephemeral`, *key* being its lease
+    key), then the per-uid config dir (:func:`ensure_user_config`), the
+    workspace grant (:func:`grant_workspace`) and, for a named user, the
+    one-time legacy migration (:func:`migrate_legacy`). Returns the spawn's
+    layout. Raises
     ``WorkspaceRefused`` for a layout it cannot prepare and
     ``UidAllocationError`` for an ephemeral uid that is not clean yet.
     """
@@ -860,12 +903,14 @@ def prepare_spawn(
     if not layout.per_uid:
         raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
     with _uid_lock(uid):
+        if not user:
+            # First: a wipe empties state/ too, and the layout below puts the
+            # pristine global config back.
+            ensure_clean_ephemeral(uid, key)
         ensure_user_config(layout)
         grant_workspace(workspace, uid, named=bool(user))
         if user:
             migrate_legacy(user, uid, workspace)
-        else:
-            ensure_clean_ephemeral(uid, key)
     return layout
 
 

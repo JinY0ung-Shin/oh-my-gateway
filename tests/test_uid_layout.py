@@ -256,12 +256,16 @@ class TestMigrateLegacy:
         assert (dst / "s1" / "subagents" / "a.jsonl").exists()
         assert (dst / "memory" / "MEMORY.md").read_text() == "remember"
         assert (project / "s1.jsonl").exists()  # the source stays (rollback)
-        # The copies inherit the default ACL: the session uid reads them.
+        # The copies inherit the default ACL: the session uid reads and writes
+        # them (its named entry is rwx, the 0666 create mode caps the mask rw-).
         fd = os.open(dst / "s1.jsonl", os.O_RDONLY)
         try:
-            assert (UID, posix_acl.R | posix_acl.W) in _named(posix_acl.get_acl(fd))
+            entries = posix_acl.get_acl(fd)
         finally:
             os.close(fd)
+        assert (UID, 7) in _named(entries)
+        mask = [e.perm for e in entries if e.tag == posix_acl.ACL_MASK]
+        assert mask == [posix_acl.R | posix_acl.W]
 
     def test_another_users_transcript_and_the_shared_memory_stay(self, tree, legacy):
         workspace = _named_ws(tree, "a.b")
