@@ -51,9 +51,10 @@ import logging
 import os
 import secrets
 import stat
-from contextlib import ExitStack
+import threading
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Set, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -80,9 +81,31 @@ _NOT_A_DIRECTORY = (errno.ENOTDIR, errno.ELOOP, errno.EMLINK)
 _MAX_DEPTH = 64
 _COPY_CHUNK = 1024 * 1024
 
+# (workspace, resource name) a warning is about.
+_Scope = Tuple[str, str]
+# Every resolve (file-browser polls included) and every SDK call reads again a
+# layout the session chose, so a warning about it would repeat for as long as the
+# session keeps it in place: each (workspace, name, reason) warns once per
+# process and logs at debug after that. The set is bounded (emptied when full,
+# after which a reason may warn once more).
+_WARNED_MAX = 4096
+_warned: Set[Tuple[str, str, str]] = set()
+_warned_guard = threading.Lock()
+
 
 def _reason(exc: OSError) -> str:
     return exc.strerror or str(exc)
+
+
+def _warn(scope: _Scope, reason: str, msg: str, *args: object) -> None:
+    key = (scope[0], scope[1], reason)
+    with _warned_guard:
+        first = key not in _warned
+        if first:
+            if len(_warned) >= _WARNED_MAX:
+                _warned.clear()
+            _warned.add(key)
+    (logger.warning if first else logger.debug)(msg, *args)
 
 
 def _lstat_at(dir_fd: int, name: str) -> Optional[os.stat_result]:
@@ -208,15 +231,17 @@ def _marker_status_at(dir_fd: int, name: str) -> Optional[bool]:
         os.close(native_fd)
 
 
-def _refuse_marker(where: Path, why: str) -> None:
-    logger.warning(
+def _refuse_marker(scope: _Scope, where: Path, why: str) -> None:
+    _warn(
+        scope,
+        "marker: " + why,
         "Refusing Claude resource marker %s (%s); leaving the mirror unmanaged",
         where,
         why,
     )
 
 
-def _write_marker(native_fd: int, where: Path) -> bool:
+def _write_marker(native_fd: int, where: Path, scope: Optional[_Scope] = None) -> bool:
     """Leave the zero-byte marker in ``native_fd``; ``False`` when refused.
 
     The marker is gateway metadata, not user data. Keep it zero bytes so the
@@ -229,6 +254,7 @@ def _write_marker(native_fd: int, where: Path) -> bool:
     refused, so a planted marker can never make the gateway create or truncate
     anything but its own marker.
     """
+    scope = scope or (str(where), "")
     st = _lstat_at(native_fd, _MANAGED_MARKER)
     if (
         st is not None
@@ -241,12 +267,12 @@ def _write_marker(native_fd: int, where: Path) -> bool:
     try:
         fd = os.open(_MANAGED_MARKER, _MARKER_FLAGS, 0o666, dir_fd=native_fd)
     except OSError as exc:
-        _refuse_marker(where, _reason(exc))
+        _refuse_marker(scope, where, _reason(exc))
         return False
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
-            _refuse_marker(where, "not a single-link regular file")
+            _refuse_marker(scope, where, "not a single-link regular file")
             return False
         if st.st_size:
             os.ftruncate(fd, 0)
@@ -357,7 +383,13 @@ def _copy_fd(fd: int, st: os.stat_result, dst_dir_fd: int, name: str) -> bool:
     return True
 
 
-def _materialize_file(src_dir_fd: int, dst_dir_fd: int, name: str, where: Path) -> bool:
+def _materialize_file(
+    src_dir_fd: int,
+    dst_dir_fd: int,
+    name: str,
+    where: Path,
+    scope: Optional[_Scope] = None,
+) -> bool:
     """Make ``name`` in ``dst_dir_fd`` the regular file ``name`` in ``src_dir_fd``.
 
     A target that already is the same inode is left alone. Otherwise the source
@@ -370,18 +402,28 @@ def _materialize_file(src_dir_fd: int, dst_dir_fd: int, name: str, where: Path) 
     nothing from outside the canonical tree is ever linked or copied. Returns
     whether the mirror entry now matches; errors on the mirror side raise.
     """
+    scope = scope or (str(where), "")
     if _same_regular(_lstat_at(src_dir_fd, name), _lstat_at(dst_dir_fd, name)):
         return True
     try:
         fd = os.open(name, _FILE_FLAGS, dir_fd=src_dir_fd)
     except OSError as exc:
-        logger.warning("Not mirroring workspace resource %s: %s", where, _reason(exc))
+        _warn(
+            scope,
+            "source: " + _reason(exc),
+            "Not mirroring workspace resource %s: %s",
+            where,
+            _reason(exc),
+        )
         return False
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
-            logger.warning(
-                "Not mirroring workspace resource %s: not a regular file", where
+            _warn(
+                scope,
+                "source: not regular",
+                "Not mirroring workspace resource %s: not a regular file",
+                where,
             )
             return False
         target = _lstat_at(dst_dir_fd, name)
@@ -407,7 +449,7 @@ def _materialize_file(src_dir_fd: int, dst_dir_fd: int, name: str, where: Path) 
 
 
 def _sync_dir(
-    src_fd: int, dst_fd: int, visible: Path, native: Path, depth: int
+    src_fd: int, dst_fd: int, visible: Path, native: Path, depth: int, scope: _Scope
 ) -> None:
     """Make the mirror directory ``dst_fd`` match the canonical ``src_fd``.
 
@@ -422,7 +464,9 @@ def _sync_dir(
     try:
         source = _scan(src_fd)
     except OSError as exc:
-        logger.warning(
+        _warn(
+            scope,
+            "unreadable: " + _reason(exc),
             "Cannot read workspace resource directory %s (%s); "
             "leaving its Claude mirror unchanged",
             visible,
@@ -435,13 +479,18 @@ def _sync_dir(
         if depth == 0 and name == _MANAGED_MARKER:
             # The marker's slot: a user file mirrored onto it would be what the
             # next marker write truncates.
-            logger.warning(
+            _warn(
+                scope,
+                "reserved name",
                 "Not mirroring workspace resource %s: the name is reserved",
                 visible / name,
             )
         elif stat.S_ISLNK(st.st_mode):
-            logger.warning(
-                "Skipping symlinked workspace resource entry %s", visible / name
+            _warn(
+                scope,
+                "symlink",
+                "Skipping symlinked workspace resource entry %s",
+                visible / name,
             )
         elif stat.S_ISDIR(st.st_mode):
             dirs.append(name)
@@ -450,7 +499,9 @@ def _sync_dir(
     try:
         mirror = _scan(dst_fd)
     except OSError as exc:
-        logger.warning(
+        _warn(
+            scope,
+            "mirror unreadable: " + _reason(exc),
             "Cannot read Claude mirror directory %s (%s); leaving it unchanged",
             native,
             _reason(exc),
@@ -467,29 +518,43 @@ def _sync_dir(
         try:
             _remove_at(dst_fd, name)
         except OSError as exc:
-            logger.warning(
+            _warn(
+                scope,
+                "stale: " + _reason(exc),
                 "Failed to remove stale Claude mirror entry %s: %s",
                 native / name,
                 _reason(exc),
             )
     for name in files:
         try:
-            _materialize_file(src_fd, dst_fd, name, visible / name)
+            _materialize_file(src_fd, dst_fd, name, visible / name, scope)
         except OSError as exc:
-            logger.warning(
+            _warn(
+                scope,
+                "mirror: " + _reason(exc),
                 "Failed to mirror workspace resource %s: %s",
                 visible / name,
                 _reason(exc),
             )
     for name in dirs:
-        _sync_subdir(src_fd, dst_fd, name, visible / name, native / name, depth + 1)
+        _sync_subdir(
+            src_fd, dst_fd, name, visible / name, native / name, depth + 1, scope
+        )
 
 
 def _sync_subdir(
-    src_fd: int, dst_fd: int, name: str, visible: Path, native: Path, depth: int
+    src_fd: int,
+    dst_fd: int,
+    name: str,
+    visible: Path,
+    native: Path,
+    depth: int,
+    scope: _Scope,
 ) -> None:
     if depth > _MAX_DEPTH:
-        logger.warning(
+        _warn(
+            scope,
+            "too deep",
             "Not mirroring workspace resource directory %s: nested deeper than %d",
             visible,
             _MAX_DEPTH,
@@ -501,7 +566,9 @@ def _sync_subdir(
         except FileNotFoundError:
             return  # removed since it was listed
         except OSError as exc:
-            logger.warning(
+            _warn(
+                scope,
+                "unreadable: " + _reason(exc),
                 "Cannot read workspace resource directory %s (%s); "
                 "leaving its Claude mirror unchanged",
                 visible,
@@ -512,14 +579,16 @@ def _sync_subdir(
         try:
             sub_dst = _ensure_dir_at(dst_fd, name)
         except OSError as exc:
-            logger.warning(
+            _warn(
+                scope,
+                "mkdir: " + _reason(exc),
                 "Failed to create Claude mirror directory %s: %s",
                 native,
                 _reason(exc),
             )
             return
         stack.callback(os.close, sub_dst)
-        _sync_dir(sub_src, sub_dst, visible, native, depth)
+        _sync_dir(sub_src, sub_dst, visible, native, depth, scope)
 
 
 # --- preparation -------------------------------------------------------------
@@ -540,13 +609,16 @@ def _prepare_resource_dir(
     workspace: Path, root_fd: int, claude_fd: int, name: str
 ) -> None:
     """Create/migrate one canonical resource root without recursively syncing it."""
+    scope = (str(workspace), name)
     visible = workspace / name
     native = workspace / _CLAUDE_DIR / name
     visible_st = _lstat_at(root_fd, name)
     native_st = _lstat_at(claude_fd, name)
 
     if visible_st is not None and not stat.S_ISDIR(visible_st.st_mode):
-        logger.warning(
+        _warn(
+            scope,
+            "visible unsafe",
             "Cannot prepare Claude workspace resource %s: "
             "visible path is not a safe directory",
             visible,
@@ -557,7 +629,9 @@ def _prepare_resource_dir(
     # It is safe to replace only when it points at the canonical visible directory.
     if native_st is not None and stat.S_ISLNK(native_st.st_mode):
         if visible_st is None or not _points_at(claude_fd, name, visible_st):
-            logger.warning(
+            _warn(
+                scope,
+                "native symlink",
                 "Cannot prepare Claude workspace resource %s: "
                 "native symlink has a different target",
                 native,
@@ -566,22 +640,30 @@ def _prepare_resource_dir(
         try:
             os.unlink(name, dir_fd=claude_fd)
         except OSError as exc:
-            logger.warning(
-                "Failed to replace Claude resource symlink %s: %s", native, _reason(exc)
+            _warn(
+                scope,
+                "native symlink: " + _reason(exc),
+                "Failed to replace Claude resource symlink %s: %s",
+                native,
+                _reason(exc),
             )
             return
         native_st = None
 
     status = _marker_status_at(claude_fd, name) if native_st is not None else None
     if status is False:
-        _refuse_marker(native / _MANAGED_MARKER, "not a single-link regular file")
+        _refuse_marker(
+            scope, native / _MANAGED_MARKER, "not a single-link regular file"
+        )
     native_is_managed = status is True
 
     if visible_st is None:
         try:
             if native_st is not None and not native_is_managed:
                 if not stat.S_ISDIR(native_st.st_mode):
-                    logger.warning(
+                    _warn(
+                        scope,
+                        "native unsafe",
                         "Cannot migrate Claude workspace resource %s: "
                         "native path is not a safe directory",
                         native,
@@ -597,7 +679,9 @@ def _prepare_resource_dir(
         except FileExistsError:
             pass
         except OSError as exc:
-            logger.warning(
+            _warn(
+                scope,
+                "visible: " + _reason(exc),
                 "Failed to create/migrate workspace resource %s: %s",
                 visible,
                 _reason(exc),
@@ -608,7 +692,9 @@ def _prepare_resource_dir(
         # Both locations contain real, independently-managed data. Never delete
         # or silently shadow either side. Operators can merge once, then remove
         # the legacy native directory; the next resolve will create the mirror.
-        logger.warning(
+        _warn(
+            scope,
+            "conflict",
             "Claude workspace has both canonical %s and unmanaged native %s; "
             "leaving both unchanged to avoid data loss",
             visible,
@@ -621,29 +707,37 @@ def _prepare_resource_dir(
             os.mkdir(name, 0o777, dir_fd=claude_fd)
         native_fd = _open_dir_at(claude_fd, name)
     except OSError as exc:
-        logger.warning(
-            "Failed to prepare Claude workspace resource %s: %s", native, _reason(exc)
+        _warn(
+            scope,
+            "native: " + _reason(exc),
+            "Failed to prepare Claude workspace resource %s: %s",
+            native,
+            _reason(exc),
         )
         return
     try:
-        _write_marker(native_fd, native / _MANAGED_MARKER)
+        _write_marker(native_fd, native / _MANAGED_MARKER, scope)
     finally:
         os.close(native_fd)
 
 
-def _prepare_claude_dir(root_fd: int, where: Path) -> Optional[int]:
+def _prepare_claude_dir(root_fd: int, where: Path, scope: _Scope) -> Optional[int]:
     """Open the root's real ``.claude`` directory, creating it when absent."""
     try:
         return _ensure_dir_at(root_fd, _CLAUDE_DIR)
     except OSError as exc:
         if exc.errno in _NOT_A_DIRECTORY:
-            logger.warning(
+            _warn(
+                scope,
+                "unsafe",
                 "Cannot prepare Claude workspace resources: "
                 "%s is not a safe directory",
                 where,
             )
         else:
-            logger.warning(
+            _warn(
+                scope,
+                _reason(exc),
                 "Failed to prepare Claude workspace resource root %s: %s",
                 where,
                 _reason(exc),
@@ -653,18 +747,21 @@ def _prepare_claude_dir(root_fd: int, where: Path) -> Optional[int]:
 
 def _prepare(workspace: Path) -> None:
     claude_where = workspace / _CLAUDE_DIR
+    claude_scope = (str(workspace), _CLAUDE_DIR)
     with ExitStack() as stack:
         try:
             root_fd = os.open(workspace, _ROOT_FLAGS)
         except OSError as exc:
-            logger.warning(
+            _warn(
+                claude_scope,
+                "root: " + _reason(exc),
                 "Failed to prepare Claude workspace resource root %s: %s",
                 claude_where,
                 _reason(exc),
             )
             return
         stack.callback(os.close, root_fd)
-        claude_fd = _prepare_claude_dir(root_fd, claude_where)
+        claude_fd = _prepare_claude_dir(root_fd, claude_where, claude_scope)
         if claude_fd is None:
             return
         stack.callback(os.close, claude_fd)
@@ -672,7 +769,9 @@ def _prepare(workspace: Path) -> None:
             try:
                 _prepare_resource_dir(workspace, root_fd, claude_fd, name)
             except OSError as exc:
-                logger.warning(
+                _warn(
+                    (str(workspace), name),
+                    "prepare: " + _reason(exc),
                     "Failed to prepare Claude workspace resource %s: %s",
                     workspace / name,
                     _reason(exc),
@@ -682,14 +781,16 @@ def _prepare(workspace: Path) -> None:
 # --- materialization ---------------------------------------------------------
 
 
-def _skip_unmaterialized(where: Path, exc: OSError) -> None:
+def _skip_unmaterialized(scope: _Scope, where: Path, exc: OSError) -> None:
     """Log why ``where`` cannot be entered, unless it is just unprepared.
 
     A missing entry or one that is not a real directory (a symlink included) is
     an unprepared or operator-managed layout, left untouched without a word.
     """
     if exc.errno not in (errno.ENOENT, *_NOT_A_DIRECTORY):
-        logger.warning(
+        _warn(
+            scope,
+            "enter: " + _reason(exc),
             "Cannot materialize Claude workspace resources in %s: %s",
             where,
             _reason(exc),
@@ -699,6 +800,7 @@ def _skip_unmaterialized(where: Path, exc: OSError) -> None:
 def _materialize_resource(
     workspace: Path, root_fd: int, claude_fd: int, name: str
 ) -> None:
+    scope = (str(workspace), name)
     visible = workspace / name
     native = workspace / _CLAUDE_DIR / name
     with ExitStack() as stack:
@@ -706,16 +808,16 @@ def _materialize_resource(
             visible_fd = _open_dir_at(root_fd, name)
             stack.callback(os.close, visible_fd)
         except OSError as exc:
-            _skip_unmaterialized(visible, exc)
+            _skip_unmaterialized(scope, visible, exc)
             return
         try:
             native_fd = _open_dir_at(claude_fd, name)
             stack.callback(os.close, native_fd)
         except OSError as exc:
-            _skip_unmaterialized(native, exc)
+            _skip_unmaterialized(scope, native, exc)
             return
         if _managed(native_fd):
-            _sync_dir(visible_fd, native_fd, visible, native, 0)
+            _sync_dir(visible_fd, native_fd, visible, native, 0, scope)
 
 
 def _materialize(workspace: Path) -> None:
@@ -728,7 +830,9 @@ def _materialize(workspace: Path) -> None:
         try:
             claude_fd = _open_dir_at(root_fd, _CLAUDE_DIR)
         except OSError as exc:
-            _skip_unmaterialized(workspace / _CLAUDE_DIR, exc)
+            _skip_unmaterialized(
+                (str(workspace), _CLAUDE_DIR), workspace / _CLAUDE_DIR, exc
+            )
             return
         stack.callback(os.close, claude_fd)
         for name in _RESOURCE_DIRS:
@@ -751,10 +855,12 @@ def _is_managed_mirror(workspace: Path, kind: str) -> bool:
         return _managed(native_fd)
 
 
-def _skip_uncleared(where: Path, exc: OSError) -> None:
+def _skip_uncleared(scope: _Scope, where: Path, exc: OSError) -> None:
     """Log why ``where`` cannot be entered, unless there is no mirror there."""
     if exc.errno not in (errno.ENOENT, *_NOT_A_DIRECTORY):
-        logger.warning(
+        _warn(
+            scope,
+            "clear: " + _reason(exc),
             "Cannot clear Claude workspace resource mirrors in %s: %s",
             where,
             _reason(exc),
@@ -762,11 +868,12 @@ def _skip_uncleared(where: Path, exc: OSError) -> None:
 
 
 def _clear_mirror(workspace: Path, claude_fd: int, name: str) -> None:
+    scope = (str(workspace), name)
     native = workspace / _CLAUDE_DIR / name
     try:
         native_fd = _open_dir_at(claude_fd, name)
     except OSError as exc:
-        _skip_uncleared(native, exc)
+        _skip_uncleared(scope, native, exc)
         return
     try:
         if not _managed(native_fd):
@@ -774,7 +881,9 @@ def _clear_mirror(workspace: Path, claude_fd: int, name: str) -> None:
         try:
             entries = _scan(native_fd)
         except OSError as exc:
-            logger.warning(
+            _warn(
+                scope,
+                "mirror unreadable: " + _reason(exc),
                 "Cannot read Claude mirror directory %s (%s); leaving it unchanged",
                 native,
                 _reason(exc),
@@ -786,7 +895,9 @@ def _clear_mirror(workspace: Path, claude_fd: int, name: str) -> None:
             try:
                 _remove_at(native_fd, entry)
             except OSError as exc:
-                logger.warning(
+                _warn(
+                    scope,
+                    "clear entry: " + _reason(exc),
                     "Failed to remove Claude mirror entry %s: %s",
                     native / entry,
                     _reason(exc),
@@ -805,14 +916,83 @@ def _clear_managed_mirrors(workspace: Path) -> None:
         try:
             claude_fd = _open_dir_at(root_fd, _CLAUDE_DIR)
         except OSError as exc:
-            _skip_uncleared(workspace / _CLAUDE_DIR, exc)
+            _skip_uncleared((str(workspace), _CLAUDE_DIR), workspace / _CLAUDE_DIR, exc)
             return
         stack.callback(os.close, claude_fd)
         for name in _RESOURCE_DIRS:
             _clear_mirror(workspace, claude_fd, name)
 
 
+# --- one workspace at a time ---------------------------------------------------
+
+
+class _LockEntry:
+    __slots__ = ("lock", "users")
+
+    def __init__(self) -> None:
+        self.lock = threading.RLock()
+        self.users = 0  # threads holding or waiting for ``lock``
+
+
+# One entry per resolved workspace path, present only while a thread holds or
+# waits for its lock -- so the table never outgrows the threads inside it.
+_locks: Dict[str, _LockEntry] = {}
+_locks_guard = threading.Lock()
+
+
+def _lock_key(workspace: Union[str, "os.PathLike[str]"]) -> str:
+    try:
+        return os.path.realpath(os.fspath(workspace))
+    except Exception:  # an odd argument must not make taking the lock raise
+        return repr(workspace)
+
+
+@contextmanager
+def _lock_entry(workspace: Union[str, "os.PathLike[str]"]) -> Iterator[_LockEntry]:
+    key = _lock_key(workspace)
+    with _locks_guard:
+        entry = _locks.get(key)
+        if entry is None:
+            entry = _locks[key] = _LockEntry()
+        entry.users += 1
+    try:
+        yield entry
+    finally:
+        with _locks_guard:
+            entry.users -= 1
+            if not entry.users:
+                _locks.pop(key, None)
+
+
+@contextmanager
+def _workspace_lock_if_free(workspace: Path) -> Iterator[bool]:
+    """:func:`workspace_lock` without waiting: yields whether it was taken."""
+    with _lock_entry(workspace) as entry:
+        taken = entry.lock.acquire(blocking=False)
+        try:
+            yield taken
+        finally:
+            if taken:
+                entry.lock.release()
+
+
 # --- public API ----------------------------------------------------------------
+
+
+@contextmanager
+def workspace_lock(workspace: Path) -> Iterator[None]:
+    """Hold this module's per-workspace lock (reentrant) for the ``with`` body.
+
+    Materialization and :func:`clear_managed_mirrors` run under it, and
+    preparation runs only when it is free, so a caller holding it across clear
+    -> ``posix_acl.grant_tree`` -> materialize knows no other thread re-links the
+    mirror in between (the grant skips files with several names). Keyed by the
+    resolved workspace path, so two spellings of one workspace share it. Taking
+    it never raises; waiting for it is unbounded, so it must not be taken on the
+    event loop.
+    """
+    with _lock_entry(workspace) as entry, entry.lock:
+        yield
 
 
 def prepare_workspace_resources(workspace: Path) -> None:
@@ -821,10 +1001,21 @@ def prepare_workspace_resources(workspace: Path) -> None:
     This is the cheap path used by :class:`WorkspaceManager`. It may run on every
     file-browser poll, so it performs only constant-number filesystem operations
     plus a one-time directory rename for legacy migration. It never raises.
+
+    Resolution runs on the event loop, so this never waits for the workspace
+    lock: while another thread materializes, clears or grants this workspace,
+    preparation is skipped (it is idempotent, and the next resolve repeats it).
     """
     workspace = Path(workspace)
     try:
-        _prepare(workspace)
+        with _workspace_lock_if_free(workspace) as taken:
+            if not taken:
+                logger.debug(
+                    "Claude workspace resources of %s are busy; not preparing now",
+                    workspace,
+                )
+                return
+            _prepare(workspace)
     except Exception:
         logger.warning(
             "Failed to prepare Claude workspace resources in %s",
@@ -839,10 +1030,13 @@ def materialize_workspace_resources(workspace: Path) -> None:
     This is the recursive path and should run immediately before Claude SDK
     discovery/query operations, not on generic workspace/file-browser access.
     Unprepared or operator-managed layouts are left untouched. It never raises.
+    It waits for the workspace lock (:func:`workspace_lock`), so call it off the
+    event loop.
     """
     workspace = Path(workspace)
     try:
-        _materialize(workspace)
+        with workspace_lock(workspace):
+            _materialize(workspace)
     except Exception:
         logger.warning(
             "Failed to materialize Claude workspace resources in %s",
@@ -890,11 +1084,13 @@ def clear_managed_mirrors(workspace: Path) -> None:
     re-links them after the grant (an ACL belongs to the inode, so the mirror
     shares it). Only a managed mirror is emptied, with the same never-following,
     depth-capped removal materialization uses, and never the canonical tree. It
-    never raises.
+    never raises. It takes :func:`workspace_lock`; hold that across clear, grant
+    and materialize so no other thread re-links the mirror in between.
     """
     workspace = Path(workspace)
     try:
-        _clear_managed_mirrors(workspace)
+        with workspace_lock(workspace):
+            _clear_managed_mirrors(workspace)
     except Exception:
         logger.warning(
             "Failed to clear Claude workspace resource mirrors in %s",

@@ -428,12 +428,12 @@ def test_mirror_directory_swapped_for_a_symlink_mid_sync_is_not_followed(
     real = wr._materialize_file
     swapped = []
 
-    def swap_then_materialize(src_dir_fd, dst_dir_fd, name, where):
+    def swap_then_materialize(src_dir_fd, dst_dir_fd, name, where, *rest):
         if not swapped:  # the walk already holds the mirror directory's fd
             mirror.rename(moved)
             mirror.symlink_to(outside, target_is_directory=True)
             swapped.append(name)
-        return real(src_dir_fd, dst_dir_fd, name, where)
+        return real(src_dir_fd, dst_dir_fd, name, where, *rest)
 
     monkeypatch.setattr(wr, "_materialize_file", swap_then_materialize)
     wr.materialize_workspace_resources(workspace)
@@ -461,15 +461,18 @@ def test_canonical_file_swapped_for_a_symlink_mid_sync_is_not_linked(
     secret = tmp_path / "secret.txt"
     secret.write_text("secret\n", encoding="utf-8")
     real = wr._materialize_file
+    swapped = []
 
-    def swap_then_materialize(src_dir_fd, dst_dir_fd, name, where):
+    def swap_then_materialize(src_dir_fd, dst_dir_fd, name, where, *rest):
         source.unlink()
         source.symlink_to(secret)
-        return real(src_dir_fd, dst_dir_fd, name, where)
+        swapped.append(name)
+        return real(src_dir_fd, dst_dir_fd, name, where, *rest)
 
     monkeypatch.setattr(wr, "_materialize_file", swap_then_materialize)
     wr.materialize_workspace_resources(workspace)
 
+    assert swapped == ["SKILL.md"]
     assert os.stat(secret).st_nlink == 1
     assert not os.path.lexists(workspace / ".claude" / "skills" / "review" / "SKILL.md")
 
@@ -948,3 +951,167 @@ def test_mirror_helpers_never_raise(tmp_path, monkeypatch, caplog):
 
     failures = [r for r in caplog.records if r.name == wr.__name__ and r.exc_info]
     assert [str(r.exc_info[1]) for r in failures] == ["unexpected failure"] * 2
+
+
+# --- warnings the session could repeat at will ---------------------------------
+
+
+def _count(caplog, level: int, text: str) -> int:
+    return sum(
+        1 for r in caplog.records if r.levelno == level and text in r.getMessage()
+    )
+
+
+def test_a_refused_marker_warns_once_then_logs_at_debug(tmp_path, caplog, monkeypatch):
+    """Every resolve (file-browser polls too) sees the planted marker again."""
+    monkeypatch.setattr(wr, "_warned", set())
+    workspace = _managed_workspace(tmp_path)
+    marker = workspace / ".claude" / "skills" / MARKER
+    marker.unlink()
+    marker.symlink_to(tmp_path / "nowhere")
+    other = tmp_path / "other"
+    other.mkdir()
+    ensure_workspace_resources(other)
+    (other / ".claude" / "skills" / MARKER).unlink()
+    (other / ".claude" / "skills" / MARKER).symlink_to(tmp_path / "nowhere")
+
+    with caplog.at_level(logging.DEBUG, logger=wr.__name__):
+        for _ in range(5):
+            wr.prepare_workspace_resources(workspace)
+        wr.prepare_workspace_resources(other)
+
+    # Once for each workspace (the second one warns on its own), debug after.
+    assert _count(caplog, logging.WARNING, "Refusing Claude resource marker") == 2
+    assert _count(caplog, logging.WARNING, "leaving both unchanged") == 2
+    assert _count(caplog, logging.DEBUG, "Refusing Claude resource marker") == 4
+    assert _count(caplog, logging.DEBUG, "leaving both unchanged") == 4
+
+
+def test_warned_reasons_are_a_bounded_set(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(wr, "_warned", set())
+    monkeypatch.setattr(wr, "_WARNED_MAX", 3)
+
+    with caplog.at_level(logging.DEBUG, logger=wr.__name__):
+        for i in range(5):
+            scope = (str(tmp_path / f"w{i}"), "skills")
+            wr._warn(scope, "conflict", "conflict in %s", scope[0])
+            wr._warn(scope, "conflict", "conflict in %s", scope[0])
+
+    assert _count(caplog, logging.WARNING, "conflict in") == 5
+    assert _count(caplog, logging.DEBUG, "conflict in") == 5
+    assert len(wr._warned) <= 3
+
+
+# --- one workspace at a time: clear -> grant -> materialize ---------------------
+
+
+def _finishes(fn, timeout: float = 5.0) -> bool:
+    """Run ``fn`` in a thread: whether it returned in time (its error re-raised)."""
+    outcome = {}
+
+    def run():
+        try:
+            fn()
+        except BaseException as exc:  # re-raised in the test thread
+            outcome["error"] = exc
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if "error" in outcome:
+        raise outcome["error"]
+    return not worker.is_alive()
+
+
+@pytest.mark.parametrize(
+    "call", ["materialize_workspace_resources", "clear_managed_mirrors"]
+)
+def test_mirror_work_from_another_thread_waits_for_the_workspace_lock(tmp_path, call):
+    workspace = _managed_workspace(tmp_path)
+    _write(workspace / "skills" / "review" / "SKILL.md", "skill\n")
+    if call == "clear_managed_mirrors":
+        ensure_workspace_resources(workspace)  # a mirror to clear
+    mirrored = workspace / ".claude" / "skills" / "review" / "SKILL.md"
+    before = mirrored.exists()
+    alias = tmp_path / "alias"
+    alias.symlink_to(workspace, target_is_directory=True)
+    done = threading.Event()
+
+    def work():
+        getattr(wr, call)(workspace)
+        done.set()
+
+    worker = threading.Thread(target=work, daemon=True)
+    with wr.workspace_lock(alias):  # another spelling of the same workspace
+        worker.start()
+        assert not done.wait(0.3)
+        assert mirrored.exists() == before  # nothing re-linked or cleared yet
+    assert done.wait(5.0)
+    worker.join(5.0)
+
+    assert mirrored.exists() != before
+    assert wr._locks == {}
+
+
+def test_the_lock_holder_can_clear_and_materialize_inside_it(tmp_path):
+    """The grant sequence holds the lock across both calls: it is reentrant."""
+    workspace = _managed_workspace(tmp_path)
+    source = workspace / "skills" / "review" / "SKILL.md"
+    _write(source, "skill\n")
+    ensure_workspace_resources(workspace)
+    links_seen_by_the_grant = []
+
+    def grant_sequence():
+        with wr.workspace_lock(workspace):
+            wr.clear_managed_mirrors(workspace)
+            links_seen_by_the_grant.append(os.stat(source).st_nlink)
+            wr.materialize_workspace_resources(workspace)
+
+    assert _finishes(grant_sequence)
+    assert links_seen_by_the_grant == [1]
+    assert os.stat(source).st_nlink == 2
+
+
+def test_prepare_skips_instead_of_waiting_while_another_thread_holds_the_lock(
+    tmp_path,
+):
+    """Resolution runs on the event loop: it must never wait for the lock."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    held, release = threading.Event(), threading.Event()
+
+    def holder():
+        with wr.workspace_lock(workspace):
+            held.set()
+            release.wait(10.0)
+
+    thread = threading.Thread(target=holder, daemon=True)
+    thread.start()
+    assert held.wait(5.0)
+    try:
+        assert _finishes(lambda: wr.prepare_workspace_resources(workspace), 2.0)
+        assert not (workspace / "skills").exists()  # skipped, not waited for
+    finally:
+        release.set()
+        thread.join(5.0)
+
+    with wr.workspace_lock(workspace):  # its own holder is not kept out
+        wr.prepare_workspace_resources(workspace)
+    assert (workspace / "skills").is_dir()
+    assert (workspace / ".claude" / "skills" / MARKER).is_file()
+
+
+def test_workspace_lock_never_raises_and_leaves_no_entries(tmp_path):
+    for odd in (None, 42, tmp_path / "missing", "relative/path"):
+        with wr.workspace_lock(odd):
+            pass
+    with pytest.raises(RuntimeError, match="the body's own error"):
+        with wr.workspace_lock(tmp_path):
+            raise RuntimeError("the body's own error")
+
+    def take():
+        with wr.workspace_lock(tmp_path):
+            pass
+
+    assert _finishes(take)  # released despite the error
+    assert wr._locks == {}
