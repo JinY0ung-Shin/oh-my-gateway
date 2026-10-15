@@ -191,15 +191,23 @@ def _session_owned_uids(app_uid: int) -> Container[int]:
     (``uid_isolation.uid_range()``), and every uid its registry records: after
     the band is narrowed a named user's uid can lie outside it, and the gateway
     refuses to start over that user only after this step has run. Minus
-    ``reserved_uids()``, i.e. root, the app uid and the broker uid, so an entry
-    this step must repair is never taken for a session's. None in any other
-    mode: those sessions run as the app uid, and a mode change hands uid
-    mode's leftovers back to it.
+    ``reserved_uids()``, i.e. root, the app uid and gid and the broker uid and
+    gid, so an entry this step must repair is never taken for a session's. (No
+    session ever ran as one of those gids: the broker refuses them as a uid.)
+    None in any other mode: those sessions run as the app uid, and a mode
+    change hands uid mode's leftovers back to it.
     """
     if not _uid_mode():
         return ()
     lo, hi = _session_uid_band()
-    reserved = {0, app_uid, _gateway_int(BROKER_UID_ENV, DEFAULT_BROKER_UID)}
+    app_gid = _gateway_int("APP_GID", DEFAULT_GID)
+    reserved = {
+        0,
+        app_uid,
+        app_gid,
+        _gateway_int(BROKER_UID_ENV, DEFAULT_BROKER_UID),
+        _gateway_int("CLAUDE_ISOLATION_BROKER_GID", app_gid),
+    }
     return _UidBand(lo, hi, reserved, _registry_uids())
 
 
@@ -657,9 +665,11 @@ def _wait_for_broker(
 def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     """Fork the resident broker before privilege drop. No-op unless uid mode.
 
-    Generates the ticket secret (if unset) and exports it, the socket path and
-    the real CLI into the environment the gateway (exec'd next) inherits, so the
-    gateway can mint tickets the broker verifies.
+    Generates the ticket secret (if unset) into the environment the broker
+    inherits, and exports the socket path and the real CLI for the gateway
+    (exec'd next). :func:`main` then moves the secret out of that environment
+    into a pipe for the gateway (:func:`hand_off_ticket_secret`), so the gateway
+    can mint tickets the broker verifies.
     """
     if not _uid_mode():
         return
@@ -726,6 +736,87 @@ def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
         os._exit(78)
 
 
+# The gateway's copy of the ticket secret travels in an inherited pipe named by
+# TICKET_SECRET_FD_ENV, not in the environment (uid_isolation reads it at
+# startup: capture_ticket_secret).
+TICKET_SECRET_ENV = "GATEWAY_ISOLATION_TICKET_SECRET"
+TICKET_SECRET_FD_ENV = "GATEWAY_ISOLATION_TICKET_SECRET_FD"
+# Linux's PIPE_BUF, and a pipe holds at least one page: a write this small into
+# a fresh pipe is atomic and never blocks, though nothing reads it until the
+# gateway starts. uid_isolation refuses a pipe holding more.
+MAX_TICKET_SECRET_BYTES = 4096
+
+
+def hand_off_ticket_secret() -> None:
+    """Move the ticket secret from the environment into a pipe for the gateway.
+
+    Everything the image CMD runs before uvicorn (the ``sh -c`` wrapper,
+    ``GATEWAY_STARTUP_SCRIPT``, ``install_plugins.py`` and its git and
+    ``claude plugin`` children) would otherwise inherit the secret while the
+    broker already accepts tickets signed with it, and uvicorn's exec-time
+    environment would keep a copy. Instead the secret is written to a pipe
+    whose write end is closed here; only the read end is inherited across the
+    exec, and the gateway reads and closes it at startup. The variable names
+    the pipe's number, device and inode (``<fd>:<dev>:<ino>``), so a process
+    that inherits only the variable (a ``uvicorn --workers``/``--reload``
+    worker) never reads a descriptor of its own by mistake. The CMD steps still
+    inherit the descriptor: one that reads it by accident consumes the secret,
+    the gateway then finds the pipe empty and uid mode refuses to start. A step
+    that means harm could read it and write it back unnoticed, but it runs as
+    the app uid, which can already rewrite the gateway's code: this is hygiene,
+    not a boundary. Python ``subprocess`` children (git, ``claude plugin``)
+    never get it, since they close inherited descriptors.
+
+    Runs for root and non-root starts alike, whenever the variable holds a
+    secret: the one :func:`launch_isolation_broker` generated or an operator's.
+    The broker was forked before this and keeps its own copy. A secret too large
+    to write without blocking stops the container rather than exec the command
+    with it in the environment: uid mode needs the secret, and the default one
+    is 64 characters.
+    """
+    secret = os.environ.get(TICKET_SECRET_ENV)
+    if secret is None or not secret.strip():
+        return
+    data = secret.encode("utf-8", "surrogateescape")
+    if len(data) > MAX_TICKET_SECRET_BYTES:
+        raise SystemExit(
+            f"{TICKET_SECRET_ENV} is {len(data)} bytes; the entrypoint hands it "
+            f"to the gateway through a pipe and accepts at most "
+            f"{MAX_TICKET_SECRET_BYTES}. Use a shorter secret, or leave it unset "
+            "so uid mode generates one."
+        )
+    import fcntl
+
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError as exc:
+        raise SystemExit(f"cannot hand {TICKET_SECRET_ENV} to the gateway: {exc}")
+    try:
+        try:
+            os.set_blocking(write_fd, False)
+            if os.write(write_fd, data) != len(data):
+                raise OSError(errno.EAGAIN, "short write")
+        finally:
+            os.close(write_fd)
+        if read_fd <= 2:
+            # A closed stdin/stdout/stderr gave the pipe a stdio number: the
+            # command would read (or write) the secret as one of its streams.
+            moved = fcntl.fcntl(read_fd, fcntl.F_DUPFD_CLOEXEC, 3)
+            os.close(read_fd)
+            read_fd = moved
+        os.set_inheritable(read_fd, True)
+        pipe = os.fstat(read_fd)
+    except OSError as exc:
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+        raise SystemExit(f"cannot hand {TICKET_SECRET_ENV} to the gateway: {exc}")
+    # uid_isolation._parse_secret_fd reads this exact shape.
+    os.environ[TICKET_SECRET_FD_ENV] = f"{read_fd}:{pipe.st_dev}:{pipe.st_ino}"
+    del os.environ[TICKET_SECRET_ENV]
+
+
 def main(argv: list[str]) -> None:
     if not argv:
         raise SystemExit("no command provided")
@@ -738,6 +829,7 @@ def main(argv: list[str]) -> None:
         launch_isolation_broker(uid, gid)  # before the drop; no-op unless uid mode
         drop_privileges(uid, gid)
 
+    hand_off_ticket_secret()
     os.execvp(argv[0], argv)
 
 

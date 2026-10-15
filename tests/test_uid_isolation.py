@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -31,13 +32,17 @@ def _clean(monkeypatch):
         ui.UID_REGISTRY_ENV,
         ui.EPHEMERAL_UIDS_ENV,
         ui.BROKER_UID_ENV,
+        ui.BROKER_GID_ENV,
         ui.TICKET_SECRET_ENV,
         "APP_UID",
+        "APP_GID",
     ):
         monkeypatch.delenv(var, raising=False)
     # Reset the module-level registry + ephemeral-pool caches between tests.
     monkeypatch.setattr(ui, "_registry", None)
     monkeypatch.setattr(ui, "_ephemeral_pool", None)
+    yield
+    ui._release_registry_lock()  # the lock a get_registry() call took
 
 
 class TestUidRange:
@@ -504,7 +509,7 @@ class TestEphemeralLeases:
         ws.rmdir()
         wm.cleanup_temp_workspace(ws)
         assert ui.get_ephemeral_pool().release(os.path.abspath(ws)) is None
-        assert uid in ui.get_ephemeral_pool()._free
+        assert ui.get_ephemeral_pool().is_free(uid)
 
     def test_a_workspace_cleanup_cannot_remove_keeps_its_lease(
         self, uid_env, monkeypatch, tmp_path
@@ -577,6 +582,372 @@ class TestBandsReview2:
         monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "1")
         monkeypatch.setenv(ui.BROKER_UID_ENV, "20003")  # the only ephemeral uid
         assert any("ephemeral" in e for e in ui.validate_bands())
+
+
+class TestBandsWithoutMaterializing:
+    """PR #244 follow-up: no band is ever listed (a wide one ran the gateway out
+    of memory), and no session can be mapped to (uid_t)-1."""
+
+    # Loads uid_isolation by path (stdlib only) under a 1 GiB address-space
+    # cap: listing the band would need tens of GiB and fail with MemoryError
+    # there instead of taking the test run down.
+    _CHILD = (
+        "import importlib.util, os, resource, sys\n"
+        "from pathlib import Path\n"
+        "resource.setrlimit(resource.RLIMIT_AS, (1 << 30, 1 << 30))\n"
+        "spec = importlib.util.spec_from_file_location('ui_child', sys.argv[1])\n"
+        "ui = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(ui)\n"
+        "os.environ[ui.UID_MIN_ENV] = '1'\n"
+        "os.environ[ui.UID_MAX_ENV] = str(ui._MAX_ID)\n"
+        "print(ui.validate_bands())\n"  # a huge stable band
+        "reg = ui.UidRegistry(\n"
+        "    Path(sys.argv[2]), *ui._stable_band(), ui.reserved_uids()\n"
+        ")\n"
+        "print(reg.resolve('x'))\n"
+        "os.environ[ui.EPHEMERAL_UIDS_ENV] = str(ui._MAX_ID - 10)\n"
+        "print(ui.validate_bands(), ui._ephemeral_count())\n"  # capped
+        "pool = ui._EphemeralPool(11, ui._MAX_ID, ui.reserved_uids())\n"  # huge
+        "print(pool.resolve('a'), pool.resolve('b'), pool._capacity)\n"
+    )
+
+    def test_a_huge_band_validates_and_leases_in_bounded_memory(self, tmp_path):
+        out = subprocess.run(
+            [sys.executable, "-c", self._CHILD, ui.__file__, str(tmp_path / "u")],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        assert out.returncode == 0, out.stderr
+        # Ephemeral band [11, _MAX_ID]: the app and broker uids inside it are
+        # skipped, and the capacity is counted, not listed.
+        assert out.stdout.split("\n")[:4] == [
+            "[]",
+            "1",
+            f"[] {ui._MAX_EPHEMERAL}",
+            f"11 12 {ui._MAX_ID - 12}",
+        ]
+
+    def test_the_ephemeral_slice_is_capped(self, monkeypatch, caplog):
+        # Released uids queue until the never-used ones run out, so the pool's
+        # memory follows its size: CLAUDE_ISOLATION_EPHEMERAL_UIDS is capped.
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, str(20000 + 10 * ui._MAX_EPHEMERAL))
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, str(5 * ui._MAX_EPHEMERAL))
+        assert ui._ephemeral_count() == ui._MAX_EPHEMERAL
+        lo, hi = ui._ephemeral_band()
+        assert hi - lo + 1 == ui._MAX_EPHEMERAL
+        with caplog.at_level(logging.WARNING, logger=ui.__name__):
+            assert ui.validate_bands() == []
+        assert f"is above the maximum {ui._MAX_EPHEMERAL}" in caplog.text
+
+    def test_a_band_reaching_uid_t_minus_one_refuses(self, monkeypatch):
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, str(ui._MAX_ID + 1))
+        errs = ui.validate_bands()
+        assert len(errs) == 1 and f"above {ui._MAX_ID}" in errs[0]
+        monkeypatch.setenv(ui.UID_MAX_ENV, str(ui._MAX_ID))
+        assert ui.validate_bands() == []
+
+    def test_the_pool_skips_excluded_uids_in_order(self, tmp_path):
+        pool = ui._EphemeralPool(20000, 20004, {20001, 20003, 5})
+        a, b, c, d = (TestEphemeralLeases._ws(tmp_path, n) for n in "abcd")
+        assert [pool.resolve(k) for k in (a, b, c)] == [20000, 20002, 20004]
+        with pytest.raises(ui.UidAllocationError, match="all 3 ephemeral uids"):
+            pool.resolve(d)
+        assert not pool.is_free(20001)  # excluded, never a pool uid
+        assert not pool.is_free(20002)  # leased
+        pool.release(b)
+        assert pool.is_free(20002)
+        assert pool.resolve(d) == 20002
+
+    def test_an_all_excluded_pool_refuses(self):
+        pool = ui._EphemeralPool(20000, 20001, {20000, 20001})
+        with pytest.raises(ui.UidAllocationError, match="no ephemeral uids"):
+            pool.resolve("a")
+
+
+class TestReservedGids:
+    """PR #244 follow-up: the broker refuses a uid or gid equal to APP_GID or its
+    own gid, and a session's gid is its uid, so the allocator must never hand
+    one of those ids out (it used to, and persisted it)."""
+
+    def test_app_and_broker_ids_are_reserved(self, monkeypatch):
+        monkeypatch.setenv("APP_UID", "1000")
+        monkeypatch.setenv("APP_GID", "20000")
+        monkeypatch.setenv(ui.BROKER_GID_ENV, "20002")
+        assert ui.reserved_uids() == {0, 1000, 20000, 20002, ui._DEFAULT_BROKER_UID}
+
+    def test_the_broker_gid_defaults_to_the_app_gid(self, monkeypatch):
+        monkeypatch.setenv("APP_GID", "20003")
+        assert ui.reserved_uids() == {0, 1000, 20003, ui._DEFAULT_BROKER_UID}
+
+    def test_gids_inside_the_band_are_never_allocated(self, monkeypatch, tmp_path):
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20010")
+        monkeypatch.setenv(ui.EPHEMERAL_UIDS_ENV, "3")  # ephemeral [20008, 20010]
+        monkeypatch.setenv("APP_GID", "20000")
+        monkeypatch.setenv(ui.BROKER_GID_ENV, "20008")
+        assert ui.resolve_uid("alice") == 20001
+        anon = {ui.resolve_uid(key, persist=False) for key in ("a", "b")}
+        assert anon == {20009, 20010}
+        with pytest.raises(ui.UidAllocationError):
+            ui.resolve_uid("c", persist=False)
+
+    def test_a_persisted_uid_on_the_app_gid_is_held_and_named(
+        self, monkeypatch, tmp_path
+    ):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({"alice": 20000, "bob": 20001}))
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20010")
+        monkeypatch.setenv("APP_GID", "20000")
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and "cannot honor (1 on a reserved id" in errs[0]
+        assert "APP_GID" in errs[0] and "cannot work" in errs[0]
+        assert "(uid 20000)" in errs[0]
+        assert "alice" not in errs[0]  # the uid, never the user key
+        with pytest.raises(ui.UidAllocationError, match="on a reserved id"):
+            ui.resolve_uid("alice")
+        assert ui.resolve_uid("bob") == 20001
+
+    def test_held_entries_are_counted_per_reason(self, tmp_path):
+        path = tmp_path / "uids.json"
+        held = {"r": 20002, "o1": 31000, "o2": 0, "s1": 20003, "s2": 20003, "m": "x"}
+        path.write_text(json.dumps(held))
+        reg = ui.UidRegistry(path, 20000, 20005, reserved={0, 20002})
+        assert reg.describe_held() == (
+            "2 on a reserved id (root, the gateway's uid/gid or the broker's "
+            "uid/gid: [0, 20002]), which the broker refuses (uids 0, 20002); "
+            "1 outside the stable band [20000, 20005] (uid 31000); "
+            "2 sharing a uid with another user (uid 20003); 1 not an integer uid"
+        )
+        assert reg.held_reasons() == ["reserved", "outside", "shared", "malformed"]
+
+    def test_describe_held_names_ten_uids_per_reason_and_no_keys(self, tmp_path):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps({f"user{i}@corp": 40000 + i for i in range(12)}))
+        reg = ui.UidRegistry(path, 20000, 20005)
+        text = reg.describe_held()
+        assert text.startswith(
+            "12 outside the stable band [20000, 20005] (uids 40000, 40001, "
+        )
+        assert text.endswith("40009 and 2 more)")
+        assert "@corp" not in text
+
+    @pytest.mark.parametrize(
+        "held, remedy",
+        [
+            ({"a": 31000}, "move the entry into the stable band"),
+            ({"a": 20001, "b": 20001}, "a uid of its own"),
+            ({"a": "x"}, "fix or remove the entry"),
+        ],
+        ids=["outside", "shared", "malformed"],
+    )
+    def test_the_startup_error_names_the_fix_for_each_reason(
+        self, monkeypatch, tmp_path, held, remedy
+    ):
+        path = tmp_path / "uids.json"
+        path.write_text(json.dumps(held))
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        monkeypatch.setenv(ui.UID_MIN_ENV, "20000")
+        monkeypatch.setenv(ui.UID_MAX_ENV, "20010")
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and remedy in errs[0]
+        assert "cannot work" not in errs[0]  # only for a reserved id
+
+    def test_a_gid_inside_the_band_warns(self, monkeypatch, caplog):
+        monkeypatch.setenv("APP_GID", "20005")
+        with caplog.at_level(logging.WARNING, logger=ui.__name__):
+            assert ui.validate_bands() == []
+        assert "broker gid/gateway app gid 20005 falls inside" in caplog.text
+
+
+class TestRegistrySingleProcess:
+    """PR #244 follow-up: each gateway process allocates from its own copy of
+    the registry, so a second process on the same one (uvicorn --workers,
+    replicas sharing the data volume) refuses uid mode instead of handing two
+    users one uid."""
+
+    # Another gateway process: uid_isolation loaded by path, holding the
+    # registry until its stdin closes.
+    _OTHER = (
+        "import importlib.util, sys\n"
+        "spec = importlib.util.spec_from_file_location('ui_other', sys.argv[1])\n"
+        "ui = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(ui)\n"
+        "ui.resolve_uid('alice')\n"
+        "print('holding', flush=True)\n"
+        "sys.stdin.read()\n"
+    )
+    _PROBE = (
+        "import fcntl, os, sys\n"
+        "fd = os.open(sys.argv[1], os.O_RDONLY)\n"
+        "try:\n"
+        "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+        "except BlockingIOError:\n"
+        "    print('held')\n"
+        "else:\n"
+        "    print('free')\n"
+    )
+
+    @pytest.fixture
+    def other_gateway(self, monkeypatch, tmp_path):
+        path = tmp_path / "data" / "uids.json"
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", self._OTHER, ui.__file__],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert proc.stdout.readline().strip() == "holding"
+            yield path, proc
+        finally:
+            proc.stdin.close()
+            proc.wait(timeout=30)
+            proc.stdout.close()
+
+    def _probe(self, lock: Path) -> str:
+        out = subprocess.run(
+            [sys.executable, "-c", self._PROBE, str(lock)],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return out.stdout.strip()
+
+    def test_a_second_process_fails_every_path_closed(self, other_gateway):
+        path, _proc = other_gateway
+        errs = ui.registry_errors()
+        assert len(errs) == 1
+        assert "another gateway process holds the uid registry" in errs[0]
+        assert f"{path}.lock" in errs[0] and "--workers" in errs[0]
+        for spawn in (
+            lambda: ui.resolve_uid("bob"),
+            lambda: ui.existing_uid("alice"),
+            lambda: ui.resolve_uid("/ws/anon", persist=False),
+        ):
+            with pytest.raises(ui.UidAllocationError, match="another gateway"):
+                spawn()
+        assert json.loads(path.read_text()) == {"alice": 20000}  # untouched
+
+    def test_the_startup_check_refuses(self, other_gateway, monkeypatch):
+        from src import config_check
+        from src.backends.claude import landlock
+
+        monkeypatch.setattr(landlock, "isolation_mode", lambda: "uid")
+        monkeypatch.setattr(landlock, "effective_mode", lambda: "uid")
+        issues = config_check._check_uid_registry()
+        assert len(issues) == 1 and issues[0].severity == "error"
+        assert "another gateway process" in issues[0].message
+
+    def test_the_lock_is_taken_once_the_other_process_exits(self, other_gateway):
+        _path, proc = other_gateway
+        assert ui.registry_errors()
+        proc.stdin.close()
+        proc.wait(timeout=30)
+        assert ui.registry_errors() == []
+        assert ui.resolve_uid("alice") == 20000  # its grant, read from disk
+        assert ui.resolve_uid("bob") == 20001
+
+    def test_this_process_holds_it_until_reset(self, monkeypatch, tmp_path):
+        path = tmp_path / "uids.json"
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        lock = tmp_path / "uids.json.lock"
+        assert ui.resolve_uid("alice") == 20000
+        assert stat.S_IMODE(lock.stat().st_mode) == 0o600
+        assert self._probe(lock) == "held"
+        assert ui.existing_uid("alice") == 20000  # the same process: no conflict
+        ui.reset_registry_cache()
+        assert self._probe(lock) == "free"
+        assert ui.resolve_uid("alice") == 20000
+        assert self._probe(lock) == "held"
+
+    def test_the_lock_is_opened_read_write(self, monkeypatch, tmp_path):
+        # NFS emulates flock with a POSIX write lock, which needs a descriptor
+        # open for writing: read-only is only the fallback.
+        import fcntl
+
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
+        assert ui.registry_errors() == []
+        fd = ui._held_registry_lock[1]
+        assert fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE == os.O_RDWR
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file modes")
+    def test_a_lock_file_the_gateway_can_only_read_still_locks(
+        self, monkeypatch, tmp_path
+    ):
+        # flock needs no write access locally: an existing read-only lock file
+        # (say, pre-created by an operator) must not refuse uid mode.
+        path = tmp_path / "uids.json"
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        lock = tmp_path / "uids.json.lock"
+        lock.write_text("")
+        lock.chmod(0o400)
+        assert ui.registry_errors() == []
+        assert self._probe(lock) == "held"
+
+    def test_a_planted_fifo_refuses_without_hanging(self, monkeypatch, tmp_path):
+        path = tmp_path / "uids.json"
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        os.mkfifo(tmp_path / "uids.json.lock")
+
+        def _hung(*_args):
+            raise TimeoutError("opening the lock blocked on a FIFO")
+
+        previous = signal.signal(signal.SIGALRM, _hung)
+        signal.alarm(10)
+        try:
+            errs = ui.registry_errors()
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, previous)
+        assert len(errs) == 1 and "is not a regular file" in errs[0]
+
+    def test_a_lock_refused_by_nfs_names_the_cause(self, monkeypatch, tmp_path):
+        import errno
+        import fcntl
+
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tmp_path / "uids.json"))
+
+        def _ebadf(_fd, _op):
+            raise OSError(errno.EBADF, "Bad file descriptor")
+
+        monkeypatch.setattr(fcntl, "flock", _ebadf)
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and "cannot lock the uid registry" in errs[0]
+        assert "over NFS" in errs[0]
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory modes")
+    def test_an_unwritable_directory_without_a_lock_names_the_fix(
+        self, monkeypatch, tmp_path
+    ):
+        data = tmp_path / "data"
+        data.mkdir()
+        path = data / "uids.json"
+        path.write_text(json.dumps({"alice": 20000}))
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        data.chmod(0o500)
+        try:
+            errs = ui.registry_errors()
+        finally:
+            data.chmod(0o700)
+        assert len(errs) == 1 and "cannot open the uid registry lock" in errs[0]
+        assert "create the lock file once" in errs[0]
+
+    def test_a_planted_lock_symlink_refuses(self, monkeypatch, tmp_path):
+        path = tmp_path / "uids.json"
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(path))
+        victim = tmp_path / "victim"
+        victim.write_text("keep")
+        (tmp_path / "uids.json.lock").symlink_to(victim)
+        errs = ui.registry_errors()
+        assert len(errs) == 1 and "cannot open the uid registry lock" in errs[0]
+        assert victim.read_text() == "keep"
 
 
 class TestTicketSecretCapture:

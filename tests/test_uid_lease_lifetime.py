@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -458,7 +459,8 @@ class TestVerify:
 
         def build(self, max_turns, cwd=None, **_kwargs):
             _lease(cwd)  # what options_env does for this spawn in uid mode
-            return object()
+            # Nothing for argv_files.externalize() to move out of the argv.
+            return SimpleNamespace(cwd=cwd, mcp_servers={}, system_prompt=None)
 
         monkeypatch.setattr(client_module, "query", fake_query)
         monkeypatch.setattr(landlock, "effective_mode", lambda: "uid")

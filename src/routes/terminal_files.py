@@ -61,7 +61,9 @@ Claude Code's own discovery (see ``backends.claude.workspace_resources``). So
 while the copy the user actually edits stays listable and writable;
 ``WORKSPACE_HIDE_DOTFILES`` reaches that mirror too, but only on its way to
 hiding everything else as well. Neither switch touches the agent process: it
-reads the workspace directly, not through this API.
+reads the workspace directly, not through this API. Whatever the switches, the
+API never lists or serves the Claude backend's per-spawn ``.gateway-argv-*``
+files (``backends.claude.argv_files``).
 - ``USER_WORKSPACE_QUOTA_MB`` — optional cumulative quota for a named user's whole
   ``<base>/<user>`` tree, across backend directories. ``0``/unset = unlimited.
 - ``ARCHIVE_MAX_CONCURRENT`` (default 4) / ``ARCHIVE_MAX_PER_USER`` (default 2) —
@@ -132,6 +134,7 @@ from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
 from src.auth import auth_manager, security, verify_api_key
+from src.backends.claude.argv_files import PREFIX as _ARGV_FILE_PREFIX
 from src.runtime_config import get_workspace_upload_max_bytes
 from src.workspace_manager import workspace_manager
 from src.workspace_quota import (
@@ -263,9 +266,17 @@ def _hide_claude_prefix() -> bool:
 
 
 def _hidden_name(name: str, *, hide_dotfiles: bool, hide_claude_prefix: bool) -> bool:
-    """Whether one path component is hidden by the current workspace policy."""
-    return (hide_dotfiles and name.startswith(".")) or (
-        hide_claude_prefix and name.startswith(".claude")
+    """Whether one path component is hidden by the current workspace policy.
+
+    The per-spawn argv files the Claude backend writes into a workspace
+    (``src/backends/claude/argv_files.py``) are hidden whatever the policy: they
+    are gateway-internal, exist only while a CLI starts, and one a crashed
+    gateway left behind holds that spawn's MCP config and system prompt.
+    """
+    return (
+        name.startswith(_ARGV_FILE_PREFIX)
+        or (hide_dotfiles and name.startswith("."))
+        or (hide_claude_prefix and name.startswith(".claude"))
     )
 
 
@@ -494,19 +505,23 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
         )
     hide_dot = _hide_dotfiles()
     hide_claude = _hide_claude_prefix()
-    if hide_dot or hide_claude:
-        requested_relative = _lexical_relative_path(root, rel)
+    # Checked even with both switches off: argv files are always hidden.
+    requested_relative = _lexical_relative_path(root, rel)
+    try:
         resolved_relative = target.relative_to(root.resolve())
-        if _hidden_relative_path(
-            requested_relative,
-            hide_dotfiles=hide_dot,
-            hide_claude_prefix=hide_claude,
-        ) or _hidden_relative_path(
-            resolved_relative,
-            hide_dotfiles=hide_dot,
-            hide_claude_prefix=hide_claude,
-        ):
-            raise HTTPException(status_code=404, detail="not found")
+    except (ValueError, OSError, RuntimeError):
+        # The root moved since _resolve_in_root checked it.
+        raise HTTPException(status_code=404, detail="not found")
+    if _hidden_relative_path(
+        requested_relative,
+        hide_dotfiles=hide_dot,
+        hide_claude_prefix=hide_claude,
+    ) or _hidden_relative_path(
+        resolved_relative,
+        hide_dotfiles=hide_dot,
+        hide_claude_prefix=hide_claude,
+    ):
+        raise HTTPException(status_code=404, detail="not found")
     return target
 
 
@@ -857,7 +872,8 @@ async def search_files(
 
     Case-insensitive substring match on entry names. Hidden entries follow
     the same rule as listing (dot-prefixed components, or only names starting
-    with ``.claude`` when that narrower switch is enabled, are pruned), symlinks
+    with ``.claude`` when that narrower switch is enabled, are pruned, and the
+    gateway's argv files always are), symlinks
     are skipped like the archive walk, and results are capped
     at ``limit`` (1-200) with a ``truncated`` flag. Name-prefix matches sort
     before substring matches, shallower paths before deeper ones.
@@ -884,16 +900,15 @@ async def search_files(
         scan_capped = False
 
         for dirpath, dirnames, filenames in os.walk(root_resolved):
-            if hide_dot or hide_claude:
-                dirnames[:] = [
-                    d
-                    for d in dirnames
-                    if not _hidden_name(
-                        d,
-                        hide_dotfiles=hide_dot,
-                        hide_claude_prefix=hide_claude,
-                    )
-                ]
+            dirnames[:] = [
+                d
+                for d in dirnames
+                if not _hidden_name(
+                    d,
+                    hide_dotfiles=hide_dot,
+                    hide_claude_prefix=hide_claude,
+                )
+            ]
             dirnames.sort()
             base = Path(dirpath)
             candidates = [(d, True) for d in dirnames] + [

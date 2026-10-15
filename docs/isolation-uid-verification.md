@@ -39,7 +39,7 @@
       만든다). 없으면 세션의 `whoami`가 실패한다.
       세 uid 대역(app 1000·브로커·사용자)은 서로 겹치지 않는다. 브로커 gid는 기본값이 APP_GID다
       (소켓 그룹이라 의도된 것이다). 브로커는 uid와 gid 모두에서 0·APP_UID·APP_GID·자기 uid/gid를
-      세션에 주지 않는다.
+      세션에 주지 않고, 게이트웨이의 uid 할당도 같은 id를 건너뛴다(세션 gid = uid).
 - [ ] 커널 Landlock **ABI ≥ 3**(≥ 6.2; ABI 2는 truncate를 못 막아 기동 거부). `scripts/isolation_probe.py`의 `=> Landlock usable (ABI>=3)` 확인.
       프로브 스크립트는 이미지에 들어 있지 않으니(`scripts/`를 복사하지 않는다) `docker cp`로 넣어
       실행한다. ABI ≥ 6이면 시그널·추상 유닉스 소켓 scoping도 켜진다.
@@ -100,14 +100,18 @@
 - [ ] 브로커 소켓이 `0660`(그룹=게이트웨이 gid)이고 디렉터리가 `0750`(브로커 소유)이라,
       게이트웨이 uid 런처가 **그룹 권한으로 연결**된다(세계-쓰기 아님). 세션 uid는 Landlock
       룰셋에 소켓 경로가 없어 애초에 못 닿는다.
-- [ ] 게이트웨이 본체 `CapEff`는 **0**이고 non-dumpable이며, `/proc/<gateway>/environ`이 아닌
-      런타임 환경(`os.environ`)에는 `GATEWAY_ISOLATION_TICKET_SECRET`이 없다(기동 때 메모리로 옮김).
+- [ ] 게이트웨이 본체 `CapEff`는 **0**이고 non-dumpable이다. 티켓 시크릿은 환경변수가 아니라 pipe로 온다:
+      root로 본 `/proc/<gateway>/environ`(exec 시점 환경)에 `GATEWAY_ISOLATION_TICKET_SECRET`이 없고
+      `GATEWAY_ISOLATION_TICKET_SECRET_FD=<fd>:<dev>:<ino>`만 있으며, 게이트웨이 로그에 "ticket secret pipe … was
+      empty" 경고가 없다. CMD 단계(`sh -c`, `install_plugins.py`)의 environ에도 시크릿이 없다.
 - [ ] 일부러 불가능하게 만들면 기동이 **거부**되거나, `CLAUDE_ISOLATION_FALLBACK=landlock`일 때만
       경고와 함께 landlock으로 내려간다. 시험할 조건:
       - 브로커 소켓 지우기;
       - ABI<3 커널(5.19–6.1의 ABI 2 포함);
       - 손상된 `isolation_uids.json`(아주 깊게 중첩된 JSON도 traceback 없이 같은 손상 오류다);
       - 대역을 좁혀 기존 사용자 uid가 대역 밖이 된 레지스트리;
+      - `CLAUDE_ISOLATION_UID_MAX=4294967295`(상한 초과), `APP_GID`를 대역 안 uid로 둔 레지스트리 항목;
+      - 같은 레지스트리를 쓰는 두 번째 게이트웨이 프로세스(`--workers 2`, `<registry>.lock`을 잡은 다른 프로세스);
       - 기동 프로브 실패;
       - 너무 넓은 실제 CLI 디렉터리(예: `CLAUDE_CLI_PATH=$HOME/claude`, §1).
 

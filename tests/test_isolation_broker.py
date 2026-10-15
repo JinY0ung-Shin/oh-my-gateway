@@ -956,6 +956,27 @@ def broker_module(monkeypatch):
     return module
 
 
+class TestAuthorizeIdRange:
+    """PR #244 follow-up: (uid_t)-1 = 4294967295 tells set*id to leave an id
+    unchanged, so the broker refuses it (and anything below 1) whatever band
+    its environment names."""
+
+    def test_the_bound_matches_the_gateway(self, broker_module):
+        assert broker_module._MAX_SESSION_ID == ui._MAX_ID
+
+    @pytest.mark.parametrize("bad", [ui._MAX_ID + 1, ui._MAX_ID + 2, -1])
+    def test_ids_outside_uid_t_are_refused(self, broker_module, monkeypatch, bad):
+        for name in ("APP_UID", "APP_GID"):
+            monkeypatch.delenv(name, raising=False)
+        monkeypatch.setenv("CLAUDE_ISOLATION_UID_MIN", "-5")
+        monkeypatch.setenv("CLAUDE_ISOLATION_UID_MAX", str(ui._MAX_ID + 2))
+        with pytest.raises(ValueError, match="not a valid session id"):
+            broker_module._authorize(bad, 20000, False)
+        with pytest.raises(ValueError, match="not a valid session id"):
+            broker_module._authorize(20000, bad, False)
+        broker_module._authorize(ui._MAX_ID, ui._MAX_ID, False)  # the top is valid
+
+
 class TestTicketVerify:
     """B13/B14: the broker's verify_ticket matches the gateway's, and its nonce
     store is bounded without ever accepting a replay."""

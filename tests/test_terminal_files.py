@@ -2745,3 +2745,53 @@ def test_move_across_devices_refuses_a_parent_swapped_for_a_symlink(
     assert (tmp_path / landed).read_text() == content
     _no_move_leftovers(workspace)
     _no_move_leftovers(tmp_path / "moved-sub")
+
+
+# ---------------------------------------------------------------------------
+# The Claude backend's per-spawn argv files: hidden whatever the policy
+# ---------------------------------------------------------------------------
+
+_ARGV_NAME = ".gateway-argv-mcp-0123456789abcdef"
+
+
+@pytest.fixture
+def argv_file(workspace):
+    # What a gateway that died mid-spawn leaves behind (argv_files.externalize).
+    path = workspace / _ARGV_NAME
+    path.write_text('{"mcpServers": {"p": {"headers": {"X-Secret": "s"}}}}')
+    return path
+
+
+def test_argv_files_are_never_listed_or_found(client, argv_file):
+    h = {**_AUTH, **_USER}
+    listing = client.get("/files/list?directory=/", headers=h).json()
+    names = [e["name"] for e in listing["entries"]]
+    assert ".env" in names  # ordinary dotfiles stay visible by default
+    assert _ARGV_NAME not in names
+    found = client.get("/files/search?query=gateway-argv", headers=h).json()
+    assert found["results"] == []
+
+
+def test_argv_files_are_never_served(client, workspace, argv_file):
+    import io as _io
+    import zipfile as _zip
+
+    h = {**_AUTH, **_USER}
+    for route in ("read", "view", "digest"):
+        r = client.get(f"/files/{route}?path=/{_ARGV_NAME}", headers=h)
+        assert r.status_code == 404, route
+    d = str(workspace.resolve())
+    assert client.get(f"/files/serve{d}/{_ARGV_NAME}", headers=h).status_code == 404
+    r = client.delete(f"/files/delete?path=/{_ARGV_NAME}", headers=h)
+    assert r.status_code == 404 and argv_file.exists()
+    r = client.post("/files/archive", headers=h, json={"paths": ["/"]})
+    names = _zip.ZipFile(_io.BytesIO(r.content)).namelist()
+    assert "notes.txt" in names and ".env" in names and _ARGV_NAME not in names
+    # Nor can a client create one under the reserved prefix.
+    up = client.post(
+        "/files/upload?directory=/",
+        headers=h,
+        files={"file": (".gateway-argv-system-prompt-x", b"x", "text/plain")},
+    )
+    assert up.status_code == 404
+    assert not (workspace / ".gateway-argv-system-prompt-x").exists()

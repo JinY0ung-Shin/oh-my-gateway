@@ -433,7 +433,29 @@ root 소유 `/usr/local/lib/python3.12/site-packages`에 있다). 세션 Bash도
 >   포기한 고아가 쥔 uid를 거부한다.
 > - **§6.5 argv 노출:** 격리 모드에서 `--mcp-config`와 시스템 프롬프트는 세션 워크스페이스의 1회용 파일로 넘기고
 >   `connect()` 뒤 지운다(CLI는 argv 파싱 때 읽는다 — `tests/test_cli_argv_files.py`). `--json-schema`는 파일 형태가
->   없어 남는다. 요청자의 `text.format` 스키마라 게이트웨이 비밀은 아니다.
+>   없어 남는다. 요청자의 `text.format` 스키마라 게이트웨이 비밀은 아니다. 머지 후속에서 기동·admin 상태 점검의
+>   `verify()`도 같은 파일화를 거치고(플러그인 MCP 자격 증명 overlay와 base 프롬프트가 argv에 남던 경로), 파일은
+>   CLI cwd 기준 **상대 이름**으로 넘겨 CLI 명령줄에 사용자 이름이 붙은 워크스페이스 경로가 드러나지 않게 했다.
+>   게이트웨이가 spawn 도중 죽어 워크스페이스에 남은 파일은 다음 기동 때 `argv_files.sweep_stale`이 지우고(15분 넘은
+>   것만), files API는 `.gateway-argv-*`를 늘 숨기고 404로 막는다. landlock 모드 `verify()`는 클라이언트 전용 0700 임시
+>   cwd에서 돌아(모든 세션 룰셋 밖) sweep 대상이 아니고, 크래시하면 그 디렉터리째 남는 것은 전과 같다.
+> - **남은 argv 노출 — Bash 도구의 셸(머지 후속 검증에서 확인, 이전부터 있던 것).** Bash 호출마다 CLI가 띄우는 셸의
+>   argv에 명령 본문(`eval '<command>'`)과 `<ws>/.cli-tmp/claude-<hex>-cwd`(CLI의 `pwd -P >|` 꼬리, TMPDIR이 워크스페이스
+>   안이라 사용자 키가 붙는다)가 실린다. 명령이 도는 동안 갇힌 다른 세션이 `/proc/<pid>/cmdline`으로 읽는다(실제
+>   Landlock 런처와 번들 CLI로 재현). 위 파일화는 CLI 자신의 argv만 다룬다. 후보: `claude-session-bash`가 명령을 argv
+>   대신 fd로 bash에 넘기기(래퍼 자신의 argv는 exec 전 짧게 남는다) — 별도 후속.
+> - **티켓 시크릿은 pipe로 넘긴다(머지 후속).** entrypoint는 브로커를 띄운 뒤 시크릿을 환경변수에서 빼 상속 pipe
+>   (`GATEWAY_ISOLATION_TICKET_SECRET_FD`)에 담고 CMD를 exec한다. 그래서 CMD의 `sh -c`·`GATEWAY_STARTUP_SCRIPT`·
+>   `install_plugins.py`(와 그 git·`claude plugin` 자식)·uvicorn의 exec 시점 environ에 시크릿이 없다. 게이트웨이는
+>   기동 때 pipe를 읽고 닫는다. 변수 값은 `<fd>:<dev>:<ino>`라서, 변수만 물려받은 `--workers`/`--reload` 워커가 같은
+>   번호의 자기 pipe(multiprocessing sentinel)를 읽고 닫지 않는다. 같은 uid인 CMD 단계는 여전히 fd를 물려받는다.
+>   실수로 읽으면 시크릿이 소진돼 게이트웨이가 uid 모드 기동을 거부하니 드러나지만, 작정하고 읽은 뒤 되써 넣으면
+>   막지 못한다. 그 단계는 어차피 app uid라 `/app/src`를 고칠 수 있으니, 이것은 경계가 아니라 위생이다.
+> - **uid 레지스트리는 한 프로세스만 쓴다(머지 후속).** 게이트웨이가 `<registry>.lock`에 프로세스 수명 `flock`을
+>   잡고, 두 번째 프로세스(`--workers`, `/app/data`를 공유하는 복제본)는 uid 모드 기동을 거부한다. 할당기는 브로커가
+>   거부하는 id(0·APP_UID·APP_GID·브로커 uid/gid)를 건너뛰고, 대역은 리스트로 만들지 않고 센다(넓은 대역의 기동
+>   OOM). 익명 슬롯은 최대 65536이고, 대역 상한은 4294967294다((uid_t)-1은 set*id에서 "그대로"). 다른 호스트의 복제본은
+>   파일시스템이 `flock`을 전달할 때만 잡힌다(NFS `local_lock=flock`/`nolock`은 못 잡음).
 > - **런처 소유권은 기동 오류다.** 런처·`_landlock_rules.py`·(있으면) `claude-session-bash`·모든 상위 디렉터리가 root
 >   소유·비쓰기여야 한다. dev 체크아웃만 `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true`로 경고로 낮춘다.
 > - **프로브 실행 실패는 실패다.** `can_enforce_landlock`이 프로브를 못 돌리면 기동을 거부한다.

@@ -381,6 +381,19 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.debug("Orphan workspace sweep skipped", exc_info=True)
 
+    # Remove the argv files a gateway that died mid-spawn left in workspaces
+    # (#241 §6.5). In a worker thread and not awaited: they are stale anyway,
+    # and walking a large workspace tree must not delay startup.
+    try:
+        from src.backends.claude import argv_files
+        from src.workspace_manager import workspace_manager
+
+        app.state.argv_file_sweep = asyncio.create_task(
+            asyncio.to_thread(argv_files.sweep_stale, workspace_manager.base_path)
+        )
+    except Exception:
+        logger.debug("argv file sweep skipped", exc_info=True)
+
     # Bring up the optional usage-log SQLAlchemy engine (no-op when the env var is
     # unset).  Kept late in startup so a flaky logging DB cannot block the
     # gateway from becoming healthy.

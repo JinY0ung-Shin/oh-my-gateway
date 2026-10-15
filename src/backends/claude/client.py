@@ -1471,6 +1471,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # not an UnboundLocalError from the diagnostic bookkeeping.
         last_error_result = ""
         verify_workspace: Optional[Path] = None
+        argv_files = None
+        from . import argv_files as argv_files_mod
         from . import landlock
 
         try:
@@ -1484,6 +1486,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
                 verify_workspace = workspace_manager.resolve(None)
             options = self._build_sdk_options(max_turns=1, cwd=verify_workspace)
+            # Like create_client: verify runs at startup and on every admin
+            # health check, and its command line would carry the plugin MCP
+            # credential overlays and the base prompt to any confined session
+            # reading /proc (#241 §6.5). The files land in options.cwd, the
+            # directory the CLI runs in.
+            if landlock.confine_enabled():
+                argv_files = argv_files_mod.externalize(
+                    options, shared_uid=landlock.effective_mode() != "uid"
+                )
             messages = []
             stream = query(prompt="Hello", options=options)
             try:
@@ -1504,6 +1515,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 # the SDK's own inner finally closes the CLI; closing here is a
                 # best-effort extra for a stream that does stop early.
                 await _aclose_query(stream)
+                if argv_files is not None:
+                    argv_files.cleanup()
 
             if last_error_result:
                 logger.error(
@@ -1546,6 +1559,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             logger.warning("  3. Test: claude --print 'Hello'")
             return False
         finally:
+            # Idempotent: also covers a failure before the stream was opened.
+            if argv_files is not None:
+                argv_files.cleanup()
             if verify_workspace is not None:
                 from src.workspace_manager import workspace_manager
 

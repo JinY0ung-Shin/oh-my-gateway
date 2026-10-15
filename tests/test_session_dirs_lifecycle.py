@@ -285,7 +285,7 @@ class TestExpiredOnLookup:
         assert not workspace.exists()
         assert not env.exists()
         assert uid_pool.get_ephemeral_pool().release(key) is None  # lease ended
-        assert uid in uid_pool.get_ephemeral_pool()._free
+        assert uid_pool.get_ephemeral_pool().is_free(uid)
 
     async def test_a_client_holding_session_is_torn_down_in_the_background(
         self, cfg, tmp_path

@@ -209,15 +209,23 @@ def _int_env(name, default):
         return default
 
 
+# The largest id a session may get: (uid_t)-1 = 4294967295 tells setresuid/
+# setresgid to leave an id unchanged, so a session "switched" to it would keep
+# the broker's. Mirrors uid_isolation._MAX_ID, which refuses such a band at
+# gateway startup; this is the check that holds whatever the broker's env says.
+_MAX_SESSION_ID = 4294967294
+
+
 def _authorize(uid, gid, test_same_uid):
     """Refuse a target uid/gid that is reserved or outside the band.
 
     Defense in depth behind the HMAC ticket: even a validly signed ticket (or
     the gateway itself) may never land a session on root, the gateway's uid/gid
-    or the broker's own uid/gid, nor outside ``[UID_MIN, UID_MAX]``. The reserved
-    set is duplicated from ``uid_isolation.reserved_uids`` (the broker must not
-    import the gateway tree). The one exception is the test-only same-uid mode,
-    where a ticket naming exactly the broker's own uid and gid runs unswitched.
+    or the broker's own uid/gid, nor outside ``[UID_MIN, UID_MAX]`` or
+    ``[1, _MAX_SESSION_ID]``. The reserved set is mirrored by
+    ``uid_isolation.reserved_uids`` (the broker must not import the gateway
+    tree). The one exception is the test-only same-uid mode, where a ticket
+    naming exactly the broker's own uid and gid runs unswitched.
     """
     if test_same_uid and (uid, gid) == (os.getuid(), os.getgid()):
         return
@@ -235,6 +243,11 @@ def _authorize(uid, gid, test_same_uid):
     for label, val in (("uid", uid), ("gid", gid)):
         if val in reserved:
             raise ValueError("%s %d is reserved" % (label, val))
+        if not 1 <= val <= _MAX_SESSION_ID:
+            raise ValueError(
+                "%s %d is not a valid session id [1, %d]"
+                % (label, val, _MAX_SESSION_ID)
+            )
         if not lo <= val <= hi:
             raise ValueError(
                 "%s %d is outside the band [%d, %d]" % (label, val, lo, hi)

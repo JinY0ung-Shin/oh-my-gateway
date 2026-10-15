@@ -216,8 +216,10 @@ _ISOLATION_ENVS = (
     "CLAUDE_ISOLATION_UID_MAX",
     "CLAUDE_ISOLATION_EPHEMERAL_UIDS",
     "CLAUDE_ISOLATION_BROKER_UID",
+    "CLAUDE_ISOLATION_BROKER_GID",
     "CLAUDE_ISOLATION_UID_REGISTRY",
     "APP_UID",
+    "APP_GID",
 )
 
 
@@ -300,6 +302,11 @@ _MIXED_REGISTRY = {
         {"CLAUDE_ISOLATION_BROKER_UID": "20005"},
         {"CLAUDE_ISOLATION_BROKER_UID": "x"},
         {"CLAUDE_ISOLATION_UID_MIN": "30000", "CLAUDE_ISOLATION_UID_MAX": "20000"},
+        # The gids on their own: the broker gid defaults to APP_GID, so only
+        # separate values catch a skip set that drops one of the two.
+        {"APP_GID": "20007"},
+        {"CLAUDE_ISOLATION_BROKER_GID": "20009"},
+        {"APP_GID": "20007", "CLAUDE_ISOLATION_BROKER_GID": "20009"},
     ],
     ids=[
         "defaults",
@@ -308,6 +315,9 @@ _MIXED_REGISTRY = {
         "broker-in-band",
         "bad",
         "empty",
+        "app-gid-in-band",
+        "broker-gid-in-band",
+        "both-gids-in-band",
     ],
 )
 @pytest.mark.parametrize("registered", [False, True], ids=["no-registry", "registry"])

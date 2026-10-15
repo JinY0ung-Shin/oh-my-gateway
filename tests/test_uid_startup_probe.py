@@ -79,6 +79,9 @@ def _uid_settings(monkeypatch, uid: int) -> None:
         ui.UID_MAX_ENV: str(uid),
         ui.EPHEMERAL_UIDS_ENV: "1",
         "APP_UID": str(uid - 3),
+        # Reserved like APP_UID (the broker refuses a session on it); its
+        # default 1000 would be the runner's uid on a typical dev machine.
+        "APP_GID": str(uid - 3),
         ui.BROKER_UID_ENV: str(uid - 4),
     }.items():
         monkeypatch.setenv(key, value)

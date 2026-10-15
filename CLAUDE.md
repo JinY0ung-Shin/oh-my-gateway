@@ -274,16 +274,27 @@ uv run pytest --cov=src                            # with coverage
   acceptance is "a path **outside the ruleset**", not `/etc/passwd`. **`/proc` stays ro too (the
   bundled CLI aborts without it), so in both modes a session can read every process's command line
   (`/proc/<pid>/cmdline`)** — world-readable whatever the uid. So with confinement on,
-  `create_client` moves the `--mcp-config` JSON (with `MCP_FORWARD_CONTEXT` `{{header:…}}` values)
-  and the system prompt (`Current user:`) into per-spawn workspace files (`argv_files.externalize`:
-  `O_EXCL|O_NOFOLLOW` under a workspace dir fd, 0600 landlock / 0644 uid; `--system-prompt-file`,
-  `--append-system-prompt-file` via `extra_args`) and removes them once `connect()` returns —
-  the CLI reads them while parsing argv and never again (`tests/test_cli_argv_files.py` pins
-  that against the bundled CLI: MCP header + prompt still arrive after the delete, the live
-  cmdline holds only paths; when a CLI bump reads them lazily, keep the files for the session).
-  An in-process `sdk` MCP server keeps the dict (the SDK needs it), and `--json-schema` has no file
-  form so the request's own `text.format` schema stays on the command line — the rest of the argv
-  exposure of `docs/security-process-isolation.md` §6.5. `environ`, `mem` and the fds of processes
+  `create_client` and `verify()` (startup and every admin health check) move the `--mcp-config`
+  JSON (with `MCP_FORWARD_CONTEXT` `{{header:…}}` values and the plugin MCP credential overlays)
+  and the system prompt (`Current user:`) into per-spawn files in the CLI's cwd
+  (`argv_files.externalize`: `O_EXCL|O_NOFOLLOW` under a workspace dir fd, 0600 landlock / 0644
+  uid; `--system-prompt-file`, `--append-system-prompt-file` via `extra_args`), passed by **name
+  relative to that cwd** (an absolute path put the workspace, named after the user, on the CLI's
+  command line), and remove them once the CLI has started (`create_client` after `connect()`,
+  `verify()` after its query) — the CLI reads them while parsing argv and never again
+  (`tests/test_cli_argv_files.py` pins that against the bundled CLI: MCP header + prompt still
+  arrive after the delete, the live cmdline holds only the relative names; when a CLI bump reads
+  them lazily, keep the files for the session). Files a gateway that died mid-spawn left behind
+  are removed at the next startup (`argv_files.sweep_stale`: depth ≤ 2 under the workspace base,
+  only `_write`-shaped names older than 15 min, never through a symlinked dir, in a worker thread
+  startup does not wait for; landlock-mode `verify()` runs in the client's private 0700 temp cwd
+  instead, outside every session's ruleset, which a crash leaves behind as before), and the workspace file
+  API always hides and 404s `.gateway-argv-*`. An in-process `sdk` MCP server keeps the dict (the
+  SDK needs it), `--json-schema` has no file form so the request's own `text.format` schema stays
+  on the command line, and **every Bash tool call's shell argv** carries the command text plus
+  `<ws>/.cli-tmp/claude-<hex>-cwd` (the CLI's `pwd -P >|` tail, so the user key), readable by
+  every session while it runs (pre-existing, not closed) — the rest of the argv exposure of
+  `docs/security-process-isolation.md` §6.5. `environ`, `mem` and the fds of processes
   outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher
   refuses anything but a JSON array of absolute paths (exit 70) and uses `os.getcwd()`, never
   `$PWD` — a relative `USER_WORKSPACES_DIR` once granted `<ws>/<ws>`, and the old `:`-joined lists
@@ -374,9 +385,19 @@ uv run pytest --cov=src                            # with coverage
   `docker/_landlock_rules.py` ruleset to the CLI child *after* the switch. The launcher's uid branch
   hands the broker the SDK's fds (`SCM_RIGHTS`) + a signed single-use ticket
   (`uid_isolation.mint_ticket`, HMAC + nonce + exp; `GATEWAY_ISOLATION_TICKET_SECRET` is
-  entrypoint-generated and shared with gateway+broker; the gateway moves it out of its own
-  `os.environ` at startup (`capture_ticket_secret`, before any spawn — the frozen codex/opencode
-  clients copy `os.environ`) and still blanks it per spawn). `create_client` re-mints the ticket
+  entrypoint-generated; the broker inherits it in its env, and `hand_off_ticket_secret` moves the
+  gateway's copy out of the environment into an inherited pipe
+  (`GATEWAY_ISOLATION_TICKET_SECRET_FD`) right before exec'ing the CMD, so the `sh -c` wrapper,
+  `GATEWAY_STARTUP_SCRIPT`, `install_plugins.py` and uvicorn's exec-time environ never hold it;
+  `capture_ticket_secret` reads and closes that pipe at startup — only a FIFO, non-blocking,
+  ≤ 4096 bytes; an operator-set variable still wins and is popped from `os.environ` — before any
+  spawn (the frozen codex/opencode clients copy `os.environ`), and the secret is still blanked per
+  spawn. The variable is `<fd>:<dev>:<ino>`, so a `uvicorn --workers`/`--reload` worker, which
+  inherits only the variable, never reads and closes a pipe of its own (multiprocessing's
+  sentinel). The CMD steps inherit the descriptor: one that reads it by accident consumes the
+  secret, the gateway warns the pipe was empty, and uid mode refuses to start; a deliberate
+  same-uid reader could write it back unnoticed, but the app uid can already rewrite `/app`, so the
+  pipe is hygiene, not a boundary). `create_client` re-mints the ticket
   right before `connect()` (120 s TTL; the skills preflight awaits a global lock in between). The
   resident loop is single-threaded `select.poll` (it forks): `SO_PEERCRED` pinned to
   `GATEWAY_ISOLATION_PEER_UID` before reading a byte, ≤ 32 handshakes in flight, a 10 s total
@@ -384,8 +405,11 @@ uv run pytest --cov=src                            # with coverage
   and any per-connection exception or fork failure answers REFUSED and keeps serving (one malformed
   header used to kill the only broker). It verifies the ticket **in the resident parent** (nonce→exp
   store, pruned at expiry, so single use is authoritative) and `_authorize` keeps uid **and** gid in
-  the band and outside {0, APP_UID, APP_GID, the broker's own uid/euid/gid/egid}; relative
-  workspace/ro/rw entries are refused. The only same-uid path is the argv-only test flag
+  the band, in [1, 4294967294] ((uid_t)-1 means "unchanged" to set*id), and outside {0, APP_UID,
+  APP_GID, the broker's own uid/euid/gid/egid}; the gateway's allocators skip the same ids
+  (`reserved_uids()`: 0, APP_UID, APP_GID, the broker uid and `CLAUDE_ISOLATION_BROKER_GID`), since
+  a session's gid is its uid; relative workspace/ro/rw entries are refused. The only same-uid path
+  is the argv-only test flag
   `--test-same-uid` (the entrypoint never passes it), which lets the whole protocol (fd passing,
   supervisor tree, Landlock, exit mirroring, ticket refusal/parity, teardown) run unprivileged in
   `tests/test_isolation_broker.py`, `tests/test_landlock_launcher_hardening.py`,
@@ -445,9 +469,22 @@ uv run pytest --cov=src                            # with coverage
   once it crosses 90%. The registry fails **closed**: a corrupt/unreadable
   `isolation_uids.json` refuses uid-mode startup (`_check_uid_registry`) instead of loading empty
   and reassigning uids; entries it cannot honor (out of band, reserved, shared — e.g. after
-  narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too, and their
-  uids are excluded from the ephemeral pool (else an anonymous run would get a named user's files);
-  writes are fsync'd 0600, and a failing directory fsync after the replace keeps the grant.
+  narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too (the
+  error counts them per reason), and their uids are excluded from the ephemeral pool (else an
+  anonymous run would get a named user's files); writes are fsync'd 0600, and a failing directory
+  fsync after the replace keeps the grant. It is **single-writer**: `get_registry()` holds a
+  process-lifetime `flock(LOCK_EX|LOCK_NB)` on `<registry>.lock`, so a second process (`uvicorn
+  --workers`, replicas sharing `/app/data`) refuses uid mode instead of handing two users one uid
+  (the in-memory ephemeral pool could not be shared either); a filesystem without `flock` refuses
+  too, and replicas on other hosts are detected only where the filesystem propagates `flock` (not
+  NFS with `local_lock=flock`/`nolock`). The lock file is opened read-write (NFS emulates `flock`
+  with a write lock) and read-only only when that is refused, so an existing one the gateway can
+  only read still works locally; creating it needs a writable directory, and a non-regular lock
+  path (a planted FIFO) is refused without blocking. The band is counted, never
+  listed (a huge band used to OOM at startup), `CLAUDE_ISOLATION_EPHEMERAL_UIDS` is capped at
+  65536 (released uids queue in memory until the never-used ones run out), and a band max above
+  4294967294 is a startup error. A held entry's startup error names its uid per reason (never the
+  user key) and the fix for that reason.
   `effective_mode()` self-detects at startup: Landlock ABI≥3, the broker reachable, and the
   **startup probe** passed. Once the broker answers, `install_process_env` runs
   `_probe_uid_sessions`:
@@ -472,9 +509,10 @@ uv run pytest --cov=src                            # with coverage
   locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`, and teardown.
   Re-run `docs/isolation-uid-verification.md` in the deployment container before enabling uid in
   prod. In uid mode the root entrypoint no longer re-owns (or walks) `~/.claude` entries owned by a
-  session uid (the band and every uid the registry records, minus root, the app uid and the broker
-  uid — the registry read as root without importing src, a symlinked, non-regular, oversized or
-  malformed one ignored with a warning; other modes still hand everything back to the app uid). The
+  session uid (the band and every uid the registry records, minus root, the app uid/gid and the
+  broker uid/gid — the registry read as root without importing src, a symlinked, non-regular,
+  oversized or malformed one ignored with a warning; other modes still hand everything back to the
+  app uid). The
   gateway cannot read or unlink a session uid's 0600 transcript, so resuming an expired uid-mode
   session is an explicit, non-retryable 500 `transcript_unreadable`
   (`session_manager.TranscriptUnreadable`, warned once per path) and stateless transcript cleanup
