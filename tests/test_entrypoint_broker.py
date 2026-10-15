@@ -728,6 +728,9 @@ class TestUidModeOwnership:
         fake_os = _Proxy(os, geteuid=lambda: 0, execvp=execvp)
         monkeypatch.setattr(entrypoint, "os", fake_os)
         monkeypatch.setattr(entrypoint, "prepare_writable_paths", seen.update)
+        # Never this host's /etc and dirs (tests/test_entrypoint_uid_provision.py).
+        monkeypatch.setattr(entrypoint, "provision_session_accounts", lambda *a: None)
+        monkeypatch.setattr(entrypoint, "prepare_isolation_dirs", lambda **k: None)
         monkeypatch.setattr(entrypoint, "launch_isolation_broker", lambda *a: None)
         monkeypatch.setattr(entrypoint, "drop_privileges", lambda *a: None)
         with pytest.raises(_Exec):

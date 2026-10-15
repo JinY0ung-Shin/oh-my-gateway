@@ -77,18 +77,25 @@ COPY docker/entrypoint.py /usr/local/bin/docker-entrypoint.py
 # itself, and both find claude-session-bash (the confined CLI's Bash shell)
 # beside them. Without this copy, both landlock and uid mode refuse to start
 # (the gateway fails closed rather than run unconfined). The modes stay off
-# unless an operator sets CLAUDE_ISOLATION_MODE.
+# unless an operator sets CLAUDE_ISOLATION_MODE (docker-compose.uid.yml turns
+# uid mode on).
+# Beside them, the read-only isolation probe: run it in the deployment
+# container before enabling a mode (docs/isolation-uid-verification.md), e.g.
+#   docker compose exec -u app gateway python3 -I /usr/local/bin/isolation_probe.py
 COPY docker/landlock_launcher.py docker/isolation_broker.py docker/_landlock_rules.py \
      docker/claude-session-bash /usr/local/bin/
+COPY scripts/isolation_probe.py /usr/local/bin/isolation_probe.py
 RUN chmod 0755 /usr/local/bin/landlock_launcher.py /usr/local/bin/isolation_broker.py \
-       /usr/local/bin/claude-session-bash \
+       /usr/local/bin/claude-session-bash /usr/local/bin/isolation_probe.py \
     && chmod 0644 /usr/local/bin/_landlock_rules.py
 
 # The Claude CLI refuses --dangerously-skip-permissions under root, and the
 # gateway always opens sessions with permission_mode=bypassPermissions (see
 # src/routes/responses.py), so the server process must run as a regular user.
 # The entrypoint starts as root only long enough to repair Docker bind-mount
-# permissions for gateway-owned data, then drops to APP_UID/APP_GID.
+# permissions for gateway-owned data (in uid mode also to add the session uids'
+# passwd/group entries, prepare their config dirs and fork the isolation
+# broker), then drops to APP_UID/APP_GID.
 RUN useradd -m -u 1000 -s /bin/bash app \
     && mkdir -p /app/data /home/app/.claude /home/app/.cache/uv \
     && chown -R app:app /app /home/app

@@ -1,0 +1,63 @@
+# uid-mode override (CLAUDE_ISOLATION_MODE=uid, issue #241): every session CLI
+# runs as a uid of its own, so sessions are kept apart by file ownership as well
+# as by the Landlock ruleset. Layer it over the main file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.uid.yml up -d --build
+#
+# Requirements:
+# - A root start: the image default, so do not set `user:`. The entrypoint, still
+#   root, adds /etc/passwd and /etc/group entries for the broker uid and the
+#   session uid band (CLAUDE_ISOLATION_UID_MIN..MAX, 20000-29999 by default),
+#   prepares the two config dirs below, forks the isolation broker and only then
+#   drops to the app uid. The broker keeps CAP_SETUID/CAP_SETGID only; both are
+#   in Docker's default capability set, so no cap_add is needed.
+# - Landlock ABI >= 3 on the host kernel (Linux >= 6.2), and a seccomp profile
+#   that lets the container use it. The gateway refuses to start in uid mode when
+#   it cannot enforce Landlock, reach the broker, or run a probe CLI as a session
+#   uid; set CLAUDE_ISOLATION_FALLBACK=landlock in .env to run the Landlock
+#   boundary instead (with a warning).
+#
+# What persists where:
+# - /data/claude (the claude_isolation volume below) must outlive the container,
+#   or named users lose their transcripts and memory when it is recreated.
+#   `docker compose down -v` removes it with the other volumes.
+#   - /data/claude/shared (CLAUDE_CONFIG_DIR): the gateway's own Claude config
+#     dir, which every session uid reads through links: skills, agents, commands,
+#     CLAUDE.md, settings.json and the installed plugins (install_plugins.py
+#     reinstalls those from the manifest in ./data on every start). It lies
+#     outside /home/app, which is mode 0700, so session uids can reach it; the
+#     entrypoint makes it 0755. Marketplace clones go to plugin-marketplaces in it
+#     (CLAUDE_PLUGIN_CLONE_ROOT): the default clone root lies in $HOME. It must
+#     not lie under /opt, /usr or another system directory: those are readable by
+#     every confined session, and the gateway refuses its state there.
+#   - /data/claude/users (CLAUDE_ISOLATION_CONFIG_BASE): one config dir per
+#     session uid (<base>/<uid>), app-owned, holding what the CLI keeps per user
+#     (transcripts, memory, session env files, task lists, plugin data), written
+#     as that uid. The entrypoint creates the base 0711 and never walks it.
+# - /home/app/.claude (claude_home in the main file) is the shared config dir of
+#   the other modes. A named user's first uid-mode session copies that user's
+#   transcripts and memory from there (CLAUDE_ISOLATION_MIGRATE_FROM). Assets an
+#   operator added there by hand (skills, CLAUDE.md, settings) are not copied:
+#   put them in /data/claude/shared.
+# - Workspaces stay where the main file puts them (USER_WORKSPACES_DIR on the
+#   ./workspaces bind mount). Session uids must be able to traverse every
+#   directory above their workspace, the host directory's own mode included
+#   (o+x); the entrypoint warns when one is not.
+#
+# Before enabling this in production, re-run docs/isolation-uid-verification.md
+# in the deployment container; the image ships the probe it starts with as
+# /usr/local/bin/isolation_probe.py.
+services:
+  gateway:
+    environment:
+      - CLAUDE_ISOLATION_MODE=uid
+      - CLAUDE_CONFIG_DIR=/data/claude/shared
+      - CLAUDE_PLUGIN_CLONE_ROOT=/data/claude/shared/plugin-marketplaces
+      - CLAUDE_ISOLATION_CONFIG_BASE=/data/claude/users
+      - CLAUDE_ISOLATION_MIGRATE_FROM=/home/app/.claude
+    volumes:
+      - claude_isolation:/data/claude
+
+volumes:
+  # The shared config dir and the per-uid config dirs of uid mode.
+  claude_isolation:
