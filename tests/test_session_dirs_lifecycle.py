@@ -431,7 +431,9 @@ class TestStatelessTranscriptCleanup:
         workspace.mkdir()
         _transcript(projects, workspace)
         with patch.object(Path, "unlink", side_effect=OSError(5, "I/O error")):
-            with caplog.at_level(logging.DEBUG, logger="src.routes.agent_messages"):
+            # The removal (and its log line) lives in uid_cleanup now.
+            uid_cleanup_log = "src.backends.claude.uid_cleanup"
+            with caplog.at_level(logging.DEBUG, logger=uid_cleanup_log):
                 _cleanup_sdk_transcript(
                     Session(session_id=SID, workspace=str(workspace))
                 )

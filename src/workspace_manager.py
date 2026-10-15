@@ -223,6 +223,39 @@ def _release_uid_lease(workspace: Path) -> None:
         )
 
 
+def remove_temp_workspace(workspace: Path) -> None:
+    """Remove a ``_tmp_`` workspace as the gateway's uid, then end its uid lease.
+
+    What the gateway's uid cannot remove stays, and so does the lease (fail
+    closed). ``WorkspaceManager.cleanup_temp_workspace`` uses this in every
+    mode but uid mode with per-uid config dirs, where
+    ``uid_cleanup.reclaim_temp_workspace`` falls back to it for a workspace no
+    session uid is known to have used.
+    """
+    if workspace.exists():
+        shutil.rmtree(workspace, ignore_errors=True)
+        logger.info("Cleaned up temporary workspace: %s", workspace)
+    if os.path.lexists(workspace):
+        logger.warning(
+            "Temporary workspace %s could not be fully removed; its uid "
+            "lease (uid isolation) is kept",
+            workspace,
+        )
+        return
+    _release_uid_lease(workspace)
+
+
+def _per_uid_layouts() -> bool:
+    """Whether uid isolation runs with per-uid config dirs (``uid_layout``)."""
+    try:
+        from src.backends.claude import uid_layout
+
+        return uid_layout.enabled()
+    except Exception:
+        logger.debug("Could not resolve the uid isolation layout", exc_info=True)
+        return False
+
+
 class WorkspaceManager:
     """Manages per-user working directories.
 
@@ -324,16 +357,27 @@ class WorkspaceManager:
 
         return workspace
 
-    def cleanup_temp_workspace(self, workspace: Path) -> None:
+    def cleanup_temp_workspace(self, workspace: Path, *, sync: bool = False) -> None:
         """Remove a temporary workspace directory.
 
         Only directories whose name starts with ``_tmp_`` are removed. Under
         uid isolation the anonymous run that used the workspace holds an
-        ephemeral uid leased on its path, and the lease ends here once the
-        directory is gone (also when it already was). A workspace that could
-        not be removed — files the session uid wrote, which the gateway's uid
-        cannot delete — keeps its uid: fail closed until broker-delegated
-        cleanup lands. So callers clean up only after
+        ephemeral uid leased on its path, and the lease ends only once the
+        directory is gone (also when it already was): a workspace that could
+        not be removed keeps its uid (fail closed).
+
+        With per-uid config dirs (uid mode with ``CLAUDE_ISOLATION_CONFIG_BASE``)
+        the session uid owns what its CLI wrote mode 0600/0700, which the
+        gateway's uid cannot delete. ``uid_cleanup.reclaim_temp_workspace`` then
+        has the broker wipe the workspace, the uid's per-uid config state and
+        its ``/dev/shm`` objects as that uid, removes the rest itself and ends
+        the lease once that is verified — in the background, retried with
+        backoff and, if it keeps failing, given up with the lease kept; with
+        *sync*, here, for at most ~30 s (the uid startup probe and
+        ``verify()``). Every other mode removes it here as the gateway's uid
+        (:func:`remove_temp_workspace`).
+
+        So callers clean up only after
         stopping the run's CLI: the session manager for anonymous sessions (it
         kills a CLI that outlived its capped disconnect, and leaves a session
         whose client is still starting to that request), ``verify()`` (after
@@ -341,7 +385,10 @@ class WorkspaceManager:
         on timeout). The ``/v1/agents/messages`` and admin try-run teardowns
         disconnect first but kill a surviving CLI only when the caller went
         away, so after a normal-path disconnect that timed out the lease ends
-        while that CLI may still run (see ``uid_isolation._EphemeralPool``).
+        while that CLI may still run (see ``uid_isolation._EphemeralPool``) —
+        with per-uid config dirs the broker does not wipe a workspace while a
+        CLI of its uid still runs there: the wipe is retried, and given up with
+        the lease kept if that CLI outlives the retries.
         """
         if not workspace.name.startswith("_tmp_"):
             if workspace.exists():
@@ -349,17 +396,12 @@ class WorkspaceManager:
                     "Skipping cleanup of non-temporary workspace: %s", workspace
                 )
             return
-        if workspace.exists():
-            shutil.rmtree(workspace, ignore_errors=True)
-            logger.info("Cleaned up temporary workspace: %s", workspace)
-        if os.path.lexists(workspace):
-            logger.warning(
-                "Temporary workspace %s could not be fully removed; its uid "
-                "lease (uid isolation) is kept",
-                workspace,
-            )
+        if _per_uid_layouts():
+            from src.backends.claude import uid_cleanup
+
+            uid_cleanup.reclaim_temp_workspace(workspace, sync=sync)
             return
-        _release_uid_lease(workspace)
+        remove_temp_workspace(workspace)
 
     def sweep_orphan_temp_workspaces(self, max_age_seconds: float) -> int:
         """Remove ``_tmp_*`` workspaces older than *max_age_seconds*.
@@ -371,7 +413,10 @@ class WorkspaceManager:
         than the cutoff are removed, so freshly-created live workspaces and
         permanent named-user workspaces are never touched.
 
-        Returns the number of directories removed.
+        Returns the number of directories handed to
+        :meth:`cleanup_temp_workspace` — with per-uid config dirs their removal
+        completes in the background (as the session uid their ACL names, since
+        the leases died with the previous process).
         """
         if not self.base_path.exists():
             return 0

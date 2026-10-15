@@ -18,7 +18,6 @@ Concurrency model
 
 import asyncio
 import contextlib
-import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -39,21 +38,25 @@ from src.constants import (
 logger = logging.getLogger(__name__)
 
 # Where the SDK stores per-session transcripts: ``<config dir>/projects``.
-# Resolved per call (``_projects_root``) via the shared config-dir resolver so a
-# per-session config dir (PR-C) is honored, instead of being frozen at import.
-# ``None`` means "resolve from the environment"; a test may set this attribute
-# to pin the root (the historical seam ``monkeypatch.setattr(session_manager,
-# "_PROJECTS_ROOT", tmp_path)`` keeps working).
+# Resolved per call (``_projects_root``) via the session's config layout
+# (``uid_layout.projects_root``: the shared config dir's, or under uid isolation
+# with per-uid config dirs the session uid's own), instead of being frozen at
+# import. ``None`` means "resolve from the environment"; a test may set this
+# attribute to pin the root (the historical seam
+# ``monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)`` keeps
+# working).
 _PROJECTS_ROOT: Optional[Path] = None
 
 
-def _projects_root() -> Path:
-    """The ``projects`` root, honoring a test override of ``_PROJECTS_ROOT``."""
+def _projects_root(user: Optional[str] = None, workspace=None) -> Optional[Path]:
+    """The ``projects`` root of (*user*, *workspace*), honoring a test override
+    of ``_PROJECTS_ROOT``. ``None`` when the session cannot have transcripts
+    (``uid_layout.projects_root``: an anonymous run with no uid lease yet)."""
     if _PROJECTS_ROOT is not None:
         return _PROJECTS_ROOT
-    from src.claude_config_paths import projects_root
+    from src.backends.claude import uid_layout
 
-    return projects_root()
+    return uid_layout.projects_root(user, workspace)
 
 
 def _encode_cwd(cwd) -> str:
@@ -77,19 +80,33 @@ def _encode_cwd(cwd) -> str:
     return _project_dir_name(str(cwd))
 
 
-def _session_jsonl_path(session_id: str, workspace) -> Path:
+def _session_jsonl_path(
+    session_id: str, workspace, user: Optional[str] = None
+) -> Optional[Path]:
     """Return the on-disk path the SDK uses for this session's transcript.
 
-    Path layout: ``~/.claude/projects/<encoded-cwd>/<session_id>.jsonl``.
+    Path layout: ``<projects root>/<encoded-cwd>/<session_id>.jsonl``, the root
+    being the session's (:func:`_projects_root`); ``None`` when it has none.
     """
-    return _projects_root() / _encode_cwd(workspace) / f"{session_id}.jsonl"
+    root = _projects_root(user, workspace)
+    if root is None:
+        return None
+    return root / _encode_cwd(workspace) / f"{session_id}.jsonl"
 
 
 def _session_jsonl_exists(session: "Session") -> bool:
-    """True when the SDK has already written a transcript for *session*."""
+    """True when the SDK has already written a transcript for *session*.
+
+    Raises :class:`TranscriptUnreadable` when the gateway may not even look and
+    the broker cannot answer for it (``uid_cleanup.transcript_exists``).
+    """
     if not session.workspace:
         return False
-    return _session_jsonl_path(session.session_id, session.workspace).is_file()
+    from src.backends.claude import uid_cleanup
+
+    return uid_cleanup.transcript_exists(
+        session.session_id, user=session.user, workspace=session.workspace
+    )
 
 
 class TranscriptUnreadable(Exception):
@@ -97,9 +114,11 @@ class TranscriptUnreadable(Exception):
 
     Under ``CLAUDE_ISOLATION_MODE=uid`` the CLI runs as the session uid and
     writes ``<session id>.jsonl`` mode 0600, so the gateway's own uid gets
-    EACCES. Resuming such a session needs the broker to read the transcript
-    as that uid, which is a follow-up. Raised instead of the silent ``None``
-    that answered 404 "not found or expired" for a session that is on disk.
+    EACCES. With per-uid config dirs the broker reads it as that uid instead
+    (``uid_cleanup.read_transcript_turns``); this is raised when it cannot —
+    no per-uid layout, no broker, or the broker refused or failed — instead of
+    the silent ``None`` that answered 404 "not found or expired" for a session
+    that is on disk.
     """
 
     def __init__(self, path: Path) -> None:
@@ -113,10 +132,17 @@ _UNREADABLE_WARNED: set = set()
 _UNREADABLE_WARNED_MAX = 4096
 
 
-def _warn_unreadable_transcript(path: Path, exc: OSError) -> None:
+def _unreadable_reason(cause: Optional[BaseException]) -> str:
+    if isinstance(cause, OSError):
+        return str(cause.strerror or cause)
+    return str(cause) if cause is not None else "permission denied"
+
+
+def _warn_unreadable_transcript(path: Path, cause: Optional[BaseException]) -> None:
     key = str(path)
+    reason = _unreadable_reason(cause)
     if key in _UNREADABLE_WARNED:
-        logger.debug("Session transcript %s is still unreadable: %s", path, exc)
+        logger.debug("Session transcript %s is still unreadable: %s", path, reason)
         return
     if len(_UNREADABLE_WARNED) >= _UNREADABLE_WARNED_MAX:
         _UNREADABLE_WARNED.clear()
@@ -124,10 +150,10 @@ def _warn_unreadable_transcript(path: Path, exc: OSError) -> None:
     logger.warning(
         "Cannot rehydrate a session from %s: %s. The gateway's uid may not read "
         "the transcript. Under CLAUDE_ISOLATION_MODE=uid the session uid owns "
-        "it, and resuming such a session needs the broker to read it as that "
-        "uid (a follow-up).",
+        "it, and the broker reads it as that uid only with per-uid config dirs "
+        "(CLAUDE_ISOLATION_CONFIG_BASE) and a reachable broker.",
         path,
-        exc.strerror or exc,
+        reason,
     )
 
 
@@ -137,75 +163,52 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
     Returns None when the jsonl file is missing, unreadable, or malformed
     enough that we can't establish a turn count. The caller treats None as
     cache-miss-and-on-disk-miss → existing 404 path. A transcript the
-    gateway is not *permitted* to read raises :class:`TranscriptUnreadable`
-    instead (logged once per path), so the caller can say so.
+    gateway is not *permitted* to read is counted by the broker as the
+    session uid (uid isolation with per-uid config dirs); when that is not
+    possible either it raises :class:`TranscriptUnreadable` instead (logged
+    once per path), so the caller can say so.
     """
     if not user or not cwd:
         return None
-    jsonl_path = _session_jsonl_path(session_id, cwd)
+    from src.backends.claude import uid_cleanup
+    from src.backends.claude.transcript_turns import TRANSCRIPT_MISMATCH
+
+    # One rule (``transcript_turns.count_transcript_turns``) whoever reads the
+    # file: the gateway when it may, else the broker as the session uid.
+    # Claude jsonl reuses type="user" for external prompts (one per
+    # gateway-issued response_id) and for tool_result blocks / isMeta system
+    # reminders the SDK injects; only the former advance the turn counter. A
+    # corrupt transcript is refused rather than guessed at.
     try:
-        if not jsonl_path.is_file():
-            return None
-        expected_cwd = Path(cwd)
-        user_msg_count = 0
-        with jsonl_path.open("r") as fh:
-            for raw in fh:
-                try:
-                    line = json.loads(raw)
-                except (ValueError, json.JSONDecodeError):
-                    return None  # corrupt — refuse to guess
-                # Ownership guard. ``_encode_cwd`` is lossy (every
-                # non-alphanumeric collapses to '-'), so distinct workspaces — e.g. users "a_b",
-                # "a.b" and "a-b" — share one on-disk transcript directory. The
-                # SDK records the REAL cwd on each turn line, so refuse to
-                # rehydrate a transcript whose recorded cwd does not match the
-                # requester's resolved workspace; otherwise a colliding user
-                # could rebuild another user's session and history.
-                recorded_cwd = line.get("cwd")
-                if (
-                    isinstance(recorded_cwd, str)
-                    and recorded_cwd
-                    and Path(recorded_cwd) != expected_cwd
-                ):
-                    logger.warning(
-                        "Refusing to rehydrate session %s: transcript cwd %r "
-                        "does not match requester workspace %r",
-                        session_id,
-                        recorded_cwd,
-                        str(cwd),
-                    )
-                    return None
-                if line.get("type") != "user":
-                    continue
-                # Claude jsonl reuses type="user" for two distinct things:
-                # (1) external prompts the gateway exposed as turns, and
-                # (2) tool_result blocks plus isMeta system reminders that
-                # the SDK injects internally. Only (1) corresponds to a
-                # gateway-issued response_id, so only (1) advances the
-                # turn counter.
-                if line.get("isMeta"):
-                    continue
-                content = line.get("message", {}).get("content")
-                if (
-                    isinstance(content, list)
-                    and content
-                    and all(isinstance(b, dict) and b.get("type") == "tool_result" for b in content)
-                ):
-                    continue
-                user_msg_count += 1
-        return Session(
-            session_id=session_id,
-            backend="claude",
-            messages=[],
-            turn_counter=user_msg_count,
-            workspace=str(cwd),
-            user=user,
+        turns = uid_cleanup.read_transcript_turns(session_id, user=user, workspace=cwd)
+    except TranscriptUnreadable as exc:
+        _warn_unreadable_transcript(exc.path, exc.__cause__)
+        raise
+    if turns == TRANSCRIPT_MISMATCH:
+        # Ownership guard. ``_encode_cwd`` is lossy (every non-alphanumeric
+        # collapses to '-'), so distinct workspaces — e.g. users "a_b", "a.b"
+        # and "a-b" — share one on-disk transcript directory. The SDK records
+        # the REAL cwd on each turn line, so a transcript whose recorded cwd
+        # does not match the requester's resolved workspace is refused;
+        # otherwise a colliding user could rebuild another user's session and
+        # history. (The other workspace is not logged: it names another user.)
+        logger.warning(
+            "Refusing to rehydrate session %s: its transcript records a cwd "
+            "other than requester workspace %r",
+            session_id,
+            str(cwd),
         )
-    except PermissionError as exc:
-        _warn_unreadable_transcript(jsonl_path, exc)
-        raise TranscriptUnreadable(jsonl_path) from exc
-    except OSError:
         return None
+    if turns < 0:
+        return None
+    return Session(
+        session_id=session_id,
+        backend="claude",
+        messages=[],
+        turn_counter=turns,
+        workspace=str(cwd),
+        user=user,
+    )
 
 
 def _cancel_idle_reader(session: "Session") -> None:
@@ -230,6 +233,8 @@ def _cancel_idle_reader(session: "Session") -> None:
 
 # How long a CLI that outlived its capped disconnect gets to die once killed.
 _KILL_WAIT_SECONDS = 5.0
+# How long shutdown waits for the uid reclaimer's queued removals.
+_SHUTDOWN_DRAIN_SECONDS = 5.0
 
 
 def _client_process(client: Any) -> Any:
@@ -830,15 +835,31 @@ class SessionManager:
         CLI is granted that same dir) while the old incarnation's teardown
         awaits its disconnect. Removing the dir then pulls it from under the
         live CLI (#244 review). The check and the removal both run under the
-        lock, so no rehydrate can slip in between.
+        lock, so no rehydrate can slip in between. Under uid isolation with
+        per-uid config dirs, what the gateway's uid could not remove goes to
+        the broker in the background; that removal asks the same question
+        again before each attempt (``guard``), so it stops once a rehydrated
+        session holds the id (it cannot hold the lock across the broker's
+        round trip, so a rehydrate in that one window is not covered).
         """
         current = self.sessions.get(session.session_id)
         if current is not None and current is not session:
             return
-        try:
-            from src.backends.claude import landlock
 
-            landlock.remove_session_env_dir(session.session_id)
+        def _still_finished() -> bool:
+            with self.lock:
+                now = self.sessions.get(session.session_id)
+            return now is None or now is session
+
+        try:
+            from src.backends.claude import uid_cleanup
+
+            uid_cleanup.remove_session_dirs(
+                session.session_id,
+                user=session.user,
+                workspace=session.workspace,
+                guard=_still_finished,
+            )
         except Exception:
             logger.debug(
                 "session-env cleanup skipped for %s", session.session_id, exc_info=True
@@ -962,7 +983,19 @@ class SessionManager:
         with self.lock:
             self._cleanup_all_temp_workspaces()
             self.sessions.clear()
-            logger.info("Session manager async shutdown complete")
+
+        # Under uid isolation with per-uid config dirs the removals above run
+        # on the uid reclaimer's thread (uid_cleanup), which dies with the
+        # process: give them a bounded chance to finish. What is left, the next
+        # start's orphan sweep reclaims.
+        try:
+            from src.backends.claude import uid_cleanup
+
+            if uid_cleanup.pending():
+                await asyncio.to_thread(uid_cleanup.drain, _SHUTDOWN_DRAIN_SECONDS)
+        except Exception:
+            logger.debug("uid cleanup drain at shutdown failed", exc_info=True)
+        logger.info("Session manager async shutdown complete")
 
     def _cleanup_all_temp_workspaces(self) -> None:
         """Remove temporary workspaces for all active sessions.
