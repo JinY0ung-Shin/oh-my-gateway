@@ -2158,13 +2158,16 @@ def check_config() -> List[str]:
     # landlock) is a hard startup error — never a silent drop.
     if requested == "uid" and mode == "uid" and not uid_mode_available():
         if _uid_probe_problems:
+            # A missing or unusable per-uid config base is the likely root
+            # cause of what the probe saw: name it first.
+            errors.extend(_config_base_errors())
             errors.append(
                 f"{MODE_ENV}=uid but a session uid cannot run the CLI here: "
                 + "; ".join(_uid_probe_problems)
-                + ". uid mode needs per-user workspace ownership and container "
-                "provisioning this image does not provide yet (see "
-                "docs/isolation-uid-verification.md); set "
-                f"{FALLBACK_ENV}=landlock to run the Landlock boundary instead."
+                + ". Fix what this names (docker-compose.uid.yml is a working "
+                "layout; docs/isolation-uid-verification.md lists what uid mode "
+                f"needs), or set {FALLBACK_ENV}=landlock to run the Landlock "
+                "boundary instead."
             )
             return errors
         why = []

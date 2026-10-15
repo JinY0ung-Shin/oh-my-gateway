@@ -538,7 +538,7 @@ class TestReclaimTempWorkspace:
         workspace, key, uid = _leased_workspace(wm)
         wm.cleanup_temp_workspace(workspace)
         assert per_uid.reclaimer.drain(5)
-        assert per_uid.ops.calls[0][1]["timeout"] == 60.0
+        assert per_uid.ops.calls[0][1]["timeout"] == uid_cleanup._OP_TIMEOUT_SECONDS
 
     def test_bases_reached_through_links_are_resolved_for_the_broker(
         self, per_uid, tmp_path, monkeypatch

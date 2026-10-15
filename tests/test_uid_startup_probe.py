@@ -231,10 +231,12 @@ class TestStartupDecision:
         assert not landlock.uid_mode_available()
         monkeypatch.setattr(landlock, "can_enforce_landlock", lambda: (True, ""))
         errors = landlock.check_config()
-        assert len(errors) == 1
-        assert "a session uid cannot run the CLI here" in errors[0]
-        assert "exited 118" in errors[0]
-        assert f"{landlock.FALLBACK_ENV}=landlock" in errors[0]
+        # The root cause first (here: no per-uid config base), then the probe.
+        assert len(errors) == 2
+        assert "CLAUDE_ISOLATION_CONFIG_BASE" in errors[0]
+        assert "a session uid cannot run the CLI here" in errors[1]
+        assert "exited 118" in errors[1]
+        assert f"{landlock.FALLBACK_ENV}=landlock" in errors[1]
 
     @_needs_nonroot
     def test_the_fallback_runs_landlock_and_says_why(self, monkeypatch, caplog):
