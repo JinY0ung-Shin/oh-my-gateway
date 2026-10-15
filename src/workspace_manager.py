@@ -265,6 +265,8 @@ class WorkspaceManager:
 
     def __init__(self, base_path: Path):
         self.base_path = Path(base_path)
+        # Whether this manager ran its (startup) orphan sweep already.
+        self._swept_orphans = False
 
     def resolve(
         self,
@@ -372,9 +374,9 @@ class WorkspaceManager:
         has the broker wipe the workspace, the uid's per-uid config state and
         its ``/dev/shm`` objects as that uid, removes the rest itself and ends
         the lease once that is verified — in the background, retried with
-        backoff and, if it keeps failing, given up with the lease kept; with
-        *sync*, here, for at most ~30 s (the uid startup probe and
-        ``verify()``). Every other mode removes it here as the gateway's uid
+        backoff and then every few minutes while the workspace and its lease
+        are there; with *sync*, here, for at most ~30 s (only the uid startup
+        probe). Every other mode removes it here as the gateway's uid
         (:func:`remove_temp_workspace`).
 
         So callers clean up only after
@@ -413,11 +415,20 @@ class WorkspaceManager:
         than the cutoff are removed, so freshly-created live workspaces and
         permanent named-user workspaces are never touched.
 
+        Under uid isolation (per-uid config dirs) the first sweep of a manager
+        (the startup one) takes every ``_tmp_`` dir, whatever its age: uid mode
+        runs one gateway process per uid registry (its lock refuses a second),
+        so at startup each of them is a previous process's — among them the
+        wipes a shutdown drain did not finish, whose uid leases died with that
+        process. Later sweeps keep the age filter.
+
         Returns the number of directories handed to
         :meth:`cleanup_temp_workspace` — with per-uid config dirs their removal
         completes in the background (as the session uid their ACL names, since
         the leases died with the previous process).
         """
+        any_age = not self._swept_orphans and _per_uid_layouts()
+        self._swept_orphans = True
         if not self.base_path.exists():
             return 0
         cutoff = time.time() - max_age_seconds
@@ -429,11 +440,12 @@ class WorkspaceManager:
         for child in children:
             if not child.name.startswith("_tmp_"):
                 continue
-            try:
-                if child.stat().st_mtime > cutoff:
+            if not any_age:
+                try:
+                    if child.stat().st_mtime > cutoff:
+                        continue
+                except OSError:
                     continue
-            except OSError:
-                continue
             self.cleanup_temp_workspace(child)
             removed += 1
         if removed:

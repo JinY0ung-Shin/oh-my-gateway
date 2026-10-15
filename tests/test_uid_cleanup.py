@@ -20,6 +20,7 @@ cannot get past (skipped as root, which gets past them).
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import json
 import logging
@@ -29,20 +30,28 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 import src.session_manager as sm
 from src import claude_config_paths as cp
-from src.backends.claude import broker_ops, landlock, uid_cleanup, uid_layout
+from src.backends.claude import broker_ops, landlock, transcript_turns, uid_cleanup
 from src.backends.claude import uid_isolation as ui
+from src.backends.claude import uid_layout
 from src.backends.claude.transcript_turns import (
     TRANSCRIPT_CORRUPT,
     TRANSCRIPT_MISMATCH,
     TRANSCRIPT_MISSING,
     TRANSCRIPT_UNREADABLE,
 )
-from src.session_manager import Session, SessionManager, TranscriptUnreadable
+from src.concurrency import SessionLimitExceeded
+from src.session_manager import (
+    Session,
+    SessionManager,
+    TranscriptTemporarilyUnavailable,
+    TranscriptUnreadable,
+)
 from src.workspace_manager import WorkspaceManager
 
 SID = "6f1c8f9e-2b1d-4c3e-9a55-0d6f2f0b7c11"
@@ -86,11 +95,12 @@ def _act_as_broker(_uid: int, kwargs: dict) -> None:
             for child in list(target.iterdir()):
                 _remove(child)
     for target in kwargs.get("remove", ()):
-        if os.path.lexists(target):
-            # The broker gives the uid's own dir (the parent here) its owner
-            # rwx back when a removal needs it.
-            parent = Path(target).parent
+        # The broker gives the uid's own dir (the parent here) its owner rwx
+        # back when a removal needs it — also when the gateway cannot look in.
+        parent = Path(target).parent
+        if parent.is_dir():
             parent.chmod(parent.stat().st_mode & 0o777 | 0o700)
+        if os.path.lexists(target):
             _remove(Path(target))
 
 
@@ -100,6 +110,7 @@ class FakeOps:
     def __init__(self) -> None:
         self.calls: list = []
         self.fail = 0  # the next N calls raise BrokerOpError
+        self.transient = False  # ... with this transient flag
         self.result = True  # what a cleanup that ran answers
         self.effect = _act_as_broker
         self.turns = 0
@@ -111,7 +122,9 @@ class FakeOps:
             self.gate.wait(5)
         if self.fail:
             self.fail -= 1
-            raise broker_ops.BrokerOpError("the broker refused the cleanup op (test)")
+            raise broker_ops.BrokerOpError(
+                "the broker refused the cleanup op (test)", transient=self.transient
+            )
         if self.effect is not None:
             self.effect(uid, kwargs)
         return self.result
@@ -121,7 +134,7 @@ class FakeOps:
         if self.fail:
             self.fail -= 1
             raise broker_ops.BrokerOpError(
-                "the broker refused the transcript op (test)"
+                "the broker refused the transcript op (test)", transient=self.transient
             )
         return self.turns
 
@@ -171,9 +184,12 @@ def pool(monkeypatch, tmp_path):
 
 @pytest.fixture
 def shm(monkeypatch, tmp_path):
+    """A fake /dev/shm, and no SysV IPC tables or mqueue mount to look at."""
     path = tmp_path / "shm"
     path.mkdir()
     monkeypatch.setattr(uid_cleanup, "_SHM_DIR", str(path))
+    monkeypatch.setattr(uid_cleanup, "_SYSVIPC_DIR", str(tmp_path / "no-sysvipc"))
+    monkeypatch.setattr(uid_cleanup, "_MQUEUE_DIR", str(tmp_path / "no-mqueue"))
     return path
 
 
@@ -313,7 +329,7 @@ class TestReclaimer:
         gate.set()
         reclaimer.stop()
         assert not reclaimer.submit("k2", lambda: True)
-        assert reclaimer._thread is None or not reclaimer._thread.is_alive()
+        assert not any(thread.is_alive() for thread in reclaimer._threads)
 
     def test_the_module_helpers_without_a_reclaimer(self, monkeypatch):
         monkeypatch.setattr(uid_cleanup, "_reclaimer", None)
@@ -325,7 +341,8 @@ class TestReclaimer:
         monkeypatch.setattr(uid_cleanup, "_reclaimer", None)
         first = uid_cleanup.reclaimer()
         assert uid_cleanup.reclaimer() is first
-        assert first._thread is None  # the thread starts with the first job
+        assert first._threads == []  # the threads start with the first job
+        assert first._workers == uid_cleanup.RECLAIMER_WORKERS
 
 
 # ---------------------------------------------------------------------------
@@ -350,7 +367,7 @@ class TestOtherModesAreUnchanged:
         assert not workspace.exists()
         assert ui.leased_uid(key) is None
         assert ops.calls == []
-        assert reclaimer._thread is None
+        assert reclaimer._threads == []
 
     @_not_root
     def test_what_the_gateway_cannot_remove_keeps_the_lease(
@@ -433,16 +450,55 @@ class TestReclaimTempWorkspace:
 
         with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
             wm.cleanup_temp_workspace(workspace)
-            assert per_uid.reclaimer.drain(5)
+            assert per_uid.reclaimer.drain(5)  # a parked job is not waited for
 
         assert workspace.is_dir()
         assert ui.leased_uid(key) == uid
-        assert "Gave up on uid cleanup job" in caplog.text
-        # A later cleanup (the broker is back) finishes it.
+        # Parked, not dropped: its workspace and lease are still there.
+        assert per_uid.reclaimer.is_pending(("ws", key))
+        assert per_uid.reclaimer.parked() == 1
+        assert "still fails after 7 attempts" in caplog.text
+        assert "Gave up" not in caplog.text
+        # A later cleanup (the broker is back) runs the parked job at once.
         per_uid.ops.fail = 0
         wm.cleanup_temp_workspace(workspace)
         assert per_uid.reclaimer.drain(5)
         assert not workspace.exists() and ui.leased_uid(key) is None
+        assert not per_uid.reclaimer.is_pending(("ws", key))
+
+    def test_a_parked_wipe_is_tried_again_on_its_own(self, per_uid, wm, monkeypatch):
+        retry = uid_cleanup.Reclaimer(backoff=FAST, parked_retry=0.05)
+        monkeypatch.setattr(uid_cleanup, "_reclaimer", retry)
+        try:
+            workspace, key, uid = _leased_workspace(wm)
+            per_uid.ops.fail = len(FAST) + 3  # the backoff, then two parked tries
+
+            wm.cleanup_temp_workspace(workspace)
+            deadline = time.monotonic() + 5
+            while retry.is_pending(("ws", key)) and time.monotonic() < deadline:
+                time.sleep(0.02)
+
+            assert not workspace.exists() and ui.leased_uid(key) is None
+            assert len(per_uid.ops.calls) == len(FAST) + 4
+        finally:
+            retry.stop()
+
+    def test_a_wipe_whose_lease_went_elsewhere_is_given_up(
+        self, per_uid, wm, caplog, monkeypatch
+    ):
+        workspace, key, uid = _leased_workspace(wm)
+
+        def refused_and_released(_uid, **_kwargs):
+            ui.release_ephemeral(key)  # say the pool reclaimed it meanwhile
+            raise broker_ops.BrokerOpError("refused (test)")
+
+        monkeypatch.setattr(broker_ops, "cleanup", refused_and_released)
+        with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
+            wm.cleanup_temp_workspace(workspace)
+            assert per_uid.reclaimer.drain(5)
+
+        assert not per_uid.reclaimer.is_pending(("ws", key))
+        assert "Gave up on uid cleanup job" in caplog.text
 
     def test_a_failed_step_with_leftovers_keeps_the_root_and_the_lease(
         self, per_uid, wm
@@ -510,7 +566,7 @@ class TestReclaimTempWorkspace:
 
         assert not workspace.exists() and ui.leased_uid(key) is None
         assert len(per_uid.ops.calls) == 3
-        assert per_uid.reclaimer._thread is None  # nothing went to the thread
+        assert per_uid.reclaimer._threads == []  # nothing went to a thread
 
     def test_sync_gives_up_within_its_budget(self, per_uid, wm, monkeypatch, caplog):
         monkeypatch.setattr(uid_cleanup, "BACKOFF_SECONDS", (0.05,) * 6)
@@ -617,6 +673,33 @@ class TestOrphanedWorkspaces:
         assert orphan.reclaimer.drain(5)
         assert orphan.ops.calls[0][0] == self.UID
         assert not orphan.workspace.exists()
+
+    def test_the_first_sweep_takes_them_at_any_age(self, orphan, wm):
+        # One gateway process per uid registry: at startup every _tmp_ dir is
+        # a previous process's, also one a shutdown drain did not finish.
+        assert wm.sweep_orphan_temp_workspaces(max_age_seconds=3600) == 1
+        assert orphan.reclaimer.drain(5)
+        assert not orphan.workspace.exists()
+
+    def test_later_sweeps_keep_the_age_filter(self, orphan, wm):
+        wm.sweep_orphan_temp_workspaces(max_age_seconds=3600)
+        assert orphan.reclaimer.drain(5)
+        fresh = wm.base_path / "_tmp_fresh"
+        fresh.mkdir()
+        assert wm.sweep_orphan_temp_workspaces(max_age_seconds=3600) == 0
+        assert fresh.is_dir()
+
+    @pytest.mark.parametrize("mode", ["off", "landlock", "uid"])
+    def test_other_modes_keep_it_on_the_first_sweep(
+        self, monkeypatch, tmp_path, cfg, mode
+    ):
+        _mode(monkeypatch, mode)  # uid without a config base: no per-uid dirs
+        monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+        monkeypatch.delenv(cp.CONFIG_BASE_ENV, raising=False)
+        manager = WorkspaceManager(base_path=tmp_path / "w")
+        (manager.base_path / "_tmp_fresh").mkdir(parents=True)
+        assert manager.sweep_orphan_temp_workspaces(max_age_seconds=3600) == 0
+        assert (manager.base_path / "_tmp_fresh").is_dir()
 
     @pytest.mark.parametrize(
         "acl",
@@ -981,9 +1064,7 @@ class TestTranscriptReads:
         assert "Refusing to rehydrate session" in caplog.text
 
     @_not_root
-    @pytest.mark.parametrize(
-        "code", [TRANSCRIPT_MISSING, TRANSCRIPT_CORRUPT, TRANSCRIPT_UNREADABLE]
-    )
+    @pytest.mark.parametrize("code", [TRANSCRIPT_MISSING, TRANSCRIPT_CORRUPT])
     def test_rehydrate_misses_on_the_other_codes(self, alice, code):
         _write_transcript(alice.path, alice.workspace).chmod(0)
         alice.ops.turns = code
@@ -1143,7 +1224,7 @@ class TestTranscriptReadsOtherModes:
         def broken_open(*_args, **_kwargs):
             raise OSError(errno.EIO, "I/O error")
 
-        monkeypatch.setattr(Path, "open", broken_open)
+        monkeypatch.setattr(uid_cleanup, "_open_transcript", broken_open)
         assert (
             uid_cleanup.read_transcript_turns(SID, user="u", workspace=workspace)
             == TRANSCRIPT_UNREADABLE
@@ -1210,7 +1291,9 @@ class TestStatelessTeardown:
 
 class TestRetentionSweep:
     @pytest.fixture
-    def users(self, per_uid):
+    def users(self, per_uid, monkeypatch):
+        # The CLI expires its own state only with the user setting source.
+        monkeypatch.setenv("CLAUDE_SETTING_SOURCES", "user,project,local")
         alice = ui.resolve_uid("alice", persist=True)
         bob = ui.resolve_uid("bob", persist=True)
         config = cp.user_config_dir(alice)
@@ -1272,3 +1355,576 @@ class TestRetentionSweep:
         with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
             assert uid_cleanup.retention_sweep() == 0
         assert "left expired entries" in caplog.text
+
+
+class TestRetentionNeedsTheUserSettingSource:
+    """The CLI runs its own cleanupPeriodDays expiry only with the ``user``
+    setting source; without it nothing ever expired these, so the gateway does
+    not either (it would start deleting transcripts nothing deleted before)."""
+
+    @pytest.fixture
+    def alice(self, per_uid):
+        uid = ui.resolve_uid("alice", persist=True)
+        (cp.user_config_dir(uid) / "projects").mkdir(parents=True)
+        return per_uid
+
+    @pytest.mark.parametrize("sources", [None, "project,local", "local"])
+    def test_without_it_nothing_is_swept(self, alice, monkeypatch, sources):
+        if sources is None:
+            monkeypatch.delenv("CLAUDE_SETTING_SOURCES", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_SETTING_SOURCES", sources)
+        assert uid_cleanup.retention_sweep() == 0
+        assert alice.ops.calls == []
+
+    def test_with_it_the_sweep_runs(self, alice, monkeypatch):
+        monkeypatch.setenv("CLAUDE_SETTING_SOURCES", "user")
+        assert uid_cleanup.retention_sweep() == 1
+
+
+# ---------------------------------------------------------------------------
+# The reclaimer pool and parked jobs
+# ---------------------------------------------------------------------------
+
+
+def _wait_for(predicate, timeout: float = 5.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class TestReclaimerPool:
+    def test_one_blocked_job_does_not_hold_the_others(self, reclaimer):
+        gate, ran = threading.Event(), threading.Event()
+        reclaimer.submit("slow", lambda: gate.wait(5))
+        reclaimer.submit("fast", lambda: ran.set() or True)
+        assert ran.wait(5)  # while "slow" still blocks
+        assert reclaimer.is_pending("slow")
+        gate.set()
+        assert reclaimer.drain(5)
+
+    def test_at_most_workers_jobs_run_at_once(self):
+        instance = uid_cleanup.Reclaimer(backoff=FAST, workers=2)
+        gate, lock, started = threading.Event(), threading.Lock(), []
+
+        def job(n):
+            with lock:
+                started.append(n)
+            return gate.wait(5)
+
+        try:
+            for n in range(4):
+                instance.submit(n, lambda n=n: job(n))
+            assert _wait_for(lambda: len(started) == 2)
+            time.sleep(0.1)
+            assert len(started) == 2
+            gate.set()
+            assert instance.drain(5)
+            assert sorted(started) == [0, 1, 2, 3]
+        finally:
+            instance.stop()
+
+    def test_a_key_never_runs_twice_at_once(self, reclaimer):
+        gate, runs = threading.Event(), []
+
+        def job():
+            runs.append(1)
+            return gate.wait(5)
+
+        reclaimer.submit("k", job)
+        assert _wait_for(lambda: runs == [1])
+        assert not reclaimer.submit("k", job)  # running: nothing queued
+        gate.set()
+        assert reclaimer.drain(5)
+        assert runs == [1]
+
+    def test_stop_joins_every_worker(self):
+        instance = uid_cleanup.Reclaimer(backoff=FAST, workers=3)
+        instance.submit("k", lambda: True)
+        assert instance.drain(5)
+        instance.stop()
+        assert len(instance._threads) == 3
+        assert not any(thread.is_alive() for thread in instance._threads)
+
+
+class TestParkedJobs:
+    @pytest.fixture
+    def parked(self):
+        instance = uid_cleanup.Reclaimer(backoff=(0.01,), parked_retry=60)
+        yield instance
+        instance.stop()
+
+    def test_past_its_backoff_a_kept_job_is_parked_not_dropped(self, parked):
+        calls = []
+        parked.submit("k", lambda: calls.append(1) and False, keep=lambda: True)
+        assert parked.drain(5)  # a parked job is not waited for
+        assert len(calls) == 2  # the first try and one backoff retry
+        assert parked.is_pending("k") and parked.parked() == 1
+
+    def test_submitting_it_again_runs_it_now(self, parked):
+        results, calls = iter([False, False, True]), []
+        parked.submit("k", lambda: calls.append(1) or next(results), keep=lambda: True)
+        assert parked.drain(5) and parked.parked() == 1
+        assert not parked.submit("k", lambda: pytest.fail("a second job"))
+        assert _wait_for(lambda: not parked.is_pending("k"))
+        assert len(calls) == 3
+
+    @pytest.mark.parametrize("keep", [lambda: False, lambda: 1 / 0])
+    def test_it_is_given_up_once_keep_says_no(self, parked, keep, caplog):
+        with caplog.at_level(logging.WARNING, logger=uid_cleanup.__name__):
+            parked.submit("k", lambda: False, keep=keep)
+            assert parked.drain(5)
+        assert not parked.is_pending("k")
+        assert "Gave up on uid cleanup job k after" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# SysV IPC and POSIX message queue leftovers
+# ---------------------------------------------------------------------------
+
+_SHM_HEADER = (
+    "       key      shmid perms                  size  cpid  lpid nattch   uid"
+    "   gid  cuid  cgid      atime      dtime      ctime                   rss"
+    "                  swap\n"
+)
+_SEM_HEADER = (
+    "       key      semid perms      nsems   uid   gid  cuid  cgid      otime"
+    "      ctime\n"
+)
+_MSG_HEADER = (
+    "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid"
+    "  cuid  cgid      stime      rtime      ctime\n"
+)
+
+
+def _shm_row(ident: int, uid: int, cuid: int) -> str:
+    return f"  0 {ident} 600 4096 1 1 0 {uid} {uid} {cuid} {cuid} 0 0 0 4096 0\n"
+
+
+def _sem_row(ident: int, uid: int, cuid: int) -> str:
+    return f"  0 {ident} 600 1 {uid} {uid} {cuid} {cuid} 0 0\n"
+
+
+def _msg_row(ident: int, uid: int, cuid: int) -> str:
+    return f"  0 {ident} 600 0 0 0 0 {uid} {uid} {cuid} {cuid} 0 0 0\n"
+
+
+class TestIpcLeftovers:
+    UID = 29750
+
+    @pytest.fixture
+    def tables(self, monkeypatch, tmp_path):
+        sysv, mqueue = tmp_path / "sysvipc", tmp_path / "mqueue"
+        sysv.mkdir()
+        mqueue.mkdir()
+        monkeypatch.setattr(uid_cleanup, "_SYSVIPC_DIR", str(sysv))
+        monkeypatch.setattr(uid_cleanup, "_MQUEUE_DIR", str(mqueue))
+        return SimpleNamespace(sysv=sysv, mqueue=mqueue)
+
+    def test_objects_the_uid_owns_or_created(self, tables):
+        uid, other = self.UID, 1000
+        (tables.sysv / "shm").write_text(
+            _SHM_HEADER
+            + _shm_row(11, uid, other)
+            + _shm_row(12, other, uid)
+            + _shm_row(13, other, other)
+        )
+        (tables.sysv / "sem").write_text(
+            _SEM_HEADER + _sem_row(21, uid, uid) + _sem_row(22, other, other)
+        )
+        (tables.sysv / "msg").write_text(_MSG_HEADER + _msg_row(31, uid, uid))
+        assert uid_cleanup.ipc_leftovers(uid) == [
+            "SysV shm 11",
+            "SysV shm 12",
+            "SysV sem 21",
+            "SysV msg 31",
+        ]
+        assert uid_cleanup.ipc_leftovers(uid + 1) == []
+
+    def test_empty_tables_and_no_mount_are_nothing(self, tables, monkeypatch):
+        (tables.sysv / "shm").write_text(_SHM_HEADER)
+        monkeypatch.setattr(uid_cleanup, "_MQUEUE_DIR", str(tables.mqueue / "none"))
+        assert uid_cleanup.ipc_leftovers(self.UID) == []
+
+    def test_no_tables_at_all_are_nothing(self, tables, monkeypatch, tmp_path):
+        monkeypatch.setattr(uid_cleanup, "_SYSVIPC_DIR", str(tmp_path / "none"))
+        assert uid_cleanup.ipc_leftovers(self.UID) == []
+
+    def test_a_header_without_the_columns_fails_closed(self, tables):
+        (tables.sysv / "sem").write_text("key semid perms\n0 21 600\n")
+        assert uid_cleanup.ipc_leftovers(self.UID) == [
+            str(tables.sysv / "sem") + " (unrecognized header)"
+        ]
+
+    def test_an_unparsable_line_fails_closed(self, tables):
+        (tables.sysv / "msg").write_text(_MSG_HEADER + "  0 31 600 x\n")
+        assert uid_cleanup.ipc_leftovers(self.UID) == [
+            str(tables.sysv / "msg") + " (unparsable line)"
+        ]
+
+    @_not_root
+    def test_an_unreadable_table_fails_closed(self, tables):
+        table = tables.sysv / "shm"
+        table.write_text(_SHM_HEADER)
+        table.chmod(0)
+        try:
+            assert uid_cleanup.ipc_leftovers(self.UID) == [str(table)]
+        finally:
+            table.chmod(0o600)
+
+    def test_message_queues_the_uid_owns(self, tables):
+        (tables.mqueue / "q1").write_text("")
+        assert uid_cleanup.ipc_leftovers(os.getuid()) == [str(tables.mqueue / "q1")]
+        assert uid_cleanup.ipc_leftovers(os.getuid() + 1) == []
+
+    def test_this_kernels_tables_parse(self):
+        # The real /proc/sysvipc (when there is one) and /dev/mqueue: a uid
+        # with no objects must come back empty, not as a parse failure.
+        assert uid_cleanup.ipc_leftovers(29999) == []
+
+    def test_they_keep_the_lease(self, per_uid, wm, monkeypatch, tmp_path):
+        workspace, key, uid = _leased_workspace(wm)
+        sysv = tmp_path / "sysvipc-live"
+        sysv.mkdir()
+        (sysv / "shm").write_text(_SHM_HEADER + _shm_row(11, uid, uid))
+        monkeypatch.setattr(uid_cleanup, "_SYSVIPC_DIR", str(sysv))
+        per_uid.ops.result = False  # the broker could not remove the segment
+
+        wm.cleanup_temp_workspace(workspace)
+        assert per_uid.reclaimer.drain(5)
+        assert ui.leased_uid(key) == uid and workspace.is_dir()
+
+        (sysv / "shm").write_text(_SHM_HEADER)  # gone now
+        wm.cleanup_temp_workspace(workspace)
+        assert per_uid.reclaimer.drain(5)
+        assert ui.leased_uid(key) is None and not workspace.exists()
+
+
+# ---------------------------------------------------------------------------
+# Bounded transcript reads, and transient broker failures
+# ---------------------------------------------------------------------------
+
+
+class TestBoundedTranscriptReads:
+    """A session uid may write its own transcript: the gateway never reads one
+    into memory unbounded."""
+
+    @pytest.fixture
+    def path(self, monkeypatch, tmp_path, ops):
+        _mode(monkeypatch, "off")
+        monkeypatch.setattr(sm, "_PROJECTS_ROOT", tmp_path / "projects")
+        path = sm._session_jsonl_path(SID, tmp_path / "ws")
+        path.parent.mkdir(parents=True)
+        return path
+
+    def test_a_file_over_the_size_cap_is_unreadable_not_read(
+        self, path, tmp_path, monkeypatch
+    ):
+        monkeypatch.setattr(transcript_turns, "MAX_TRANSCRIPT_BYTES", 1024)
+        with open(path, "wb") as sparse:  # one endless "line", no newline
+            sparse.truncate(1 << 20)
+        with pytest.raises(TranscriptUnreadable) as excinfo:
+            uid_cleanup.read_transcript_turns(SID, user="u", workspace=tmp_path / "ws")
+        assert "more than the 1024" in str(excinfo.value.__cause__)
+        # The route's 500, not a 404 "not found or expired".
+        with pytest.raises(TranscriptUnreadable):
+            sm._try_rehydrate_from_jsonl(SID, user="u", cwd=str(tmp_path / "ws"))
+
+    def test_a_line_over_the_line_cap_is_corrupt(self, path, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript_turns, "MAX_LINE_CHARS", 64)
+        line = json.dumps({"type": "user", "message": {"content": "x" * 200}})
+        path.write_text(line + "\n")
+        read = []
+        real = transcript_turns.bounded_lines
+
+        def spy(fh, max_line):
+            read.append(max_line)
+            return real(fh, max_line)
+
+        monkeypatch.setattr(transcript_turns, "bounded_lines", spy)
+        assert (
+            uid_cleanup.read_transcript_turns(SID, user="u", workspace=tmp_path / "ws")
+            == TRANSCRIPT_CORRUPT
+        )
+        assert read == [64]
+
+    def test_lines_within_the_caps_count(self, path, tmp_path, monkeypatch):
+        monkeypatch.setattr(transcript_turns, "MAX_LINE_CHARS", 4096)
+        monkeypatch.setattr(transcript_turns, "MAX_TRANSCRIPT_BYTES", 4096)
+        line = json.dumps({"type": "user", "message": {"content": "hi"}})
+        path.write_text(line + "\n" + line + "\n")
+        assert (
+            uid_cleanup.read_transcript_turns(SID, user="u", workspace=tmp_path / "ws")
+            == 2
+        )
+
+
+class TestTransientBrokerFailures:
+    @pytest.fixture
+    def alice(self, per_uid):
+        ui.resolve_uid("alice", persist=True)
+        workspace = "/ws/alice/claude"
+        path = sm._session_jsonl_path(SID, workspace, user="alice")
+        return SimpleNamespace(workspace=workspace, path=path, **vars(per_uid))
+
+    @_not_root
+    def test_a_transient_failure_is_temporarily_unavailable(self, alice, caplog):
+        _write_transcript(alice.path, alice.workspace).chmod(0)
+        alice.ops.fail, alice.ops.transient = 1, True
+        manager = SessionManager()
+        with caplog.at_level(logging.WARNING, logger=sm.__name__):
+            with pytest.raises(TranscriptTemporarilyUnavailable) as excinfo:
+                manager.get_session(SID, user="alice", cwd=alice.workspace)
+        assert excinfo.value.path == alice.path
+        assert manager.stats()["rehydrate_misses"] == 1
+        assert "a retry may succeed" in caplog.text
+        # It cleared: the next attempt rehydrates.
+        alice.ops.turns = 1
+        assert manager.get_session(SID, user="alice", cwd=alice.workspace)
+
+    @_not_root
+    def test_a_refusal_stays_unreadable(self, alice):
+        _write_transcript(alice.path, alice.workspace).chmod(0)
+        alice.ops.fail = 1
+        with pytest.raises(TranscriptUnreadable):
+            uid_cleanup.read_transcript_turns(
+                SID, user="alice", workspace=alice.workspace
+            )
+
+    @_not_root
+    def test_the_brokers_unreadable_is_unreadable_not_missing(self, alice):
+        _write_transcript(alice.path, alice.workspace).chmod(0)
+        alice.ops.turns = TRANSCRIPT_UNREADABLE
+        with pytest.raises(TranscriptUnreadable) as excinfo:
+            sm._try_rehydrate_from_jsonl(SID, user="alice", cwd=alice.workspace)
+        assert "either" in str(excinfo.value.__cause__)
+
+    @_not_root
+    def test_the_existence_check_tells_them_apart(self, alice):
+        _write_transcript(alice.path, alice.workspace)
+        alice.path.parent.chmod(0)
+        try:
+            alice.ops.fail, alice.ops.transient = 1, True
+            with pytest.raises(TranscriptTemporarilyUnavailable):
+                uid_cleanup.transcript_exists(
+                    SID, user="alice", workspace=alice.workspace
+                )
+            alice.ops.fail, alice.ops.transient = 1, False
+            with pytest.raises(TranscriptUnreadable):
+                uid_cleanup.transcript_exists(
+                    SID, user="alice", workspace=alice.workspace
+                )
+        finally:
+            alice.path.parent.chmod(0o700)
+
+
+class TestRouteAnswers:
+    def test_temporarily_unavailable_is_a_retryable_503(
+        self, monkeypatch, tmp_path, isolated_session_manager
+    ):
+        from src.constants import DEFAULT_MODEL
+        from tests.test_session_dirs_lifecycle import _responses_client
+
+        def unavailable(session_id, *, user, workspace):
+            raise TranscriptTemporarilyUnavailable(tmp_path / f"{session_id}.jsonl")
+
+        monkeypatch.setattr(uid_cleanup, "read_transcript_turns", unavailable)
+        workspace = tmp_path / "workspaces" / "alice" / "claude"
+        workspace.mkdir(parents=True)
+        with _responses_client(workspace) as client:
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "and then?",
+                    "user": "alice",
+                    "previous_response_id": f"resp_{SID}_1",
+                },
+            )
+        assert resp.status_code == 503
+        assert "x-should-retry" not in resp.headers
+        assert "retry shortly" in resp.json()["error"]["message"]
+        assert SID not in isolated_session_manager.sessions
+
+    def test_unreadable_while_starting_a_client_is_the_same_500(self):
+        from src.routes import responses
+
+        exc = responses._backend_unavailable_error(
+            "claude", TranscriptUnreadable(Path("/cfg/projects/-ws/s.jsonl"))
+        )
+        assert exc.status_code == 500
+        assert exc.headers["x-should-retry"] == "false"
+        assert exc.detail["error"]["code"] == "transcript_unreadable"
+        assert "/cfg" not in exc.detail["error"]["message"]
+
+    def test_temporarily_unavailable_while_starting_a_client_is_a_503(self):
+        from src.routes import responses
+
+        exc = responses._backend_unavailable_error(
+            "claude", TranscriptTemporarilyUnavailable(Path("/x.jsonl"))
+        )
+        assert exc.status_code == 503 and not exc.headers
+
+
+# ---------------------------------------------------------------------------
+# Rehydrate outside the manager's lock and off the event loop
+# ---------------------------------------------------------------------------
+
+
+class TestRehydrateOutsideTheLock:
+    """A rehydrate's transcript read can be a broker round trip (uid mode):
+    it used to run under ``SessionManager.lock`` and on the event loop."""
+
+    @staticmethod
+    def _install(monkeypatch, read):
+        monkeypatch.setattr(uid_cleanup, "read_transcript_turns", read)
+
+    def test_the_sync_read_does_not_hold_the_lock(self, monkeypatch):
+        manager, free = SessionManager(), []
+
+        def read(session_id, *, user, workspace):
+            free.append(manager.lock.acquire(blocking=False))
+            if free[-1]:
+                manager.lock.release()
+            return 2
+
+        self._install(monkeypatch, read)
+        session = manager.get_session(SID, user="alice", cwd="/ws/a")
+        assert free == [True]
+        assert session.turn_counter == 2 and manager.sessions[SID] is session
+        assert manager.stats()["rehydrate_hits"] == 1
+
+    async def test_the_async_read_runs_off_the_event_loop(self, monkeypatch):
+        manager = SessionManager()
+        started, release = threading.Event(), threading.Event()
+        threads = []
+
+        def read(session_id, *, user, workspace):
+            threads.append(threading.current_thread())
+            started.set()
+            release.wait(5)
+            return 1
+
+        self._install(monkeypatch, read)
+        task = asyncio.create_task(
+            manager.get_session_async(SID, user="alice", cwd="/ws/a")
+        )
+        assert await asyncio.to_thread(started.wait, 5)
+        for _ in range(3):  # the loop keeps running meanwhile
+            await asyncio.sleep(0.01)
+        assert not task.done()
+        assert manager.lock.acquire(blocking=False)  # and the lock is free
+        manager.lock.release()
+        manager.get_or_create_session(OTHER_SID)  # other sessions work
+        release.set()
+        session = await asyncio.wait_for(task, 5)
+        assert session.turn_counter == 1 and manager.sessions[SID] is session
+        assert threads and threads[0] is not threading.main_thread()
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_a_live_session_that_appeared_meanwhile_wins(
+        self, monkeypatch, asynchronous
+    ):
+        manager, live = SessionManager(), []
+
+        def read(session_id, *, user, workspace):
+            live.append(manager.get_or_create_session(SID))  # a concurrent one
+            return 3
+
+        self._install(monkeypatch, read)
+        if asynchronous:
+            found = await manager.get_session_async(SID, user="alice", cwd="/ws/a")
+        else:
+            found = manager.get_session(SID, user="alice", cwd="/ws/a")
+        assert found is live[0] and manager.sessions[SID] is live[0]
+        assert found.turn_counter == 0  # the live one, not the read
+        assert manager.stats()["rehydrate_hits"] == 0
+
+    @pytest.mark.parametrize(
+        "error", [TranscriptUnreadable, TranscriptTemporarilyUnavailable]
+    )
+    async def test_a_failed_read_counts_a_miss(self, monkeypatch, error):
+        manager = SessionManager()
+
+        def read(session_id, *, user, workspace):
+            raise error(Path("/x.jsonl"))
+
+        self._install(monkeypatch, read)
+        with pytest.raises(error):
+            await manager.get_session_async(SID, user="alice", cwd="/ws/a")
+        assert manager.stats()["rehydrate_misses"] == 1
+        assert SID not in manager.sessions
+
+    async def test_admission_is_checked_after_the_read(self, monkeypatch):
+        manager = SessionManager()
+        manager.get_or_create_session(OTHER_SID)
+        self._install(monkeypatch, lambda session_id, *, user, workspace: 1)
+        with patch("src.constants.MAX_LIVE_SESSIONS", 1):
+            with pytest.raises(SessionLimitExceeded):
+                await manager.get_session_async(SID, user="alice", cwd="/ws/a")
+        assert SID not in manager.sessions
+
+    async def test_a_turn_the_transcript_cannot_serve_is_a_miss(self, monkeypatch):
+        manager = SessionManager()
+        self._install(monkeypatch, lambda session_id, *, user, workspace: 1)
+        assert (
+            await manager.get_session_async(SID, user="alice", cwd="/ws/a", max_turn=2)
+            is None
+        )
+        assert manager.stats()["rehydrate_misses"] == 1
+
+    async def test_no_context_is_a_plain_cache_lookup(self, monkeypatch):
+        manager = SessionManager()
+        self._install(monkeypatch, lambda *a, **k: pytest.fail("read without context"))
+        assert await manager.get_session_async(SID) is None
+        assert await manager.get_session_async(SID, user="alice") is None
+        live = manager.get_or_create_session(SID)
+        assert await manager.get_session_async(SID, user="alice", cwd="/w") is live
+        assert manager.stats()["rehydrate_misses"] == 0
+
+
+# ---------------------------------------------------------------------------
+# A transcript under a project dir the gateway cannot enter
+# ---------------------------------------------------------------------------
+
+
+class TestLockedProjectDir:
+    @_not_root
+    def test_removal_goes_to_the_broker(self, per_uid):
+        uid = ui.resolve_uid("alice", persist=True)
+        workspace = "/ws/alice/claude"
+        transcript = _write_transcript(
+            sm._session_jsonl_path(SID, workspace, user="alice"), workspace
+        )
+        project = transcript.parent
+        project.chmod(0)  # the uid's own 0700 dir: the gateway cannot even look
+        try:
+            uid_cleanup.remove_transcript(SID, user="alice", workspace=workspace)
+            assert per_uid.reclaimer.drain(5)
+        finally:
+            if project.exists():
+                project.chmod(0o700)
+        ((called, kwargs),) = per_uid.ops.calls
+        assert called == uid
+        assert kwargs == {"remove": [str(transcript), str(project / SID)]}
+        assert not transcript.exists()
+
+    @_not_root
+    def test_the_brokers_word_is_taken_where_the_gateway_cannot_check(self, per_uid):
+        ui.resolve_uid("alice", persist=True)
+        workspace = "/ws/alice/claude"
+        transcript = _write_transcript(
+            sm._session_jsonl_path(SID, workspace, user="alice"), workspace
+        )
+        project = transcript.parent
+        per_uid.ops.effect = None  # it "removed" them; the gateway cannot see
+        project.chmod(0)
+        try:
+            uid_cleanup.remove_transcript(SID, user="alice", workspace=workspace)
+            assert per_uid.reclaimer.drain(5)
+        finally:
+            project.chmod(0o700)
+        assert len(per_uid.ops.calls) == 1  # done, not retried

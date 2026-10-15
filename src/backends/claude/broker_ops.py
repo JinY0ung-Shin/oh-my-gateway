@@ -63,7 +63,17 @@ class BrokerOpError(RuntimeError):
     that is live or being wiped), could not be reached, the link failed, timed
     out or closed before a full record, or it answered with a record of the
     wrong kind. No message carries the ticket.
+
+    *transient* is true for the failures a later attempt may not meet: the
+    broker could not be reached, the link failed or closed early, or no answer
+    came in time (a broker restarting, or overloaded). A refusal, a record of
+    the wrong kind and a missing socket or secret are not: the same request
+    gets the same answer.
     """
+
+    def __init__(self, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.transient = transient
 
 
 def available() -> bool:
@@ -114,7 +124,7 @@ def _mint(op: str, uid: int, fields: dict) -> str:
 def _remaining(deadline: float, what: str) -> float:
     left = deadline - time.monotonic()
     if left <= 0:
-        raise BrokerOpError(f"the broker {what} op timed out")
+        raise BrokerOpError(f"the broker {what} op timed out", transient=True)
     return left
 
 
@@ -140,14 +150,15 @@ def _exchange(ticket: str, timeout: float, what: str) -> Tuple[int, int]:
             chunk = sock.recv(_RECORD.size - len(data))
             if not chunk:
                 raise BrokerOpError(
-                    f"the broker closed the link before answering the {what} op"
+                    f"the broker closed the link before answering the {what} op",
+                    transient=True,
                 )
             data += chunk
     except socket.timeout as exc:
-        raise BrokerOpError(f"the broker {what} op timed out") from exc
+        raise BrokerOpError(f"the broker {what} op timed out", transient=True) from exc
     except OSError as exc:
         raise BrokerOpError(
-            f"the broker {what} op failed: {exc.strerror or exc}"
+            f"the broker {what} op failed: {exc.strerror or exc}", transient=True
         ) from exc
     finally:
         sock.close()
@@ -208,7 +219,7 @@ def cleanup(
     raise _unexpected("cleanup", uid, kind, value)
 
 
-def read_transcript(uid: int, path, cwd, *, timeout: float = 35.0) -> int:
+def read_transcript(uid: int, path, cwd, *, timeout: float = 75.0) -> int:
     """Count the external user turns of the transcript at *path*, as *uid*.
 
     The broker applies ``transcript_turns.count_transcript_turns`` against

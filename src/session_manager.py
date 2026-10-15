@@ -126,6 +126,21 @@ class TranscriptUnreadable(Exception):
         self.path = path
 
 
+class TranscriptTemporarilyUnavailable(Exception):
+    """A session transcript is on disk, but could not be read right now.
+
+    The gateway may not read it itself (a session uid's 0600 transcript under
+    ``CLAUDE_ISOLATION_MODE=uid``) and the broker that reads it as that uid
+    could not be reached or did not answer in time (a broker restart, an
+    overloaded host). Unlike :class:`TranscriptUnreadable`, a retry may
+    succeed: the route answers a retryable 503.
+    """
+
+    def __init__(self, path: Path) -> None:
+        super().__init__(f"session transcript {path} cannot be read right now")
+        self.path = path
+
+
 # Transcript paths whose EACCES was logged at WARNING already. Bounded: once
 # full it starts over, so each path then warns once more.
 _UNREADABLE_WARNED: set = set()
@@ -183,6 +198,13 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
         turns = uid_cleanup.read_transcript_turns(session_id, user=user, workspace=cwd)
     except TranscriptUnreadable as exc:
         _warn_unreadable_transcript(exc.path, exc.__cause__)
+        raise
+    except TranscriptTemporarilyUnavailable as exc:
+        logger.warning(
+            "Cannot rehydrate a session from %s right now: %s; a retry may succeed",
+            exc.path,
+            _unreadable_reason(exc.__cause__),
+        )
         raise
     if turns == TRANSCRIPT_MISMATCH:
         # Ownership guard. ``_encode_cwd`` is lossy (every non-alphanumeric
@@ -1075,25 +1097,82 @@ class SessionManager:
         the route's own turn validation owns that case.
 
         Raises :class:`TranscriptUnreadable` when the transcript is on disk
-        but the gateway may not read it (uid isolation).
+        but the gateway may not read it (uid isolation), and
+        :class:`TranscriptTemporarilyUnavailable` when the broker that reads
+        it as the session uid did not answer.
+
+        The transcript is read outside the manager's lock: under uid isolation
+        that read can be a broker round trip, and holding the lock across it
+        stalled every other session operation. Async callers use
+        :meth:`get_session_async`, which also keeps it off the event loop.
         """
         with self.lock:
-            self._remove_if_expired(session_id)
-            session = self.sessions.get(session_id)
-            if session is not None:
-                session.touch()
-                return session
+            session = self._cached_session_locked(session_id)
             # Cache miss path — only count rehydrate hit/miss when the
             # caller supplied enough context for a jsonl lookup to be
             # attempted. Generic cache misses (e.g., simple existence
             # checks without user/cwd) must not pollute the metric.
-            if not user or not cwd:
-                return None
-            try:
-                session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
-            except TranscriptUnreadable:
-                self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
-                raise
+            if session is not None or not user or not cwd:
+                return session
+        try:
+            session = _try_rehydrate_from_jsonl(session_id, user=user, cwd=cwd)
+        except (TranscriptUnreadable, TranscriptTemporarilyUnavailable):
+            self._count_rehydrate_miss()
+            raise
+        return self._admit_rehydrated(session_id, session, max_turn)
+
+    async def get_session_async(
+        self,
+        session_id: str,
+        *,
+        user: Optional[str] = None,
+        cwd: Optional[str] = None,
+        max_turn: Optional[int] = None,
+    ) -> Optional[Session]:
+        """:meth:`get_session` for async callers.
+
+        The cache lookup and the admission run here, on the event loop (an
+        expired session's teardown and an LRU eviction schedule tasks on it);
+        the transcript read runs in a worker thread.
+        """
+        with self.lock:
+            session = self._cached_session_locked(session_id)
+            if session is not None or not user or not cwd:
+                return session
+        try:
+            session = await asyncio.to_thread(
+                _try_rehydrate_from_jsonl, session_id, user=user, cwd=cwd
+            )
+        except (TranscriptUnreadable, TranscriptTemporarilyUnavailable):
+            self._count_rehydrate_miss()
+            raise
+        return self._admit_rehydrated(session_id, session, max_turn)
+
+    def _cached_session_locked(self, session_id: str) -> Optional[Session]:
+        """The live session *session_id*, touched; caller holds the lock."""
+        self._remove_if_expired(session_id)
+        session = self.sessions.get(session_id)
+        if session is not None:
+            session.touch()
+        return session
+
+    def _count_rehydrate_miss(self) -> None:
+        with self.lock:
+            self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
+
+    def _admit_rehydrated(
+        self, session_id: str, session: Optional[Session], max_turn: Optional[int]
+    ) -> Optional[Session]:
+        """Admit *session*, read from its transcript outside the lock.
+
+        A live session that appeared meanwhile (a concurrent continuation
+        rehydrated the same id first) is the one returned, as a cache hit: the
+        read is dropped, so one id never maps to two sessions.
+        """
+        with self.lock:
+            current = self._cached_session_locked(session_id)
+            if current is not None:
+                return current
             if session is not None and max_turn is not None and max_turn > session.turn_counter:
                 self._rehydrate_misses = getattr(self, "_rehydrate_misses", 0) + 1
                 return None

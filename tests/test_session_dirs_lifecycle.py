@@ -360,10 +360,14 @@ class TestUnreadableTranscript:
         assert manager.get_session(SID, user="alice", cwd=str(workspace))
 
     def test_other_os_errors_still_read_as_missing(self, projects, tmp_path):
+        from src.backends.claude import uid_cleanup
+
         workspace = tmp_path / "ws"
         workspace.mkdir()
         _transcript(projects, workspace)
-        with patch.object(Path, "open", side_effect=OSError(5, "I/O error")):
+        with patch.object(
+            uid_cleanup, "_open_transcript", side_effect=OSError(5, "I/O error")
+        ):
             assert (
                 sm._try_rehydrate_from_jsonl(SID, user="alice", cwd=str(workspace))
                 is None

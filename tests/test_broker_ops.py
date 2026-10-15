@@ -440,3 +440,55 @@ class TestReadTranscript:
             broker_ops.read_transcript(
                 20033, tmp_path / "s.jsonl", tmp_path, timeout=0.3
             )
+
+
+class TestTransientFailures:
+    """``BrokerOpError.transient``: a later attempt may succeed (unreachable,
+    link failed or closed early, no answer in time) versus the same request
+    getting the same answer (refused, wrong record, no socket, no secret)."""
+
+    @pytest.mark.parametrize(
+        "reply",
+        [b"", _record(1, 0)[:3], _HANG],
+        ids=["closed", "partial", "silent"],
+    )
+    def test_no_full_answer_is_transient(self, broker, reply):
+        broker.responder = lambda _p: reply
+        with pytest.raises(broker_ops.BrokerOpError) as excinfo:
+            broker_ops.cleanup(20040, timeout=0.3)
+        assert excinfo.value.transient is True
+
+    def test_no_broker_listening_is_transient(self, uid_env):
+        with pytest.raises(broker_ops.BrokerOpError) as excinfo:
+            broker_ops.read_transcript(20041, "/cfg/s.jsonl", "/ws")
+        assert excinfo.value.transient is True
+
+    @pytest.mark.parametrize(
+        "reply",
+        [_record(broker_ops.ST_REFUSED, 0), _record(broker_ops.ST_SIGNALED, 9)],
+        ids=["refused", "wrong-kind"],
+    )
+    def test_an_answer_is_not_transient(self, broker, reply):
+        broker.responder = lambda _p: reply
+        with pytest.raises(broker_ops.BrokerOpError) as excinfo:
+            broker_ops.read_transcript(20042, "/cfg/s.jsonl", "/ws")
+        assert excinfo.value.transient is False
+
+    def test_a_missing_socket_or_secret_is_not_transient(self, broker, monkeypatch):
+        monkeypatch.delenv(ui.TICKET_SECRET_ENV)
+        with pytest.raises(broker_ops.BrokerOpError) as excinfo:
+            broker_ops.cleanup(20043)
+        assert excinfo.value.transient is False
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, _SECRET)
+        monkeypatch.delenv(landlock.BROKER_SOCKET_ENV)
+        with pytest.raises(broker_ops.BrokerOpError) as excinfo:
+            broker_ops.cleanup(20043)
+        assert excinfo.value.transient is False
+
+
+def test_the_transcript_read_outwaits_the_brokers_alarm():
+    # The broker's transcript reader gets 60 s; the client waits longer.
+    import inspect
+
+    timeout = inspect.signature(broker_ops.read_transcript).parameters["timeout"]
+    assert timeout.default == 75.0

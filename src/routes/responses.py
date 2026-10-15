@@ -713,7 +713,9 @@ def _validate_background_request(body: ResponseCreateRequest) -> None:
         )
 
 
-def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tuple[str, Any]:
+async def _resolve_response_session(
+    body: ResponseCreateRequest, backend: str
+) -> tuple[str, Any]:
     if not body.previous_response_id:
         session_id = str(uuid.uuid4())
         return session_id, session_manager.get_or_create_session(session_id)
@@ -748,13 +750,18 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             _early_cwd = str(workspace_manager.resolve(body.user, backend=backend))
         except (ValueError, OSError):
             pass
-    from src.session_manager import TranscriptUnreadable
+    from src.session_manager import (
+        TranscriptTemporarilyUnavailable,
+        TranscriptUnreadable,
+    )
 
     # max_turn: a transcript that cannot serve the requested turn must be
     # discarded before admission — at the cap, admitting it can evict a live
     # session (SESSION_EVICTION_POLICY=lru) only for this request to 404.
+    # Async: under uid isolation the transcript read can be a broker round
+    # trip, which must not block the event loop (get_session_async).
     try:
-        session = session_manager.get_session(
+        session = await session_manager.get_session_async(
             session_id, user=body.user, cwd=_early_cwd, max_turn=turn
         )
         if session is None and backend == "claude" and body.user:
@@ -763,34 +770,21 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             except (ValueError, OSError):
                 legacy_cwd = None
             if legacy_cwd and legacy_cwd != _early_cwd:
-                session = session_manager.get_session(
+                session = await session_manager.get_session_async(
                     session_id, user=body.user, cwd=legacy_cwd, max_turn=turn
                 )
     except TranscriptUnreadable as exc:
-        # On disk but unreadable: the gateway's uid may not read it, and no
-        # broker read as the session uid worked either (uid isolation reads a
-        # session uid's 0600 transcript through the broker; uid_cleanup). Say
-        # so instead of the generic "not found or expired", which the session
-        # is not; the cause is logged. Not a transient state a client retry
-        # clears, and OpenAI SDKs retry 408/409/429 and every 5xx by themselves
-        # unless told not to (``x-should-retry``).
+        raise _transcript_unreadable_error(body.previous_response_id) from exc
+    except TranscriptTemporarilyUnavailable as exc:
+        # The broker that reads a session uid's transcript did not answer: a
+        # plain, retryable 503 (no ``x-should-retry: false``).
         raise HTTPException(
-            status_code=500,
-            headers=dict(_NO_RETRY_HEADERS),
-            detail={
-                "error": {
-                    "type": "server_error",
-                    "code": "transcript_unreadable",
-                    "message": (
-                        "Session for previous_response_id "
-                        f"'{body.previous_response_id}' cannot be resumed: the "
-                        "gateway may not read its transcript (permission "
-                        "denied), and under uid isolation the broker could not "
-                        "read it as the session's own uid either (the gateway "
-                        "log says why)."
-                    ),
-                }
-            },
+            status_code=503,
+            detail=(
+                f"Session for previous_response_id '{body.previous_response_id}' "
+                "cannot be resumed right now: its transcript could not be read "
+                "(the isolation broker did not answer); retry shortly"
+            ),
         ) from exc
     if not session:
         raise HTTPException(
@@ -1108,6 +1102,40 @@ def _response_input_to_codex_items(
 _NO_RETRY_HEADERS = {"x-should-retry": "false"}
 
 
+def _transcript_unreadable_error(previous_response_id: Optional[str]) -> HTTPException:
+    """The 500 for a session whose transcript is on disk but unreadable.
+
+    The gateway's uid may not read it, and no broker read as the session uid
+    worked either (uid isolation reads a session uid's 0600 transcript through
+    the broker; ``uid_cleanup``). Said so instead of the generic "not found or
+    expired", which the session is not; the cause is logged. Not a transient
+    state a client retry clears, and OpenAI SDKs retry 408/409/429 and every
+    5xx by themselves unless told not to (``x-should-retry``).
+    """
+    which = (
+        f"Session for previous_response_id '{previous_response_id}'"
+        if previous_response_id
+        else "The session"
+    )
+    return HTTPException(
+        status_code=500,
+        headers=dict(_NO_RETRY_HEADERS),
+        detail={
+            "error": {
+                "type": "server_error",
+                "code": "transcript_unreadable",
+                "message": (
+                    f"{which} cannot be resumed: its transcript is on disk but "
+                    "cannot be read — the gateway may not read it (permission "
+                    "denied, or larger than a transcript is read up to), and "
+                    "under uid isolation the broker could not read it as the "
+                    "session's own uid either (the gateway log says why)."
+                ),
+            }
+        },
+    )
+
+
 def _backend_unavailable_error(backend: str, exc: BaseException) -> HTTPException:
     """The HTTP error for a backend client, or its preflight, that could not start.
 
@@ -1124,7 +1152,12 @@ def _backend_unavailable_error(backend: str, exc: BaseException) -> HTTPExceptio
     """
     from src.backends.claude.landlock import WorkspaceRefused
     from src.backends.claude.uid_isolation import UidBandExhausted
+    from src.session_manager import TranscriptUnreadable
 
+    if isinstance(exc, TranscriptUnreadable):
+        # Raised while deciding to resume (the transcript is there but cannot
+        # be read): the same error the rehydrate path answers.
+        return _transcript_unreadable_error(None)
     if isinstance(exc, WorkspaceRefused):
         return HTTPException(
             status_code=500,
@@ -2216,7 +2249,7 @@ async def create_response(
     _validate_response_continuation(body)
     if body.background:
         _validate_background_request(body)
-    session_id, session = _resolve_response_session(body, resolved.backend)
+    session_id, session = await _resolve_response_session(body, resolved.backend)
     workspace = await _resolve_response_workspace(
         body, session, session_id, is_new_session, resolved.backend
     )
