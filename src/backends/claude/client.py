@@ -1739,6 +1739,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         cwd: Optional[str],
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]] = None,
+        user: Optional[str] = None,
     ):
         """Assemble the PreToolUse hook matchers for a session.
 
@@ -1775,11 +1776,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 for name in BLOCKED_DEFERRED_TOOLS
             )
         # Other users' transcripts and plans live in the shared ~/.claude: that
-        # guard is always on, independent of the opt-in workspace sandbox.
+        # guard is always on, independent of the opt-in workspace sandbox. Under
+        # uid isolation the session has its own config dir too (its layout).
         if cwd:
-            matchers.append(
-                HookMatcher(matcher="", hooks=[make_claude_home_guard_hook(Path(cwd))])
+            from .uid_layout import session_layout
+
+            guard = make_claude_home_guard_hook(
+                Path(cwd), layout=session_layout(user, cwd)
             )
+            matchers.append(HookMatcher(matcher="", hooks=[guard]))
         if cwd and sandbox_enabled():
             matchers.append(
                 HookMatcher(matcher="", hooks=[make_workspace_sandbox_hook(Path(cwd))])
@@ -2009,6 +2014,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # crash).
         from src.session_manager import _session_jsonl_exists
 
+        from .uid_layout import migrate_user
+
+        # Under uid isolation a named user's transcripts move into their own
+        # config dir on their first spawn; do that before asking whether this
+        # session has one, so a migrated session is resumed, not restarted.
+        migrate_user(user, cwd)
         has_history = _session_jsonl_exists(session)
         options = self._build_sdk_options(
             model=model,
@@ -2051,7 +2062,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         options.can_use_tool = self._make_ask_user_can_use_tool(session)
 
         options.hooks = {
-            "PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools, disallowed_tools)
+            "PreToolUse": self._pre_tool_use_hooks(
+                cwd, allowed_tools, disallowed_tools, user=user
+            )
         }
         post_tool_use = self._post_tool_use_hooks()
         if post_tool_use:

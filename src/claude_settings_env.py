@@ -389,13 +389,26 @@ def _resolve_templates(env: Mapping[str, str]) -> Dict[str, str]:
 
 
 def _write_settings(path: Path, settings: Dict[str, Any]) -> None:
-    """Atomically write the settings file, creating ``~/.claude`` if needed."""
+    """Atomically write the settings file, creating ``~/.claude`` if needed.
+
+    Under ``CLAUDE_ISOLATION_MODE=uid`` the file is the shared tree's
+    ``settings.json``, which every session uid's CLI reads through its config
+    dir's link (docs/isolation-uid-ownership-design.md §4.4): it is written
+    0644 then, or the session uids would silently lose the user settings and
+    every enabled plugin. Each session applies its ``env`` block anyway, so it
+    holds nothing a session does not get. Other modes keep ``mkstemp``'s 0600.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(
         dir=str(path.parent), prefix=path.name + ".", suffix=".tmp"
     )
+    shared_by_uids = (
+        os.getenv("CLAUDE_ISOLATION_MODE") or ""
+    ).strip().lower() == "uid"
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if shared_by_uids:
+                os.fchmod(f.fileno(), 0o644)
             json.dump(settings, f, ensure_ascii=False, indent=2)
             f.write("\n")
         os.replace(tmp, path)

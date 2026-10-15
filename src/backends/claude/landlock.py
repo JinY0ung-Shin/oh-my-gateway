@@ -370,6 +370,7 @@ def install_process_env() -> None:
                 timeout,
             )
         else:
+            _prepare_shared_tree()
             _probe_uid_sessions()
         reset_mode_cache()
     # Resolve and lock the effective mode once, before the first spawn, and log
@@ -393,6 +394,22 @@ def install_process_env() -> None:
 _UID_PROBE_TIMEOUT_SECONDS = 30.0
 
 
+def _prepare_shared_tree() -> None:
+    """uid mode with per-uid config dirs: make the shared tree's entry points
+    readable by session uids before the probe checks them
+    (``uid_layout.ensure_shared_readable``). Never raises."""
+    from src.claude_config_paths import config_base
+
+    if config_base() is None:
+        return
+    try:
+        from . import uid_layout
+
+        uid_layout.ensure_shared_readable()
+    except Exception:  # the probe reports what is still unreadable
+        logger.warning("could not prepare the shared config dir", exc_info=True)
+
+
 def _probe_uid_sessions() -> None:
     """Spawn one CLI the way a uid-mode session would, once, at startup.
 
@@ -411,9 +428,19 @@ def _probe_uid_sessions() -> None:
     :func:`check_config` reports those with their own, clearer errors.
     """
     global _uid_probe_problems
+    from src.claude_config_paths import config_base
+
     from . import uid_isolation as ui
 
-    if not ui.ticket_secret() or ui.validate_bands() or ui.registry_errors():
+    # A configured but unusable per-uid config base is check_config's to
+    # report (an unset one too; without it the probe still runs the shared
+    # layout, which shows why sessions cannot work).
+    if (
+        not ui.ticket_secret()
+        or ui.validate_bands()
+        or ui.registry_errors()
+        or (config_base() is not None and _config_base_errors())
+    ):
         _uid_probe_problems = None
         return
     try:
@@ -427,6 +454,131 @@ def _probe_uid_sessions() -> None:
 
 def _uid_session_problems() -> List[str]:
     """Why a uid-mode session cannot run here (empty list when it can)."""
+    from . import uid_layout
+
+    if uid_layout.enabled():
+        return _per_uid_session_problems()
+    return _shared_layout_session_problems()
+
+
+def _per_uid_session_problems() -> List[str]:
+    """The startup probe with per-uid config dirs: real operations, not a
+    mode-bit guess (design §7).
+
+    POSIX ACLs open the workspace and ``P`` to the session uid, and mode bits
+    do not show them (the group bits are the mask), so the probe does what a
+    session does and checks what happened: it prepares a fresh anonymous
+    workspace and its ephemeral uid's ``P`` (``uid_layout.prepare_spawn``),
+    spawns the real CLI ``--version`` through the launcher and broker with a
+    probe session id, then checks as the gateway that the session uid created
+    its tmp dir, its ``projects/<name>`` and its ``session-env``/``tasks``
+    dirs — the kernel having evaluated the ACLs — and that the shared tree is
+    readable by it (``S`` carries no ACL: there mode bits are the truth).
+    Finally the workspace is removed the way an anonymous run's is, through the
+    broker's cleanup op as the session uid, and the uid's ``P`` must be empty
+    again: otherwise every anonymous run would keep its uid lease and the
+    ephemeral band would run dry.
+    """
+    import secrets
+    import subprocess
+
+    from src.workspace_manager import workspace_manager
+
+    from . import uid_isolation as ui
+    from . import uid_layout
+    from .client import child_secret_env
+
+    workspace = workspace_manager.resolve(None)
+    cwd = _absolute(workspace)
+    sid = "probe-" + secrets.token_hex(8)
+    problems: List[str] = []
+    uid: Optional[int] = None
+    try:
+        try:
+            env = options_env(Path(cwd), user=None, session_id=sid)
+        except (WorkspaceRefused, ui.UidAllocationError) as exc:
+            return [f"a session uid's layout could not be prepared: {exc}"]
+        uid = ui.leased_uid(cwd)
+        if uid is None:  # pragma: no cover - options_env leased it
+            return ["the probe spawn got no ephemeral uid"]
+        problems.extend(uid_layout.shared_tree_problems(uid))
+        try:
+            result = subprocess.run(
+                [launcher_path(), "--version"],
+                cwd=cwd,
+                env={**os.environ, **child_secret_env(), **env},
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=_UID_PROBE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            problems.insert(
+                0,
+                "a CLI spawned as a session uid did not finish `--version` within "
+                f"{_UID_PROBE_TIMEOUT_SECONDS:.0f} s",
+            )
+            return problems
+        if result.returncode != 0:
+            meaning = describe_launcher_exit(result.returncode) or "the CLI failed"
+            detail = _last_line(result.stderr)
+            problems.insert(
+                0,
+                f"a CLI spawned as a session uid exited {result.returncode}: "
+                f"{meaning}" + (f" ({detail})" if detail else ""),
+            )
+            return problems
+        problems.extend(_probe_dir_problems(uid, cwd, sid))
+        return problems
+    finally:
+        workspace_manager.cleanup_temp_workspace(Path(cwd), sync=True)
+        if uid is not None:
+            if os.path.lexists(cwd):
+                problems.append(
+                    "the broker could not remove the probe workspace as the "
+                    f"session uid ({cwd} is left): every anonymous run would "
+                    "keep its uid lease"
+                )
+            elif uid_layout._has_leftovers(uid):
+                problems.append(
+                    "the broker could not empty the per-uid config dir of the "
+                    f"probe's uid {uid}: the next anonymous run on that uid "
+                    "would find the previous one's state"
+                )
+
+
+def _probe_dir_problems(uid: int, cwd: str, sid: str) -> List[str]:
+    """What the probe spawn's session uid failed to create (checked by owner)."""
+    from src.claude_config_paths import layout as config_layout
+
+    from . import workspace_sandbox as ws
+
+    config = Path(_real(config_layout(uid).config_dir))
+    workspace = _real(cwd)
+    wanted = [
+        (Path(workspace) / ".cli-tmp", "its tmp dir"),
+        (config / "projects" / ws._project_dir_name(workspace), "its transcript dir"),
+        (config / "session-env" / sid, "its session-env dir"),
+        (config / "tasks" / sid, "its tasks dir"),
+    ]
+    problems = []
+    for path, what in wanted:
+        try:
+            st = os.lstat(path)
+            ok = stat.S_ISDIR(st.st_mode) and st.st_uid == uid
+        except OSError:
+            ok = False
+        if not ok:
+            problems.append(
+                f"a session uid could not create {what} {path} (the POSIX ACL the "
+                "gateway sets there did not let it): sessions would fail"
+            )
+    return problems
+
+
+def _shared_layout_session_problems() -> List[str]:
+    """The startup probe without per-uid config dirs (no config base — startup
+    refuses that in uid mode, tests use it): one ``--version`` spawn and a
+    mode-bit check of the shared config dir."""
     import subprocess
 
     from src.workspace_manager import workspace_manager
@@ -793,6 +945,39 @@ def _config_dir_readable() -> Tuple[str, ...]:
     )
 
 
+def _shared_dir_readable() -> Tuple[str, ...]:
+    """What a per-uid spawn may read inside the shared config dir ``S``.
+
+    The shared assets its ``P`` links in (``uid_layout.SHARED_LINKS``: the
+    file-tool guard's assets and the Landlock-only ones, the user settings
+    files) plus the plugins tree and the plugin clone root the registry
+    points into. Never ``S``'s own global config, transcripts or state: in uid
+    mode only the gateway's own catalog spawns use ``S`` as their config dir.
+    """
+    from . import workspace_sandbox as ws
+
+    return (
+        *ws._SHARED_CLAUDE_ASSETS,
+        *_LANDLOCK_ONLY_ASSETS,
+        "plugin-marketplaces",
+        "settings.json",
+        "settings.local.json",
+    )
+
+
+def _per_uid_readable() -> Tuple[str, ...]:
+    """What a per-uid spawn may read inside its own config dir ``P`` by name.
+
+    Its links lead into ``S`` (judged there, :func:`_shared_dir_readable`);
+    ``plugins`` is a real per-uid dir (its own links, and ``data/``, which is
+    granted read-write). The rest of ``P`` is read-write state granted
+    entry by entry (``projects/<name>``, ``session-env/<id>``, …).
+    """
+    from . import uid_layout
+
+    return (*uid_layout.SHARED_LINKS, "plugins")
+
+
 def _real(path) -> str:
     """*path* absolute, with every symlink resolved (missing tails kept)."""
     return os.path.realpath(os.fspath(path))
@@ -916,8 +1101,14 @@ class _GrantFilter:
     a gateway that runs confined needs a real home directory.
     """
 
-    def __init__(self, claude_home: Optional[Path], workspace: Optional[Path]) -> None:
-        from src.claude_config_paths import _home, global_config_file
+    def __init__(
+        self,
+        claude_home: Optional[Path],
+        workspace: Optional[Path],
+        *,
+        layout=None,
+    ) -> None:
+        from src.claude_config_paths import _home, config_base, global_config_file
         from src.workspace_manager import workspace_manager
 
         def resolved(get) -> Optional[str]:
@@ -937,13 +1128,30 @@ class _GrantFilter:
             ("temp dir", resolved(tempfile.gettempdir), "temp"),
             ("session workspace", resolved(lambda: workspace), "contain"),
         ]
+        # A per-uid spawn (uid mode): *claude_home* is the session's own config
+        # dir P. The shared tree S its links lead to is a second config root
+        # (only the shared assets readable), and the config base holding every
+        # uid's P is denied: what lies there outside P is other users' state.
+        shared = None
+        if layout is not None and layout.per_uid:
+            shared = resolved(lambda: layout.shared_dir)
+            candidates += [
+                ("shared config dir", shared, "config"),
+                ("per-uid config base", resolved(config_base), "deny"),
+            ]
         candidates += [(p, _real(p), "deny") for p in _PRIVATE_SYSTEM_ROOTS]
         self._roots = [(label, r, kind) for label, r, kind in candidates if r]
-        self._readable = (
-            [os.path.join(self._config, n) for n in _config_dir_readable()]
-            if self._config
-            else []
-        )
+        # What a confined CLI may read inside each config root, by name.
+        self._readable: Dict[str, List[str]] = {}
+        if self._config:
+            names = _per_uid_readable() if shared else _config_dir_readable()
+            self._readable[self._config] = [
+                os.path.join(self._config, n) for n in names
+            ]
+        if shared and shared != self._config:
+            self._readable[shared] = [
+                os.path.join(shared, n) for n in _shared_dir_readable()
+            ]
         # The global config file where the CLI reads it — its directory
         # resolved, not the file: a symlinked one must not exempt its target.
         gc = os.path.abspath(global_config_file())
@@ -1008,7 +1216,8 @@ class _GrantFilter:
             return reason
         for _label, root, kind in self._innermost(path):
             if kind == "config":
-                if not any(_beneath(path, r) for r in self._readable):
+                readable = self._readable.get(root, ())
+                if not any(_beneath(path, r) for r in readable):
                     return (
                         f"it lies inside the config dir {root} outside the shared "
                         "assets a confined CLI may read; other users' transcripts, "
@@ -1133,7 +1342,11 @@ def _private_dir_refusal(path: str) -> Optional[str]:
 
 
 def _confined_workspace(
-    effective_cwd, claude_home: Optional[Path], *, gateway_owned: bool = False
+    effective_cwd,
+    claude_home: Optional[Path],
+    *,
+    gateway_owned: bool = False,
+    layout=None,
 ) -> str:
     """The resolved working directory of a confined spawn; refuses an unsafe one.
 
@@ -1188,7 +1401,7 @@ def _confined_workspace(
     else:
         reason = None
     if reason is None:
-        filter_ = _GrantFilter(claude_home, None)
+        filter_ = _GrantFilter(claude_home, None, layout=layout)
         reason = filter_.workspace_refusal(path, in_base=under is not None)
     if reason is not None:
         _warn_once(
@@ -1207,6 +1420,7 @@ def _ro_rw_roots(
     *,
     precreate: bool = True,
     gateway_owned: bool = False,
+    layout=None,
 ) -> Tuple[List[str], List[str]]:
     """Build the read-only and read-write path lists for *effective_cwd*.
 
@@ -1228,9 +1442,14 @@ def _ro_rw_roots(
     ``tasks`` dirs (:func:`_session_dir`). uid mode passes ``precreate=False``:
     a gateway-owned 0700 dir is unusable by the session uid, so the broker's
     child creates them as that uid.
+
+    A per-uid *layout* (uid mode, ``claude_config_paths.ConfigLayout``) builds
+    the lists of :func:`_per_uid_ro_rw` instead.
     """
     from . import workspace_sandbox as ws
 
+    if layout is not None and layout.per_uid:
+        return _per_uid_ro_rw(effective_cwd, session_id, layout)
     claude_home = ws._claude_home()
     workspace = _confined_workspace(
         effective_cwd, claude_home, gateway_owned=gateway_owned
@@ -1295,6 +1514,71 @@ def _ro_rw_roots(
         if path is not None:
             grant_rw(path)
 
+    return _dedupe([_absolute(p) for p in ro]), _dedupe([_absolute(p) for p in rw])
+
+
+def _per_uid_ro_rw(
+    effective_cwd: Path, session_id: Optional[str], layout
+) -> Tuple[List[str], List[str]]:
+    """The read-only and read-write lists of a per-uid spawn (uid mode).
+
+    The session's config dir is its own ``P`` (``layout.config_dir``); the
+    shared assets are read where ``P``'s links lead, in the gateway's config
+    dir ``S`` (``layout.shared_dir``) — design §4.1.
+
+    Read-only: ``S``'s shared assets (skills, plugins with their cache,
+    marketplaces and registry, agents, commands, output styles, ``CLAUDE.md``,
+    rules, hooks, workflows) and user settings files, ``P``'s own ``plugins``
+    dir (its links), the plugin roots ``S``'s registry names and the
+    operator's read-only add-dirs. Read-write: the workspace (first, resolved),
+    ``P/projects/<name>``, this session's ``P/session-env/<id>`` and
+    ``P/tasks/<id>``, ``P/plugins/data`` (per uid, so plugin hooks may write
+    their data — landlock mode's shared one stays read-only) and ``P/state``
+    (the CLI's global config, through the ``P/.claude.json`` link). Nothing is
+    created here: ``uid_layout.prepare_spawn`` made ``P``'s dirs, and the
+    broker's child creates the per-session ones as the session uid. Every entry
+    but the workspace passes :class:`_GrantFilter`, which here also refuses
+    the config base (every uid's ``P``) and ``S`` outside its shared assets.
+    """
+    from . import workspace_sandbox as ws
+
+    config = Path(_real(layout.config_dir))
+    shared = Path(_real(layout.shared_dir))
+    workspace = _confined_workspace(effective_cwd, config, layout=layout)
+    cwd = Path(workspace)
+    grants = _GrantFilter(config, cwd, layout=layout)
+    ro: List[str] = []
+    rw: List[str] = []
+
+    def grant_ro(candidate, *, file: bool = False) -> None:
+        path = grants.ro(candidate, file=file)
+        if path is not None:
+            ro.append(path)
+
+    def grant_rw(expected: Path) -> None:
+        path = grants.rw(expected)
+        if path is not None:
+            rw.append(path)
+
+    for name in (*ws._SHARED_CLAUDE_ASSETS, *_LANDLOCK_ONLY_ASSETS):
+        grant_ro(shared / name, file=name in _FILE_ASSETS)
+    for name in ("settings.json", "settings.local.json"):
+        grant_ro(shared / name, file=True)
+    grant_ro(config / "plugins")
+    for root in ws._plugin_resource_roots(shared):
+        grant_ro(root)
+    for root in ws._operator_add_dir_roots(shared, cwd):
+        grant_ro(root)
+
+    rw.append(workspace)
+    for path in _own_project_dirs(cwd, config):
+        grant_rw(path)
+    for kind in _SESSION_DIR_KINDS:
+        path = _session_dir(config, kind, session_id, create=False)
+        if path is not None:
+            grant_rw(path)
+    grant_rw(config / "plugins" / "data")
+    grant_rw(config / "state")
     return _dedupe([_absolute(p) for p in ro]), _dedupe([_absolute(p) for p in rw])
 
 
@@ -1577,18 +1861,55 @@ def options_env(
     if mode not in _LANDLOCK_MODES:
         return {}
     cwd = _absolute(effective_cwd)
-    ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=mode != "uid")
-
     if mode == "uid":
-        return _uid_spawn_env(cwd, ro, rw, user)[0]
-
+        return _uid_options_env(cwd, user, session_id)
+    ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=True)
     return _landlock_env(ro, rw)
 
 
+def _uid_options_env(
+    cwd: str, user: Optional[str], session_id: Optional[str]
+) -> Dict[str, str]:
+    """The uid-mode ``options.env`` of a spawn in *cwd*.
+
+    With per-uid config dirs (``uid_layout.enabled()``: a config base is set,
+    which startup requires in uid mode) the uid is resolved first, because the
+    spawn's lists depend on it: its config dir ``P(uid)`` and the workspace
+    are prepared for that uid (``uid_layout.prepare_spawn``: P's layout, the
+    workspace ACL, the one-time migrations), the lists are the per-uid ones
+    (:func:`_per_uid_ro_rw`) and the CLI gets ``CLAUDE_CONFIG_DIR=P``. Without
+    a config base the shared layout of before stays (only tests run that).
+    """
+    from . import uid_isolation as ui
+    from . import uid_layout
+
+    if not uid_layout.enabled():
+        ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=False)
+        return _uid_spawn_env(cwd, ro, rw, user)[0]
+    from src.claude_config_paths import CONFIG_DIR_ENV, layout as config_layout
+
+    uid = ui.resolve_uid(user or cwd, persist=bool(user))
+    planned = config_layout(uid)
+    workspace = _confined_workspace(
+        cwd, Path(_real(planned.config_dir)), layout=planned
+    )
+    layout = uid_layout.prepare_spawn(uid, workspace, user=user, key=cwd)
+    ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=False, layout=layout)
+    env, _ = _uid_spawn_env(cwd, ro, rw, user, uid=uid)
+    env[CONFIG_DIR_ENV] = _real(layout.config_dir)
+    return env
+
+
 def _uid_spawn_env(
-    cwd: str, ro: List[str], rw: List[str], user: Optional[str]
+    cwd: str,
+    ro: List[str],
+    rw: List[str],
+    user: Optional[str],
+    *,
+    uid: Optional[int] = None,
 ) -> Tuple[Dict[str, str], int]:
-    """The uid-mode ``options.env`` for a spawn in *cwd*, and the uid it runs as."""
+    """The uid-mode ``options.env`` for a spawn in *cwd*, and the uid it runs as
+    (*uid* when the caller resolved it already)."""
     from . import uid_isolation as ui
 
     # Key the uid on the user when known, else on the (per-run) workspace so
@@ -1599,8 +1920,8 @@ def _uid_spawn_env(
     # leased the spawn is refused, retryably (#241 review). The absolute path,
     # so a session and its preflight land on the same lease however the cwd
     # was spelled — and the workspace cleanup releases it under that key.
-    key = user or cwd
-    uid = ui.resolve_uid(key, persist=bool(user))
+    if uid is None:
+        uid = ui.resolve_uid(user or cwd, persist=bool(user))
     ticket = ui.mint_ticket(
         uid=uid,
         # The resolved workspace (the first rw entry, see _ro_rw_roots): the
@@ -1692,7 +2013,10 @@ def _system_ro_errors(mode: str) -> List[str]:
         ("the temp dir", tempfile.gettempdir()),
     ]
     if mode == "uid":
+        from src.claude_config_paths import config_base
+
         candidates.append(("the uid registry", ui._registry_path()))
+        candidates.append(("the per-uid config base", config_base()))
     roots = [(root, _real(root)) for root in _LAUNCHER_SYSTEM_RO]
     errors: List[str] = [
         f"{MODE_ENV}={mode} but the system root {root} resolves to /, and the "
@@ -1713,6 +2037,79 @@ def _system_ro_errors(mode: str) -> List[str]:
                     f"{', '.join(_LAUNCHER_SYSTEM_RO)}."
                 )
                 break
+    return errors
+
+
+def _config_base_errors() -> List[str]:
+    """Startup errors for uid mode's per-uid config base (empty when usable).
+
+    uid mode gives every session uid its own Claude config dir
+    ``<CLAUDE_ISOLATION_CONFIG_BASE>/<uid>`` (design §4): without one the
+    session uid cannot write the shared config dir its CLI needs. The base must
+    be absolute and must not be, contain or lie inside the shared config dir,
+    ``$HOME``, the workspace base or the gateway's app root, nor be or contain
+    the temp dir: each per-uid dir is granted to its uid, and Landlock refuses
+    grants there. Its filesystem must support POSIX ACLs (the gateway opens the
+    per-uid dirs to their uid with one), and so must the workspace base's.
+    """
+    from src.claude_config_paths import CONFIG_BASE_ENV, config_base
+    from src.workspace_manager import workspace_manager
+
+    from . import posix_acl
+    from . import workspace_sandbox as ws
+
+    raw = (os.getenv(CONFIG_BASE_ENV) or "").strip()
+    if not raw:
+        return [
+            f"{MODE_ENV}=uid needs {CONFIG_BASE_ENV}: every session uid gets its "
+            "own Claude config dir <base>/<uid> (docs/isolation-uid-ownership-"
+            "design.md §4). Point it at a directory on a persistent volume outside "
+            "$HOME, the workspace base and the shared config dir (CLAUDE_CONFIG_DIR)."
+        ]
+    if not os.path.isabs(raw):
+        return [f"{CONFIG_BASE_ENV}={raw!r} must be an absolute path."]
+    base = _real(config_base())
+    errors: List[str] = []
+    others = [
+        ("the shared config dir", ws._claude_home(), True),
+        ("$HOME", os.environ.get("HOME") or str(Path.home()), True),
+        ("the workspace base", workspace_manager.base_path, True),
+        ("the gateway's app root", _APP_ROOT, True),
+        ("the temp dir", tempfile.gettempdir(), False),
+    ]
+    for label, other, inside_too in others:
+        if not other:
+            continue
+        real = _real(other)
+        overlap = _beneath(real, base) or (inside_too and _beneath(base, real))
+        if overlap:
+            errors.append(
+                f"{CONFIG_BASE_ENV}={raw!r} overlaps {label} {real}: the per-uid "
+                "config dirs need a directory of their own."
+            )
+    if (os.getenv("WORKSPACE_LEGACY_LOCALPART_KEY") or "").strip().lower() == "true":
+        errors.append(
+            f"{MODE_ENV}=uid cannot run with WORKSPACE_LEGACY_LOCALPART_KEY=true: it "
+            "keys workspaces on the identity's localpart but uids on the whole "
+            "identity, so two uids would share one workspace."
+        )
+    for label, path in (
+        ("the per-uid config base", base),
+        ("the workspace base", _real(workspace_manager.base_path)),
+    ):
+        probe = path
+        while probe != os.sep and not os.path.isdir(probe):
+            probe = os.path.dirname(probe)
+        try:
+            ok = posix_acl.supported(probe)
+        except OSError:
+            ok = False
+        if not ok:
+            errors.append(
+                f"{label} {path} is on a filesystem without POSIX ACL support (as "
+                f"checked at {probe}); uid mode grants each session uid its "
+                "workspace and config dir with an ACL."
+            )
     return errors
 
 
@@ -1808,6 +2205,9 @@ def check_config() -> List[str]:
         # The per-user uid band must be usable and must not force a session onto
         # root, the gateway's own uid or the broker's uid.
         errors.extend(ui.validate_bands())
+        # Each session uid's own config dir, and ACL support for it and the
+        # workspaces (docs/isolation-uid-ownership-design.md §3–§4).
+        errors.extend(_config_base_errors())
 
     launcher = Path(launcher_path())
     if not (launcher.is_file() and os.access(launcher, os.X_OK)):

@@ -164,3 +164,58 @@ def test_snapshot_reports_remaining_and_overage(tmp_path: Path, monkeypatch):
     assert snap.limit_bytes == 1024 * 1024
     assert snap.remaining_bytes == 1024 * 1024 - 100
     assert snap.over_quota is False
+
+
+class TestSessionTmpPrivateDirs:
+    """uid mode: the CLI always makes ``.cli-tmp/claude-<uid>`` 0700 as the
+    session uid, which the gateway can never read; that dir must not fail every
+    quota-growing write, while every other unreadable subtree still does."""
+
+    @staticmethod
+    def _tree(tmp_path: Path):
+        user_root = tmp_path / "alice"
+        workspace = user_root / "claude"
+        private = workspace / ".cli-tmp" / "claude-20001"
+        private.mkdir(parents=True)
+        (private / "task.out").write_bytes(b"p" * 7)
+        (workspace / ".cli-tmp" / "npm-cache").mkdir()
+        (workspace / ".cli-tmp" / "npm-cache" / "pkg").write_bytes(b"n" * 5)
+        (workspace / "visible.bin").write_bytes(b"v" * 11)
+        return user_root, workspace, private
+
+    @staticmethod
+    def _deny(monkeypatch, blocked: Path) -> None:
+        real_scandir = workspace_quota_module.os.scandir
+
+        def guarded(path):
+            if Path(path) == blocked:
+                raise PermissionError(errno.EACCES, "denied", str(path))
+            return real_scandir(path)
+
+        monkeypatch.setattr(workspace_quota_module.os, "scandir", guarded)
+
+    def test_a_session_uids_private_tmp_dir_is_skipped(self, tmp_path, monkeypatch):
+        user_root, _workspace, private = self._tree(tmp_path)
+        self._deny(monkeypatch, private)
+        # The dir belongs to "another" uid: the gateway is someone else here.
+        real_uid = os.geteuid()
+        monkeypatch.setattr(workspace_quota_module.os, "geteuid", lambda: real_uid + 1)
+        assert logical_size_bytes(user_root) == 11 + 5
+
+    def test_the_gateways_own_unreadable_tmp_dir_still_fails(
+        self, tmp_path, monkeypatch
+    ):
+        user_root, _workspace, private = self._tree(tmp_path)
+        self._deny(monkeypatch, private)
+        with pytest.raises(WorkspaceQuotaAccountingError):
+            logical_size_bytes(user_root)
+
+    def test_a_foreign_unreadable_dir_elsewhere_still_fails(self, tmp_path, monkeypatch):
+        user_root, workspace, _private = self._tree(tmp_path)
+        locked = workspace / "locked"
+        locked.mkdir()
+        self._deny(monkeypatch, locked)
+        real_uid = os.geteuid()
+        monkeypatch.setattr(workspace_quota_module.os, "geteuid", lambda: real_uid + 1)
+        with pytest.raises(WorkspaceQuotaAccountingError):
+            logical_size_bytes(user_root)

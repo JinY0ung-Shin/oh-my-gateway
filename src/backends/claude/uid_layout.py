@@ -5,25 +5,41 @@ Two things the gateway owns must then become usable by ``U`` without handing
 the gateway's own state over (``docs/isolation-uid-ownership-design.md``):
 
 * the **workspace** stays owned by the gateway (app) uid; before each spawn the
-  gateway grants ``U`` access to it with a POSIX ACL (design α, §3.1);
+  gateway grants ``U`` access to it with a POSIX ACL (design α, §3.1): access
+  ``u::rwx, u:U:rwx, g::---, m::rwx, o::---`` and the default ACL
+  ``d:u::rwx, d:u:U:rwx, d:u:<app>:rwx, d:g::---, d:m::rwx, d:o::---``, so what
+  either side creates there stays reachable by the other unless it is made
+  0600/0700 on purpose. An existing workspace's tree is granted once
+  (§3.7, :func:`grant_workspace`);
 * the **config dir**: ``U`` gets its own ``P = <CLAUDE_ISOLATION_CONFIG_BASE>/<U>``
-  (``CLAUDE_CONFIG_DIR`` of its CLI), app-owned, readable by ``U``, writable only
-  where the CLI keeps per-user state, with the shared assets linked in from the
-  gateway's own config dir ``S`` (§4.1).
+  (``CLAUDE_CONFIG_DIR`` of its CLI), owned by app, readable by ``U``, writable
+  only where the CLI keeps per-user state (:data:`WRITABLE_DIRS`), with the
+  shared assets linked in from the gateway's own config dir ``S`` (§4.1,
+  :func:`ensure_user_config`). A named user's transcripts and memory from the
+  shared config dir are copied over on their first spawn (:func:`migrate_legacy`).
 
 This module answers "which layout does this session use" without allocating
 anything (:func:`session_uid`, :func:`session_layout`, :func:`projects_root`)
-and prepares a layout before a spawn (:func:`prepare_spawn`). Everything a
-session uid locked away from the gateway (its 0600/0700 files) is removed or
-read as that uid by the broker (``broker_ops``, ``uid_cleanup``).
+and prepares a layout before a spawn (:func:`prepare_spawn`). What a session uid
+locks away from the gateway (its 0600/0700 files) is removed or read as that uid
+by the broker (``broker_ops``, ``uid_cleanup``).
+
+Every step here runs as the gateway uid, unconfined, on trees a session uid can
+write: everything below the config base and the workspace is reached from
+directory fds without following a symlink, and only entries the gateway owns
+are changed.
 """
 
 from __future__ import annotations
 
+import errno
 import logging
 import os
+import stat
+import threading
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from src import claude_config_paths as cp
 from src.claude_config_paths import ConfigLayout
@@ -35,6 +51,69 @@ logger = logging.getLogger(__name__)
 # keeps its transcripts, hook env files, task lists, plugin data and global
 # config (``state/.claude.json``, linked as ``P/.claude.json``) there.
 WRITABLE_DIRS = ("projects", "session-env", "tasks", "plugins/data", "state")
+
+# ``P/<name> -> S/<name>``: the shared assets a session reads from the
+# gateway's own config dir. Kept equal to the guard's and Landlock's shared
+# names (``workspace_sandbox._SHARED_CLAUDE_ASSETS`` minus ``plugins``, which is
+# a real per-uid dir here, plus ``landlock._LANDLOCK_ONLY_ASSETS``) by
+# tests/test_uid_layout.py, plus the user settings files the CLI loads.
+SHARED_LINKS = (
+    "skills",
+    "agents",
+    "commands",
+    "output-styles",
+    "CLAUDE.md",
+    "rules",
+    "hooks",
+    "workflows",
+    "settings.json",
+    "settings.local.json",
+)
+# ``P/plugins/<name> -> S/plugins/<name>``. ``plugins`` itself is a real dir:
+# the CLI mkdirs ``plugins/data/<id>`` before every plugin hook and skips the
+# hook when that fails, so a shared link would silently disable every hook
+# (design §4.2, measured). No ``cache`` link: the registry names each plugin's
+# absolute install path in S, and the CLI's cache GC would only try to write S.
+PLUGIN_LINKS = ("installed_plugins.json", "known_marketplaces.json", "marketplaces")
+# The CLI's global config is ``<CLAUDE_CONFIG_DIR>/.claude.json``; it writes it
+# with a lock and a rename in ``P``, which ``U`` cannot write, and then falls
+# back to writing through the link (measured), so the link points into the
+# writable ``state/``.
+GLOBAL_CONFIG = ".claude.json"
+_GLOBAL_CONFIG_TARGET = "state/.claude.json"
+
+# Marker beside a named workspace (in its app-owned parent) recording the uid
+# its existing tree was granted to (grant_workspace), and the list of migrated
+# project dirs in ``P`` (migrate_legacy). Both live where the session uid
+# cannot write.
+_TREE_MARKER_PREFIX = ".oh-my-gateway-acl-"
+_MIGRATED_MARKER = ".oh-my-gateway-migrated"
+
+_DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+_DIR_NOFOLLOW = _DIR | os.O_NOFOLLOW
+_FILE_NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+
+
+# Where POSIX shared memory objects live; tests point it elsewhere (the test
+# uid is the developer's, whose own /dev/shm objects must never be touched).
+_SHM_DIR = "/dev/shm"
+
+
+def _workspace_refused():
+    from .landlock import WorkspaceRefused
+
+    return WorkspaceRefused
+
+
+def refused(message: str) -> Exception:
+    """A ``landlock.WorkspaceRefused`` for a layout this module cannot prepare.
+
+    The request paths answer it with the non-retryable 500
+    ``workspace_refused`` (an operator has to fix the layout); the details are
+    logged here, never sent to the caller.
+    """
+    logger.error("uid isolation: %s", message)
+    return _workspace_refused()(f"refusing an isolated spawn: {message}")
 
 
 def enabled() -> bool:
@@ -106,3 +185,802 @@ def ephemeral_clear_targets(uid: int) -> List[str]:
     if config is None:
         return []
     return [os.path.join(str(config), rel) for rel in WRITABLE_DIRS]
+
+
+# --------------------------------------------------------------------------
+# Preparing a spawn
+# --------------------------------------------------------------------------
+
+_uid_locks: Dict[int, threading.Lock] = {}
+_uid_locks_guard = threading.Lock()
+
+
+def _uid_lock(uid: int) -> threading.Lock:
+    """One lock per session uid: a named user's concurrent spawns prepare the
+    same ``P`` and workspace, and the one-time steps must run once."""
+    with _uid_locks_guard:
+        lock = _uid_locks.get(uid)
+        if lock is None:
+            lock = _uid_locks[uid] = threading.Lock()
+        return lock
+
+
+def _app_uid() -> int:
+    return os.geteuid()
+
+
+def _mkdir_at(dir_fd: int, name: str, mode: int) -> int:
+    """``name`` below *dir_fd* as a directory the gateway owns, opened.
+
+    Made when missing; never followed when it is a symlink (ELOOP), and
+    refused when something else or another uid's dir sits there.
+    """
+    try:
+        os.mkdir(name, mode, dir_fd=dir_fd)
+    except FileExistsError:
+        pass
+    try:
+        fd = os.open(name, _DIR_NOFOLLOW, dir_fd=dir_fd)
+    except OSError as exc:
+        raise refused(f"{name!r} is not a directory the gateway can use ({exc})")
+    if os.fstat(fd).st_uid != _app_uid():
+        os.close(fd)
+        raise refused(f"{name!r} is not owned by the gateway uid")
+    return fd
+
+
+def _acl_equal(current, wanted) -> bool:
+    return current is not None and sorted(current) == sorted(wanted)
+
+
+def _set_acl(fd: int, entries, *, default: bool = False) -> None:
+    """Set an ACL unless it is already exactly that (no ctime churn)."""
+    from . import posix_acl
+
+    if _acl_equal(posix_acl.get_acl(fd, default=default), entries):
+        return
+    posix_acl.set_acl(fd, entries, default=default)
+
+
+def _grant_readable(fd: int, uid: int) -> None:
+    """``u::rwx, u:U:r-x, g::---, m::r-x, o::---``: U lists and enters, never
+    writes (it must not swap the shared links in ``P``)."""
+    from . import posix_acl
+
+    _set_acl(fd, posix_acl.session_dir_access(uid, write=False))
+
+
+def _grant_writable(fd: int, uid: int) -> None:
+    """The workspace-root ACL (access + default) on one writable dir."""
+    from . import posix_acl
+
+    _set_acl(fd, posix_acl.session_dir_access(uid, write=True))
+    _set_acl(fd, posix_acl.session_dir_default(uid, _app_uid()), default=True)
+
+
+_warned: Set[Tuple] = set()
+
+
+def _warn_once(key: Tuple, msg: str, *args) -> None:
+    if key in _warned:
+        return
+    if len(_warned) > 1024:
+        _warned.clear()
+    _warned.add(key)
+    logger.warning(msg, *args)
+
+
+def _ensure_link(dir_fd: int, name: str, target: str) -> None:
+    """``name -> target`` below *dir_fd* (only the gateway writes there).
+
+    A link to the wrong place is replaced; a real file or dir in its place is
+    left alone with a warning (never delete what someone put there).
+    """
+    try:
+        st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        st = None
+    if st is not None:
+        if not stat.S_ISLNK(st.st_mode):
+            _warn_once(
+                ("link", target, name),
+                "uid isolation: %s in a per-uid config dir is not the link to %s "
+                "the layout expects; leaving it as it is",
+                name,
+                target,
+            )
+            return
+        if os.readlink(name, dir_fd=dir_fd) == target:
+            return
+        os.unlink(name, dir_fd=dir_fd)
+    try:
+        os.symlink(target, name, dir_fd=dir_fd)
+    except FileExistsError:
+        pass  # a concurrent prepare of the same uid (held off by _uid_lock)
+
+
+def _open_config_base() -> int:
+    """The config base, resolved and opened (created 0711 when missing)."""
+    base = cp.config_base()
+    if base is None:
+        raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
+    real = os.path.realpath(base)
+    try:
+        os.makedirs(real, mode=0o711, exist_ok=True)
+        return os.open(real, _DIR)
+    except OSError as exc:
+        raise refused(f"the per-uid config base {real} is unusable ({exc})")
+
+
+def ensure_user_config(layout: ConfigLayout) -> None:
+    """Make ``P = layout.config_dir`` the per-uid config dir of ``layout.uid``.
+
+    Idempotent; runs before every per-uid spawn (a few syscalls when nothing
+    changed). Raises ``WorkspaceRefused`` (:func:`refused`) when it cannot.
+    """
+    from . import posix_acl
+
+    uid = layout.uid
+    if uid is None:
+        return
+    shared = os.path.realpath(layout.shared_dir)
+    base_fd = _open_config_base()
+    try:
+        p_fd = _mkdir_at(base_fd, str(uid), 0o750)
+        try:
+            _grant_readable(p_fd, uid)
+            for name in SHARED_LINKS:
+                _ensure_link(p_fd, name, os.path.join(shared, name))
+            _ensure_link(p_fd, GLOBAL_CONFIG, _GLOBAL_CONFIG_TARGET)
+            for rel in ("projects", "session-env", "tasks", "state"):
+                fd = _mkdir_at(p_fd, rel, 0o770)
+                try:
+                    _grant_writable(fd, uid)
+                    if rel == "state":
+                        _ensure_global_config(fd)
+                finally:
+                    os.close(fd)
+            plugins_fd = _mkdir_at(p_fd, "plugins", 0o750)
+            try:
+                _grant_readable(plugins_fd, uid)
+                for name in PLUGIN_LINKS:
+                    target = os.path.join(shared, "plugins", name)
+                    _ensure_link(plugins_fd, name, target)
+                data_fd = _mkdir_at(plugins_fd, "data", 0o770)
+                try:
+                    _grant_writable(data_fd, uid)
+                finally:
+                    os.close(data_fd)
+            finally:
+                os.close(plugins_fd)
+        finally:
+            os.close(p_fd)
+    except posix_acl.AclUnsupported as exc:
+        raise refused(
+            f"the per-uid config base does not support POSIX ACLs ({exc}); uid "
+            "mode needs them"
+        )
+    except OSError as exc:
+        raise refused(f"the per-uid config dir of uid {uid} is unusable ({exc})")
+    finally:
+        os.close(base_fd)
+
+
+def _ensure_global_config(state_fd: int) -> None:
+    """``state/.claude.json`` as ``{}`` when missing, so the CLI's fallback
+    write through ``P/.claude.json`` has a target (created 0666: under the
+    dir's default ACL, U and the gateway both get read + write)."""
+    try:
+        fd = os.open(
+            GLOBAL_CONFIG,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o666,
+            dir_fd=state_fd,
+        )
+    except FileExistsError:
+        return
+    try:
+        os.write(fd, b"{}\n")
+    finally:
+        os.close(fd)
+
+
+# Anonymous workspaces whose tree this process granted (they never outlive it),
+# by resolved path → uid.
+_granted_anonymous: Dict[str, int] = {}
+_GRANTED_ANONYMOUS_MAX = 4096
+
+
+def grant_workspace(workspace: str, uid: int, *, named: bool) -> None:
+    """Open the resolved *workspace* root to *uid* (design §3.1).
+
+    The root keeps its owner (the gateway); its access and default ACL are set
+    on every spawn — idempotent, and the only way the gateway's own later
+    ``chmod`` could have narrowed them. Never chmod the root after this: the
+    group bits are the ACL mask. The tree that existed before the first grant
+    (app-owned 0755/0644 from the off/landlock modes) is granted once
+    (``posix_acl.grant_tree``): a default ACL is inherited only at creation.
+    Raises ``WorkspaceRefused`` when it cannot.
+    """
+    from . import posix_acl
+
+    try:
+        fd = os.open(workspace, _DIR_NOFOLLOW)
+    except OSError as exc:
+        raise refused(f"cannot open the workspace {workspace} ({exc})")
+    try:
+        if os.fstat(fd).st_uid != _app_uid():
+            raise refused(f"the workspace {workspace} is not owned by the gateway uid")
+        _grant_writable(fd, uid)
+        if not _tree_granted(workspace, uid, named):
+            started = time.monotonic()
+            stats = posix_acl.grant_tree(fd, uid, _app_uid(), owner=_app_uid())
+            took = time.monotonic() - started
+            log = logger.warning if stats.truncated or stats.errors else logger.info
+            log(
+                "uid isolation: granted the existing tree of %s to uid %d in "
+                "%.2fs (%d dirs, %d files, %d skipped, %d errors%s)",
+                workspace,
+                uid,
+                took,
+                stats.dirs,
+                stats.files,
+                stats.skipped,
+                stats.errors,
+                ", truncated" if stats.truncated else "",
+            )
+            _mark_tree_granted(workspace, uid, named)
+    except posix_acl.AclUnsupported as exc:
+        raise refused(
+            f"the workspace {workspace} does not support POSIX ACLs ({exc}); uid "
+            "mode needs them"
+        )
+    except OSError as exc:
+        raise refused(f"cannot grant the workspace {workspace} to uid {uid} ({exc})")
+    finally:
+        os.close(fd)
+
+
+def _tree_marker(workspace: str) -> Tuple[str, str]:
+    parent, name = os.path.split(workspace.rstrip(os.sep))
+    return parent, _TREE_MARKER_PREFIX + name
+
+
+def _tree_granted(workspace: str, uid: int, named: bool) -> bool:
+    if not named:
+        return _granted_anonymous.get(workspace) == uid
+    parent, marker = _tree_marker(workspace)
+    try:
+        pfd = os.open(parent, _DIR_NOFOLLOW)
+    except OSError:
+        return False
+    try:
+        fd = os.open(marker, _FILE_NOFOLLOW, dir_fd=pfd)
+    except OSError:
+        return False
+    finally:
+        os.close(pfd)
+    try:
+        return os.read(fd, 64).strip() == str(uid).encode()
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
+
+
+def _mark_tree_granted(workspace: str, uid: int, named: bool) -> None:
+    if not named:
+        if len(_granted_anonymous) >= _GRANTED_ANONYMOUS_MAX:
+            _granted_anonymous.clear()
+        _granted_anonymous[workspace] = uid
+        return
+    parent, marker = _tree_marker(workspace)
+    try:
+        _write_file_at(parent, marker, f"{uid}\n".encode())
+    except OSError as exc:
+        _warn_once(
+            ("tree-marker", workspace),
+            "uid isolation: could not record the grant of %s (%s); it is redone "
+            "on the next spawn",
+            workspace,
+            exc,
+        )
+
+
+def _write_file_at(directory: str, name: str, data: bytes) -> None:
+    """Replace ``directory/name`` atomically (a temp name, then a rename),
+    never following a symlink; mode 0644, owned by the gateway."""
+    dfd = os.open(directory, _DIR_NOFOLLOW)
+    try:
+        tmp = f".{name}.tmp-{os.getpid()}"
+        try:
+            os.unlink(tmp, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        fd = os.open(
+            tmp,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o644,
+            dir_fd=dfd,
+        )
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+    finally:
+        os.close(dfd)
+
+
+# --------------------------------------------------------------------------
+# Ephemeral uids: a leased uid's config dir must be empty before it is used
+# --------------------------------------------------------------------------
+
+# uid -> the lease key whose spawn found P(uid) clean (this process).
+_clean_for: Dict[int, str] = {}
+
+
+def _has_leftovers(uid: int) -> bool:
+    """Whether ``P(uid)``'s writable dirs or ``/dev/shm`` hold anything of a
+    previous run (the gateway can list them: they are its own dirs)."""
+    for path in ephemeral_clear_targets(uid):
+        try:
+            if os.listdir(path):
+                return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return True
+    try:
+        with os.scandir(_SHM_DIR) as entries:
+            for entry in entries:
+                try:
+                    if entry.stat(follow_symlinks=False).st_uid == uid:
+                        return True
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return False
+
+
+def ensure_clean_ephemeral(uid: int, key: str) -> None:
+    """Make sure the run leasing ephemeral *uid* under *key* starts clean.
+
+    A lease is released only after the broker wiped ``P(uid)`` and the uid's
+    ``/dev/shm`` objects (``uid_cleanup``), but a previous gateway process may
+    have died before that: its leftovers would otherwise be the next anonymous
+    caller's to read. Checked once per (uid, key); leftovers are wiped as
+    *uid* through the broker before the spawn, and a wipe that fails refuses
+    the spawn retryably (``UidAllocationError``: the run is not given a uid
+    that holds another run's data).
+    """
+    if _clean_for.get(uid) == key:
+        return
+    if _has_leftovers(uid):
+        from . import broker_ops
+        from . import uid_isolation as ui
+
+        logger.warning(
+            "uid isolation: ephemeral uid %d still holds a previous run's state; "
+            "wiping it before reuse",
+            uid,
+        )
+        targets = [p for p in ephemeral_clear_targets(uid) if os.path.isdir(p)]
+        try:
+            done = broker_ops.cleanup(uid, clear=targets, shm=True, wait=10)
+        except Exception as exc:
+            raise ui.UidAllocationError(
+                f"could not wipe the previous run's state of ephemeral uid {uid}: "
+                f"{exc}"
+            ) from exc
+        if not done or _has_leftovers(uid):
+            raise ui.UidAllocationError(
+                f"the previous run's state of ephemeral uid {uid} is not fully "
+                "removed; retry shortly"
+            )
+    _clean_for[uid] = key
+
+
+# --------------------------------------------------------------------------
+# Legacy migration: a named user's transcripts from the shared config dir
+# --------------------------------------------------------------------------
+
+_COPY_MAX_ENTRIES = 50000
+_COPY_MAX_BYTES = 2 << 30
+
+
+class _CopyBudget:
+    def __init__(self) -> None:
+        self.entries = 0
+        self.bytes = 0
+
+    def take(self, size: int = 0) -> bool:
+        self.entries += 1
+        self.bytes += size
+        return self.entries <= _COPY_MAX_ENTRIES and self.bytes <= _COPY_MAX_BYTES
+
+
+def _copy_file_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) -> bool:
+    """Copy the regular file *name*; never through a symlink, never over an
+    existing destination. Returns whether it was copied."""
+    try:
+        sfd = os.open(name, _FILE_NOFOLLOW, dir_fd=src_dir)
+    except OSError:
+        return False
+    try:
+        st = os.fstat(sfd)
+        if not stat.S_ISREG(st.st_mode) or not budget.take(st.st_size):
+            return False
+        try:
+            dfd = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o666,
+                dir_fd=dst_dir,
+            )
+        except FileExistsError:
+            return False
+        try:
+            while True:
+                chunk = os.read(sfd, 1 << 20)
+                if not chunk:
+                    break
+                view = memoryview(chunk)
+                while view:
+                    view = view[os.write(dfd, view) :]
+            os.utime(dfd, ns=(st.st_atime_ns, st.st_mtime_ns))
+        finally:
+            os.close(dfd)
+        return True
+    finally:
+        os.close(sfd)
+
+
+def _copy_tree_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) -> None:
+    """Copy the directory *name* recursively (regular files and dirs only)."""
+    try:
+        sfd = os.open(name, _DIR_NOFOLLOW, dir_fd=src_dir)
+    except OSError:
+        return
+    try:
+        if not budget.take():
+            return
+        try:
+            os.mkdir(name, 0o777, dir_fd=dst_dir)
+        except FileExistsError:
+            pass
+        try:
+            dfd = os.open(name, _DIR_NOFOLLOW, dir_fd=dst_dir)
+        except OSError:
+            return
+        try:
+            for entry in sorted(os.listdir(sfd)):
+                try:
+                    st = os.stat(entry, dir_fd=sfd, follow_symlinks=False)
+                except OSError:
+                    continue
+                if stat.S_ISDIR(st.st_mode):
+                    _copy_tree_at(sfd, entry, dfd, budget)
+                elif stat.S_ISREG(st.st_mode):
+                    _copy_file_at(sfd, entry, dfd, budget)
+        finally:
+            os.close(dfd)
+    finally:
+        os.close(sfd)
+
+
+def _transcript_owner_ok(src_dir: int, name: str, workspaces: List[str]) -> int:
+    """``count_transcript_turns`` of the legacy transcript *name* against the
+    workspace's spellings: the first non-mismatch result, else MISMATCH."""
+    from .transcript_turns import TRANSCRIPT_MISMATCH, TRANSCRIPT_UNREADABLE
+    from .transcript_turns import TRANSCRIPT_CORRUPT, count_transcript_turns
+
+    result = TRANSCRIPT_MISMATCH
+    for workspace in workspaces:
+        try:
+            fd = os.open(name, _FILE_NOFOLLOW, dir_fd=src_dir)
+        except OSError:
+            return TRANSCRIPT_UNREADABLE
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                os.close(fd)
+                return TRANSCRIPT_UNREADABLE
+            with os.fdopen(fd, "r", encoding="utf-8", newline=None) as fh:
+                try:
+                    result = count_transcript_turns(fh, workspace)
+                except UnicodeDecodeError:
+                    return TRANSCRIPT_CORRUPT
+        except OSError:
+            return TRANSCRIPT_UNREADABLE
+        if result != TRANSCRIPT_MISMATCH:
+            return result
+    return result
+
+
+def _migrated(p_fd: int) -> Set[str]:
+    try:
+        fd = os.open(_MIGRATED_MARKER, _FILE_NOFOLLOW, dir_fd=p_fd)
+    except OSError:
+        return set()
+    try:
+        data = os.read(fd, 1 << 20)
+    except OSError:
+        return set()
+    finally:
+        os.close(fd)
+    return set(data.decode("utf-8", "replace").split())
+
+
+def migrate_legacy(user: str, uid: int, workspace: str) -> None:
+    """Copy a named user's ``projects/<name>`` from the legacy config dir once.
+
+    Before uid mode, every session CLI kept its transcripts, subagent logs and
+    auto memory in the shared config dir. The first per-uid spawn of a user
+    copies what is theirs into ``P(uid)/projects/<name>`` (design §3.7): the
+    transcripts whose every recorded ``cwd`` is this workspace (the
+    ``projects/`` names are lossy: other users' transcripts can share the dir),
+    their sidecar dirs, and ``memory/`` only when no transcript in the dir
+    belongs to anyone else. Copies are made by the gateway (0666 under the
+    dir's default ACL: the session uid reads and appends them). The source is
+    left in place (rollback). Recorded in ``P``, so it runs once per project
+    dir; best effort: a failure is logged and the spawn goes on.
+    """
+    legacy = cp.legacy_config_dir()
+    config = cp.user_config_dir(uid)
+    if legacy is None or config is None:
+        return
+    from . import workspace_sandbox as ws
+
+    name = ws._project_dir_name(workspace)
+    try:
+        p_fd = os.open(os.path.realpath(config), _DIR_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        done = _migrated(p_fd)
+        if name in done:
+            return
+        copied = _copy_project(legacy, name, p_fd, workspace)
+        if copied is None:
+            return  # the legacy dir is unreadable now: try again next time
+        _write_file_at(
+            os.path.realpath(config),
+            _MIGRATED_MARKER,
+            "\n".join(sorted(done | {name})).encode() + b"\n",
+        )
+        if copied:
+            logger.info(
+                "uid isolation: migrated %d legacy transcript(s) of user %r into "
+                "the per-uid config dir of uid %d",
+                copied,
+                user,
+                uid,
+            )
+    except OSError as exc:
+        _warn_once(
+            ("migrate", uid, name),
+            "uid isolation: could not migrate the legacy transcripts of uid %d: %s",
+            uid,
+            exc,
+        )
+    finally:
+        os.close(p_fd)
+
+
+def _copy_project(legacy: Path, name: str, p_fd: int, workspace: str) -> Optional[int]:
+    """Copy ``<legacy>/projects/<name>`` into ``P/projects/<name>``; how many
+    transcripts were copied, ``None`` when the source cannot be read."""
+    from .transcript_turns import TRANSCRIPT_MISMATCH
+
+    try:
+        projects_fd = os.open(os.path.join(os.path.realpath(legacy), "projects"), _DIR)
+    except FileNotFoundError:
+        return 0
+    except OSError:
+        return None
+    try:
+        try:
+            src = os.open(name, _DIR_NOFOLLOW, dir_fd=projects_fd)
+        except FileNotFoundError:
+            return 0
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                return 0  # not a real dir: nothing of this user's to copy
+            return None
+    finally:
+        os.close(projects_fd)
+    try:
+        entries = sorted(os.listdir(src))
+        spellings = list(dict.fromkeys([workspace, os.path.abspath(workspace)]))
+        sids: List[str] = []
+        mismatch = False
+        for entry in entries:
+            if not entry.endswith(".jsonl"):
+                continue
+            turns = _transcript_owner_ok(src, entry, spellings)
+            if turns == TRANSCRIPT_MISMATCH:
+                mismatch = True
+            elif turns >= 0:
+                sids.append(entry[: -len(".jsonl")])
+        if not sids and (mismatch or "memory" not in entries):
+            return 0
+        dst_parent = os.open("projects", _DIR_NOFOLLOW, dir_fd=p_fd)
+        try:
+            try:
+                os.mkdir(name, 0o777, dir_fd=dst_parent)
+            except FileExistsError:
+                pass
+            dst = os.open(name, _DIR_NOFOLLOW, dir_fd=dst_parent)
+        finally:
+            os.close(dst_parent)
+        budget = _CopyBudget()
+        copied = 0
+        try:
+            for sid in sids:
+                if _copy_file_at(src, sid + ".jsonl", dst, budget):
+                    copied += 1
+                if sid in entries:
+                    _copy_tree_at(src, sid, dst, budget)
+            if not mismatch and "memory" in entries:
+                _copy_tree_at(src, "memory", dst, budget)
+        finally:
+            os.close(dst)
+        if budget.entries > _COPY_MAX_ENTRIES or budget.bytes > _COPY_MAX_BYTES:
+            logger.warning(
+                "uid isolation: the legacy project dir %s exceeded the copy budget; "
+                "only part of it was migrated",
+                name,
+            )
+        return copied
+    finally:
+        os.close(src)
+
+
+# --------------------------------------------------------------------------
+# Entry points
+# --------------------------------------------------------------------------
+
+
+def prepare_spawn(
+    uid: int, workspace: str, *, user: Optional[str], key: str
+) -> ConfigLayout:
+    """Make *uid*'s config dir and the resolved *workspace* ready for a spawn.
+
+    Runs before every per-uid spawn (sessions, the slash preflight, ``verify()``
+    and the startup probe): the per-uid config dir (:func:`ensure_user_config`),
+    the workspace grant (:func:`grant_workspace`), then for a named user the
+    one-time legacy migration (:func:`migrate_legacy`) and for an anonymous run
+    the clean-start check of its ephemeral uid (:func:`ensure_clean_ephemeral`,
+    *key* being its lease key). Returns the spawn's layout. Raises
+    ``WorkspaceRefused`` for a layout it cannot prepare and
+    ``UidAllocationError`` for an ephemeral uid that is not clean yet.
+    """
+    layout = cp.layout(uid)
+    if not layout.per_uid:
+        raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
+    with _uid_lock(uid):
+        ensure_user_config(layout)
+        grant_workspace(workspace, uid, named=bool(user))
+        if user:
+            migrate_legacy(user, uid, workspace)
+        else:
+            ensure_clean_ephemeral(uid, key)
+    return layout
+
+
+def migrate_user(user: Optional[str], workspace) -> None:
+    """For ``create_client``: give a named *user* their uid and config dir and
+    run the legacy migration *before* it asks whether the session has a
+    transcript (a migrated one makes it ``--resume``). No-op unless per-uid
+    config dirs are on. Allocates the user's durable uid (the create path is a
+    spawn); raises like :func:`prepare_spawn`."""
+    if not user or workspace is None or not enabled():
+        return
+    from . import uid_isolation as ui
+
+    uid = ui.resolve_uid(user, persist=True)
+    layout = cp.layout(uid)
+    with _uid_lock(uid):
+        ensure_user_config(layout)
+        migrate_legacy(user, uid, os.path.realpath(str(workspace)))
+
+
+# --------------------------------------------------------------------------
+# The shared tree S
+# --------------------------------------------------------------------------
+
+# What of S a session uid reads through its links: S itself and these entries.
+_SHARED_FILES = ("settings.json", "settings.local.json", "CLAUDE.md")
+_SHARED_PLUGIN_FILES = ("installed_plugins.json", "known_marketplaces.json")
+
+
+def ensure_shared_readable() -> List[str]:
+    """At uid-mode startup: make the shared tree's entry points readable by
+    session uids, and return what it changed.
+
+    ``S`` carries no ACL, so plain mode bits decide: ``S``, its asset dirs and
+    ``plugins/`` get ``o+rx``, its settings and registry files ``o+r`` — only
+    entries the gateway owns, never through a symlink, never deeper (what the
+    CLI and git write below them is readable by default). The admin settings
+    writer and the CLI's plugin commands may write these 0600.
+    """
+    shared = os.path.realpath(cp.config_dir())
+    changed: List[str] = []
+
+    def widen(dir_fd: Optional[int], name: str, label: str) -> None:
+        """Add ``o+r`` (and ``o+x`` for a dir) to an entry the gateway owns."""
+        try:
+            st = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        except OSError:
+            return
+        if stat.S_ISLNK(st.st_mode) or st.st_uid != _app_uid():
+            return
+        bits = 0o055 if stat.S_ISDIR(st.st_mode) else 0o044
+        if st.st_mode & bits == bits:
+            return
+        try:
+            os.chmod(name, stat.S_IMODE(st.st_mode) | bits, dir_fd=dir_fd)
+        except (OSError, NotImplementedError):
+            return
+        changed.append(label)
+
+    widen(None, shared, shared)
+    try:
+        sfd = os.open(shared, _DIR)
+    except OSError:
+        return changed
+    try:
+        for name in (*SHARED_LINKS, "plugins"):
+            widen(sfd, name, f"{shared}/{name}")
+        try:
+            pfd = os.open("plugins", _DIR_NOFOLLOW, dir_fd=sfd)
+        except OSError:
+            pfd = -1
+        if pfd >= 0:
+            try:
+                for name in (*_SHARED_PLUGIN_FILES, "marketplaces"):
+                    widen(pfd, name, f"{shared}/plugins/{name}")
+            finally:
+                os.close(pfd)
+    finally:
+        os.close(sfd)
+    if changed:
+        logger.info(
+            "uid isolation: made shared entries readable by session uids: %s",
+            ", ".join(changed),
+        )
+    return changed
+
+
+def shared_tree_problems(uid: int) -> List[str]:
+    """Why session *uid* cannot read the shared tree (empty when it can).
+
+    Mode bits only — ``S`` carries no ACL, so they are what the kernel checks
+    (with the session's gid equal to its uid and no supplementary groups).
+    """
+    shared = os.path.realpath(cp.config_dir())
+    if not os.path.isdir(shared):
+        return []
+    from .landlock import _first_unsearchable, _dac_allows, _describe_mode
+
+    blocked = _first_unsearchable(Path(shared), uid, uid)
+    if blocked is not None:
+        return [
+            f"a session uid cannot reach the shared config dir {shared} "
+            f"({blocked}): sessions would run without the shared settings, "
+            "skills and plugins. Put CLAUDE_CONFIG_DIR outside /home/app on a "
+            "path every uid can search."
+        ]
+    problems = []
+    for rel in (*_SHARED_FILES, *(f"plugins/{n}" for n in _SHARED_PLUGIN_FILES)):
+        path = Path(shared) / rel
+        try:
+            if path.is_file() and not _dac_allows(path, uid, uid, os.R_OK):
+                problems.append(
+                    f"a session uid cannot read the shared {path} "
+                    f"({_describe_mode(path)})"
+                )
+        except OSError:
+            continue
+    return problems

@@ -394,6 +394,15 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.debug("argv file sweep skipped", exc_info=True)
 
+    # uid isolation keeps every session uid's state in its own config dir, and
+    # the CLI's own retention sweep runs only when that uid's CLI starts: expire
+    # what users who do not come back left behind (design §4.5).
+    from src.backends.claude import uid_layout
+
+    uid_retention = None
+    if uid_layout.enabled():
+        uid_retention = asyncio.create_task(_uid_retention_loop())
+
     # Bring up the optional usage-log SQLAlchemy engine (no-op when the env var is
     # unset).  Kept late in startup so a flaky logging DB cannot block the
     # gateway from becoming healthy.
@@ -408,10 +417,41 @@ async def lifespan(app: FastAPI):
 
     # Cleanup on shutdown (async to disconnect SDK clients)
     await auto_refresher.stop()
+    if uid_retention is not None:
+        uid_retention.cancel()
     logger.info("Shutting down session manager...")
     await session_manager.async_shutdown()
+    if uid_layout.enabled():
+        # Session teardown handed anonymous workspaces to the broker-backed
+        # reclaimer; give it a bounded moment (each lease is released only once
+        # its uid's state is gone, and a restart starts with no leases).
+        from src.backends.claude import uid_cleanup
+
+        await asyncio.to_thread(uid_cleanup.reclaimer().drain, 15.0)
     await _shutdown_backends()
     await usage_logger.close()
+
+
+# First uid-mode retention sweep this long after startup, then once a day.
+_UID_RETENTION_FIRST_DELAY_SECONDS = 300.0
+_UID_RETENTION_INTERVAL_SECONDS = 24 * 3600.0
+
+
+async def _uid_retention_loop() -> None:
+    """Expire per-uid transcripts, hook env dirs and task lists older than the
+    shared settings' ``cleanupPeriodDays`` (as each session uid, through the
+    broker). Never raises; cancelled at shutdown."""
+    from src.backends.claude import uid_cleanup
+
+    delay = _UID_RETENTION_FIRST_DELAY_SECONDS
+    while True:
+        await asyncio.sleep(delay)
+        delay = _UID_RETENTION_INTERVAL_SECONDS
+        try:
+            swept = await asyncio.to_thread(uid_cleanup.retention_sweep)
+            logger.info("uid isolation retention sweep: %d uid(s) swept", swept)
+        except Exception:
+            logger.warning("uid isolation retention sweep failed", exc_info=True)
 
 
 # Create FastAPI app
