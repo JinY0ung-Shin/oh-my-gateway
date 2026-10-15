@@ -471,11 +471,19 @@ def grant_workspace(workspace: str, uid: int, *, named: bool) -> None:
             # gateway's .claude/{skills,agents} mirrors is a hard link of its
             # canonical file: empty the mirrors first so the user's own skills
             # and agents are granted, then rebuild them (the ACL is per inode).
-            if named:
-                workspace_resources.clear_managed_mirrors(Path(workspace))
-            stats = posix_acl.grant_tree(fd, uid, _app_uid(), owner=_app_uid())
-            if named:
-                workspace_resources.materialize_workspace_resources(Path(workspace))
+            # Under the workspace's mirror lock: a concurrent materialize (another
+            # request's create_client or slash preflight) re-linking between the
+            # clear and the grant would leave those files ungranted for good.
+            # Every caller runs in a worker thread or at startup: the wait is
+            # unbounded.
+            with workspace_resources.workspace_lock(Path(workspace)):
+                if named:
+                    workspace_resources.clear_managed_mirrors(Path(workspace))
+                stats = posix_acl.grant_tree(fd, uid, _app_uid(), owner=_app_uid())
+                if named:
+                    workspace_resources.materialize_workspace_resources(
+                        Path(workspace)
+                    )
             took = time.monotonic() - started
             complete = not stats.truncated and not stats.errors
             log = logger.info if complete else logger.warning
