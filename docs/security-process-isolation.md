@@ -1,10 +1,11 @@
 # 사용자별 프로세스 격리 (설계)
 
 > **상태: 설계/계획, 일부 구현.** Landlock 단독과 ①은 `CLAUDE_ISOLATION_MODE=landlock|uid`(#241)로 들어왔다(§3·§5·§6의
-> 구현 노트). uid 모드는 워크스페이스 소유권과 컨테이너 프로비저닝(§7 step 4) 전에는 쓸 수 없다. 메커니즘 선택은 prod
-> 호스트의 커널·권한에 달려 있고, 그 사실은 `scripts/isolation_probe.py`를 prod 컨테이너에서 돌려 확정한다.
-> uid 모드를 쓰게 만드는 남은 두 선행 작업(워크스페이스 uid 소유권·정리 대행, 사용자별 config dir — §7 step 2·4)의
-> 상세 설계는 [isolation-uid-ownership-design.md](isolation-uid-ownership-design.md)를 보라.
+> 구현 노트). uid 모드를 쓰게 만든 두 선행 작업(워크스페이스 uid 소유권·정리 대행, 사용자별 config dir — §7
+> step 2·4)과 컨테이너 프로비저닝은 2026-10-15에 들어왔고 로컬 컨테이너 수용 시험을 통과했다(설계·구현 노트:
+> [isolation-uid-ownership-design.md](isolation-uid-ownership-design.md), 레이아웃: `docker-compose.uid.yml`).
+> 메커니즘 선택은 prod 호스트의 커널·권한에 달려 있고, 그 사실은 `scripts/isolation_probe.py`(이미지의
+> `/usr/local/bin/isolation_probe.py`)를 prod 컨테이너에서 돌려 확정한다.
 > 앱 계층(자격증명→워크스페이스/세션 스코프) 격리는 [security-user-isolation.md](security-user-isolation.md)를 보라.
 > 이 문서는 그 아래, **OS/프로세스 계층**(한 세션이 다른 세션·게이트웨이의 파일/메모리/비밀에
 > 닿지 못하게 하는 경계)을 다룬다.

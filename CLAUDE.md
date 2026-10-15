@@ -267,7 +267,7 @@ uv run pytest --cov=src                            # with coverage
   `$CLAUDE_PLUGIN_DATA` before every plugin hook and **skips the hook on EACCES**; with the dir
   present the hook runs and only its writes there fail. The CLI's only knob,
   `CLAUDE_CODE_PLUGIN_CACHE_DIR`, moves the whole plugins root, so a per-session data dir needs
-  per-user config dirs. `CLAUDE_ADD_DIRS` rides the #240 filter (`_operator_add_dir_roots`) and then
+  per-user config dirs (uid mode has them: there `P/plugins/data` is the session uid's). `CLAUDE_ADD_DIRS` rides the #240 filter (`_operator_add_dir_roots`) and then
   `_GrantFilter`, never the raw strings. A confined script reaches what a file tool may plus `/dev/shm` and the read-only
   system roots — `/app` is never listed (code + `/app/data` creds denied by rule absence, not a ro
   rule). `/etc` and `/usr` stay ro (the CLI/libc need them; a passwd entry is required), so
@@ -320,7 +320,9 @@ uv run pytest --cov=src                            # with coverage
   `core.excludesFile`/`core.attributesFile` at absent tmp paths (kept only while it is a readable,
   non-empty regular file still carrying that `excludesFile` line, so the session's own
   `git config --global` edits persist; anything else moves aside to `gitconfig.broken-<n>` and is
-  rewritten atomically): Landlock does not mediate `access(2)`, so git took a denied `~/.gitconfig`
+  rewritten atomically): Landlock does not mediate `access(2)` (nor `stat`, `chmod`, `chown`,
+  `utime` or `setxattr` of a file outside the ruleset — it checks opening, executing, creating,
+  removing, renaming/linking, truncating and device ioctls), so git took a denied `~/.gitconfig`
   or `~/.config/git/ignore` for readable and exited 128. Operator-wide git config belongs in
   `/etc/gitconfig` — except those two keys, which the session's global file overrides; the CLI's
   internal git helpers pin `GIT_CONFIG_GLOBAL=/dev/null` and still read the default excludes file.
@@ -457,12 +459,15 @@ uv run pytest --cov=src                            # with coverage
   orphan still holds — one not swept yet, or one a sweep gave up on (`_check_uid_free`). That
   check assumes one workspace per uid: a named user whose orphan a sweep gave up on cannot spawn
   until it exits, and one live in two workspaces at once (a legacy `base/<user>` resume beside a
-  `base/<user>/claude` session) is refused in the second. An anonymous workspace uid mode cannot
-  delete keeps its uid (fail closed until broker cleanup lands). Today a session uid cannot write
-  its workspace; once it can, every anonymous workspace is such a one and the pool drains after
-  `CLAUDE_ISOLATION_EPHEMERAL_UIDS` runs, so broker-delegated cleanup must land with workspace
-  ownership. Nothing removes a run's `/dev/shm` objects, so the next run leased that uid can read
-  them. The persisted registry never grows, and with every uid leased a new anonymous run gets
+  `base/<user>/claude` session) is refused in the second. The session uid writes its workspace
+  (next gotcha), so the gateway alone cannot delete an anonymous one: `cleanup_temp_workspace`
+  hands it to `uid_cleanup.reclaim_temp_workspace` (one background `Reclaimer` thread; `sync=True`
+  only for the startup probe), which has the broker wipe the workspace, the uid's per-uid config
+  state (`uid_layout.ephemeral_clear_targets`) and its `/dev/shm` objects as that uid (`cleanup`
+  op, parked until the run's supervisor is gone), removes the rest itself and releases the lease
+  only once that is verified; a failed wipe keeps the lease and is retried. Before a leased uid's
+  first spawn `uid_layout.ensure_clean_ephemeral` wipes what a dead gateway process left (an
+  unleased `_tmp_` workspace's uid is read from its root's ACL). The persisted registry never grows, and with every uid leased a new anonymous run gets
   the retryable 503 (an `api_error` event on `/v1/agents/messages`). Named users get durable uids,
   never reclaimed (follow-up): a full stable
   band raises `UidBandExhausted` → HTTP 500 `uid_band_exhausted`, not "retry shortly", with a warning
@@ -488,36 +493,37 @@ uv run pytest --cov=src                            # with coverage
   `effective_mode()` self-detects at startup: Landlock ABI≥3, the broker reachable, and the
   **startup probe** passed. Once the broker answers, `install_process_env` runs
   `_probe_uid_sessions`:
-  - it spawns the real CLI `--version` through the launcher and broker, as an ephemeral session
-    uid, in a fresh anonymous workspace from the workspace manager;
-  - it checks with mode bits (no ACLs) that this uid can reach the config dir and create its
-    `projects/<name>`.
+  - it prepares an ephemeral session uid's layout for a fresh anonymous workspace
+    (`uid_layout.prepare_spawn`) and spawns the real CLI `--version` through the launcher and
+    broker with a probe session id;
+  - it checks as the gateway that the uid created its `.cli-tmp`, `projects/<name>`,
+    `session-env/<id>` and `tasks/<id>` (by owner: the kernel evaluated the ACLs, mode bits would
+    not show them), that the shared tree is mode-readable to it (`uid_layout.shared_tree_problems`:
+    it carries no ACL), and that the broker's cleanup then leaves nothing of the uid behind.
 
   Unavailable uid is a hard `check_config` error naming the reason, **unless**
-  `CLAUDE_ISOLATION_FALLBACK=landlock`. The probe is skipped when the secret, the bands or the
-  registry are broken, so their own errors stand. In uid mode, `verify()` also runs in such a
+  `CLAUDE_ISOLATION_FALLBACK=landlock`. The probe is skipped when the secret, the bands, the
+  registry or a configured per-uid config base are broken, so their own errors stand (a missing
+  base is reported first, as the likely cause of what the probe saw). In uid mode, `verify()` also runs in such a
   workspace and names a launcher/broker refusal (`landlock.describe_launcher_exit`) instead of
   printing npm install hints.
 
-  **With the shipped image the probe fails and uid mode refuses to start.** A local container run
-  (2026-10-14) served no turn: the session uid cannot write the app-owned 0755 workspace, so the CLI
-  died on `.cli-tmp`, while startup passed and every request got a 503. `/home/app` is 0700, which
-  hides the shared `~/.claude` assets, `session-env/<id>` and `plugins/data`. The image has no
-  passwd entries for the broker uid or the band. uid mode becomes usable only when per-user
-  workspace ownership and container provisioning land; `landlock` is the boundary to run today.
-  That run did verify the privileged layout: broker caps exactly SETUID|SETGID with securebits
-  locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`, and teardown.
-  Re-run `docs/isolation-uid-verification.md` in the deployment container before enabling uid in
-  prod. In uid mode the root entrypoint no longer re-owns (or walks) `~/.claude` entries owned by a
+  uid mode needs the layout `docker-compose.uid.yml` sets (next gotcha). A local container run
+  (2026-10-15, this layout) served named, anonymous and stateless turns as session uids, migrated a
+  legacy transcript and memory, resumed an expired session after a restart, wiped and reused
+  ephemeral uids (8 runs on a 3-uid slice), ran a plugin SessionStart hook as the session uid, and
+  refused the two broken layouts (no config base; the shared config dir in the 0700 `/home/app`);
+  the 2026-10-14 run had verified the privileged layout (broker caps exactly SETUID|SETGID with
+  securebits locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`,
+  teardown). Re-run `docs/isolation-uid-verification.md` in the deployment container before
+  enabling uid in prod. In uid mode the root entrypoint no longer re-owns (or walks) `~/.claude` entries owned by a
   session uid (the band and every uid the registry records, minus root, the app uid/gid and the
   broker uid/gid — the registry read as root without importing src, a symlinked, non-regular,
   oversized or malformed one ignored with a warning; other modes still hand everything back to the
-  app uid). The
-  gateway cannot read or unlink a session uid's 0600 transcript, so resuming an expired uid-mode
-  session is an explicit, non-retryable 500 `transcript_unreadable`
-  (`session_manager.TranscriptUnreadable`, warned once per path) and stateless transcript cleanup
-  warns; the broker doing both as the session uid belongs to the workspace-ownership follow-up. A
-  refused workspace (`landlock.WorkspaceRefused`) is a non-retryable 500 `workspace_refused` too.
+  app uid). A session uid's 0600 transcript is read (rehydrate, `transcript_exists`) and removed
+  through the broker as that uid (`uid_cleanup`: the gateway tries itself first); only a transcript
+  neither may read is the non-retryable 500 `transcript_unreadable`
+  (`session_manager.TranscriptUnreadable`). A refused workspace (`landlock.WorkspaceRefused`) is a non-retryable 500 `workspace_refused` too.
   These, `uid_band_exhausted` and the 409 `session_ended` carry `x-should-retry: false`: OpenAI
   SDKs retry 408/409/429 and every 5xx on their own otherwise (a retried `session_ended` would
   silently start a fresh conversation), CORS exposes the header to browser clients, and the
@@ -526,11 +532,57 @@ uv run pytest --cov=src                            # with coverage
   rate-limit handler instead, which keeps its own body and `Retry-After` (the archive 429's code
   and `Retry-After` are lost there — pre-existing).
   Remaining
-  hardening (seccomp arg filter on set*id, bounding-set drop, per-user workspace ownership + broker
-  cleanup) is a container/follow-up step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py`
+  hardening (seccomp arg filter on set*id, bounding-set drop) is a container/follow-up step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py`
   never import `/app/src` (session-writable + privileged); the broker's ticket-verify is duplicated
   from `uid_isolation` and kept in lockstep by `test_isolation_broker.py::TestTicketVerify`
   (valid/tampered/expired/replayed cross-check + identical `ValueError` refusals).
+- uid-mode ownership + per-uid config dir (`docs/isolation-uid-ownership-design.md`, layout in
+  `docker-compose.uid.yml`): `uid_layout.enabled()` = uid mode + `CLAUDE_ISOLATION_CONFIG_BASE`
+  (startup requires it, an absolute dir on a persistent volume outside `$HOME`, the shared config
+  dir, the workspace base, `/app`, a system root; ACL support on it and on the workspace base;
+  `WORKSPACE_LEGACY_LOCALPART_KEY` refused). Before every per-uid spawn `uid_layout.prepare_spawn`
+  (and, for a named user, `migrate_user` in a worker thread before `create_client` asks for the
+  transcript) makes, as the gateway and never through a link:
+  - the per-uid config dir `P = <base>/<uid>` — the CLI's `CLAUDE_CONFIG_DIR` — app-owned with
+    ACL `u:U:r-x`: links to the shared tree `S` = the gateway's own `CLAUDE_CONFIG_DIR` (skills,
+    agents, commands, output-styles, `CLAUDE.md`, rules, hooks, workflows, `settings*.json`), a real
+    `plugins/` (registry and `marketplaces` linked to `S/plugins`; a linked `plugins/` silently
+    skips every plugin hook), and the writable `projects`, `session-env`, `tasks`, `plugins/data`,
+    `state` (`P/.claude.json -> state/.claude.json`; the CLI's locked write fails, its fallback
+    writes through the link) with `u:U:rwx` plus a default ACL. `S` must lie outside `/home/app`
+    (0700) and the system roots; `install_plugins.py` installs into it, and in uid mode the settings
+    writer writes `settings.json` 0644 and startup widens `S`'s entry points (`ensure_shared_readable`);
+  - the workspace root kept app-owned (design α) with access ACL `u:U:rwx` and default ACL
+    `d:u:U:rwx, d:u:<app>:rwx` — without the app entry the gateway loses everything U creates; never
+    `chmod` a granted dir (its group bits are the mask). Under a default ACL umask is ignored and a
+    new object's mask is the default mask ∩ its create mode's group bits, so U's 0600/0700 files
+    (transcripts, `mkstemp`, the CLI's `.cli-tmp/claude-<uid>`) close to the gateway: those go
+    through the broker. An existing tree is granted once (`posix_acl.grant_tree`: no link followed,
+    hard-linked files skipped, so the managed `.claude/{skills,agents}` mirror is emptied first and
+    rebuilt after; marker beside the workspace, written only when complete), and a named user's
+    legacy `projects/<name>` (their transcripts by recorded `cwd`, sidecars, `memory/` only without
+    another user's transcript) is copied once from `CLAUDE_ISOLATION_MIGRATE_FROM` (default the
+    shared dir, `off` disables; the source stays for a rollback).
+  The Landlock lists come from `landlock._per_uid_ro_rw` (rw: workspace, `P/projects/<name>`,
+  `P/session-env/<id>`, `P/tasks/<id>`, `P/plugins/data`, `P/state`; ro: `S`'s shared assets and
+  registry roots, `P/plugins`); `_GrantFilter` knows `S` (shared names only) and denies the config
+  base. The broker's two ops (`docker/isolation_broker.py`; client `broker_ops`, no fds, strict
+  schema; the spawn path refuses an op ticket): `cleanup` (as `(broker, U, broker)`: clear / remove
+  / expire / `/dev/shm`, no link followed, parked while a live supervisor of that `(uid, workspace)`
+  runs, a spawn of the uid refused meanwhile) and `transcript` (returns only a turn count or a
+  negative code: `transcript_turns.count_transcript_turns`, kept byte-identical to the broker's copy
+  by `tests/test_transcript_turns.py`). A daily `uid_cleanup.retention_sweep` expires named users'
+  per-uid state older than `S`'s `cleanupPeriodDays` (the CLI's own sweep runs only when that uid's
+  CLI starts). The CLI child gets umask 077 (new `/dev/shm` objects 0600), git `safe.directory` for
+  the app-owned root via `GIT_CONFIG_COUNT`, and `USER`/`LOGNAME` from the passwd entries the root
+  entrypoint adds for the broker uid and the band (`provision_session_accounts`, ≤ 65536 uids). The
+  quota walk skips only a session uid's private dirs under `.cli-tmp` (else every quota-growing write
+  of every uid-mode session would fail closed). In tests the broker refuses op paths outside the
+  temp dir and touches `/dev/shm` only via `GATEWAY_ISOLATION_TEST_SHM_DIR` (the test uid is the
+  developer's). Python 3.12's `Path.exists()/is_file()` raise on an unsearchable parent: code that
+  looks into session-writable trees uses `lstat` and catches `OSError`. Rollback to landlock/off
+  keeps U's ordinary (0666/0777) workspace files usable by the app uid through the ACL; its
+  0600/0700 files and the transcripts in `P` stay closed (those sessions are not resumed).
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values

@@ -1,10 +1,10 @@
 # uid 모드: 워크스페이스 소유권 + 사용자별 config dir (설계)
 
-> **상태: 설계. 구현 전.** 이 문서는 `docs/security-process-isolation.md` §7 step 2(사용자별 HOME/config dir)와
-> step 4(워크스페이스 uid 소유권·정리)를 **한 묶음으로** 상세화한다. step 3의 런처·브로커는 #244로 이미 들어왔고
-> 이 문서는 그 위에 얹는다. `CLAUDE_ISOLATION_MODE=uid`는 이 둘이 들어오기 전에는 출하 이미지에서 턴을 하나도
-> 돌리지 못한다(기동 프로브가 거부). 상위 설계·위협 모델은 `security-process-isolation.md`를, 앱 계층 격리는
-> `security-user-isolation.md`를 보라.
+> **상태: 구현됨(2026-10-15, 브랜치 `feat/uid-ownership-config-dir`). 로컬 컨테이너 수용 시험 통과 — 운영 배포
+> 컨테이너에서의 재확인은 남았다.** 이 문서는 `docs/security-process-isolation.md` §7 step 2(사용자별 HOME/config
+> dir)와 step 4(워크스페이스 uid 소유권·정리)를 **한 묶음으로** 상세화한다. step 3의 런처·브로커는 #244로 이미
+> 들어왔고 이 문서는 그 위에 얹는다. 구현에서 정한 것과 설계에서 달라진 점은 §11에 있다. 상위 설계·위협 모델은
+> `security-process-isolation.md`를, 앱 계층 격리는 `security-user-isolation.md`를 보라.
 >
 > 아래의 사실은 2026-10-15에 로컬에서 실측했다(이미지 `omg-landlock:6aa5496`, 커널 6.18, Landlock ABI 7,
 > Docker 29.1.3; 번들 CLI 2.1.283 / SDK 0.2.160). 실측은 "실측"으로, 코드 정적 분석은 "코드"로 표기한다.
@@ -432,3 +432,61 @@ ACL로 연 접근을 **거짓 거부**하고(ACL은 group 비트를 mask로 접�
 - **transcript 읽기 대행 방식**(§3.6): (a) 브로커 `transcript` op(권장) vs (b) 게이트웨이 메타데이터.
 - **롤백 지원 범위**(§3.7): 브로커가 `U`의 잠긴 산출물을 되돌리는 op까지 지원할지, "롤백 = 잠긴 산출물·resume
   포기"로 문서화할지.
+
+---
+
+## 11. 구현 노트 (2026-10-15)
+
+§9의 1–6단계가 들어왔고 7단계(수용 시험)는 로컬 컨테이너에서 통과했다(이미지 `omg-uid:d71aaec`, 커널 6.18,
+Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 아래와 같다.
+
+### 11.1 모듈
+| 설계 | 구현 |
+|---|---|
+| §6 미러 symlink-안전화 | `workspace_resources.py`: 루트 fd에서 한 성분씩 `O_NOFOLLOW`, marker는 일반 파일·nlink 1만, 파일은 연 inode를 `/proc/self/fd` linkat(실패 시 그 fd에서 복사), 깊이 상한 64, 예외를 올리지 않음. `clear_managed_mirrors`·`is_managed_mirror` 추가 |
+| §2.2 ACL 인코더 | `posix_acl.py`(stdlib, setfacl과 바이트 동일): 프리셋, `grant_dir`, 1회 이전용 `grant_tree`(symlink·하드 링크·FIFO·다른 소유자·마운트 경계는 건너뜀) |
+| §3.1–3.2, §3.7, §4.1–4.3 | `uid_layout.py`: `prepare_spawn`(P 골격·링크·ACL, 워크스페이스 루트 ACL, 1회 트리 grant와 미러 비우기/재생성, 레거시 이전, ephemeral 잔여물 확인), `migrate_user`(create_client 전, 워커 스레드), `ensure_shared_readable`, 조회 API(`session_layout`·`projects_root`) |
+| §4.4 리졸버 매개변수화 | `claude_config_paths.ConfigLayout`·`layout(uid)`·`config_base`·`legacy_config_dir`; `landlock._per_uid_ro_rw`·`_GrantFilter(layout=)`; 가드 훅은 P와 S를 함께 지킨다 |
+| §3.3, §3.6 브로커 op | `docker/isolation_broker.py`의 `cleanup`·`transcript` op, 게이트웨이 클라이언트 `broker_ops.py`, 정리 경로 `uid_cleanup.py`(Reclaimer 스레드, 익명 워크스페이스·임대, session dir·transcript, 보존 sweep) |
+| §7 프로브 | `landlock._per_uid_session_problems`: 실제 spawn 뒤 세션 uid가 만든 디렉터리를 소유자로 확인하고, 브로커 정리 후 잔여물이 없어야 통과 |
+| §8 프로비저닝 | `docker/entrypoint.py`(passwd/group, S·config base 디렉터리), `docker-compose.uid.yml`, 이미지에 `isolation_probe.py` |
+
+### 11.2 열린 질문(§10)에 대한 결정
+- **α vs β**: α(app 소유 루트 + spawn별 ACL).
+- **transcript 읽기 대행**: (a) 브로커 `transcript` op. 공유 규칙 `transcript_turns.count_transcript_turns`는 브로커에
+  바이트 단위 사본이 있고 소스 parity 테스트로 묶는다.
+- **`/dev/shm` DAC**: 브로커 CLI 자식 umask 077(새 객체 0600) + 익명 임대 해제 전 `cleanup` op가 그 uid 소유 항목을 지운다.
+- **git `safe.directory`**: 브로커가 `GIT_CONFIG_COUNT`로 `<ws>`·`<ws>/*`를 싣는다(git ≥ 2.46; 이미지 2.47.3).
+- **익명 lease 키잉**: per-uid P는 uid로 키잉하고, 임대 해제 전에 지우며(브로커), 다음 임대 전에 한 번 더 확인한다.
+- **`WORKSPACE_LEGACY_LOCALPART_KEY`**: uid 모드에서 기동 거부.
+- **롤백**: 별도 op 없이 문서화 — U가 평범하게 만든 파일은 `d:u:<app>` 덕에 계속 쓰이고, 0600/0700과 P의
+  transcript는 포기한다(컨테이너에서 landlock으로 되돌려 확인).
+- **`.credentials.json`**: 지원하지 않는다(문서화 유지; compose는 `ANTHROPIC_AUTH_TOKEN`).
+
+### 11.3 설계와 달라진 점
+- **S 위치**: 예시의 `/opt/claude-shared`는 쓸 수 없다 — `/opt`는 런처가 모든 세션에 읽기 전용으로 여는 시스템
+  루트라 게이트웨이가 상태를 두지 못하게 거부한다(`_system_ro_errors`). compose override는 `/data/claude/shared`(S)와
+  `/data/claude/users`(config base)를 한 영속 볼륨에 둔다.
+- **`state/.claude.json`**: 브로커 자식이 아니라 게이트웨이가 `{}`로 미리 만든다(state/의 default ACL로 U가
+  읽고 쓴다). ephemeral uid의 잔여물 판정에서 이 pristine 파일은 빼고 본다.
+- **기존 트리 이전**: 관리 미러 파일은 원본의 하드 링크라 `grant_tree`가 건너뛴다. 그래서 1회 grant 전에 미러를
+  비우고 뒤에 다시 만든다(ACL은 inode별). 마커는 오류·상한 없이 끝났을 때만 쓴다.
+- **quota**: 세션 uid가 항상 만드는 0700 `.cli-tmp/claude-<uid>` 때문에 quota를 켠 uid 모드의 모든 쓰기가
+  fail-closed로 막혔다(§3.5-3의 "U가 일부러 잠근 경우만"이라는 전제가 깨짐). quota 워커는 `.cli-tmp` 아래의
+  세션 uid 소유 비공개 디렉터리만 집계에서 뺀다. 그 밖의 읽을 수 없는 하위는 그대로 fail-closed다.
+- **이벤트 루프**: create_client 전 미러 동기화, named 사용자의 1회 준비, slash preflight 옵션 구성을 워커
+  스레드로 옮겼다(세션이 키울 수 있는 트리를 걷는다).
+- **`agent_catalog`**: managed 판정을 `is_managed_mirror`로, 파일 판정을 lstat으로 바꿨다(링크된 `.claude`를
+  읽지 않고, 세션 uid가 닫은 디렉터리에서 Python 3.12의 `PermissionError`로 500이 나지 않게).
+- **expire**: 비고 오래된 project 디렉터리만, 그리고 sweep 전 mtime도 오래됐을 때만 지운다(spawn이 방금 만든
+  빈 `projects/<name>`은 Landlock이 inode로 grant했기 때문).
+- **테스트 안전장치**: `--test-same-uid`(개발자 uid로 도는) 브로커는 op 경로가 임시 디렉터리 밖이면 거부하고,
+  `/dev/shm`은 `GATEWAY_ISOLATION_TEST_SHM_DIR`을 줄 때만 그 디렉터리로 대신한다.
+
+### 11.4 남은 것
+- 운영 배포 컨테이너에서 `docs/isolation-uid-verification.md` 재실행(커널·seccomp·마운트·ACL 지원은 이 dev
+  머신과 무관하다).
+- named 사용자 uid 회수, 브로커 seccomp 인자 필터·bounding set 축소, 비root 시작 경로, codex/opencode(격리 밖).
+- 보존 sweep과 동시 spawn의 좁은 경쟁(비고 오래된 `projects/<name>`을 sweep이 지우는 순간 같은 사용자의 spawn이
+  그것을 쓰는 경우)은 감수한다.
+- 파일 API는 세션 uid가 0600/0700으로 잠근 파일에서 500이다(§3.5-2, 자기 것만 잠근 경우).
