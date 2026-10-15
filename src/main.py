@@ -420,14 +420,9 @@ async def lifespan(app: FastAPI):
     if uid_retention is not None:
         uid_retention.cancel()
     logger.info("Shutting down session manager...")
+    # Under uid isolation this also drains the broker-backed reclaimer the
+    # session teardowns handed anonymous workspaces to (bounded).
     await session_manager.async_shutdown()
-    if uid_layout.enabled():
-        # Session teardown handed anonymous workspaces to the broker-backed
-        # reclaimer; give it a bounded moment (each lease is released only once
-        # its uid's state is gone, and a restart starts with no leases).
-        from src.backends.claude import uid_cleanup
-
-        await asyncio.to_thread(uid_cleanup.reclaimer().drain, 15.0)
     await _shutdown_backends()
     await usage_logger.close()
 

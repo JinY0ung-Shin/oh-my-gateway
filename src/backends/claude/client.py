@@ -2018,8 +2018,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         # Under uid isolation a named user's transcripts move into their own
         # config dir on their first spawn; do that before asking whether this
-        # session has one, so a migrated session is resumed, not restarted.
-        migrate_user(user, cwd)
+        # session has one, so a migrated session is resumed, not restarted. In a
+        # worker thread: the first one also grants a whole existing workspace
+        # tree (and may copy a large legacy project dir).
+        await asyncio.to_thread(migrate_user, user, cwd)
         has_history = _session_jsonl_exists(session)
         options = self._build_sdk_options(
             model=model,

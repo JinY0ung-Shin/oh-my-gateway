@@ -46,7 +46,6 @@ import logging
 import math
 import os
 import re
-import shutil
 import stat
 import tempfile
 import time
@@ -1779,21 +1778,14 @@ def remove_session_dirs(session_id: Optional[str]) -> None:
     those exact dirs: the id is validated as at creation, nothing is removed
     through a symlink in its place or above it, and links inside it are
     removed, not followed.
-    """
-    from . import workspace_sandbox as ws
 
-    claude_home = ws._claude_home()
-    if claude_home is None or not session_id or not _SESSION_ID_RE.match(session_id):
-        return
-    kinds = _SESSION_DIR_KINDS if confine_enabled() else ("session-env",)
-    for kind in kinds:
-        path = claude_home / kind / session_id
-        try:
-            if _real(path) != str(path) or not path.is_dir():
-                continue
-            shutil.rmtree(path)
-        except OSError:
-            logger.debug("Could not remove %s", path, exc_info=True)
+    The work is ``uid_cleanup.remove_session_dirs``'s, which also knows the
+    per-uid config dirs of uid mode (and removes what the session uid locked
+    away through the broker); this name stays for its existing callers.
+    """
+    from . import uid_cleanup
+
+    uid_cleanup.remove_session_dirs(session_id)
 
 
 # The original name, which the session and stateless cleanups call.

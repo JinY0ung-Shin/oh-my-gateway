@@ -241,7 +241,9 @@ async def _fetch_commands(cwd: Optional[Path], user: Optional[str] = None) -> se
     so user-scope plugin skills installed by the admin panel are visible to the
     preflight and the answer describes the CLI that will actually run the turn.
     """
-    opts = _build_preflight_options(cwd, user)
+    # Off the event loop: the build refreshes the workspace's resource mirrors
+    # and, under uid isolation, prepares the session uid's layout.
+    opts = await asyncio.to_thread(_build_preflight_options, cwd, user)
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -296,7 +298,7 @@ async def _fetch_command_details(
     cwd: Optional[Path], user: Optional[str] = None
 ) -> dict[str, dict[str, str]]:
     """Names plus SDK metadata (description, argumentHint) for completion UIs."""
-    opts = _build_preflight_options(cwd, user)
+    opts = await asyncio.to_thread(_build_preflight_options, cwd, user)
     details: dict[str, dict[str, str]] = {}
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()

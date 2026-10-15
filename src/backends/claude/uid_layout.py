@@ -602,13 +602,16 @@ def ensure_clean_ephemeral(uid: int, key: str) -> None:
     if _has_leftovers(uid):
         from . import broker_ops
         from . import uid_isolation as ui
+        from .uid_cleanup import _broker_path
 
         logger.warning(
             "uid isolation: ephemeral uid %d still holds a previous run's state; "
             "wiping it before reuse",
             uid,
         )
-        targets = [p for p in ephemeral_clear_targets(uid) if os.path.isdir(p)]
+        targets = [
+            _broker_path(p) for p in ephemeral_clear_targets(uid) if os.path.isdir(p)
+        ]
         try:
             done = broker_ops.cleanup(uid, clear=targets, shm=True, wait=10)
         except Exception as exc:
@@ -915,20 +918,33 @@ def prepare_spawn(
 
 
 def migrate_user(user: Optional[str], workspace) -> None:
-    """For ``create_client``: give a named *user* their uid and config dir and
-    run the legacy migration *before* it asks whether the session has a
-    transcript (a migrated one makes it ``--resume``). No-op unless per-uid
-    config dirs are on. Allocates the user's durable uid (the create path is a
-    spawn); raises like :func:`prepare_spawn`."""
+    """For ``create_client``, in a worker thread: a named *user*'s one-time
+    steps ahead of the spawn's synchronous option build.
+
+    Gives the user their uid and config dir, grants the workspace (its whole
+    existing tree, the first time) and runs the legacy migration *before*
+    ``create_client`` asks whether the session has a transcript (a migrated one
+    makes it ``--resume``). The spawn's own :func:`prepare_spawn` then finds
+    all of it done. The workspace is checked exactly as a spawn checks it
+    (``landlock._confined_workspace``). No-op unless per-uid config dirs are
+    on. Allocates the user's durable uid (the create path is a spawn); raises
+    like :func:`prepare_spawn`."""
     if not user or workspace is None or not enabled():
         return
+    from . import landlock
     from . import uid_isolation as ui
 
     uid = ui.resolve_uid(user, persist=True)
     layout = cp.layout(uid)
+    resolved = landlock._confined_workspace(
+        landlock._absolute(workspace),
+        Path(os.path.realpath(layout.config_dir)),
+        layout=layout,
+    )
     with _uid_lock(uid):
         ensure_user_config(layout)
-        migrate_legacy(user, uid, os.path.realpath(str(workspace)))
+        grant_workspace(resolved, uid, named=True)
+        migrate_legacy(user, uid, resolved)
 
 
 # --------------------------------------------------------------------------

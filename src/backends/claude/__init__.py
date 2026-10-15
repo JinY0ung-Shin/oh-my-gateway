@@ -296,9 +296,13 @@ def _install_workspace_resource_materializer(cli) -> None:
     async def create_client_with_workspace_resources(*args, **kwargs):
         cwd = kwargs.get("cwd")
         if cwd:
+            import asyncio
+
             from src.backends.claude.workspace_resources import materialize_workspace_resources
 
-            materialize_workspace_resources(Path(cwd))
+            # A recursive walk of a tree the session can grow at will: never on
+            # the event loop every other session's stream shares.
+            await asyncio.to_thread(materialize_workspace_resources, Path(cwd))
         return await original_create_client(*args, **kwargs)
 
     cli.create_client = create_client_with_workspace_resources

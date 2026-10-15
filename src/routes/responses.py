@@ -767,12 +767,13 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
                     session_id, user=body.user, cwd=legacy_cwd, max_turn=turn
                 )
     except TranscriptUnreadable as exc:
-        # On disk but unreadable to the gateway (uid isolation: the session
-        # uid owns it). Say so instead of the generic "not found or expired",
-        # which the session is not; the cause is logged once per transcript.
-        # No retry can clear it before the broker reads transcripts as the
-        # session uid (a follow-up). OpenAI SDKs retry 408/409/429 and every
-        # 5xx by themselves unless told not to (``x-should-retry``).
+        # On disk but unreadable: the gateway's uid may not read it, and no
+        # broker read as the session uid worked either (uid isolation reads a
+        # session uid's 0600 transcript through the broker; uid_cleanup). Say
+        # so instead of the generic "not found or expired", which the session
+        # is not; the cause is logged. Not a transient state a client retry
+        # clears, and OpenAI SDKs retry 408/409/429 and every 5xx by themselves
+        # unless told not to (``x-should-retry``).
         raise HTTPException(
             status_code=500,
             headers=dict(_NO_RETRY_HEADERS),
@@ -784,9 +785,9 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
                         "Session for previous_response_id "
                         f"'{body.previous_response_id}' cannot be resumed: the "
                         "gateway may not read its transcript (permission "
-                        "denied). Under uid isolation the session's own uid "
-                        "owns it, and resuming such a session is not supported "
-                        "yet."
+                        "denied), and under uid isolation the broker could not "
+                        "read it as the session's own uid either (the gateway "
+                        "log says why)."
                     ),
                 }
             },
