@@ -738,7 +738,7 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
     닿는데, Dockerfile의 `useradd -m`이 만든 `/home/app`은 **0700**이다(trixie `login.defs`의
     `HOME_MODE 0700`; 로컬 빌드 이미지로 확인, prod 값은 프로브가 찍는다). 그대로면 `skills/`가 0755여도
     세션 uid는 `~/.claude` 아래 공유 자산에 전혀 닿지 못하고, 세션 HOME에서 symlink로 이어도 대상 경로가
-    같은 이유로 막힌다. 공유 트리를 HOME 밖(예: `/opt/claude-shared`, `0755`)으로 옮겨 세션 config dir에서
+    같은 이유로 막힌다. 공유 트리를 HOME 밖(예: `/data/claude/shared`, `0755`)으로 옮겨 세션 config dir에서
     연결하는 쪽을 권한다. `/home/app`에 o+x(`0711`)를 주는 방법도 있지만, 그러면 HOME 아래에서 경로를
     아는 o+r 파일이 전부 세션 uid에 열린다.
   - **②**: 공유 트리를 각 감옥에 **ro bind-mount**, 워크스페이스만 rw bind.
@@ -769,7 +769,7 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
     (`Path.home()/.claude`), `plugin_admin_service`의 clone 루트와 Refresh·install이 저장소를 찾는
     `known_marketplaces.json`, `claude_settings_env`의 `settings_path()`(`GATEWAY_CLAUDE_SETTINGS_PATH` 또는
     `$HOME/.claude/settings.json` — 그 엔드포인트는 `/admin/api/claude-settings-env`), 샌드박스/guard의
-    `_claude_home`. 그래서 공유 트리를 **HOME 밖**으로 옮기면(§5 ①의 `/opt/claude-shared` 권고) 읽기 모델이 그
+    `_claude_home`. 그래서 공유 트리를 **HOME 밖**으로 옮기면(§5 ①의 `/data/claude/shared` 권고) 읽기 모델이 그
     경로를 몰라 `/admin/api/plugins`·`/v1/agent-resources`가 **과소보고**한다(세션 자체는 샌드박스 루트만 맞으면
     영향 없음). 좁지만 실재하는 간극이고, 이 소비자들을 하나씩 고치기보다 리졸버 하나로 모으는 편이 낫다(§7 step 2).
 - **검증 항목**: CLI가 세션별 config dir에서 공유 스킬/플러그인을 **여전히 인식**하는지 e2e로 확인.

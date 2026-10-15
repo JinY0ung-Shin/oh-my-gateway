@@ -487,7 +487,7 @@ Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 �
 - **SysV IPC**: 두 리뷰어가 컨테이너에서 재현 — 런이 남긴 SysV shm·세마포어를 같은 uid를 다시 받은 다음 익명
   런이 읽었다(Landlock은 SysV IPC를 중재하지 않는다, `/dev/shm`만 막던 §3.3의 공백). cleanup op의 IPC 단계가 그
   uid 소유(owner 또는 creator) SysV shm/sem/msg와 `/dev/mqueue` 항목을 `IPC_RMID`/unlink하고, 게이트웨이의 잔여물
-  판정(`uid_cleanup.ipc_leftovers`)도 그것을 센다(컨테이너 재확인: 다음 런에서 0개).
+  판정(`uid_cleanup.ipc_leftovers`)은 그중 U가 만든 것을 센다(§11.6; 컨테이너 재확인: 다음 런에서 0개).
 - **transcript 읽기 상한**: 세션이 쓸 수 있는 transcript를 개행 없는 sparse 파일로 바꾸면 이전·재개가 한 줄을
   통째로 읽어 게이트웨이가 OOM이었다(재현). 공유 규칙 `MAX_TRANSCRIPT_BYTES`(1 GiB)·`MAX_LINE_CHARS`(64 MiB)·
   `bounded_lines`를 게이트웨이·브로커 사본이 함께 쓴다. 이전 복사는 깊이 상한·하드링크 제외·예외 포착을 더했다.
@@ -500,6 +500,27 @@ Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 �
   락), 파일 API 교체 때 세션 uid의 ACL 유지, 이름이 겹치는 project의 `memory/` 미복사, 새로 배정된 named uid의
   잔여물 정리, `agent_catalog`의 연 파일 위치 확인, 거부된 marker 경고 1회.
 
+### 11.6 수정 라운드 검증 반영 (같은 날)
+- **IPC 소유자 위조**: `IPC_SET`으로 creator는 객체의 owner를 아무 uid로나 바꿀 수 있고, 그 세그먼트를 attach한
+  채 두면 브로커의 `IPC_RMID` 뒤에도 `SHM_DEST`(`perms` 01000) 행이 남는다(이 커널에서 확인). 잔여물 판정이
+  owner를 세던 탓에 다른 세션이 band uid의 lease를 영구히 붙잡을 수 있었다(풀 고갈 → 503). 판정은 이제 U가
+  **만든**(cuid) 객체만, `SHM_DEST` 세그먼트는 빼고 센다. 남이 넘겨준 객체는 이전 런의 상태가 아니고, 넘겨주기는
+  언제든 다시 할 수 있다. 브로커는 그대로 U 소유 객체까지 지운다.
+- **줄 하나의 메모리 증폭**: 64 MiB짜리 dense한 줄(작은 list·dict)을 파싱하면 줄 크기의 약 24배를 썼다(실측
+  1.6 GiB). `count_transcript_turns`는 `MAX_LINE_VALUES`(1 Mi)보다 많은 JSON 값을 담을 수 있는 줄을 파싱 전에
+  CORRUPT로 거절한다(`too_many_values`: 문자 클래스 하나 + json의 C `scanstring`으로 문자열을 건너뜀). 그룹을
+  반복하는 정규식은 반복마다 backtrack 기록을 남겨, 이스케이프로 채운 줄 하나에 3.9 GiB를 썼다(possessive
+  수량자는 Python 3.11+라 쓰지 않는다). 같은 줄의 피크는 이제 줄 자체(≈162 MiB 프로세스)다.
+- **새 named uid의 정리 확인**: "레지스트리에 uid가 없었다"로 판정하면, 첫 wipe가 실패한 뒤 uid는 이미
+  저장돼 재시도가 확인을 건너뛰었다. 이제 P의 소유자 마커(`.oh-my-gateway-owner`, 키의 digest)로 판정한다.
+  정리가 통과한 뒤, 사용자 데이터가 들어오기 전에 쓰고, 쓰지 못하면 spawn을 거부한다. 마커를 읽지 못하면 wipe하지
+  않고 거부한다. 다른 키의 마커면 정리하고 이전 소유자의 이전 기록을 지운다. 익명 lease는 마커를 뗀다.
+- **`verify()`**: 옵션 구성(`prepare_spawn`)을 create_client처럼 워커 스레드에서 한다(admin 헬스체크마다 돈다).
+- **보존 sweep 기아**: 브로커는 그 uid의 세션이 하나라도 살아 있으면 expire를 거부하는데, sweep이 매일 같은
+  시각이라 그 시각에 늘 활동하는 사용자는 영영 정리되지 않았다. sweep은 매시간 돌며 uid마다 하루 한 번만
+  실행하고, 거부된 uid는 다음 시간에 다시 시도한다. 이틀 동안 거부되면 하루 한 번 경고한다.
+- **문서**: `docs/security-process-isolation.md`에 남은 `/opt/claude-shared` 권고를 `/data/claude/shared`로 고쳤다.
+
 ### 11.5 남은 것
 - 운영 배포 컨테이너에서 `docs/isolation-uid-verification.md` 재실행(커널·seccomp·마운트·ACL 지원은 이 dev
   머신과 무관하다).
@@ -509,3 +530,9 @@ Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 �
 - 파일 API는 세션 uid가 0600/0700으로 잠근 파일에서 500이다(§3.5-2, 자기 것만 잠근 경우).
 - SysV IPC는 세션별 namespace가 아니라, 살아 있는 세션이 일부러 world 권한으로 만든 객체는 다른 살아 있는 세션이
   열 수 있다(Landlock 비중재). 세션별 IPC namespace(또는 seccomp 차단)가 후속이다. 남은 객체는 위 정리가 지운다.
+  남이 넘겨준(owner만 U인) 객체나 아직 attach된 채 파괴 표시된 세그먼트는 다음 런의 시작을 막지 않는다(§11.6).
+- 늘 살아 있는 세션이 있는 named 사용자(24시간 봇 등)는 보존 sweep이 돌지 못한다(이틀 뒤부터 경고).
+- named 사용자의 첫 이전에서 `memory/` 복사 여부를 정하는 `_name_is_shared`는 워크스페이스 base의 사용자마다
+  하위 디렉터리를 나열한다(사용자 수에 비례, 사용자당 한 번, 워커 스레드). 못 읽으면 공유로 보고 복사하지 않는다.
+- transcript 한 줄의 메모리는 이제 줄의 저장 크기가 좌우한다. astral 문자만으로 된 64 Mi 문자 줄(디스크
+  256 MiB)은 읽기·디코드 동안 약 0.7 GiB를 쓴다(구조와 무관, `MAX_LINE_CHARS`가 상한).
