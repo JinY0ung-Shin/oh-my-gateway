@@ -47,7 +47,7 @@ uid 모드는 세션 CLI를 세션 uid `U`로 띄운다. 그러면 두 가지가
 | 워크스페이스 소유권 | **설계 α**: 워크스페이스 루트는 **게이트웨이(app) 소유**로 두고, spawn마다 세션 uid `U`에 **POSIX 기본 ACL**을 걸어 쓰기를 연다. 기본 ACL에 **app uid의 named 엔트리**(`d:u:<APP_UID>:rwx`)를 함께 넣어, `U`가 평범하게 만든 파일·디렉터리(기본 mode 0666/0777)를 app도 계속 읽고 쓴다. | ACL 실측(§3.1–3.2): app 소유 루트 + `u:U:rwx` + `d:u:U`·`d:u:<APP_UID>` default ACL이 overlay·volume·bind 모두에서 동작. app 엔트리가 없으면 app은 `U`가 만든 모든 것에서 막힌다(실측). 게이트웨이가 루트를 계속 소유하므로 매 spawn에 ACL을 다시 걸 수 있고, 기존 app-uid 경로(파일 API·quota·이미지·미러)가 흔한 경우 그대로 돈다. |
 | `U`가 0600/0700으로 잠근 파일·transcript | **브로커 정리 대행**(새 `cleanup` op, §3.3) + **transcript 읽기 대행**(§3.6). | ACL mask는 생성 mode의 group 비트로 접혀, `U`의 0600/0700 생성물은 app이 못 연다(실측 §3.2). app은 `U` 소유 트리를 rmtree하지 못한다(실측). rehydrate는 transcript **내용**을 읽으므로(코드) 삭제 대행만으로는 resume이 살아나지 않는다. |
 | config dir | **사용자별 `CLAUDE_CONFIG_DIR=P`**. `P`는 app 소유, `U`에 **traverse+read**만 주고 쓰기는 지정 하위(`projects/<name>`·`session-env`·`tasks`·`plugins/data`, `.claude.json` 대상 — §4.1)에만. 공유 자산은 `P` 안의 **symlink로 공유 트리 `S`**를 가리킨다. | CLI 쓰기 인벤토리 실측(§5): `CLAUDE_CONFIG_DIR=P`면 상태가 `P`에만 쌓이고, 쓰기 불가 `P`에서 그 셋만 열어도 세션·resume이 정상(실험은 CLI uid 소유 0500 `P`). 공유 링크 레이아웃 실측(§4): `S`에 대한 쓰기 0건. |
-| 공유 트리 `S` 위치 | **HOME 밖 고정 절대경로**(예: `/opt/claude-shared`, 0755, 상위 전부 o+x). | `/home/app` 0700이라 HOME 아래로는 `U`가 못 닿는다(실측). 플러그인 레지스트리의 절대경로(`installLocation`)가 설치 때와 같아야 로드된다(실측 §4.2). |
+| 공유 트리 `S` 위치 | **HOME 밖 고정 절대경로**(예: `/data/claude/shared`, 0755, 상위 전부 o+x; `/opt`·`/usr` 같은 시스템 루트 아래는 안 된다 — §11.3). | `/home/app` 0700이라 HOME 아래로는 `U`가 못 닿는다(실측). 플러그인 레지스트리의 절대경로(`installLocation`)가 설치 때와 같아야 로드된다(실측 §4.2). |
 | 선행 블로커 | **`workspace_resources.py` 미러를 symlink 안 따르게 고친다**(§6). | 지금 게이트웨이가 매 resolve에 `<ws>/.claude/{skills,agents}`에 symlink를 따라 쓴다. `U`가 워크스페이스에 쓰게 되는 순간, app 손으로 임의 파일을 0바이트로 자르는 수단이 된다(실측). **소유권보다 먼저 고쳐야 한다.** |
 | 기동 프로브 | mode-bit 추정(`_dac_allows`)을 **실제 동작 시도**로 바꾼다. | 프로브가 ACL을 모른다 → ACL로 연 접근을 거짓 거부한다(코드 `landlock.py:484`). 브로커로 `U`가 실제로 `projects/<name>`을 만들고 파일을 쓰게 하면 ACL/per-uid dir를 우회해 판정한다. |
 | 기존 데이터 | **1회성 이전**: 기존 워크스페이스 트리에 ACL을 소급 적용하고, named 사용자 transcript를 per-uid `P`로 옮긴다(§3.7). 롤백은 수용 시험에 넣는다. | default ACL은 생성 시점에만 상속된다(POSIX ACL 규칙). 지금 워크스페이스는 app 소유 0755/0644다(코드). |
@@ -249,7 +249,7 @@ P/                      # app 소유, U에 r-x. 공유 링크를 U가 못 바꾸
   projects/<name>/        # U 쓰기 가능. transcript·subagents·memory
   session-env/            # U 쓰기 가능 (그 아래 <sid>는 브로커 자식이 U로 생성)
   tasks/                  # U 쓰기 가능
-S = /opt/claude-shared    # HOME 밖, 0755, 상위 전부 o+x. 설치 때와 같은 절대경로.
+S = /data/claude/shared   # HOME 밖, 0755, 상위 전부 o+x. 설치 때와 같은 절대경로. (/opt 아래 불가 — §11.3)
 ```
 - **최소 쓰기 집합**(실측): `projects/<name>`, `session-env`, `tasks`, TMPDIR. 쓰기 불가 `P`에서 이 셋만 열어도
   세션·`--resume`이 정상이었다. 실험은 CLI uid가 소유한 0500 `P`였다 — 설계의 app 소유 + `U`에 r-x와 CLI 입장에선
@@ -283,7 +283,7 @@ S = /opt/claude-shared    # HOME 밖, 0755, 상위 전부 o+x. 설치 때와 같
   반영하는 식으로 다룬다(§4.4).
 
 ### 4.3 `S`는 HOME 밖 (실측)
-`/home/app` 0700이라 그 아래로는 다른 uid가 전혀 못 닿는다(실측). `S`를 `/opt/claude-shared`(0755, 상위 전부
+`/home/app` 0700이라 그 아래로는 다른 uid가 전혀 못 닿는다(실측). `S`를 `/data/claude/shared`(0755, 상위 전부
 o+x)에 두고 `P`에서 링크한다. `$HOME`·`/app`·임시 디렉터리·시스템 루트를 가리키는 링크는 Landlock 필터가
 경고와 함께 뺀다(코드 `_GrantFilter`) — `S`는 그중 어디도 아니어야 한다. `CLAUDE_CONFIG_DIR`를 `~/.claude` 밖
 `P`로 옮기면 기본 plugin clone 루트(`$HOME/.claude/plugin-marketplaces`)가 `$HOME` 안이라 빠지므로,
@@ -374,12 +374,12 @@ ACL로 연 접근을 **거짓 거부**하고(ACL은 group 비트를 mask로 접�
 - **passwd/group**: 브로커 uid 19999 + 사용자 대역 20000–29999를 `/etc/passwd`·`/etc/group`에. 정적 생성
   스크립트 또는 `nss_wrapper`. 없으면 `whoami`·node `os.userInfo()` 실패. uid별 `USER`/`LOGNAME`도 env로
   (`security-process-isolation.md` §3 V).
-- **공유 트리 `S`**: `/opt/claude-shared`(HOME 밖, 0755, 상위 전부 o+x), 설치 때와 같은 절대경로. 파일 자산
+- **공유 트리 `S`**: `/data/claude/shared`(HOME 밖, 0755, 상위 전부 o+x, 시스템 루트 밖), 설치 때와 같은 절대경로. 파일 자산
   (`CLAUDE.md`·`settings.json`)은 링크 하나뿐인 일반 파일(하드 링크면 Landlock 필터가 뺌).
 - **per-uid config base·워크스페이스 base**: 상위 전부 o+x로 `U`가 자기 dir까지 탐색 가능. base는 app 소유.
 - **영속 볼륨**: 지금은 `claude_home` 볼륨(`/home/app/.claude`)이 transcript·플러그인 상태를 지킨다(코드
   `docker-compose.yml`). `<config-base>`도 볼륨 위에 둬야 컨테이너를 다시 만든 뒤에도 named 사용자 resume이 된다.
-  `S`를 이미지 레이어(`/opt`)에 두면 기동 때 `install_plugins.py`가 다시 채우는 것만 남는다. 런타임 쓰기(코드:
+  `S`를 영속 볼륨 밖(이미지 레이어)에 두면 기동 때 `install_plugins.py`가 다시 채우는 것만 남는다. 런타임 쓰기(코드:
   `plugin_admin_service`가 marketplace를 clone한다)까지 유지하려면 `S`도 볼륨에 두거나, "`S`는 기동마다
   재생성"을 운영 규칙으로 명시한다.
 - **ACL 인코더**: `os.setxattr` 기반 stdlib 헬퍼(이미지에 `acl` 없음). 프로비저닝 편의로 `acl` 패키지를 넣는
@@ -464,7 +464,7 @@ Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 �
 - **`.credentials.json`**: 지원하지 않는다(문서화 유지; compose는 `ANTHROPIC_AUTH_TOKEN`).
 
 ### 11.3 설계와 달라진 점
-- **S 위치**: 예시의 `/opt/claude-shared`는 쓸 수 없다 — `/opt`는 런처가 모든 세션에 읽기 전용으로 여는 시스템
+- **S 위치**: 처음 예시로 든 `/opt/claude-shared`는 쓸 수 없다(본문 예시는 고쳤다) — `/opt`는 런처가 모든 세션에 읽기 전용으로 여는 시스템
   루트라 게이트웨이가 상태를 두지 못하게 거부한다(`_system_ro_errors`). compose override는 `/data/claude/shared`(S)와
   `/data/claude/users`(config base)를 한 영속 볼륨에 둔다.
 - **`state/.claude.json`**: 브로커 자식이 아니라 게이트웨이가 `{}`로 미리 만든다(state/의 default ACL로 U가
