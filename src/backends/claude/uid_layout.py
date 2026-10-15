@@ -639,8 +639,8 @@ def _has_leftovers(uid: int) -> bool:
         if entries:
             return True
     try:
-        with os.scandir(_SHM_DIR) as entries:
-            for entry in entries:
+        with os.scandir(_SHM_DIR) as shm:
+            for entry in shm:
                 try:
                     if entry.stat(follow_symlinks=False).st_uid == uid:
                         return True
