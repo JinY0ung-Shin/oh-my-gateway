@@ -172,7 +172,7 @@ def cleanup(
     shm: bool = False,
     wait: int = 0,
     expire: Optional[Mapping] = None,
-    timeout: float = 60.0,
+    timeout: float = 75.0,
 ) -> bool:
     """Run a ``cleanup`` op as *uid*.
 
@@ -208,7 +208,7 @@ def cleanup(
     raise _unexpected("cleanup", uid, kind, value)
 
 
-def read_transcript(uid: int, path, cwd, *, timeout: float = 30.0) -> int:
+def read_transcript(uid: int, path, cwd, *, timeout: float = 35.0) -> int:
     """Count the external user turns of the transcript at *path*, as *uid*.
 
     The broker applies ``transcript_turns.count_transcript_turns`` against

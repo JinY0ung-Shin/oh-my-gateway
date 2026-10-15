@@ -1010,7 +1010,9 @@ def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
     for raw in lines:
         try:
             line = json.loads(raw)
-        except ValueError:  # JSONDecodeError is a ValueError
+        except (ValueError, RecursionError):  # JSONDecodeError is a ValueError;
+            # a line nested deeper than the parser's recursion limit is no
+            # transcript line either
             return TRANSCRIPT_CORRUPT
         if not isinstance(line, dict):
             return TRANSCRIPT_CORRUPT

@@ -173,6 +173,9 @@ CASES = [
         2,
     ),
     ("not UTF-8", _text(PROMPT) + b'{"type": "user", "x": "\xff"}\n', -3),
+    # Deeper than the JSON parser's recursion limit: RecursionError, not a
+    # ValueError, and still no transcript line.
+    ("a line nested too deeply", _text(PROMPT) + b"[" * 100000 + b"\n", -3),
 ]
 
 
@@ -212,14 +215,13 @@ def test_both_copies_agree(broker, tmp_path, data, expected):
     assert broker._read_transcript(os.path.realpath(path), _CWD) == expected
 
 
-def test_deep_nesting_raises_in_both_and_reads_as_corrupt(broker, tmp_path):
+def test_deep_nesting_reads_as_corrupt_in_both(broker, tmp_path):
     # json.loads raises RecursionError, not ValueError, on a line nested this
-    # deep, and the rule does not catch it: both copies raise alike. The
-    # broker's read maps it to CORRUPT (the CLI writes no such line).
+    # deep; the rule counts it as CORRUPT in both copies (the CLI writes no
+    # such line), and so does the broker's read.
     path = tmp_path / "s.jsonl"
     path.write_bytes(_text(PROMPT) + b"[" * 100000 + b"]" * 100000 + b"\n")
     for fn in (gateway.count_transcript_turns, broker.count_transcript_turns):
-        with pytest.raises(RecursionError):
-            _evaluate(fn, path)
+        assert _evaluate(fn, path) == gateway.TRANSCRIPT_CORRUPT
     read = broker._read_transcript(os.path.realpath(path), _CWD)
     assert read == gateway.TRANSCRIPT_CORRUPT

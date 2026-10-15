@@ -58,7 +58,7 @@ BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0)
 _SYNC_BUDGET_SECONDS = 30.0
 # How long the broker may park a workspace wipe while a CLI of the uid lives.
 _WIPE_WAIT_SECONDS = 10
-_OP_TIMEOUT_SECONDS = 60.0
+_OP_TIMEOUT_SECONDS = 75.0  # above the broker cleaner's 60 s alarm
 _DEFAULT_RETENTION_DAYS = 30
 _SHM_DIR = "/dev/shm"
 # What ``Path.is_file()`` reads as "no such file" rather than raising.
