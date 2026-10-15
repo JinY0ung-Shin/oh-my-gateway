@@ -545,3 +545,224 @@ class TestConfigBaseErrors:
 
     def test_a_good_base_passes(self, tree):
         assert landlock._config_base_errors() == []
+
+
+class TestMigrationBounds:
+    """A legacy project dir is session-written: what the copy reads is bounded
+    (spawn-side review #1: a sparse file with one endless line made the gateway
+    OOM on every request of that user)."""
+
+    @pytest.fixture
+    def legacy(self, tree, monkeypatch):
+        legacy = tree["tmp"] / "legacy"
+        (legacy / "projects").mkdir(parents=True)
+        monkeypatch.setenv(cp.MIGRATE_FROM_ENV, str(legacy))
+        uid_layout._migrate_failed.clear()
+        return legacy
+
+    def _project(self, legacy, workspace):
+        project = legacy / "projects" / ws._project_dir_name(str(workspace))
+        project.mkdir()
+        return project
+
+    def _dst(self, tree, project):
+        return tree["base"] / str(UID) / "projects" / project.name
+
+    def test_an_oversized_transcript_is_not_copied(self, tree, legacy, monkeypatch):
+        from src.backends.claude import transcript_turns
+
+        workspace = _named_ws(tree)
+        project = self._project(legacy, workspace)
+        (project / "big.jsonl").write_text(_transcript(str(workspace), "x" * 400))
+        (project / "ok.jsonl").write_text(_transcript(str(workspace), "y"))
+        monkeypatch.setattr(transcript_turns, "MAX_TRANSCRIPT_BYTES", 300)
+        uid_layout.ensure_user_config(cp.layout(UID))
+        uid_layout.migrate_legacy("alice", UID, str(workspace))
+        dst = self._dst(tree, project)
+        assert (dst / "ok.jsonl").exists() and not (dst / "big.jsonl").exists()
+
+    def test_an_endless_line_is_not_read_whole(self, tree, legacy):
+        workspace = _named_ws(tree)
+        project = self._project(legacy, workspace)
+        sparse = project / "endless.jsonl"
+        with open(sparse, "wb") as fh:
+            fh.truncate(100 << 20)  # no newline anywhere: one 100 MiB "line"
+        uid_layout.ensure_user_config(cp.layout(UID))
+        uid_layout.migrate_legacy("alice", UID, str(workspace))  # no MemoryError
+        assert not (self._dst(tree, project) / "endless.jsonl").exists()
+
+    def test_a_deep_sidecar_is_cut_not_a_recursion_error(self, tree, legacy):
+        workspace = _named_ws(tree)
+        project = self._project(legacy, workspace)
+        (project / "s1.jsonl").write_text(_transcript(str(workspace), "hi"))
+        deep = project / "s1"
+        for _ in range(uid_layout._COPY_MAX_DEPTH + 20):
+            deep = deep / "d"
+        deep.mkdir(parents=True)
+        uid_layout.ensure_user_config(cp.layout(UID))
+        uid_layout.migrate_legacy("alice", UID, str(workspace))
+        dst = self._dst(tree, project)
+        assert (dst / "s1.jsonl").exists()
+        marker = tree["base"] / str(UID) / ".oh-my-gateway-migrated"
+        assert project.name in marker.read_text()
+
+    def test_a_hard_linked_transcript_is_not_copied(self, tree, legacy):
+        workspace = _named_ws(tree)
+        project = self._project(legacy, workspace)
+        (project / "s1.jsonl").write_text(_transcript(str(workspace), "hi"))
+        os.link(project / "s1.jsonl", tree["tmp"] / "elsewhere.jsonl")
+        uid_layout.ensure_user_config(cp.layout(UID))
+        uid_layout.migrate_legacy("alice", UID, str(workspace))
+        assert not (self._dst(tree, project) / "s1.jsonl").exists()
+
+    def test_memory_of_a_shared_name_stays_without_transcripts(self, tree, legacy):
+        # a.b and a_b map to one projects/ name; a_b's transcripts expired and
+        # only memory/ is left: whose it is cannot be told (review #7).
+        workspace = _named_ws(tree, "a.b")
+        (tree["workspaces"] / "a_b" / "claude").mkdir(parents=True)
+        project = self._project(legacy, workspace)
+        (project / "memory").mkdir()
+        (project / "memory" / "MEMORY.md").write_text("whose?")
+        uid_layout.ensure_user_config(cp.layout(UID))
+        uid_layout.migrate_legacy("a.b", UID, str(workspace))
+        assert not (self._dst(tree, project) / "memory").exists()
+
+    def test_an_unexpected_error_does_not_fail_the_spawn_or_repeat(
+        self, tree, legacy, monkeypatch
+    ):
+        workspace = _named_ws(tree)
+        project = self._project(legacy, workspace)
+        (project / "s1.jsonl").write_text(_transcript(str(workspace), "hi"))
+        calls = []
+
+        def boom(*_a, **_k):
+            calls.append(1)
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(uid_layout, "_copy_project", boom)
+        uid_layout.ensure_user_config(cp.layout(UID))
+        uid_layout.migrate_legacy("alice", UID, str(workspace))
+        uid_layout.migrate_legacy("alice", UID, str(workspace))
+        assert calls == [1]  # tried once in this process
+
+
+class TestFreshNamedUid:
+    def test_a_newly_assigned_uid_starts_clean(self, tree, monkeypatch):
+        """A band change can hand a named user a uid an anonymous run used:
+        its config dir is wiped as that uid before the user's first spawn."""
+        from src.backends.claude import broker_ops
+
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
+        ui.reset_registry_cache()
+        uid = 20000  # what the registry hands out first
+        uid_layout.ensure_user_config(cp.layout(uid))
+        stale = tree["base"] / str(uid) / "projects" / "-old-run"
+        stale.mkdir()
+        wiped = []
+
+        def cleanup(cleanup_uid, **kwargs):
+            wiped.append((cleanup_uid, kwargs))
+            stale.rmdir()
+            return True
+
+        monkeypatch.setattr(broker_ops, "cleanup", cleanup)
+        workspace = _named_ws(tree, "newbie")
+        uid_layout.migrate_user("newbie", workspace)
+        assert ui.existing_uid("newbie") == uid
+        assert wiped and wiped[0][0] == uid
+        wiped.clear()
+        uid_layout.migrate_user("newbie", workspace)  # not fresh any more
+        assert wiped == []
+        ui.reset_registry_cache()
+
+
+class TestPerUidOptionsEnv:
+    def test_a_named_spawn_gets_its_config_dir_and_lists(self, tree, monkeypatch):
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+        ui.reset_registry_cache()
+        workspace = _named_ws(tree, "erin")
+        env = landlock.options_env(workspace, user="erin", session_id="sess-9")
+        uid = ui.existing_uid("erin")
+        p = os.path.realpath(tree["base"] / str(uid))
+        assert env[cp.CONFIG_DIR_ENV] == p
+        payload = ui.verify_ticket(env[landlock.TICKET_ENV])
+        assert payload["uid"] == uid
+        assert payload["rw"][0] == os.path.realpath(workspace)
+        assert f"{p}/session-env/sess-9" in payload["rw"]
+        assert f"{p}/state" in payload["rw"]
+        assert _named(_acl(workspace)) == {(uid, 7)}
+        assert os.readlink(os.path.join(p, "skills")).endswith("/shared/skills")
+        ui.reset_registry_cache()
+
+    def test_an_anonymous_spawn_leases_and_keys_on_the_workspace(
+        self, tree, monkeypatch
+    ):
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+        ui.reset_registry_cache()
+        workspace = tree["workspaces"] / "_tmp_anon"
+        workspace.mkdir()
+        env = landlock.options_env(workspace, user=None)
+        uid = ui.leased_uid(os.path.abspath(workspace))
+        assert uid is not None and ui.in_ephemeral_band(uid)
+        assert env[cp.CONFIG_DIR_ENV] == os.path.realpath(tree["base"] / str(uid))
+        assert not ui.registry_holds(uid)
+        ui.release_ephemeral(os.path.abspath(workspace))
+        ui.reset_registry_cache()
+
+
+class TestFileApiKeepsOwnerAccess:
+    def test_a_replaced_session_file_stays_writable_for_its_uid(
+        self, tree, monkeypatch
+    ):
+        """Spawn-side review #5: the file API's replacement of a session uid's
+        0644 file got mask r-- from the chmod to the old mode, so the agent
+        could no longer write it."""
+        from src.routes import terminal_files as tf
+
+        workspace = tree["workspaces"] / "_tmp_files"
+        workspace.mkdir()
+        uid_layout.grant_workspace(str(workspace), UID, named=False)
+        old = workspace / "doc.txt"
+        old.write_text("v1")
+        old.chmod(0o644)  # as if the session uid had made it 0644
+        tmp = workspace / ".doc.txt.tmp"
+        tmp.write_text("v2")
+        # The old file "belongs to another uid": the gateway is someone else.
+        real = os.geteuid()
+        monkeypatch.setattr(tf.os, "geteuid", lambda: real + 1)
+        st = os.stat(old)
+        os.chmod(tmp, stat.S_IMODE(st.st_mode))
+        dfd = os.open(workspace, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            tf._keep_owner_access(dfd, tmp.name, st)
+        finally:
+            os.close(dfd)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            entries = posix_acl.get_acl(fd)
+        finally:
+            os.close(fd)
+        assert (real, posix_acl.R | posix_acl.W) in _named(entries)
+        mask = [e.perm for e in entries if e.tag == posix_acl.ACL_MASK][0]
+        assert mask & (posix_acl.R | posix_acl.W) == posix_acl.R | posix_acl.W
+
+    def test_nothing_changes_without_an_acl(self, tmp_path):
+        from src.routes import terminal_files as tf
+
+        tmp = tmp_path / "x"
+        tmp.write_text("x")
+        st = os.stat(tmp)
+        dfd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            tf._keep_owner_access(dfd, "x", st)  # owner is the gateway: no-op
+        finally:
+            os.close(dfd)
+        fd = os.open(tmp, os.O_RDONLY)
+        try:
+            assert posix_acl.get_acl(fd) is None
+        finally:
+            os.close(fd)

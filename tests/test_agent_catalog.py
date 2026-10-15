@@ -405,3 +405,16 @@ def test_frontmatter_of_a_fifo_returns_empty_without_blocking(tmp_path):
         t.join(5)
     assert not blocked, "reading a FIFO's frontmatter blocked"
     assert result == [{}]
+
+
+def test_a_read_through_a_swapped_component_is_refused(tmp_path):
+    # Spawn-side review #9: names are checked before the open, but an
+    # intermediate dir swapped for a link meanwhile must not be read through.
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    _write(elsewhere / "SKILL.md", "---\nname: planted\ndescription: x\n---\n")
+    (workspace / "skills").symlink_to(elsewhere)
+    path = workspace / "skills" / "SKILL.md"
+    assert agent_catalog._parse_frontmatter(path, str(workspace.resolve())) == {}
+    assert agent_catalog._parse_frontmatter(path)["name"] == "planted"  # no root

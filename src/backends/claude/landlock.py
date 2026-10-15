@@ -1880,12 +1880,14 @@ def _uid_options_env(
         return _uid_spawn_env(cwd, ro, rw, user)[0]
     from src.claude_config_paths import CONFIG_DIR_ENV, layout as config_layout
 
+    fresh = bool(user) and ui.existing_uid(user) is None
     uid = ui.resolve_uid(user or cwd, persist=bool(user))
     planned = config_layout(uid)
     workspace = _confined_workspace(
         cwd, Path(_real(planned.config_dir)), layout=planned
     )
-    layout = uid_layout.prepare_spawn(uid, workspace, user=user, key=cwd)
+    key = f"named:{user}" if user else cwd
+    layout = uid_layout.prepare_spawn(uid, workspace, user=user, key=key, fresh=fresh)
     ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=False, layout=layout)
     env, _ = _uid_spawn_env(cwd, ro, rw, user, uid=uid)
     env[CONFIG_DIR_ENV] = _real(layout.config_dir)

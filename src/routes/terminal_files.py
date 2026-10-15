@@ -1327,6 +1327,46 @@ def _preserve_copy(dir_fd: int, claim: str, target: Path) -> Path:
     raise OSError("could not preserve the conflicting version")
 
 
+def _keep_owner_access(dir_fd: int, tmp: str, old: os.stat_result) -> None:
+    """Keep a session uid's access to a file the gateway replaces.
+
+    Under uid isolation a workspace file may belong to the session uid, which
+    reaches it as its owner. The replacement is the gateway's file: its
+    inherited ACL names the session uid, but the ``chmod`` to the old mode put
+    the old *group* bits — that file's ACL mask, ``r--`` for a 0644 one — into
+    the new mask, and the agent could no longer write a file it just had (the
+    old owner bits never applied to it as a named entry). So when the old file
+    was another uid's and the new one carries an ACL, that uid gets a named
+    entry with its old owner bits and the mask makes room for them. Elsewhere
+    (no ACL: every mode but uid) nothing changes. Best effort, never raises.
+    """
+    if old.st_uid == os.geteuid():
+        return
+    try:
+        from src.backends.claude import posix_acl
+
+        fd = os.open(tmp, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=dir_fd)
+        try:
+            entries = posix_acl.get_acl(fd)
+            if entries is None:
+                return
+            owner_bits = (old.st_mode >> 6) & 0o7
+            mask = owner_bits
+            kept = []
+            for entry in entries:
+                if entry.tag == posix_acl.ACL_MASK:
+                    mask |= entry.perm
+                elif not (entry.tag == posix_acl.ACL_USER and entry.id == old.st_uid):
+                    kept.append(entry)
+            kept.append(posix_acl.Entry(posix_acl.ACL_USER, owner_bits, old.st_uid))
+            kept.append(posix_acl.Entry(posix_acl.ACL_MASK, mask))
+            posix_acl.set_acl(fd, kept)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        logger.debug("Could not keep the owner's access to %s", tmp, exc_info=True)
+
+
 def _cas_write_locked(
     dir_fd: int, target: Path, data: bytes, expected: str
 ) -> Optional[Path]:
@@ -1350,8 +1390,9 @@ def _cas_write_locked(
         if current != expected:
             raise _WriteConflict(exists=current is not None)
         try:
-            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
-            os.chmod(tmp, stat_module.S_IMODE(mode), dir_fd=dir_fd)
+            old = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            os.chmod(tmp, stat_module.S_IMODE(old.st_mode), dir_fd=dir_fd)
+            _keep_owner_access(dir_fd, tmp, old)
         except OSError:
             pass
         _cas_after_compare(target)

@@ -91,7 +91,9 @@ _MIGRATED_MARKER = ".oh-my-gateway-migrated"
 
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 _DIR_NOFOLLOW = _DIR | os.O_NOFOLLOW
-_FILE_NOFOLLOW = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+_FILE_NOFOLLOW = (
+    os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_NOCTTY | os.O_CLOEXEC
+)
 
 
 # Where POSIX shared memory objects live; tests point it elsewhere (the test
@@ -642,7 +644,11 @@ def _has_leftovers(uid: int) -> bool:
 
 
 def ensure_clean_ephemeral(uid: int, key: str) -> None:
-    """Make sure the run leasing ephemeral *uid* under *key* starts clean.
+    """Make sure the run leasing *uid* under *key* starts clean.
+
+    For an ephemeral uid on every new lease; for a named user's uid only when
+    the registry has just assigned it (a band change can hand a named user a
+    uid an anonymous run used, ``prepare_spawn(fresh=True)``).
 
     A lease is released only after the broker wiped ``P(uid)`` and the uid's
     ``/dev/shm`` objects (``uid_cleanup``), but a previous gateway process may
@@ -688,17 +694,24 @@ def ensure_clean_ephemeral(uid: int, key: str) -> None:
 
 _COPY_MAX_ENTRIES = 50000
 _COPY_MAX_BYTES = 2 << 30
+# A legacy tree is session-written: no deeper than this (recursion), no file
+# with another name elsewhere (its current content would be copied over).
+_COPY_MAX_DEPTH = 64
 
 
 class _CopyBudget:
     def __init__(self) -> None:
         self.entries = 0
         self.bytes = 0
+        self.truncated = False
 
     def take(self, size: int = 0) -> bool:
         self.entries += 1
         self.bytes += size
-        return self.entries <= _COPY_MAX_ENTRIES and self.bytes <= _COPY_MAX_BYTES
+        ok = self.entries <= _COPY_MAX_ENTRIES and self.bytes <= _COPY_MAX_BYTES
+        if not ok:
+            self.truncated = True
+        return ok
 
 
 def _copy_file_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) -> bool:
@@ -710,7 +723,9 @@ def _copy_file_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) ->
         return False
     try:
         st = os.fstat(sfd)
-        if not stat.S_ISREG(st.st_mode) or not budget.take(st.st_size):
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+            return False
+        if not budget.take(st.st_size):
             return False
         try:
             dfd = os.open(
@@ -737,8 +752,14 @@ def _copy_file_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) ->
         os.close(sfd)
 
 
-def _copy_tree_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) -> None:
-    """Copy the directory *name* recursively (regular files and dirs only)."""
+def _copy_tree_at(
+    src_dir: int, name: str, dst_dir: int, budget: _CopyBudget, depth: int = 0
+) -> None:
+    """Copy the directory *name* recursively (regular files and dirs only),
+    at most :data:`_COPY_MAX_DEPTH` levels deep."""
+    if depth > _COPY_MAX_DEPTH:
+        budget.truncated = True
+        return
     try:
         sfd = os.open(name, _DIR_NOFOLLOW, dir_fd=src_dir)
     except OSError:
@@ -761,7 +782,7 @@ def _copy_tree_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) ->
                 except OSError:
                     continue
                 if stat.S_ISDIR(st.st_mode):
-                    _copy_tree_at(sfd, entry, dfd, budget)
+                    _copy_tree_at(sfd, entry, dfd, budget, depth + 1)
                 elif stat.S_ISREG(st.st_mode):
                     _copy_file_at(sfd, entry, dfd, budget)
         finally:
@@ -772,9 +793,17 @@ def _copy_tree_at(src_dir: int, name: str, dst_dir: int, budget: _CopyBudget) ->
 
 def _transcript_owner_ok(src_dir: int, name: str, workspaces: List[str]) -> int:
     """``count_transcript_turns`` of the legacy transcript *name* against the
-    workspace's spellings: the first non-mismatch result, else MISMATCH."""
-    from .transcript_turns import TRANSCRIPT_MISMATCH, TRANSCRIPT_UNREADABLE
-    from .transcript_turns import TRANSCRIPT_CORRUPT, count_transcript_turns
+    workspace's spellings: the first non-mismatch result, else MISMATCH. The
+    file was session-written: one larger than ``MAX_TRANSCRIPT_BYTES`` is
+    UNREADABLE (not copied), and lines are read through ``bounded_lines``."""
+    from .transcript_turns import (
+        MAX_TRANSCRIPT_BYTES,
+        TRANSCRIPT_CORRUPT,
+        TRANSCRIPT_MISMATCH,
+        TRANSCRIPT_UNREADABLE,
+        bounded_lines,
+        count_transcript_turns,
+    )
 
     result = TRANSCRIPT_MISMATCH
     for workspace in workspaces:
@@ -783,12 +812,17 @@ def _transcript_owner_ok(src_dir: int, name: str, workspaces: List[str]) -> int:
         except OSError:
             return TRANSCRIPT_UNREADABLE
         try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
+            st = os.fstat(fd)
+            if (
+                not stat.S_ISREG(st.st_mode)
+                or st.st_nlink > 1
+                or st.st_size > MAX_TRANSCRIPT_BYTES
+            ):
                 os.close(fd)
                 return TRANSCRIPT_UNREADABLE
             with os.fdopen(fd, "r", encoding="utf-8", newline=None) as fh:
                 try:
-                    result = count_transcript_turns(fh, workspace)
+                    result = count_transcript_turns(bounded_lines(fh), workspace)
                 except UnicodeDecodeError:
                     return TRANSCRIPT_CORRUPT
         except OSError:
@@ -812,6 +846,41 @@ def _migrated(p_fd: int) -> Set[str]:
     return set(data.decode("utf-8", "replace").split())
 
 
+# (uid, project name) whose migration raised in this process.
+_migrate_failed: Set[Tuple[int, str]] = set()
+
+
+def _name_is_shared(name: str, workspace: str) -> bool:
+    """Whether another workspace under the workspace base maps to the same
+    ``projects/`` name (``a.b`` and ``a_b``), so files in that legacy project
+    dir with no owner of their own (``memory/``) may be someone else's."""
+    from src.workspace_manager import workspace_manager
+
+    from . import workspace_sandbox as ws
+
+    base = os.path.realpath(workspace_manager.base_path)
+    mine = os.path.realpath(workspace)
+    try:
+        users = os.listdir(base)
+    except OSError:
+        return True  # cannot tell: treat it as shared
+    for user in users:
+        top = os.path.join(base, user)
+        candidates = [top]
+        try:
+            candidates += [
+                os.path.join(top, d)
+                for d in os.listdir(top)
+                if os.path.isdir(os.path.join(top, d))
+            ]
+        except OSError:
+            pass
+        for candidate in candidates:
+            if candidate != mine and ws._project_dir_name(candidate) == name:
+                return True
+    return False
+
+
 def migrate_legacy(user: str, uid: int, workspace: str) -> None:
     """Copy a named user's ``projects/<name>`` from the legacy config dir once.
 
@@ -833,6 +902,9 @@ def migrate_legacy(user: str, uid: int, workspace: str) -> None:
     from . import workspace_sandbox as ws
 
     name = ws._project_dir_name(workspace)
+    attempt = (uid, name)
+    if attempt in _migrate_failed:
+        return  # it failed in this process: no retry on every spawn
     try:
         p_fd = os.open(os.path.realpath(config), _DIR_NOFOLLOW)
     except OSError:
@@ -857,10 +929,13 @@ def migrate_legacy(user: str, uid: int, workspace: str) -> None:
                 user,
                 uid,
             )
-    except OSError as exc:
+    except Exception as exc:  # best effort: never fails the spawn
+        if len(_migrate_failed) < _GRANTED_ANONYMOUS_MAX:
+            _migrate_failed.add(attempt)
         _warn_once(
             ("migrate", uid, name),
-            "uid isolation: could not migrate the legacy transcripts of uid %d: %s",
+            "uid isolation: could not migrate the legacy transcripts of uid %d "
+            "(retried after a restart): %r",
             uid,
             exc,
         )
@@ -922,11 +997,16 @@ def _copy_project(legacy: Path, name: str, p_fd: int, workspace: str) -> Optiona
                     copied += 1
                 if sid in entries:
                     _copy_tree_at(src, sid, dst, budget)
-            if not mismatch and "memory" in entries:
+            # memory/ has no recorded owner: only when nothing else may own it.
+            if (
+                not mismatch
+                and "memory" in entries
+                and not _name_is_shared(name, workspace)
+            ):
                 _copy_tree_at(src, "memory", dst, budget)
         finally:
             os.close(dst)
-        if budget.entries > _COPY_MAX_ENTRIES or budget.bytes > _COPY_MAX_BYTES:
+        if budget.truncated:
             logger.warning(
                 "uid isolation: the legacy project dir %s exceeded the copy budget; "
                 "only part of it was migrated",
@@ -943,7 +1023,12 @@ def _copy_project(legacy: Path, name: str, p_fd: int, workspace: str) -> Optiona
 
 
 def prepare_spawn(
-    uid: int, workspace: str, *, user: Optional[str], key: str
+    uid: int,
+    workspace: str,
+    *,
+    user: Optional[str],
+    key: str,
+    fresh: bool = False,
 ) -> ConfigLayout:
     """Make *uid*'s config dir and the resolved *workspace* ready for a spawn.
 
@@ -952,8 +1037,9 @@ def prepare_spawn(
     of its ephemeral uid (:func:`ensure_clean_ephemeral`, *key* being its lease
     key), then the per-uid config dir (:func:`ensure_user_config`), the
     workspace grant (:func:`grant_workspace`) and, for a named user, the
-    one-time legacy migration (:func:`migrate_legacy`). Returns the spawn's
-    layout. Raises
+    one-time legacy migration (:func:`migrate_legacy`). *fresh*: the registry
+    assigned the named user's uid just now — its config dir gets the same
+    clean-start check. Returns the spawn's layout. Raises
     ``WorkspaceRefused`` for a layout it cannot prepare and
     ``UidAllocationError`` for an ephemeral uid that is not clean yet.
     """
@@ -961,7 +1047,7 @@ def prepare_spawn(
     if not layout.per_uid:
         raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
     with _uid_lock(uid):
-        if not user:
+        if not user or fresh:
             # First: a wipe empties state/ too, and the layout below puts the
             # pristine global config back.
             ensure_clean_ephemeral(uid, key)
@@ -989,6 +1075,7 @@ def migrate_user(user: Optional[str], workspace) -> None:
     from . import landlock
     from . import uid_isolation as ui
 
+    fresh = ui.existing_uid(user) is None
     uid = ui.resolve_uid(user, persist=True)
     layout = cp.layout(uid)
     resolved = landlock._confined_workspace(
@@ -997,6 +1084,8 @@ def migrate_user(user: Optional[str], workspace) -> None:
         layout=layout,
     )
     with _uid_lock(uid):
+        if fresh:
+            ensure_clean_ephemeral(uid, f"named:{user}")
         ensure_user_config(layout)
         grant_workspace(resolved, uid, named=True)
         migrate_legacy(user, uid, resolved)

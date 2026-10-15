@@ -39,17 +39,34 @@ _MAX_DESCRIPTION_CHARS = 400
 _MANAGED_MARKER = ".oh-my-gateway-managed"
 
 
-def _parse_frontmatter(path: Path) -> Dict[str, Any]:
-    """Return the YAML frontmatter of *path* as a dict (``{}`` when absent)."""
-    # The file was checked with ``is_file()``/``is_symlink()``, but the
-    # workspace keeps changing: open without following a symlink and without
-    # blocking on a FIFO, then confirm a regular file on the open descriptor.
+def _opened_beneath(fd: int, root: Optional[str]) -> bool:
+    """Whether the open *fd* is a file below the resolved *root* (no root: yes).
+
+    The checks before the open looked at each name, but a session can swap an
+    intermediate directory (``.claude``, ``skills/x``) for a link between them
+    and the open; what the descriptor really is decides."""
+    if root is None:
+        return True
+    try:
+        actual = os.readlink(f"/proc/self/fd/{fd}")
+    except OSError:
+        return False
+    return actual.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def _parse_frontmatter(path: Path, root: Optional[str] = None) -> Dict[str, Any]:
+    """Return the YAML frontmatter of *path* as a dict (``{}`` when absent).
+
+    *root*: the resolved directory the file must really lie below."""
+    # The file was checked with lstat, but the workspace keeps changing: open
+    # without following a symlink and without blocking on a FIFO, then confirm
+    # a regular file below *root* on the open descriptor.
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     except OSError:
         return {}
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
+        if not stat.S_ISREG(os.fstat(fd).st_mode) or not _opened_beneath(fd, root):
             return {}
         os.set_blocking(fd, True)
         with os.fdopen(os.dup(fd), "r", encoding="utf-8", errors="replace") as fh:
@@ -73,13 +90,15 @@ def _parse_frontmatter(path: Path) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def _meta(path: Path, fallback_name: str) -> Dict[str, str]:
+def _meta(
+    path: Path, fallback_name: str, root: Optional[str] = None
+) -> Dict[str, str]:
     """``{name, description}`` for one skill/agent file.
 
     Frontmatter ``name`` wins over the filename (that is what the CLI keys on),
     and the description is trimmed to a single line.
     """
-    front = _parse_frontmatter(path)
+    front = _parse_frontmatter(path, root)
     name = str(front.get("name") or fallback_name).strip() or fallback_name
     description = " ".join(str(front.get("description") or "").split())
     return {"name": name, "description": description[:_MAX_DESCRIPTION_CHARS]}
@@ -154,9 +173,20 @@ def _agent_files(base: Path) -> List[Path]:
     return files
 
 
-def _dir_entries(base: Path, source: str, kind: str) -> List[Dict[str, str]]:
-    """Collect ``{name, description, source}`` for one scope directory."""
+def _dir_entries(
+    base: Path, source: str, kind: str, root: Optional[Path] = None
+) -> List[Dict[str, str]]:
+    """Collect ``{name, description, source}`` for one scope directory.
+
+    *root*: a session-writable tree (the workspace) every file read must lie in.
+    """
     files = _skill_files(base) if kind == "skills" else _agent_files(base)
+    real_root = None
+    if root is not None:
+        try:
+            real_root = os.path.realpath(root)
+        except (OSError, ValueError):
+            return []
     out: List[Dict[str, str]] = []
     for path in files:
         fallback = (
@@ -164,7 +194,7 @@ def _dir_entries(base: Path, source: str, kind: str) -> List[Dict[str, str]]:
             if path.name in ("SKILL.md", "AGENT.md", "agent.md")
             else path.stem
         )
-        meta = _meta(path, fallback)
+        meta = _meta(path, fallback, real_root)
         out.append({**meta, "source": source, "plugin": ""})
     return out
 
@@ -262,7 +292,7 @@ def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
 
     visible_dir = workspace / kind
     native_dir = workspace / ".claude" / kind
-    visible = _dir_entries(visible_dir, "project", kind)
+    visible = _dir_entries(visible_dir, "project", kind, root=workspace)
 
     if is_managed_mirror(workspace, kind):
         return visible
@@ -272,7 +302,7 @@ def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
     if not (_real_dir(workspace / ".claude") and _real_dir(native_dir)):
         return visible
 
-    legacy = _dir_entries(native_dir, "project", kind)
+    legacy = _dir_entries(native_dir, "project", kind, root=workspace)
     if visible and legacy:
         shadowed = sorted({e["name"] for e in visible} - {e["name"] for e in legacy})
         if shadowed:
