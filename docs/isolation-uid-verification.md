@@ -256,8 +256,13 @@ passwd/group·공유 트리·config base 프로비저닝과 compose override, �
   세션이 열 수 있다(Landlock 비중재). 런이 끝나면 정리 op가 그 uid의 객체를 지운다. 세션별 IPC namespace가 후속이다.
   다음 런의 시작을 막는 잔여물은 그 uid가 **만든** 객체뿐이다: 다른 세션이 `IPC_SET`으로 넘겨준 객체나, 아직
   attach된 채 파괴 표시(`SHM_DEST`)된 세그먼트는 세지 않는다(그러지 않으면 다른 세션이 lease를 영구히 붙잡는다).
+  `SHM_DEST` 세그먼트는 id로 아직 attach할 수 있어서, 이전 테넌트가 다른 uid에게 접근을 준 세그먼트는 다음
+  테넌트도 읽을 수 있다(그 uid는 이미 갖고 있는 내용이다; 설계 §11.7).
 - 보존 sweep(uid마다 하루 한 번, 공유 `settings.json`의 `cleanupPeriodDays`)은 그 uid의 세션이 살아 있으면
-  브로커가 거부하므로 매시간 다시 시도한다. 늘 세션이 살아 있는 사용자는 정리되지 않는다(이틀째부터 경고).
+  브로커가 거부하므로 매시간 다시 시도한다. 마지막 실행 시각은 P의 `.oh-my-gateway-retention`에 남아 재시작에도
+  이어진다. 늘 세션이 살아 있는 사용자는 정리되지 않는다(기한 뒤 이틀째부터 하루 한 번 경고).
+- 소유자 마커(`P/.oh-my-gateway-owner`)가 생기기 전 빌드로 만든 P(5b5df9b 이전의 수용 컨테이너 볼륨 등)는 그
+  사용자의 첫 spawn이 지운다. 그런 볼륨은 버리고 다시 돌린다(설계 §11.7).
 - 보존 sweep과 같은 사용자의 동시 spawn 사이의 좁은 경쟁:
   비고 오래된 `projects/<name>`을 sweep이 지우는 순간 그 사용자의 spawn이 그 디렉터리를 쓰면 그 세션의
   transcript가 남지 않는다(감수).

@@ -521,6 +521,27 @@ Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 �
   실행하고, 거부된 uid는 다음 시간에 다시 시도한다. 이틀 동안 거부되면 하루 한 번 경고한다.
 - **문서**: `docs/security-process-isolation.md`에 남은 `/opt/claude-shared` 권고를 `/data/claude/shared`로 고쳤다.
 
+### 11.7 세 번째 검증 반영 (같은 날)
+- **소유자 마커 내구성**: 마커 쓰기(`_write_file_at`)는 이제 파일을 fsync한 뒤 rename하고 디렉터리도 fsync한다.
+  예전에는 crash 뒤 0바이트 마커가 남을 수 있었고, 그런 마커는 다른 키의 마커처럼 wipe로 이어졌다. 64자리 hex
+  digest가 아닌 마커(빈 것, 잘린 것)는 거부한다(500 `workspace_refused`). 손으로 지우면 정리부터 다시 한다.
+- **마커 이전의 P**: 마커가 들어오기 전 이 브랜치의 빌드(5b5df9b 이전, 예: 수용 컨테이너의 볼륨)로 만든 P는
+  unclaimed로 읽혀, 그 사용자의 첫 spawn이 지운다(transcript·memory 포함). 그런 빌드가 배포된 곳은 없다. 그런
+  볼륨은 버리거나, 업그레이드 전에 `P/.oh-my-gateway-owner`에 `named:<user>`의 sha256 hex를 써 둔다.
+- **취소 경쟁**: 스폰을 준비하는 offload(`create_client`의 이전·옵션 구성·confinement, `verify()`의 옵션 구성,
+  slash preflight, 미러 materialize)는 `uid_layout.to_thread_to_completion`으로 돈다. 취소돼도 스레드가 끝난
+  뒤에 취소가 전파된다. 예전에는 기동 timeout으로 취소된 `verify()`의 정리가 아직 lease를 잡는 스레드 옆에서
+  돌았다. `verify()`의 익명 워크스페이스 resolve는 다시 동기다(값을 잃지 않게).
+- **보존 sweep 기록**: uid마다 마지막 실행 시각을 P의 `.oh-my-gateway-retention` mtime으로 남긴다(게이트웨이
+  소유, U는 못 쓴다). 그래서 재시작해도 하루 주기와 경고가 이어진다. 경고는 마지막 실행(없으면 claim) 뒤
+  하루가 지나 기한이 된 다음, 그로부터 이틀 더 거부될 때 하루 한 번 낸다. 브로커에 닿지 못한 실패는 호출마다
+  WARNING 한 줄로 모은다.
+- **감수(근거와 함께)**: `SHM_DEST` 세그먼트는 키는 없어도 Linux가 id로 `shmat`을 허용한다. 그래서 다음 테넌트가
+  creator 권한으로 이전 테넌트의 내용을 읽을 수 있다(커널에서 재현). 다만 그런 세그먼트가 남으려면 이전
+  테넌트가 다른 uid에게 접근을 줬어야 하고(world 비트나 `IPC_SET`), 그 uid는 이미 내용을 갖고 있다. 다른 세션이
+  owner를 U로 넘겨 심어 둔 객체가 다음 런까지 남는 것도 마찬가지다(그 세션은 언제든 다시 심을 수 있다).
+  lease를 붙잡던 이전 규칙의 DoS보다 이쪽을 택했다. 세션별 IPC namespace가 둘 다 닫는다.
+
 ### 11.5 남은 것
 - 운영 배포 컨테이너에서 `docs/isolation-uid-verification.md` 재실행(커널·seccomp·마운트·ACL 지원은 이 dev
   머신과 무관하다).
