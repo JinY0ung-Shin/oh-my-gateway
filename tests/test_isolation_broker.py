@@ -21,7 +21,9 @@ import hmac
 import importlib.util
 import json
 import os
+import pwd
 import secrets
+import select
 import signal
 import socket
 import struct
@@ -123,6 +125,40 @@ elif mode == "stop-orphan-killer":
         return pid
 
     os.fork = fork
+elif mode == "slow-cleanup":
+    # Holds a cleanup helper inside its run: unlinking an entry named
+    # slow-marker takes 3 s (only a cleanup ever unlinks one).
+    import time
+
+    real_unlink = os.unlink
+
+    def unlink(path, *, dir_fd=None):
+        if os.path.basename(os.fsdecode(path)) == "slow-marker":
+            sys.stderr.write("seam: slow unlink\n")
+            sys.stderr.flush()
+            time.sleep(3)
+        return real_unlink(path, dir_fd=dir_fd)
+
+    os.unlink = unlink
+elif mode == "eacces-prefix":
+    # An entry named eacces-* cannot be removed from its directory, as when U
+    # may not write a parent the gateway owns (same-uid, every dir is ours).
+    real_unlink, real_rmdir = os.unlink, os.rmdir
+
+    def denied(path):
+        return os.path.basename(os.fsdecode(path)).startswith("eacces-")
+
+    def unlink(path, *, dir_fd=None):
+        if denied(path):
+            raise PermissionError(errno.EACCES, "seam: parent not writable")
+        return real_unlink(path, dir_fd=dir_fd)
+
+    def rmdir(path, *, dir_fd=None):
+        if denied(path):
+            raise PermissionError(errno.EACCES, "seam: parent not writable")
+        return real_rmdir(path, dir_fd=dir_fd)
+
+    os.unlink, os.rmdir = unlink, rmdir
 runpy.run_path(broker, run_name="__main__")
 """
 
@@ -162,6 +198,9 @@ class _Broker:
         fields.setdefault("rw", [str(ws)])
         return _mint(self.secret, **fields)
 
+    def op_ticket(self, op, **fields) -> str:
+        return _mint_op(self.secret, op, **fields)
+
     def fd_count(self) -> int:
         return len(os.listdir(f"/proc/{self.proc.pid}/fd"))
 
@@ -181,8 +220,11 @@ def start_broker(tmp_path):
             ui.TICKET_SECRET_ENV: secret,
             "GATEWAY_REAL_CLI": _SYS_PY,
             "GATEWAY_ISOLATION_PEER_UID": str(os.getuid()),
-            **(extra_env or {}),
         }
+        # The same-uid broker's cleanup op sweeps this test dir for shm, or
+        # nothing: never one a developer's shell happened to export.
+        env.pop(_TEST_SHM_ENV, None)
+        env.update(extra_env or {})
         flags = ["--test-same-uid"] if test_same_uid else []
         if seam:
             cmd = [sys.executable, "-c", _SEAM, seam, str(_BROKER), *flags]
@@ -1612,3 +1654,1154 @@ def _supervisors(broker) -> list:
     for tid in os.listdir(f"/proc/{broker.proc.pid}/task"):
         pids += Path(f"/proc/{broker.proc.pid}/task/{tid}/children").read_text().split()
     return pids
+
+
+# --- broker ops: cleanup and transcript ---------------------------------------
+#
+# docs/isolation-uid-ownership-design.md §3.3 / §3.6. Same-uid like the rest:
+# the helper's real switch to (broker, U, broker) is container-only, and
+# TestOpHelperCredentials pins its calls. Every path here is under tmp_path; a
+# same-uid broker never sweeps the real /dev/shm (TestShmDir).
+
+_ST_EXITED, _ST_TRANSCRIPT = 1, 4
+_TEST_SHM_ENV = "GATEWAY_ISOLATION_TEST_SHM_DIR"
+_DROP = object()  # a field _mint_op leaves out
+
+
+def _mint_op(secret: str, op, **fields) -> str:
+    """An op ticket as ``uid_isolation.mint_op_ticket`` signs it, for this
+    test's own uid and gid (which the same-uid broker runs unswitched); a
+    field given as ``_DROP`` is left out."""
+    payload = {
+        "op": op,
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "nonce": secrets.token_hex(16),
+        "exp": int(time.time()) + 120,
+    }
+    payload.update(fields)
+    payload = {k: v for k, v in payload.items() if v is not _DROP}
+    body = json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    sig = hmac.new(secret.encode(), body.encode(), hashlib.sha256).hexdigest()
+    return f"{sig}.{body}"
+
+
+def _op_send(broker, ticket, *, fds=False, argv=(), env=None, extra=b""):
+    """Send one op request as the gateway does: the header, with no fds
+    unless *fds*; return the connected socket for :func:`_op_reply`."""
+    header = json.dumps({"ticket": ticket, "argv": list(argv), "env": env or {}})
+    data = struct.pack("=I", len(header)) + header.encode() + extra
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.settimeout(15)
+    conn.connect(str(broker.sock))
+    if not fds:
+        conn.sendall(data)
+        return conn
+    r, w = os.pipe()
+    try:
+        anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [r]))]
+        sent = conn.sendmsg([data], anc)
+    finally:
+        os.close(r)
+        os.close(w)
+    conn.sendall(data[sent:])
+    return conn
+
+
+def _op_reply(conn, timeout=15.0):
+    """The one ``(kind, value)`` record the broker answers, or ``None`` if the
+    link closes first. Closes the socket."""
+    conn.settimeout(timeout)
+    buf = b""
+    try:
+        while len(buf) < _REC.size:
+            chunk = conn.recv(_REC.size - len(buf))
+            if not chunk:
+                return None
+            buf += chunk
+    finally:
+        conn.close()
+    return _REC.unpack(buf)
+
+
+def _op(broker, ticket, **kw):
+    return _op_reply(_op_send(broker, ticket, **kw))
+
+
+def _cleanup_ticket(broker, workspace="", **fields):
+    return broker.op_ticket("cleanup", workspace=str(workspace), **fields)
+
+
+def _cleanup(broker, workspace="", **fields):
+    return _op(broker, _cleanup_ticket(broker, workspace, **fields))
+
+
+def _transcript(broker, path, cwd):
+    return _op(broker, broker.op_ticket("transcript", path=str(path), cwd=str(cwd)))
+
+
+def _wait_log(broker, text, timeout=10.0, count=1):
+    deadline = time.monotonic() + timeout
+    while broker.log_text().count(text) < count:
+        if time.monotonic() >= deadline:
+            pytest.fail("%r never logged:\n%s" % (text, broker.log_text()))
+        time.sleep(0.05)
+
+
+def _outside(tmp_path: Path) -> Path:
+    """A directory no cleanup is aimed at, with a file links point to."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "victim").write_text("v")
+    return outside
+
+
+def _session_tree(root: Path, outside: Path) -> Path:
+    """What a session leaves: files, nested dirs, a FIFO, links out of the
+    tree, and directories of its own that lost their owner bits."""
+    (root / "sub" / "deep").mkdir(parents=True)
+    (root / "a.txt").write_text("a")
+    (root / "sub" / "deep" / "f").write_text("f")
+    os.mkfifo(root / "fifo")
+    os.symlink(outside, root / "dir-link")
+    os.symlink(outside / "victim", root / "file-link")
+    for name, mode in (("r-x", 0o500), ("none", 0o000), ("w-only", 0o300)):
+        (root / name).mkdir()
+        (root / name / "x").write_text("x")
+        (root / name).chmod(mode)
+    return root
+
+
+def _real_shm_canary():
+    """A file of ours in the real /dev/shm, which no test may touch."""
+    shm = Path("/dev/shm")
+    if not (shm.is_dir() and os.access(shm, os.W_OK | os.X_OK)):
+        return None
+    canary = shm / ("omg-broker-test-%s" % secrets.token_hex(8))
+    canary.write_text("canary")
+    return canary
+
+
+_HOLD = (
+    "import os, sys, time\n"
+    "open(sys.argv[1], 'w').write(str(os.getpid()))\n"
+    "time.sleep(60)\n"
+)
+
+_CWD = "/data/workspaces/alice/claude"
+_PROMPT = {"type": "user", "cwd": _CWD, "message": {"role": "user", "content": "hi"}}
+_ANSWER = {"type": "assistant", "cwd": _CWD, "message": {"content": []}}
+_RESULT = {
+    "type": "user",
+    "cwd": _CWD,
+    "message": {"content": [{"type": "tool_result", "tool_use_id": "t"}]},
+}
+_META = {"type": "user", "cwd": _CWD, "isMeta": True, "message": {"content": "x"}}
+
+
+def _jsonl(path: Path, *lines) -> Path:
+    path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+    return path
+
+
+class TestOpValidation:
+    """The strict per-op schemas, checked in the resident before anything
+    runs (in-process)."""
+
+    def _payload(self, op="cleanup", **fields):
+        payload = {"op": op, "uid": 20005, "nonce": "n", "exp": 1}
+        if op == "cleanup":
+            payload["workspace"] = ""
+        payload.update(fields)
+        return {k: v for k, v in payload.items() if v is not _DROP}
+
+    def test_cleanup_defaults(self, broker_module):
+        req = broker_module._op_request("cleanup", self._payload())
+        assert req == {
+            "op": "cleanup",
+            "uid": 20005,
+            "gid": 20005,  # absent: the uid
+            "workspace": "",
+            "wait": 0,
+            "clear": [],
+            "remove": [],
+            "expire": None,
+            "shm": False,
+        }
+        req = broker_module._op_request(
+            "cleanup",
+            self._payload(
+                gid=20006,
+                workspace="/ws/_tmp_x",
+                wait=30,
+                clear=["/ws/_tmp_x"],
+                remove=["/cfg/p/x.jsonl"],
+                expire={"older_than": 3600},
+                shm=True,
+            ),
+        )
+        assert req["gid"] == 20006 and req["wait"] == 30 and req["shm"] is True
+        assert req["expire"] == {"older_than": 3600, "units": [], "nested": []}
+
+    @pytest.mark.parametrize(
+        "fields",
+        [
+            {"workspace": _DROP},
+            {"workspace": None},
+            {"workspace": "ws"},
+            {"workspace": "/"},
+            {"rw": ["/ws"]},  # a spawn field: unknown here
+            {"env_allow": []},
+            {"wait": -1},
+            {"wait": 31},
+            {"wait": True},
+            {"wait": 1.5},
+            {"wait": "5"},
+            {"shm": 1},
+            {"shm": "true"},
+            {"clear": "/ws"},
+            {"clear": [5]},
+            {"remove": [None]},
+            {"remove": ["relative/x"]},
+            {"expire": None},
+            {"expire": []},
+            {"expire": {"older_than": 3599}},
+            {"expire": {"older_than": True}},
+            {"expire": {"units": ["/x"]}},
+            {"expire": {"older_than": 3600, "units": "/x"}},
+            {"expire": {"older_than": 3600, "nested": ["x"]}},
+            {"expire": {"older_than": 3600, "extra": []}},
+            {"uid": "20005"},
+            {"uid": True},
+            {"gid": 1.0},
+        ],
+    )
+    def test_cleanup_refusals(self, broker_module, fields):
+        with pytest.raises(ValueError):
+            broker_module._op_request("cleanup", self._payload(**fields))
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "",
+            "relative.jsonl",
+            "/",
+            "//x/a.jsonl",
+            "/a/../b",
+            "/a/./b",
+            "/a//b",
+            "/a/",
+            "/a\0b",
+            "/a/\ud800",  # not encodable as a path
+            5,
+            None,
+            ["/a"],
+        ],
+    )
+    def test_path_refusals(self, broker_module, path):
+        with pytest.raises(ValueError):
+            broker_module._op_path(path, "test path")
+        with pytest.raises(ValueError):
+            broker_module._op_request("cleanup", self._payload(remove=[path]))
+
+    def test_transcript_schema(self, broker_module):
+        good = self._payload("transcript", path="/cfg/p/s.jsonl", cwd="/ws")
+        req = broker_module._op_request("transcript", good)
+        assert (req["path"], req["cwd"], req["gid"]) == ("/cfg/p/s.jsonl", "/ws", 20005)
+        for fields in (
+            {"path": "/cfg/p/s.json"},  # not a transcript
+            {"path": _DROP},
+            {"cwd": _DROP},
+            {"cwd": "ws"},
+            {"cwd": "/ws/"},
+            {"workspace": ""},  # a cleanup field: unknown here
+        ):
+            with pytest.raises(ValueError):
+                broker_module._op_request("transcript", {**good, **fields})
+
+    def test_the_op_a_ticket_names(self, broker_module):
+        assert broker_module._ticket_op({}) == "spawn"
+        for op in ("spawn", "cleanup", "transcript"):
+            assert broker_module._ticket_op({"op": op}) == op
+        for op in ("frobnicate", "", None, 5, ["cleanup"], {"op": 1}):
+            with pytest.raises(ValueError, match="unknown broker op"):
+                broker_module._ticket_op({"op": op})
+
+    def test_the_spawn_request_refuses_an_op_ticket(self, broker_module):
+        header = {"ticket": "t", "argv": [], "env": {}}
+        payload = {"uid": 20005, "workspace": "/ws"}
+        broker_module._spawn_request(header, payload)  # a spawn
+        broker_module._spawn_request(header, {**payload, "op": "spawn"})
+        for op in ("cleanup", "transcript", None):
+            with pytest.raises(ValueError, match="cannot spawn"):
+                broker_module._spawn_request(header, {**payload, "op": op})
+
+
+class TestShmDir:
+    """With --test-same-uid the session uid IS the developer's, so the shm
+    step may never reach the real /dev/shm then (in-process: no sweep)."""
+
+    def test_production_sweeps_dev_shm_whatever_the_env(self, broker_module):
+        assert broker_module._shm_dir(False, {}) == "/dev/shm"
+        env = {_TEST_SHM_ENV: "/tmp/x"}
+        assert broker_module._shm_dir(False, env) == "/dev/shm"
+
+    def test_test_mode_sweeps_only_a_test_dir(self, broker_module, tmp_path):
+        shm = str(tmp_path / "shm")
+        assert broker_module._shm_dir(True, {_TEST_SHM_ENV: shm}) == shm
+        # Unset, blank, relative, or outside the temp dir: skipped.
+        for value in (None, "", " ", "relative", "/dev/shm", "/dev/shm/x"):
+            env = {} if value is None else {_TEST_SHM_ENV: value}
+            assert broker_module._shm_dir(True, env) is None, value
+
+
+class TestTestModePaths:
+    """Under --test-same-uid an op runs as the developer's own uid: whatever a
+    test asks, it touches nothing outside the temp dir."""
+
+    def test_paths_outside_the_temp_dir_are_refused(self, broker, tmp_path):
+        outside = "/nonexistent-omg-broker-test/x.jsonl"
+        for fields in (
+            {"clear": [outside]},
+            {"remove": [str(tmp_path / "ok"), outside]},
+            {"expire": {"older_than": 3600, "nested": [outside]}},
+        ):
+            assert _cleanup(broker, **fields) == (_ST_REFUSED, 0), fields
+        assert _transcript(broker, outside, _CWD) == (_ST_REFUSED, 0)
+        assert "is outside the temp dir" in broker.log_text()
+        assert _cleanup(broker, remove=[str(tmp_path / "ok")]) == (_ST_EXITED, 0)
+
+
+class TestCleanupOp:
+    """The cleanup op's steps against tmp trees, end to end."""
+
+    def test_clear_keeps_the_dir_and_empties_it(self, broker, tmp_path):
+        outside = _outside(tmp_path)
+        d = _session_tree(tmp_path / "d", outside)
+        assert _cleanup(broker, clear=[str(d)]) == (_ST_EXITED, 0), broker.log_text()
+        assert d.is_dir() and list(d.iterdir()) == []
+        assert (outside / "victim").read_text() == "v"  # links went, unfollowed
+        assert _cleanup(broker, clear=[str(tmp_path / "missing")]) == (_ST_EXITED, 0)
+
+    def test_remove_takes_files_dirs_links_and_missing(self, broker, tmp_path):
+        outside = _outside(tmp_path)
+        f = tmp_path / "s.jsonl"
+        f.write_text("{}\n")
+        d = _session_tree(tmp_path / "d", outside)
+        link = tmp_path / "link"
+        os.symlink(outside, link)
+        missing = tmp_path / "nope" / "deeper"
+        reply = _cleanup(broker, remove=[str(f), str(d), str(link), str(missing)])
+        assert reply == (_ST_EXITED, 0), broker.log_text()
+        assert not os.path.lexists(f) and not d.exists()
+        assert not os.path.lexists(link)  # the link itself, not its target
+        assert (outside / "victim").read_text() == "v"
+
+    def test_a_symlinked_component_fails_only_that_target(self, broker, tmp_path):
+        outside = _outside(tmp_path)
+        (outside / "inner").mkdir()
+        (outside / "inner" / "f").write_text("f")
+        via = tmp_path / "via"
+        via.symlink_to(outside)
+        other = tmp_path / "other"
+        other.write_text("x")
+        reply = _cleanup(broker, remove=[str(via / "victim"), str(other)])
+        assert reply == (_ST_EXITED, 1)
+        assert not other.exists()  # the other target still went
+        reply = _cleanup(broker, clear=[str(via), str(via / "inner")])
+        assert reply == (_ST_EXITED, 1)
+        assert (outside / "victim").read_text() == "v"
+        assert (outside / "inner" / "f").read_text() == "f"
+        assert "cannot reach" in broker.log_text()  # via/...: a link component
+        assert "cannot open" in broker.log_text()  # via itself: not followed
+
+    def test_our_own_dirs_get_their_owner_bits_back(self, broker, tmp_path):
+        parent = tmp_path / "projects" / "p"
+        target = parent / "s"
+        (target / "sub").mkdir(parents=True)
+        (target / "sub" / "x").write_text("x")
+        (parent / "s.jsonl").write_text("{}\n")
+        (target / "sub").chmod(0o000)
+        parent.chmod(0o500)  # U's own parent, narrowed by the agent
+        try:
+            reply = _cleanup(broker, remove=[str(target), str(parent / "s.jsonl")])
+            assert reply == (_ST_EXITED, 0), broker.log_text()
+            assert os.lstat(parent).st_mode & 0o7777 == 0o700  # rwx back only
+        finally:
+            parent.chmod(0o755)
+        assert list(parent.iterdir()) == []
+
+    def test_an_emptied_dir_whose_parent_is_not_writable_counts(
+        self, start_broker, tmp_path
+    ):
+        # Spec: U cannot remove a workspace root from the gateway's base; it
+        # empties it and the gateway rmdirs it. Anything else that stays fails.
+        broker = start_broker(seam="eacces-prefix")
+        ws = tmp_path / "eacces-ws"
+        (ws / "sub").mkdir(parents=True)
+        (ws / "sub" / "f").write_text("f")
+        assert _cleanup(broker, remove=[str(ws)]) == (_ST_EXITED, 0), broker.log_text()
+        assert ws.is_dir() and list(ws.iterdir()) == []
+        f = tmp_path / "eacces-file"
+        f.write_text("x")
+        assert _cleanup(broker, remove=[str(f)]) == (_ST_EXITED, 1)
+        assert f.exists()
+        outer = tmp_path / "outer"
+        (outer / "eacces-inner").mkdir(parents=True)  # not the target itself
+        assert _cleanup(broker, remove=[str(outer)]) == (_ST_EXITED, 1)
+        assert (outer / "eacces-inner").is_dir()
+
+    def test_a_deep_tree_is_removed(self, broker, tmp_path):
+        # Deeper than the helper's fd window: subtrees move up as it goes.
+        top = tmp_path / "deep"
+        top.mkdir()
+        fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+        for _ in range(200):
+            os.mkdir("d", dir_fd=fd)
+            nxt = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        os.close(os.open("leaf", os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=fd))
+        os.close(fd)
+        assert _cleanup(broker, remove=[str(top)]) == (_ST_EXITED, 0), broker.log_text()
+        assert not top.exists()
+
+    def test_expire_removes_only_what_is_old(self, broker, tmp_path):
+        cfg = tmp_path / "cfg"
+        env, proj = cfg / "session-env", cfg / "projects"
+        (env / "old-sid").mkdir(parents=True)
+        (env / "old-sid" / "f").write_text("x")
+        (env / "fresh-sid").mkdir()
+        (env / "fresh-sid" / "f").write_text("x")  # an old dir, a fresh file
+        (env / "old-file").write_text("x")
+        p1, p2, p3 = proj / "p1", proj / "p2", proj / "p3"
+        (p1 / "memory").mkdir(parents=True)
+        (p1 / "memory" / "m.md").write_text("m")
+        (p1 / "old.jsonl").write_text("{}\n")
+        (p1 / "old" / "subagents").mkdir(parents=True)
+        (p1 / "old" / "subagents" / "a.jsonl").write_text("{}\n")
+        (p1 / "fresh.jsonl").write_text("{}\n")
+        p2.mkdir()
+        (p2 / "s.jsonl").write_text("{}\n")
+        p3.mkdir()  # a spawn has just made it: fresh and empty
+        (proj / "stray").write_text("x")
+        old = time.time() - 10 * 86400
+        for path in (  # children before their parents
+            env / "old-sid" / "f",
+            env / "old-sid",
+            env / "fresh-sid",
+            env / "old-file",
+            p1 / "memory" / "m.md",
+            p1 / "memory",
+            p1 / "old.jsonl",
+            p1 / "old" / "subagents" / "a.jsonl",
+            p1 / "old" / "subagents",
+            p1 / "old",
+            p1,
+            p2 / "s.jsonl",
+            p2,
+            proj / "stray",
+        ):
+            os.utime(path, (old, old), follow_symlinks=False)
+        expire = {
+            "older_than": 86400,
+            "units": [str(env), str(cfg / "tasks")],  # tasks: missing, skipped
+            "nested": [str(proj)],
+        }
+        assert _cleanup(broker, expire=expire) == (_ST_EXITED, 0), broker.log_text()
+        assert not (env / "old-sid").exists() and not (env / "old-file").exists()
+        assert (env / "fresh-sid" / "f").exists()
+        assert not (p1 / "old.jsonl").exists() and not (p1 / "old").exists()
+        assert (p1 / "memory" / "m.md").exists()  # memory is never expired
+        assert (p1 / "fresh.jsonl").exists()
+        assert not p2.exists()  # emptied, and old itself: gone
+        assert p3.is_dir()  # empty but fresh: kept
+        assert (proj / "stray").exists()  # not a project directory
+
+    def test_expire_of_a_linked_dir_fails(self, broker, tmp_path):
+        outside = _outside(tmp_path)
+        old = time.time() - 10 * 86400
+        os.utime(outside / "victim", (old, old))
+        (tmp_path / "session-env").symlink_to(outside)
+        expire = {"older_than": 3600, "units": [str(tmp_path / "session-env")]}
+        assert _cleanup(broker, expire=expire) == (_ST_EXITED, 1)
+        assert (outside / "victim").exists()
+
+    def test_shm_sweeps_the_configured_dir_only(
+        self, start_broker, broker_module, tmp_path
+    ):
+        shm = tmp_path / "shm"
+        shm.mkdir()
+        # Guard: if this mode could name the real /dev/shm, stop before a sweep.
+        assert broker_module._shm_dir(True, {_TEST_SHM_ENV: str(shm)}) == str(shm)
+        broker = start_broker(extra_env={_TEST_SHM_ENV: str(shm)})
+        outside = _outside(tmp_path)
+        (shm / "sem.mp-x").write_text("x")
+        (shm / "dir" / "in").mkdir(parents=True)
+        (shm / "dir" / "in" / "f").write_text("f")
+        os.symlink(outside, shm / "link")
+        canary = _real_shm_canary()
+        try:
+            assert _cleanup(broker, shm=True) == (_ST_EXITED, 0), broker.log_text()
+            assert list(shm.iterdir()) == []
+            assert (outside / "victim").read_text() == "v"
+            assert canary is None or canary.read_text() == "canary"
+        finally:
+            if canary is not None:
+                canary.unlink(missing_ok=True)
+
+    def test_shm_step_is_skipped_without_a_test_dir(
+        self, broker, broker_module, tmp_path
+    ):
+        assert broker_module._shm_dir(True, {}) is None  # guard, as above
+        unconfigured = tmp_path / "shm"
+        unconfigured.mkdir()
+        marker = unconfigured / "sem.mine"
+        marker.write_text("mine")
+        assert marker.stat().st_uid == os.getuid()
+        canary = _real_shm_canary()
+        try:
+            assert _cleanup(broker, shm=True) == (_ST_EXITED, 0), broker.log_text()
+            assert "shm step skipped in test mode" in broker.log_text()
+            assert marker.read_text() == "mine"
+            assert canary is None or canary.read_text() == "canary"
+        finally:
+            if canary is not None:
+                canary.unlink(missing_ok=True)
+
+    @pytest.mark.skipif(
+        os.getgid() != os.getuid(), reason="gateway tickets carry no gid (gid=uid)"
+    )
+    def test_gateway_minted_op_tickets(self, broker, tmp_path, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, broker.secret)
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "f").write_text("x")
+        ticket = ui.mint_op_ticket(
+            ui.OP_CLEANUP,
+            uid=os.getuid(),
+            workspace="",
+            wait=0,
+            clear=[str(d)],
+            remove=[],
+            shm=False,
+        )
+        assert _op(broker, ticket) == (_ST_EXITED, 0), broker.log_text()
+        assert d.is_dir() and list(d.iterdir()) == []
+        t = _jsonl(tmp_path / "s.jsonl", _PROMPT, _ANSWER)
+        ticket = ui.mint_op_ticket(
+            ui.OP_TRANSCRIPT, uid=os.getuid(), path=str(t), cwd=_CWD
+        )
+        assert _op(broker, ticket) == (_ST_TRANSCRIPT, 1), broker.log_text()
+
+
+class TestOpProtocol:
+    """B3/B12 for ops: a bad op request is refused by the resident, which keeps
+    serving and leaks no fd; an op ticket is single-use and never spawns."""
+
+    def test_bad_op_requests_are_refused(self, broker, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        assert _cleanup(broker, clear=[str(d)]) == (_ST_EXITED, 0)  # warm
+        fds_before = broker.fd_count()
+        transcript = broker.op_ticket("transcript", path=str(d / "a.jsonl"), cwd=str(d))
+        young = {"older_than": 60}
+        cases = [
+            ("an fd", _cleanup_ticket(broker), {"fds": True}),
+            ("argv", _cleanup_ticket(broker), {"argv": ["x"]}),
+            ("env", _cleanup_ticket(broker), {"env": {"A": "b"}}),
+            ("data after the header", _cleanup_ticket(broker), {"extra": b"\0" * 8}),
+            ("unknown op", broker.op_ticket("frobnicate"), {}),
+            ("op not a string", broker.op_ticket(5), {}),
+            ("op null", broker.op_ticket(None), {}),
+            ("unknown key", _cleanup_ticket(broker, rw=[str(d)]), {}),
+            ("no workspace", broker.op_ticket("cleanup"), {}),
+            ("relative path", _cleanup_ticket(broker, clear=["d"]), {}),
+            ("/", _cleanup_ticket(broker, remove=["/"]), {}),
+            ("not normalized", _cleanup_ticket(broker, remove=[f"{d}/../d"]), {}),
+            ("double slash", _cleanup_ticket(broker, remove=["/" + str(d)]), {}),
+            ("wait too long", _cleanup_ticket(broker, wait=31), {}),
+            ("expire too young", _cleanup_ticket(broker, expire=young), {}),
+            ("reserved uid", _cleanup_ticket(broker, uid=0), {}),
+            (
+                "not a transcript",
+                broker.op_ticket("transcript", path=str(d / "s.json"), cwd=str(d)),
+                {},
+            ),
+            ("transcript fds", transcript, {"fds": True}),
+        ]
+        for name, ticket, kw in cases:
+            assert _op(broker, ticket, **kw) == (_ST_REFUSED, 0), name
+            assert broker.alive(), "broker died on: %s" % name
+        deadline = time.monotonic() + 2.0
+        while broker.fd_count() != fds_before and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert broker.fd_count() == fds_before  # no received fd leaked
+        assert "rejecting cleanup:" in broker.log_text()
+        (d / "f").write_text("x")
+        assert _cleanup(broker, clear=[str(d)]) == (_ST_EXITED, 0)  # still serving
+        assert not (d / "f").exists()
+
+    def test_an_op_ticket_is_single_use(self, broker, tmp_path):
+        d = tmp_path / "d"
+        d.mkdir()
+        ticket = _cleanup_ticket(broker, clear=[str(d)])
+        assert _op(broker, ticket) == (_ST_EXITED, 0)
+        (d / "f").write_text("x")
+        assert _op(broker, ticket) == (_ST_REFUSED, 0)
+        assert "ticket already used" in broker.log_text()
+        assert (d / "f").exists()
+
+    def test_an_op_ticket_never_spawns(self, broker, tmp_path):
+        ws = _workspace(tmp_path)
+        tickets = [
+            _cleanup_ticket(broker, ws),
+            broker.op_ticket("transcript", path=str(ws / "s.jsonl"), cwd=str(ws)),
+        ]
+        for ticket in tickets:  # with fds 0/1/2, as a launcher sends them
+            header = json.dumps({"ticket": ticket, "argv": [], "env": {}}).encode()
+            assert _raw_spawn(broker, header) == _REC.pack(_ST_REFUSED, 0)
+        proc = _run(broker, ws, "print('ran')\n", ticket=_cleanup_ticket(broker, ws))
+        assert proc.returncode == 70 and "ran" not in proc.stdout
+        assert broker.alive()
+
+    def test_a_spawn_ticket_is_no_op_ticket(self, broker, tmp_path):
+        # No op names a spawn, and a spawn passes fds 0/1/2: refused without.
+        ws = _workspace(tmp_path)
+        assert _op(broker, broker.ticket(ws)) == (_ST_REFUSED, 0)
+        assert "expected fds 0/1/2, got 0" in broker.log_text()
+
+
+class TestCleanupLiveness:
+    """A cleanup never runs while its uid is in use: refused with ``wait=0``,
+    otherwise parked until it is free or its wait is over."""
+
+    def test_a_live_session_holds_its_workspace(self, broker, tmp_path):
+        ws = _workspace(tmp_path)
+        stuff = ws / "stuff"
+        stuff.mkdir()
+        (stuff / "f").write_text("x")
+        holder = _popen(broker, ws, _HOLD, ws / "cli.pid")
+        try:
+            _wait_file(ws / "cli.pid", proc=holder)
+            start = time.monotonic()
+            assert _cleanup(broker, ws, clear=[str(stuff)]) == (_ST_REFUSED, 0)
+            assert time.monotonic() - start < 2
+            assert "uid %d still has a live session" % os.getuid() in broker.log_text()
+            start = time.monotonic()
+            reply = _cleanup(broker, ws, wait=1, clear=[str(stuff)])
+            assert reply == (_ST_REFUSED, 0)  # at its deadline
+            assert 0.9 <= time.monotonic() - start < 5
+            assert "after 1s" in broker.log_text()
+            # Another workspace of the uid is not held up by this session.
+            other = tmp_path / "other"
+            other.mkdir()
+            (other / "g").write_text("g")
+            reply = _cleanup(broker, tmp_path / "elsewhere", clear=[str(other)])
+            assert reply == (_ST_EXITED, 0), broker.log_text()
+            ticket = _cleanup_ticket(broker, ws, wait=10, clear=[str(stuff)])
+            conn = _op_send(broker, ticket)
+            assert not select.select([conn], [], [], 0.5)[0]  # parked
+            assert (stuff / "f").exists()
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+        assert _op_reply(conn) == (_ST_EXITED, 0), broker.log_text()
+        assert stuff.is_dir() and list(stuff.iterdir()) == []
+
+    def test_an_shm_sweep_waits_for_every_session_of_the_uid(
+        self, start_broker, tmp_path
+    ):
+        shm = tmp_path / "shm"
+        shm.mkdir()
+        broker = start_broker(extra_env={_TEST_SHM_ENV: str(shm)})
+        ws = _workspace(tmp_path)
+        holder = _popen(broker, ws, _HOLD, ws / "cli.pid")
+        try:
+            _wait_file(ws / "cli.pid", proc=holder)
+            assert _cleanup(broker, shm=True) == (_ST_REFUSED, 0)
+            assert _cleanup(broker, tmp_path / "elsewhere", shm=True) == (
+                _ST_REFUSED,
+                0,
+            )
+            assert _cleanup(broker) == (_ST_EXITED, 0)  # no shm, no workspace
+        finally:
+            holder.kill()
+            holder.wait(timeout=5)
+
+    def test_a_workspace_cleanup_holds_the_uid_while_it_runs(
+        self, start_broker, tmp_path
+    ):
+        broker = start_broker(seam="slow-cleanup")
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "slow-marker").write_text("x")
+        run_ws = tmp_path / "_tmp_run"
+        conn = _op_send(broker, _cleanup_ticket(broker, run_ws, clear=[str(d)]))
+        parked = None
+        try:
+            _wait_log(broker, "seam: slow unlink")
+            proc = _run(broker, _workspace(tmp_path), "print('ran')\n")
+            assert proc.returncode == 70 and "ran" not in proc.stdout
+            assert "uid %d is being cleaned up" % os.getuid() in broker.log_text()
+            x = tmp_path / "x"
+            x.write_text("x")
+            assert _cleanup(broker, remove=[str(x)]) == (_ST_REFUSED, 0)
+            assert "another cleanup of uid" in broker.log_text()
+            parked = _op_send(broker, _cleanup_ticket(broker, wait=10, remove=[str(x)]))
+            # A transcript read has no live check.
+            missing = tmp_path / "none.jsonl"
+            assert _transcript(broker, missing, _CWD) == (_ST_TRANSCRIPT, -1)
+            assert _op_reply(conn) == (_ST_EXITED, 0), broker.log_text()
+            assert _op_reply(parked) == (_ST_EXITED, 0), broker.log_text()
+            assert not x.exists()
+        finally:
+            conn.close()
+            if parked is not None:
+                parked.close()
+        deadline = time.monotonic() + 10
+        while True:  # the helper is reaped on the broker's next tick
+            proc = _run(broker, _workspace(tmp_path, "ws2"), "print('ran')\n")
+            if proc.returncode == 0 or time.monotonic() > deadline:
+                break
+            time.sleep(0.1)
+        assert proc.returncode == 0, proc.stderr
+        assert "ran" in proc.stdout
+
+    def test_unswept_orphans_hold_the_uid(self, start_broker, tmp_path):
+        broker = start_broker(seam="stop-orphan-killer")
+        ws = _workspace(tmp_path)
+        proc = _popen(broker, ws, _STUBBORN, ws / "pids")
+        cli = kid = None
+        try:
+            cli, kid, supervisor = map(int, _wait_file(ws / "pids", proc=proc).split())
+            os.kill(supervisor, signal.SIGKILL)  # survivors re-parent to the broker
+            assert proc.wait(timeout=10) == 70
+            _wait_log(broker, "could not sweep orphans")
+            assert _cleanup(broker) == (_ST_REFUSED, 0)
+            assert "still has an unswept orphan" in broker.log_text()
+            for pid in (cli, kid):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            deadline = time.monotonic() + 10
+            while True:  # reaped on a later tick
+                reply = _cleanup(broker)
+                if reply == (_ST_EXITED, 0) or time.monotonic() > deadline:
+                    break
+                time.sleep(0.1)
+            assert reply == (_ST_EXITED, 0), broker.log_text()
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            for pid in [p for p in (cli, kid) if p is not None]:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+
+    def test_waiting_cleanups_are_bounded_and_dropped_when_left(
+        self, broker, tmp_path
+    ):
+        ws = _workspace(tmp_path)
+        holder = _popen(broker, ws, _HOLD, ws / "cli.pid")
+        conns = []
+        try:
+            _wait_file(ws / "cli.pid", proc=holder)
+            fds_before = broker.fd_count()
+            for _ in range(65):
+                conns.append(_op_send(broker, _cleanup_ticket(broker, ws, wait=30)))
+            deadline = time.monotonic() + 5
+            ready = []
+            while not ready and time.monotonic() < deadline:
+                ready = select.select(conns, [], [], 0.2)[0]
+            assert len(ready) == 1, "one over the bound must be refused"
+            conns.remove(ready[0])
+            assert _op_reply(ready[0]) == (_ST_REFUSED, 0)
+            assert "64 cleanups are waiting already" in broker.log_text()
+            assert not select.select(conns, [], [], 0.5)[0]  # the 64 still wait
+            for conn in conns:
+                conn.close()
+            conns = []
+            _wait_log(broker, "its client went away", count=64)
+            deadline = time.monotonic() + 2.0
+            while broker.fd_count() != fds_before and time.monotonic() < deadline:
+                time.sleep(0.02)
+            assert broker.fd_count() == fds_before
+        finally:
+            for conn in conns:
+                conn.close()
+            holder.kill()
+            holder.wait(timeout=5)
+
+
+class TestTranscriptOp:
+    """The transcript op: the user turns of a file read as U, or a code."""
+
+    def test_counts_the_user_turns(self, broker, tmp_path):
+        t = _jsonl(
+            tmp_path / "s.jsonl", _PROMPT, _ANSWER, _RESULT, _ANSWER, _META, _PROMPT
+        )
+        assert _transcript(broker, t, _CWD) == (_ST_TRANSCRIPT, 2)
+
+    def test_another_workspace_is_a_mismatch(self, broker, tmp_path):
+        t = _jsonl(tmp_path / "s.jsonl", _PROMPT, {**_PROMPT, "cwd": "/data/bob"})
+        assert _transcript(broker, t, _CWD) == (_ST_TRANSCRIPT, -2)
+
+    @pytest.mark.parametrize(
+        "content",
+        [b'{"type": "user"\n', b"\n", b'{"a": "\xff\xfe"}\n', b"[1, 2]\n"],
+        ids=["bad-json", "blank-line", "not-utf8", "not-an-object"],
+    )
+    def test_corrupt(self, broker, tmp_path, content):
+        t = tmp_path / "s.jsonl"
+        t.write_bytes(json.dumps(_PROMPT).encode() + b"\n" + content)
+        assert _transcript(broker, t, _CWD) == (_ST_TRANSCRIPT, -3)
+
+    def test_missing(self, broker, tmp_path):
+        assert _transcript(broker, tmp_path / "none.jsonl", _CWD) == (
+            _ST_TRANSCRIPT,
+            -1,
+        )
+        nowhere = tmp_path / "no" / "dir" / "s.jsonl"
+        assert _transcript(broker, nowhere, _CWD) == (_ST_TRANSCRIPT, -1)
+        real = tmp_path / "real"
+        real.mkdir()
+        _jsonl(real / "s.jsonl", _PROMPT)
+        (tmp_path / "link").symlink_to(real)  # the walk follows no link
+        linked = tmp_path / "link" / "s.jsonl"
+        assert _transcript(broker, linked, _CWD) == (_ST_TRANSCRIPT, -1)
+
+    @pytest.mark.parametrize("kind", ["fifo", "dir", "sparse", "symlink"])
+    def test_not_a_regular_file_is_unreadable(self, broker, tmp_path, kind):
+        t = tmp_path / "s.jsonl"
+        if kind == "fifo":
+            os.mkfifo(t)  # never opened for its writer: O_NONBLOCK
+        elif kind == "dir":
+            t.mkdir()
+        elif kind == "sparse":
+            with open(t, "wb") as f:
+                f.truncate((256 << 20) + 1)  # over the cap: never read
+        else:
+            t.symlink_to(_jsonl(tmp_path / "real.jsonl", _PROMPT))
+        start = time.monotonic()
+        assert _transcript(broker, t, _CWD) == (_ST_TRANSCRIPT, -4)
+        assert time.monotonic() - start < 5
+
+
+class TestProductionModeOps:
+    """B7 for ops: no shortcut without --test-same-uid, and a helper that
+    cannot take the session uid does nothing."""
+
+    def test_the_brokers_own_uid_is_refused(self, start_broker, tmp_path):
+        broker = start_broker(test_same_uid=False)
+        assert _cleanup(broker) == (_ST_REFUSED, 0)
+        assert "is reserved" in broker.log_text()
+
+    @pytest.mark.skipif(os.geteuid() == 0, reason="root could really switch")
+    def test_a_helper_that_cannot_switch_does_nothing(self, start_broker, tmp_path):
+        broker = start_broker(test_same_uid=False)
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "f").write_text("x")
+        ids = {"uid": 20005, "gid": 20005}
+        ticket = broker.op_ticket("cleanup", workspace="", clear=[str(d)], **ids)
+        assert _op(broker, ticket) == (_ST_REFUSED, 0)
+        assert (d / "f").exists()  # nothing ran as the broker's own uid
+        assert "refusing the cleanup for uid 20005" in broker.log_text()
+        t = _jsonl(tmp_path / "s.jsonl", _PROMPT)
+        ticket = broker.op_ticket("transcript", path=str(t), cwd=_CWD, **ids)
+        assert _op(broker, ticket) == (_ST_REFUSED, 0)
+        assert "refusing the transcript read for uid 20005" in broker.log_text()
+
+
+class TestOpHelperCredentials:
+    """The helpers' credential layer as calls (the switch itself needs
+    CAP_SETUID: container-verify only): the supervisor's split, then the
+    alarm, before any file is touched; nothing at all when it did not take."""
+
+    U, G = 20005, 20006
+
+    class _Sock:
+        def __init__(self):
+            self.sent = b""
+
+        def settimeout(self, _timeout):
+            pass
+
+        def sendall(self, data):
+            self.sent += data
+
+    def _patch(self, mod, monkeypatch, resuid):
+        calls = []
+
+        def rec(name):
+            return lambda *args: calls.append((name, *args))
+
+        fake_os = _Proxy(
+            os,
+            setgroups=lambda g: calls.append(("setgroups", list(g))),
+            setresgid=rec("setresgid"),
+            setresuid=rec("setresuid"),
+            getresuid=lambda: resuid,
+        )
+        monkeypatch.setattr(mod, "os", fake_os)
+        monkeypatch.setattr(mod.ll, "drop_all_caps", rec("drop_all_caps"))
+        monkeypatch.setattr(mod, "signal", _Proxy(signal, alarm=rec("alarm")))
+        return calls
+
+    def _split(self):
+        b, u, g = os.getuid(), self.U, self.G
+        return [
+            ("setgroups", []),
+            ("setresgid", g, g, g),
+            ("setresuid", b, u, b),
+            ("drop_all_caps",),
+        ]
+
+    def _cleanup_req(self, d):
+        return {
+            "op": "cleanup",
+            "uid": self.U,
+            "gid": self.G,
+            "workspace": "",
+            "wait": 0,
+            "clear": [str(d)],
+            "remove": [],
+            "expire": None,
+            "shm": False,  # never True here: not test mode, so /dev/shm
+        }
+
+    def test_a_cleanup_runs_after_the_split(self, broker_module, monkeypatch, tmp_path):
+        b = os.getuid()
+        calls = self._patch(broker_module, monkeypatch, (b, self.U, b))
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "f").write_text("x")
+        sock = self._Sock()
+        assert broker_module._run_cleanup(sock, self._cleanup_req(d), False) == 0
+        assert calls == [*self._split(), ("alarm", 60)]
+        assert sock.sent == _REC.pack(_ST_EXITED, 0)
+        assert not (d / "f").exists()
+
+    def test_a_cleanup_without_the_split_touches_nothing(
+        self, broker_module, monkeypatch, tmp_path
+    ):
+        u = self.U
+        calls = self._patch(broker_module, monkeypatch, (u, u, u))  # did not take
+        d = tmp_path / "d"
+        d.mkdir()
+        (d / "f").write_text("x")
+        sock = self._Sock()
+        assert broker_module._run_cleanup(sock, self._cleanup_req(d), False) == 0
+        assert sock.sent == _REC.pack(_ST_REFUSED, 0)
+        assert not [c for c in calls if c[0] in ("alarm", "drop_all_caps")]
+        assert (d / "f").exists()
+
+    def test_a_transcript_read_runs_after_the_split(
+        self, broker_module, monkeypatch, tmp_path
+    ):
+        b = os.getuid()
+        calls = self._patch(broker_module, monkeypatch, (b, self.U, b))
+        req = {
+            "op": "transcript",
+            "uid": self.U,
+            "gid": self.G,
+            "path": str(_jsonl(tmp_path / "s.jsonl", _PROMPT)),
+            "cwd": _CWD,
+        }
+        sock = self._Sock()
+        assert broker_module._run_transcript(sock, req, False) == 0
+        assert calls == [*self._split(), ("alarm", 20)]
+        assert sock.sent == _REC.pack(_ST_TRANSCRIPT, 1)
+
+
+class TestRemovalEngine:
+    """The cleanup helper's tree walk, in-process as this test's uid."""
+
+    @staticmethod
+    def _chain(top: Path, depth: int, leaf="leaf") -> None:
+        top.mkdir()
+        fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+        for _ in range(depth):
+            os.mkdir("d", dir_fd=fd)
+            nxt = os.open("d", os.O_RDONLY | os.O_DIRECTORY, dir_fd=fd)
+            os.close(fd)
+            fd = nxt
+        os.close(os.open(leaf, os.O_CREAT | os.O_WRONLY, 0o600, dir_fd=fd))
+        os.close(fd)
+
+    def test_a_deep_chain_is_emptied_in_a_bounded_fd_window(
+        self, broker_module, monkeypatch, tmp_path
+    ):
+        top = tmp_path / "top"
+        self._chain(top, 50)
+        live, peak = set(), [0]
+
+        def open_(*args, **kw):
+            fd = os.open(*args, **kw)
+            live.add(fd)
+            peak[0] = max(peak[0], len(live))
+            return fd
+
+        def close(fd):
+            live.discard(fd)
+            os.close(fd)
+
+        monkeypatch.setattr(broker_module, "os", _Proxy(os, open=open_, close=close))
+        monkeypatch.setattr(broker_module, "_MAX_DEPTH", 4)
+        log = broker_module._Failures(os.getuid())
+        fd = os.open(top, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            assert broker_module._empty(fd, str(top), log) is True
+        finally:
+            os.close(fd)
+        assert log.count == 0 and list(top.iterdir()) == []  # moved ones too
+        assert not live  # every fd it opened is closed
+        assert 0 < peak[0] <= 4 + 1  # the window, plus a transient open
+
+    def test_the_age_check_is_capped(self, broker_module, monkeypatch, tmp_path):
+        monkeypatch.setattr(broker_module, "_EXPIRE_SCAN_CAP", 5)
+        e = tmp_path / "e"
+        e.mkdir()
+        for n in range(4):
+            (e / str(n)).write_text("x")
+        cutoff = time.time() + 100  # everything here is older
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            assert broker_module._is_old(fd, "e", cutoff) is True  # 5: at the cap
+            (e / "4").write_text("x")
+            assert broker_module._is_old(fd, "e", cutoff) is False  # 6: unsure
+        finally:
+            os.close(fd)
+
+    def test_the_age_check_stops_at_the_fd_window(
+        self, broker_module, monkeypatch, tmp_path
+    ):
+        monkeypatch.setattr(broker_module, "_MAX_DEPTH", 3)
+        self._chain(tmp_path / "shallow", 2)
+        self._chain(tmp_path / "deep", 3)
+        cutoff = time.time() + 100
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            assert broker_module._is_old(fd, "shallow", cutoff) is True
+            assert broker_module._is_old(fd, "deep", cutoff) is False
+        finally:
+            os.close(fd)
+
+    def test_the_age_check_follows_no_link(self, broker_module, tmp_path):
+        old = time.time() - 10 * 86400
+        fresh = tmp_path / "fresh"
+        fresh.mkdir()
+        (fresh / "new").write_text("x")
+        e = tmp_path / "e"
+        e.mkdir()
+        os.symlink(fresh, e / "link")
+        os.utime(e / "link", (old, old), follow_symlinks=False)
+        os.utime(e, (old, old))
+        fd = os.open(tmp_path, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            assert broker_module._is_old(fd, "e", time.time() - 86400) is True
+        finally:
+            os.close(fd)
+
+
+class TestSessionEnv:
+    """The CLI child's umask, user names and git safe.directory (uid mode:
+    the workspace root is the gateway's, not the session uid's)."""
+
+    def _env(self, mod, env, uid=20005):
+        return mod._child_env(env, [], "/ws", "/ws/.cli-tmp", uid)
+
+    @staticmethod
+    def _git_pairs(env, first, last):
+        return [
+            (env["GIT_CONFIG_KEY_%d" % n], env["GIT_CONFIG_VALUE_%d" % n])
+            for n in range(first, last + 1)
+        ]
+
+    def test_an_operator_git_config_is_kept(self, broker_module):
+        env = self._env(
+            broker_module,
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.pager",
+                "GIT_CONFIG_VALUE_0": "cat",
+            },
+        )
+        assert env["GIT_CONFIG_COUNT"] == "3"
+        assert self._git_pairs(env, 0, 2) == [
+            ("core.pager", "cat"),
+            ("safe.directory", "/ws"),
+            ("safe.directory", "/ws/*"),
+        ]
+
+    @pytest.mark.parametrize(
+        "inherited",
+        [
+            {},
+            {"GIT_CONFIG_COUNT": ""},
+            {"GIT_CONFIG_COUNT": "x"},
+            {"GIT_CONFIG_COUNT": "-1"},
+            {"GIT_CONFIG_COUNT": " 1", "GIT_CONFIG_KEY_0": "a.b"},
+            {"GIT_CONFIG_COUNT": "1"},  # its pair is missing: git would die
+            {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "a.b"},
+            {"GIT_CONFIG_COUNT": "1234567"},
+        ],
+    )
+    def test_without_a_valid_count_ours_come_first(self, broker_module, inherited):
+        env = self._env(broker_module, {**inherited, "GIT_CONFIG_VALUE_0": "v"})
+        assert env["GIT_CONFIG_COUNT"] == "2"
+        assert self._git_pairs(env, 0, 1) == [
+            ("safe.directory", "/ws"),
+            ("safe.directory", "/ws/*"),
+        ]
+
+    def test_user_and_logname_name_the_session_uid(self, broker_module, monkeypatch):
+        class _Entry:
+            pw_name = "s20005"
+
+        def getpwuid(uid):
+            if uid == 20005:
+                return _Entry()
+            raise KeyError(uid)
+
+        monkeypatch.setattr(broker_module, "pwd", _Proxy(pwd, getpwuid=getpwuid))
+        env = self._env(broker_module, {"USER": "app", "LOGNAME": "app"})
+        assert env["USER"] == env["LOGNAME"] == "s20005"
+        env = self._env(broker_module, {"USER": "app"}, uid=20006)  # no entry
+        assert env["USER"] == "app" and "LOGNAME" not in env
+
+    def test_the_cli_runs_with_them(self, broker, tmp_path):
+        ws = _workspace(tmp_path)
+        script = (
+            "import json, os, subprocess, sys\n"
+            "mask = os.umask(0)\n"
+            "safe = None\n"
+            "if sys.argv[1]:\n"
+            "    safe = subprocess.run(\n"
+            "        [sys.argv[1], 'config', '--get-all', 'safe.directory'],\n"
+            "        capture_output=True, text=True).stdout.splitlines()\n"
+            "keys = ['USER', 'LOGNAME', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0']\n"
+            "print(json.dumps({'umask': mask, 'safe': safe,\n"
+            "                  'env': {k: os.environ.get(k) for k in keys}}))\n"
+        )
+        proc = _run(
+            broker,
+            ws,
+            script,
+            _GIT or "",
+            GIT_CONFIG_COUNT="1",
+            GIT_CONFIG_KEY_0="core.pager",
+            GIT_CONFIG_VALUE_0="cat",
+        )
+        assert proc.returncode == 0, (proc.stderr, broker.log_text())
+        result = json.loads(proc.stdout)
+        assert result["umask"] == 0o077
+        name = pwd.getpwuid(os.getuid()).pw_name
+        assert result["env"]["USER"] == result["env"]["LOGNAME"] == name
+        assert result["env"]["GIT_CONFIG_COUNT"] == "3"
+        assert result["env"]["GIT_CONFIG_KEY_0"] == "core.pager"  # still applies
+        if _GIT:
+            assert result["safe"][-2:] == [str(ws), str(ws) + "/*"]

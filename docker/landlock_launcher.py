@@ -185,8 +185,11 @@ def _ro_rw(real_cli, cwd):
     _session_tmpdir(cwd)
     os.environ.update(ll.session_shell_env(os.environ))
     # /dev/shm stays rw for POSIX semaphores (multiprocessing, joblib). In this
-    # mode it is a surface shared by every same-uid session; uid mode
-    # separates it by DAC.
+    # mode it is a surface shared by every same-uid session. uid mode runs each
+    # session as its own uid with umask 077, so new objects there are 0600 to
+    # the other session uids (an agent can still chmod its own open), and the
+    # broker's cleanup op removes what a run left before its uid is leased
+    # again.
     rw = ["/dev/shm"]
     return ro, rw, gateway_ro, gateway_rw
 

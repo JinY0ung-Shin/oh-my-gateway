@@ -709,6 +709,11 @@ def restore_exec_signals():
 # SCM_RIGHTS on its first byte. Everything after that, in both directions, is
 # fixed-size ``(kind, value)`` records. The exit code and the terminating signal
 # travel as separate kinds, so no exit code is ever mistaken for a signal.
+#
+# The gateway's own broker ops (cleanup, transcript: the ticket's ``op``) send
+# the same header with an empty argv and env and no fds, and read back exactly
+# one record: ST_EXITED (cleanup: 0 done, 1 something failed), ST_TRANSCRIPT,
+# or ST_REFUSED.
 
 MAX_HEADER = 8 << 20  # env + argv + the ticket's path lists, JSON-escaped
 REC = struct.Struct("=Ii")
@@ -716,6 +721,9 @@ REC_RELAY = 1  # launcher -> broker: relay signal ``value`` to the CLI's group
 ST_EXITED = 1  # broker -> launcher: the CLI exited with code ``value``
 ST_SIGNALED = 2  # broker -> launcher: the CLI was killed by signal ``value``
 ST_REFUSED = 3  # broker -> launcher: spawn refused; the CLI never started
+# broker -> gateway: a transcript op's answer ``value``: the user turns (>= 0),
+# or a negative TRANSCRIPT_* code (src/backends/claude/transcript_turns.py)
+ST_TRANSCRIPT = 4
 
 
 _PR_CAP_AMBIENT = 47
