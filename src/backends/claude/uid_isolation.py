@@ -563,6 +563,23 @@ class _EphemeralPool:
                 and uid not in self._leases.values()
             )
 
+    def lease_of(self, key: str) -> Optional[int]:
+        """The uid *key* holds a lease on, without leasing one."""
+        with self._lock:
+            return self._leases.get(key)
+
+    def holder_of(self, uid: int) -> Optional[str]:
+        """The key holding a lease on *uid*, or ``None``."""
+        with self._lock:
+            for key, held in self._leases.items():
+                if held == uid:
+                    return key
+        return None
+
+    def in_band(self, uid: int) -> bool:
+        """Whether *uid* is one of this pool's (non-reserved) uids."""
+        return self._lo <= uid <= self._hi and uid not in self._reserved
+
     def _take_free_locked(self) -> Optional[int]:
         while self._next <= self._hi:
             uid = self._next
@@ -771,6 +788,46 @@ def release_ephemeral(key: str) -> None:
     pool = _ephemeral_pool
     if pool is not None:
         pool.release(key)
+
+
+def leased_uid(key: str) -> Optional[int]:
+    """The ephemeral uid *key* (an absolute workspace path) holds, else ``None``.
+
+    Never leases one and never builds the pool: ``None`` too when no anonymous
+    run leased a uid in this process.
+    """
+    pool = _ephemeral_pool
+    return None if pool is None else pool.lease_of(key)
+
+
+def lease_holder(uid: int) -> Optional[str]:
+    """The key holding a lease on the ephemeral *uid*, else ``None``."""
+    pool = _ephemeral_pool
+    return None if pool is None else pool.holder_of(uid)
+
+
+def in_ephemeral_band(uid: int) -> bool:
+    """Whether *uid* lies in the ephemeral slice (and is not reserved).
+
+    Computed from the band settings, so it works before any lease was taken —
+    e.g. for an anonymous workspace a previous gateway process left behind.
+    Registry uids are not excluded here: callers that act on an unleased uid
+    check that the registry does not hold it (:func:`registry_holds`).
+    """
+    lo, hi = _ephemeral_band()
+    return _ephemeral_count() > 0 and lo <= uid <= hi and uid not in reserved_uids()
+
+
+def registry_holds(uid: int) -> bool:
+    """Whether the persisted registry accounts for *uid* (honored or held).
+
+    A registry that cannot be loaded counts as holding it: callers use this
+    to refuse acting on a uid that may belong to a named user.
+    """
+    try:
+        return uid in get_registry().claimed_uids()
+    except UidAllocationError:
+        return True
 
 
 def reset_registry_cache() -> None:
@@ -1137,17 +1194,59 @@ def mint_ticket(
             "entrypoint must generate it and share it with the gateway and broker."
         )
     payload = {
+        "op": OP_SPAWN,
         "uid": uid,
         "workspace": workspace,
         "ro": ro,
         "rw": rw,
         "env_allow": env_allow,
+    }
+    return _sign(secret, payload, ttl)
+
+
+# Broker operations a ticket may authorize (``payload["op"]``). A ticket
+# without ``op`` is a spawn (the broker accepts both spellings); the broker's
+# spawn path refuses any other op, so a cleanup ticket can never start a CLI.
+# See docs/isolation-uid-ownership-design.md §3.3 and §3.6, and
+# docker/isolation_broker.py for what each one does.
+OP_SPAWN = "spawn"
+OP_CLEANUP = "cleanup"
+OP_TRANSCRIPT = "transcript"
+_OPS = frozenset({OP_SPAWN, OP_CLEANUP, OP_TRANSCRIPT})
+
+
+def _sign(secret: bytes, payload: Dict, ttl: int) -> str:
+    """``payload`` plus a fresh nonce and expiry, signed: the wire ticket."""
+    payload = {
+        **payload,
         "nonce": secrets.token_hex(16),
         "exp": int(time.time()) + max(1, ttl),
     }
     body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
     sig = hmac.new(secret, body, hashlib.sha256).hexdigest()
     return f"{sig}.{body.decode('utf-8')}"
+
+
+def mint_op_ticket(op: str, *, uid: int, ttl: int = _TICKET_TTL_SECONDS, **fields) -> str:
+    """Mint a signed, single-use ticket for a broker *op* run as *uid*.
+
+    ``op`` is :data:`OP_CLEANUP` or :data:`OP_TRANSCRIPT`; *fields* are that
+    op's own payload fields (``src.backends.claude.broker_ops`` builds them).
+    The session gid is the uid, as for a spawn. Raises ``ValueError`` for an
+    unknown op and ``RuntimeError`` when no shared secret is configured.
+    """
+    if op not in _OPS or op == OP_SPAWN:
+        raise ValueError(f"not a broker op ticket: {op!r}")
+    reserved = {"op", "uid", "gid", "nonce", "exp"} & set(fields)
+    if reserved:
+        raise ValueError(f"op ticket fields may not set {sorted(reserved)}")
+    secret = _secret()
+    if secret is None:
+        raise RuntimeError(
+            f"{TICKET_SECRET_ENV} is not set; cannot mint a broker ticket. The "
+            "entrypoint must generate it and share it with the gateway and broker."
+        )
+    return _sign(secret, {"op": op, "uid": int(uid), **fields}, ttl)
 
 
 def verify_ticket(ticket: str, *, seen_nonces: Optional[set] = None) -> Dict:
