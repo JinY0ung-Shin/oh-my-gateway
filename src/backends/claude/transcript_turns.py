@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import json
 from pathlib import PurePosixPath
-from typing import Iterable
+from typing import Iterable, Iterator
 
 # Negative results; a count is >= 0. MISSING and UNREADABLE come from whoever
 # opens the file (no such file / not a readable regular file, too large, I/O
@@ -27,6 +27,15 @@ TRANSCRIPT_MISSING = -1
 TRANSCRIPT_MISMATCH = -2
 TRANSCRIPT_CORRUPT = -3
 TRANSCRIPT_UNREADABLE = -4
+
+# Bounds on what a reader takes in. A transcript is session-writable (a session
+# uid may replace its own with a sparse file holding one endless "line"), and
+# both the gateway and the broker's helper read it into memory: the caller
+# refuses a file larger than MAX_TRANSCRIPT_BYTES (UNREADABLE) and iterates
+# through :func:`bounded_lines`, which turns a line longer than MAX_LINE_CHARS
+# into CORRUPT instead of reading all of it. The CLI writes neither.
+MAX_TRANSCRIPT_BYTES = 1 << 30
+MAX_LINE_CHARS = 64 << 20
 
 
 def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
@@ -79,3 +88,20 @@ def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
             continue
         turns += 1
     return turns
+
+
+def bounded_lines(fh, max_line: int = MAX_LINE_CHARS) -> Iterator[str]:
+    """The lines of the text file *fh*, at most *max_line* characters each.
+
+    A longer line is not read past the bound: it is yielded as ``""``, which
+    :func:`count_transcript_turns` counts as CORRUPT, and iteration stops.
+    Mirrored by ``docker/isolation_broker.py`` like the counter.
+    """
+    while True:
+        line = fh.readline(max_line + 1)
+        if not line:
+            return
+        if len(line) > max_line:
+            yield ""
+            return
+        yield line
