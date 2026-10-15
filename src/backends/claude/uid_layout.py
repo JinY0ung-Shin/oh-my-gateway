@@ -648,7 +648,11 @@ def _has_leftovers(uid: int) -> bool:
                     continue
     except OSError:
         pass
-    return False
+    # SysV shm/sem/msg objects and POSIX message queues outlive a run too, and
+    # Landlock mediates none of them: the next caller on this uid could attach.
+    from .uid_cleanup import ipc_leftovers
+
+    return bool(ipc_leftovers(uid))
 
 
 def ensure_clean_ephemeral(uid: int, key: str) -> None:

@@ -62,6 +62,13 @@ def tree(tmp_path, monkeypatch):
     monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
     monkeypatch.setattr(uid_layout, "_SHM_DIR", str(tmp_path / "shm"))
     (tmp_path / "shm").mkdir()
+    # Nor the machine's SysV IPC tables or message queues (the test uid is the
+    # developer's): empty stand-ins.
+    from src.backends.claude import uid_cleanup
+
+    (tmp_path / "sysvipc").mkdir()
+    monkeypatch.setattr(uid_cleanup, "_SYSVIPC_DIR", str(tmp_path / "sysvipc"))
+    monkeypatch.setattr(uid_cleanup, "_MQUEUE_DIR", str(tmp_path / "mqueue"))
     from src.workspace_manager import workspace_manager
 
     monkeypatch.setattr(workspace_manager, "base_path", workspaces)
