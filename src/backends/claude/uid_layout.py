@@ -36,6 +36,7 @@ import errno
 import hashlib
 import logging
 import os
+import re
 import stat
 import threading
 import time
@@ -567,8 +568,10 @@ def _mark_tree_granted(workspace: str, uid: int, named: bool) -> None:
 
 
 def _write_file_at(directory: str, name: str, data: bytes) -> None:
-    """Replace ``directory/name`` atomically (a temp name, then a rename),
-    never following a symlink; mode 0644, owned by the gateway."""
+    """Replace ``directory/name`` atomically and durably (a temp name, fsync,
+    a rename, fsync of the dir), never following a symlink; mode 0644, owned
+    by the gateway. A crash leaves the old file or the new one, never an
+    empty one: a marker read back empty would mean something else."""
     dfd = os.open(directory, _DIR_NOFOLLOW)
     try:
         tmp = f".{name}.tmp-{os.getpid()}"
@@ -584,9 +587,11 @@ def _write_file_at(directory: str, name: str, data: bytes) -> None:
         )
         try:
             os.write(fd, data)
+            os.fsync(fd)
         finally:
             os.close(fd)
         os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
     finally:
         os.close(dfd)
 
@@ -707,12 +712,19 @@ def _owner_digest(key: str) -> bytes:
     return hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest().encode()
 
 
+_DIGEST = re.compile(rb"[0-9a-f]{64}")
+
+
 def _owner_state(uid: int, key: str) -> str:
     """Whom ``P(uid)`` belongs to, for a named user's *key*: ``"mine"`` (the
     marker holds this key), ``"unclaimed"`` (no marker, no P yet, or another
     key's marker: whatever is there is no data of this user's) — or
-    ``WorkspaceRefused`` when the marker cannot be read: an unreadable
-    marker must not make the gateway wipe the user's own transcripts."""
+    ``WorkspaceRefused`` when the marker cannot be read or holds no digest
+    (empty, cut short): such a marker must not make the gateway wipe the
+    user's own transcripts. Removing it by hand redoes the clean start.
+
+    A ``P`` made before this marker existed (builds of the uid layout before
+    it) reads as unclaimed: its user's first spawn wipes it."""
     config = cp.user_config_dir(uid)
     if config is None:
         raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
@@ -739,6 +751,11 @@ def _owner_state(uid: int, key: str) -> str:
         raise refused(f"cannot read the owner of uid {uid}'s config dir ({exc})")
     finally:
         os.close(fd)
+    if not _DIGEST.fullmatch(data):
+        raise refused(
+            f"the owner marker of uid {uid}'s config dir is malformed; remove "
+            f"{_OWNER_MARKER} there to redo its clean start"
+        )
     return "mine" if data == _owner_digest(key) else "unclaimed"
 
 

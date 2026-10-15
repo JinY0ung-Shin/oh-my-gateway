@@ -771,6 +771,47 @@ class TestFreshNamedUid:
         assert not (p / uid_layout._OWNER_MARKER).exists()
 
 
+class TestOwnerMarkerDurability:
+    @pytest.fixture
+    def claimed(self, tree, monkeypatch):
+        from src.backends.claude import broker_ops
+
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
+        ui.reset_registry_cache()
+        wiped = []
+        monkeypatch.setattr(
+            broker_ops, "cleanup", lambda uid, **kw: wiped.append(uid) or True
+        )
+        workspace = _named_ws(tree, "newbie")
+        uid_layout.migrate_user("newbie", workspace)
+        uid = ui.existing_uid("newbie")
+        p = tree["base"] / str(uid)
+        (p / "projects" / "-mine").mkdir()  # the user's own data from here on
+        uid_layout._clean_for.clear()
+        yield {"workspace": workspace, "p": p, "wiped": wiped}
+        ui.reset_registry_cache()
+
+    @pytest.mark.parametrize("content", [b"", b"\n", b"0123abcd\n", b"z" * 64])
+    def test_a_marker_without_a_digest_refuses_without_a_wipe(self, claimed, content):
+        # A crash cannot leave one (the write is fsync'd), but whatever left
+        # it, it is no evidence that P belongs to someone else.
+        (claimed["p"] / uid_layout._OWNER_MARKER).write_bytes(content)
+        with pytest.raises(landlock.WorkspaceRefused, match="malformed"):
+            uid_layout.migrate_user("newbie", claimed["workspace"])
+        assert claimed["wiped"] == []
+        assert (claimed["p"] / "projects" / "-mine").is_dir()
+
+    def test_marker_writes_are_fsynced(self, tree, monkeypatch):
+        synced = []
+        real = os.fsync
+        monkeypatch.setattr(os, "fsync", lambda fd: synced.append(fd) or real(fd))
+        target = tree["tmp"] / "markers"
+        target.mkdir()
+        uid_layout._write_file_at(str(target), "m", b"x\n")
+        assert len(synced) == 2  # the file before the rename, the dir after
+        assert (target / "m").read_bytes() == b"x\n"
+
+
 class TestPerUidOptionsEnv:
     def test_a_named_spawn_gets_its_config_dir_and_lists(self, tree, monkeypatch):
         monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
