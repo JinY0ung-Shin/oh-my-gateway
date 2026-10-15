@@ -392,6 +392,35 @@ class TestSessionLookup:
         )
         ui.reset_registry_cache()
 
+    def test_an_unmigrated_legacy_workspace_reads_the_legacy_dir(
+        self, tree, monkeypatch
+    ):
+        # A named user with a uid resumes a session of the legacy <base>/<user>
+        # layout: until a spawn there copies its project dir, it is only in the
+        # legacy config dir (#3 of the cleanup review).
+        monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
+        ui.reset_registry_cache()
+        legacy = tree["tmp"] / "legacy"
+        monkeypatch.setenv(cp.MIGRATE_FROM_ENV, str(legacy))
+        uid = ui.resolve_uid("carol")
+        uid_layout.ensure_user_config(cp.layout(uid))
+        old_ws = tree["workspaces"] / "carol"
+        old_ws.mkdir()
+        name = ws._project_dir_name(str(old_ws))
+        (legacy / "projects" / name).mkdir(parents=True)
+        (legacy / "projects" / name / "s.jsonl").write_text(
+            _transcript(str(old_ws), "hi")
+        )
+        assert uid_layout.projects_root("carol", old_ws) == legacy / "projects"
+        uid_layout.migrate_legacy("carol", uid, str(old_ws))
+        p_projects = tree["base"] / str(uid) / "projects"
+        assert uid_layout.projects_root("carol", old_ws) == p_projects
+        # A workspace with nothing in the legacy dir uses P straight away.
+        new_ws = tree["workspaces"] / "carol" / "claude"
+        new_ws.mkdir()
+        assert uid_layout.projects_root("carol", new_ws) == p_projects
+        ui.reset_registry_cache()
+
     def test_anonymous_without_lease_has_no_root(self, tree):
         assert uid_layout.projects_root(None, "/ws/_tmp_x") is None
 

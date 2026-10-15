@@ -5,6 +5,7 @@ implementation registered as the ``claude`` backend.
 """
 
 import asyncio
+import functools
 import weakref
 import json
 import os
@@ -2022,26 +2023,34 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # worker thread: the first one also grants a whole existing workspace
         # tree (and may copy a large legacy project dir).
         await asyncio.to_thread(migrate_user, user, cwd)
-        has_history = _session_jsonl_exists(session)
-        options = self._build_sdk_options(
-            model=model,
-            system_prompt=system_prompt,
-            max_turns=get_default_max_turns(),
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-            session_id=None if has_history else session.session_id,
-            resume=session.session_id if has_history else None,
-            permission_mode=permission_mode,
-            output_format=output_format,
-            mcp_servers=mcp_servers,
-            task_budget=task_budget,
-            cwd=Path(cwd) if cwd else None,
-            extra_env=extra_env,
-            _custom_base=_custom_base,
-            user=user,
-            forward_headers=forward_headers,
-            include_partial_messages=include_partial_messages,
-            effort=effort,
+        # Off the loop too: a transcript the gateway may not stat is asked of
+        # the broker.
+        has_history = await asyncio.to_thread(_session_jsonl_exists, session)
+        # In a worker thread: under uid isolation building the options prepares
+        # the session uid's layout (``uid_layout.prepare_spawn``), which on a
+        # leased uid a dead gateway left dirty waits for a broker wipe.
+        options = await asyncio.to_thread(
+            functools.partial(
+                self._build_sdk_options,
+                model=model,
+                system_prompt=system_prompt,
+                max_turns=get_default_max_turns(),
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                session_id=None if has_history else session.session_id,
+                resume=session.session_id if has_history else None,
+                permission_mode=permission_mode,
+                output_format=output_format,
+                mcp_servers=mcp_servers,
+                task_budget=task_budget,
+                cwd=Path(cwd) if cwd else None,
+                extra_env=extra_env,
+                _custom_base=_custom_base,
+                user=user,
+                forward_headers=forward_headers,
+                include_partial_messages=include_partial_messages,
+                effort=effort,
+            )
         )
         # 세션 단위 effort — SDK가 생성 시점에 굽는다(중간 변경 API 없음).
         # 그래서 '다음 새 대화부터 적용'이 이 값의 정직한 의미다.
@@ -2076,7 +2085,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # the awaits above (skill discovery serialized under the global preflight
         # lock, the relay probe) can outlast that under a burst: the broker
         # would refuse the spawn. Mint it again right before the spawn (#241).
-        self._configure_confinement(
+        await asyncio.to_thread(
+            self._configure_confinement,
             options,
             Path(options.cwd) if options.cwd else None,
             user,

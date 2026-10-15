@@ -166,10 +166,55 @@ def projects_root(user: Optional[str], workspace) -> Optional[Path]:
         return cp.projects_root()
     uid = session_uid(user, workspace)
     if uid is not None:
+        if user and workspace is not None:
+            legacy = _unmigrated_legacy_projects(uid, workspace)
+            if legacy is not None:
+                return legacy
         return cp.layout(uid).projects
     if user:
         legacy = cp.legacy_config_dir()
         return None if legacy is None else legacy / "projects"
+    return None
+
+
+def _unmigrated_legacy_projects(uid: int, workspace) -> Optional[Path]:
+    """The legacy ``projects`` root while this workspace's project dir is
+    still only there, else ``None``.
+
+    The legacy copy runs on a spawn in that workspace (:func:`migrate_user`).
+    A named user who got a uid in one workspace may still resume a session of
+    another (the legacy ``<base>/<user>`` layout): until a spawn there copied
+    its project dir, its transcripts are only in the legacy config dir, and
+    looking in ``P`` alone answered 404 before any spawn could copy them.
+    """
+    from . import workspace_sandbox as ws
+
+    legacy = cp.legacy_config_dir()
+    config = cp.user_config_dir(uid)
+    if legacy is None or config is None:
+        return None
+    name = ws._project_dir_name(str(workspace))
+    try:
+        os.lstat(config / "projects" / name)
+        return None  # P has it: authoritative
+    except OSError:
+        pass
+    try:
+        p_fd = os.open(os.path.realpath(config), _DIR_NOFOLLOW)
+    except OSError:
+        p_fd = -1
+    if p_fd >= 0:
+        try:
+            if name in _migrated(p_fd):
+                return None
+        finally:
+            os.close(p_fd)
+    candidate = legacy / "projects"
+    try:
+        if stat.S_ISDIR(os.lstat(candidate / name).st_mode):
+            return candidate
+    except OSError:
+        pass
     return None
 
 
