@@ -654,9 +654,12 @@ class TestMigrationBounds:
 
 
 class TestFreshNamedUid:
-    def test_a_newly_assigned_uid_starts_clean(self, tree, monkeypatch):
-        """A band change can hand a named user a uid an anonymous run used:
-        its config dir is wiped as that uid before the user's first spawn."""
+    """A band change can hand a named user a uid an anonymous run used: its
+    config dir is wiped as that uid before the user's first spawn, and that is
+    decided by the owner marker in P, not by whether the registry had the uid."""
+
+    @pytest.fixture
+    def broker(self, tree, monkeypatch):
         from src.backends.claude import broker_ops
 
         monkeypatch.setenv(ui.UID_REGISTRY_ENV, str(tree["tmp"] / "uids.json"))
@@ -665,22 +668,107 @@ class TestFreshNamedUid:
         uid_layout.ensure_user_config(cp.layout(uid))
         stale = tree["base"] / str(uid) / "projects" / "-old-run"
         stale.mkdir()
-        wiped = []
+        state = {"uid": uid, "stale": stale, "wiped": [], "fail": 0}
 
         def cleanup(cleanup_uid, **kwargs):
-            wiped.append((cleanup_uid, kwargs))
-            stale.rmdir()
+            state["wiped"].append(cleanup_uid)
+            if state["fail"]:
+                state["fail"] -= 1
+                raise broker_ops.BrokerOpError("the broker is restarting")
+            if stale.exists():
+                stale.rmdir()
             return True
 
         monkeypatch.setattr(broker_ops, "cleanup", cleanup)
+        yield state
+        ui.reset_registry_cache()
+
+    def test_a_newly_assigned_uid_starts_clean(self, tree, broker):
         workspace = _named_ws(tree, "newbie")
         uid_layout.migrate_user("newbie", workspace)
+        uid = broker["uid"]
         assert ui.existing_uid("newbie") == uid
-        assert wiped and wiped[0][0] == uid
-        wiped.clear()
-        uid_layout.migrate_user("newbie", workspace)  # not fresh any more
-        assert wiped == []
-        ui.reset_registry_cache()
+        assert broker["wiped"] == [uid] and not broker["stale"].exists()
+        broker["wiped"].clear()
+        uid_layout.migrate_user("newbie", workspace)  # claimed now
+        assert broker["wiped"] == []
+
+    def test_a_failed_wipe_is_redone_on_the_retry(self, tree, broker):
+        # The registry keeps the uid the first attempt was given; the retry
+        # must not take that for "not fresh" and start on the old run's state.
+        workspace = _named_ws(tree, "newbie")
+        broker["fail"] = 1
+        with pytest.raises(ui.UidAllocationError):
+            uid_layout.migrate_user("newbie", workspace)
+        assert ui.existing_uid("newbie") == broker["uid"]
+        assert broker["stale"].exists()
+        uid_layout.migrate_user("newbie", workspace)
+        assert broker["wiped"] == [broker["uid"]] * 2
+        assert not broker["stale"].exists()
+
+    def test_the_spawn_path_cleans_too(self, tree, broker, monkeypatch):
+        monkeypatch.setenv(ui.TICKET_SECRET_ENV, "s3cret")
+        monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+        workspace = _named_ws(tree, "newbie")
+        broker["fail"] = 1
+        with pytest.raises(ui.UidAllocationError):
+            landlock.options_env(workspace, user="newbie", session_id="s1")
+        landlock.options_env(workspace, user="newbie", session_id="s1")
+        assert not broker["stale"].exists()
+
+    def test_the_claim_survives_a_restart(self, tree, broker):
+        workspace = _named_ws(tree, "newbie")
+        uid_layout.migrate_user("newbie", workspace)
+        mine = tree["base"] / str(broker["uid"]) / "projects" / "-mine"
+        mine.mkdir()  # the user's own transcripts from here on
+        uid_layout._clean_for.clear()  # a new process
+        broker["wiped"].clear()
+        uid_layout.migrate_user("newbie", workspace)
+        assert broker["wiped"] == [] and mine.is_dir()
+
+    @pytest.mark.parametrize("plant", ["dir", "symlink"])
+    def test_an_unreadable_marker_refuses_without_a_wipe(self, tree, broker, plant):
+        workspace = _named_ws(tree, "newbie")
+        uid_layout.migrate_user("newbie", workspace)
+        p = tree["base"] / str(broker["uid"])
+        marker = p / uid_layout._OWNER_MARKER
+        marker.unlink()
+        if plant == "dir":
+            marker.mkdir()
+        else:
+            marker.symlink_to(tree["tmp"] / "elsewhere")
+        uid_layout._clean_for.clear()
+        broker["wiped"].clear()
+        with pytest.raises(landlock.WorkspaceRefused):
+            uid_layout.migrate_user("newbie", workspace)
+        assert broker["wiped"] == []
+
+    def test_another_owners_dir_is_wiped_and_reclaimed(self, tree, broker):
+        uid = broker["uid"]
+        p = tree["base"] / str(uid)
+        (p / uid_layout._OWNER_MARKER).write_bytes(
+            uid_layout._owner_digest("named:someone-else") + b"\n"
+        )
+        (p / uid_layout._MIGRATED_MARKER).write_text("-their-project\n")
+        workspace = _named_ws(tree, "newbie")
+        uid_layout.migrate_user("newbie", workspace)
+        assert broker["wiped"] == [uid]
+        assert (p / uid_layout._OWNER_MARKER).read_bytes().strip() == (
+            uid_layout._owner_digest("named:newbie")
+        )
+        # The migration record starts over: only this user's project now.
+        migrated = (p / uid_layout._MIGRATED_MARKER).read_text().split()
+        assert migrated == [ws._project_dir_name(str(workspace))]
+
+    def test_an_anonymous_lease_drops_the_claim(self, tree, broker):
+        uid = broker["uid"]
+        p = tree["base"] / str(uid)
+        broker["stale"].rmdir()
+        (p / uid_layout._OWNER_MARKER).write_bytes(b"x\n")
+        workspace = tree["workspaces"] / "_tmp_anon"
+        workspace.mkdir()
+        uid_layout.prepare_spawn(uid, str(workspace), user=None, key=str(workspace))
+        assert not (p / uid_layout._OWNER_MARKER).exists()
 
 
 class TestPerUidOptionsEnv:

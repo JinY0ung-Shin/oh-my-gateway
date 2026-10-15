@@ -33,6 +33,7 @@ are changed.
 from __future__ import annotations
 
 import errno
+import hashlib
 import logging
 import os
 import stat
@@ -88,6 +89,9 @@ _GLOBAL_CONFIG_TARGET = "state/.claude.json"
 # cannot write.
 _TREE_MARKER_PREFIX = ".oh-my-gateway-acl-"
 _MIGRATED_MARKER = ".oh-my-gateway-migrated"
+# In P: whose config dir it is — the digest of the named user's key, written
+# once its first clean start passed (:func:`_claim`).
+_OWNER_MARKER = ".oh-my-gateway-owner"
 
 _DIR = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
 _DIR_NOFOLLOW = _DIR | os.O_NOFOLLOW
@@ -658,9 +662,9 @@ def _has_leftovers(uid: int) -> bool:
 def ensure_clean_ephemeral(uid: int, key: str) -> None:
     """Make sure the run leasing *uid* under *key* starts clean.
 
-    For an ephemeral uid on every new lease; for a named user's uid only when
-    the registry has just assigned it (a band change can hand a named user a
-    uid an anonymous run used, ``prepare_spawn(fresh=True)``).
+    For an ephemeral uid on every new lease; for a named user's uid until its
+    config dir is claimed for that user (:func:`_owner_state`): a band change
+    can hand a named user a uid an anonymous run used.
 
     A lease is released only after the broker wiped ``P(uid)`` and the uid's
     ``/dev/shm`` objects (``uid_cleanup``), but a previous gateway process may
@@ -678,8 +682,8 @@ def ensure_clean_ephemeral(uid: int, key: str) -> None:
         from .uid_cleanup import _broker_path
 
         logger.warning(
-            "uid isolation: ephemeral uid %d still holds a previous run's state; "
-            "wiping it before reuse",
+            "uid isolation: uid %d still holds a previous run's state; wiping it "
+            "before reuse",
             uid,
         )
         targets = [
@@ -689,15 +693,95 @@ def ensure_clean_ephemeral(uid: int, key: str) -> None:
             done = broker_ops.cleanup(uid, clear=targets, shm=True, wait=10)
         except Exception as exc:
             raise ui.UidAllocationError(
-                f"could not wipe the previous run's state of ephemeral uid {uid}: "
-                f"{exc}"
+                f"could not wipe the previous run's state of uid {uid}: {exc}"
             ) from exc
         if not done or _has_leftovers(uid):
             raise ui.UidAllocationError(
-                f"the previous run's state of ephemeral uid {uid} is not fully "
-                "removed; retry shortly"
+                f"the previous run's state of uid {uid} is not fully removed; "
+                "retry shortly"
             )
     _clean_for[uid] = key
+
+
+def _owner_digest(key: str) -> bytes:
+    return hashlib.sha256(key.encode("utf-8", "surrogatepass")).hexdigest().encode()
+
+
+def _owner_state(uid: int, key: str) -> str:
+    """Whom ``P(uid)`` belongs to, for a named user's *key*: ``"mine"`` (the
+    marker holds this key), ``"unclaimed"`` (no marker, no P yet, or another
+    key's marker: whatever is there is no data of this user's) — or
+    ``WorkspaceRefused`` when the marker cannot be read: an unreadable
+    marker must not make the gateway wipe the user's own transcripts."""
+    config = cp.user_config_dir(uid)
+    if config is None:
+        raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
+    try:
+        dfd = os.open(os.path.realpath(config), _DIR_NOFOLLOW)
+    except FileNotFoundError:
+        return "unclaimed"
+    except OSError as exc:
+        raise refused(f"the per-uid config dir of uid {uid} is unusable ({exc})")
+    try:
+        fd = os.open(_OWNER_MARKER, _FILE_NOFOLLOW, dir_fd=dfd)
+    except FileNotFoundError:
+        return "unclaimed"
+    except OSError as exc:
+        raise refused(f"cannot read the owner of uid {uid}'s config dir ({exc})")
+    finally:
+        os.close(dfd)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != _app_uid():
+            raise refused(f"the owner marker of uid {uid}'s config dir is not ours")
+        data = os.read(fd, 128).strip()
+    except OSError as exc:
+        raise refused(f"cannot read the owner of uid {uid}'s config dir ({exc})")
+    finally:
+        os.close(fd)
+    return "mine" if data == _owner_digest(key) else "unclaimed"
+
+
+def _claim(uid: int, key: str) -> None:
+    """Record ``P(uid)`` as *key*'s, after its clean start passed and before
+    any data of the user lands there. A failure refuses the spawn: without
+    the marker, the next spawn would take the user's data for a previous run's.
+    A previous owner's migration record goes first (it names their projects)."""
+    config = cp.user_config_dir(uid)
+    if config is None:
+        raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
+    real = os.path.realpath(config)
+    try:
+        dfd = os.open(real, _DIR_NOFOLLOW)
+        try:
+            os.unlink(_MIGRATED_MARKER, dir_fd=dfd)
+        except FileNotFoundError:
+            pass
+        finally:
+            os.close(dfd)
+        _write_file_at(real, _OWNER_MARKER, _owner_digest(key) + b"\n")
+    except OSError as exc:
+        raise refused(f"cannot record the owner of uid {uid}'s config dir ({exc})")
+
+
+def _unclaim(uid: int) -> None:
+    """Drop the owner marker of a uid an ephemeral run leases (the registry
+    gave it up): a named user it goes to later starts clean again."""
+    config = cp.user_config_dir(uid)
+    if config is None:
+        return
+    try:
+        dfd = os.open(os.path.realpath(config), _DIR_NOFOLLOW)
+    except OSError:
+        return
+    try:
+        os.unlink(_OWNER_MARKER, dir_fd=dfd)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise refused(f"cannot clear the owner of uid {uid}'s config dir ({exc})")
+    finally:
+        os.close(dfd)
 
 
 # --------------------------------------------------------------------------
@@ -1040,34 +1124,55 @@ def prepare_spawn(
     *,
     user: Optional[str],
     key: str,
-    fresh: bool = False,
 ) -> ConfigLayout:
     """Make *uid*'s config dir and the resolved *workspace* ready for a spawn.
 
     Runs before every per-uid spawn (sessions, the slash preflight, ``verify()``
-    and the startup probe): for an anonymous run first the clean-start check
-    of its ephemeral uid (:func:`ensure_clean_ephemeral`, *key* being its lease
-    key), then the per-uid config dir (:func:`ensure_user_config`), the
-    workspace grant (:func:`grant_workspace`) and, for a named user, the
-    one-time legacy migration (:func:`migrate_legacy`). *fresh*: the registry
-    assigned the named user's uid just now — its config dir gets the same
-    clean-start check. Returns the spawn's layout. Raises
+    and the startup probe): first the clean start (:func:`_start_clean`, *key*
+    being the lease key of an anonymous run or ``named:<user>``), then the
+    per-uid config dir (:func:`ensure_user_config`), the workspace grant
+    (:func:`grant_workspace`) and, for a named user, the one-time legacy
+    migration (:func:`migrate_legacy`). Returns the spawn's layout. Raises
     ``WorkspaceRefused`` for a layout it cannot prepare and
-    ``UidAllocationError`` for an ephemeral uid that is not clean yet.
+    ``UidAllocationError`` for a uid that is not clean yet.
     """
     layout = cp.layout(uid)
     if not layout.per_uid:
         raise refused(f"{cp.CONFIG_BASE_ENV} is not set")
     with _uid_lock(uid):
-        if not user or fresh:
-            # First: a wipe empties state/ too, and the layout below puts the
-            # pristine global config back.
-            ensure_clean_ephemeral(uid, key)
-        ensure_user_config(layout)
+        _start_clean(uid, layout, user=user, key=key)
         grant_workspace(workspace, uid, named=bool(user))
         if user:
             migrate_legacy(user, uid, workspace)
     return layout
+
+
+def _start_clean(
+    uid: int, layout: ConfigLayout, *, user: Optional[str], key: str
+) -> None:
+    """The clean start and config dir of a spawn, under the uid's lock.
+
+    An anonymous run's ephemeral uid is checked on every new lease. A named
+    user's uid until its config dir is claimed for that user: a band change
+    can hand a named user a uid an anonymous run used, and the check must
+    survive a wipe that failed (the registry keeps the uid, the client
+    retries) and a restart — so it is decided by the marker in ``P``
+    (:func:`_owner_state`), not by whether the registry had the uid. The clean
+    check runs first (a wipe empties ``state/`` too, and the layout puts the
+    pristine global config back); the claim is recorded before anything of
+    the user's lands in ``P``.
+    """
+    if not user:
+        ensure_clean_ephemeral(uid, key)
+        ensure_user_config(layout)
+        _unclaim(uid)
+        return
+    claimed = _owner_state(uid, key) == "mine"
+    if not claimed:
+        ensure_clean_ephemeral(uid, key)
+    ensure_user_config(layout)
+    if not claimed:
+        _claim(uid, key)
 
 
 def migrate_user(user: Optional[str], workspace) -> None:
@@ -1087,7 +1192,6 @@ def migrate_user(user: Optional[str], workspace) -> None:
     from . import landlock
     from . import uid_isolation as ui
 
-    fresh = ui.existing_uid(user) is None
     uid = ui.resolve_uid(user, persist=True)
     layout = cp.layout(uid)
     resolved = landlock._confined_workspace(
@@ -1096,9 +1200,7 @@ def migrate_user(user: Optional[str], workspace) -> None:
         layout=layout,
     )
     with _uid_lock(uid):
-        if fresh:
-            ensure_clean_ephemeral(uid, f"named:{user}")
-        ensure_user_config(layout)
+        _start_clean(uid, layout, user=user, key=f"named:{user}")
         grant_workspace(resolved, uid, named=True)
         migrate_legacy(user, uid, resolved)
 
