@@ -483,10 +483,29 @@ Landlock ABI 7, root 시작, 가짜 Anthropic API). 코드 위치와 결정은 �
 - **테스트 안전장치**: `--test-same-uid`(개발자 uid로 도는) 브로커는 op 경로가 임시 디렉터리 밖이면 거부하고,
   `/dev/shm`은 `GATEWAY_ISOLATION_TEST_SHM_DIR`을 줄 때만 그 디렉터리로 대신한다.
 
-### 11.4 남은 것
+### 11.4 리뷰 반영 (같은 날, 독립 리뷰 3개 + 검증)
+- **SysV IPC**: 두 리뷰어가 컨테이너에서 재현 — 런이 남긴 SysV shm·세마포어를 같은 uid를 다시 받은 다음 익명
+  런이 읽었다(Landlock은 SysV IPC를 중재하지 않는다, `/dev/shm`만 막던 §3.3의 공백). cleanup op의 IPC 단계가 그
+  uid 소유(owner 또는 creator) SysV shm/sem/msg와 `/dev/mqueue` 항목을 `IPC_RMID`/unlink하고, 게이트웨이의 잔여물
+  판정(`uid_cleanup.ipc_leftovers`)도 그것을 센다(컨테이너 재확인: 다음 런에서 0개).
+- **transcript 읽기 상한**: 세션이 쓸 수 있는 transcript를 개행 없는 sparse 파일로 바꾸면 이전·재개가 한 줄을
+  통째로 읽어 게이트웨이가 OOM이었다(재현). 공유 규칙 `MAX_TRANSCRIPT_BYTES`(1 GiB)·`MAX_LINE_CHARS`(64 MiB)·
+  `bounded_lines`를 게이트웨이·브로커 사본이 함께 쓴다. 이전 복사는 깊이 상한·하드링크 제외·예외 포착을 더했다.
+- **이벤트 루프·락**: rehydrate는 transcript를 세션 매니저 락 밖, 워커 스레드에서 읽고(`get_session_async`),
+  create_client의 옵션 구성(`prepare_spawn`)·transcript 확인, slash preflight, 미러 동기화도 워커 스레드에서 한다.
+- **정리 내구성**: Reclaimer 워커 4개, 포기한 워크스페이스 작업은 5분마다 다시, uid 모드 기동 sweep은 나이와
+  무관하게 `_tmp_`를 거둔다. 일시적 브로커 장애는 503(재시도), 거부·못 읽음만 500 `transcript_unreadable`.
+- **보존**: CLI처럼 `user` setting source가 켜졌을 때만 sweep하고, 그 uid의 live supervisor가 있으면 expire를 막는다.
+- **그 밖**: 이전 안 된 레거시 `<base>/<user>` 세션의 resume(레거시 dir fallback), 미러 재링크 경쟁(워크스페이스
+  락), 파일 API 교체 때 세션 uid의 ACL 유지, 이름이 겹치는 project의 `memory/` 미복사, 새로 배정된 named uid의
+  잔여물 정리, `agent_catalog`의 연 파일 위치 확인, 거부된 marker 경고 1회.
+
+### 11.5 남은 것
 - 운영 배포 컨테이너에서 `docs/isolation-uid-verification.md` 재실행(커널·seccomp·마운트·ACL 지원은 이 dev
   머신과 무관하다).
 - named 사용자 uid 회수, 브로커 seccomp 인자 필터·bounding set 축소, 비root 시작 경로, codex/opencode(격리 밖).
 - 보존 sweep과 동시 spawn의 좁은 경쟁(비고 오래된 `projects/<name>`을 sweep이 지우는 순간 같은 사용자의 spawn이
   그것을 쓰는 경우)은 감수한다.
 - 파일 API는 세션 uid가 0600/0700으로 잠근 파일에서 500이다(§3.5-2, 자기 것만 잠근 경우).
+- SysV IPC는 세션별 namespace가 아니라, 살아 있는 세션이 일부러 world 권한으로 만든 객체는 다른 살아 있는 세션이
+  열 수 있다(Landlock 비중재). 세션별 IPC namespace(또는 seccomp 차단)가 후속이다. 남은 객체는 위 정리가 지운다.

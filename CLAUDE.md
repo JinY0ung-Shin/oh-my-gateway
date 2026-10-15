@@ -568,16 +568,33 @@ uv run pytest --cov=src                            # with coverage
   registry roots, `P/plugins`); `_GrantFilter` knows `S` (shared names only) and denies the config
   base. The broker's two ops (`docker/isolation_broker.py`; client `broker_ops`, no fds, strict
   schema; the spawn path refuses an op ticket): `cleanup` (as `(broker, U, broker)`: clear / remove
-  / expire / `/dev/shm`, no link followed, parked while a live supervisor of that `(uid, workspace)`
-  runs, a spawn of the uid refused meanwhile) and `transcript` (returns only a turn count or a
-  negative code: `transcript_turns.count_transcript_turns`, kept byte-identical to the broker's copy
-  by `tests/test_transcript_turns.py`). A daily `uid_cleanup.retention_sweep` expires named users'
-  per-uid state older than `S`'s `cleanupPeriodDays` (the CLI's own sweep runs only when that uid's
-  CLI starts). The CLI child gets umask 077 (new `/dev/shm` objects 0600), git `safe.directory` for
+  / expire / IPC — `/dev/shm` entries, SysV shm/sem/msg objects whose owner or creator is U, and
+  `/dev/mqueue` entries —, no link followed, parked while a live supervisor of that
+  `(uid, workspace)` runs, the IPC and expire steps while any of the uid runs, a spawn of the uid
+  refused meanwhile) and `transcript` (returns only a turn count or a negative code:
+  `transcript_turns.count_transcript_turns` over `bounded_lines`, files above
+  `MAX_TRANSCRIPT_BYTES` refused, kept byte-identical to the broker's copy by
+  `tests/test_transcript_turns.py`). The gateway's leftover checks count the same IPC objects
+  (`uid_cleanup.ipc_leftovers`, fail closed). SysV IPC is not namespaced per session and Landlock
+  does not mediate it: a live session can still share an object it made world-accessible with
+  another live session (a per-session IPC namespace is the follow-up). Rehydrate reads the transcript
+  outside `SessionManager.lock` and off the event loop (`get_session_async`); a transient broker
+  failure is a retryable 503 (`TranscriptTemporarilyUnavailable`), a refusal or an unreadable one
+  the 500 `transcript_unreadable`. The `Reclaimer` has 4 workers and re-parks a given-up workspace
+  job every 5 min while its root and lease exist; the uid-mode startup sweep takes every `_tmp_`
+  regardless of age (one process per registry). A daily `uid_cleanup.retention_sweep` expires named
+  users' per-uid state older than `S`'s `cleanupPeriodDays`, only when the `user` setting source is
+  on (the CLI's own sweep has the same gate and runs only when that uid's CLI starts). The CLI child gets umask 077 (new `/dev/shm` objects 0600), git `safe.directory` for
   the app-owned root via `GIT_CONFIG_COUNT`, and `USER`/`LOGNAME` from the passwd entries the root
   entrypoint adds for the broker uid and the band (`provision_session_accounts`, ≤ 65536 uids). The
   quota walk skips only a session uid's private dirs under `.cli-tmp` (else every quota-growing write
-  of every uid-mode session would fail closed). In tests the broker refuses op paths outside the
+  of every uid-mode session would fail closed). The file API's compare-and-swap write keeps a session
+  uid's named ACL entry and mask on the file it replaces (`_keep_owner_access`: the chmod to the old
+  mode would collapse the mask and lock the agent out of its own file). The one-time tree grant
+  holds `workspace_resources.workspace_lock` across mirror clear → grant → rebuild; legacy reads and
+  copies are bounded (size, line length, depth; hard-linked files skipped) and a failure never fails
+  the spawn; a freshly assigned named uid gets the ephemeral clean-start check (a band change can
+  hand it a uid an anonymous run used). In tests the broker refuses op paths outside the
   temp dir and touches `/dev/shm` only via `GATEWAY_ISOLATION_TEST_SHM_DIR` (the test uid is the
   developer's). Python 3.12's `Path.exists()/is_file()` raise on an unsearchable parent: code that
   looks into session-writable trees uses `lstat` and catches `OSError`. Rollback to landlock/off

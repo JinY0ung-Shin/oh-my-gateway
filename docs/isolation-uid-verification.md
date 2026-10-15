@@ -36,6 +36,8 @@
 >   0·NNP 1, 세션 삭제 때 `nohup` 작업까지 정리된다.
 > - landlock 모드로 되돌리면 app uid가 세션 uid가 만든 파일을 ACL로 계속 읽고 쓴다.
 > - 음성 시험: config base 미설정, 공유 config dir이 `/home/app`(0700) 안 → 이유를 남기고 기동 거부.
+> - 리뷰 반영 뒤 이미지(`omg-uid:ff0266c`)로 위 전부를 다시 돌려 통과했고, SysV IPC 시험을 더했다: ephemeral
+>   uid 하나로 돌린 익명 런이 SysV shm·세마포어를 남기면, 같은 uid를 받은 다음 런에는 0개가 보인다.
 
 무특권 부분(티켓 서명·검증 패리티·uid 매핑·ephemeral uid 임대와 그 수명·SCM_RIGHTS fd 전달·supervisor
 트리·Landlock·`O_NOFOLLOW` 규칙 열기·cwd 일치 검사·종료 상태 미러링·teardown·하위 프로세스 sweep·고아 킬러·
@@ -250,6 +252,8 @@ passwd/group·공유 트리·config base 프로비저닝과 compose override, �
 - 브로커 cap 추가 잠금: `set*id` 대상을 사용자 uid 대역으로 묶는 **seccomp 인자 필터**,
   bounding set 최소화(CAP_SETPCAP 필요).
 - 비root 시작(compose `user:`) 경로의 브로커 file-cap 기동.
+- SysV IPC는 세션별 namespace가 아니다: 살아 있는 세션이 world 권한으로 만든 SysV 객체는 다른 살아 있는
+  세션이 열 수 있다(Landlock 비중재). 런이 끝나면 정리 op가 그 uid의 객체를 지운다. 세션별 IPC namespace가 후속이다.
 - 보존 sweep(하루 한 번, 공유 `settings.json`의 `cleanupPeriodDays`)과 같은 사용자의 동시 spawn 사이의 좁은 경쟁:
   비고 오래된 `projects/<name>`을 sweep이 지우는 순간 그 사용자의 spawn이 그 디렉터리를 쓰면 그 세션의
   transcript가 남지 않는다(감수).
