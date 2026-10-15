@@ -46,6 +46,8 @@ from typing import Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from .uid_layout import to_thread_to_completion
+
 # Destructive built-ins are always blocked. Operators extend the set with the
 # BLOCKED_SLASH_COMMANDS env var (comma-separated names, leading slash
 # optional) to disable additional skills/commands gateway-wide. This gates the
@@ -243,7 +245,7 @@ async def _fetch_commands(cwd: Optional[Path], user: Optional[str] = None) -> se
     """
     # Off the event loop: the build refreshes the workspace's resource mirrors
     # and, under uid isolation, prepares the session uid's layout.
-    opts = await asyncio.to_thread(_build_preflight_options, cwd, user)
+    opts = await to_thread_to_completion(_build_preflight_options, cwd, user)
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -298,7 +300,7 @@ async def _fetch_command_details(
     cwd: Optional[Path], user: Optional[str] = None
 ) -> dict[str, dict[str, str]]:
     """Names plus SDK metadata (description, argumentHint) for completion UIs."""
-    opts = await asyncio.to_thread(_build_preflight_options, cwd, user)
+    opts = await to_thread_to_completion(_build_preflight_options, cwd, user)
     details: dict[str, dict[str, str]] = {}
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()

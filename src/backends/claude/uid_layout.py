@@ -32,6 +32,7 @@ are changed.
 
 from __future__ import annotations
 
+import asyncio
 import errno
 import hashlib
 import logging
@@ -1133,6 +1134,34 @@ def _copy_project(legacy: Path, name: str, p_fd: int, workspace: str) -> Optiona
 # --------------------------------------------------------------------------
 # Entry points
 # --------------------------------------------------------------------------
+
+
+async def to_thread_to_completion(func, /, *args, **kwargs):
+    """``asyncio.to_thread``, except that a cancelled caller first waits for
+    the thread to finish; the cancellation then propagates as usual.
+
+    A spawn's preparation runs in a thread (it may wait for a broker wipe):
+    it leases an anonymous run's uid, grants the workspace and builds the
+    layout. Cancelling the await does not stop the thread, and the caller's
+    cleanup (removing the workspace, releasing the lease) would otherwise run
+    beside it — the thread could then lease again for a workspace that is
+    gone. A failure the thread raises after the cancellation is logged."""
+    future = asyncio.ensure_future(asyncio.to_thread(func, *args, **kwargs))
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        while not future.done():
+            try:
+                await asyncio.wait({future})
+            except asyncio.CancelledError:
+                pass  # cancelled again: the thread still has to finish
+        if not future.cancelled() and future.exception() is not None:
+            logger.debug(
+                "uid isolation: %s failed after its caller was cancelled: %r",
+                getattr(func, "__name__", func),
+                future.exception(),
+            )
+        raise
 
 
 def prepare_spawn(

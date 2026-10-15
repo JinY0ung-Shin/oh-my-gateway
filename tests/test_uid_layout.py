@@ -9,10 +9,12 @@ that it never follows what a session could plant. That the kernel then lets
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import stat
+import threading
 from pathlib import Path
 
 import pytest
@@ -810,6 +812,95 @@ class TestOwnerMarkerDurability:
         uid_layout._write_file_at(str(target), "m", b"x\n")
         assert len(synced) == 2  # the file before the rename, the dir after
         assert (target / "m").read_bytes() == b"x\n"
+
+
+class TestToThreadToCompletion:
+    async def test_a_cancelled_caller_waits_for_the_thread(self):
+        started, release = threading.Event(), threading.Event()
+        order = []
+
+        def work():
+            started.set()
+            release.wait(5)
+            order.append("thread")
+            return 1
+
+        task = asyncio.ensure_future(uid_layout.to_thread_to_completion(work))
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done()  # held until the thread is through
+        task.cancel()  # a second cancellation changes nothing
+        await asyncio.sleep(0.05)
+        assert not task.done()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert order == ["thread"]
+
+    async def test_a_failure_after_the_cancel_stays_a_cancellation(self):
+        started, release = threading.Event(), threading.Event()
+
+        def work():
+            started.set()
+            release.wait(5)
+            raise RuntimeError("too late")
+
+        task = asyncio.ensure_future(uid_layout.to_thread_to_completion(work))
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    async def test_results_and_errors_pass_through(self):
+        assert await uid_layout.to_thread_to_completion(lambda a, b: a + b, 1, b=2) == 3
+        with pytest.raises(ValueError):
+            await uid_layout.to_thread_to_completion(int, "x")
+
+    async def test_a_cancelled_verify_cleans_up_after_the_build(
+        self, tmp_path, monkeypatch
+    ):
+        # The startup timeout cancels verify(): its workspace (and in uid mode
+        # its uid lease) must go only once the option build that prepares the
+        # spawn has finished, never beside it.
+        from unittest.mock import patch
+
+        from src.backends.claude.client import ClaudeCodeCLI
+        from src.workspace_manager import workspace_manager
+
+        with patch("src.auth.validate_claude_code_auth", return_value=(True, {})), patch(
+            "src.auth.auth_manager"
+        ) as mock_auth:
+            mock_auth.get_claude_code_env_vars.return_value = {}
+            cli = ClaudeCodeCLI(cwd=str(tmp_path))
+        started, release = threading.Event(), threading.Event()
+        order = []
+
+        def build(**_kwargs):
+            started.set()
+            release.wait(5)
+            order.append("built")
+            raise RuntimeError("never spawned")
+
+        monkeypatch.setattr(landlock, "effective_mode", lambda: "uid")
+        monkeypatch.setattr(landlock, "confine_enabled", lambda: True)
+        monkeypatch.setattr(workspace_manager, "resolve", lambda user: tmp_path / "ws")
+        monkeypatch.setattr(
+            workspace_manager,
+            "cleanup_temp_workspace",
+            lambda path, **kw: order.append(("cleanup", path)),
+        )
+        monkeypatch.setattr(cli, "_build_sdk_options", build)
+        task = asyncio.ensure_future(cli.verify())
+        await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert order == []  # the build is still running: no cleanup yet
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert order == ["built", ("cleanup", tmp_path / "ws")]
 
 
 class TestPerUidOptionsEnv:

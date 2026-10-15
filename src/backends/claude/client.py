@@ -1485,15 +1485,16 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if landlock.effective_mode() == "uid":
                 from src.workspace_manager import workspace_manager
 
-                verify_workspace = await asyncio.to_thread(
-                    workspace_manager.resolve, None
-                )
+                verify_workspace = workspace_manager.resolve(None)
             # In a worker thread, as in create_client: verify runs on every
             # admin health check, and under uid isolation building the options
             # prepares the session uid's layout (``uid_layout.prepare_spawn``:
             # a dirty leased uid waits for a broker wipe, a workspace grant for
-            # the mirror lock).
-            options = await asyncio.to_thread(
+            # the mirror lock). A cancelled verify (the startup timeout) waits
+            # for it before the cleanup below releases the workspace's lease.
+            from .uid_layout import to_thread_to_completion
+
+            options = await to_thread_to_completion(
                 functools.partial(
                     self._build_sdk_options, max_turns=1, cwd=verify_workspace
                 )
@@ -2026,21 +2027,23 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # crash).
         from src.session_manager import _session_jsonl_exists
 
-        from .uid_layout import migrate_user
+        from .uid_layout import migrate_user, to_thread_to_completion
 
         # Under uid isolation a named user's transcripts move into their own
         # config dir on their first spawn; do that before asking whether this
         # session has one, so a migrated session is resumed, not restarted. In a
         # worker thread: the first one also grants a whole existing workspace
-        # tree (and may copy a large legacy project dir).
-        await asyncio.to_thread(migrate_user, user, cwd)
+        # tree (and may copy a large legacy project dir). The spawn-preparing
+        # steps run to completion even when this create is cancelled: the
+        # teardown that follows a cancellation must not run beside them.
+        await to_thread_to_completion(migrate_user, user, cwd)
         # Off the loop too: a transcript the gateway may not stat is asked of
         # the broker.
         has_history = await asyncio.to_thread(_session_jsonl_exists, session)
         # In a worker thread: under uid isolation building the options prepares
         # the session uid's layout (``uid_layout.prepare_spawn``), which on a
         # leased uid a dead gateway left dirty waits for a broker wipe.
-        options = await asyncio.to_thread(
+        options = await to_thread_to_completion(
             functools.partial(
                 self._build_sdk_options,
                 model=model,
@@ -2096,7 +2099,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # the awaits above (skill discovery serialized under the global preflight
         # lock, the relay probe) can outlast that under a burst: the broker
         # would refuse the spawn. Mint it again right before the spawn (#241).
-        await asyncio.to_thread(
+        await to_thread_to_completion(
             self._configure_confinement,
             options,
             Path(options.cwd) if options.cwd else None,
