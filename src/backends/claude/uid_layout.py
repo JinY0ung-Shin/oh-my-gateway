@@ -417,8 +417,18 @@ def grant_workspace(workspace: str, uid: int, *, named: bool) -> None:
         _grant_writable(fd, uid)
         attempt = (workspace, uid)
         if attempt not in _tree_attempted and not _tree_granted(workspace, uid, named):
+            from . import workspace_resources
+
             started = time.monotonic()
+            # grant_tree skips files with several names, and every file of the
+            # gateway's .claude/{skills,agents} mirrors is a hard link of its
+            # canonical file: empty the mirrors first so the user's own skills
+            # and agents are granted, then rebuild them (the ACL is per inode).
+            if named:
+                workspace_resources.clear_managed_mirrors(Path(workspace))
             stats = posix_acl.grant_tree(fd, uid, _app_uid(), owner=_app_uid())
+            if named:
+                workspace_resources.materialize_workspace_resources(Path(workspace))
             took = time.monotonic() - started
             complete = not stats.truncated and not stats.errors
             log = logger.info if complete else logger.warning

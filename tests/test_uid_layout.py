@@ -196,6 +196,25 @@ class TestGrantWorkspace:
         uid_layout.grant_workspace(str(workspace), UID + 1, named=True)
         assert len(calls) == 2
 
+    def test_mirrored_skills_are_granted_and_the_mirror_rebuilt(self, tree):
+        from src.backends.claude import workspace_resources as wr
+
+        workspace = _named_ws(tree)
+        skill = workspace / "skills" / "mine" / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text("---\nname: mine\n---\n")
+        wr.ensure_workspace_resources(workspace)
+        mirrored = workspace / ".claude" / "skills" / "mine" / "SKILL.md"
+        assert skill.stat().st_nlink == 2  # canonical + mirror: one inode
+        uid_layout.grant_workspace(str(workspace), UID, named=True)
+        fd = os.open(skill, os.O_RDONLY)
+        try:
+            assert (UID, 6) in _named(posix_acl.get_acl(fd))  # rw like the owner
+        finally:
+            os.close(fd)
+        assert mirrored.exists()
+        assert os.path.samestat(skill.stat(), mirrored.stat())
+
     def test_an_anonymous_tree_is_granted_once_per_process(self, tree, monkeypatch):
         workspace = tree["workspaces"] / "_tmp_abc"
         workspace.mkdir()

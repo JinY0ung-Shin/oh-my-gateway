@@ -85,6 +85,26 @@ def _meta(path: Path, fallback_name: str) -> Dict[str, str]:
     return {"name": name, "description": description[:_MAX_DESCRIPTION_CHARS]}
 
 
+def _lstat_mode(path: Path) -> int:
+    """*path*'s own file type bits (a symlink is a symlink), ``0`` when it
+    cannot be looked at. ``Path.is_file()``/``is_dir()`` follow links and, on
+    an unsearchable parent, raise ``PermissionError`` on Python 3.12 instead of
+    answering ``False``: a session uid that closes one of its own dirs must not
+    turn the catalog into a 500 (uid isolation)."""
+    try:
+        return os.lstat(path).st_mode
+    except OSError:
+        return 0
+
+
+def _real_file(path: Path) -> bool:
+    return stat.S_ISREG(_lstat_mode(path))
+
+
+def _real_dir(path: Path) -> bool:
+    return stat.S_ISDIR(_lstat_mode(path))
+
+
 def _skill_files(base: Path) -> List[Path]:
     """Skill definition files under a project/user skill directory.
 
@@ -95,20 +115,19 @@ def _skill_files(base: Path) -> List[Path]:
     for the same reason.
     """
     files: List[Path] = []
-    if not base.is_dir() or base.is_symlink():
+    if not _real_dir(base):
         return files
     try:
         entries = sorted(base.iterdir())
     except OSError:
         return files
     for entry in entries:
-        if entry.is_symlink():
-            continue
-        if entry.is_file() and entry.suffix == ".md":
-            files.append(entry)
-        elif entry.is_dir():
+        if _real_file(entry):
+            if entry.suffix == ".md":
+                files.append(entry)
+        elif _real_dir(entry):
             nested = entry / "SKILL.md"
-            if nested.is_file() and not nested.is_symlink():
+            if _real_file(nested):
                 files.append(nested)
     return files
 
@@ -116,21 +135,20 @@ def _skill_files(base: Path) -> List[Path]:
 def _agent_files(base: Path) -> List[Path]:
     """Subagent definition files under a project/user agent directory."""
     files: List[Path] = []
-    if not base.is_dir() or base.is_symlink():
+    if not _real_dir(base):
         return files
     try:
         entries = sorted(base.iterdir())
     except OSError:
         return files
     for entry in entries:
-        if entry.is_symlink():
-            continue
-        if entry.is_file() and entry.suffix == ".md":
-            files.append(entry)
-        elif entry.is_dir():
+        if _real_file(entry):
+            if entry.suffix == ".md":
+                files.append(entry)
+        elif _real_dir(entry):
             for filename in ("AGENT.md", "agent.md"):
                 nested = entry / filename
-                if nested.is_file() and not nested.is_symlink():
+                if _real_file(nested):
                     files.append(nested)
                     break
     return files
@@ -240,11 +258,18 @@ def _project_entries(workspace: Path, kind: str) -> List[Dict[str, str]]:
     reasoning to names that exist on one side only. The shadowed names are logged
     once so an operator can see what the conflict is costing them.
     """
+    from src.backends.claude.workspace_resources import is_managed_mirror
+
     visible_dir = workspace / kind
     native_dir = workspace / ".claude" / kind
     visible = _dir_entries(visible_dir, "project", kind)
 
-    if (native_dir / _MANAGED_MARKER).is_file():
+    if is_managed_mirror(workspace, kind):
+        return visible
+    # Read the native side only through real directories: a ``.claude`` the
+    # session replaced with a link would have the gateway catalog whatever it
+    # points at.
+    if not (_real_dir(workspace / ".claude") and _real_dir(native_dir)):
         return visible
 
     legacy = _dir_entries(native_dir, "project", kind)

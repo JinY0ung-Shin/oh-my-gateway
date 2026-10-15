@@ -102,6 +102,29 @@ def test_symlinked_entries_are_skipped(tmp_path):
     assert agent_catalog.list_agent_resources(tmp_path)["skills"] == []
 
 
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root ignores modes")
+def test_an_unsearchable_skill_dir_does_not_raise(tmp_path):
+    # uid isolation: a session uid may close one of its own dirs to the gateway.
+    _write(tmp_path / ".claude" / "skills" / "ok" / "SKILL.md", "---\nname: ok\n---\n")
+    locked = tmp_path / ".claude" / "skills" / "locked"
+    _write(locked / "SKILL.md", "---\nname: locked\n---\n")
+    locked.chmod(0)
+    try:
+        names = [s["name"] for s in agent_catalog.list_agent_resources(tmp_path)["skills"]]
+    finally:
+        locked.chmod(0o755)
+    assert names == ["ok"]
+
+
+def test_a_symlinked_claude_dir_is_not_read(tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    _write(elsewhere / "skills" / "planted" / "SKILL.md", "---\nname: planted\n---\n")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / ".claude").symlink_to(elsewhere)
+    assert agent_catalog.list_agent_resources(workspace)["skills"] == []
+
+
 def test_missing_claude_dir_and_none_workspace_are_empty(tmp_path):
     assert agent_catalog.list_agent_resources(tmp_path) == {"skills": [], "agents": []}
     assert agent_catalog.list_agent_resources(None) == {"skills": [], "agents": []}
