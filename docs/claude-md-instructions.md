@@ -42,7 +42,10 @@ gateway가 띄우는 Claude CLI가 어떤 `CLAUDE.md`를 읽는지, 그리고 �
   - docker-compose는 기본으로 `user,project,local`을 넣는다. 그래서 Docker 배포에서는 HOME의 `CLAUDE.md`가 읽힌다.
 - 모든 세션은 HOME 하나를 같이 쓴다. HOME 보호 훅(`make_claude_home_guard_hook`)이 `~/.claude/CLAUDE.md`를
   **읽기 전용 공유 자산**으로 다룬다(`_SHARED_CLAUDE_ASSETS`). 세션이 파일 도구로 이 파일을 고칠 수 없다.
-  - 다만 Bash 쪽 방어는 경계가 아니다(루트 `CLAUDE.md`의 Gotchas 참고). 그래서 아래처럼 **읽기 전용 마운트**를 권한다.
+  - 세션 OS 격리(`CLAUDE_ISOLATION_MODE=landlock|uid`)를 켜면 이 파일은 OS 수준에서도 읽기 전용으로만 열린다.
+  - 격리가 꺼져 있으면 Bash 쪽 방어는 경계가 아니다(루트 `CLAUDE.md`의 Gotchas 참고). 그래서 아래처럼
+    **읽기 전용 마운트**를 권한다.
+- `CLAUDE_CONFIG_DIR`을 설정했다면 CLI는 `~/.claude` 대신 그 디렉터리의 `CLAUDE.md`를 읽는다.
 
 ## 모든 사용자에게 공통 지시 넣기 (Docker)
 
