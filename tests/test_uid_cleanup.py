@@ -21,6 +21,7 @@ cannot get past (skipped as root, which gets past them).
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import errno
 import json
 import logging
@@ -1500,8 +1501,10 @@ _MSG_HEADER = (
 )
 
 
-def _shm_row(ident: int, uid: int, cuid: int) -> str:
-    return f"  0 {ident} 600 4096 1 1 0 {uid} {uid} {cuid} {cuid} 0 0 0 4096 0\n"
+def _shm_row(ident: int, uid: int, cuid: int, perms: str = "600") -> str:
+    return (
+        f"  0 {ident} {perms} 4096 1 1 0 {uid} {uid} {cuid} {cuid} 0 0 0 4096 0\n"
+    )
 
 
 def _sem_row(ident: int, uid: int, cuid: int) -> str:
@@ -1524,25 +1527,76 @@ class TestIpcLeftovers:
         monkeypatch.setattr(uid_cleanup, "_MQUEUE_DIR", str(mqueue))
         return SimpleNamespace(sysv=sysv, mqueue=mqueue)
 
-    def test_objects_the_uid_owns_or_created(self, tables):
+    def test_objects_the_uid_created(self, tables):
         uid, other = self.UID, 1000
         (tables.sysv / "shm").write_text(
             _SHM_HEADER
-            + _shm_row(11, uid, other)
-            + _shm_row(12, other, uid)
+            + _shm_row(11, uid, uid)
+            + _shm_row(12, other, uid)  # made by the uid, handed to another
             + _shm_row(13, other, other)
+            + _shm_row(14, uid, uid, perms="2600")  # SHM_LOCKED: still there
         )
         (tables.sysv / "sem").write_text(
             _SEM_HEADER + _sem_row(21, uid, uid) + _sem_row(22, other, other)
         )
-        (tables.sysv / "msg").write_text(_MSG_HEADER + _msg_row(31, uid, uid))
+        (tables.sysv / "msg").write_text(_MSG_HEADER + _msg_row(31, other, uid))
         assert uid_cleanup.ipc_leftovers(uid) == [
             "SysV shm 11",
             "SysV shm 12",
+            "SysV shm 14",
             "SysV sem 21",
             "SysV msg 31",
         ]
         assert uid_cleanup.ipc_leftovers(uid + 1) == []
+
+    def test_an_object_handed_to_the_uid_is_not_its_leftover(self, tables):
+        # IPC_SET lets an object's creator make any uid its owner: another
+        # session could otherwise keep the uid's lease from being released.
+        uid, other = self.UID, 29751
+        (tables.sysv / "shm").write_text(_SHM_HEADER + _shm_row(11, uid, other))
+        (tables.sysv / "sem").write_text(_SEM_HEADER + _sem_row(21, uid, other))
+        (tables.sysv / "msg").write_text(_MSG_HEADER + _msg_row(31, uid, other))
+        assert uid_cleanup.ipc_leftovers(uid) == []
+        assert uid_cleanup.ipc_leftovers(other) == [
+            "SysV shm 11",
+            "SysV sem 21",
+            "SysV msg 31",
+        ]
+
+    def test_a_destroyed_segment_is_gone(self, tables):
+        # IPC_RMID on a segment another process still has attached marks it
+        # SHM_DEST (perms 01000) and takes its key; the row stays until the
+        # last detach, which another uid may never do.
+        uid = self.UID
+        (tables.sysv / "shm").write_text(
+            _SHM_HEADER
+            + _shm_row(11, uid, uid, perms="1600")
+            + _shm_row(12, 29751, uid, perms="3666")
+        )
+        assert uid_cleanup.ipc_leftovers(uid) == []
+
+    def test_a_live_segment_reads_as_destroyed_after_rmid(self):
+        libc = ctypes.CDLL(None, use_errno=True)
+        libc.shmat.restype = ctypes.c_void_p
+        if not os.path.isfile("/proc/sysvipc/shm"):
+            pytest.skip("no SysV IPC here")
+        ident = libc.shmget(0, ctypes.c_size_t(4096), 0o1000 | 0o600)  # private
+        if ident < 0:
+            pytest.skip("cannot make a SysV segment here")
+        name = f"SysV shm {ident}"
+        attached, removed = None, False
+        try:
+            assert name in uid_cleanup.ipc_leftovers(os.getuid())
+            attached = libc.shmat(ident, None, 0)
+            assert attached not in (None, ctypes.c_void_p(-1).value)
+            removed = libc.shmctl(ident, 0, None) == 0  # IPC_RMID, still attached
+            assert removed
+            assert name not in uid_cleanup.ipc_leftovers(os.getuid())
+        finally:
+            if attached not in (None, ctypes.c_void_p(-1).value):
+                libc.shmdt(ctypes.c_void_p(attached))
+            if not removed:
+                libc.shmctl(ident, 0, None)
 
     def test_empty_tables_and_no_mount_are_nothing(self, tables, monkeypatch):
         (tables.sysv / "shm").write_text(_SHM_HEADER)

@@ -75,6 +75,9 @@ _SYSVIPC_DIR = "/proc/sysvipc"
 _MQUEUE_DIR = "/dev/mqueue"
 # The tables of /proc/sysvipc and the name of each one's id column.
 _SYSVIPC_TABLES = (("shm", "shmid"), ("sem", "semid"), ("msg", "msqid"))
+# The ``perms`` bit of a shared memory segment IPC_RMID marked destroyed while
+# a process still had it attached (it goes when the last one detaches).
+_SHM_DEST = 0o1000
 # What ``Path.is_file()`` reads as "no such file" rather than raising.
 _ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP})
 
@@ -578,15 +581,16 @@ def _leftovers(uid: int, targets: Sequence[str]) -> List[str]:
 
 
 def ipc_leftovers(uid: int) -> List[str]:
-    """The uid's SysV IPC objects and POSIX message queues, described.
+    """The SysV IPC objects and POSIX message queues a run on *uid* left
+    behind, described.
 
     A run's SysV shared memory segments, semaphore sets and message queues
-    outlive it (``/proc/sysvipc/{shm,sem,msg}``: the objects whose ``uid`` or
-    ``cuid`` is *uid*), and so do its POSIX message queues (the ``/dev/mqueue``
-    entries it owns, where that is mounted); the broker's shm step removes
-    them as the uid. Each table is read by its header line. A table that
-    cannot be read or parsed counts as a leftover (fail closed); a missing one
-    (no such kernel support, no such mount) as none. Never raises.
+    outlive it (``/proc/sysvipc/{shm,sem,msg}``: the objects whose ``cuid`` is
+    *uid*, :func:`_sysvipc_objects`), and so do its POSIX message queues (the
+    ``/dev/mqueue`` entries it owns, where that is mounted); the broker's shm
+    step removes them as the uid. Each table is read by its header line. A
+    table that cannot be read or parsed counts as a leftover (fail closed); a
+    missing one (no such kernel support, no such mount) as none. Never raises.
     """
     left: List[str] = []
     for name, id_column in _SYSVIPC_TABLES:
@@ -616,11 +620,20 @@ def ipc_leftovers(uid: int) -> List[str]:
 def _sysvipc_objects(
     table, name: str, id_column: str, uid: int, path: str
 ) -> List[str]:
-    """The objects of one ``/proc/sysvipc`` *table* whose owner or creator is
-    *uid*, read by the column names of its header line."""
+    """The objects of one ``/proc/sysvipc`` *table* a run on *uid* left
+    behind, read by the column names of its header line: the ones *uid*
+    created, whoever owns them now (``IPC_SET`` can hand an object over; its
+    creator keeps the right to remove it).
+
+    Not counted: an object another uid created and handed to *uid* — that uid
+    can hand one over at any time, the next run's included, so it is no
+    previous run's state, and counting it would let any session hold *uid*'s
+    lease for good (the broker's sweep still removes it, as its owner) — and a
+    segment already marked destroyed (``SHM_DEST``): IPC_RMID took its key, and
+    it lives on only while another uid's process keeps it attached."""
     header = table.readline().split()
     try:
-        columns = [header.index(c) for c in (id_column, "uid", "cuid")]
+        columns = [header.index(c) for c in (id_column, "cuid", "perms")]
     except ValueError:
         return [f"{path} (unrecognized header)"]
     found: List[str] = []
@@ -629,11 +642,13 @@ def _sysvipc_objects(
         if not fields:
             continue
         try:
-            ident, owner, creator = (int(fields[i]) for i in columns)
+            ident, creator = (int(fields[i]) for i in columns[:2])
+            perms = int(fields[columns[2]], 8)
         except (IndexError, ValueError):
             return found + [f"{path} (unparsable line)"]
-        if uid in (owner, creator):
-            found.append(f"SysV {name} {ident}")
+        if creator != uid or (name == "shm" and perms & _SHM_DEST):
+            continue
+        found.append(f"SysV {name} {ident}")
     return found
 
 
