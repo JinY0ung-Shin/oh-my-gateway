@@ -1485,8 +1485,19 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             if landlock.effective_mode() == "uid":
                 from src.workspace_manager import workspace_manager
 
-                verify_workspace = workspace_manager.resolve(None)
-            options = self._build_sdk_options(max_turns=1, cwd=verify_workspace)
+                verify_workspace = await asyncio.to_thread(
+                    workspace_manager.resolve, None
+                )
+            # In a worker thread, as in create_client: verify runs on every
+            # admin health check, and under uid isolation building the options
+            # prepares the session uid's layout (``uid_layout.prepare_spawn``:
+            # a dirty leased uid waits for a broker wipe, a workspace grant for
+            # the mirror lock).
+            options = await asyncio.to_thread(
+                functools.partial(
+                    self._build_sdk_options, max_turns=1, cwd=verify_workspace
+                )
+            )
             # Like create_client: verify runs at startup and on every admin
             # health check, and its command line would carry the plugin MCP
             # credential overlays and the base prompt to any confined session
