@@ -872,6 +872,17 @@ def existing_uid(key: str) -> Optional[int]:
     return uid
 
 
+def named_uids() -> List[int]:
+    """The uids the registry honors for named users, ascending (never held
+    ones); empty when the registry cannot be loaded."""
+    try:
+        registry = get_registry()
+    except UidAllocationError:
+        return []
+    with registry._lock:
+        return sorted(set(registry._map.values()))
+
+
 def registry_errors() -> List[str]:
     """Startup errors for an unusable uid registry (empty list means OK).
 
