@@ -99,6 +99,7 @@ import hmac
 import json
 import os
 import pwd
+import re
 import select
 import signal
 import socket
@@ -107,6 +108,7 @@ import struct
 import sys
 import tempfile
 import time
+from json.decoder import scanstring as _scanstring
 from pathlib import PurePosixPath
 from typing import Iterable, Iterator
 
@@ -987,8 +989,8 @@ def _exec_cli(req, fds, real_cli, supervisor, test_same_uid):
 # --- transcript turns (a copy of src/backends/claude/transcript_turns.py) ----
 #
 # The broker must not import the gateway tree, so the rule the gateway applies
-# to a transcript it may read itself — the counter, the line bound and their
-# constants — is copied here verbatim. tests/test_transcript_turns.py keeps the
+# to a transcript it may read itself — the counter, the line and value bounds
+# and their constants — is copied here verbatim. tests/test_transcript_turns.py keeps the
 # two equal (a shared corpus and the functions' source text): change both
 # together.
 
@@ -1002,17 +1004,31 @@ TRANSCRIPT_UNREADABLE = -4
 # both the gateway and the broker's helper read it into memory: the caller
 # refuses a file larger than MAX_TRANSCRIPT_BYTES (UNREADABLE) and iterates
 # through :func:`bounded_lines`, which turns a line longer than MAX_LINE_CHARS
-# into CORRUPT instead of reading all of it. The CLI writes neither.
+# into CORRUPT instead of reading all of it. Parsing a line builds one object
+# per JSON value (a dense line of small lists takes some 24 times its size), so
+# :func:`count_transcript_turns` refuses a line that may hold more than
+# MAX_LINE_VALUES values before parsing it (CORRUPT, :func:`too_many_values`).
+# The CLI writes none of these: its long lines are long strings (images, tool
+# output), and its tool output is capped well below the value bound.
 MAX_TRANSCRIPT_BYTES = 1 << 30
 MAX_LINE_CHARS = 64 << 20
+MAX_LINE_VALUES = 1 << 20
+# What :func:`too_many_values` counts: a string's opening quote, and the
+# bracket, brace, comma or colon every other value follows. One character
+# class: a regex repeating a group keeps a backtracking record per repetition
+# (gigabytes for a line of escapes); strings are skipped by json's own scanner.
+_VALUE_CHARS = re.compile(r'["\[{,:]')
 
 
-def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
+def count_transcript_turns(
+    lines: Iterable[str], expected_cwd: str, max_values: int = MAX_LINE_VALUES
+) -> int:
     """The external user turns in *lines*, or a negative code.
 
     * :data:`TRANSCRIPT_CORRUPT` — a line that is not a JSON object (a blank
-      line included: the CLI writes none), or a user line whose ``message`` is
-      not an object. Refuse to guess.
+      line included: the CLI writes none), one that may hold more than
+      *max_values* JSON values (:func:`too_many_values`, not parsed), or a user
+      line whose ``message`` is not an object. Refuse to guess.
     * :data:`TRANSCRIPT_MISMATCH` — a line records a ``cwd`` other than
       *expected_cwd*: the transcript belongs to another workspace that maps to
       the same ``projects/`` name.
@@ -1026,6 +1042,8 @@ def count_transcript_turns(lines: Iterable[str], expected_cwd: str) -> int:
     expected = PurePosixPath(expected_cwd)
     turns = 0
     for raw in lines:
+        if too_many_values(raw, max_values):
+            return TRANSCRIPT_CORRUPT
         try:
             line = json.loads(raw)
         except (ValueError, RecursionError):  # JSONDecodeError is a ValueError;
@@ -1074,6 +1092,35 @@ def bounded_lines(fh, max_line: int = MAX_LINE_CHARS) -> Iterator[str]:
             yield ""
             return
         yield line
+
+
+def too_many_values(line: str, limit: int = MAX_LINE_VALUES) -> bool:
+    """Whether the JSON text *line* may hold more than *limit* values.
+
+    An upper bound, counted without parsing: every value is a string or
+    follows a bracket, brace, comma or colon (:data:`_VALUE_CHARS`), and a
+    string is skipped with json's own C scanner, so the scan sees the strings
+    ``json.loads`` sees, in constant memory. A line holds no more values than
+    characters, so only a longer line is scanned, and only until the count
+    passes *limit*. Also true for a line with a string ``json.loads`` refuses
+    (unterminated, a bad escape, a control character): CORRUPT either way.
+    Mirrored by ``docker/isolation_broker.py`` like the counter.
+    """
+    if len(line) <= limit:
+        return False
+    count = pos = 0
+    while count <= limit:
+        match = _VALUE_CHARS.search(line, pos)
+        if match is None:
+            return False
+        count += 1
+        pos = match.end()
+        if line[pos - 1] == '"':
+            try:
+                pos = _scanstring(line, pos, True)[1]
+            except ValueError:
+                return True
+    return True
 
 
 # --- path walking (both ops) -------------------------------------------------

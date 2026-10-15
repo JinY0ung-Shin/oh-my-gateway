@@ -3,12 +3,13 @@
 Under ``CLAUDE_ISOLATION_MODE=uid`` the broker reads a transcript as the session
 uid and returns only this count, and it must not import the gateway tree, so
 ``docker/isolation_broker.py`` carries a verbatim copy of the rule in
-``src/backends/claude/transcript_turns.py`` — the counter, ``bounded_lines``
-and their constants. These tests keep the two equal: the functions' source
-text and the constants, and a corpus of the CLI's line shapes fed to both
-through the same text-mode file iteration (``encoding="utf-8"``,
-``newline=None``, each copy's ``bounded_lines``), and through the broker's
-whole read path (``_read_transcript``, in-process as this test's uid) as well.
+``src/backends/claude/transcript_turns.py`` — the counter, ``bounded_lines``,
+``too_many_values`` and their constants. These tests keep the two equal: the
+functions' source text and the constants, and a corpus of the CLI's line
+shapes fed to both through the same text-mode file iteration
+(``encoding="utf-8"``, ``newline=None``, each copy's ``bounded_lines``), and
+through the broker's whole read path (``_read_transcript``, in-process as this
+test's uid) as well.
 """
 
 from __future__ import annotations
@@ -180,19 +181,27 @@ CASES = [
 ]
 
 
-def _evaluate(rule, path: Path, cwd: str = _CWD, **bound) -> int:
+def _evaluate(
+    rule, path: Path, cwd: str = _CWD, max_values=None, **bound
+) -> int:
     """*rule*'s counter over the file as both callers read it: a text-mode
     iteration with universal newlines through the same copy's
     ``bounded_lines`` (*bound*: its ``max_line``), where a UnicodeDecodeError
-    while iterating means CORRUPT (the contract in ``transcript_turns``)."""
+    while iterating means CORRUPT (the contract in ``transcript_turns``).
+    *max_values*: the counter's value bound, when not the default."""
+    values = {} if max_values is None else {"max_values": max_values}
     with open(path, "r", encoding="utf-8", newline=None) as fh:
         try:
-            return rule.count_transcript_turns(rule.bounded_lines(fh, **bound), cwd)
+            return rule.count_transcript_turns(
+                rule.bounded_lines(fh, **bound), cwd, **values
+            )
         except UnicodeDecodeError:
             return gateway.TRANSCRIPT_CORRUPT
 
 
-@pytest.mark.parametrize("name", ["count_transcript_turns", "bounded_lines"])
+@pytest.mark.parametrize(
+    "name", ["count_transcript_turns", "bounded_lines", "too_many_values"]
+)
 def test_the_copy_is_verbatim(broker, name):
     copy = inspect.getsource(getattr(broker, name))
     assert copy == inspect.getsource(getattr(gateway, name))
@@ -206,8 +215,11 @@ def test_the_constants_match(broker):
         "TRANSCRIPT_UNREADABLE",
         "MAX_TRANSCRIPT_BYTES",
         "MAX_LINE_CHARS",
+        "MAX_LINE_VALUES",
     ):
         assert getattr(broker, name) == getattr(gateway, name), name
+    assert broker._VALUE_CHARS.pattern == gateway._VALUE_CHARS.pattern
+    assert broker._scanstring is gateway._scanstring is json.decoder.scanstring
 
 
 @pytest.mark.parametrize(
@@ -265,3 +277,77 @@ def test_the_bound_stops_reading(broker):
 
         assert list(rule.bounded_lines(_File(), max_line=8)) == [""]
         assert reads == [9]
+
+
+# --- the value bound ---------------------------------------------------------
+#
+# Parsing builds an object per JSON value: a dense line takes many times its
+# size in memory. A line that may hold more values than the bound is CORRUPT
+# without being parsed; a long line of long strings (the CLI's own images and
+# tool output) is not.
+
+_SMALL = 64  # a value bound standing in for MAX_LINE_VALUES (1 Mi values)
+_FILLER = "y" * 4096  # makes a line longer than _SMALL characters
+
+
+def _tokens(line: str) -> int:
+    """What the scanner counts for *line*: quotes of strings plus the
+    brackets, braces, commas and colons outside them."""
+    count = pos = 0
+    while True:
+        match = gateway._VALUE_CHARS.search(line, pos)
+        if match is None:
+            return count
+        count += 1
+        pos = match.end()
+        if line[pos - 1] == '"':
+            pos = json.decoder.scanstring(line, pos, True)[1]
+
+
+@pytest.mark.parametrize(
+    "tail, expected",
+    [
+        ("[" + "[]," * 100 + "[]]", -3),  # dense: refused unparsed
+        (json.dumps(_user(_FILLER)), 2),  # long, but few values: counted
+        ('"' + '\\"' * 3000, -3),  # an unterminated string full of escapes
+        ('{"type": "user", "x": "\\q' + "z" * 4096 + '"}', -3),  # a bad escape
+        ('{"type": "user", "x": "a\x01' + "z" * 4096 + '"}', -3),  # a control char
+    ],
+    ids=["dense", "long-string", "unterminated", "bad-escape", "control-char"],
+)
+def test_the_value_bound_in_both(broker, tmp_path, tail, expected):
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(_text(PROMPT) + tail.encode() + b"\n")
+    for rule in (gateway, broker):
+        assert _evaluate(rule, path, max_values=_SMALL) == expected, rule.__name__
+
+
+def test_the_bound_is_exact(broker):
+    # A line of exactly the bound passes, one more value does not; a line no
+    # longer than the bound is never scanned (it cannot hold more).
+    line = '{"type": "user", "pad": "' + "p" * 200 + '", "x": [' + "0," * 12
+    while _tokens(line + "0]}") < _SMALL:
+        line += "0,"
+    exact = line + "0]}"
+    assert _tokens(exact) == _SMALL and len(exact) > _SMALL
+    over = line + "0,0]}"
+    for rule in (gateway, broker):
+        assert rule.too_many_values(exact, _SMALL) is False
+        assert rule.too_many_values(over, _SMALL) is True
+        assert rule.too_many_values("[" * _SMALL, _SMALL) is False
+        assert rule.count_transcript_turns([exact], _CWD, _SMALL) == 1
+        assert rule.count_transcript_turns([over], _CWD, _SMALL) == -3
+
+
+def test_the_default_bound(broker, tmp_path):
+    # MAX_LINE_VALUES itself: a valid line just past it is CORRUPT unparsed,
+    # one just within it is counted.
+    limit = gateway.MAX_LINE_VALUES
+    path = tmp_path / "s.jsonl"
+    over = '{"type": "user", "x": [' + "0," * limit + "0]}\n"
+    within = '{"type": "user", "x": [' + "0," * (limit - 8) + "0]}\n"
+    for line, expected in ((over, -3), (within, 1)):
+        path.write_text(line)
+        assert _evaluate(gateway, path) == expected
+        assert _evaluate(broker, path) == expected
+        assert broker._read_transcript(os.path.realpath(path), _CWD) == expected
