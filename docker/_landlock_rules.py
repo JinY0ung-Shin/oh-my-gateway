@@ -586,6 +586,16 @@ def session_tmp_env(tmp):
     ``npm_config_*`` case-insensitively and the last spelling in the env wins,
     so both spellings are set.
 
+    uv also keeps its managed Pythons and its tool envs under ``$HOME``
+    (``~/.local/share/uv/{python,tools}``), and it treats an unreadable
+    directory there as fatal, unlike a missing one: as a session uid, which
+    cannot enter the 0700 ``/home/app``, every ``uv run`` died with "Failed to
+    discover managed Python installations" and every ``uvx`` with "failed to
+    create directory .../uv/tools" — plugin MCP servers bootstrapped that way
+    among them (#246). Both move beneath the tmp dir; a project venv stays
+    beside its project (no ``UV_PROJECT_ENVIRONMENT``: an absolute one would
+    make every project in the workspace share a venv).
+
     git: the ruleset grants none of ``~/.gitconfig``, ``~/.config/git/config``
     and the default excludes file ``~/.config/git/ignore``. Landlock does not
     mediate ``access()``, so git's ``access(R_OK)`` passes, the ``open()`` is
@@ -605,6 +615,8 @@ def session_tmp_env(tmp):
         "npm_config_cache": npm_cache,
         "NPM_CONFIG_CACHE": npm_cache,
         "UV_CACHE_DIR": os.path.join(tmp, "uv-cache"),
+        "UV_PYTHON_INSTALL_DIR": os.path.join(tmp, "uv-python"),
+        "UV_TOOL_DIR": os.path.join(tmp, "uv-tools"),
         "GIT_CONFIG_GLOBAL": os.path.join(tmp, GIT_CONFIG_NAME),
     }
 

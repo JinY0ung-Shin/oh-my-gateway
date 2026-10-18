@@ -161,8 +161,10 @@
 - [ ] 정상 작업은 유지: Bash(결과에 `~/.profile`·`~/.bashrc`의 `Permission denied` 줄이 없다 — CLI가 bash를
       고르면 `claude-session-bash`가 맨 앞 `-c -l`을 `--norc -c`로 바꾼다), `git init`·`commit`·`status`(세션 전역
       설정 `<워크스페이스>/.cli-tmp/gitconfig`; 세션의 `git config --global` 값이 다음 spawn에도 남는다),
-      `python3`(multiprocessing — `/dev/shm`), `uv run`·`npx -y`(세션별 캐시
-      `<워크스페이스>/.cli-tmp/{uv-cache,npm-cache}`), 스킬 인식, 사용자 설정·rules 로드
+      `python3`(multiprocessing — `/dev/shm`), `uv run`·`uvx`·`npx -y`(세션별 캐시
+      `<워크스페이스>/.cli-tmp/{uv-cache,npm-cache}`, uv의 관리형 Python·도구 환경은 `.cli-tmp/{uv-python,uv-tools}`),
+      `uv run --with …`으로 뜨는 플러그인 MCP 서버의 도구 사용(#246 — 시작에 실패하면 게이트웨이 로그에
+      `MCP server '<이름>' failed to start` 경고), 스킬 인식, 사용자 설정·rules 로드
       (`~/.claude/settings.json`·`~/.claude.json`·`~/.claude/rules` ro), 플러그인 훅 실행(`plugins/data/<id>`는
       게이트웨이가 미리 만들어 두고 읽기 전용 — 그 안에 쓰는 훅만 실패), SessionStart 훅과 TaskCreate
       (`session-env/<session id>`·`tasks/<session id>`만 rw).

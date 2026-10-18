@@ -261,7 +261,13 @@ uv run pytest --cov=src                            # with coverage
   `~/.npm`, uv cache or `plugins/data` is a cross-session plant channel (other sessions' `npx -y` /
   `uv run` / plugin hooks execute from them), so the launcher/broker point `npm_config_cache`,
   `NPM_CONFIG_CACHE` and `UV_CACHE_DIR` under `<cwd>/.cli-tmp` (per-workspace downloads: they count
-  against `USER_WORKSPACE_QUOTA_MB`, and a stateless run starts cold every request), and
+  against `USER_WORKSPACE_QUOTA_MB`, and a stateless run starts cold every request) — with
+  `UV_PYTHON_INSTALL_DIR` and `UV_TOOL_DIR` too: uv treats an unreadable `~/.local/share/uv/*` as
+  fatal (a missing one is fine), so as a uid-mode session uid every `uv run` / `uvx` — plugin MCP
+  servers bootstrapped that way included — died before #246; no `UV_PROJECT_ENVIRONMENT` (a project
+  venv stays beside its project). A plugin MCP server that dies while starting is only
+  `init.mcp_servers[].status == "failed"` (the CLI keeps no stderr); the gateway logs it as
+  `MCP server '<name>' failed to start` (`tests/test_cli_mcp_startup_failure.py`), and
   `plugins/data` stays read-only with the gateway pre-creating `plugins/data/<id>` for each
   `installed_plugins.json` key on every confined spawn (`_ensure_plugin_data_dirs`): the CLI mkdirs
   `$CLAUDE_PLUGIN_DATA` before every plugin hook and **skips the hook on EACCES**; with the dir

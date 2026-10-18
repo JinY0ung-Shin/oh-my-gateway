@@ -605,6 +605,86 @@ class TestGitConfig:
 
 
 # ---------------------------------------------------------------------------
+# uv: managed Pythons and tool envs off $HOME (#246)
+# ---------------------------------------------------------------------------
+
+_UV = shutil.which("uv")
+_UVX = shutil.which("uvx")
+
+
+def _uv_home(tmp_path: Path) -> Path:
+    """A HOME whose ``~/.local`` the caller cannot enter, like ``/home/app``
+    (0700, app-owned) seen from a session uid."""
+    home = tmp_path / "home"
+    (home / ".local" / "share" / "uv" / "python").mkdir(parents=True)
+    (home / ".local").chmod(0)
+    return home
+
+
+@pytest.fixture
+def uv_env(rules, tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root enters a 0000 dir")
+    home = _uv_home(tmp_path)
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    tmp = rules.safe_tmpdir(str(ws))
+    env = {
+        "PATH": os.pathsep.join(
+            {os.path.dirname(_UV or "/"), "/usr/local/bin", "/usr/bin", "/bin"}
+        ),
+        "HOME": str(home),
+        **rules.session_tmp_env(tmp),
+    }
+    yield ws, env
+    (home / ".local").chmod(0o700)
+
+
+def _uv_run(argv, ws: Path, env: dict) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv, cwd=ws, env=env, capture_output=True, text=True, timeout=120
+    )
+
+
+class TestUvOffHome:
+    def test_every_path_lies_beneath_the_tmp_dir(self, rules, tmp_path):
+        tmp = str(tmp_path / ".cli-tmp")
+        env = rules.session_tmp_env(tmp)
+        assert env["UV_PYTHON_INSTALL_DIR"] == tmp + "/uv-python"
+        assert env["UV_TOOL_DIR"] == tmp + "/uv-tools"
+        for value in env.values():
+            assert value == tmp or value.startswith(tmp + os.sep)
+
+    def test_no_shared_project_venv(self, rules, tmp_path):
+        # A project venv stays beside its project, in the workspace.
+        assert "UV_PROJECT_ENVIRONMENT" not in rules.session_tmp_env(str(tmp_path))
+
+    @pytest.mark.skipif(_UV is None, reason="no uv")
+    def test_uv_run_works_with_an_unreadable_home(self, uv_env):
+        ws, env = uv_env
+        argv = [_UV, "run", "--offline", "--no-project", "python", "-c", "print(1)"]
+        proc = _uv_run(argv, ws, env)
+        assert proc.returncode == 0, proc.stderr
+        # The control: the same run without the override is what #246 saw.
+        del env["UV_PYTHON_INSTALL_DIR"]
+        proc = _uv_run(argv, ws, env)
+        assert proc.returncode != 0
+        assert "managed Python installations" in proc.stderr
+
+    @pytest.mark.skipif(_UVX is None, reason="no uvx")
+    def test_uvx_reaches_its_tool_dir_beneath_the_tmp_dir(self, uv_env):
+        # No package needed: uvx creates its tool dir before resolving, so an
+        # unresolvable offline request fails *after* that point when it works.
+        ws, env = uv_env
+        argv = [_UVX, "--offline", "gateway-test-no-such-package"]
+        proc = _uv_run(argv, ws, env)
+        assert "uv/tools" not in proc.stderr, proc.stderr
+        del env["UV_TOOL_DIR"]
+        proc = _uv_run(argv, ws, env)
+        assert "uv/tools" in proc.stderr and "Permission denied" in proc.stderr
+
+
+# ---------------------------------------------------------------------------
 # session shell: which bash, and when
 # ---------------------------------------------------------------------------
 

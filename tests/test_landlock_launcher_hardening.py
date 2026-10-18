@@ -532,7 +532,8 @@ class TestSessionEnv:
         probe = (
             "import json, os\n"
             "keys = ['TMPDIR', 'CLAUDE_CODE_TMPDIR', 'npm_config_cache',\n"
-            "        'NPM_CONFIG_CACHE', 'UV_CACHE_DIR']\n"
+            "        'NPM_CONFIG_CACHE', 'UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR',\n"
+            "        'UV_TOOL_DIR']\n"
             "print(json.dumps({k: os.environ.get(k) for k in keys}))\n"
         )
         env = _env(
@@ -540,6 +541,8 @@ class TestSessionEnv:
             npm_config_cache="/home/app/.npm",
             NPM_CONFIG_CACHE="/home/app/.npm",
             UV_CACHE_DIR="/home/app/.cache/uv",
+            UV_PYTHON_INSTALL_DIR="/home/app/.local/share/uv/python",
+            UV_TOOL_DIR="/home/app/.local/share/uv/tools",
         )
         proc = _confined(ws, probe, env=env)
         assert proc.returncode == 0, proc.stderr
@@ -548,6 +551,8 @@ class TestSessionEnv:
         assert got["TMPDIR"] == got["CLAUDE_CODE_TMPDIR"] == tmp
         assert got["npm_config_cache"] == got["NPM_CONFIG_CACHE"] == tmp + "/npm-cache"
         assert got["UV_CACHE_DIR"] == tmp + "/uv-cache"
+        assert got["UV_PYTHON_INSTALL_DIR"] == tmp + "/uv-python"
+        assert got["UV_TOOL_DIR"] == tmp + "/uv-tools"
 
     def test_sigpipe_is_back_at_default(self, ws):
         # Python ignores SIGPIPE/SIGXFSZ at startup and ignored dispositions

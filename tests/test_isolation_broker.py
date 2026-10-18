@@ -420,7 +420,8 @@ class TestBrokerProtocol:
         script = (
             "import json, os\n"
             "keys = ['TMPDIR', 'CLAUDE_CODE_TMPDIR', 'npm_config_cache',\n"
-            "        'NPM_CONFIG_CACHE', 'UV_CACHE_DIR', 'PWD']\n"
+            "        'NPM_CONFIG_CACHE', 'UV_CACHE_DIR', 'UV_PYTHON_INSTALL_DIR',\n"
+            "        'UV_TOOL_DIR', 'PWD']\n"
             "print(json.dumps({k: os.environ.get(k) for k in keys}))\n"
         )
         proc = _run(
@@ -429,6 +430,8 @@ class TestBrokerProtocol:
             script,
             NPM_CONFIG_CACHE="/home/app/.npm",
             UV_CACHE_DIR="/home/app/.cache/uv",
+            UV_PYTHON_INSTALL_DIR="/home/app/.local/share/uv/python",
+            UV_TOOL_DIR="/home/app/.local/share/uv/tools",
             PWD="relative/ws",
         )
         assert proc.returncode == 0, proc.stderr
@@ -437,6 +440,8 @@ class TestBrokerProtocol:
         assert env["TMPDIR"] == env["CLAUDE_CODE_TMPDIR"] == tmp
         assert env["npm_config_cache"] == env["NPM_CONFIG_CACHE"] == tmp + "/npm-cache"
         assert env["UV_CACHE_DIR"] == tmp + "/uv-cache"
+        assert env["UV_PYTHON_INSTALL_DIR"] == tmp + "/uv-python"
+        assert env["UV_TOOL_DIR"] == tmp + "/uv-tools"
         assert env["PWD"] == str(ws)
 
     def test_ticket_single_use_replay_refused(self, broker, tmp_path):

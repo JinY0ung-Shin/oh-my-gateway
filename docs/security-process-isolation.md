@@ -870,7 +870,10 @@ docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.
        값과 uid 모드에선 `.cli-tmp`다.
      - **캐시:** 두 캐시는 세션 쓰기 경로로 재지정했다 — 런처/브로커가 `npm_config_cache`·`NPM_CONFIG_CACHE`·
        `UV_CACHE_DIR`을 `<cwd>/.cli-tmp/{npm-cache,uv-cache}`로 덮어쓰고, 공유 `~/.npm`·uv 캐시는 rw 규칙에서 뺐다
-       (워크스페이스마다 새로 받는다).
+       (워크스페이스마다 새로 받는다). uv의 관리형 Python·도구 환경(`UV_PYTHON_INSTALL_DIR`·`UV_TOOL_DIR`)도
+       `<cwd>/.cli-tmp/{uv-python,uv-tools}`로 옮긴다: uv는 없는 `~/.local/share/uv/*`는 넘어가지만 읽을 수 없는 것은
+       치명적 오류로 보아, uid 모드 세션 uid(0700 `/home/app`에 못 들어간다)의 `uv run`·`uvx`가 — 그렇게 뜨는 플러그인
+       MCP 서버도 — 모두 죽었다(#246). 프로젝트 venv는 프로젝트 옆에 둔다(`UV_PROJECT_ENVIRONMENT` 없음).
      - **git:** `GIT_CONFIG_GLOBAL=<cwd>/.cli-tmp/gitconfig`(`core.excludesFile`·`core.attributesFile`을 없는 tmp 경로로
        돌린다; 물려받은 값도 덮는다). Landlock은 `access(2)`를 중재하지 않아, git이 거부된 `~/.gitconfig`나
        `~/.config/git/ignore`를 읽을 수 있다고 보고 열다가 exit 128로 죽었다. 그 파일은 읽을 수 있고 비어 있지 않은 일반

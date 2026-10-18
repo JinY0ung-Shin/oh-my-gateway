@@ -1139,6 +1139,44 @@ class TestInitMcpServerErrorsLogging:
         assert "'ghost'" in caplog.text
         assert "Skipped" in caplog.text
 
+    def test_servers_that_failed_to_start_are_logged(self, cli_class, caplog):
+        """#246: a server that died while starting is only status "failed"."""
+        from claude_agent_sdk.types import SystemMessage
+
+        cli = _make_cli(cli_class)
+        # Field shape observed live on the bundled CLI 2.1.283.
+        message = SystemMessage(
+            subtype="init",
+            data={
+                "mcp_servers": [
+                    {"name": "uv-server", "status": "failed", "source": "dynamic"},
+                    {"name": "ok", "status": "connected", "source": "dynamic"},
+                    {"name": "auth", "status": "needs-auth"},
+                    "not-a-dict",
+                ],
+            },
+        )
+
+        with caplog.at_level("WARNING"):
+            cli._convert_message(message)
+
+        assert "MCP server 'uv-server' failed to start" in caplog.text
+        assert "'ok'" not in caplog.text
+        assert "'auth'" not in caplog.text
+
+    def test_failed_server_dict_chunk_is_logged(self, cli_class, caplog):
+        cli = _make_cli(cli_class)
+        chunk = {
+            "type": "system",
+            "subtype": "init",
+            "data": {"mcp_servers": [{"name": "dead", "status": "failed"}]},
+        }
+
+        with caplog.at_level("WARNING"):
+            cli._convert_message(chunk)
+
+        assert "MCP server 'dead' failed to start" in caplog.text
+
 
 class TestConvertMessageEdgeCases:
     """Test _convert_message edge cases."""

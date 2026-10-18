@@ -1427,11 +1427,27 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         this is the only trace of a broken gateway- or plugin-materialized
         server, so without this log an invalid config vanishes silently.
         Log-only: both endpoints' whitelists keep the field off the wire.
+
+        A server that passed validation but died while starting (bad command,
+        a ``uv run`` that cannot set itself up, #246) is only an
+        ``mcp_servers`` entry with ``status: "failed"``: the CLI waits for
+        every server before it emits ``init``, so ``pending`` is not left
+        there, and it keeps no stderr (``get_mcp_status`` says just
+        "Connection closed"; pinned on the bundled CLI 2.1.283).
         """
         if converted.get("subtype") != "init":
             return
         data = converted.get("data")
-        errors = data.get("mcp_server_errors") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return
+        servers = data.get("mcp_servers")
+        for entry in servers if isinstance(servers, list) else []:
+            if isinstance(entry, dict) and entry.get("status") == "failed":
+                logger.warning(
+                    "MCP server %r failed to start; its tools are unavailable",
+                    entry.get("name"),
+                )
+        errors = data.get("mcp_server_errors")
         if not errors:
             return
         for entry in errors if isinstance(errors, list) else [errors]:
