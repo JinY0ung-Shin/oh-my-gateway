@@ -35,6 +35,14 @@ Configuration (env):
   under one is redacted.
 * ``SYSINFO_REDACT_ALLOW`` — comma-separated literals never redacted (e.g. a
   deliberately neutral hostname that is also a common word).
+* ``SYSINFO_REDACT_ALL_ENV`` — off by default; ``true`` redacts the value of
+  **every** gateway env variable (``[REDACTED:env]``), not only secret-looking
+  names. Values shorter than ``MIN_SECRET_LEN`` are still skipped, and so are
+  the process basics in ``_ALL_ENV_EXCEPTIONS`` (``PATH``, ``HOME``, ``LANG``,
+  …): the agent's own shell reports those, and masking a path the model must
+  reuse breaks its tool calls.
+* ``SYSINFO_REDACT_ALL_ENV_EXCEPT`` — comma-separated env names to leave out
+  of ``SYSINFO_REDACT_ALL_ENV`` as well (e.g. a workspace root the agent cites).
 """
 
 from __future__ import annotations
@@ -79,6 +87,27 @@ _SECRET_NAME_RE = re.compile(
 )
 # Env names whose values are configuration, not secrets, despite matching above.
 _SECRET_NAME_EXCEPTIONS = frozenset({"SSH_AUTH_SOCK", "GPG_AGENT_INFO"})
+# Left out of SYSINFO_REDACT_ALL_ENV: the session's own process environment.
+# The agent reads these from its shell anyway, and they are paths/locales it
+# must reuse verbatim — masking them breaks tool calls, it hides nothing.
+_ALL_ENV_EXCEPTIONS = frozenset(
+    {
+        "PATH",
+        "HOME",
+        "PWD",
+        "OLDPWD",
+        "SHELL",
+        "TERM",
+        "LANG",
+        "LANGUAGE",
+        "TZ",
+        "USER",
+        "LOGNAME",
+        "SHLVL",
+        "TMPDIR",
+        "_",
+    }
+)
 _URL_USERINFO_RE = re.compile(
     r"^[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGNORECASE
 )
@@ -239,6 +268,26 @@ def _secret_env_values(env: Dict[str, str]) -> List[str]:
             continue
         if _SECRET_NAME_RE.search(name) or _URL_USERINFO_RE.match(value):
             out.append(value)
+    return out
+
+
+def _all_env_values(env: Dict[str, str]) -> List[str]:
+    """Every other env value, for ``SYSINFO_REDACT_ALL_ENV`` (secrets excluded)."""
+    if not parse_bool_env("SYSINFO_REDACT_ALL_ENV", "false"):
+        return []
+    skip = _ALL_ENV_EXCEPTIONS | {
+        name.upper() for name in _csv_env("SYSINFO_REDACT_ALL_ENV_EXCEPT")
+    }
+    secrets = set(_secret_env_values(env))
+    out = []
+    for name, value in env.items():
+        value = (value or "").strip()
+        upper = name.upper()
+        if len(value) < MIN_SECRET_LEN or value in secrets:
+            continue
+        if upper in skip or upper.startswith("LC_"):
+            continue
+        out.append(value)
     return out
 
 
@@ -451,6 +500,7 @@ def build_redactor(env: Optional[Dict[str, str]] = None) -> Redactor:
     literals += [_Literal(v, "container-id", True) for v in _container_ids()]
     literals += [_Literal(v, "mac", True) for v in _mac_addresses()]
     literals += [_Literal(v, "secret", False) for v in _secret_env_values(env)]
+    literals += [_Literal(v, "env", False) for v in _all_env_values(env)]
     literals += [
         _Literal(v, "custom", False) for v in _csv_env("SYSINFO_REDACT_VALUES")
     ]

@@ -289,6 +289,74 @@ class TestCollection:
         for value in ("tiny", "Jane Example", "/tmp/ssh-xyz/agent.123", "/usr/bin:/bin"):
             assert r.redact_text(value) == value
 
+    def test_all_env_values_are_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("SYSINFO_REDACT_ALL_ENV", raising=False)
+        r = _build(
+            {"GIT_AUTHOR_NAME": "Jane Example", "SERVICE_REGION": "ap-northeast-2"}
+        )
+        assert (
+            r.redact_text("Jane Example ap-northeast-2")
+            == "Jane Example ap-northeast-2"
+        )
+
+    def test_all_env_values_option_redacts_every_value(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        env = {
+            "GIT_AUTHOR_NAME": "Jane Example",
+            "SERVICE_REGION": "ap-northeast-2",
+            "INTERNAL_BASE_URL": "https://svc.internal:8443/v1",
+            "ANTHROPIC_AUTH_TOKEN": "tok-aaaaaaaaaaaa",  # still labelled secret
+            "SSH_AUTH_SOCK": "/tmp/ssh-xyz/agent.123",  # no secret exception here
+            "SHORT": "tiny",  # under MIN_SECRET_LEN
+            # process basics the agent's shell reports and must reuse verbatim
+            "PATH": "/usr/local/bin:/usr/bin",
+            "HOME": "/home/appuser",
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "TMPDIR": "/tmp/session-1",
+        }
+        r = _build(env)
+        for value in (
+            "Jane Example",
+            "ap-northeast-2",
+            "https://svc.internal:8443/v1",
+            "/tmp/ssh-xyz/agent.123",
+        ):
+            assert r.redact_text(f"[{value}]") == "[[REDACTED:env]]", value
+        assert r.redact_text("tok-aaaaaaaaaaaa") == "[REDACTED:secret]"
+        for value in (
+            "tiny",
+            "/usr/local/bin:/usr/bin",
+            "/home/appuser",
+            "en_US.UTF-8",
+            "/tmp/session-1",
+        ):
+            assert r.redact_text(value) == value
+
+    def test_all_env_values_honours_name_exceptions_and_allow(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "1")
+        monkeypatch.setenv(
+            "SYSINFO_REDACT_ALL_ENV_EXCEPT", "workspace_root, CLAUDE_CWD"
+        )
+        monkeypatch.setenv("SYSINFO_REDACT_ALLOW", "keep-this-value")
+        env = {
+            "WORKSPACE_ROOT": "/srv/workspaces",
+            "CLAUDE_CWD": "/srv/workspaces/u1",
+            "SOME_FLAG": "keep-this-value",
+            "OTHER": "mask-this-value",
+        }
+        r = _build(env)
+        assert r.redact_text("/srv/workspaces/u1/a.py") == "/srv/workspaces/u1/a.py"
+        assert (
+            r.redact_text("keep-this-value mask-this-value")
+            == "keep-this-value [REDACTED:env]"
+        )
+
+    def test_host_label_wins_over_env_label(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        r = _build({"HOSTNAME": HOST})
+        assert r.redact_text(f"on {HOST}") == "on [REDACTED:hostname]"
+
     def test_real_probes_never_raise_and_skip_loopback(self):
         r = sr.build_redactor({})
         assert r.redact_text("127.0.0.1 ::1 localhost") == "127.0.0.1 ::1 localhost"
