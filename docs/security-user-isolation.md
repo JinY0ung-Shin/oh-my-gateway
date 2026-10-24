@@ -3,9 +3,11 @@
 Oh My Gateway supports a credential-bound user identity in addition to the legacy single service key.
 
 > This page covers **application-layer** isolation: how a credential scopes a caller to its own
-> workspace/session over HTTP. The **OS/process-layer** boundary (keeping one session's CLI subprocess
-> from reading another session's or the gateway's files/memory/secrets — uid, Landlock, namespaces) is a
-> separate, in-design concern: see [security-process-isolation.md](security-process-isolation.md).
+> workspace/session over HTTP. The **OS/process-layer** boundary is separate: the currently
+> implemented `CLAUDE_ISOLATION_MODE=landlock|uid` settings restrict the Claude CLI and
+> its subprocesses. See the [deployment/configuration guide](user-isolation-deployment.md)
+> for practical setup and [process-isolation design](security-process-isolation.md)
+> for the threat model and limitations. Neither OS mode authenticates the HTTP caller.
 
 ## Configuration
 
