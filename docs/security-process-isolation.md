@@ -6,6 +6,7 @@
 > [isolation-uid-ownership-design.md](isolation-uid-ownership-design.md), 레이아웃: `docker-compose.uid.yml`).
 > 메커니즘 선택은 prod 호스트의 커널·권한에 달려 있고, 그 사실은 `scripts/isolation_probe.py`(이미지의
 > `/usr/local/bin/isolation_probe.py`)를 prod 컨테이너에서 돌려 확정한다.
+> 운영자가 켜는 절차(모드 선택·인증·검증)는 [user-isolation-deployment.md](user-isolation-deployment.md)에 있다.
 > 앱 계층(자격증명→워크스페이스/세션 스코프) 격리는 [security-user-isolation.md](security-user-isolation.md)를 보라.
 > 이 문서는 그 아래, **OS/프로세스 계층**(한 세션이 다른 세션·게이트웨이의 파일/메모리/비밀에
 > 닿지 못하게 하는 경계)을 다룬다.

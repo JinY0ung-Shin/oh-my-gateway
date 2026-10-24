@@ -15,6 +15,8 @@
 
 **공통 전제:** Linux Landlock ABI **3 이상**(통상 커널 6.2 이상 또는 백포트) + 필요한 syscall을 허용하는 seccomp. 실제 판정은 **배포 컨테이너 안에서** 한다. 이 요건이 없으면 `landlock`/`uid` 기동이 거부된다(암묵적으로 `off`로 내려가지 않음).
 
+**워크스페이스 아래 symlink 금지(두 모드 공통):** 격리 모드는 spawn마다 워크스페이스가 정확히 `realpath(USER_WORKSPACES_DIR)/<사용자>/...`로 풀리는지 검사한다. 사용자 워크스페이스를 다른 볼륨으로 잇는 링크처럼 base **아래**의 symlink를 거치면 그 요청은 HTTP 500 `workspace_refused`가 된다(base 자체가 링크인 것은 괜찮다). 켜기 전에 `find <workspace base> -mindepth 1 -type l`로 확인한다.
+
 ## 2. 인증과 OS 격리는 별도 설정 (중요)
 
 ### A. ChatDRAGON BFF만 Gateway에 접속하는 현재 구조
@@ -79,6 +81,22 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 
 **Landlock 모드의 한계:** UID가 같고 `/dev/shm` 등 OS 자원을 공유한다. 파일 경계가 생기더라도 별도 컨테이너·네트워크·PID 격리나 모든 프로세스/IPC 분리를 뜻하지 않는다. `GATEWAY_NON_DUMPABLE=true`는 Gateway 본체의 `/proc` 노출 방어이지만 CLI 자식에게 상속되는 환경변수를 완전히 제거하지는 않는다. `SYSINFO_CHILD_ENV_MASK`와 자식 환경변수 정리(#247)를 별도로 점검한다.
 
+**명령줄은 다른 세션에 보인다(landlock·uid 공통):** CLI가 `/proc` 없이는 뜨지 않아 `/proc`는 읽기 전용으로 열려 있고, `/proc/<pid>/cmdline`은 uid와 관계없이 누구나 읽는다. 게이트웨이는 MCP 설정(`--mcp-config`)과 시스템 프롬프트를 1회용 파일로 넘겨 명령줄에서 뺐지만, 다음은 실행되는 동안 다른 세션이 볼 수 있다.
+- 각 Bash 도구 호출의 **명령 텍스트**. 워크스페이스 경로가 들어 있어 사용자 키도 드러난다.
+- 요청의 `text.format` JSON 스키마(`--json-schema`).
+
+파일 **내용**은 보이지 않는다. 명령에 비밀값을 직접 쓰는 사용 패턴은 피한다. 상세: [설계 §6.5](security-process-isolation.md).
+
+**켜면 달라지는 동작(landlock·uid 공통)** — "정상 기능" 확인에서 걸리는 것들이다.
+- **공유 캐시를 쓸 수 없다.** npm·uv 캐시와 uv의 Python·도구 설치 경로가 세션마다 `<워크스페이스>/.cli-tmp` 아래로 옮겨진다. 한 세션이 심은 패키지를 다른 세션이 실행하지 못하게 하려는 것이다.
+  - `npx -y`·`uvx`는 워크스페이스마다 새로 받고, 그 용량은 `USER_WORKSPACE_QUOTA_MB`에 잡힌다.
+  - stateless 런은 매번 빈 캐시로 시작한다. npx·uvx로 띄우는 MCP 서버는 이미지에 미리 설치해 두는 편이 낫다.
+- **`~/.gitconfig`·`~/.config/git`은 읽히지 않는다.** git은 워크스페이스별 `<워크스페이스>/.cli-tmp/gitconfig`를 전역 설정으로 쓴다. 운영 전역 git 설정은 `/etc/gitconfig`에 둔다.
+- **플러그인:**
+  - landlock 모드에서는 `~/.claude/plugins/data`가 읽기 전용이다. 훅은 돌지만 그 안에 쓰는 것은 실패한다. uid 모드에서는 사용자별 config dir에 쓸 수 있다.
+  - 플러그인의 `bin/`이 Bash `PATH`에 오르지 않는다.
+- **CLI 자체 Bash 샌드박스(bubblewrap)는 강제로 꺼진다.** Landlock 도메인 안에서는 뜰 수 없기 때문이다. `CLAUDE_SANDBOX_ENABLED=true`가 설정돼 있으면 기동 때 경고한다.
+
 ## 4. 방법 2 — 사용자별 UID + Landlock (더 강한 OS 격리)
 
 메인 Compose와 **이미 포함된** `docker-compose.uid.yml`을 합쳐 실행한다. 이 override는 아래를 이미 설정한다.
@@ -113,6 +131,8 @@ docker compose -f docker-compose.yml -f docker-compose.uid.yml \
 - `/data/claude/shared`는 여러 사용자가 **읽는 공유** 스킬/설정 트리이다. 사용자 비밀이나 쓰기 가능한 테넌트별 데이터를 넣지 않는다. 기존 `~/.claude`의 수동 설치 자산은 자동 이전 대상이 아니므로 옮겨야 할 자산을 검토한다.
 - `CLAUDE_ISOLATION_FALLBACK` **미설정 권장**: uid 모드가 불가능할 때 실패하도록 둔다. `landlock`을 명시해 폴백하면 **사용자별 UID 경계가 사라지고**, UID 소유 0600 파일·기존 세션 재개가 막힐 수 있다. 자동 안전 강등으로 간주하지 않는다.
 - 다중 worker/다중 복제본은 UID registry 파일 잠금과 세션 상태의 전역 조율이 요구된다. 같은 registry를 쓴 두 Gateway 프로세스는 기동이 거부될 수 있다. 일반적인 worker 증설을 격리 확장 방식으로 보지 않는다.
+- **되돌리기(uid → landlock/off):** 세션 uid가 평범하게 만든 워크스페이스 파일(0666/0777)은 ACL 덕분에 계속 쓸 수 있다. 하지만 세션 uid가 0600/0700으로 만든 파일과 사용자별 config dir의 transcript·memory는 열리지 않는다. 그 세션들은 이어지지 않는다. 처음 켜기 전에 `/data/claude` 볼륨과 registry 백업을 먼저 확보한다.
+- **SysV IPC는 사용자별로 나뉘지 않는다.** Landlock이 SysV 공유 메모리·세마포어를 다루지 않기 때문이다. 살아 있는 세션이 world-accessible로 만든 객체는 다른 세션도 붙을 수 있다. 세션별 IPC 네임스페이스는 후속 작업이다.
 
 세션 검증은 [uid 격리 수용 체크리스트](isolation-uid-verification.md)를 따른다. 특히 **사용자 A가 B의 워크스페이스·transcript를 열지 못하는지**, `/app/data`와 Gateway `/proc/<pid>/environ` 접근이 차단되는지, 세션 subprocess UID가 서로 다른지, 같은 사용자 재개·익명 세션 정리가 되는지 확인한다.
 
