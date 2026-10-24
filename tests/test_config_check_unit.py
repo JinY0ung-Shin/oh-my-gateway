@@ -364,6 +364,16 @@ def test_scoped_identity_invalid_value_is_error(clean_env):
     assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY", "boolean")
 
 
+def test_scoped_identity_present_but_empty_is_error(clean_env):
+    """A set-but-empty security switch (broken template) is a startup error, not a
+    silent fall-through to disabled."""
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+    for raw in ("", "   "):
+        clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", raw)
+        issues = check_config()
+        assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY", "boolean"), raw
+
+
 def test_user_api_keys_malformed_still_warns(clean_env):
     """Malformed USER_API_KEYS fails the auth manager fast at startup; the check
     must not mask the default-open gateway it leaves (it provides no usable

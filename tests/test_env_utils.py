@@ -85,10 +85,13 @@ class TestParseBoolEnvStrict:
             assert parse_bool_env_strict("UNSET_STRICT") is False
             assert parse_bool_env_strict("UNSET_STRICT", True) is True
 
-    def test_empty_or_whitespace_uses_default(self):
+    def test_present_but_empty_raises(self):
+        """A set-but-empty value is a misconfiguration, not an explicit default —
+        a security switch must not be silently disabled by an empty string."""
         for raw in ("", "   "):
             with patch.dict(os.environ, {"TEST_STRICT": raw}):
-                assert parse_bool_env_strict("TEST_STRICT", True) is True
+                with pytest.raises(ValueError):
+                    parse_bool_env_strict("TEST_STRICT", True)
 
     def test_unrecognized_value_raises(self):
         for raw in ("ture", "enabled", "yep", "2", "falsey"):
