@@ -267,6 +267,28 @@ async def test_gateway_secrets_are_blank_in_the_agent_shell(tmp_path, monkeypatc
     assert "A=[] P=[]" in seen, seen
 
 
+async def test_all_env_option_keeps_the_real_workspace_path_usable(
+    tmp_path, monkeypatch
+):
+    """#252 review P2: with ``SYSINFO_REDACT_ALL_ENV`` on, a workspace-base env
+    value (``USER_WORKSPACES_DIR``) must not turn the paths the model reads into
+    ``[REDACTED:env]/...`` — its next tool call reuses them — while an opaque
+    value is still redacted."""
+    region = "zz-region-leak-77"
+    monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+    monkeypatch.setenv("USER_WORKSPACES_DIR", str(tmp_path))
+    monkeypatch.setenv("INTERNAL_REGION", region)
+    sysinfo_redaction.reset_redactor_cache()
+    plan = _single_tool_plan(
+        "Bash",
+        {"command": 'pwd; echo "R=$INTERNAL_REGION"', "description": "where"},
+    )
+    requests, _ = await _run(tmp_path, plan, extra_env={"INTERNAL_REGION": region})
+    seen = _model_tool_result(requests)
+    assert str(tmp_path / "ws") in seen, seen
+    assert region not in seen and "R=[REDACTED:env]" in seen, seen
+
+
 async def test_known_limit_failed_tool_output_is_not_rewritten(tmp_path):
     """PostToolUseFailure cannot rewrite results (CLI 2.1.283).
 

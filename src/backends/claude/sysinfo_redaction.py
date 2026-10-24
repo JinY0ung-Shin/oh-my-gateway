@@ -37,10 +37,16 @@ Configuration (env):
   deliberately neutral hostname that is also a common word).
 * ``SYSINFO_REDACT_ALL_ENV`` — off by default; ``true`` redacts the value of
   **every** gateway env variable (``[REDACTED:env]``), not only secret-looking
-  names. Values shorter than ``MIN_SECRET_LEN`` are still skipped, and so are
-  the process basics in ``_ALL_ENV_EXCEPTIONS`` (``PATH``, ``HOME``, ``LANG``,
-  …): the agent's own shell reports those, and masking a path the model must
-  reuse breaks its tool calls.
+  names. Left out (names logged once at startup): values shorter than
+  ``MIN_SECRET_LEN``, the process basics in ``_ALL_ENV_EXCEPTIONS`` (``PATH``,
+  ``HOME``, ``LANG``, …), **path-like** values (``/…``, ``~…``, any value with
+  a ``/`` that is not a URL — ``USER_WORKSPACES_DIR``, a plugin manifest, a
+  relative plans directory: masking a path the
+  model must reuse breaks its tool calls), and values with whitespace or longer
+  than ``_ALL_ENV_MAX_LEN`` (a JSON config): the stream carry would hold back
+  ordinary text for the length of such a literal. Secret-named values are not
+  affected by these limits (they stay in the ``secret`` set), and any value can
+  still be listed explicitly in ``SYSINFO_REDACT_VALUES``.
 * ``SYSINFO_REDACT_ALL_ENV_EXCEPT`` — comma-separated env names to leave out
   of ``SYSINFO_REDACT_ALL_ENV`` as well (e.g. a workspace root the agent cites).
 """
@@ -108,6 +114,11 @@ _ALL_ENV_EXCEPTIONS = frozenset(
         "_",
     }
 )
+# SYSINFO_REDACT_ALL_ENV adds only whitespace-free values up to this length: it
+# is the stream carry's own floor (``Redactor.stream_keep``), so enabling the
+# option never makes streamed text wait longer than it already does.
+_ALL_ENV_MAX_LEN = 256
+_PATH_LIKE_PREFIXES = ("/", "~", "./", "../")
 _URL_USERINFO_RE = re.compile(
     r"^[a-z][a-z0-9+.-]*://[^/\s:@]+:[^/\s@]+@", re.IGNORECASE
 )
@@ -271,15 +282,30 @@ def _secret_env_values(env: Dict[str, str]) -> List[str]:
     return out
 
 
-def _all_env_values(env: Dict[str, str]) -> List[str]:
-    """Every other env value, for ``SYSINFO_REDACT_ALL_ENV`` (secrets excluded)."""
+def _path_like(value: str) -> bool:
+    """A filesystem path (absolute, home-relative or relative), not a URL."""
+    return value.startswith(_PATH_LIKE_PREFIXES) or (
+        "/" in value and "://" not in value
+    )
+
+
+def _all_env_values(env: Dict[str, str]) -> Tuple[List[str], List[str]]:
+    """``SYSINFO_REDACT_ALL_ENV``: (values to redact, names left out by shape).
+
+    Secret values are excluded (they are redacted as ``secret`` already).
+    Left out by shape: path-like values, which the model must be able to reuse
+    in its tool calls, and values with whitespace or longer than
+    ``_ALL_ENV_MAX_LEN``, which would make the stream carry hold back ordinary
+    text (``_TextCarry``) for their length.
+    """
     if not parse_bool_env("SYSINFO_REDACT_ALL_ENV", "false"):
-        return []
+        return [], []
     skip = _ALL_ENV_EXCEPTIONS | {
         name.upper() for name in _csv_env("SYSINFO_REDACT_ALL_ENV_EXCEPT")
     }
     secrets = set(_secret_env_values(env))
-    out = []
+    out: List[str] = []
+    left_out: List[str] = []
     for name, value in env.items():
         value = (value or "").strip()
         upper = name.upper()
@@ -287,8 +313,15 @@ def _all_env_values(env: Dict[str, str]) -> List[str]:
             continue
         if upper in skip or upper.startswith("LC_"):
             continue
+        if (
+            _path_like(value)
+            or len(value) > _ALL_ENV_MAX_LEN
+            or any(c.isspace() for c in value)
+        ):
+            left_out.append(name)
+            continue
         out.append(value)
-    return out
+    return out, left_out
 
 
 class Redactor:
@@ -500,7 +533,16 @@ def build_redactor(env: Optional[Dict[str, str]] = None) -> Redactor:
     literals += [_Literal(v, "container-id", True) for v in _container_ids()]
     literals += [_Literal(v, "mac", True) for v in _mac_addresses()]
     literals += [_Literal(v, "secret", False) for v in _secret_env_values(env)]
-    literals += [_Literal(v, "env", False) for v in _all_env_values(env)]
+    env_values, env_left_out = _all_env_values(env)
+    literals += [_Literal(v, "env", False) for v in env_values]
+    if env_values or env_left_out:
+        logger.info(
+            "SYSINFO_REDACT_ALL_ENV: redacting %d env value(s); left out as "
+            "path-like, multi-word or longer than %d chars: %s",
+            len(env_values),
+            _ALL_ENV_MAX_LEN,
+            ", ".join(sorted(env_left_out)) or "none",
+        )
     literals += [
         _Literal(v, "custom", False) for v in _csv_env("SYSINFO_REDACT_VALUES")
     ]

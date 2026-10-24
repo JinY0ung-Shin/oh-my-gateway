@@ -9,6 +9,8 @@ chunking, and the gateway wiring (hooks, child env, both outbound paths).
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import os
 import random
 import re
@@ -302,11 +304,10 @@ class TestCollection:
     def test_all_env_values_option_redacts_every_value(self, monkeypatch):
         monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
         env = {
-            "GIT_AUTHOR_NAME": "Jane Example",
+            "GIT_AUTHOR_EMAIL": "jane@corp.example",
             "SERVICE_REGION": "ap-northeast-2",
             "INTERNAL_BASE_URL": "https://svc.internal:8443/v1",
             "ANTHROPIC_AUTH_TOKEN": "tok-aaaaaaaaaaaa",  # still labelled secret
-            "SSH_AUTH_SOCK": "/tmp/ssh-xyz/agent.123",  # no secret exception here
             "SHORT": "tiny",  # under MIN_SECRET_LEN
             # process basics the agent's shell reports and must reuse verbatim
             "PATH": "/usr/local/bin:/usr/bin",
@@ -317,10 +318,9 @@ class TestCollection:
         }
         r = _build(env)
         for value in (
-            "Jane Example",
+            "jane@corp.example",
             "ap-northeast-2",
             "https://svc.internal:8443/v1",
-            "/tmp/ssh-xyz/agent.123",
         ):
             assert r.redact_text(f"[{value}]") == "[[REDACTED:env]]", value
         assert r.redact_text("tok-aaaaaaaaaaaa") == "[REDACTED:secret]"
@@ -332,6 +332,59 @@ class TestCollection:
             "/tmp/session-1",
         ):
             assert r.redact_text(value) == value
+
+    def test_all_env_values_leave_paths_intact(self, monkeypatch):
+        """#252 review P2: a path the model must reuse in its next tool call."""
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        env = {
+            "USER_WORKSPACES_DIR": "/data/workspaces",  # the Compose default
+            "CLAUDE_PLUGIN_MANIFEST": "/app/data/gateway-plugins.json",
+            "CLAUDE_PLANS_DIRECTORY": ".claude/plans",
+            "SSH_AUTH_SOCK": "/tmp/ssh-xyz/agent.123",
+            "CACHE_DIR": "~/.cache/gateway",
+            "SERVICE_REGION": "ap-northeast-2",
+        }
+        r = _build(env)
+        for path in (
+            "/data/workspaces/alice/claude/a.py",
+            "/app/data/gateway-plugins.json",
+            ".claude/plans/plan.md",
+            "/tmp/ssh-xyz/agent.123",
+            "~/.cache/gateway/x",
+        ):
+            assert r.redact_text(path) == path
+        assert r.redact_text("ap-northeast-2") == "[REDACTED:env]"
+
+    def test_all_env_values_never_lengthen_the_stream_hold(
+        self, monkeypatch, caplog
+    ):
+        """#252 review P1: a long or multi-word value (a JSON config) would make
+        the stream carry hold ordinary text back for its length."""
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        servers = {f"s{i}": {"url": "x" * 40} for i in range(80)}
+        config = json.dumps({"servers": servers})
+        assert len(config) > 4096 and " " in config
+        env = {
+            "MCP_CONFIG": config,
+            "BANNER": "hello from the gateway",
+            "LONG_OPAQUE": "z" * (sr._ALL_ENV_MAX_LEN + 1),
+            "SERVICE_REGION": "ap-northeast-2",
+        }
+        with caplog.at_level(logging.INFO, logger=sr.logger.name):
+            r = _build(env)
+        assert r.max_ws_literal_len == 0
+        assert r.stream_keep == 256
+        assert r.redact_text("hello from the gateway") == "hello from the gateway"
+        assert "BANNER, LONG_OPAQUE, MCP_CONFIG" in caplog.text
+        # Short unrelated deltas stream out before the block ends.
+        s = StreamRedactor(r)
+        first = []
+        for _ in range(20):
+            out = s.process(_delta("plain words stream out "))
+            if _streamed_text(out):
+                first.append(out)
+                break
+        assert first, "streamed text was held back until the block stop"
 
     def test_all_env_values_honours_name_exceptions_and_allow(self, monkeypatch):
         monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "1")
