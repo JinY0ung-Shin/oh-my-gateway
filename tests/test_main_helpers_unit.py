@@ -55,9 +55,34 @@ def test_prompt_for_api_protection_returns_generated_token(monkeypatch):
 
 def test_prompt_for_api_protection_handles_invalid_input_then_interrupt(monkeypatch):
     monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.delenv("USER_API_KEYS", raising=False)
 
     with patch("builtins.input", side_effect=["maybe", KeyboardInterrupt]):
         assert main.prompt_for_api_protection() is None
+
+
+def test_prompt_for_api_protection_skips_when_user_api_keys_configured(monkeypatch):
+    """Per-user auth is already configured, so offering an unscoped legacy key
+    (which would let its holder impersonate any user) is skipped — even if the
+    operator would answer 'yes'."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("USER_API_KEYS", '{"alice": "alice-token"}')
+
+    with patch("builtins.input", return_value="yes"):
+        assert main.prompt_for_api_protection() is None
+
+
+def test_prompt_for_api_protection_prompts_when_user_api_keys_empty(monkeypatch):
+    """USER_API_KEYS='{}' carries no token (default-open), so the legacy-key
+    offer still applies."""
+    monkeypatch.delenv("API_KEY", raising=False)
+    monkeypatch.setenv("USER_API_KEYS", "{}")
+
+    with (
+        patch("builtins.input", return_value="yes"),
+        patch.object(main, "generate_secure_token", return_value="generated-token"),
+    ):
+        assert main.prompt_for_api_protection() == "generated-token"
 
 
 def test_process_chunk_content_handles_old_and_result_formats():

@@ -13,6 +13,7 @@ from fastapi import HTTPException
 
 # We need to patch environment before importing auth module
 import importlib
+from types import SimpleNamespace
 
 
 class TestClaudeCodeAuthManagerDetectMethod:
@@ -550,3 +551,64 @@ def reset_auth_module():
     import src.auth
 
     importlib.reload(src.auth)
+
+
+class TestEnforceScopedIdentity:
+    """Strict per-user identity mode (#251): enforce_scoped_identity()."""
+
+    @staticmethod
+    def _request(auth_user):
+        return SimpleNamespace(state=SimpleNamespace(auth_user=auth_user))
+
+    def test_noop_when_mode_off(self, monkeypatch):
+        monkeypatch.delenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", raising=False)
+        import src.auth as a
+        # Even with no principal, mode off => no refusal.
+        a.enforce_scoped_identity(self._request(None))
+
+    def test_refuses_without_principal_when_on(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+        import src.auth as a
+        with pytest.raises(HTTPException) as exc:
+            a.enforce_scoped_identity(self._request(None))
+        assert exc.value.status_code == 403
+        assert exc.value.headers.get("x-should-retry") == "false"
+
+    def test_allows_bound_principal_when_on(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+        import src.auth as a
+        # A USER_API_KEYS principal is present => allowed.
+        a.enforce_scoped_identity(self._request("alice"))
+
+    def test_trailing_whitespace_still_enables(self, monkeypatch):
+        """'true ' must not silently read as false (the [P1] fail-open)."""
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true ")
+        import src.auth as a
+        with pytest.raises(HTTPException) as exc:
+            a.enforce_scoped_identity(self._request(None))
+        assert exc.value.status_code == 403
+
+    def test_unrecognized_value_fails_closed(self, monkeypatch):
+        """A typo ('ture') must enforce (fail closed), never fall open to off."""
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "ture")
+        import src.auth as a
+        assert a.scoped_identity_required() is True
+        with pytest.raises(HTTPException) as exc:
+            a.enforce_scoped_identity(self._request(None))
+        assert exc.value.status_code == 403
+
+    def test_explicit_false_disables(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "false")
+        import src.auth as a
+        assert a.scoped_identity_required() is False
+        a.enforce_scoped_identity(self._request(None))
+
+    def test_present_but_empty_fails_closed(self, monkeypatch):
+        """A set-but-empty value is a misconfiguration: enforce (fail closed),
+        never silently disable."""
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "")
+        import src.auth as a
+        assert a.scoped_identity_required() is True
+        with pytest.raises(HTTPException) as exc:
+            a.enforce_scoped_identity(self._request(None))
+        assert exc.value.status_code == 403

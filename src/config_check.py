@@ -22,7 +22,12 @@ import os
 from dataclasses import dataclass
 from typing import List, Literal
 
-from src.env_utils import parse_bool_env, parse_workspace_initial_dirs
+from src.env_utils import (
+    parse_bool_env,
+    parse_bool_env_strict,
+    parse_user_api_keys,
+    parse_workspace_initial_dirs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -244,16 +249,89 @@ def _check_cors() -> List[ConfigIssue]:
 
 
 def _check_api_key() -> List[ConfigIssue]:
-    """verify_api_key (src/auth.py) allows ALL requests when no API key is
-    configured — default-open."""
-    if _is_set("API_KEY"):
+    """Gateway client authentication (src/auth.py, src/concurrency_middleware.py).
+
+    ``verify_api_key`` is default-open: with neither ``API_KEY`` nor
+    ``USER_API_KEYS`` set it accepts every request, and the ``/v1/responses``
+    identity is then whatever ``user`` the caller puts in the request body —
+    ``ConcurrencyLimitMiddleware`` rebinds that field to the credential only for
+    a ``USER_API_KEYS`` token. So on any reachable default-open deployment a
+    caller can act as any user (resolve their workspace, continue their
+    sessions). Only ``USER_API_KEYS`` binds identity to the credential; the
+    legacy ``API_KEY`` is an unscoped service key whose holder may act across
+    users by design, so it alone is not a multi-user boundary. Mirror
+    ``ClaudeCodeAuthManager.has_api_auth`` here (either key authenticates) so the
+    secure ``USER_API_KEYS``-only deployment is not falsely flagged as open.
+
+    ``USER_API_KEYS`` is tested by *parsed content*, not mere presence: a valid
+    but empty object (``USER_API_KEYS='{}'``) carries no authenticating token, so
+    ``has_api_auth`` is false and the gateway is default-open — presence alone
+    (``_is_set``) would hide that. Reuse the same parser the auth manager uses so
+    the two cannot drift; malformed JSON (which the auth manager rejects
+    fail-fast at startup) counts here as no usable auth, so the warning still
+    fires rather than masking a gateway that will not start."""
+    try:
+        user_keys = parse_user_api_keys(os.getenv("USER_API_KEYS"))
+    except ValueError:
+        user_keys = {}
+    if _is_set("API_KEY") or user_keys:
         return []
     return [
         ConfigIssue(
             "warning",
-            "API_KEY is unset: public /v1 endpoints accept unauthenticated "
-            "requests (src/auth.py verify_api_key is default-open). Set API_KEY "
-            "for any non-local deployment.",
+            "Neither API_KEY nor USER_API_KEYS is set: public /v1 endpoints "
+            "accept unauthenticated requests (src/auth.py verify_api_key is "
+            "default-open) and the /v1/responses `user` is read from the request "
+            "body, so any reachable caller can act as any user — resolving their "
+            "workspace and continuing their sessions. Set USER_API_KEYS for "
+            "per-user isolation, or API_KEY for a trusted single-tenant "
+            "deployment.",
+        )
+    ]
+
+
+def _check_scoped_identity() -> List[ConfigIssue]:
+    """GATEWAY_REQUIRE_SCOPED_IDENTITY (#251) needs USER_API_KEYS to be useful.
+
+    Strict mode refuses any per-user request that is not bound to a USER_API_KEYS
+    principal (src/auth.py enforce_scoped_identity). With no usable USER_API_KEYS
+    there is no such credential, so every /v1/responses, /v1/sessions/* and file
+    request would be refused — fail fast rather than start a gateway that answers
+    403 to everything. A legacy API_KEY does not satisfy it (it carries no
+    principal), so it is not accepted here either.
+
+    The flag is parsed strictly: an unrecognized value (``'ture'``, ``'enabled'``,
+    a stray trailing space that some parsers would mis-handle) is a security
+    switch silently failing open, so it is a startup error, not a fall-through to
+    disabled."""
+    try:
+        enabled = parse_bool_env_strict("GATEWAY_REQUIRE_SCOPED_IDENTITY", False)
+    except ValueError as exc:
+        return [
+            ConfigIssue(
+                "error",
+                f"{exc}. This is a security switch — an unrecognized value would "
+                "silently disable per-user identity enforcement. Set it to a "
+                "clear boolean or unset it.",
+            )
+        ]
+    if not enabled:
+        return []
+    try:
+        user_keys = parse_user_api_keys(os.getenv("USER_API_KEYS"))
+    except ValueError:
+        user_keys = {}
+    if user_keys:
+        return []
+    return [
+        ConfigIssue(
+            "error",
+            "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires a non-empty "
+            "USER_API_KEYS mapping: it is the only credential that binds a "
+            "request's identity to the caller, so without it every per-user "
+            "request (/v1/responses, /v1/sessions/*, workspace files) is refused "
+            "with 403. Set USER_API_KEYS, or unset "
+            "GATEWAY_REQUIRE_SCOPED_IDENTITY.",
         )
     ]
 
@@ -779,6 +857,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_usage_log_db_url())
     issues.extend(_check_cors())
     issues.extend(_check_api_key())
+    issues.extend(_check_scoped_identity())
     issues.extend(_check_sanitizer())
     issues.extend(_check_default_model(backends))
     issues.extend(_check_effort_certification())

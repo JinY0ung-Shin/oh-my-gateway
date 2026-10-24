@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
+_BOOL_FALSE = {"false", "0", "no", "off"}
 
 
 def parse_bool_env(name: str, default: str = "false") -> bool:
@@ -23,6 +24,30 @@ def parse_bool_env(name: str, default: str = "false") -> bool:
     """
     raw = os.getenv(name, default)
     return raw.lower() in _BOOL_TRUE
+
+
+def parse_bool_env_strict(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var, refusing anything that is not a clear boolean.
+
+    Unlike :func:`parse_bool_env`, this strips surrounding whitespace and raises
+    ``ValueError`` on any present-but-unclear value instead of silently treating
+    it as false. Use it for security switches, where a misread must fail loudly —
+    never fail open. Only an *unset* variable yields *default*: a present but
+    empty or whitespace-only value is a misconfiguration (a broken template or
+    Compose substitution), not an explicit ``false``, so it raises too — a
+    security mode must not be silently disabled by an empty string.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in _BOOL_TRUE:
+        return True
+    if value in _BOOL_FALSE:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean (true/false/1/0/yes/no/on/off); got {raw!r}"
+    )
 
 
 def parse_int_env(name: str, default: int) -> int:
@@ -127,3 +152,55 @@ def parse_workspace_initial_dirs(raw: Optional[str]) -> tuple[Path, ...]:
             result.append(normalized)
             seen.add(key)
     return tuple(result)
+
+
+# ---------------------------------------------------------------------------
+# USER_API_KEYS
+# ---------------------------------------------------------------------------
+
+import json as _json
+import re as _re
+
+# A workspace/user id: a single pure source shared by the auth manager
+# (src/auth.py) and the startup config check (src/config_check.py) so the two
+# can never drift on what counts as a valid USER_API_KEYS mapping.
+_USER_ID_PATTERN = _re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
+
+
+def parse_user_api_keys(raw: Optional[str]) -> dict[str, str]:
+    """Parse ``USER_API_KEYS`` (user -> bearer token) into a validated dict.
+
+    A blank/unset value yields ``{}``. Invalid configuration raises
+    ``ValueError`` (fail-fast at import/startup rather than silently falling
+    back to an unscoped identity boundary). A valid-but-empty JSON object
+    ``{}`` parses to an empty dict — which provides **no** authenticating token,
+    so callers must test the returned dict's truthiness, not merely that the
+    env var was set.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = _json.loads(raw)
+    except _json.JSONDecodeError as exc:
+        raise ValueError(
+            "USER_API_KEYS must be a JSON object mapping user ids to API keys"
+        ) from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("USER_API_KEYS must be a JSON object mapping user ids to API keys")
+
+    result: dict[str, str] = {}
+    seen_keys: set[str] = set()
+    for user, key in parsed.items():
+        if not isinstance(user, str) or not _USER_ID_PATTERN.fullmatch(user):
+            raise ValueError(
+                "USER_API_KEYS user ids must match "
+                "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$"
+            )
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"USER_API_KEYS entry for {user!r} must be a non-empty string")
+        if key in seen_keys:
+            raise ValueError("USER_API_KEYS must not map the same API key to multiple users")
+        seen_keys.add(key)
+        result[user] = key
+    return result
