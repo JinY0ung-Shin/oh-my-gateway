@@ -296,6 +296,30 @@ def test_user_api_keys_only_is_quiet(clean_env):
     assert not _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
 
 
+def test_user_api_keys_empty_object_warns(clean_env):
+    """USER_API_KEYS='{}' is valid JSON but carries no token, so has_api_auth is
+    False and the gateway is default-open — the check must warn by parsed
+    content, not by mere presence of the env var."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", "{}")
+
+    issues = check_config()
+
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+
+
+def test_user_api_keys_malformed_still_warns(clean_env):
+    """Malformed USER_API_KEYS fails the auth manager fast at startup; the check
+    must not mask the default-open gateway it leaves (it provides no usable
+    auth), so the warning still fires."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", "not json")
+
+    issues = check_config()
+
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+
+
 # ---------------------------------------------------------------------------
 # Sanitizer
 # ---------------------------------------------------------------------------

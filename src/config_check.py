@@ -22,7 +22,11 @@ import os
 from dataclasses import dataclass
 from typing import List, Literal
 
-from src.env_utils import parse_bool_env, parse_workspace_initial_dirs
+from src.env_utils import (
+    parse_bool_env,
+    parse_user_api_keys,
+    parse_workspace_initial_dirs,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -256,8 +260,20 @@ def _check_api_key() -> List[ConfigIssue]:
     legacy ``API_KEY`` is an unscoped service key whose holder may act across
     users by design, so it alone is not a multi-user boundary. Mirror
     ``ClaudeCodeAuthManager.has_api_auth`` here (either key authenticates) so the
-    secure ``USER_API_KEYS``-only deployment is not falsely flagged as open."""
-    if _is_set("API_KEY") or _is_set("USER_API_KEYS"):
+    secure ``USER_API_KEYS``-only deployment is not falsely flagged as open.
+
+    ``USER_API_KEYS`` is tested by *parsed content*, not mere presence: a valid
+    but empty object (``USER_API_KEYS='{}'``) carries no authenticating token, so
+    ``has_api_auth`` is false and the gateway is default-open — presence alone
+    (``_is_set``) would hide that. Reuse the same parser the auth manager uses so
+    the two cannot drift; malformed JSON (which the auth manager rejects
+    fail-fast at startup) counts here as no usable auth, so the warning still
+    fires rather than masking a gateway that will not start."""
+    try:
+        user_keys = parse_user_api_keys(os.getenv("USER_API_KEYS"))
+    except ValueError:
+        user_keys = {}
+    if _is_set("API_KEY") or user_keys:
         return []
     return [
         ConfigIssue(

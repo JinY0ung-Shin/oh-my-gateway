@@ -1,17 +1,15 @@
 import hmac
-import json
 import os
 import logging
-import re
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List, Tuple
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
+from src.env_utils import parse_user_api_keys
+
 logger = logging.getLogger(__name__)
 # Note: load_dotenv() runs in src/__init__.py, before any src submodule import
-
-_USER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$")
 
 
 # ============================================================================
@@ -117,35 +115,12 @@ class ClaudeCodeAuthManager:
         """Parse and validate ``USER_API_KEYS`` (user -> bearer token).
 
         Invalid configuration fails fast at import/startup rather than silently
-        falling back to an unscoped identity boundary.
+        falling back to an unscoped identity boundary. The parse itself lives in
+        ``src.env_utils.parse_user_api_keys`` — a single side-effect-free source
+        the startup config check (``src.config_check``) shares, so the check's
+        notion of "authenticated" can never drift from this one.
         """
-        raw = os.getenv("USER_API_KEYS", "").strip()
-        if not raw:
-            return {}
-        try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                "USER_API_KEYS must be a JSON object mapping user ids to API keys"
-            ) from exc
-        if not isinstance(parsed, dict):
-            raise ValueError("USER_API_KEYS must be a JSON object mapping user ids to API keys")
-
-        result: Dict[str, str] = {}
-        seen_keys: set[str] = set()
-        for user, key in parsed.items():
-            if not isinstance(user, str) or not _USER_ID_PATTERN.fullmatch(user):
-                raise ValueError(
-                    "USER_API_KEYS user ids must match "
-                    "^[a-zA-Z0-9][a-zA-Z0-9._-]{0,62}$"
-                )
-            if not isinstance(key, str) or not key:
-                raise ValueError(f"USER_API_KEYS entry for {user!r} must be a non-empty string")
-            if key in seen_keys:
-                raise ValueError("USER_API_KEYS must not map the same API key to multiple users")
-            seen_keys.add(key)
-            result[user] = key
-        return result
+        return parse_user_api_keys(os.getenv("USER_API_KEYS"))
 
     # ------------------------------------------------------------------
     # Backend provider access
