@@ -6,10 +6,26 @@ from typing import Optional, Dict, Any, List, Tuple
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from src.env_utils import parse_user_api_keys
+from src.env_utils import parse_bool_env, parse_user_api_keys
 
 logger = logging.getLogger(__name__)
 # Note: load_dotenv() runs in src/__init__.py, before any src submodule import
+
+# Strict-identity mode (#251): when on, a request to a per-user surface
+# (/v1/responses + its continuation/retrieval routes, /v1/sessions/* and the
+# workspace file API) is refused unless its identity is bound to the credential
+# — i.e. a USER_API_KEYS token. It closes the #249 impersonation vector
+# (caller-chosen body/query/header `user`) for operators who opt in, instead of
+# only warning. A legacy unscoped API_KEY carries no principal, so a request
+# authenticated with it is refused here; no-auth is refused too (and already
+# default-open-warned). Startup (src/config_check) fails fast when this is on
+# without USER_API_KEYS, so the mode can never refuse *every* request silently.
+REQUIRE_SCOPED_IDENTITY_ENV = "GATEWAY_REQUIRE_SCOPED_IDENTITY"
+
+
+def scoped_identity_required() -> bool:
+    """Whether strict per-user identity binding is enforced on identity routes."""
+    return parse_bool_env(REQUIRE_SCOPED_IDENTITY_ENV, "false")
 
 
 # ============================================================================
@@ -274,6 +290,31 @@ def get_authenticated_user(request: Request) -> Optional[str]:
     state = getattr(request, "state", None)
     principal = getattr(state, "auth_user", None) if state is not None else None
     return principal if isinstance(principal, str) and principal else None
+
+
+def enforce_scoped_identity(request: Request) -> None:
+    """Refuse a per-user request whose identity is not credential-bound.
+
+    No-op unless ``GATEWAY_REQUIRE_SCOPED_IDENTITY`` is on. When on, the request
+    must carry a ``USER_API_KEYS`` principal (the only credential
+    ``ConcurrencyLimitMiddleware`` binds to the request's ``user``); a no-auth or
+    legacy-``API_KEY`` request — where ``user`` is caller-chosen — is refused with
+    403. Call it on every route that resolves a tenant from caller input, after
+    ``verify_api_key`` has run.
+    """
+    if not scoped_identity_required():
+        return
+    if get_authenticated_user(request) is None:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "This gateway requires a per-user credential: set "
+                "GATEWAY_REQUIRE_SCOPED_IDENTITY only with USER_API_KEYS, and "
+                "authenticate with a user token (the unscoped API_KEY cannot "
+                "bind a caller's identity)."
+            ),
+            headers={"x-should-retry": "false"},
+        )
 
 
 def validate_claude_code_auth() -> Tuple[bool, Dict[str, Any]]:

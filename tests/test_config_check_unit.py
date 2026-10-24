@@ -29,6 +29,7 @@ _CHECKED_VARS = [
     "CORS_ORIGINS",
     "API_KEY",
     "USER_API_KEYS",
+    "GATEWAY_REQUIRE_SCOPED_IDENTITY",
     "SANITIZER_ENABLED",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
@@ -306,6 +307,39 @@ def test_user_api_keys_empty_object_warns(clean_env):
     issues = check_config()
 
     assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+
+
+def test_scoped_identity_without_user_api_keys_is_error(clean_env):
+    """GATEWAY_REQUIRE_SCOPED_IDENTITY needs USER_API_KEYS or every per-user
+    request 403s — fail fast at startup."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.delenv("USER_API_KEYS", raising=False)
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_with_legacy_key_only_is_error(clean_env):
+    """A legacy API_KEY carries no principal, so it does not satisfy strict mode."""
+    clean_env.setenv("API_KEY", "svc-key")
+    clean_env.delenv("USER_API_KEYS", raising=False)
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_with_user_api_keys_is_clean(clean_env):
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+
+    issues = check_config()
+
+    assert not _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
 
 
 def test_user_api_keys_malformed_still_warns(clean_env):

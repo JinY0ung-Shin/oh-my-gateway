@@ -289,6 +289,36 @@ def _check_api_key() -> List[ConfigIssue]:
     ]
 
 
+def _check_scoped_identity() -> List[ConfigIssue]:
+    """GATEWAY_REQUIRE_SCOPED_IDENTITY (#251) needs USER_API_KEYS to be useful.
+
+    Strict mode refuses any per-user request that is not bound to a USER_API_KEYS
+    principal (src/auth.py enforce_scoped_identity). With no usable USER_API_KEYS
+    there is no such credential, so every /v1/responses, /v1/sessions/* and file
+    request would be refused — fail fast rather than start a gateway that answers
+    403 to everything. A legacy API_KEY does not satisfy it (it carries no
+    principal), so it is not accepted here either."""
+    if not parse_bool_env("GATEWAY_REQUIRE_SCOPED_IDENTITY", "false"):
+        return []
+    try:
+        user_keys = parse_user_api_keys(os.getenv("USER_API_KEYS"))
+    except ValueError:
+        user_keys = {}
+    if user_keys:
+        return []
+    return [
+        ConfigIssue(
+            "error",
+            "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires a non-empty "
+            "USER_API_KEYS mapping: it is the only credential that binds a "
+            "request's identity to the caller, so without it every per-user "
+            "request (/v1/responses, /v1/sessions/*, workspace files) is refused "
+            "with 403. Set USER_API_KEYS, or unset "
+            "GATEWAY_REQUIRE_SCOPED_IDENTITY.",
+        )
+    ]
+
+
 def _check_sanitizer() -> List[ConfigIssue]:
     """SANITIZER_ENABLED without ANTHROPIC_BASE_URL is a documented no-op
     (src/sanitizer/config.py requires an explicit upstream)."""
@@ -810,6 +840,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_usage_log_db_url())
     issues.extend(_check_cors())
     issues.extend(_check_api_key())
+    issues.extend(_check_scoped_identity())
     issues.extend(_check_sanitizer())
     issues.extend(_check_default_model(backends))
     issues.extend(_check_effort_certification())

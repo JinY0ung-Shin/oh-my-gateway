@@ -8,7 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 
 from src.models import SessionListResponse
-from src.auth import get_authenticated_user, verify_api_key, security
+from src.auth import get_authenticated_user, verify_api_key, enforce_scoped_identity, security
 from src.backends import BackendRegistry
 from src.backends.claude.client import TaskStopClientUnavailable, TaskStopRejected
 from src.rate_limiter import rate_limit_endpoint
@@ -68,6 +68,7 @@ async def list_sessions(
 ):
     """List active sessions visible to the authenticated caller."""
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     sessions = session_manager.list_sessions()
     auth_user = get_authenticated_user(request)
     if auth_user is not None:
@@ -88,6 +89,7 @@ async def get_session(
 ):
     """Get information about a specific visible session."""
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     session = _session_for_request(request, session_id)
     return session.to_session_info()
 
@@ -114,6 +116,7 @@ async def get_session_pending_events(
     service-key callers retain the optional ``user`` query scoping behavior.
     """
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     session = session_manager.peek_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -172,6 +175,7 @@ async def stop_session_task(
     ``user``.
     """
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     session = session_manager.peek_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -262,6 +266,7 @@ async def delete_session(
 ):
     """Delete a specific visible session."""
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     session = session_manager.peek_session(session_id)
     auth_user = get_authenticated_user(request)
     if session is None or (auth_user is not None and session.user != auth_user):

@@ -18,7 +18,7 @@ from fastapi.responses import StreamingResponse
 
 from src.models import Message
 from src.message_adapter import MessageAdapter
-from src.auth import verify_api_key, security
+from src.auth import verify_api_key, enforce_scoped_identity, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, BackendRegistry, ResolvedModel
 from src.backends.claude.client import UnsupportedContinuationPolicy
@@ -2219,6 +2219,7 @@ async def create_response(
     Routes to the appropriate backend based on the model field.
     """
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
 
     # Resolve model -> backend and validate auth
     resolved, backend = resolve_and_get_backend(body.model)
@@ -3133,6 +3134,7 @@ async def cancel_response(
     continuable ``incomplete`` turn, exactly like a streamed interrupt.
     """
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     parsed = _parse_response_id(response_id)
     if parsed is None:
         raise _response_not_found(response_id)
@@ -3227,6 +3229,7 @@ async def get_response(
     alone grants access, matching GET /v1/sessions semantics.
     """
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     run = _BACKGROUND_RUNS.get(response_id)
     if run is not None:
         run_session = session_manager.get_session(run["session_id"])
@@ -3269,6 +3272,7 @@ async def delete_response(
     ``{"id": ..., "object": "response", "deleted": true}``.
     """
     await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
     session, session_id, turn = _lookup_stored_response(response_id, user)
     if turn != session.turn_counter:
         latest_id = _make_response_id(session_id, session.turn_counter)

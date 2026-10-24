@@ -133,7 +133,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from starlette.background import BackgroundTask
 from pydantic import BaseModel
 
-from src.auth import auth_manager, security, verify_api_key
+from src.auth import auth_manager, enforce_scoped_identity, security, verify_api_key
 from src.backends.claude.argv_files import PREFIX as _ARGV_FILE_PREFIX
 from src.runtime_config import get_workspace_upload_max_bytes
 from src.workspace_manager import workspace_manager
@@ -321,7 +321,13 @@ def _legacy_localpart_key() -> bool:
 
 
 def _workspace_key(request: Request) -> str:
-    """The caller's identity as the workspace key ("" when the header is absent)."""
+    """The caller's identity as the workspace key ("" when the header is absent).
+
+    In strict mode (#251) the file identity header is only trustworthy when the
+    gateway rebound it to a USER_API_KEYS principal; a legacy-API_KEY caller sets
+    it freely. This is the file API's single identity choke point, so the strict
+    check lives here and covers every file route."""
+    enforce_scoped_identity(request)
     identity = (request.headers.get(_user_header()) or "").strip()
     if _legacy_localpart_key():
         return identity.split("@")[0]

@@ -144,3 +144,53 @@ def test_user_api_keys_only_upload_uses_widened_limit_and_succeeds(
         assert (workspace / "user-only.bin").read_bytes() == payload
     finally:
         runtime_config.reset("workspace_upload_max_bytes")
+
+
+def test_scoped_identity_refuses_legacy_key_file_request(tmp_path: Path, monkeypatch):
+    """Strict mode (#251): a legacy API_KEY request carries no principal, so the
+    file API refuses it — the X-User-Email header is caller-chosen."""
+    _configure_auth(monkeypatch, legacy_key="svc-key")
+    monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+    workspace = tmp_path / "victim" / "claude"
+    workspace.mkdir(parents=True)
+    monkeypatch.setattr(tf.workspace_manager, "resolve", lambda user, backend=None: workspace)
+
+    app = FastAPI()
+    app.include_router(router)
+    app.add_middleware(cm.ConcurrencyLimitMiddleware)
+    client = TestClient(app)
+
+    response = client.get(
+        "/files/list?directory=/",
+        headers={"Authorization": "Bearer svc-key", "X-User-Email": "victim"},
+    )
+
+    assert response.status_code == 403, response.text
+
+
+def test_scoped_identity_allows_user_token_file_request(tmp_path: Path, monkeypatch):
+    """Strict mode: a USER_API_KEYS token is credential-bound, so it is allowed;
+    the middleware rebinds the identity header to the token's user."""
+    _configure_auth(monkeypatch, user_keys={"alice": "alice-key"})
+    monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+    workspace = tmp_path / "alice" / "claude"
+    workspace.mkdir(parents=True)
+
+    def resolve(user, backend=None):
+        assert user == "alice", f"unexpected workspace user: {user}"
+        return workspace
+
+    monkeypatch.setattr(tf.workspace_manager, "resolve", resolve)
+
+    app = FastAPI()
+    app.include_router(router)
+    app.add_middleware(cm.ConcurrencyLimitMiddleware)
+    client = TestClient(app)
+
+    # A legacy key or a forged header must not matter: the token decides identity.
+    response = client.get(
+        "/files/list?directory=/",
+        headers={"Authorization": "Bearer alice-key", "X-User-Email": "victim"},
+    )
+
+    assert response.status_code == 200, response.text
