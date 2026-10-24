@@ -28,6 +28,8 @@ _CHECKED_VARS = [
     "USAGE_LOG_DB_URL",
     "CORS_ORIGINS",
     "API_KEY",
+    "USER_API_KEYS",
+    "GATEWAY_REQUIRE_SCOPED_IDENTITY",
     "SANITIZER_ENABLED",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
@@ -279,7 +281,109 @@ def test_missing_api_key_warns(clean_env):
 
     issues = check_config()
 
-    assert _has(issues, "warning", "API_KEY is unset")
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+    # The warning names the actual exposure: caller-chosen /v1/responses identity.
+    assert _has(issues, "warning", "any reachable caller can act as any user")
+
+
+def test_user_api_keys_only_is_quiet(clean_env):
+    """USER_API_KEYS binds identity to the credential, so it is NOT default-open;
+    the old check falsely warned here because it only looked at API_KEY."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+
+    issues = check_config()
+
+    assert not _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+
+
+def test_user_api_keys_empty_object_warns(clean_env):
+    """USER_API_KEYS='{}' is valid JSON but carries no token, so has_api_auth is
+    False and the gateway is default-open — the check must warn by parsed
+    content, not by mere presence of the env var."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", "{}")
+
+    issues = check_config()
+
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+
+
+def test_scoped_identity_without_user_api_keys_is_error(clean_env):
+    """GATEWAY_REQUIRE_SCOPED_IDENTITY needs USER_API_KEYS or every per-user
+    request 403s — fail fast at startup."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.delenv("USER_API_KEYS", raising=False)
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_with_legacy_key_only_is_error(clean_env):
+    """A legacy API_KEY carries no principal, so it does not satisfy strict mode."""
+    clean_env.setenv("API_KEY", "svc-key")
+    clean_env.delenv("USER_API_KEYS", raising=False)
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_with_user_api_keys_is_clean(clean_env):
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true")
+
+    issues = check_config()
+
+    assert not _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_trailing_whitespace_still_enforced(clean_env):
+    """'true ' must be read as enabled, so the USER_API_KEYS requirement fires —
+    not silently fall through to disabled (the [P1] fail-open)."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.delenv("USER_API_KEYS", raising=False)
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true ")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_invalid_value_is_error(clean_env):
+    """A typo in the security switch is a startup error, never a silent disable."""
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "ture")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY", "boolean")
+
+
+def test_scoped_identity_present_but_empty_is_error(clean_env):
+    """A set-but-empty security switch (broken template) is a startup error, not a
+    silent fall-through to disabled."""
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+    for raw in ("", "   "):
+        clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", raw)
+        issues = check_config()
+        assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY", "boolean"), raw
+
+
+def test_user_api_keys_malformed_still_warns(clean_env):
+    """Malformed USER_API_KEYS fails the auth manager fast at startup; the check
+    must not mask the default-open gateway it leaves (it provides no usable
+    auth), so the warning still fires."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", "not json")
+
+    issues = check_config()
+
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +608,7 @@ def test_run_startup_check_returns_warnings_without_raising(clean_env):
     issues = run_startup_config_check()
 
     assert all(i.severity == "warning" for i in issues)
-    assert _has(issues, "warning", "API_KEY is unset")
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
 
 
 def test_skip_config_check_escape_hatch(clean_env):

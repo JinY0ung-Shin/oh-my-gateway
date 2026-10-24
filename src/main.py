@@ -20,6 +20,7 @@ from src.auth import (
     validate_claude_code_auth,
     auth_manager,
 )
+from src.env_utils import parse_user_api_keys
 from src.session_manager import session_manager
 from src.backends import (
     BackendRegistry,
@@ -96,6 +97,20 @@ def prompt_for_api_protection() -> Optional[str]:
     """
     # Don't prompt if API_KEY is already set via environment variable
     if os.getenv("API_KEY"):
+        return None
+
+    # Don't offer a legacy unscoped service key when per-user auth is already
+    # configured. USER_API_KEYS binds each caller's identity to its token;
+    # minting an extra legacy key here (authenticated with principal=None, so
+    # ConcurrencyLimitMiddleware never rebinds its request `user`) would hand its
+    # holder cross-user impersonation, defeating that isolation. Tested by parsed
+    # content, not presence, so an empty `{}` still falls through to the prompt.
+    # Malformed USER_API_KEYS already fails fast when the auth manager is
+    # constructed at import, so this only ever sees a valid value.
+    try:
+        if parse_user_api_keys(os.getenv("USER_API_KEYS")):
+            return None
+    except ValueError:
         return None
 
     print("\n" + "=" * 60)
@@ -239,6 +254,15 @@ async def lifespan(app: FastAPI):
     from src.config_check import run_startup_config_check
 
     run_startup_config_check()
+
+    # Make the per-user identity enforcement state (#251) visible to operators:
+    # a security boundary silently off is worse than one loudly on.
+    from src.auth import scoped_identity_required
+
+    logger.info(
+        "Scoped identity enforcement (GATEWAY_REQUIRE_SCOPED_IDENTITY): %s",
+        "ENABLED" if scoped_identity_required() else "DISABLED",
+    )
 
     # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
