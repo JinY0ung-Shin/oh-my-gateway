@@ -28,6 +28,7 @@ _CHECKED_VARS = [
     "USAGE_LOG_DB_URL",
     "CORS_ORIGINS",
     "API_KEY",
+    "USER_API_KEYS",
     "SANITIZER_ENABLED",
     "ANTHROPIC_BASE_URL",
     "CLAUDE_CUSTOM_UPSTREAM_EFFORT_MODELS",
@@ -279,7 +280,20 @@ def test_missing_api_key_warns(clean_env):
 
     issues = check_config()
 
-    assert _has(issues, "warning", "API_KEY is unset")
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
+    # The warning names the actual exposure: caller-chosen /v1/responses identity.
+    assert _has(issues, "warning", "any reachable caller can act as any user")
+
+
+def test_user_api_keys_only_is_quiet(clean_env):
+    """USER_API_KEYS binds identity to the credential, so it is NOT default-open;
+    the old check falsely warned here because it only looked at API_KEY."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+
+    issues = check_config()
+
+    assert not _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +518,7 @@ def test_run_startup_check_returns_warnings_without_raising(clean_env):
     issues = run_startup_config_check()
 
     assert all(i.severity == "warning" for i in issues)
-    assert _has(issues, "warning", "API_KEY is unset")
+    assert _has(issues, "warning", "Neither API_KEY nor USER_API_KEYS is set")
 
 
 def test_skip_config_check_escape_hatch(clean_env):

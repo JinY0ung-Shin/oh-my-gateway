@@ -244,16 +244,31 @@ def _check_cors() -> List[ConfigIssue]:
 
 
 def _check_api_key() -> List[ConfigIssue]:
-    """verify_api_key (src/auth.py) allows ALL requests when no API key is
-    configured — default-open."""
-    if _is_set("API_KEY"):
+    """Gateway client authentication (src/auth.py, src/concurrency_middleware.py).
+
+    ``verify_api_key`` is default-open: with neither ``API_KEY`` nor
+    ``USER_API_KEYS`` set it accepts every request, and the ``/v1/responses``
+    identity is then whatever ``user`` the caller puts in the request body —
+    ``ConcurrencyLimitMiddleware`` rebinds that field to the credential only for
+    a ``USER_API_KEYS`` token. So on any reachable default-open deployment a
+    caller can act as any user (resolve their workspace, continue their
+    sessions). Only ``USER_API_KEYS`` binds identity to the credential; the
+    legacy ``API_KEY`` is an unscoped service key whose holder may act across
+    users by design, so it alone is not a multi-user boundary. Mirror
+    ``ClaudeCodeAuthManager.has_api_auth`` here (either key authenticates) so the
+    secure ``USER_API_KEYS``-only deployment is not falsely flagged as open."""
+    if _is_set("API_KEY") or _is_set("USER_API_KEYS"):
         return []
     return [
         ConfigIssue(
             "warning",
-            "API_KEY is unset: public /v1 endpoints accept unauthenticated "
-            "requests (src/auth.py verify_api_key is default-open). Set API_KEY "
-            "for any non-local deployment.",
+            "Neither API_KEY nor USER_API_KEYS is set: public /v1 endpoints "
+            "accept unauthenticated requests (src/auth.py verify_api_key is "
+            "default-open) and the /v1/responses `user` is read from the request "
+            "body, so any reachable caller can act as any user — resolving their "
+            "workspace and continuing their sessions. Set USER_API_KEYS for "
+            "per-user isolation, or API_KEY for a trusted single-tenant "
+            "deployment.",
         )
     ]
 
