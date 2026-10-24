@@ -354,6 +354,7 @@ async def lifespan(app: FastAPI):
         TURN_QUEUE_MAX_WAITERS or "unlimited",
     )
     metrics.bind_live_sessions_source(lambda: len(session_manager.sessions))
+    metrics.bind_turns_in_flight_source(lambda: turn_limiter.in_flight)
     metrics.bind_turns_queued_source(lambda: turn_limiter.queued)
     metrics.bind_oldest_active_turn_silence_source(
         session_manager.oldest_active_turn_silence
@@ -380,6 +381,28 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.debug("Orphan workspace sweep skipped", exc_info=True)
 
+    # Remove the argv files a gateway that died mid-spawn left in workspaces
+    # (#241 §6.5). In a worker thread and not awaited: they are stale anyway,
+    # and walking a large workspace tree must not delay startup.
+    try:
+        from src.backends.claude import argv_files
+        from src.workspace_manager import workspace_manager
+
+        app.state.argv_file_sweep = asyncio.create_task(
+            asyncio.to_thread(argv_files.sweep_stale, workspace_manager.base_path)
+        )
+    except Exception:
+        logger.debug("argv file sweep skipped", exc_info=True)
+
+    # uid isolation keeps every session uid's state in its own config dir, and
+    # the CLI's own retention sweep runs only when that uid's CLI starts: expire
+    # what users who do not come back left behind (design §4.5).
+    from src.backends.claude import uid_layout
+
+    uid_retention = None
+    if uid_layout.enabled():
+        uid_retention = asyncio.create_task(_uid_retention_loop())
+
     # Bring up the optional usage-log SQLAlchemy engine (no-op when the env var is
     # unset).  Kept late in startup so a flaky logging DB cannot block the
     # gateway from becoming healthy.
@@ -394,10 +417,37 @@ async def lifespan(app: FastAPI):
 
     # Cleanup on shutdown (async to disconnect SDK clients)
     await auto_refresher.stop()
+    if uid_retention is not None:
+        uid_retention.cancel()
     logger.info("Shutting down session manager...")
+    # Under uid isolation this also drains the broker-backed reclaimer the
+    # session teardowns handed anonymous workspaces to (bounded).
     await session_manager.async_shutdown()
     await _shutdown_backends()
     await usage_logger.close()
+
+
+# First uid-mode retention sweep this long after startup, then every hour: a
+# sweep expires each uid once a day and retries the ones the broker refused.
+_UID_RETENTION_FIRST_DELAY_SECONDS = 300.0
+
+
+async def _uid_retention_loop() -> None:
+    """Expire per-uid transcripts, hook env dirs and task lists older than the
+    shared settings' ``cleanupPeriodDays`` (as each session uid, through the
+    broker). Never raises; cancelled at shutdown."""
+    from src.backends.claude import uid_cleanup
+
+    delay = _UID_RETENTION_FIRST_DELAY_SECONDS
+    while True:
+        await asyncio.sleep(delay)
+        delay = uid_cleanup.RETENTION_RETRY_SECONDS
+        try:
+            swept = await asyncio.to_thread(uid_cleanup.retention_sweep)
+            if swept:
+                logger.info("uid isolation retention sweep: %d uid(s) swept", swept)
+        except Exception:
+            logger.warning("uid isolation retention sweep failed", exc_info=True)
 
 
 # Create FastAPI app
@@ -420,6 +470,9 @@ app.add_middleware(
     allow_credentials=cors_allow_credentials,
     allow_methods=["*"],
     allow_headers=["*"],
+    # A browser-side OpenAI client must read it to stop retrying the errors
+    # no retry can clear (src/routes/responses.py ``_NO_RETRY_HEADERS``).
+    expose_headers=["x-should-retry"],
 )
 
 # Add rate limiting error handler
@@ -716,10 +769,15 @@ async def http_exception_handler(_request: Request, exc: HTTPException):
     if isinstance(detail, dict) and isinstance(detail.get("error"), dict):
         # Caller already produced an OpenAI-style {"error": {...}} payload;
         # pass it through unchanged to avoid double-nesting.
-        return JSONResponse(status_code=exc.status_code, content=detail)
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=detail,
+            headers=getattr(exc, "headers", None),
+        )
     return JSONResponse(
         status_code=exc.status_code,
         content={"error": {"message": detail, "type": "api_error", "code": str(exc.status_code)}},
+        headers=getattr(exc, "headers", None),
     )
 
 

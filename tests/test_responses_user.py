@@ -299,10 +299,17 @@ class TestUserSessionBinding:
                 "peek_session",
                 return_value=None,
             ) as mock_peek_session,
+            # The rehydrate lookups are async (the transcript read runs off
+            # the event loop); the later plain lookup is get_session.
+            patch.object(
+                isolated_session_manager,
+                "get_session_async",
+                AsyncMock(side_effect=[None, session]),
+            ) as mock_get_session_async,
             patch.object(
                 isolated_session_manager,
                 "get_session",
-                side_effect=[None, session, session],
+                return_value=session,
             ) as mock_get_session,
             client_context_with_workspace(mock_wm) as (client, mock_cli),
         ):
@@ -326,11 +333,11 @@ class TestUserSessionBinding:
             call("alice", backend="claude"),
             call("alice"),
         ]
-        assert mock_get_session.call_args_list == [
+        assert mock_get_session_async.call_args_list == [
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice/claude", max_turn=1),
             call(existing_session_id, user="alice", cwd="/tmp/ws/alice", max_turn=1),
-            call(existing_session_id),
         ]
+        assert mock_get_session.call_args_list == [call(existing_session_id)]
         assert create_calls[0]["cwd"] == "/tmp/ws/alice"
 
     def test_codex_followup_rehydrate_uses_backend_specific_workspace(

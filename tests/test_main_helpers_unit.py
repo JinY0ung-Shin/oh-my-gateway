@@ -120,6 +120,40 @@ async def test_lifespan_runs_startup_orphan_workspace_sweep():
     sweep.assert_called_once_with(SESSION_MAX_AGE_MINUTES * 60)
 
 
+async def test_lifespan_sweeps_stale_argv_files_off_the_event_loop():
+    """Startup removes the argv files a dead gateway left in the workspaces, in
+    a worker thread so a large workspace tree never delays startup."""
+    import threading
+
+    from src.backends.claude import argv_files
+    from src.workspace_manager import workspace_manager
+
+    threads = []
+
+    def fake_sweep(base):
+        threads.append(threading.current_thread())
+        return 0
+
+    with (
+        patch.object(
+            main,
+            "validate_claude_code_auth",
+            return_value=(True, {"method": "claude_cli"}),
+        ),
+        patch.object(main, "get_mcp_servers", return_value={}),
+        patch.object(main, "discover_backends"),
+        patch.object(main, "_verify_backends", AsyncMock()),
+        patch.object(main.session_manager, "start_cleanup_task"),
+        patch.object(main.session_manager, "async_shutdown", AsyncMock()),
+        patch.object(argv_files, "sweep_stale", side_effect=fake_sweep) as sweep,
+    ):
+        async with main.lifespan(main.app):
+            await main.app.state.argv_file_sweep
+
+    sweep.assert_called_once_with(workspace_manager.base_path)
+    assert threads and threads[0] is not threading.main_thread()
+
+
 def test_find_available_port_returns_first_free_port():
     socket_instances = []
     connect_results = iter([0, 1])

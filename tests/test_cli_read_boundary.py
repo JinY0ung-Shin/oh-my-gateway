@@ -209,7 +209,7 @@ async def _run(
         return {"text": "done"}
 
     cli = _make_cli()
-    built = cli._build_sdk_options(permission_mode=mode)
+    built = cli._build_sdk_options(permission_mode=mode, cwd=workspace)
     gateway_cb = cli._make_ask_user_can_use_tool(SimpleNamespace())
     asked: List[str] = []
 
@@ -243,7 +243,8 @@ async def _run(
         # the closure tests prove the OUTSIDE read is blocked, not that python
         # failed to boot. It is a subtree, so the repo's src/ and data/ stay
         # denied (the /app protection the other tests check).
-        confinement[landlock.RO_ENV] += os.pathsep + sys.prefix
+        ro = json.loads(confinement[landlock.RO_ENV])  # a JSON array
+        confinement[landlock.RO_ENV] = json.dumps([*ro, sys.prefix])
         env.update(confinement)
     with FakeAnthropicAPI(plan) as api:
         options = ClaudeAgentOptions(
@@ -425,3 +426,32 @@ class TestLandlockConfinement:
         results, _ = await _run(tmp_path, calls, "default", confine=True)
         assert all(INSIDE in r for r in results[:2]), results
         assert "written" in results[2], results[2]
+
+    async def test_confined_bash_is_not_a_login_shell(
+        self, tmp_path, boundary_off, monkeypatch
+    ):
+        # #244 review 4: confined, the CLI cannot write its shell snapshot and
+        # ran every Bash call as `bash -c -l`, so a ~/.profile (which the
+        # ruleset denies) put "Permission denied" into every result and a PATH
+        # reset in /etc/profile dropped operator PATH entries. The launcher
+        # points CLAUDE_CODE_SHELL at docker/claude-session-bash, which drops
+        # the -l. The other tests' HOME has no .profile, so they never saw it.
+        # (boundary_off: the read boundary refuses `echo $PATH` as unverifiable.)
+        bash = next(
+            (b for b in ("/bin/bash", "/usr/bin/bash") if os.access(b, os.X_OK)), None
+        )
+        if bash is None:
+            pytest.skip("no system bash")
+        # SHELL names a bash, so it is the CLI's pick as in the image (no zsh);
+        # a zsh the CLI would pick is left alone.
+        monkeypatch.setenv("SHELL", bash)
+        home = tmp_path / "home"
+        home.mkdir()
+        (home / ".profile").write_text("PATH=/profile/reset\n")
+        marker = str(tmp_path / "operator-bin")
+        monkeypatch.setenv("PATH", f"{marker}{os.pathsep}{os.environ['PATH']}")
+        probe = "shopt -q login_shell && echo LOGIN || echo NOLOGIN; echo P=$PATH"
+        results, _ = await _run(tmp_path, [_bash(probe)], "default", confine=True)
+        assert "NOLOGIN" in results[0], results[0]
+        assert "Permission denied" not in results[0], results[0]
+        assert f"P={marker}{os.pathsep}" in results[0], results[0]

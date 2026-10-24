@@ -26,16 +26,30 @@ contract:
 PR-C turns per-session isolation on by pointing ``CLAUDE_CONFIG_DIR`` (or the
 equivalent) per session; because every consumer now routes through here, that is
 a change in one place rather than six.
+
+uid mode (``docs/isolation-uid-ownership-design.md`` §4) gives every session
+uid its own config dir ``P = <CLAUDE_ISOLATION_CONFIG_BASE>/<uid>``, whose
+shared assets are links into the gateway's own config dir (the shared tree
+``S``). :class:`ConfigLayout` names both for one spawn; :func:`layout` builds
+it. Every other mode keeps one config dir for everything (``P == S``).
 """
 
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 PLUGIN_CLONE_ROOT_ENV = "CLAUDE_PLUGIN_CLONE_ROOT"
+# uid mode only: where the per-uid config dirs live (``<base>/<uid>``).
+CONFIG_BASE_ENV = "CLAUDE_ISOLATION_CONFIG_BASE"
+# uid mode only: the config dir whose ``projects/<name>`` a named user's first
+# uid-mode spawn copies into its own config dir. Unset: the shared config dir
+# (where the CLI kept every transcript before); ``off`` turns the copy off.
+MIGRATE_FROM_ENV = "CLAUDE_ISOLATION_MIGRATE_FROM"
+_MIGRATE_OFF = frozenset({"off", "none", "false", "0", "no"})
 
 _CONFIG_DIR_NAME = ".claude"
 _GLOBAL_CONFIG_NAME = ".claude.json"
@@ -131,3 +145,76 @@ def plugin_clone_root() -> Path:
     if configured:
         return Path(configured)
     return _home() / _CONFIG_DIR_NAME / _PLUGIN_MARKETPLACES
+
+
+@dataclass(frozen=True)
+class ConfigLayout:
+    """Where one spawn's CLI keeps its state and finds the shared assets.
+
+    * ``config_dir`` — the CLI child's ``CLAUDE_CONFIG_DIR``: the per-uid dir
+      ``P`` in uid mode, else the gateway's own config dir;
+    * ``shared_dir`` — where the shared assets (skills, plugins, agents, …,
+      ``settings.json``) physically live: the gateway's own config dir ``S``.
+      ``P`` links them in, so the two differ only for a per-uid layout;
+    * ``uid`` — the session uid of a per-uid layout, ``None`` otherwise.
+
+    Paths are as configured, not resolved.
+    """
+
+    config_dir: Path
+    shared_dir: Path
+    uid: Optional[int] = None
+
+    @property
+    def per_uid(self) -> bool:
+        return self.uid is not None
+
+    @property
+    def projects(self) -> Path:
+        """``<config dir>/projects``: this layout's transcripts."""
+        return self.config_dir / "projects"
+
+
+def config_base() -> Optional[Path]:
+    """``$CLAUDE_ISOLATION_CONFIG_BASE`` as an absolute path, else ``None``.
+
+    The startup check refuses a relative value in uid mode (it would resolve
+    against the gateway's cwd, the app root); here it is only normalized.
+    """
+    raw = os.environ.get(CONFIG_BASE_ENV, "").strip()
+    return Path(os.path.abspath(raw)) if raw else None
+
+
+def user_config_dir(uid: int) -> Optional[Path]:
+    """The per-uid config dir ``<config base>/<uid>``, or ``None`` without a base."""
+    base = config_base()
+    return None if base is None else base / str(int(uid))
+
+
+def layout(uid: Optional[int] = None) -> ConfigLayout:
+    """The config layout of a spawn as *uid* (``None``: not a per-uid spawn).
+
+    A per-uid layout needs a config base; without one this is the shared
+    layout (uid mode's startup check refuses that configuration).
+    """
+    shared = config_dir()
+    if uid is not None:
+        per_uid = user_config_dir(uid)
+        if per_uid is not None:
+            return ConfigLayout(per_uid, shared, int(uid))
+    return ConfigLayout(shared, shared, None)
+
+
+def legacy_config_dir() -> Optional[Path]:
+    """The config dir a named user's legacy transcripts are migrated from.
+
+    ``$CLAUDE_ISOLATION_MIGRATE_FROM`` when set (absolute), the shared config
+    dir when unset, ``None`` when it says ``off``.
+    """
+    raw = os.environ.get(MIGRATE_FROM_ENV)
+    if raw is None:
+        return config_dir()
+    raw = raw.strip()
+    if not raw or raw.lower() in _MIGRATE_OFF:
+        return None
+    return Path(os.path.abspath(raw))

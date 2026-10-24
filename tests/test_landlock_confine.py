@@ -109,8 +109,8 @@ class TestGatewayWiring:
 
     def test_on_builds_ro_rw_env(self, confine_on, tmp_path):
         env = landlock.options_env(tmp_path)
-        assert env[landlock.RO_ENV] is not None
-        rw = env[landlock.RW_ENV].split(os.pathsep)
+        assert isinstance(json.loads(env[landlock.RO_ENV]), list)
+        rw = json.loads(env[landlock.RW_ENV])  # JSON arrays, never ':'-joined
         assert str(tmp_path) in rw  # the workspace is always read-write
         assert env[landlock.REAL_CLI_ENV]
 
@@ -315,6 +315,60 @@ class TestFailClosed:
         assert any(f"directory {launcher.parent} " in p for p in problems)
         assert not any(p.startswith(f"{launcher} ") for p in problems)
 
+    def test_write_problems_cover_the_session_shell(self, monkeypatch, tmp_path):
+        # Every confined Bash call runs the wrapper beside the launcher, so a
+        # replaceable one plants code in every session; absent, it is skipped
+        # (the CLI keeps its own shell).
+        launcher = self._launcher_tree(tmp_path)
+        shell = launcher.parent / "claude-session-bash"
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **k):
+            values = list(real_stat(self, *a, **k))
+            values[stat.ST_UID] = 0
+            values[stat.ST_MODE] &= ~0o022 | stat.S_ISVTX
+            if self == shell:
+                values[stat.ST_MODE] = stat.S_IFREG | 0o777
+            return os.stat_result(values)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        assert landlock.launcher_write_problems(launcher) == []
+        shell.write_text("#!/bin/sh\n")
+        problems = landlock.launcher_write_problems(launcher)
+        assert any(p.startswith(f"{shell} ") and "0777" in p for p in problems)
+
+    def test_a_linked_rules_file_is_checked_where_it_loads_from(
+        self, monkeypatch, tmp_path
+    ):
+        # The launcher loads a linked _landlock_rules.py from its target, and
+        # the session shell is found beside that target: its directory chain
+        # and that shell are what a session would have to be kept out of.
+        launcher = self._launcher_tree(tmp_path)
+        real = tmp_path / "real"
+        real.mkdir()
+        target = real / "_landlock_rules.py"
+        target.write_text("")
+        (launcher.parent / "_landlock_rules.py").unlink()
+        (launcher.parent / "_landlock_rules.py").symlink_to(target)
+        shell = real / "claude-session-bash"
+        shell.write_text("#!/bin/sh\n")
+        real_stat = Path.stat
+
+        def fake_stat(self, *a, **k):
+            values = list(real_stat(self, *a, **k))
+            values[stat.ST_UID] = 0
+            values[stat.ST_MODE] &= ~0o022 | stat.S_ISVTX
+            if self == real:
+                values[stat.ST_UID] = 1000
+            elif self == shell:
+                values[stat.ST_MODE] = stat.S_IFREG | 0o777
+            return os.stat_result(values)
+
+        monkeypatch.setattr(Path, "stat", fake_stat)
+        problems = landlock.launcher_write_problems(launcher)
+        assert any(f"directory {real} " in p for p in problems)
+        assert any(p.startswith(f"{shell} ") and "0777" in p for p in problems)
+
     def test_a_sticky_world_writable_ancestor_is_allowed(
         self, monkeypatch, tmp_path
     ):
@@ -371,8 +425,8 @@ class TestClientOverrides:
 
         assert _get_cli_path() == str(_LAUNCHER)
 
-    def test_sandbox_forced_off_when_on(self, confine_on):
-        options = self._cli()._build_sdk_options()
+    def test_sandbox_forced_off_when_on(self, confine_on, tmp_path):
+        options = self._cli()._build_sdk_options(cwd=tmp_path)
         sandbox = options.sandbox
         # SandboxSettings is a TypedDict in the SDK; be tolerant of either shape.
         enabled = sandbox["enabled"] if isinstance(sandbox, dict) else sandbox.enabled
@@ -381,7 +435,7 @@ class TestClientOverrides:
     def test_options_carry_confinement_env_when_on(self, confine_on):
         options = self._cli()._build_sdk_options(cwd=Path("/tmp/ws-x"))
         assert options.env.get(landlock.RW_ENV)
-        assert "/tmp/ws-x" in options.env[landlock.RW_ENV].split(os.pathsep)
+        assert "/tmp/ws-x" in json.loads(options.env[landlock.RW_ENV])
 
     def test_no_confinement_env_when_off(self, confine_off):
         options = self._cli()._build_sdk_options(cwd=Path("/tmp/ws-x"))
@@ -421,7 +475,7 @@ class TestLauncherConfines:
         "}))\n"
     )
 
-    def _run(self, tmp_path, ro="", rw=None):
+    def _run(self, tmp_path, ro=None, rw=None):
         ws = tmp_path / "ws"
         ws.mkdir()
         (ws / "in.txt").write_text("INSIDE\n")
@@ -434,8 +488,8 @@ class TestLauncherConfines:
             "PATH": "/usr/bin:/bin",
             "PWD": str(ws),
             landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
-            landlock.RW_ENV: os.pathsep.join(rw or [str(ws)]),
-            landlock.RO_ENV: ro,
+            landlock.RW_ENV: json.dumps(rw or [str(ws)]),
+            landlock.RO_ENV: json.dumps(ro or []),
         }
         proc = subprocess.run(
             [
@@ -493,8 +547,8 @@ class TestLauncherConfines:
             "PATH": "/usr/bin:/bin",
             "PWD": str(ws),
             landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
-            landlock.RW_ENV: str(ws),
-            landlock.RO_ENV: str(ro_dir),
+            landlock.RW_ENV: json.dumps([str(ws)]),
+            landlock.RO_ENV: json.dumps([str(ro_dir)]),
         }
         proc = subprocess.run(
             [
@@ -550,8 +604,8 @@ class TestLauncherConfines:
             "PATH": "/usr/bin:/bin",
             "PWD": str(ws),
             landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
-            landlock.RW_ENV: str(ws),
-            landlock.RO_ENV: str(cfg),
+            landlock.RW_ENV: json.dumps([str(ws)]),
+            landlock.RO_ENV: json.dumps([str(cfg)]),
         }
         proc = subprocess.run(
             [sys.executable, str(_LAUNCHER), str(ws / "p.py"), str(cfg)],
@@ -589,8 +643,8 @@ class TestLauncherConfines:
             "PATH": "/usr/bin:/bin",
             "PWD": str(ws),
             landlock.REAL_CLI_ENV: _SYSTEM_PYTHON,
-            landlock.RW_ENV: str(ws),
-            landlock.RO_ENV: "",
+            landlock.RW_ENV: json.dumps([str(ws)]),
+            landlock.RO_ENV: json.dumps([]),
         }
         proc = subprocess.run(
             [sys.executable, str(_LAUNCHER), str(ws / "p.py"), str(outside / "evil")],
@@ -614,7 +668,7 @@ def _cfg(monkeypatch, tmp_path) -> Path:
 
 
 def _entries(env: dict, var: str) -> list:
-    return env[var].split(os.pathsep)
+    return json.loads(env[var])
 
 
 class TestReviewRoRwLists:
@@ -676,7 +730,7 @@ class TestReviewRoRwLists:
         extra.mkdir()  # a writable mount → the #240 filter must drop it
         monkeypatch.setenv("CLAUDE_ADD_DIRS", str(extra))
         env = landlock.options_env(tmp_path / "ws")
-        ro = env[landlock.RO_ENV].split(os.pathsep)
+        ro = _entries(env, landlock.RO_ENV)
         assert str(extra) not in ro
 
 
@@ -704,12 +758,14 @@ class TestPreflightConfinement:
 
     def test_session_preflight_runs_as_the_session_uid(self, uid_on, tmp_path):
         # The workspace's settings, skills and commands load in the preflight
-        # too, so in uid mode it must not run as the gateway uid.
+        # too, so in uid mode it must not run as the gateway uid once the user
+        # has one (their session's spawn assigned it; a user without one is in
+        # tests/test_uid_preflight_alloc.py).
         ws = tmp_path / "ws"
+        session = _ticket(landlock.options_env(ws, user="alice"))
         pre = landlock.preflight_options_env(ws, user="alice")
         assert pre[landlock.MODE_ENV] == "uid"
         assert landlock.RO_ENV not in pre and landlock.RW_ENV not in pre
-        session = _ticket(landlock.options_env(ws, user="alice"))
         assert _ticket(pre)["uid"] == session["uid"]
         assert _ticket(pre)["workspace"] == str(ws)
 
@@ -752,7 +808,9 @@ class TestPreflightConfinement:
         self, uid_on, tmp_path
     ):
         from src.backends.claude import slash_commands as sc
+        from src.backends.claude import uid_isolation as ui
 
+        ui.resolve_uid("alice")  # a user who already has a uid
         opts = sc._build_preflight_options(tmp_path / "ws", user="alice")
         assert opts.env[landlock.MODE_ENV] == "uid"
         assert _ticket(opts.env)["workspace"] == str(tmp_path / "ws")
@@ -802,11 +860,14 @@ class TestPreflightConfinement:
         monkeypatch.setenv(landlock.MODE_ENV, mode)
         monkeypatch.setenv("GATEWAY_ISOLATION_TICKET_SECRET", "s3cret")
         if mode == "uid":
+            from src.backends.claude import uid_isolation as ui
+
             monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
             monkeypatch.setenv(
                 "CLAUDE_ISOLATION_UID_REGISTRY", str(tmp_path / "uids.json")
             )
             monkeypatch.setattr(landlock, "uid_mode_available", lambda: True)
+            ui.resolve_uid("alice")  # so the preflight takes the ticket path
         landlock.reset_mode_cache()
         env = sc._build_preflight_options(tmp_path / "ws", user="alice").env
         for name in (*secrets, "GATEWAY_ISOLATION_TICKET_SECRET"):

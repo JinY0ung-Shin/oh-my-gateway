@@ -306,6 +306,7 @@ async def test_uid_mode_preflight_runs_through_the_broker(monkeypatch, tmp_path)
             "CLAUDE_ISOLATION_UID_MIN": str(uid),
             "CLAUDE_ISOLATION_UID_MAX": str(uid + 1),
             "APP_UID": str(uid - 1),
+            "APP_GID": str(uid - 1),  # reserved too; default 1000 = runner uid
             "CLAUDE_ISOLATION_BROKER_UID": str(uid - 2),
             "CLAUDE_ISOLATION_UID_REGISTRY": str(tmp_path / "uids.json"),
         }.items():
@@ -330,6 +331,9 @@ async def test_uid_mode_preflight_runs_through_the_broker(monkeypatch, tmp_path)
             ui.capture_ticket_secret()  # as the lifespan does
             landlock.install_process_env()  # waits for the broker socket
             assert landlock.effective_mode() == "uid"
+            # The preflight runs as the user's uid only once the user has one
+            # (a session spawn allocates it); give alice hers first.
+            ui.resolve_uid("alice")
             names = await asyncio.wait_for(
                 sc._fetch_commands(ws, user="alice"), _TIMEOUT
             )

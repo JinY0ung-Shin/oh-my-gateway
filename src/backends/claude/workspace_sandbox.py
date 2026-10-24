@@ -826,8 +826,15 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
-def make_claude_home_guard_hook(workspace_root: Path):
+def make_claude_home_guard_hook(workspace_root: Path, layout=None):
     """Build the always-on PreToolUse guard for the shared ``$HOME/.claude``.
+
+    *layout* (``claude_config_paths.ConfigLayout``) is the session's config
+    layout. A per-uid one (uid mode) has the session's own config dir ``P``,
+    whose shared assets are links into the gateway's config dir ``S``: then
+    both are guarded — the session's own project dir is in ``P``, the shared
+    assets are read where the links lead (in ``S``), and everything else in
+    either is denied.
 
     Every gateway CLI child shares one HOME, so ``~/.claude/projects/*`` holds
     every user's transcripts, tool results and auto memory, and ``plans/`` the
@@ -861,11 +868,23 @@ def make_claude_home_guard_hook(workspace_root: Path):
     """
     workspace = Path(workspace_root).resolve()
     claude_home = _claude_home()
-    own = _own_project_roots(Path(workspace_root), claude_home)
+    protected = [claude_home] if claude_home is not None else []
+    own_home = claude_home
+    if layout is not None and getattr(layout, "per_uid", False):
+        try:
+            own_home = Path(layout.config_dir).resolve()
+        except (OSError, RuntimeError, ValueError):
+            own_home = None
+        if own_home is not None and own_home not in protected:
+            protected.insert(0, own_home)
+    own = _own_project_roots(Path(workspace_root), own_home)
     readable = list(own)
     # Never the operator's CLAUDE_ADD_DIRS: an entry that is $HOME or
     # $HOME/.claude would otherwise open every user's transcripts and plans.
-    for root in _shared_asset_roots(claude_home) + _plugin_resource_roots(claude_home):
+    # A per-uid P's asset names resolve into S (its links), so both spellings
+    # land on the same roots.
+    asset_roots = _shared_asset_roots(own_home) + _shared_asset_roots(claude_home)
+    for root in asset_roots + _plugin_resource_roots(claude_home):
         if root not in readable:
             readable.append(root)
     # Shared, read-only for the write tools wherever they live: plugin resource
@@ -882,18 +901,20 @@ def make_claude_home_guard_hook(workspace_root: Path):
         return expanded
 
     def violation(candidate: str, write: bool) -> Optional[str]:
-        if claude_home is None or not candidate:
+        if not protected or not candidate:
             return None
         allowed = own if write else readable
         absolute = _absolute(candidate)
         cut = min((absolute.find(c) for c in _GLOB_CHARS if c in absolute), default=-1)
         if cut >= 0:
-            # A pattern: deny when its fixed prefix could expand into
-            # $HOME/.claude outside the allowed roots.
+            # A pattern: deny when its fixed prefix could expand into a
+            # protected config dir outside the allowed roots.
             prefix = os.path.normpath(absolute[:cut]) if cut else "/"
             fixed = absolute[:cut]
-            home = str(claude_home)
-            reaches = home.startswith(fixed) or _is_within(Path(prefix), claude_home)
+            reaches = any(
+                str(home).startswith(fixed) or _is_within(Path(prefix), home)
+                for home in protected
+            )
             if not reaches:
                 return None
             if any(_is_within(Path(prefix), root) for root in allowed):
@@ -911,22 +932,24 @@ def make_claude_home_guard_hook(workspace_root: Path):
                 _is_within(resolved, root) for root in shared_read_only
             ):
                 return candidate
-        if not _is_within(resolved, claude_home):
+        if not any(_is_within(resolved, home) for home in protected):
             return None
         if any(_is_within(resolved, root) for root in allowed):
             return None
         return candidate
 
+    shown = " or ".join(str(home) for home in protected)
+
     def deny(tool: str, path: str) -> Dict[str, Any]:
         return _deny(
-            f"{tool} target {path!r} is shared Claude state ({claude_home} or a "
+            f"{tool} target {path!r} is shared Claude state ({shown} or a "
             "shared plugin root), which holds other users' sessions and plans. "
             "Only this session's own project directory is available there; "
             "shared skills and plugins are read-only."
         )
 
     async def hook(input_data, _tool_use_id, _context):
-        if claude_home is None or not isinstance(input_data, dict):
+        if not protected or not isinstance(input_data, dict):
             return {}
         tool_name = input_data.get("tool_name", "")
         tool_input = input_data.get("tool_input", {}) or {}

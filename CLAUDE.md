@@ -199,58 +199,154 @@ uv run pytest --cov=src                            # with coverage
   it), applies a Landlock ruleset, and execs the real CLI (operator `CLAUDE_CLI_PATH` or SDK bundle,
   resolved by `landlock.resolve_real_cli`). Landlock is inherited across `execve`, so Bash, a script
   the agent wrote, and stdio MCP are all confined at `open()`. The per-workspace ro/rw path lists
-  ride `options.env` (`landlock.options_env`) and are built from the **same** `workspace_sandbox`
-  helpers as the always-on `~/.claude` guard (`_shared_asset_roots`, `plugin_resource_roots`,
-  `_writable_extra_roots`), plus the CLI's own config files read-only (`<cfg>/settings.json`,
-  `settings.local.json`, the legacy `<cfg>/.config.json`, and `claude_config_paths.global_config_file()`
-  = `$CLAUDE_CONFIG_DIR/.claude.json` else `$HOME/.claude.json`, never `<cfg>.parent` — so the
-  confined CLI logs a harmless `Failed to save config with lock`). RW is only the workspace, the
-  session's own `projects/<name>`, `<cfg>/session-env/<session id>` (pre-created 0700 when the id is
-  known — never `session-env` itself: its siblings are other sessions' `$CLAUDE_ENV_FILE` scripts the
-  CLI sources into Bash; a confined CLI cannot sweep it, so the gateway removes it when the session
-  ends — delete, expiry, eviction, shutdown, stateless cleanup) and `/dev/shm` (POSIX semaphores — multiprocessing/joblib; in landlock mode a
+  ride `options.env` (`landlock.options_env`, JSON arrays: a granted path may contain `:`) and are
+  built from the guard's shared asset names (skills, plugins, agents, commands, output-styles,
+  `CLAUDE.md`) plus the Landlock-only `rules`, `hooks` and `workflows` (the CLI loads user rules and
+  runs user hook scripts from them; the file-tool guard still denies them), `plugin_resource_roots()`
+  and the CLI's own config files read-only (`<cfg>/settings.json`, `settings.local.json`, the legacy
+  `<cfg>/.config.json`, and `claude_config_paths.global_config_file()` = `$CLAUDE_CONFIG_DIR/.claude.json`
+  else `$HOME/.claude.json`, never `<cfg>.parent` — so the confined CLI logs a harmless
+  `Failed to save config with lock`). **Every entry goes through `_GrantFilter`**: it is resolved,
+  the resolved path is what gets granted, and it is refused (warned once) when it is or contains the
+  config dir, `$HOME`, the workspace base, the app root (`/app`) or the temp dir, lies inside the
+  workspace base, `/app`, the temp dir, `/run`, `/var/run`, `/dev`, `/sys`, `/root` or `/var/tmp`,
+  or lies inside the config dir or `$HOME` outside the shared subtrees and the global config file.
+  Refusals for the workspace base, `/app` and the system roots beat every exemption, and roots that
+  are the same directory apply the strictest rule (`USER_WORKSPACES_DIR=$HOME` still refuses another
+  user's workspace); only an operator `CLAUDE_PLUGIN_CLONE_ROOT` exempts paths under `$HOME` (the
+  default `<cfg>/plugin-marketplaces` is just a shared subtree name, so a planted
+  `plugin-marketplaces -> ~/.ssh` grants nothing); a file grant must be a single-link regular file;
+  `HOME=/` fails closed. The workspace itself goes through `_confined_workspace`: a
+  workspace-manager workspace must resolve to exactly `realpath(base)/<rel>` and a gateway-owned
+  preflight dir must be a real dir the gateway owns, else `WorkspaceRefused` refuses the spawn; the
+  resolved workspace is the first rw entry and the ticket's workspace, and the launcher (exit 70) /
+  broker child (exit 113) refuse a spawn whose kernel cwd is not exactly it. (A symlinked base
+  passes, but the CLI names its transcript dir after the resolved cwd while the gateway's
+  transcript lookup, `session_manager._encode_cwd`, uses the lexical workspace: a re-created client
+  then starts fresh instead of resuming, and rehydrate 404s — pre-existing.) The launcher and broker
+  open every gateway-provided entry without following any symlink (a component walk with
+  `O_NOFOLLOW`) and refuse a hard-linked file target, so a swap after the filter is not granted; the
+  system roots, `/dev` files, `/dev/shm`, the real-CLI dir and the shell wrapper keep a following open
+  (merged-usr `/lib` links). `check_config` refuses a real-CLI dir that is or contains `/`, `$HOME`,
+  the config dir, the workspace base, `/app`, the temp dir or a system root, or lies in the
+  workspace base, and a workspace base, config dir, `$HOME` or app root under a root the launcher
+  grants every session read-only (`/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/etc`, `/opt`, `/proc`
+  — e.g. `USER_WORKSPACES_DIR=/opt/ws`) (the launcher/broker re-check
+  `/` and holding the workspace). So a planted link (`agents -> .`, `settings.local.json -> /`, a
+  workspace dir `-> ~/.claude`) or a broad registry/env root (`installLocation: /`,
+  `CLAUDE_PLUGIN_CLONE_ROOT=/data` holding the workspace base) cannot widen every session's grant,
+  while a link to a safe target (`skills -> /opt/shared-skills`) still works. It is a deny-list of
+  the gateway's own state, not of every secret on the host, and a hard link an unconfined writer
+  plants *inside* a granted dir (e.g. `skills/x.jsonl` → another user's transcript) is not detected.
+  RW is only the workspace, the session's own `projects/<name>` (one, for the resolved cwd the CLI
+  names it after; a planted link there is refused), `<cfg>/session-env/<session id>` and
+  `<cfg>/tasks/<session id>` (the CLI's Task list) —
+  pre-created 0700 by the gateway in landlock mode, created by the broker child as the session uid in
+  uid mode, never `session-env` or `tasks` themselves: their siblings are other sessions'
+  `$CLAUDE_ENV_FILE` scripts the CLI sources into Bash and other sessions' task lists. A confined CLI
+  cannot sweep them, so the gateway removes both once the session is **finished** — explicit delete,
+  any teardown of an anonymous session, stateless cleanup — but not when a named session expires, is
+  evicted or the gateway shuts down (a continuation resumes the same id, and SessionStart then runs
+  with `source=resume` only), and never while a live session holds the id
+  (`SessionManager._release_session_dirs`); the dirs of named sessions never resumed stay behind,
+  and in uid mode the app-uid gateway cannot remove what the session uid wrote there (the same
+  broker-cleanup follow-up as its transcripts). While a session's client is starting
+  (`begin_client_start` → `create_client` → `finish_client_start`), a teardown defers removing its
+  workspace, lease and dirs until that client is stopped, and a session deleted meanwhile answers
+  409 `session_ended`; every session-manager teardown SIGKILLs a CLI that outlived its capped
+  disconnect (`_stop_client`) before anything is removed. A new session whose first turn is refused
+  (e.g. a slash 400) is deleted at once.
+  RW also covers `/dev/shm` (POSIX semaphores — multiprocessing/joblib; in landlock mode a
   surface every same-uid session shares). **No shared cache is writable**: a session-writable
   `~/.npm`, uv cache or `plugins/data` is a cross-session plant channel (other sessions' `npx -y` /
   `uv run` / plugin hooks execute from them), so the launcher/broker point `npm_config_cache`,
   `NPM_CONFIG_CACHE` and `UV_CACHE_DIR` under `<cwd>/.cli-tmp` (per-workspace downloads: they count
-  against `USER_WORKSPACE_QUOTA_MB`, and a stateless run starts cold every request), and
+  against `USER_WORKSPACE_QUOTA_MB`, and a stateless run starts cold every request) — with
+  `UV_PYTHON_INSTALL_DIR` and `UV_TOOL_DIR` too: uv treats an unreadable `~/.local/share/uv/*` as
+  fatal (a missing one is fine), so as a uid-mode session uid every `uv run` / `uvx` — plugin MCP
+  servers bootstrapped that way included — died before #246; no `UV_PROJECT_ENVIRONMENT` (a project
+  venv stays beside its project). A plugin MCP server that dies while starting is only
+  `init.mcp_servers[].status == "failed"` (the CLI keeps no stderr); the gateway logs it as
+  `MCP server '<name>' failed to start` (`tests/test_cli_mcp_startup_failure.py`), and
   `plugins/data` stays read-only with the gateway pre-creating `plugins/data/<id>` for each
   `installed_plugins.json` key on every confined spawn (`_ensure_plugin_data_dirs`): the CLI mkdirs
   `$CLAUDE_PLUGIN_DATA` before every plugin hook and **skips the hook on EACCES**; with the dir
   present the hook runs and only its writes there fail. The CLI's only knob,
   `CLAUDE_CODE_PLUGIN_CACHE_DIR`, moves the whole plugins root, so a per-session data dir needs
-  per-user config dirs. `CLAUDE_ADD_DIRS` rides the #240 filter (`_operator_add_dir_roots`), never
-  the raw strings. A confined script reaches what a file tool may plus `/dev/shm` and the read-only
+  per-user config dirs (uid mode has them: there `P/plugins/data` is the session uid's). `CLAUDE_ADD_DIRS` rides the #240 filter (`_operator_add_dir_roots`) and then
+  `_GrantFilter`, never the raw strings. A confined script reaches what a file tool may plus `/dev/shm` and the read-only
   system roots — `/app` is never listed (code + `/app/data` creds denied by rule absence, not a ro
   rule). `/etc` and `/usr` stay ro (the CLI/libc need them; a passwd entry is required), so
   acceptance is "a path **outside the ruleset**", not `/etc/passwd`. **`/proc` stays ro too (the
   bundled CLI aborts without it), so in both modes a session can read every process's command line
   (`/proc/<pid>/cmdline`)** — world-readable whatever the uid. So with confinement on,
-  `create_client` moves the `--mcp-config` JSON (with `MCP_FORWARD_CONTEXT` `{{header:…}}` values)
-  and the system prompt (`Current user:`) into per-spawn workspace files (`argv_files.externalize`:
-  `O_EXCL|O_NOFOLLOW` under a workspace dir fd, 0600 landlock / 0644 uid; `--system-prompt-file`,
-  `--append-system-prompt-file` via `extra_args`) and removes them once `connect()` returns —
-  the CLI reads them while parsing argv and never again (`tests/test_cli_argv_files.py` pins
-  that against the bundled CLI: MCP header + prompt still arrive after the delete, the live
-  cmdline holds only paths; when a CLI bump reads them lazily, keep the files for the session).
-  An in-process `sdk` MCP server keeps the dict (the SDK needs it), and `--json-schema` has no file
-  form so the request's own `text.format` schema stays on the command line — the rest of the argv
-  exposure of `docs/security-process-isolation.md` §6.5. `environ`, `mem` and the fds of processes outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher refuses
-  a relative one (exit 70) and uses `os.getcwd()`, never `$PWD` — a relative `USER_WORKSPACES_DIR`
-  once granted `<ws>/<ws>`. A rule target that is a regular file (e.g. the user `CLAUDE.md`) gets
+  `create_client` and `verify()` (startup and every admin health check) move the `--mcp-config`
+  JSON (with `MCP_FORWARD_CONTEXT` `{{header:…}}` values and the plugin MCP credential overlays)
+  and the system prompt (`Current user:`) into per-spawn files in the CLI's cwd
+  (`argv_files.externalize`: `O_EXCL|O_NOFOLLOW` under a workspace dir fd, 0600 landlock / 0644
+  uid; `--system-prompt-file`, `--append-system-prompt-file` via `extra_args`), passed by **name
+  relative to that cwd** (an absolute path put the workspace, named after the user, on the CLI's
+  command line), and remove them once the CLI has started (`create_client` after `connect()`,
+  `verify()` after its query) — the CLI reads them while parsing argv and never again
+  (`tests/test_cli_argv_files.py` pins that against the bundled CLI: MCP header + prompt still
+  arrive after the delete, the live cmdline holds only the relative names; when a CLI bump reads
+  them lazily, keep the files for the session). Files a gateway that died mid-spawn left behind
+  are removed at the next startup (`argv_files.sweep_stale`: depth ≤ 2 under the workspace base,
+  only `_write`-shaped names older than 15 min, never through a symlinked dir, in a worker thread
+  startup does not wait for; landlock-mode `verify()` runs in the client's private 0700 temp cwd
+  instead, outside every session's ruleset, which a crash leaves behind as before), and the workspace file
+  API always hides and 404s `.gateway-argv-*`. An in-process `sdk` MCP server keeps the dict (the
+  SDK needs it), `--json-schema` has no file form so the request's own `text.format` schema stays
+  on the command line, and **every Bash tool call's shell argv** carries the command text plus
+  `<ws>/.cli-tmp/claude-<hex>-cwd` (the CLI's `pwd -P >|` tail, so the user key), readable by
+  every session while it runs (pre-existing, not closed) — the rest of the argv exposure of
+  `docs/security-process-isolation.md` §6.5. `environ`, `mem` and the fds of processes
+  outside the domain stay denied. Every list entry leaves the gateway absolute and the launcher
+  refuses anything but a JSON array of absolute paths (exit 70) and uses `os.getcwd()`, never
+  `$PWD` — a relative `USER_WORKSPACES_DIR` once granted `<ws>/<ws>`, and the old `:`-joined lists
+  turned `.../x:/secret` into a grant of `/secret`. A rule target that is a regular file (e.g. the user `CLAUDE.md`) gets
   file-only rights — the dir-only `READ_DIR` bit is EINVAL for a file and would abort the whole
   build. On ABI ≥ 6 both modes add `LANDLOCK_SCOPE_SIGNAL | LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET`: a
   confined process cannot signal (or reach an abstract socket of) anything outside its domain, so
   sessions cannot signal each other even in landlock mode; below ABI 6 there is no scoping.
   `TMPDIR`/`CLAUDE_CODE_TMPDIR` point at `<cwd>/.cli-tmp`
   (off the shared `/tmp`), which is **not** a Landlock rule: it rides beneath the granted cwd and is
-  symlink-stripped first, because a rule on that agent-controlled path was a `ln -s / .cli-tmp`
-  escape (`_add_rule` opens targets with `O_PATH`, following the link). Failing to make it is fatal
-  (launcher exit 70, broker child exit 118), not an opaque CLI exit 1 later. The slash/skill preflight
+  rebuilt first when it is not a real directory we can use (symlink, file, FIFO, socket, lost owner
+  bits — and the CLI's own `claude-<uid>` inside it likewise; one owned by another uid moves aside
+  to `<name>.stale-<n>`), because a rule on that agent-controlled path was a `ln -s / .cli-tmp`
+  escape (`_add_rule` opens targets with `O_PATH`, following the link) and a `touch .cli-tmp` locked
+  the workspace out for good. The repair runs fd-relative from the workspace and never follows a
+  link (an agent racing it with re-planted links only makes its own spawns fail closed after 8
+  tries; nothing sweeps a landlock-mode session's detached jobs), and an operator
+  `CLAUDE_CODE_TMPDIR` is honored (landlock mode only; the broker always uses `.cli-tmp`) only as a
+  single entry directly in the workspace. Failing to make
+  it is fatal (launcher exit 70, broker child exit 118), not an opaque CLI exit 1 later. The same
+  shared helpers (`_landlock_rules.session_tmp_env` / `session_shell_env`, launcher and broker child
+  alike) set two more overrides. `GIT_CONFIG_GLOBAL=<cwd>/.cli-tmp/gitconfig`, pointing
+  `core.excludesFile`/`core.attributesFile` at absent tmp paths (kept only while it is a readable,
+  non-empty regular file still carrying that `excludesFile` line, so the session's own
+  `git config --global` edits persist; anything else moves aside to `gitconfig.broken-<n>` and is
+  rewritten atomically): Landlock does not mediate `access(2)` (nor `stat`, `chmod`, `chown`,
+  `utime` or `setxattr` of a file outside the ruleset — it checks opening, executing, creating,
+  removing, renaming/linking, truncating and device ioctls), so git took a denied `~/.gitconfig`
+  or `~/.config/git/ignore` for readable and exited 128. Operator-wide git config belongs in
+  `/etc/gitconfig` — except those two keys, which the session's global file overrides; the CLI's
+  internal git helpers pin `GIT_CONFIG_GLOBAL=/dev/null` and still read the default excludes file.
+  And, when the CLI would
+  pick bash, `CLAUDE_CODE_SHELL=claude-session-bash` (root-owned, `/usr/local/bin` in the image; the
+  file itself is in the ro list): with no writable `<cfg>/shell-snapshots` — shared, so never made
+  writable, since every session sources its snapshot before each command — the CLI runs every Bash
+  call as `bash -c -l`, whose `/etc/profile` reset PATH and whose denied `~/.profile` put
+  `Permission denied` in every result; the wrapper turns exactly that leading `-c -l` into
+  `--norc -c` (Debian's bash otherwise reads `~/.bashrc` when the env looks like ssh; a zsh choice
+  is left alone). Plugin `bin/` dirs on PATH and the CLI's pkill self-guard come only through the
+  snapshot, so they stay off under confinement. The slash/skill preflight
   (`slash_commands._build_preflight_options`) is confined exactly like a session in that workspace
-  (uid mode: through the broker as the request user's uid — `user` is threaded from the responses
-  route and `create_client`; a no-cwd preflight stays landlock-shaped in a private per-process
-  `mkdtemp` dir) and in **every** mode runs with `--strict-mcp-config` (zero servers),
+  (uid mode: through the broker as the request user's uid once that user has one — `user` is
+  threaded from the responses route and `create_client`; a named user with no uid yet stays
+  landlock-shaped as the gateway uid, so a request that then fails 400 allocates nothing, and so
+  does a no-cwd preflight in a private per-process `mkdtemp` dir) and in **every** mode runs with
+  `--strict-mcp-config` (zero servers),
   `--settings {"disableAllHooks": true, "apiKeyHelper": "", …}` (every startup settings command —
   `apiKeyHelper`, `proxyAuthHelper`, `awsCredentialExport`, `awsAuthRefresh`, `gcpAuthRefresh`,
   `otelHeadersHelper` — blanked; a flag value outranks the workspace's) and the same secret blanks a
@@ -260,10 +356,11 @@ uv run pytest --cov=src                            # with coverage
   `.mcp.json` servers and ran a workspace `apiKeyHelper` that saw `ADMIN_API_KEY`
   (`tests/test_cli_slash_preflight.py` pins identical catalogs, no side effects, a helper that does
   run seeing no gateway secret, and the uid-mode preflight through the broker). The image ships
-  launcher+broker+`_landlock_rules` at `/usr/local/bin` (root-owned, outside `/app` so
-  `chown -R app /app` can't make them agent-writable) and sets `GATEWAY_LANDLOCK_LAUNCHER`; startup
-  **refuses** a launcher a session could replace — it, its sibling `_landlock_rules.py` and every
-  ancestor dir must be root-owned and not group/other-writable (sticky dirs pass;
+  launcher+broker+`_landlock_rules`+`claude-session-bash` at `/usr/local/bin` (root-owned, outside
+  `/app` so `chown -R app /app` can't make them agent-writable) and sets `GATEWAY_LANDLOCK_LAUNCHER`;
+  startup **refuses** a launcher a session could replace — it, its sibling `_landlock_rules.py`, the
+  sibling `claude-session-bash` when present, and every ancestor dir must be root-owned and not
+  group/other-writable (sticky dirs pass;
   `landlock.launcher_write_problems`), and `CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER=true` downgrades
   that to a warning for a dev checkout (`tests/conftest.py` sets it). This is
   the no-privilege **interim** of `docs/security-process-isolation.md` §3: no uid switch, so no
@@ -296,9 +393,19 @@ uv run pytest --cov=src                            # with coverage
   `docker/_landlock_rules.py` ruleset to the CLI child *after* the switch. The launcher's uid branch
   hands the broker the SDK's fds (`SCM_RIGHTS`) + a signed single-use ticket
   (`uid_isolation.mint_ticket`, HMAC + nonce + exp; `GATEWAY_ISOLATION_TICKET_SECRET` is
-  entrypoint-generated and shared with gateway+broker; the gateway moves it out of its own
-  `os.environ` at startup (`capture_ticket_secret`, before any spawn — the frozen codex/opencode
-  clients copy `os.environ`) and still blanks it per spawn). `create_client` re-mints the ticket
+  entrypoint-generated; the broker inherits it in its env, and `hand_off_ticket_secret` moves the
+  gateway's copy out of the environment into an inherited pipe
+  (`GATEWAY_ISOLATION_TICKET_SECRET_FD`) right before exec'ing the CMD, so the `sh -c` wrapper,
+  `GATEWAY_STARTUP_SCRIPT`, `install_plugins.py` and uvicorn's exec-time environ never hold it;
+  `capture_ticket_secret` reads and closes that pipe at startup — only a FIFO, non-blocking,
+  ≤ 4096 bytes; an operator-set variable still wins and is popped from `os.environ` — before any
+  spawn (the frozen codex/opencode clients copy `os.environ`), and the secret is still blanked per
+  spawn. The variable is `<fd>:<dev>:<ino>`, so a `uvicorn --workers`/`--reload` worker, which
+  inherits only the variable, never reads and closes a pipe of its own (multiprocessing's
+  sentinel). The CMD steps inherit the descriptor: one that reads it by accident consumes the
+  secret, the gateway warns the pipe was empty, and uid mode refuses to start; a deliberate
+  same-uid reader could write it back unnoticed, but the app uid can already rewrite `/app`, so the
+  pipe is hygiene, not a boundary). `create_client` re-mints the ticket
   right before `connect()` (120 s TTL; the skills preflight awaits a global lock in between). The
   resident loop is single-threaded `select.poll` (it forks): `SO_PEERCRED` pinned to
   `GATEWAY_ISOLATION_PEER_UID` before reading a byte, ≤ 32 handshakes in flight, a 10 s total
@@ -306,8 +413,11 @@ uv run pytest --cov=src                            # with coverage
   and any per-connection exception or fork failure answers REFUSED and keeps serving (one malformed
   header used to kill the only broker). It verifies the ticket **in the resident parent** (nonce→exp
   store, pruned at expiry, so single use is authoritative) and `_authorize` keeps uid **and** gid in
-  the band and outside {0, APP_UID, APP_GID, the broker's own uid/euid/gid/egid}; relative
-  workspace/ro/rw entries are refused. The only same-uid path is the argv-only test flag
+  the band, in [1, 4294967294] ((uid_t)-1 means "unchanged" to set*id), and outside {0, APP_UID,
+  APP_GID, the broker's own uid/euid/gid/egid}; the gateway's allocators skip the same ids
+  (`reserved_uids()`: 0, APP_UID, APP_GID, the broker uid and `CLAUDE_ISOLATION_BROKER_GID`), since
+  a session's gid is its uid; relative workspace/ro/rw entries are refused. The only same-uid path
+  is the argv-only test flag
   `--test-same-uid` (the entrypoint never passes it), which lets the whole protocol (fd passing,
   supervisor tree, Landlock, exit mirroring, ticket refusal/parity, teardown) run unprivileged in
   `tests/test_isolation_broker.py`, `tests/test_landlock_launcher_hardening.py`,
@@ -321,8 +431,12 @@ uv run pytest --cov=src                            # with coverage
   remaining descendant and loops until none is left — the CLI starts each Bash command detached in
   its own session, so killing only the CLI's group leaked `cmd &`/setsid jobs — never `kill(-1)` (a
   named user's other sessions share the uid), and only then reports the status. If a supervisor dies
-  abnormally, the resident broker (also a subreaper) kills what it left as their own uid
-  (`_sweep_orphans`). Gap: a direct launcher SIGKILL with no relayed SIGTERM (the `agent_messages`
+  abnormally, the resident broker (also a subreaper) kills what it left from a short-lived killer
+  with the supervisor's `(broker, U, broker)` credentials and caps 0 (`_sweep_orphans`/`_kill_as`),
+  so U's orphans cannot stop or kill it even below ABI 6, and waits for it a bounded time
+  (`WNOHANG|WUNTRACED`, 2 s, plus up to 2 s to reap it after a SIGKILL): a stopped or overrunning
+  killer is SIGKILLed and reaped, and its pids are logged as not swept and not retried — the
+  single-threaded resident never blocks on a process a session can signal. Gap: a direct launcher SIGKILL with no relayed SIGTERM (the `agent_messages`
   wedge path) leaves a CLI that ignores SIGTERM up to 5 s, so stateless cleanup can race it. A local
   container run measured under 1 s, background jobs included. **Wire format** after the
   `=I` length + JSON header (3 fds on its first byte): fixed `=Ii` `(kind, value)` records —
@@ -339,49 +453,177 @@ uv run pytest --cov=src                            # with coverage
   `test_wait_knob_parses_like_the_gateway` — a broker that never comes up delays startup ~2× before
   the gateway fails closed). The
   broker execs the CLI with the launcher-passed env (the SDK's child env) — not the broker's —
-  filtered + plumbing-stripped, `PWD` = workspace. Anonymous/stateless runs use an **in-memory
-  ephemeral uid band** (`_EphemeralPool`, top `CLAUDE_ISOLATION_EPHEMERAL_UIDS` of the band; an empty
-  one is a startup error) so they cannot grow the persisted registry. A uid is **leased** for as long
-  as its `_tmp_` workspace exists and is handed to another run only after the workspace is gone; with
-  every uid leased the spawn is refused (`UidAllocationError`), never shared — two live runs on one
-  uid would share DAC access and `/dev/shm`. The broker backs that up: it refuses a uid a live
-  supervisor (or an unswept orphan) holds for a different workspace (`_check_uid_free`). An
-  anonymous workspace uid mode cannot delete keeps its uid (fail closed until broker cleanup
-  lands). Named users get durable uids. The registry fails **closed**: a corrupt/unreadable
+  filtered + plumbing-stripped, `PWD` = workspace. Anonymous/stateless runs **lease** a uid from an
+  in-memory ephemeral band (`_EphemeralPool`, top `CLAUDE_ISOLATION_EPHEMERAL_UIDS` of the band; an
+  empty one is a startup error), keyed by the absolute workspace path and released by
+  `WorkspaceManager.cleanup_temp_workspace` once the workspace is gone (when the pool is full, leases
+  whose workspace is gone are reclaimed first), which every path runs only after the run's CLI is
+  stopped, so no uid is shared by two live runs. In the known gaps (a stateless or try-run
+  disconnect that times out without the cancelled path's kill, and a delete during a continuation's
+  slash preflight) the uid can be handed out while the old CLI still runs, and the broker backs the
+  pool up: it refuses a uid a live supervisor holds for a different workspace, and any uid an
+  orphan still holds — one not swept yet, or one a sweep gave up on (`_check_uid_free`). That
+  check assumes one workspace per uid: a named user whose orphan a sweep gave up on cannot spawn
+  until it exits, and one live in two workspaces at once (a legacy `base/<user>` resume beside a
+  `base/<user>/claude` session) is refused in the second. The session uid writes its workspace
+  (next gotcha), so the gateway alone cannot delete an anonymous one: `cleanup_temp_workspace`
+  hands it to `uid_cleanup.reclaim_temp_workspace` (one background `Reclaimer` thread; `sync=True`
+  only for the startup probe), which has the broker wipe the workspace, the uid's per-uid config
+  state (`uid_layout.ephemeral_clear_targets`) and its `/dev/shm` objects as that uid (`cleanup`
+  op, parked until the run's supervisor is gone), removes the rest itself and releases the lease
+  only once that is verified; a failed wipe keeps the lease and is retried. Before a leased uid's
+  first spawn `uid_layout.ensure_clean_ephemeral` wipes what a dead gateway process left (an
+  unleased `_tmp_` workspace's uid is read from its root's ACL). The persisted registry never grows, and with every uid leased a new anonymous run gets
+  the retryable 503 (an `api_error` event on `/v1/agents/messages`). Named users get durable uids,
+  never reclaimed (follow-up): a full stable
+  band raises `UidBandExhausted` → HTTP 500 `uid_band_exhausted`, not "retry shortly", with a warning
+  once it crosses 90%. The registry fails **closed**: a corrupt/unreadable
   `isolation_uids.json` refuses uid-mode startup (`_check_uid_registry`) instead of loading empty
   and reassigning uids; entries it cannot honor (out of band, reserved, shared — e.g. after
-  narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too, and their
-  uids are excluded from the ephemeral pool (else an anonymous run would get a named user's files);
-  writes are fsync'd 0600, and a failing directory fsync after the replace keeps the grant.
+  narrowing the band or growing the ephemeral slice) are kept on disk, refuse startup too (the
+  error counts them per reason), and their uids are excluded from the ephemeral pool (else an
+  anonymous run would get a named user's files); writes are fsync'd 0600, and a failing directory
+  fsync after the replace keeps the grant. It is **single-writer**: `get_registry()` holds a
+  process-lifetime `flock(LOCK_EX|LOCK_NB)` on `<registry>.lock`, so a second process (`uvicorn
+  --workers`, replicas sharing `/app/data`) refuses uid mode instead of handing two users one uid
+  (the in-memory ephemeral pool could not be shared either); a filesystem without `flock` refuses
+  too, and replicas on other hosts are detected only where the filesystem propagates `flock` (not
+  NFS with `local_lock=flock`/`nolock`). The lock file is opened read-write (NFS emulates `flock`
+  with a write lock) and read-only only when that is refused, so an existing one the gateway can
+  only read still works locally; creating it needs a writable directory, and a non-regular lock
+  path (a planted FIFO) is refused without blocking. The band is counted, never
+  listed (a huge band used to OOM at startup), `CLAUDE_ISOLATION_EPHEMERAL_UIDS` is capped at
+  65536 (released uids queue in memory until the never-used ones run out), and a band max above
+  4294967294 is a startup error. A held entry's startup error names its uid per reason (never the
+  user key) and the fix for that reason.
   `effective_mode()` self-detects at startup: Landlock ABI≥3, the broker reachable, and the
   **startup probe** passed. Once the broker answers, `install_process_env` runs
   `_probe_uid_sessions`:
-  - it spawns the real CLI `--version` through the launcher and broker, as an ephemeral session
-    uid, in a fresh anonymous workspace from the workspace manager;
-  - it checks with mode bits (no ACLs) that this uid can reach the config dir and create its
-    `projects/<name>`.
+  - it prepares an ephemeral session uid's layout for a fresh anonymous workspace
+    (`uid_layout.prepare_spawn`) and spawns the real CLI `--version` through the launcher and
+    broker with a probe session id;
+  - it checks as the gateway that the uid created its `.cli-tmp`, `projects/<name>`,
+    `session-env/<id>` and `tasks/<id>` (by owner: the kernel evaluated the ACLs, mode bits would
+    not show them), that the shared tree is mode-readable to it (`uid_layout.shared_tree_problems`:
+    it carries no ACL), and that the broker's cleanup then leaves nothing of the uid behind.
 
   Unavailable uid is a hard `check_config` error naming the reason, **unless**
-  `CLAUDE_ISOLATION_FALLBACK=landlock`. The probe is skipped when the secret, the bands or the
-  registry are broken, so their own errors stand. In uid mode, `verify()` also runs in such a
+  `CLAUDE_ISOLATION_FALLBACK=landlock`. The probe is skipped when the secret, the bands, the
+  registry or a configured per-uid config base are broken, so their own errors stand (a missing
+  base is reported first, as the likely cause of what the probe saw). In uid mode, `verify()` also runs in such a
   workspace and names a launcher/broker refusal (`landlock.describe_launcher_exit`) instead of
   printing npm install hints.
 
-  **With the shipped image the probe fails and uid mode refuses to start.** A local container run
-  (2026-10-14) served no turn: the session uid cannot write the app-owned 0755 workspace, so the CLI
-  died on `.cli-tmp`, while startup passed and every request got a 503. `/home/app` is 0700, which
-  hides the shared `~/.claude` assets, `session-env/<id>` and `plugins/data`. The image has no
-  passwd entries for the broker uid or the band. uid mode becomes usable only when per-user
-  workspace ownership and container provisioning land; `landlock` is the boundary to run today.
-  That run did verify the privileged layout: broker caps exactly SETUID|SETGID with securebits
-  locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`, and teardown.
-  Re-run `docs/isolation-uid-verification.md` in the deployment container before enabling uid in
-  prod. Remaining
-  hardening (seccomp arg filter on set*id, bounding-set drop, per-user workspace ownership + broker
-  cleanup) is a container/follow-up step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py`
+  uid mode needs the layout `docker-compose.uid.yml` sets (next gotcha). A local container run
+  (2026-10-15, this layout) served named, anonymous and stateless turns as session uids, migrated a
+  legacy transcript and memory, resumed an expired session after a restart, wiped and reused
+  ephemeral uids (8 runs on a 3-uid slice), ran a plugin SessionStart hook as the session uid, and
+  refused the two broken layouts (no config base; the shared config dir in the 0700 `/home/app`);
+  the 2026-10-14 run had verified the privileged layout (broker caps exactly SETUID|SETGID with
+  securebits locked, gateway CapEff 0, supervisor `(broker, U, broker)` with caps 0, CLI `(U,U,U)`,
+  teardown). Re-run `docs/isolation-uid-verification.md` in the deployment container before
+  enabling uid in prod. In uid mode the root entrypoint no longer re-owns (or walks) `~/.claude` entries owned by a
+  session uid (the band and every uid the registry records, minus root, the app uid/gid and the
+  broker uid/gid — the registry read as root without importing src, a symlinked, non-regular,
+  oversized or malformed one ignored with a warning; other modes still hand everything back to the
+  app uid). A session uid's 0600 transcript is read (rehydrate, `transcript_exists`) and removed
+  through the broker as that uid (`uid_cleanup`: the gateway tries itself first); only a transcript
+  neither may read is the non-retryable 500 `transcript_unreadable`
+  (`session_manager.TranscriptUnreadable`). A refused workspace (`landlock.WorkspaceRefused`) is a non-retryable 500 `workspace_refused` too.
+  These, `uid_band_exhausted` and the 409 `session_ended` carry `x-should-retry: false`: OpenAI
+  SDKs retry 408/409/429 and every 5xx on their own otherwise (a retried `session_ended` would
+  silently start a fresh conversation), CORS exposes the header to browser clients, and the
+  OpenAI-style `HTTPException` handler in `src/main.py` now passes exception headers through (it
+  used to drop them, `WWW-Authenticate` on the 401s included). A 429 still goes through the
+  rate-limit handler instead, which keeps its own body and `Retry-After` (the archive 429's code
+  and `Retry-After` are lost there — pre-existing).
+  Remaining
+  hardening (seccomp arg filter on set*id, bounding-set drop) is a container/follow-up step. `docker/{landlock_launcher,isolation_broker,_landlock_rules}.py`
   never import `/app/src` (session-writable + privileged); the broker's ticket-verify is duplicated
   from `uid_isolation` and kept in lockstep by `test_isolation_broker.py::TestTicketVerify`
   (valid/tampered/expired/replayed cross-check + identical `ValueError` refusals).
+- uid-mode ownership + per-uid config dir (`docs/isolation-uid-ownership-design.md`, layout in
+  `docker-compose.uid.yml`): `uid_layout.enabled()` = uid mode + `CLAUDE_ISOLATION_CONFIG_BASE`
+  (startup requires it, an absolute dir on a persistent volume outside `$HOME`, the shared config
+  dir, the workspace base, `/app`, a system root; ACL support on it and on the workspace base;
+  `WORKSPACE_LEGACY_LOCALPART_KEY` refused). Before every per-uid spawn `uid_layout.prepare_spawn`
+  (and, for a named user, `migrate_user` in a worker thread before `create_client` asks for the
+  transcript) makes, as the gateway and never through a link:
+  - the per-uid config dir `P = <base>/<uid>` — the CLI's `CLAUDE_CONFIG_DIR` — app-owned with
+    ACL `u:U:r-x`: links to the shared tree `S` = the gateway's own `CLAUDE_CONFIG_DIR` (skills,
+    agents, commands, output-styles, `CLAUDE.md`, rules, hooks, workflows, `settings*.json`), a real
+    `plugins/` (registry and `marketplaces` linked to `S/plugins`; a linked `plugins/` silently
+    skips every plugin hook), and the writable `projects`, `session-env`, `tasks`, `plugins/data`,
+    `state` (`P/.claude.json -> state/.claude.json`; the CLI's locked write fails, its fallback
+    writes through the link) with `u:U:rwx` plus a default ACL. `S` must lie outside `/home/app`
+    (0700) and the system roots; `install_plugins.py` installs into it, and in uid mode the settings
+    writer writes `settings.json` 0644 and startup widens `S`'s entry points (`ensure_shared_readable`);
+  - the workspace root kept app-owned (design α) with access ACL `u:U:rwx` and default ACL
+    `d:u:U:rwx, d:u:<app>:rwx` — without the app entry the gateway loses everything U creates; never
+    `chmod` a granted dir (its group bits are the mask). Under a default ACL umask is ignored and a
+    new object's mask is the default mask ∩ its create mode's group bits, so U's 0600/0700 files
+    (transcripts, `mkstemp`, the CLI's `.cli-tmp/claude-<uid>`) close to the gateway: those go
+    through the broker. An existing tree is granted once (`posix_acl.grant_tree`: no link followed,
+    hard-linked files skipped, so the managed `.claude/{skills,agents}` mirror is emptied first and
+    rebuilt after; marker beside the workspace, written only when complete), and a named user's
+    legacy `projects/<name>` (their transcripts by recorded `cwd`, sidecars, `memory/` only without
+    another user's transcript) is copied once from `CLAUDE_ISOLATION_MIGRATE_FROM` (default the
+    shared dir, `off` disables; the source stays for a rollback).
+  The Landlock lists come from `landlock._per_uid_ro_rw` (rw: workspace, `P/projects/<name>`,
+  `P/session-env/<id>`, `P/tasks/<id>`, `P/plugins/data`, `P/state`; ro: `S`'s shared assets and
+  registry roots, `P/plugins`); `_GrantFilter` knows `S` (shared names only) and denies the config
+  base. The broker's two ops (`docker/isolation_broker.py`; client `broker_ops`, no fds, strict
+  schema; the spawn path refuses an op ticket): `cleanup` (as `(broker, U, broker)`: clear / remove
+  / expire / IPC — `/dev/shm` entries, SysV shm/sem/msg objects whose owner or creator is U, and
+  `/dev/mqueue` entries —, no link followed, parked while a live supervisor of that
+  `(uid, workspace)` runs, the IPC and expire steps while any of the uid runs, a spawn of the uid
+  refused meanwhile) and `transcript` (returns only a turn count or a negative code:
+  `transcript_turns.count_transcript_turns` over `bounded_lines`, files above
+  `MAX_TRANSCRIPT_BYTES` refused, a line that may hold more than `MAX_LINE_VALUES` JSON values
+  refused unparsed — `too_many_values`, one character class plus json's own C `scanstring`: a
+  regex repeating a group keeps a backtracking record per repetition, gigabytes for a line of
+  escapes — kept byte-identical to the broker's copy by `tests/test_transcript_turns.py`). The
+  gateway's leftover check (`uid_cleanup.ipc_leftovers`, fail closed) counts only the SysV objects
+  U **created** and not a segment marked `SHM_DEST`: `IPC_SET` lets any creator hand an object to
+  any uid, and another session holding such a segment attached would otherwise keep U's lease
+  forever (the broker still removes what U owns; accepted cost: Linux still lets a `SHM_DEST`
+  segment be attached by id, so one the previous tenant shared with another uid stays readable to
+  the next tenant — design §11.7). SysV IPC is not namespaced per session and Landlock
+  does not mediate it: a live session can still share an object it made world-accessible with
+  another live session (a per-session IPC namespace is the follow-up). Rehydrate reads the transcript
+  outside `SessionManager.lock` and off the event loop (`get_session_async`); a transient broker
+  failure is a retryable 503 (`TranscriptTemporarilyUnavailable`), a refusal or an unreadable one
+  the 500 `transcript_unreadable`. The `Reclaimer` has 4 workers and re-parks a given-up workspace
+  job every 5 min while its root and lease exist; the uid-mode startup sweep takes every `_tmp_`
+  regardless of age (one process per registry). An hourly `uid_cleanup.retention_sweep` expires each
+  named uid's per-uid state older than `S`'s `cleanupPeriodDays` once a day (last run = the mtime of
+  `P/.oh-my-gateway-retention`, so restarts keep the schedule), only when the `user` setting source
+  is on (the CLI's own sweep has the same gate and runs only when that uid's CLI starts); the broker
+  refuses it while any session of the uid is live, so a refused uid is retried the next hour, one
+  overdue for two days is warned about once a day (an always-live user is never swept), and an
+  unreachable broker is one warning per sweep. Spawn-preparing thread offloads (`create_client`,
+  `verify()`, the slash preflight, the mirror materialize) use `uid_layout.to_thread_to_completion`:
+  a cancelled caller waits for the thread before its cleanup runs (it could lease again for a
+  removed workspace). The CLI child gets umask 077 (new `/dev/shm` objects 0600), git `safe.directory` for
+  the app-owned root via `GIT_CONFIG_COUNT`, and `USER`/`LOGNAME` from the passwd entries the root
+  entrypoint adds for the broker uid and the band (`provision_session_accounts`, ≤ 65536 uids). The
+  quota walk skips only a session uid's private dirs under `.cli-tmp` (else every quota-growing write
+  of every uid-mode session would fail closed). The file API's compare-and-swap write keeps a session
+  uid's named ACL entry and mask on the file it replaces (`_keep_owner_access`: the chmod to the old
+  mode would collapse the mask and lock the agent out of its own file). The one-time tree grant
+  holds `workspace_resources.workspace_lock` across mirror clear → grant → rebuild; legacy reads and
+  copies are bounded (size, line length, depth; hard-linked files skipped) and a failure never fails
+  the spawn; a named uid gets the ephemeral clean-start check until `P` carries its owner marker
+  (`.oh-my-gateway-owner`, the key's digest, fsync'd, written before any of the user's data lands
+  there; a band change can hand it a uid an anonymous run used, and a failed wipe must be redone on
+  the retry and after a restart — an unreadable or malformed marker refuses the spawn rather than
+  wipe; a `P` from a build before the marker reads as unclaimed and is wiped). `verify()`
+  builds its options in a worker thread like `create_client`. In tests the broker refuses op paths outside the
+  temp dir and touches `/dev/shm` only via `GATEWAY_ISOLATION_TEST_SHM_DIR` (the test uid is the
+  developer's). Python 3.12's `Path.exists()/is_file()` raise on an unsearchable parent: code that
+  looks into session-writable trees uses `lstat` and catches `OSError`. Rollback to landlock/off
+  keeps U's ordinary (0666/0777) workspace files usable by the app uid through the ACL; its
+  0600/0700 files and the transcripts in `P` stay closed (those sessions are not resumed).
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values

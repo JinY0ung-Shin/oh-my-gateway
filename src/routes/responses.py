@@ -713,7 +713,9 @@ def _validate_background_request(body: ResponseCreateRequest) -> None:
         )
 
 
-def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tuple[str, Any]:
+async def _resolve_response_session(
+    body: ResponseCreateRequest, backend: str
+) -> tuple[str, Any]:
     if not body.previous_response_id:
         session_id = str(uuid.uuid4())
         return session_id, session_manager.get_or_create_session(session_id)
@@ -748,21 +750,42 @@ def _resolve_response_session(body: ResponseCreateRequest, backend: str) -> tupl
             _early_cwd = str(workspace_manager.resolve(body.user, backend=backend))
         except (ValueError, OSError):
             pass
+    from src.session_manager import (
+        TranscriptTemporarilyUnavailable,
+        TranscriptUnreadable,
+    )
+
     # max_turn: a transcript that cannot serve the requested turn must be
     # discarded before admission — at the cap, admitting it can evict a live
     # session (SESSION_EVICTION_POLICY=lru) only for this request to 404.
-    session = session_manager.get_session(
-        session_id, user=body.user, cwd=_early_cwd, max_turn=turn
-    )
-    if session is None and backend == "claude" and body.user:
-        try:
-            legacy_cwd = str(workspace_manager.resolve(body.user))
-        except (ValueError, OSError):
-            legacy_cwd = None
-        if legacy_cwd and legacy_cwd != _early_cwd:
-            session = session_manager.get_session(
-                session_id, user=body.user, cwd=legacy_cwd, max_turn=turn
-            )
+    # Async: under uid isolation the transcript read can be a broker round
+    # trip, which must not block the event loop (get_session_async).
+    try:
+        session = await session_manager.get_session_async(
+            session_id, user=body.user, cwd=_early_cwd, max_turn=turn
+        )
+        if session is None and backend == "claude" and body.user:
+            try:
+                legacy_cwd = str(workspace_manager.resolve(body.user))
+            except (ValueError, OSError):
+                legacy_cwd = None
+            if legacy_cwd and legacy_cwd != _early_cwd:
+                session = await session_manager.get_session_async(
+                    session_id, user=body.user, cwd=legacy_cwd, max_turn=turn
+                )
+    except TranscriptUnreadable as exc:
+        raise _transcript_unreadable_error(body.previous_response_id) from exc
+    except TranscriptTemporarilyUnavailable as exc:
+        # The broker that reads a session uid's transcript did not answer: a
+        # plain, retryable 503 (no ``x-should-retry: false``).
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Session for previous_response_id '{body.previous_response_id}' "
+                "cannot be resumed right now: its transcript could not be read "
+                "(the isolation broker did not answer); retry shortly"
+            ),
+        ) from exc
     if not session:
         raise HTTPException(
             status_code=404,
@@ -1073,6 +1096,107 @@ def _response_input_to_codex_items(
     return items, system_prompt
 
 
+# Sent with the errors no retry can clear. OpenAI SDKs retry 408, 409, 429 and
+# every 5xx on their own unless the response says ``x-should-retry: false``; a
+# retried ``session_ended`` would silently start a fresh conversation.
+_NO_RETRY_HEADERS = {"x-should-retry": "false"}
+
+
+def _transcript_unreadable_error(previous_response_id: Optional[str]) -> HTTPException:
+    """The 500 for a session whose transcript is on disk but unreadable.
+
+    The gateway's uid may not read it, and no broker read as the session uid
+    worked either (uid isolation reads a session uid's 0600 transcript through
+    the broker; ``uid_cleanup``). Said so instead of the generic "not found or
+    expired", which the session is not; the cause is logged. Not a transient
+    state a client retry clears, and OpenAI SDKs retry 408/409/429 and every
+    5xx by themselves unless told not to (``x-should-retry``).
+    """
+    which = (
+        f"Session for previous_response_id '{previous_response_id}'"
+        if previous_response_id
+        else "The session"
+    )
+    return HTTPException(
+        status_code=500,
+        headers=dict(_NO_RETRY_HEADERS),
+        detail={
+            "error": {
+                "type": "server_error",
+                "code": "transcript_unreadable",
+                "message": (
+                    f"{which} cannot be resumed: its transcript is on disk but "
+                    "cannot be read — the gateway may not read it (permission "
+                    "denied, or larger than a transcript is read up to), and "
+                    "under uid isolation the broker could not read it as the "
+                    "session's own uid either (the gateway log says why)."
+                ),
+            }
+        },
+    )
+
+
+def _backend_unavailable_error(backend: str, exc: BaseException) -> HTTPException:
+    """The HTTP error for a backend client, or its preflight, that could not start.
+
+    A retryable 503, except for two failures no retry can clear, which would
+    only send clients round in a "retry shortly" loop (#241):
+
+    * a full stable uid band under uid isolation (``UidBandExhausted``): every
+      uid there stays with its named user (uids are not reclaimed yet), so it
+      lasts until an operator widens the band;
+    * a workspace a confined spawn refused (``WorkspaceRefused``: a symlink
+      planted in it, a layout the isolation checks reject), which lasts until
+      an operator fixes it. The caller learns only that much; the path and the
+      reason are in the gateway log.
+    """
+    from src.backends.claude.landlock import WorkspaceRefused
+    from src.backends.claude.uid_isolation import UidBandExhausted
+    from src.session_manager import TranscriptUnreadable
+
+    if isinstance(exc, TranscriptUnreadable):
+        # Raised while deciding to resume (the transcript is there but cannot
+        # be read): the same error the rehydrate path answers.
+        return _transcript_unreadable_error(None)
+    if isinstance(exc, WorkspaceRefused):
+        return HTTPException(
+            status_code=500,
+            headers=dict(_NO_RETRY_HEADERS),
+            detail={
+                "error": {
+                    "type": "server_error",
+                    "code": "workspace_refused",
+                    "message": (
+                        f"The {backend} backend refused to start an isolated "
+                        "session: its workspace failed the gateway's isolation "
+                        "checks. Retrying will not help; an operator must fix "
+                        "the workspace (the gateway log names it and why)."
+                    ),
+                }
+            },
+        )
+    if isinstance(exc, UidBandExhausted):
+        return HTTPException(
+            status_code=500,
+            headers=dict(_NO_RETRY_HEADERS),
+            detail={
+                "error": {
+                    "type": "server_error",
+                    "code": "uid_band_exhausted",
+                    "message": (
+                        f"The {backend} backend cannot assign an isolation uid to "
+                        "a new user: every uid in the gateway's stable uid band "
+                        "is taken. Retrying will not help; an operator must widen "
+                        "CLAUDE_ISOLATION_UID_MIN/CLAUDE_ISOLATION_UID_MAX."
+                    ),
+                }
+            },
+        )
+    return HTTPException(
+        status_code=503, detail=f"{backend} backend unavailable; retry shortly"
+    )
+
+
 async def _validate_backend_prompt(
     resolved: ResolvedModel,
     prompt: str,
@@ -1081,9 +1205,13 @@ async def _validate_backend_prompt(
 ) -> None:
     if resolved.backend != "claude":
         return
+    from src.backends.claude.landlock import WorkspaceRefused
+    from src.backends.claude.uid_isolation import UidAllocationError
+
     try:
         # ``user`` is the identity create_client gets: under uid isolation the
-        # catalog preflight in the workspace runs as that session's uid.
+        # catalog preflight in the workspace runs as that user's uid, or
+        # landlock-shaped while they have none (it never allocates one).
         await validate_slash_prompt(
             prompt,
             cwd=Path(workspace_str) if workspace_str else None,
@@ -1100,6 +1228,12 @@ async def _validate_backend_prompt(
                 }
             },
         ) from e
+    except (UidAllocationError, WorkspaceRefused) as e:
+        # The catalog preflight could not get an isolation uid, or its confined
+        # spawn refused the workspace (#241): answer it as a create_client
+        # failure is answered instead of escaping unhandled.
+        logger.error("slash-command preflight could not start: %s", e)
+        raise _backend_unavailable_error(resolved.backend, e) from e
 
 
 async def _refresh_existing_client_policy(
@@ -1203,8 +1337,12 @@ async def _ensure_response_session_client(
             create_kwargs["effort"] = body.reasoning.effort
     if resolved.backend in {"claude", "codex"} and forward_headers:
         create_kwargs["forward_headers"] = forward_headers
+    # From here until the client is handed over, a delete (or another
+    # teardown) of the session leaves its workspace and uid lease alone: the
+    # CLI may already run in them (see SessionManager.finish_client_start).
+    session_manager.begin_client_start(session)
     try:
-        session.client = await backend.create_client(
+        client = await backend.create_client(
             session=session,
             model=resolved.provider_model,
             system_prompt=system_prompt if is_new_session else None,
@@ -1218,12 +1356,41 @@ async def _ensure_response_session_client(
             _custom_base=resolved_base,
             **create_kwargs,
         )
-    except Exception:
+    except Exception as exc:
         logger.error("create_client failed", exc_info=True)
-        await session_manager.delete_session_async(session_id)
+        if await session_manager.finish_client_start(session_id, session, None):
+            # A new session was never handed out, so nothing can resume it:
+            # finished. A continuation's session may be resumed later, so its
+            # CLI session-env dir stays (see SessionManager._release_session_dirs).
+            await session_manager.delete_session_async(
+                session_id, finished=is_new_session
+            )
+        raise _backend_unavailable_error(resolved.backend, exc)
+    except BaseException:
+        # Cancelled: end the start all the same, or the session could never be
+        # evicted again and a teardown it deferred would never run.
+        await session_manager.finish_client_start(session_id, session, None)
+        raise
+    if not await session_manager.finish_client_start(session_id, session, client):
+        # The session was deleted (or expired, or the gateway is shutting
+        # down) while its client was starting. Nothing holds it any more, so
+        # handing the client over would leave that CLI running with no owner:
+        # it has been stopped, and the session's dirs released after it.
         raise HTTPException(
-            status_code=503,
-            detail=f"{resolved.backend} backend unavailable; retry shortly",
+            status_code=409,
+            headers=dict(_NO_RETRY_HEADERS),
+            detail={
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "session_ended",
+                    "message": (
+                        "The session ended (it was deleted or expired, or the "
+                        "gateway is shutting down) while its backend client was "
+                        "starting; that client was stopped. Start a new "
+                        "conversation."
+                    ),
+                }
+            },
         )
 
 
@@ -2082,87 +2249,97 @@ async def create_response(
     _validate_response_continuation(body)
     if body.background:
         _validate_background_request(body)
-    session_id, session = _resolve_response_session(body, resolved.backend)
+    session_id, session = await _resolve_response_session(body, resolved.backend)
     workspace = await _resolve_response_workspace(
         body, session, session_id, is_new_session, resolved.backend
     )
     workspace_str = str(workspace)
 
-    # ------------------------------------------------------------------
-    # Detect function_call_output BEFORE converting input to prompt.
-    # If present, this is a tool-continuation turn: the client is sending
-    # the user's response to an AskUserQuestion function_call.
-    # ------------------------------------------------------------------
-    fc_output = _detect_function_call_output(body.input)
-    if fc_output is not None:
-        if body.background:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "background=true cannot continue a function_call_output "
-                    "turn; send the continuation without background."
+    try:
+        # ------------------------------------------------------------------
+        # Detect function_call_output BEFORE converting input to prompt.
+        # If present, this is a tool-continuation turn: the client is sending
+        # the user's response to an AskUserQuestion function_call.
+        # ------------------------------------------------------------------
+        fc_output = _detect_function_call_output(body.input)
+        if fc_output is not None:
+            if body.background:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "background=true cannot continue a function_call_output "
+                        "turn; send the continuation without background."
+                    ),
+                )
+            return await _handle_function_call_output(
+                body, resolved, backend, session, session_id, workspace_str, fc_output
+            )
+
+        # A paused human decision (AskUserQuestion, ExitPlanMode) accepts exactly one
+        # continuation: the matching function_call_output above. Anything else would
+        # move the parked SDK client past the decision — a policy refresh
+        # (set_permission_mode) or a new query on it before the user answered, which
+        # for ExitPlanMode means leaving plan mode unreviewed. Refuse it before any
+        # policy refresh or client call. Timeout and client teardown clear the pause,
+        # so this never wedges a session.
+        _reject_while_human_decision_pending(session)
+
+        # Codex carries multimodal turns as a list of input items rather than a
+        # single collapsed text prompt. Build the list directly from the request
+        # body so we don't run through the disk-saving image_handler path (which
+        # rejects non-``data:`` URLs and would collapse the image into a text
+        # placeholder anyway).
+        if resolved.backend == "codex" and _has_multimodal_input(body):
+            codex_items, system_prompt = _response_input_to_codex_items(body)
+            if not codex_items:
+                # Defensive — _has_multimodal_input said yes but conversion
+                # produced nothing (e.g. an empty image_url). Fail at the API
+                # boundary instead of letting the backend reject an empty turn.
+                raise HTTPException(
+                    status_code=400,
+                    detail="Codex multimodal input produced no usable items",
+                )
+            prompt: Any = codex_items
+        elif resolved.backend == "claude" and _has_multimodal_input(body):
+            # Claude carries images as native inline content blocks (issue #140) —
+            # no disk round-trip, no <attached_image> placeholder, no Read-tool
+            # dependency for the model to see the pixels.
+            prompt, system_prompt = _response_prompt_blocks_and_system(body)
+            if not prompt:
+                # Defensive — same rationale as the Codex branch above.
+                raise HTTPException(
+                    status_code=400,
+                    detail="Multimodal input produced no usable content blocks",
+                )
+        else:
+            prompt, system_prompt = _response_prompt_and_system(body, workspace)
+
+        # Reject slash-prefixed prompts that would be intercepted by the SDK as
+        # unknown skills or run destructive built-ins.  Only applies to the Claude
+        # backend; other backends pass through unchanged.
+        if isinstance(prompt, str):
+            await _validate_backend_prompt(resolved, prompt, workspace_str, body.user)
+        elif resolved.backend == "claude":
+            # Block-mode prompts get the same slash validation on their text.
+            await _validate_backend_prompt(
+                resolved,
+                "\n".join(
+                    b.get("text", "")
+                    for b in prompt
+                    if isinstance(b, dict) and b.get("type") == "text"
                 ),
+                workspace_str,
+                body.user,
             )
-        return await _handle_function_call_output(
-            body, resolved, backend, session, session_id, workspace_str, fc_output
-        )
-
-    # A paused human decision (AskUserQuestion, ExitPlanMode) accepts exactly one
-    # continuation: the matching function_call_output above. Anything else would
-    # move the parked SDK client past the decision — a policy refresh
-    # (set_permission_mode) or a new query on it before the user answered, which
-    # for ExitPlanMode means leaving plan mode unreviewed. Refuse it before any
-    # policy refresh or client call. Timeout and client teardown clear the pause,
-    # so this never wedges a session.
-    _reject_while_human_decision_pending(session)
-
-    # Codex carries multimodal turns as a list of input items rather than a
-    # single collapsed text prompt. Build the list directly from the request
-    # body so we don't run through the disk-saving image_handler path (which
-    # rejects non-``data:`` URLs and would collapse the image into a text
-    # placeholder anyway).
-    if resolved.backend == "codex" and _has_multimodal_input(body):
-        codex_items, system_prompt = _response_input_to_codex_items(body)
-        if not codex_items:
-            # Defensive — _has_multimodal_input said yes but conversion
-            # produced nothing (e.g. an empty image_url). Fail at the API
-            # boundary instead of letting the backend reject an empty turn.
-            raise HTTPException(
-                status_code=400,
-                detail="Codex multimodal input produced no usable items",
-            )
-        prompt: Any = codex_items
-    elif resolved.backend == "claude" and _has_multimodal_input(body):
-        # Claude carries images as native inline content blocks (issue #140) —
-        # no disk round-trip, no <attached_image> placeholder, no Read-tool
-        # dependency for the model to see the pixels.
-        prompt, system_prompt = _response_prompt_blocks_and_system(body)
-        if not prompt:
-            # Defensive — same rationale as the Codex branch above.
-            raise HTTPException(
-                status_code=400,
-                detail="Multimodal input produced no usable content blocks",
-            )
-    else:
-        prompt, system_prompt = _response_prompt_and_system(body, workspace)
-
-    # Reject slash-prefixed prompts that would be intercepted by the SDK as
-    # unknown skills or run destructive built-ins.  Only applies to the Claude
-    # backend; other backends pass through unchanged.
-    if isinstance(prompt, str):
-        await _validate_backend_prompt(resolved, prompt, workspace_str, body.user)
-    elif resolved.backend == "claude":
-        # Block-mode prompts get the same slash validation on their text.
-        await _validate_backend_prompt(
-            resolved,
-            "\n".join(
-                b.get("text", "")
-                for b in prompt
-                if isinstance(b, dict) and b.get("type") == "text"
-            ),
-            workspace_str,
-            body.user,
-        )
+    except Exception:
+        if is_new_session:
+            # This request created the session and never handed it out: a
+            # refused first turn (a bad /command, an unusable input) drops
+            # it now, its workspace and the uid its slash preflight leased
+            # with it, instead of holding them and a session slot for the
+            # session TTL. A continuation's session stays.
+            await session_manager.delete_session_async(session_id)
+        raise
 
     if body.background:
         return await _create_background_response(

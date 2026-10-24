@@ -164,12 +164,39 @@ def _accounting_error(path: Path, exc: OSError) -> WorkspaceQuotaAccountingError
     return WorkspaceQuotaAccountingError(path, exc)
 
 
+# The confined CLI's per-session tmp dir inside each workspace (the isolation
+# launcher/broker's ``<workspace>/.cli-tmp``).
+_SESSION_TMP = ".cli-tmp"
+
+
+def _private_session_tmp_dir(directory: Path) -> bool:
+    """Whether *directory* is a session uid's private dir in a session tmp dir.
+
+    Under ``CLAUDE_ISOLATION_MODE=uid`` the CLI runs as the session uid and
+    always makes its own ``<workspace>/.cli-tmp/claude-<uid>`` mode 0700 (tools
+    there use 0700 ``mkdtemp`` dirs too), and a 0700 dir stays closed to the
+    gateway whatever ACL the workspace carries. Failing closed on it would
+    refuse every quota-growing write of every uid-mode session, so such a dir
+    is not counted. Only there: anywhere else an unreadable subtree still fails
+    the accounting closed. Never true for the gateway's own dirs (every other
+    mode): those it can always read.
+    """
+    if _SESSION_TMP not in directory.parts[:-1]:
+        return False
+    try:
+        return directory.lstat().st_uid != os.geteuid()
+    except OSError:
+        return False
+
+
 def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
     """Yield lstat results for regular files below *root*, never following links.
 
     Concurrent disappearance is benign: an entry that is gone by the time we
     inspect it contributes no current bytes. Any other stat/scandir failure could
-    hide real storage, so it is surfaced rather than silently under-counted.
+    hide real storage, so it is surfaced rather than silently under-counted —
+    except for a session uid's private dir in a session tmp dir
+    (:func:`_private_session_tmp_dir`).
     """
 
     stack = [Path(root)]
@@ -197,6 +224,10 @@ def _iter_regular_files(root: Path) -> Iterable[os.stat_result]:
             continue
         except WorkspaceQuotaAccountingError:
             raise
+        except PermissionError as exc:
+            if _private_session_tmp_dir(directory):
+                continue
+            raise _accounting_error(directory, exc) from exc
         except OSError as exc:
             raise _accounting_error(directory, exc) from exc
 

@@ -8,7 +8,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import uuid
 from collections.abc import Mapping
 from contextlib import suppress
@@ -24,7 +23,7 @@ from pydantic import BaseModel
 
 from src.agent_message_models import AgentMessagesRequest
 from src.auth import security, verify_api_key
-from src.backends.claude import landlock
+from src.backends.claude import uid_cleanup
 from src.constants import SSE_KEEPALIVE_INTERVAL
 from src.mcp_config import get_mcp_servers
 from src.rate_limiter import rate_limit_endpoint
@@ -668,24 +667,30 @@ def _spawn_cancelled_turn_teardown(client: Any, session, workspace) -> None:
 
 
 def _cleanup_sdk_transcript(session: Optional[Session]) -> None:
-    """Delete SDK artifacts created for one endpoint-local ephemeral session."""
+    """Delete SDK artifacts created for one endpoint-local ephemeral session.
+
+    Its transcript, the ``<id>/`` tool-result dir beside it and the project dir
+    they leave empty, then its session-env dir (a confined CLI cannot sweep
+    it, #241). Under uid isolation with per-uid config dirs all of that lives
+    in the run's ephemeral config dir, which the workspace cleanup that follows
+    wipes as the session uid before the uid lease ends.
+    """
     if session is None or not session.workspace:
         return
-    transcript = _session_jsonl_path(session.session_id, session.workspace)
-    session_artifacts = transcript.parent / session.session_id
     try:
-        transcript.unlink(missing_ok=True)
-        shutil.rmtree(session_artifacts, ignore_errors=True)
-        # Anonymous workspaces get unique encoded project directories. Remove
-        # the now-empty directory, but never disturb unexpected sibling files.
-        try:
-            transcript.parent.rmdir()
-        except OSError:
-            pass
-    except OSError:
-        logger.debug("Stateless agent transcript cleanup failed", exc_info=True)
-    # Its session-env dir too: a confined CLI cannot sweep it (#241).
-    landlock.remove_session_env_dir(session.session_id)
+        transcript = _session_jsonl_path(session.session_id, session.workspace)
+    except Exception:
+        logger.debug("Stateless agent transcript path unresolved", exc_info=True)
+        transcript = None
+    uid_cleanup.remove_transcript(
+        session.session_id,
+        user=session.user,
+        workspace=session.workspace,
+        path=transcript,
+    )
+    uid_cleanup.remove_session_dirs(
+        session.session_id, user=session.user, workspace=session.workspace
+    )
 
 
 async def _stream_agent_messages(body: AgentMessagesRequest, resolved, backend):

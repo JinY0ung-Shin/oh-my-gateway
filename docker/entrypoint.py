@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Docker entrypoint for repairing writable bind mounts before startup."""
+"""Docker entrypoint: repairs writable bind mounts before startup and, in uid
+mode, provisions what session uids need and forks the isolation broker."""
 
 from __future__ import annotations
 
 import errno
+import json
 import math
 import os
 import socket
 import stat
 import sys
 import time
+from collections.abc import Container
 from pathlib import Path
 
 
@@ -22,6 +25,21 @@ DEFAULT_OPENCODE_HOME = Path("/home/app/.local/share/opencode")
 DEFAULT_OPENCODE_CONFIG = Path("/home/app/.config/opencode")
 DEFAULT_UV_CACHE_DIR = Path("/home/app/.cache/uv")
 MYSQL_DATA_DIR_NAME = "mysql_data"
+ISOLATION_MODE_ENV = "CLAUDE_ISOLATION_MODE"
+# uid mode's per-user band, with the gateway's names and defaults
+# (src/backends/claude/uid_isolation.py; tests/test_entrypoint_broker.py pins
+# the parity).
+SESSION_UID_MIN_ENV = "CLAUDE_ISOLATION_UID_MIN"
+SESSION_UID_MAX_ENV = "CLAUDE_ISOLATION_UID_MAX"
+DEFAULT_SESSION_UID_MIN = 20000
+DEFAULT_SESSION_UID_MAX = 29999
+BROKER_UID_ENV = "CLAUDE_ISOLATION_BROKER_UID"
+BROKER_GID_ENV = "CLAUDE_ISOLATION_BROKER_GID"
+# The gateway's persisted user -> uid map: uid_isolation._registry_path() is
+# <app root>/data/isolation_uids.json, and the image's app root is /app.
+UID_REGISTRY_ENV = "CLAUDE_ISOLATION_UID_REGISTRY"
+DEFAULT_UID_REGISTRY = DEFAULT_DATA_DIR / "isolation_uids.json"
+MAX_UID_REGISTRY_BYTES = 16 << 20
 # Just below the default per-user band (20000-29999) and kept equal to the
 # gateway's default in uid_isolation, so the broker's uid is never a session's.
 DEFAULT_BROKER_UID = 19999
@@ -46,8 +64,164 @@ def _parse_id(name: str, default: int) -> int:
     return value
 
 
-def _chown(path: Path, uid: int, gid: int) -> bool:
-    """Chown ``path`` itself; return False when it sits on a read-only mount."""
+def _gateway_int(name: str, default: int) -> int:
+    """An integer knob read like the gateway's ``uid_isolation._int_env``:
+    blank gives *default*, and so does a value that is not an integer (with a
+    warning)."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        print(
+            f"warning: ignoring {name}={raw!r}: not an integer; using {default}",
+            file=sys.stderr,
+        )
+        return default
+
+
+def _session_uid_band() -> tuple[int, int]:
+    """``[CLAUDE_ISOLATION_UID_MIN, CLAUDE_ISOLATION_UID_MAX]``, parsed exactly
+    like the gateway's ``uid_isolation.uid_range()``."""
+    return (
+        _gateway_int(SESSION_UID_MIN_ENV, DEFAULT_SESSION_UID_MIN),
+        _gateway_int(SESSION_UID_MAX_ENV, DEFAULT_SESSION_UID_MAX),
+    )
+
+
+def _uid_mode() -> bool:
+    return (os.environ.get(ISOLATION_MODE_ENV) or "").strip().lower() == "uid"
+
+
+def _uid_registry_path() -> Path:
+    """``CLAUDE_ISOLATION_UID_REGISTRY`` read like ``_registry_path()``."""
+    raw = (os.environ.get(UID_REGISTRY_ENV) or "").strip()
+    return Path(raw) if raw else DEFAULT_UID_REGISTRY
+
+
+def _read_uid_registry(path: Path) -> bytes | None:
+    """The registry file's bytes, or ``None`` when there is none yet.
+
+    Root reads a file the app uid can replace, so: no symlink anywhere on its
+    path, a regular file only (never block on a FIFO or open a device), at most
+    ``MAX_UID_REGISTRY_BYTES``. Raises ``ValueError`` or ``OSError`` otherwise.
+    """
+    absolute = Path(os.path.abspath(path))
+    link = _first_symlink(absolute, anchor=Path(absolute.anchor))
+    if link is not None:
+        raise ValueError(f"{link} is a symlink")
+    try:
+        info = os.lstat(absolute)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("not a regular file")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    fd = os.open(absolute, flags)
+    try:
+        opened = os.fstat(fd)
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError("replaced while it was opened")
+        if opened.st_size > MAX_UID_REGISTRY_BYTES:
+            raise ValueError(f"larger than {MAX_UID_REGISTRY_BYTES} bytes")
+        chunks, size = [], 0
+        while size <= MAX_UID_REGISTRY_BYTES:
+            chunk = os.read(fd, MAX_UID_REGISTRY_BYTES + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        os.close(fd)
+    if size > MAX_UID_REGISTRY_BYTES:
+        raise ValueError(f"larger than {MAX_UID_REGISTRY_BYTES} bytes")
+    return b"".join(chunks)
+
+
+def _registry_uids() -> frozenset[int]:
+    """Every uid the gateway's uid registry records, honored or held.
+
+    Values count as uids exactly as ``UidRegistry._load`` takes them (ints, not
+    bools). A file the gateway would refuse (unreadable, not UTF-8 JSON, not an
+    object), or one that is symlinked, not a regular file or oversized, is
+    ignored with a warning and the band alone decides: never fatal here.
+    """
+    path = _uid_registry_path()
+    try:
+        data = _read_uid_registry(path)
+        if data is None:
+            return frozenset()
+        raw = json.loads(data.decode("utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("not a JSON object")
+    except (OSError, ValueError, RecursionError) as exc:
+        print(f"warning: ignoring the uid registry {path}: {exc}", file=sys.stderr)
+        return frozenset()
+    return frozenset(
+        uid
+        for uid in raw.values()
+        if isinstance(uid, int) and not isinstance(uid, bool)
+    )
+
+
+class _UidBand:
+    """Membership in ``[lo, hi]`` or *extra*, minus *reserved* (not a set: a
+    band can be huge)."""
+
+    def __init__(
+        self,
+        lo: int,
+        hi: int,
+        reserved: set[int],
+        extra: frozenset[int] = frozenset(),
+    ) -> None:
+        self.lo, self.hi, self.reserved, self.extra = lo, hi, reserved, extra
+
+    def __contains__(self, uid: object) -> bool:
+        return (
+            isinstance(uid, int)
+            and (self.lo <= uid <= self.hi or uid in self.extra)
+            and uid not in self.reserved
+        )
+
+
+def _session_owned_uids(app_uid: int) -> Container[int]:
+    """The owners whose entries the root step leaves alone.
+
+    In uid mode, the uids the gateway can give a session, the band
+    (``uid_isolation.uid_range()``), and every uid its registry records: after
+    the band is narrowed a named user's uid can lie outside it, and the gateway
+    refuses to start over that user only after this step has run. Minus
+    ``reserved_uids()``, i.e. root, the app uid and gid and the broker uid and
+    gid, so an entry this step must repair is never taken for a session's. (No
+    session ever ran as one of those gids: the broker refuses them as a uid.)
+    None in any other mode: those sessions run as the app uid, and a mode
+    change hands uid mode's leftovers back to it.
+    """
+    if not _uid_mode():
+        return ()
+    lo, hi = _session_uid_band()
+    return _UidBand(lo, hi, _reserved_ids(app_uid), _registry_uids())
+
+
+def _reserved_ids(app_uid: int) -> set[int]:
+    """The ids no session gets as its uid or gid, read like the gateway's
+    ``uid_isolation.reserved_uids()``: root, the app uid and gid, and the
+    broker uid and gid (a session's gid is its uid)."""
+    app_gid = _gateway_int("APP_GID", DEFAULT_GID)
+    return {
+        0,
+        app_uid,
+        app_gid,
+        _gateway_int(BROKER_UID_ENV, DEFAULT_BROKER_UID),
+        _gateway_int(BROKER_GID_ENV, app_gid),
+    }
+
+
+def _chown(path: Path, uid: int, gid: int, skip_owners: Container[int] = ()) -> bool:
+    """Chown ``path`` itself; return False when the walk must not enter it: it
+    sits on a read-only mount, or its owner is in ``skip_owners``."""
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -55,6 +229,12 @@ def _chown(path: Path, uid: int, gid: int) -> bool:
     except OSError as exc:
         print(f"warning: could not chown {path}: {exc}", file=sys.stderr)
         return True
+    # uid mode: a session uid's own state (its projects/<name> transcripts,
+    # memory, subagent logs) stays its own across restarts. Re-owned to the
+    # app uid with its 0600/0700 modes, it locked the session out of resuming
+    # (#244 review 4). Nor is it walked: the session controls its contents.
+    if info.st_uid in skip_owners:
+        return False
     # Another hard link to a file the app user does not own can live outside
     # these trees, and changing this inode would change that file as well.
     if not stat.S_ISDIR(info.st_mode) and info.st_nlink > 1 and info.st_uid != uid:
@@ -102,28 +282,37 @@ def _prepare_dir(path: Path, *, anchor: Path) -> bool:
     return True
 
 
-def _chown_tree(root: Path, uid: int, gid: int) -> None:
+def _chown_tree(
+    root: Path, uid: int, gid: int, skip_owners: Container[int] = ()
+) -> None:
     # Stop at a read-only mount, and never walk from a link: os.walk() lists
     # a symlinked top directory's target even with followlinks=False.
-    if not _chown(root, uid, gid) or root.is_symlink() or not root.is_dir():
+    if (
+        not _chown(root, uid, gid, skip_owners)
+        or root.is_symlink()
+        or not root.is_dir()
+    ):
         return
     for current, dirs, files in os.walk(root):
         current_path = Path(current)
         writable_dirs = []
         for name in dirs:
-            if _chown(current_path / name, uid, gid):
+            if _chown(current_path / name, uid, gid, skip_owners):
                 writable_dirs.append(name)
-        # Pruning keeps os.walk() out of read-only mounts below the root.
+        # Pruning keeps os.walk() out of read-only mounts below the root, and
+        # out of directories a session uid owns (uid mode).
         dirs[:] = writable_dirs
         for name in files:
-            _chown(current_path / name, uid, gid)
+            _chown(current_path / name, uid, gid, skip_owners)
 
 
-def _chown_path_with_parents(path: Path, *, stop: Path, uid: int, gid: int) -> None:
+def _chown_path_with_parents(
+    path: Path, *, stop: Path, uid: int, gid: int, skip_owners: Container[int] = ()
+) -> None:
     try:
         path.relative_to(stop)
     except ValueError:
-        _chown(path, uid, gid)
+        _chown(path, uid, gid, skip_owners)
         return
 
     paths = [path]
@@ -132,7 +321,7 @@ def _chown_path_with_parents(path: Path, *, stop: Path, uid: int, gid: int) -> N
         current = current.parent
         paths.append(current)
     for item in reversed(paths):
-        _chown(item, uid, gid)
+        _chown(item, uid, gid, skip_owners)
 
 
 def prepare_writable_paths(
@@ -145,8 +334,13 @@ def prepare_writable_paths(
     opencode_home: Path = DEFAULT_OPENCODE_HOME,
     opencode_config: Path = DEFAULT_OPENCODE_CONFIG,
     uv_cache_dir: Path = DEFAULT_UV_CACHE_DIR,
+    skip_owners: Container[int] = (),
 ) -> None:
-    """Ensure gateway-owned writable paths are usable by the app process."""
+    """Ensure gateway-owned writable paths are usable by the app process.
+
+    Entries owned by a uid in ``skip_owners`` (uid mode's session uids, see
+    :func:`_session_owned_uids`) are neither chowned nor walked.
+    """
     data_dir = Path(data_dir)
     prompts_dir = data_dir / "prompts"
     claude_home = Path(claude_home)
@@ -167,18 +361,20 @@ def prepare_writable_paths(
         if _prepare_dir(path, anchor=home_dir):
             ready_home_paths.append(path)
 
-    if data_ready and _chown(data_dir, uid, gid):
+    if data_ready and _chown(data_dir, uid, gid, skip_owners):
         for child in data_dir.iterdir():
             if child.name == MYSQL_DATA_DIR_NAME:
                 continue
             if child == prompts_dir:
-                _chown_tree(child, uid, gid)
+                _chown_tree(child, uid, gid, skip_owners)
             elif child.is_file() or child.is_symlink():
-                _chown(child, uid, gid)
+                _chown(child, uid, gid, skip_owners)
 
     for path in ready_home_paths:
-        _chown_path_with_parents(path, stop=home_dir, uid=uid, gid=gid)
-        _chown_tree(path, uid, gid)
+        _chown_path_with_parents(
+            path, stop=home_dir, uid=uid, gid=gid, skip_owners=skip_owners
+        )
+        _chown_tree(path, uid, gid, skip_owners)
 
 
 def drop_privileges(uid: int, gid: int) -> None:
@@ -188,6 +384,589 @@ def drop_privileges(uid: int, gid: int) -> None:
     os.setgroups([])
     os.setgid(gid)
     os.setuid(uid)
+
+
+# ===========================================================================
+# uid mode: the accounts and directories session uids need (root start)
+# ===========================================================================
+#
+# docs/isolation-uid-ownership-design.md §2.1, §4 and §8. The image has
+# accounts for root and app only, and HOME (/home/app) is 0700, so a session
+# uid had no passwd entry and could reach neither the shared Claude config dir
+# nor a config dir of its own. main() runs these in uid mode, after the
+# ownership repair and before the broker that runs the session uids starts.
+# Everything here only warns: the gateway's startup probe spawns a CLI as a
+# session uid and refuses uid mode, with the reason, when the result does not
+# work.
+
+PASSWD_PATH = Path("/etc/passwd")
+GROUP_PATH = Path("/etc/group")
+BROKER_ACCOUNT = "claude-broker"
+# A session uid's account and group are named after it: claude-u20000, ...
+SESSION_ACCOUNT_PREFIX = "claude-u"
+ACCOUNT_HOME = "/nonexistent"
+ACCOUNT_SHELL = "/usr/sbin/nologin"
+# A wider band is not written into the files (every lookup scans them): the
+# operator provisions NSS for it instead.
+MAX_PROVISIONED_UIDS = 65536
+# The largest id a session may get (uid_isolation._MAX_ID): (uid_t)-1 tells
+# setresuid/setresgid to leave the id unchanged.
+MAX_SESSION_ID = 4294967294
+
+
+class _AccountFile:
+    """``/etc/passwd`` or ``/etc/group``: its bytes and status, the names and
+    ids its lines claim, and the lines to append."""
+
+    def __init__(self, path: Path, data: bytes, info: os.stat_result) -> None:
+        self.path, self.data, self.info = path, data, info
+        self.names: set[str] = set()
+        self.ids: set[int] = set()
+        self.added: list[str] = []
+        for raw in data.split(b"\n"):
+            # A line counts by its name and id fields even when the rest is
+            # malformed, so neither is ever claimed twice.
+            fields = raw.strip().split(b":")
+            if not fields[0] or fields[0].startswith(b"#"):
+                continue
+            self.names.add(fields[0].decode("utf-8", "surrogateescape"))
+            if len(fields) > 2 and fields[2].strip().isdigit():
+                self.ids.add(int(fields[2].strip()))
+
+    def add(self, line: str, name: str, xid: int) -> None:
+        self.added.append(line)
+        self.names.add(name)
+        self.ids.add(xid)
+
+
+def _read_account_file(path: Path) -> _AccountFile | None:
+    """*path* read for :func:`provision_session_accounts`; None, with a
+    warning, when it is not a regular file (a symlink would be replaced by a
+    copy) or cannot be read."""
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError("not a regular file")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        fd = os.open(path, flags)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+                raise ValueError("replaced while it was opened")
+            chunks = []
+            while chunk := os.read(fd, 1 << 20):
+                chunks.append(chunk)
+        finally:
+            os.close(fd)
+    except (OSError, ValueError) as exc:
+        print(f"warning: not adding session accounts to {path}: {exc}", file=sys.stderr)
+        return None
+    return _AccountFile(path, b"".join(chunks), opened)
+
+
+def _replace_file(path: Path, data: bytes, info: os.stat_result) -> None:
+    """Atomically replace *path* with *data*, keeping its owner and mode.
+
+    The bytes go to a temp file beside it, which gets the owner and mode and
+    an fsync before it is renamed over *path*; the directory is synced after.
+    On failure the temp file is removed and *path* is unchanged.
+    """
+    import tempfile
+
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    try:
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view) :]
+            os.fchown(fd, info.st_uid, info.st_gid)
+            os.fchmod(fd, stat.S_IMODE(info.st_mode))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    try:
+        dir_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError:
+        pass
+    finally:
+        os.close(dir_fd)
+
+
+def _write_account_file(account_file: _AccountFile) -> None:
+    """Append the added lines to the file; a no-op when there are none."""
+    if not account_file.added:
+        return
+    data = account_file.data
+    if data and not data.endswith(b"\n"):
+        data += b"\n"
+    data += "".join(f"{line}\n" for line in account_file.added).encode()
+    try:
+        _replace_file(account_file.path, data, account_file.info)
+    except OSError as exc:
+        print(
+            f"warning: could not add {len(account_file.added)} session accounts "
+            f"to {account_file.path}: {exc}",
+            file=sys.stderr,
+        )
+
+
+def _broker_ids(app_gid: int) -> tuple[int, int] | None:
+    """The broker's uid and gid as :func:`launch_isolation_broker` reads them;
+    None, with a warning, when one is invalid (that launch refuses it too)."""
+    try:
+        return (
+            _parse_id(BROKER_UID_ENV, DEFAULT_BROKER_UID),
+            _parse_id(BROKER_GID_ENV, app_gid),
+        )
+    except SystemExit as exc:
+        print(f"warning: not adding the broker account: {exc}", file=sys.stderr)
+        return None
+
+
+def _provisioned_band() -> range:
+    """The uids of the session band to add accounts for: none, with a warning,
+    when the gateway refuses the band or it is wider than
+    ``MAX_PROVISIONED_UIDS`` (an empty band the gateway reports itself)."""
+    lo, hi = _session_uid_band()
+    if hi < lo:
+        return range(0)
+    if lo < 1 or hi > MAX_SESSION_ID:
+        print(
+            f"warning: not adding session accounts for the uid band [{lo}, {hi}]: "
+            f"the gateway refuses a band outside [1, {MAX_SESSION_ID}]",
+            file=sys.stderr,
+        )
+        return range(0)
+    if hi - lo + 1 > MAX_PROVISIONED_UIDS:
+        print(
+            f"warning: not adding accounts for the {hi - lo + 1} session uids of "
+            f"[{lo}, {hi}] to {PASSWD_PATH} and {GROUP_PATH} (more than "
+            f"{MAX_PROVISIONED_UIDS}): provision NSS entries for them, or whoami "
+            "and node's os.userInfo() fail in the sessions",
+            file=sys.stderr,
+        )
+        return range(0)
+    return range(lo, hi + 1)
+
+
+def provision_session_accounts(
+    app_uid: int,
+    app_gid: int,
+    *,
+    passwd_path: Path = PASSWD_PATH,
+    group_path: Path = GROUP_PATH,
+) -> None:
+    """Add ``/etc/passwd`` and ``/etc/group`` entries for the broker and the
+    session uids (uid mode, root start).
+
+    uid mode runs the broker and every session as uids the image has no
+    account for, and userland needs one: ``whoami`` and node's
+    ``os.userInfo()`` (the CLI's runtime) fail for a uid without a passwd
+    entry. So this adds ``claude-broker`` for the broker uid (primary group =
+    the broker gid; that gid's group is added as ``claude-broker`` only when it
+    has none, and by default it is the app's) and, for every uid of the band
+    ``[CLAUDE_ISOLATION_UID_MIN, CLAUDE_ISOLATION_UID_MAX]`` (read like the
+    gateway) except the ids no session gets (:func:`_reserved_ids`), a user
+    ``claude-u<uid>`` with a group ``claude-u<uid>`` of gid = uid (the broker
+    gives a session the gid equal to its uid). Home ``/nonexistent``, shell
+    ``/usr/sbin/nologin``, no password.
+
+    Existing lines are never changed, malformed ones included, and no entry is
+    added whose name or id a line already claims: an operator's own entries
+    win, and a second start writes nothing. A band wider than
+    ``MAX_PROVISIONED_UIDS`` is skipped with a warning; the operator then
+    provisions NSS for it. A file is replaced atomically (owner and mode kept)
+    and only when an entry is missing. Failures only warn.
+    """
+    passwd = _read_account_file(passwd_path)
+    group = _read_account_file(group_path)
+    unnamed: dict[Path, list[int]] = {}
+
+    def add(account_file: _AccountFile | None, name: str, xid: int, line: str) -> None:
+        if account_file is None or xid in account_file.ids:
+            return
+        if name in account_file.names:
+            unnamed.setdefault(account_file.path, []).append(xid)
+            return
+        account_file.add(line, name, xid)
+
+    def add_account(name: str, uid: int, gid: int, gecos: str) -> None:
+        tail = f"{gecos}:{ACCOUNT_HOME}:{ACCOUNT_SHELL}"
+        add(passwd, name, uid, f"{name}:x:{uid}:{gid}:{tail}")
+
+    broker = _broker_ids(app_gid)
+    if broker is not None:
+        broker_uid, broker_gid = broker
+        add(group, BROKER_ACCOUNT, broker_gid, f"{BROKER_ACCOUNT}:x:{broker_gid}:")
+        add_account(BROKER_ACCOUNT, broker_uid, broker_gid, "claude isolation broker")
+    reserved = _reserved_ids(app_uid)
+    for uid in _provisioned_band():
+        if uid in reserved:
+            continue
+        name = f"{SESSION_ACCOUNT_PREFIX}{uid}"
+        add(group, name, uid, f"{name}:x:{uid}:")
+        add_account(name, uid, uid, "claude session uid")
+    for path, ids in unnamed.items():
+        shown = ", ".join(str(xid) for xid in ids[:5]) + (", ..." if ids[5:] else "")
+        print(
+            f"warning: {path}: no entry added for {len(ids)} id(s) ({shown}): "
+            "the name is taken by another id",
+            file=sys.stderr,
+        )
+    # Groups first: an account's primary group exists before the account.
+    for account_file in (group, passwd):
+        if account_file is not None:
+            _write_account_file(account_file)
+
+
+CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
+CONFIG_BASE_ENV = "CLAUDE_ISOLATION_CONFIG_BASE"
+PLUGIN_CLONE_ROOT_ENV = "CLAUDE_PLUGIN_CLONE_ROOT"
+WORKSPACES_DIR_ENV = "USER_WORKSPACES_DIR"
+DEFAULT_APP_ROOT = DEFAULT_DATA_DIR.parent
+# What this root step hands to the app uid (the shared config dir, the
+# per-uid config base) is never one of these, inside one or above one: an
+# app-owned /usr or /etc would let the app uid replace what root and the
+# broker run. The launcher grants /opt and the other system roots read-only
+# to every session, and the gateway refuses its own state there.
+SYSTEM_DIRS = (
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/libx32",
+    "/opt",
+    "/proc",
+    "/root",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/tmp",
+    "/usr",
+    "/var/run",
+    "/var/tmp",
+)
+
+
+def _beneath(path: str, root: str) -> bool:
+    """Whether *path* is *root* or lies below it (both absolute)."""
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def _overlap(path: str, other: str) -> str | None:
+    """How *path* overlaps *other* ("is", "contains" or "lies inside"), each
+    taken as given and with its symlinks resolved; None when they are apart."""
+    for mine in dict.fromkeys((path, os.path.realpath(path))):
+        for theirs in dict.fromkeys((other, os.path.realpath(other))):
+            if mine == theirs:
+                return "is"
+            if _beneath(theirs, mine):
+                return "contains"
+            if _beneath(mine, theirs):
+                return "lies inside"
+    return None
+
+
+def _placement_refusal(path: str, protected: list[tuple[str, str]]) -> str | None:
+    """Why this root step must not hand *path* to the app uid, or None: it is
+    ``/``, or it is, contains or lies inside a *protected* ``(label, path)``
+    or one of :data:`SYSTEM_DIRS`."""
+    if path == "/":
+        return "it is the filesystem root"
+    system = [("the system directory", root) for root in SYSTEM_DIRS]
+    for label, other in [*protected, *system]:
+        relation = _overlap(path, other)
+        if relation is not None:
+            return f"it {relation} {label} {other}"
+    return None
+
+
+def _component_problem(path: str, exc: OSError) -> str:
+    """*exc*, raised at the path component *path*, described."""
+    try:
+        mode = os.lstat(path).st_mode
+    except OSError:
+        return f"{path}: {exc.strerror}"
+    if stat.S_ISLNK(mode):
+        return f"{path} is a symlink"
+    if not stat.S_ISDIR(mode):
+        return f"{path} is not a directory"
+    return f"{path}: {exc.strerror}"
+
+
+def _make_dir_nofollow(path: str, mode: int, label: str) -> int | None:
+    """Create the absolute *path* and its missing parents without following a
+    symlink, and return an fd of it; None, with a warning, when that fails.
+
+    Every component is opened ``O_NOFOLLOW`` from ``/`` down, so an existing
+    one that is a symlink or not a directory fails the path before anything is
+    created through it. A parent created here gets 0755 and *path* *mode*,
+    whatever the umask.
+    """
+    parts = Path(path).parts[1:]
+    if not parts:
+        print(f"warning: not preparing {label}: it is /", file=sys.stderr)
+        return None
+    current = "/"
+    fd = os.open(current, os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for index, name in enumerate(parts):
+            current = os.path.join(current, name)
+            want = mode if index == len(parts) - 1 else 0o755
+            created = True
+            try:
+                os.mkdir(name, want, dir_fd=fd)
+            except FileExistsError:
+                created = False
+            flags = os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            if not created and index < len(parts) - 1:
+                flags |= os.O_PATH  # only traversed: needs no read access
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            if created:
+                os.fchmod(fd, want)
+    except OSError as exc:
+        os.close(fd)
+        print(
+            f"warning: not preparing {label}: {_component_problem(current, exc)}",
+            file=sys.stderr,
+        )
+        return None
+    return fd
+
+
+def _prepare_shared_config_dir(
+    shared: str,
+    *,
+    uid: int,
+    gid: int,
+    skip_owners: Container[int],
+    protected: list[tuple[str, str]],
+) -> bool:
+    """Create the shared config dir *shared* (S), hand its tree to the app uid
+    like ``~/.claude`` and make S itself 0755. False (warned) when refused."""
+    label = f"{CONFIG_DIR_ENV} {shared}"
+    reason = _placement_refusal(shared, protected)
+    if reason is not None:
+        print(f"warning: not preparing {label}: {reason}", file=sys.stderr)
+        return False
+    fd = _make_dir_nofollow(shared, 0o755, label)
+    if fd is None:
+        return False
+    try:
+        _chown_tree(Path(shared), uid, gid, skip_owners)
+        owner = os.fstat(fd).st_uid
+        if owner != uid:
+            print(
+                f"warning: not opening {label} to session uids: it is owned by "
+                f"uid {owner}, not the app uid {uid}",
+                file=sys.stderr,
+            )
+            return False
+        os.fchmod(fd, 0o755)
+    except OSError as exc:
+        print(f"warning: could not prepare {label}: {exc}", file=sys.stderr)
+        return False
+    finally:
+        os.close(fd)
+    return True
+
+
+def _prepare_config_base(
+    *, uid: int, gid: int, protected: list[tuple[str, str]]
+) -> str | None:
+    """Create the per-uid config base (read like the gateway's
+    ``claude_config_paths.config_base()``), owned by app:app and 0711, its
+    contents never walked; the path, or None (warned) when refused."""
+    raw = (os.environ.get(CONFIG_BASE_ENV) or "").strip()
+    if not raw:
+        print(
+            f"warning: {CONFIG_BASE_ENV} is unset: uid mode has no per-uid config "
+            "dirs to give the session uids (docker-compose.uid.yml sets "
+            "/data/claude/users)",
+            file=sys.stderr,
+        )
+        return None
+    if not os.path.isabs(raw):
+        print(
+            f"warning: not preparing {CONFIG_BASE_ENV} {raw}: not an absolute path",
+            file=sys.stderr,
+        )
+        return None
+    base = os.path.normpath(raw)
+    label = f"{CONFIG_BASE_ENV} {base}"
+    reason = _placement_refusal(base, protected)
+    if reason is not None:
+        print(f"warning: not preparing {label}: {reason}", file=sys.stderr)
+        return None
+    fd = _make_dir_nofollow(base, 0o711, label)
+    if fd is None:
+        return None
+    try:
+        os.fchown(fd, uid, gid)
+        os.fchmod(fd, 0o711)
+    except OSError as exc:
+        print(f"warning: could not prepare {label}: {exc}", file=sys.stderr)
+        return None
+    finally:
+        os.close(fd)
+    return base
+
+
+def _workspaces_dir() -> str:
+    """The workspace base, read like the gateway's ``_resolve_base_path()``."""
+    raw = os.environ.get(WORKSPACES_DIR_ENV, "")
+    if raw:
+        return os.path.abspath(raw)
+    import tempfile
+
+    return os.path.join(tempfile.gettempdir(), "oh-my-gateway-workspaces")
+
+
+def _warn_unreachable(label: str, path: str) -> None:
+    """Warn when others may not search a directory from ``/`` down to *path*
+    (itself included): a session uid has to traverse every one of them."""
+    target = Path(path)
+    blocked = []
+    for step in (*reversed(target.parents), target):
+        try:
+            info = os.stat(step)
+        except OSError:
+            break
+        if stat.S_ISDIR(info.st_mode) and not info.st_mode & stat.S_IXOTH:
+            blocked.append(f"{step} (mode {stat.S_IMODE(info.st_mode):04o})")
+    if blocked:
+        print(
+            f"warning: session uids cannot reach {label} {path}: others may not "
+            f"search {', '.join(blocked)}",
+            file=sys.stderr,
+        )
+
+
+def _check_clone_root(shared: str, home: str) -> None:
+    """Warn when marketplace clones land outside the shared config dir, where
+    the session uids read them."""
+    raw = (os.environ.get(PLUGIN_CLONE_ROOT_ENV) or "").strip()
+    example = os.path.join(shared, "plugin-marketplaces")
+    if not raw:
+        print(
+            f"warning: {PLUGIN_CLONE_ROOT_ENV} is unset, so marketplaces are cloned "
+            f"under {os.path.join(home, '.claude', 'plugin-marketplaces')}, which "
+            f"session uids cannot reach; set it inside {CONFIG_DIR_ENV} (for "
+            f"example {example})",
+            file=sys.stderr,
+        )
+    elif _overlap(os.path.abspath(raw), shared) != "lies inside":
+        print(
+            f"warning: {PLUGIN_CLONE_ROOT_ENV} {raw} is not inside "
+            f"{CONFIG_DIR_ENV} {shared}: uid-mode sessions read the marketplace "
+            "clones through the shared config dir, so plugins cloned elsewhere "
+            f"may not load (for example {example})",
+            file=sys.stderr,
+        )
+
+
+def prepare_isolation_dirs(
+    *,
+    uid: int,
+    gid: int,
+    skip_owners: Container[int] = (),
+    home: Path | None = None,
+    app_root: Path = DEFAULT_APP_ROOT,
+) -> None:
+    """Prepare the config dirs uid mode's session uids use (root start).
+
+    * The shared config dir S (``CLAUDE_CONFIG_DIR``): the gateway's own, whose
+      skills, plugins and settings every per-uid config dir links in. Unset, it
+      is ``$HOME/.claude``; ``$HOME`` is 0700 in the image, so S unset or inside
+      ``$HOME`` only warns that session uids cannot reach it (the gateway's
+      startup probe then refuses uid mode). Otherwise S is created without
+      following a symlink anywhere on its path, its tree handed to the app uid
+      like ``~/.claude`` (entries a session uid owns, *skip_owners*, are left
+      alone) and S itself made 0755.
+    * The per-uid config base (``CLAUDE_ISOLATION_CONFIG_BASE``), absolute and
+      apart from S: created the same way, owned by app:app and 0711, but never
+      walked, since the per-uid dirs in it hold files the session uids own.
+
+    Neither may be ``/``, nor be, contain or lie inside ``$HOME``, the app root,
+    the workspace base or a system directory (:data:`SYSTEM_DIRS`): this root
+    step would hand them to the app uid. A refused one is skipped with a
+    warning. Also warns, without failing, when a directory on the way to S,
+    the base or the workspace base is not searchable by others, and when
+    ``CLAUDE_PLUGIN_CLONE_ROOT`` does not lie inside S.
+    """
+    if home is None:
+        home = (os.environ.get("HOME") or "").strip() or DEFAULT_CLAUDE_HOME.parent
+    home_dir = os.path.abspath(home)
+    app = os.path.abspath(app_root)
+    workspaces = _workspaces_dir()
+    raw = (os.environ.get(CONFIG_DIR_ENV) or "").strip()
+    shared = os.path.abspath(raw) if raw else None
+
+    ready_shared = False
+    if shared is None or _overlap(shared, home_dir) in ("is", "lies inside"):
+        where = (
+            f"is unset, so the shared Claude config dir is {home_dir}/.claude"
+            if shared is None
+            else f"is {shared}"
+        )
+        print(
+            f"warning: {CONFIG_DIR_ENV} {where}, inside $HOME {home_dir}: session "
+            "uids cannot reach it (the image makes $HOME 0700), so uid-mode "
+            "sessions get no skills, plugins or settings and the gateway's "
+            f"startup probe refuses uid mode; set {CONFIG_DIR_ENV} outside $HOME "
+            "(docker-compose.uid.yml uses /data/claude/shared)",
+            file=sys.stderr,
+        )
+    else:
+        ready_shared = _prepare_shared_config_dir(
+            shared,
+            uid=uid,
+            gid=gid,
+            skip_owners=skip_owners,
+            protected=[
+                ("$HOME", home_dir),
+                ("the gateway's app root", app),
+                ("the workspace base", workspaces),
+            ],
+        )
+
+    others = [] if shared is None else [(CONFIG_DIR_ENV, shared)]
+    base = _prepare_config_base(
+        uid=uid,
+        gid=gid,
+        protected=[
+            *others,
+            ("$HOME", home_dir),
+            ("the gateway's app root", app),
+            ("the workspace base", workspaces),
+        ],
+    )
+
+    for label, path in (
+        (CONFIG_DIR_ENV, shared if ready_shared else None),
+        (CONFIG_BASE_ENV, base),
+        (WORKSPACES_DIR_ENV, workspaces),
+    ):
+        if path is not None:
+            _warn_unreachable(label, path)
+    if ready_shared:
+        _check_clone_root(shared, home_dir)
 
 
 # ===========================================================================
@@ -477,11 +1256,13 @@ def _wait_for_broker(
 def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     """Fork the resident broker before privilege drop. No-op unless uid mode.
 
-    Generates the ticket secret (if unset) and exports it, the socket path and
-    the real CLI into the environment the gateway (exec'd next) inherits, so the
-    gateway can mint tickets the broker verifies.
+    Generates the ticket secret (if unset) into the environment the broker
+    inherits, and exports the socket path and the real CLI for the gateway
+    (exec'd next). :func:`main` then moves the secret out of that environment
+    into a pipe for the gateway (:func:`hand_off_ticket_secret`), so the gateway
+    can mint tickets the broker verifies.
     """
-    if (os.environ.get("CLAUDE_ISOLATION_MODE") or "").strip().lower() != "uid":
+    if not _uid_mode():
         return
     if os.geteuid() != 0:
         print(
@@ -513,8 +1294,8 @@ def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
     # The broker runs under a dedicated non-root uid but keeps the gateway's gid
     # by default, so the socket it binds (mode 0660, group = that gid) is
     # connectable by the gateway-uid launcher without a world-writable socket.
-    broker_uid = _parse_id("CLAUDE_ISOLATION_BROKER_UID", DEFAULT_BROKER_UID)
-    broker_gid = _parse_id("CLAUDE_ISOLATION_BROKER_GID", app_gid)
+    broker_uid = _parse_id(BROKER_UID_ENV, DEFAULT_BROKER_UID)
+    broker_gid = _parse_id(BROKER_GID_ENV, app_gid)
     # The broker pins its only legitimate client to the gateway's uid.
     os.environ["GATEWAY_ISOLATION_PEER_UID"] = str(app_uid)
 
@@ -546,6 +1327,87 @@ def launch_isolation_broker(app_uid: int, app_gid: int) -> None:
         os._exit(78)
 
 
+# The gateway's copy of the ticket secret travels in an inherited pipe named by
+# TICKET_SECRET_FD_ENV, not in the environment (uid_isolation reads it at
+# startup: capture_ticket_secret).
+TICKET_SECRET_ENV = "GATEWAY_ISOLATION_TICKET_SECRET"
+TICKET_SECRET_FD_ENV = "GATEWAY_ISOLATION_TICKET_SECRET_FD"
+# Linux's PIPE_BUF, and a pipe holds at least one page: a write this small into
+# a fresh pipe is atomic and never blocks, though nothing reads it until the
+# gateway starts. uid_isolation refuses a pipe holding more.
+MAX_TICKET_SECRET_BYTES = 4096
+
+
+def hand_off_ticket_secret() -> None:
+    """Move the ticket secret from the environment into a pipe for the gateway.
+
+    Everything the image CMD runs before uvicorn (the ``sh -c`` wrapper,
+    ``GATEWAY_STARTUP_SCRIPT``, ``install_plugins.py`` and its git and
+    ``claude plugin`` children) would otherwise inherit the secret while the
+    broker already accepts tickets signed with it, and uvicorn's exec-time
+    environment would keep a copy. Instead the secret is written to a pipe
+    whose write end is closed here; only the read end is inherited across the
+    exec, and the gateway reads and closes it at startup. The variable names
+    the pipe's number, device and inode (``<fd>:<dev>:<ino>``), so a process
+    that inherits only the variable (a ``uvicorn --workers``/``--reload``
+    worker) never reads a descriptor of its own by mistake. The CMD steps still
+    inherit the descriptor: one that reads it by accident consumes the secret,
+    the gateway then finds the pipe empty and uid mode refuses to start. A step
+    that means harm could read it and write it back unnoticed, but it runs as
+    the app uid, which can already rewrite the gateway's code: this is hygiene,
+    not a boundary. Python ``subprocess`` children (git, ``claude plugin``)
+    never get it, since they close inherited descriptors.
+
+    Runs for root and non-root starts alike, whenever the variable holds a
+    secret: the one :func:`launch_isolation_broker` generated or an operator's.
+    The broker was forked before this and keeps its own copy. A secret too large
+    to write without blocking stops the container rather than exec the command
+    with it in the environment: uid mode needs the secret, and the default one
+    is 64 characters.
+    """
+    secret = os.environ.get(TICKET_SECRET_ENV)
+    if secret is None or not secret.strip():
+        return
+    data = secret.encode("utf-8", "surrogateescape")
+    if len(data) > MAX_TICKET_SECRET_BYTES:
+        raise SystemExit(
+            f"{TICKET_SECRET_ENV} is {len(data)} bytes; the entrypoint hands it "
+            f"to the gateway through a pipe and accepts at most "
+            f"{MAX_TICKET_SECRET_BYTES}. Use a shorter secret, or leave it unset "
+            "so uid mode generates one."
+        )
+    import fcntl
+
+    try:
+        read_fd, write_fd = os.pipe()
+    except OSError as exc:
+        raise SystemExit(f"cannot hand {TICKET_SECRET_ENV} to the gateway: {exc}")
+    try:
+        try:
+            os.set_blocking(write_fd, False)
+            if os.write(write_fd, data) != len(data):
+                raise OSError(errno.EAGAIN, "short write")
+        finally:
+            os.close(write_fd)
+        if read_fd <= 2:
+            # A closed stdin/stdout/stderr gave the pipe a stdio number: the
+            # command would read (or write) the secret as one of its streams.
+            moved = fcntl.fcntl(read_fd, fcntl.F_DUPFD_CLOEXEC, 3)
+            os.close(read_fd)
+            read_fd = moved
+        os.set_inheritable(read_fd, True)
+        pipe = os.fstat(read_fd)
+    except OSError as exc:
+        try:
+            os.close(read_fd)
+        except OSError:
+            pass
+        raise SystemExit(f"cannot hand {TICKET_SECRET_ENV} to the gateway: {exc}")
+    # uid_isolation._parse_secret_fd reads this exact shape.
+    os.environ[TICKET_SECRET_FD_ENV] = f"{read_fd}:{pipe.st_dev}:{pipe.st_ino}"
+    del os.environ[TICKET_SECRET_ENV]
+
+
 def main(argv: list[str]) -> None:
     if not argv:
         raise SystemExit("no command provided")
@@ -554,10 +1416,16 @@ def main(argv: list[str]) -> None:
     gid = _parse_id("APP_GID", DEFAULT_GID)
 
     if os.geteuid() == 0:
-        prepare_writable_paths(uid=uid, gid=gid)
+        skip_owners = _session_owned_uids(uid)
+        prepare_writable_paths(uid=uid, gid=gid, skip_owners=skip_owners)
+        if _uid_mode():
+            # What the session uids need, before the broker that runs them.
+            provision_session_accounts(uid, gid)
+            prepare_isolation_dirs(uid=uid, gid=gid, skip_owners=skip_owners)
         launch_isolation_broker(uid, gid)  # before the drop; no-op unless uid mode
         drop_privileges(uid, gid)
 
+    hand_off_ticket_secret()
     os.execvp(argv[0], argv)
 
 

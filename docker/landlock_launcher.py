@@ -78,8 +78,28 @@ def _cwd():
 
 
 def _parse_paths(var):
-    paths = [p for p in os.environ.get(var, "").split(os.pathsep) if p]
+    """The JSON array of absolute paths in *var*; unset or empty is none.
+
+    JSON, never a ``:``-joined list: a path may contain ``:`` (a marketplace
+    cloned from ``https://git.internal:8443``), and splitting on it turned one
+    grant into others — a relative fragment refused on every spawn, or
+    ``.../x:/secret`` granting ``/secret`` (#244 review)."""
+    raw = os.environ.get(var, "")
+    if not raw.strip():
+        return []
+    try:
+        paths = json.loads(raw)
+    except (ValueError, RecursionError) as exc:
+        _die("%s is not a JSON array of paths (%s); refusing it" % (var, exc))
+    if not isinstance(paths, list):
+        _die("%s is not a JSON array of paths; refusing it" % var)
     for path in paths:
+        if not isinstance(path, str) or not path or "\0" in path:
+            _die("%s entry %r is not a path; refusing it" % (var, path))
+        try:
+            os.fsencode(path)
+        except UnicodeError:
+            _die("%s entry %r is not a path; refusing it" % (var, path))
         # A relative rule would resolve against the cwd, granting something
         # other than what the gateway meant; refuse instead of guessing.
         if not os.path.isabs(path):
@@ -87,23 +107,46 @@ def _parse_paths(var):
     return paths
 
 
+def _tmpdir_name(cwd):
+    """The session tmp dir's entry in the workspace *cwd*: an operator
+    ``CLAUDE_CODE_TMPDIR`` naming one entry directly in it (``tmp``,
+    ``<cwd>/tmp``), else ``.cli-tmp``.
+
+    One entry only: ``ll.session_tmpdir`` prepares it relative to the
+    workspace fd without following a link, and every further component would
+    be one more name the agent controls between a check and its use — a
+    swapped ``a`` in ``a/b`` steered the old realpath-checked branch outside
+    the workspace (#244 review). A fixed path can name one workspace at most,
+    so a per-workspace tmp dir is a single relative entry anyway."""
+    configured = os.environ.get("CLAUDE_CODE_TMPDIR", "").strip()
+    if configured:
+        path = os.path.abspath(configured)  # against the kernel cwd: lexical
+        name = os.path.basename(path)
+        if os.path.dirname(path) == cwd and name not in ("", ".", ".."):
+            return name
+    return ".cli-tmp"
+
+
 def _session_tmpdir(cwd):
     """A workspace-local tmpdir, honored over the shared /tmp.
 
-    An operator ``CLAUDE_CODE_TMPDIR`` already under the cwd is kept; otherwise
-    point TMPDIR/CLAUDE_CODE_TMPDIR at ``<cwd>/.cli-tmp`` so the CLI's temp
-    writes stay inside the granted workspace, not the shared /tmp (a cross-
-    session channel when sessions share a uid). The npm and uv caches move
-    beneath it too (``ll.session_tmp_env``). Exported for the real CLI.
+    Points TMPDIR/CLAUDE_CODE_TMPDIR at ``<cwd>/.cli-tmp`` (or the operator's
+    single-entry name, :func:`_tmpdir_name`) so the CLI's temp writes stay
+    inside the granted workspace, not the shared /tmp (a cross-session channel
+    when sessions share a uid). The npm and uv caches and the git global config
+    move beneath it too (``ll.session_tmp_env``). Whatever the agent left in
+    its place is repaired without following a link (``ll.session_tmpdir``).
+    Exported for the real CLI.
     """
-    real_cwd = os.path.realpath(cwd)
-    configured = os.environ.get("CLAUDE_CODE_TMPDIR", "").strip()
+    real_cwd = cwd  # os.getcwd(), just checked equal to the gateway's grant
     try:
-        if configured and os.path.realpath(configured).startswith(real_cwd + os.sep):
-            tmp = configured
-            os.makedirs(tmp, exist_ok=True)
-        else:
-            tmp = ll.safe_tmpdir(real_cwd)
+        # "." is the kernel cwd just checked against the gateway's grant, so
+        # the repair works on that very directory, not on a path lookup.
+        dot = os.open(".", os.O_PATH | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            tmp = ll.session_tmpdir(real_cwd, _tmpdir_name(real_cwd), cwd_fd=dot)
+        finally:
+            os.close(dot)
     except OSError as exc:
         # The CLI cannot start without it; say why instead of its bare exit 1.
         _die("cannot create the session tmp dir in %r: %s" % (real_cwd, exc))
@@ -112,20 +155,43 @@ def _session_tmpdir(cwd):
 
 
 def _ro_rw(real_cli, cwd):
-    """The read-only and read-write path lists for a confinement at *cwd*."""
+    """The path lists for a confinement at *cwd*: ``(ro, rw)`` of our own,
+    opened following links, and ``(gateway_ro, gateway_rw)``, the gateway's
+    resolved entries, opened following none (``ll.build_and_restrict``)."""
+    cli_dir = os.path.dirname(os.path.realpath(real_cli))
+    problem = ll.cli_dir_problem(cli_dir, cwd)
+    if problem:
+        _die("refusing to grant the real CLI's directory %r: %s" % (cli_dir, problem))
     ro = list(ll.SYSTEM_RO)
-    ro.append(os.path.dirname(os.path.realpath(real_cli)))
-    ro.extend(_parse_paths("GATEWAY_LANDLOCK_RO"))
+    ro.append(cli_dir)
+    # The session shell wrapper, which the CLI execs for every Bash call: the
+    # file, never its directory (in a checkout that is the gateway's docker/).
+    ro.append(ll.SESSION_SHELL)
+    gateway_ro = _parse_paths("GATEWAY_LANDLOCK_RO")
+    gateway_rw = _parse_paths("GATEWAY_LANDLOCK_RW")
+    # The workspace is granted as the gateway named it, never as the kernel's
+    # cwd: the SDK's chdir follows links, so a workspace planted as a link
+    # granted its target rw — the whole config dir, or every user's workspace
+    # (#244 review). The gateway sends it resolved, as its first read-write
+    # entry, so the kernel cwd must be exactly that entry.
+    if not gateway_rw or cwd != gateway_rw[0]:
+        _die(
+            "the working directory %r is not the gateway's workspace grant (the "
+            "first GATEWAY_LANDLOCK_RW entry); refusing to confine elsewhere" % cwd
+        )
     # TMPDIR is set inside the workspace but is NOT a separate rule: it lies
     # beneath the granted cwd, so a rule would be redundant and (because it is
-    # agent-controlled) a symlink-escape vector — see ll.safe_tmpdir.
+    # agent-controlled) a symlink-escape vector — see ll.session_tmpdir.
     _session_tmpdir(cwd)
+    os.environ.update(ll.session_shell_env(os.environ))
     # /dev/shm stays rw for POSIX semaphores (multiprocessing, joblib). In this
-    # mode it is a surface shared by every same-uid session; uid mode
-    # separates it by DAC.
-    rw = [cwd, "/dev/shm"]
-    rw.extend(_parse_paths("GATEWAY_LANDLOCK_RW"))
-    return ro, rw
+    # mode it is a surface shared by every same-uid session. uid mode runs each
+    # session as its own uid with umask 077, so new objects there are 0600 to
+    # the other session uids (an agent can still chmod its own open), and the
+    # broker's cleanup op removes what a run left before its uid is leased
+    # again.
+    rw = ["/dev/shm"]
+    return ro, rw, gateway_ro, gateway_rw
 
 
 # --- landlock mode: confine in place, then exec ------------------------------
@@ -133,9 +199,9 @@ def _ro_rw(real_cli, cwd):
 
 def _run_landlock(real_cli):
     cwd = _cwd()
-    ro, rw = _ro_rw(real_cli, cwd)
+    ro, rw, gateway_ro, gateway_rw = _ro_rw(real_cli, cwd)
     try:
-        ll.build_and_restrict(ro, rw)
+        ll.build_and_restrict(ro, rw, gateway_ro=gateway_ro, gateway_rw=gateway_rw)
     except ll.LandlockError as exc:
         _die(str(exc))
     ll.restore_exec_signals()

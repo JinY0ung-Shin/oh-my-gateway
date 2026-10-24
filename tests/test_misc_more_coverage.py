@@ -469,7 +469,11 @@ class TestSessionManagerGaps:
         jsonl = project_dir / "sess-oserror.jsonl"
         jsonl.write_text(json.dumps({"type": "user", "cwd": cwd}) + "\n")
 
-        with patch.object(Path, "open", side_effect=OSError("no access")):
+        from src.backends.claude import uid_cleanup
+
+        with patch.object(
+            uid_cleanup, "_open_transcript", side_effect=OSError("no access")
+        ):
             result = _try_rehydrate_from_jsonl("sess-oserror", user="alice", cwd=cwd)
         assert result is None
 

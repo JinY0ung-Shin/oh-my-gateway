@@ -1,0 +1,40 @@
+#!/bin/sh
+# Session shell of a confined Claude CLI (CLAUDE_ISOLATION_MODE=landlock|uid).
+#
+# The launcher and the uid broker point CLAUDE_CODE_SHELL here and the real
+# bash in GATEWAY_REAL_BASH (docker/_landlock_rules.py session_shell_env).
+# Confined, the CLI cannot write its shell snapshot — <config dir>/shell-snapshots
+# stays read-only, because every session sources its snapshot before each
+# command — and without one it runs every Bash tool call as a login shell,
+# `bash -c -l <cmd>`. A login shell reads /etc/profile, which may reset PATH,
+# and ~/.profile, which the sandbox denies, so every result started with
+# "Permission denied". This drops exactly that leading -l, and adds --norc:
+# Debian's bash is built with SSH_SOURCE_BASHRC, so even a non-login `bash -c`
+# reads the (denied) ~/.bashrc when SSH_CLIENT is set and SHLVL < 2. Any other
+# argv reaches bash unchanged.
+#
+# Fixed and root-owned (/usr/local/bin in the image); the file name must
+# contain "bash": the CLI honours CLAUDE_CODE_SHELL only then, and picks its
+# shell dialect from it.
+
+real=${GATEWAY_REAL_BASH:-}
+if [ -z "$real" ] || [ ! -x "$real" ] || [ "$real" -ef "$0" ]; then
+    # Unset (an env the CLI did not inherit) or unusable: the same search.
+    real=
+    for dir in /bin /usr/bin /usr/local/bin; do
+        if [ -x "$dir/bash" ]; then
+            real=$dir/bash
+            break
+        fi
+    done
+    if [ -z "$real" ]; then
+        echo "claude-session-bash: no bash found" >&2
+        exit 127
+    fi
+fi
+
+if [ "$#" -ge 3 ] && [ "$1" = "-c" ] && [ "$2" = "-l" ]; then
+    shift 2
+    exec "$real" --norc -c "$@"
+fi
+exec "$real" "$@"

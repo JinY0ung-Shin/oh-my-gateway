@@ -5,6 +5,7 @@ implementation registered as the ``claude`` backend.
 """
 
 import asyncio
+import functools
 import weakref
 import json
 import os
@@ -557,6 +558,35 @@ def _error_result_text(message: Any) -> str:
     if getattr(message, "is_error", False) and hasattr(message, "result"):
         return str(getattr(message, "result", "") or "")
     return ""
+
+
+async def _aclose_query(stream: Any) -> None:
+    """Close an SDK ``query()`` generator, bounded; best effort.
+
+    For a generator that cleans up on close this runs its teardown (stdin
+    EOF, then SIGTERM, then SIGKILL, ~20 s at worst), so it is capped like a
+    disconnect. The pinned SDK's top-level ``query()`` has no ``try/finally``,
+    though: closing it early does not stop its CLI. What keeps that CLI from
+    outliving the caller is draining the stream, whose end runs the SDK's own
+    inner ``finally`` (``transport.close()``). The cap needs
+    ``asyncio.timeout`` (Python 3.11+): ``asyncio.wait_for`` before 3.12 would
+    close the generator from another task, which its anyio cancel scopes
+    refuse, so without it the close is awaited uncapped. Never raises.
+    """
+    from src.constants import CLIENT_DISCONNECT_TIMEOUT_SECONDS
+
+    aclose = getattr(stream, "aclose", None)
+    if aclose is None:
+        return
+    timeout = getattr(asyncio, "timeout", None)
+    try:
+        if timeout is None:
+            await aclose()
+        else:
+            async with timeout(CLIENT_DISCONNECT_TIMEOUT_SECONDS):
+                await aclose()
+    except Exception:
+        logger.debug("Closing the verify query failed", exc_info=True)
 
 
 class ClaudeCodeCLI(TokenEstimateMixin):
@@ -1397,11 +1427,27 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         this is the only trace of a broken gateway- or plugin-materialized
         server, so without this log an invalid config vanishes silently.
         Log-only: both endpoints' whitelists keep the field off the wire.
+
+        A server that passed validation but died while starting (bad command,
+        a ``uv run`` that cannot set itself up, #246) is only an
+        ``mcp_servers`` entry with ``status: "failed"``: the CLI waits for
+        every server before it emits ``init``, so ``pending`` is not left
+        there, and it keeps no stderr (``get_mcp_status`` says just
+        "Connection closed"; pinned on the bundled CLI 2.1.283).
         """
         if converted.get("subtype") != "init":
             return
         data = converted.get("data")
-        errors = data.get("mcp_server_errors") if isinstance(data, dict) else None
+        if not isinstance(data, dict):
+            return
+        servers = data.get("mcp_servers")
+        for entry in servers if isinstance(servers, list) else []:
+            if isinstance(entry, dict) and entry.get("status") == "failed":
+                logger.warning(
+                    "MCP server %r failed to start; its tools are unavailable",
+                    entry.get("name"),
+                )
+        errors = data.get("mcp_server_errors")
         if not errors:
             return
         for entry in errors if isinstance(errors, list) else [errors]:
@@ -1442,6 +1488,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # not an UnboundLocalError from the diagnostic bookkeeping.
         last_error_result = ""
         verify_workspace: Optional[Path] = None
+        argv_files = None
+        from . import argv_files as argv_files_mod
         from . import landlock
 
         try:
@@ -1454,19 +1502,50 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 from src.workspace_manager import workspace_manager
 
                 verify_workspace = workspace_manager.resolve(None)
-            options = self._build_sdk_options(max_turns=1, cwd=verify_workspace)
-            messages = []
-            async for message in query(
-                prompt="Hello",
-                options=options,
-            ):
-                messages.append(message)
-                msg_type = getattr(message, "type", None) or (
-                    message.get("type") if isinstance(message, dict) else None
+            # In a worker thread, as in create_client: verify runs on every
+            # admin health check, and under uid isolation building the options
+            # prepares the session uid's layout (``uid_layout.prepare_spawn``:
+            # a dirty leased uid waits for a broker wipe, a workspace grant for
+            # the mirror lock). A cancelled verify (the startup timeout) waits
+            # for it before the cleanup below releases the workspace's lease.
+            from .uid_layout import to_thread_to_completion
+
+            options = await to_thread_to_completion(
+                functools.partial(
+                    self._build_sdk_options, max_turns=1, cwd=verify_workspace
                 )
-                if msg_type == "assistant":
-                    break
-                last_error_result = _error_result_text(message) or last_error_result
+            )
+            # Like create_client: verify runs at startup and on every admin
+            # health check, and its command line would carry the plugin MCP
+            # credential overlays and the base prompt to any confined session
+            # reading /proc (#241 §6.5). The files land in options.cwd, the
+            # directory the CLI runs in.
+            if landlock.confine_enabled():
+                argv_files = argv_files_mod.externalize(
+                    options, shared_uid=landlock.effective_mode() != "uid"
+                )
+            messages = []
+            stream = query(prompt="Hello", options=options)
+            try:
+                async for message in stream:
+                    messages.append(message)
+                    msg_type = getattr(message, "type", None) or (
+                        message.get("type") if isinstance(message, dict) else None
+                    )
+                    if msg_type == "assistant":
+                        break
+                    last_error_result = _error_result_text(message) or last_error_result
+            finally:
+                # The CLI must be stopped before the workspace below is
+                # removed: under uid isolation that ends the run's uid lease,
+                # which must not happen while the CLI still runs as that uid
+                # (#244 review). With the pinned SDK the loop drains the stream
+                # (its messages carry no ``type``, so the break never fires) and
+                # the SDK's own inner finally closes the CLI; closing here is a
+                # best-effort extra for a stream that does stop early.
+                await _aclose_query(stream)
+                if argv_files is not None:
+                    argv_files.cleanup()
 
             if last_error_result:
                 logger.error(
@@ -1509,6 +1588,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             logger.warning("  3. Test: claude --print 'Hello'")
             return False
         finally:
+            # Idempotent: also covers a failure before the stream was opened.
+            if argv_files is not None:
+                argv_files.cleanup()
             if verify_workspace is not None:
                 from src.workspace_manager import workspace_manager
 
@@ -1686,6 +1768,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         cwd: Optional[str],
         allowed_tools: Optional[List[str]],
         disallowed_tools: Optional[List[str]] = None,
+        user: Optional[str] = None,
     ):
         """Assemble the PreToolUse hook matchers for a session.
 
@@ -1722,11 +1805,15 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 for name in BLOCKED_DEFERRED_TOOLS
             )
         # Other users' transcripts and plans live in the shared ~/.claude: that
-        # guard is always on, independent of the opt-in workspace sandbox.
+        # guard is always on, independent of the opt-in workspace sandbox. Under
+        # uid isolation the session has its own config dir too (its layout).
         if cwd:
-            matchers.append(
-                HookMatcher(matcher="", hooks=[make_claude_home_guard_hook(Path(cwd))])
+            from .uid_layout import session_layout
+
+            guard = make_claude_home_guard_hook(
+                Path(cwd), layout=session_layout(user, cwd)
             )
+            matchers.append(HookMatcher(matcher="", hooks=[guard]))
         if cwd and sandbox_enabled():
             matchers.append(
                 HookMatcher(matcher="", hooks=[make_workspace_sandbox_hook(Path(cwd))])
@@ -1956,26 +2043,44 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # crash).
         from src.session_manager import _session_jsonl_exists
 
-        has_history = _session_jsonl_exists(session)
-        options = self._build_sdk_options(
-            model=model,
-            system_prompt=system_prompt,
-            max_turns=get_default_max_turns(),
-            allowed_tools=allowed_tools,
-            disallowed_tools=disallowed_tools,
-            session_id=None if has_history else session.session_id,
-            resume=session.session_id if has_history else None,
-            permission_mode=permission_mode,
-            output_format=output_format,
-            mcp_servers=mcp_servers,
-            task_budget=task_budget,
-            cwd=Path(cwd) if cwd else None,
-            extra_env=extra_env,
-            _custom_base=_custom_base,
-            user=user,
-            forward_headers=forward_headers,
-            include_partial_messages=include_partial_messages,
-            effort=effort,
+        from .uid_layout import migrate_user, to_thread_to_completion
+
+        # Under uid isolation a named user's transcripts move into their own
+        # config dir on their first spawn; do that before asking whether this
+        # session has one, so a migrated session is resumed, not restarted. In a
+        # worker thread: the first one also grants a whole existing workspace
+        # tree (and may copy a large legacy project dir). The spawn-preparing
+        # steps run to completion even when this create is cancelled: the
+        # teardown that follows a cancellation must not run beside them.
+        await to_thread_to_completion(migrate_user, user, cwd)
+        # Off the loop too: a transcript the gateway may not stat is asked of
+        # the broker.
+        has_history = await asyncio.to_thread(_session_jsonl_exists, session)
+        # In a worker thread: under uid isolation building the options prepares
+        # the session uid's layout (``uid_layout.prepare_spawn``), which on a
+        # leased uid a dead gateway left dirty waits for a broker wipe.
+        options = await to_thread_to_completion(
+            functools.partial(
+                self._build_sdk_options,
+                model=model,
+                system_prompt=system_prompt,
+                max_turns=get_default_max_turns(),
+                allowed_tools=allowed_tools,
+                disallowed_tools=disallowed_tools,
+                session_id=None if has_history else session.session_id,
+                resume=session.session_id if has_history else None,
+                permission_mode=permission_mode,
+                output_format=output_format,
+                mcp_servers=mcp_servers,
+                task_budget=task_budget,
+                cwd=Path(cwd) if cwd else None,
+                extra_env=extra_env,
+                _custom_base=_custom_base,
+                user=user,
+                forward_headers=forward_headers,
+                include_partial_messages=include_partial_messages,
+                effort=effort,
+            )
         )
         # 세션 단위 effort — SDK가 생성 시점에 굽는다(중간 변경 API 없음).
         # 그래서 '다음 새 대화부터 적용'이 이 값의 정직한 의미다.
@@ -1998,7 +2103,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         options.can_use_tool = self._make_ask_user_can_use_tool(session)
 
         options.hooks = {
-            "PreToolUse": self._pre_tool_use_hooks(cwd, allowed_tools, disallowed_tools)
+            "PreToolUse": self._pre_tool_use_hooks(
+                cwd, allowed_tools, disallowed_tools, user=user
+            )
         }
         post_tool_use = self._post_tool_use_hooks()
         if post_tool_use:
@@ -2008,7 +2115,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # the awaits above (skill discovery serialized under the global preflight
         # lock, the relay probe) can outlast that under a burst: the broker
         # would refuse the spawn. Mint it again right before the spawn (#241).
-        self._configure_confinement(
+        await to_thread_to_completion(
+            self._configure_confinement,
             options,
             Path(options.cwd) if options.cwd else None,
             user,

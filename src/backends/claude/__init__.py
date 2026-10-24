@@ -296,9 +296,14 @@ def _install_workspace_resource_materializer(cli) -> None:
     async def create_client_with_workspace_resources(*args, **kwargs):
         cwd = kwargs.get("cwd")
         if cwd:
+            from src.backends.claude.uid_layout import to_thread_to_completion
             from src.backends.claude.workspace_resources import materialize_workspace_resources
 
-            materialize_workspace_resources(Path(cwd))
+            # A recursive walk of a tree the session can grow at will: never on
+            # the event loop every other session's stream shares. Run to the end
+            # even when the create is cancelled: the teardown after it removes
+            # an anonymous workspace this walk is still writing into.
+            await to_thread_to_completion(materialize_workspace_resources, Path(cwd))
         return await original_create_client(*args, **kwargs)
 
     cli.create_client = create_client_with_workspace_resources

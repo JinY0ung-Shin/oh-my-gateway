@@ -46,6 +46,8 @@ from typing import Optional
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+from .uid_layout import to_thread_to_completion
+
 # Destructive built-ins are always blocked. Operators extend the set with the
 # BLOCKED_SLASH_COMMANDS env var (comma-separated names, leading slash
 # optional) to disable additional skills/commands gateway-wide. This gates the
@@ -195,8 +197,9 @@ def _build_preflight_options(
     Shared by the names and the details fetchers so they stay identical. Routes
     through the same cwd/confinement path a real session uses: ``cli_path`` is
     the launcher under confinement, and the per-workspace ro/rw lists (or, in
-    uid mode, the session uid's broker ticket — ``user`` keys it) ride
-    ``options.env`` so the confined catalog CLI can read ``~/.claude`` (#241).
+    uid mode, the session uid's broker ticket — ``user`` keys it, once that
+    user has a uid) ride ``options.env`` so the confined catalog CLI can read
+    ``~/.claude`` (#241).
     """
     from src.backends.claude import landlock
     from src.backends.claude.client import (
@@ -240,7 +243,9 @@ async def _fetch_commands(cwd: Optional[Path], user: Optional[str] = None) -> se
     so user-scope plugin skills installed by the admin panel are visible to the
     preflight and the answer describes the CLI that will actually run the turn.
     """
-    opts = _build_preflight_options(cwd, user)
+    # Off the event loop: the build refreshes the workspace's resource mirrors
+    # and, under uid isolation, prepares the session uid's layout.
+    opts = await to_thread_to_completion(_build_preflight_options, cwd, user)
     names: set[str] = set()
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()
@@ -259,7 +264,9 @@ async def get_available_commands(
     """The registered command names for *cwd*, TTL-cached per cwd.
 
     ``user`` is whom the preflight runs as under ``uid`` isolation (the session
-    in *cwd*); the cache stays keyed on the cwd alone.
+    in *cwd*) once that user has a uid; before that it runs landlock-shaped
+    (``landlock.preflight_options_env``). The cache stays keyed on the cwd
+    alone.
     """
     async with _cache.lock:
         if not force and _cache.is_fresh(cwd):
@@ -293,7 +300,7 @@ async def _fetch_command_details(
     cwd: Optional[Path], user: Optional[str] = None
 ) -> dict[str, dict[str, str]]:
     """Names plus SDK metadata (description, argumentHint) for completion UIs."""
-    opts = _build_preflight_options(cwd, user)
+    opts = await to_thread_to_completion(_build_preflight_options, cwd, user)
     details: dict[str, dict[str, str]] = {}
     async with ClaudeSDKClient(options=opts) as client:
         info = await client.get_server_info()

@@ -1761,6 +1761,8 @@ class TestEnsureResponseSessionClientBaseSysPrompt:
         session = MagicMock()
         session.client = None
         session.base_system_prompt = "custom base prompt"
+        # The new client is handed over only to a session the manager holds.
+        isolated_session_manager.sessions["sess-1"] = session
 
         async def run():
             with patch("src.routes.responses.get_mcp_servers", return_value={}):

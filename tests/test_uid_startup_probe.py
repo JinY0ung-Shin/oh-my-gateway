@@ -79,6 +79,9 @@ def _uid_settings(monkeypatch, uid: int) -> None:
         ui.UID_MAX_ENV: str(uid),
         ui.EPHEMERAL_UIDS_ENV: "1",
         "APP_UID": str(uid - 3),
+        # Reserved like APP_UID (the broker refuses a session on it); its
+        # default 1000 would be the runner's uid on a typical dev machine.
+        "APP_GID": str(uid - 3),
         ui.BROKER_UID_ENV: str(uid - 4),
     }.items():
         monkeypatch.setenv(key, value)
@@ -228,10 +231,12 @@ class TestStartupDecision:
         assert not landlock.uid_mode_available()
         monkeypatch.setattr(landlock, "can_enforce_landlock", lambda: (True, ""))
         errors = landlock.check_config()
-        assert len(errors) == 1
-        assert "a session uid cannot run the CLI here" in errors[0]
-        assert "exited 118" in errors[0]
-        assert f"{landlock.FALLBACK_ENV}=landlock" in errors[0]
+        # The root cause first (here: no per-uid config base), then the probe.
+        assert len(errors) == 2
+        assert "CLAUDE_ISOLATION_CONFIG_BASE" in errors[0]
+        assert "a session uid cannot run the CLI here" in errors[1]
+        assert "exited 118" in errors[1]
+        assert f"{landlock.FALLBACK_ENV}=landlock" in errors[1]
 
     @_needs_nonroot
     def test_the_fallback_runs_landlock_and_says_why(self, monkeypatch, caplog):
