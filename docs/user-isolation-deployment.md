@@ -81,6 +81,12 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 
 **Landlock 모드의 한계:** UID가 같고 `/dev/shm` 등 OS 자원을 공유한다. 파일 경계가 생기더라도 별도 컨테이너·네트워크·PID 격리나 모든 프로세스/IPC 분리를 뜻하지 않는다. `GATEWAY_NON_DUMPABLE=true`는 Gateway 본체의 `/proc` 노출 방어이지만 CLI 자식에게 상속되는 환경변수를 완전히 제거하지는 않는다. `SYSINFO_CHILD_ENV_MASK`와 자식 환경변수 정리(#247)를 별도로 점검한다.
 
+**landlock 모드에서는 다른 사용자 파일의 존재·메타데이터가 보인다(#253):** Landlock은 `open()`은 막지만 `stat(2)`·경로 탐색은 다루지 않는다. 그래서 같은 uid를 쓰는 landlock 모드에서는 다른 사용자 워크스페이스의 경로를 짐작해 `os.path.exists`·`os.stat`으로 다음을 알아낼 수 있다.
+- 파일·디렉터리가 있는지
+- 크기, mtime, inode, 소유자
+
+파일 **내용**은 열리지 않는다(EACCES). seccomp는 경로를 보고 거르지 못하므로, 이 모드에서는 구조적으로 닫을 방법이 없다. 존재·활동 시각까지 숨겨야 하면 **uid 모드**를 쓴다(§4).
+
 **명령줄은 다른 세션에 보인다(landlock·uid 공통):** CLI가 `/proc` 없이는 뜨지 않아 `/proc`는 읽기 전용으로 열려 있고, `/proc/<pid>/cmdline`은 uid와 관계없이 누구나 읽는다. 게이트웨이는 MCP 설정(`--mcp-config`)과 시스템 프롬프트를 1회용 파일로 넘겨 명령줄에서 뺐지만, 다음은 실행되는 동안 다른 세션이 볼 수 있다.
 - 각 Bash 도구 호출의 **명령 텍스트**. 워크스페이스 경로가 들어 있어 사용자 키도 드러난다.
 - 요청의 `text.format` JSON 스키마(`--json-schema`).
@@ -132,6 +138,7 @@ docker compose -f docker-compose.yml -f docker-compose.uid.yml \
 - `CLAUDE_ISOLATION_FALLBACK` **미설정 권장**: uid 모드가 불가능할 때 실패하도록 둔다. `landlock`을 명시해 폴백하면 **사용자별 UID 경계가 사라지고**, UID 소유 0600 파일·기존 세션 재개가 막힐 수 있다. 자동 안전 강등으로 간주하지 않는다.
 - 다중 worker/다중 복제본은 UID registry 파일 잠금과 세션 상태의 전역 조율이 요구된다. 같은 registry를 쓴 두 Gateway 프로세스는 기동이 거부될 수 있다. 일반적인 worker 증설을 격리 확장 방식으로 보지 않는다.
 - **되돌리기(uid → landlock/off):** 세션 uid가 평범하게 만든 워크스페이스 파일(0666/0777)은 ACL 덕분에 계속 쓸 수 있다. 하지만 세션 uid가 0600/0700으로 만든 파일과 사용자별 config dir의 transcript·memory는 열리지 않는다. 그 세션들은 이어지지 않는다. 처음 켜기 전에 `/data/claude` 볼륨과 registry 백업을 먼저 확보한다.
+- **stat oracle(#253):** uid 모드는 워크스페이스 루트의 ACL이 그 세션 uid에게만 탐색을 허용하고 `other`에는 아무 권한도 주지 않는다. 그래서 다른 세션 uid가 그 안의 경로를 `stat`하면 파일이 있든 없든 똑같이 EACCES다. 존재도 메타데이터도 드러나지 않는다(`tests/test_uid_stat_oracle.py`가 root에서 확인한다). 남는 것은 `<base>/<사용자>`와 워크스페이스 루트 자체다. 사용자 이름을 짐작하면 그 사용자의 워크스페이스가 있는지와 그 디렉터리의 mtime은 보인다.
 - **SysV IPC는 사용자별로 나뉘지 않는다.** Landlock이 SysV 공유 메모리·세마포어를 다루지 않기 때문이다. 살아 있는 세션이 world-accessible로 만든 객체는 다른 세션도 붙을 수 있다. 세션별 IPC 네임스페이스는 후속 작업이다.
 
 세션 검증은 [uid 격리 수용 체크리스트](isolation-uid-verification.md)를 따른다. 특히 **사용자 A가 B의 워크스페이스·transcript를 열지 못하는지**, `/app/data`와 Gateway `/proc/<pid>/environ` 접근이 차단되는지, 세션 subprocess UID가 서로 다른지, 같은 사용자 재개·익명 세션 정리가 되는지 확인한다.
