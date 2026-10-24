@@ -116,6 +116,13 @@ Tri-state semantics:
 
 > Sandbox isolates Bash commands only. File tool access (Read/Edit/Write) is governed by SDK permission rules, not the sandbox. Linux/macOS only — not Windows.
 
+> **This is not the multi-user isolation control.** To keep users from reading each other's files,
+> use `CLAUDE_ISOLATION_MODE=landlock|uid` — see [user-isolation-deployment.md](../user-isolation-deployment.md).
+> This sandbox does not provide that boundary:
+> - it does not restrict reads, because the gateway sets no `Read` deny rules (#218);
+> - the image this repo's Dockerfile builds has no bubblewrap/socat, so the CLI only warns and runs Bash unsandboxed;
+> - under `landlock`/`uid` it is forced off, because bubblewrap cannot start inside a Landlock domain.
+
 ## Custom System Prompt
 
 By default the gateway uses the bundled `claude_code` preset. To override:
@@ -241,10 +248,11 @@ End-to-end examples live in `examples/`:
 | `THINKING_MODE` | `adaptive` | `adaptive` / `enabled` / `disabled` |
 | `THINKING_BUDGET_TOKENS` | `10000` | Budget for `enabled` mode |
 | `TASK_BUDGET` | unset | Global tool-use token budget |
-| `DEFAULT_MAX_TURNS` | `10` | Max agent turns per request |
+| `DEFAULT_MAX_TURNS` | `40` | Max agent turns per request |
 | `TOKEN_STREAMING` | `true` | Per-token vs per-message streaming |
 | `MAX_TIMEOUT` | `600000` | Non-streaming turn budget (ms); streaming unbounded |
 | `CLAUDE_SANDBOX_ENABLED` | unset | Tri-state Bash sandbox |
+| `CLAUDE_ISOLATION_MODE` | `off` | OS file boundary between users: `off` / `landlock` / `uid` ([guide](../user-isolation-deployment.md)) |
 | `SYSTEM_PROMPT_FILE` | unset | Custom system prompt path |
 | `DISALLOWED_SUBAGENT_TYPES` | `statusline-setup` | Blocked subagent types |
 | `MCP_CONFIG` | — | MCP server config (shared with OpenCode optionally) |
