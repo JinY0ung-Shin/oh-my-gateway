@@ -579,3 +579,26 @@ class TestEnforceScopedIdentity:
         import src.auth as a
         # A USER_API_KEYS principal is present => allowed.
         a.enforce_scoped_identity(self._request("alice"))
+
+    def test_trailing_whitespace_still_enables(self, monkeypatch):
+        """'true ' must not silently read as false (the [P1] fail-open)."""
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true ")
+        import src.auth as a
+        with pytest.raises(HTTPException) as exc:
+            a.enforce_scoped_identity(self._request(None))
+        assert exc.value.status_code == 403
+
+    def test_unrecognized_value_fails_closed(self, monkeypatch):
+        """A typo ('ture') must enforce (fail closed), never fall open to off."""
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "ture")
+        import src.auth as a
+        assert a.scoped_identity_required() is True
+        with pytest.raises(HTTPException) as exc:
+            a.enforce_scoped_identity(self._request(None))
+        assert exc.value.status_code == 403
+
+    def test_explicit_false_disables(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "false")
+        import src.auth as a
+        assert a.scoped_identity_required() is False
+        a.enforce_scoped_identity(self._request(None))

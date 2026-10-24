@@ -24,6 +24,7 @@ from typing import List, Literal
 
 from src.env_utils import (
     parse_bool_env,
+    parse_bool_env_strict,
     parse_user_api_keys,
     parse_workspace_initial_dirs,
 )
@@ -297,8 +298,24 @@ def _check_scoped_identity() -> List[ConfigIssue]:
     there is no such credential, so every /v1/responses, /v1/sessions/* and file
     request would be refused — fail fast rather than start a gateway that answers
     403 to everything. A legacy API_KEY does not satisfy it (it carries no
-    principal), so it is not accepted here either."""
-    if not parse_bool_env("GATEWAY_REQUIRE_SCOPED_IDENTITY", "false"):
+    principal), so it is not accepted here either.
+
+    The flag is parsed strictly: an unrecognized value (``'ture'``, ``'enabled'``,
+    a stray trailing space that some parsers would mis-handle) is a security
+    switch silently failing open, so it is a startup error, not a fall-through to
+    disabled."""
+    try:
+        enabled = parse_bool_env_strict("GATEWAY_REQUIRE_SCOPED_IDENTITY", False)
+    except ValueError as exc:
+        return [
+            ConfigIssue(
+                "error",
+                f"{exc}. This is a security switch — an unrecognized value would "
+                "silently disable per-user identity enforcement. Set it to a "
+                "clear boolean or unset it.",
+            )
+        ]
+    if not enabled:
         return []
     try:
         user_keys = parse_user_api_keys(os.getenv("USER_API_KEYS"))

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 _BOOL_TRUE = {"true", "1", "yes", "on"}
+_BOOL_FALSE = {"false", "0", "no", "off"}
 
 
 def parse_bool_env(name: str, default: str = "false") -> bool:
@@ -23,6 +24,30 @@ def parse_bool_env(name: str, default: str = "false") -> bool:
     """
     raw = os.getenv(name, default)
     return raw.lower() in _BOOL_TRUE
+
+
+def parse_bool_env_strict(name: str, default: bool = False) -> bool:
+    """Parse a boolean env var, refusing anything that is not a clear boolean.
+
+    Unlike :func:`parse_bool_env`, this strips surrounding whitespace and raises
+    ``ValueError`` on an unrecognized non-empty value (a typo like ``ture`` or a
+    stray ``enabled``) instead of silently treating it as false. Use it for
+    security switches, where a misread must fail loudly — never fail open. An
+    unset or whitespace-only value yields *default*.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value == "":
+        return default
+    if value in _BOOL_TRUE:
+        return True
+    if value in _BOOL_FALSE:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean (true/false/1/0/yes/no/on/off); got {raw!r}"
+    )
 
 
 def parse_int_env(name: str, default: int) -> int:

@@ -4,7 +4,9 @@ import os
 from unittest.mock import patch
 
 
-from src.env_utils import parse_bool_env, parse_int_env
+import pytest
+
+from src.env_utils import parse_bool_env, parse_bool_env_strict, parse_int_env
 
 
 class TestParseBoolEnv:
@@ -63,3 +65,33 @@ class TestParseIntEnv:
     def test_zero(self):
         with patch.dict(os.environ, {"TEST_INT": "0"}):
             assert parse_int_env("TEST_INT", default=5) == 0
+
+
+class TestParseBoolEnvStrict:
+    """Strict boolean parsing for security switches — fails loud, not open."""
+
+    def test_true_values_with_whitespace(self):
+        for raw in ("true", "True", "TRUE ", " on", "1", "yes\n"):
+            with patch.dict(os.environ, {"TEST_STRICT": raw}):
+                assert parse_bool_env_strict("TEST_STRICT") is True, raw
+
+    def test_false_values_with_whitespace(self):
+        for raw in ("false", "FALSE", " off ", "0", "no"):
+            with patch.dict(os.environ, {"TEST_STRICT": raw}):
+                assert parse_bool_env_strict("TEST_STRICT") is False, raw
+
+    def test_unset_uses_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            assert parse_bool_env_strict("UNSET_STRICT") is False
+            assert parse_bool_env_strict("UNSET_STRICT", True) is True
+
+    def test_empty_or_whitespace_uses_default(self):
+        for raw in ("", "   "):
+            with patch.dict(os.environ, {"TEST_STRICT": raw}):
+                assert parse_bool_env_strict("TEST_STRICT", True) is True
+
+    def test_unrecognized_value_raises(self):
+        for raw in ("ture", "enabled", "yep", "2", "falsey"):
+            with patch.dict(os.environ, {"TEST_STRICT": raw}):
+                with pytest.raises(ValueError):
+                    parse_bool_env_strict("TEST_STRICT")

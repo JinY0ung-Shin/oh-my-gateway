@@ -342,6 +342,28 @@ def test_scoped_identity_with_user_api_keys_is_clean(clean_env):
     assert not _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
 
 
+def test_scoped_identity_trailing_whitespace_still_enforced(clean_env):
+    """'true ' must be read as enabled, so the USER_API_KEYS requirement fires —
+    not silently fall through to disabled (the [P1] fail-open)."""
+    clean_env.delenv("API_KEY", raising=False)
+    clean_env.delenv("USER_API_KEYS", raising=False)
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "true ")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY=true requires")
+
+
+def test_scoped_identity_invalid_value_is_error(clean_env):
+    """A typo in the security switch is a startup error, never a silent disable."""
+    clean_env.setenv("USER_API_KEYS", '{"alice": "alice-key"}')
+    clean_env.setenv("GATEWAY_REQUIRE_SCOPED_IDENTITY", "ture")
+
+    issues = check_config()
+
+    assert _has(issues, "error", "GATEWAY_REQUIRE_SCOPED_IDENTITY", "boolean")
+
+
 def test_user_api_keys_malformed_still_warns(clean_env):
     """Malformed USER_API_KEYS fails the auth manager fast at startup; the check
     must not mask the default-open gateway it leaves (it provides no usable

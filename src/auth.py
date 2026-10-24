@@ -6,7 +6,7 @@ from typing import Optional, Dict, Any, List, Tuple
 from fastapi import HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from src.env_utils import parse_bool_env, parse_user_api_keys
+from src.env_utils import parse_bool_env_strict, parse_user_api_keys
 
 logger = logging.getLogger(__name__)
 # Note: load_dotenv() runs in src/__init__.py, before any src submodule import
@@ -24,8 +24,22 @@ REQUIRE_SCOPED_IDENTITY_ENV = "GATEWAY_REQUIRE_SCOPED_IDENTITY"
 
 
 def scoped_identity_required() -> bool:
-    """Whether strict per-user identity binding is enforced on identity routes."""
-    return parse_bool_env(REQUIRE_SCOPED_IDENTITY_ENV, "false")
+    """Whether strict per-user identity binding is enforced on identity routes.
+
+    Parsed strictly: an unrecognized value (a typo, a stray word) is rejected at
+    startup by ``config_check._check_scoped_identity``. Should one slip past that
+    (e.g. ``SKIP_CONFIG_CHECK=true``), this fails **closed** — a security switch
+    must never silently fall open on a misread — and enforces.
+    """
+    try:
+        return parse_bool_env_strict(REQUIRE_SCOPED_IDENTITY_ENV, False)
+    except ValueError:
+        logger.warning(
+            "%s has an unrecognized value; enforcing scoped identity "
+            "(fail-closed). Set a valid boolean (startup normally rejects this).",
+            REQUIRE_SCOPED_IDENTITY_ENV,
+        )
+        return True
 
 
 # ============================================================================

@@ -255,6 +255,15 @@ async def lifespan(app: FastAPI):
 
     run_startup_config_check()
 
+    # Make the per-user identity enforcement state (#251) visible to operators:
+    # a security boundary silently off is worse than one loudly on.
+    from src.auth import scoped_identity_required
+
+    logger.info(
+        "Scoped identity enforcement (GATEWAY_REQUIRE_SCOPED_IDENTITY): %s",
+        "ENABLED" if scoped_identity_required() else "DISABLED",
+    )
+
     # Clean stale Bedrock/Vertex env vars before anything else
     auth_manager.clean_stale_env_vars()
 
