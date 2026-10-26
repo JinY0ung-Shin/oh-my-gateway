@@ -2136,6 +2136,62 @@ def _real_cli_dir_errors(mode: str) -> List[str]:
     return errors
 
 
+def refused_plugin_roots() -> List[Tuple[str, List[str], str]]:
+    """Registry plugin roots a confined session will not be granted (#255).
+
+    ``(resolved root, [where it came from …], reason)`` for every existing
+    root of :func:`workspace_sandbox.plugin_resource_sources` that
+    :class:`_GrantFilter` refuses read-only — the same decision every spawn
+    makes, without its once-per-process log line. A refused root is not an
+    error (the refusal is the boundary working: ``/app`` holds the gateway's
+    credentials), but the CLI then never sees what lies there, so a plugin
+    installed from it is missing from every session while the registry, the
+    admin page and ``/v1/agent-resources`` still list it. Missing paths (stale
+    registry entries) are skipped. Never raises.
+    """
+    from . import workspace_sandbox as ws
+
+    try:
+        claude_home = ws._claude_home()
+        sources = ws.plugin_resource_sources(claude_home)
+        grants = _GrantFilter(claude_home, None)
+    except Exception:  # noqa: BLE001 - a diagnostic, never a startup failure
+        logger.debug("plugin root check skipped", exc_info=True)
+        return []
+    by_root: Dict[str, Tuple[List[str], str]] = {}
+    for source, raw in sources:
+        try:
+            path = _real(raw)
+            if not os.path.exists(path):
+                continue
+            if path in by_root:
+                by_root[path][0].append(source)
+                continue
+            reason = grants._read_refusal(path) or _target_refusal(path, file=False)
+        except (OSError, ValueError):
+            continue
+        if reason is not None:
+            by_root[path] = ([source], reason)
+    return [(root, srcs, reason) for root, (srcs, reason) in by_root.items()]
+
+
+def refused_plugin_root_warnings() -> List[str]:
+    """One operator-facing warning per refused plugin root (#255), or none
+    when confinement is off."""
+    if not confine_enabled():
+        return []
+    return [
+        f"{MODE_ENV}={effective_mode()}: the plugin root {root} "
+        f"({', '.join(sources)}) is not readable by confined sessions ({reason}). "
+        "The CLI cannot load what it holds, so those plugin skills are missing "
+        "from every session while the admin page and /v1/agent-resources still "
+        "list them. Move the marketplace outside that location (for example a "
+        "volume named by CLAUDE_PLUGIN_CLONE_ROOT) and add it again; see "
+        "docs/user-isolation-deployment.md."
+        for root, sources, reason in refused_plugin_roots()
+    ]
+
+
 def check_config() -> List[str]:
     """Fail-closed preconditions for confinement, as error message strings.
 

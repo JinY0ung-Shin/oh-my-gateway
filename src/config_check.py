@@ -760,6 +760,21 @@ def _check_landlock_confinement() -> List[ConfigIssue]:
     return [ConfigIssue("error", message) for message in _landlock_check()]
 
 
+def _check_confined_plugin_roots() -> List[ConfigIssue]:
+    """Warn about plugin roots confined sessions cannot read (#255).
+
+    With Landlock confinement on, a marketplace or plugin registered from a
+    path the confinement refuses (``/app/...``, the workspace base, the temp
+    dir) installs and lists fine but never reaches the model. Not an error:
+    the refusal is the boundary working; the operator moves the source.
+    """
+    from src.backends.claude.landlock import refused_plugin_root_warnings
+
+    return [
+        ConfigIssue("warning", message) for message in refused_plugin_root_warnings()
+    ]
+
+
 # Linux managed-settings locations the CLI reads (policy outranks --settings).
 _MANAGED_SETTINGS_DIR = "/etc/claude-code"
 
@@ -870,6 +885,7 @@ def check_config() -> List[ConfigIssue]:
     issues.extend(_check_workspace_quota())
     issues.extend(_check_cross_session_messaging())
     issues.extend(_check_landlock_confinement())
+    issues.extend(_check_confined_plugin_roots())
     issues.extend(_check_isolation_sandbox_conflict())
     issues.extend(_check_uid_registry())
     return issues

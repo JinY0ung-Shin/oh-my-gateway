@@ -39,16 +39,31 @@ def _default_plan(body: Dict[str, Any]) -> Reply:
 class FakeAnthropicAPI:
     """Threaded fake Messages API; use as a context manager."""
 
-    def __init__(self, plan: Optional[Plan] = None) -> None:
+    def __init__(
+        self,
+        plan: Optional[Plan] = None,
+        host: str = "127.0.0.1",
+        advertise: Optional[str] = None,
+    ) -> None:
         self.plan: Plan = plan or _default_plan
         self.requests: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
-        self._server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler_class())
+        # ``advertise`` is the base URL a CLI should dial when it cannot reach
+        # ``host`` directly (a sandbox container behind a forwarder); ``{port}``
+        # in it is replaced with the bound port.
+        self._advertise = advertise
+        self._server = ThreadingHTTPServer((host, 0), self._handler_class())
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
     def base_url(self) -> str:
+        if self._advertise:
+            return self._advertise.format(port=self.port)
         return f"http://127.0.0.1:{self._server.server_address[1]}"
+
+    @property
+    def port(self) -> int:
+        return self._server.server_address[1]
 
     def __enter__(self) -> "FakeAnthropicAPI":
         self._thread.start()

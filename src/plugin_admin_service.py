@@ -509,7 +509,7 @@ def add_marketplace(
     name = _marketplace_name_from_clone(Path(local_path), repo)
     plugin_manifest.set_marketplace(name, repo=repo, branch=branch, scope=scope)
 
-    return {
+    result = {
         "status": "added",
         "repo": repo,
         "marketplace": name,
@@ -517,6 +517,7 @@ def add_marketplace(
         "branch": branch,
         "scope": scope,
     }
+    return _with_confinement_warnings(result)
 
 
 def _refresh_record(name: str) -> dict:
@@ -677,6 +678,20 @@ def remove_marketplace(name: str, *, scope: str = "user") -> dict:
     return {"status": "removed", "marketplace": name, "scope": removed_scope}
 
 
+def _with_confinement_warnings(result: dict) -> dict:
+    """Add ``warnings`` when Landlock confinement will hide a plugin root from
+    every session (#255): the install succeeded, but the model will not get
+    what that root holds. Logged too, so a CLI-only admin sees it."""
+    from src.backends.claude.landlock import refused_plugin_root_warnings
+
+    warnings = refused_plugin_root_warnings()
+    for message in warnings:
+        logger.warning("%s", message)
+    if warnings:
+        result["warnings"] = warnings
+    return result
+
+
 def install_plugin(
     name: str,
     *,
@@ -744,13 +759,14 @@ def install_plugin(
         branch=manifest_branch,
     )
 
-    return {
+    result = {
         "status": "installed",
         "plugin": name,
         "marketplace": marketplace,
         "spec": spec,
         "scope": scope,
     }
+    return _with_confinement_warnings(result)
 
 
 def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
