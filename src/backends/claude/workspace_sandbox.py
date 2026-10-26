@@ -23,7 +23,7 @@ import os
 import re
 import shlex
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.workspace_manager import workspace_manager
 from src.workspace_quota import (
@@ -178,40 +178,52 @@ def _plugin_resource_roots(claude_home: Optional[Path]) -> List[Path]:
     """
     roots: List[Path] = []
     seen: Set[Path] = set()
+    for _source, path in plugin_resource_sources(claude_home):
+        _add_root(roots, seen, path)
+    return roots
+
+
+def plugin_resource_sources(claude_home: Optional[Path]) -> List[Tuple[str, Path]]:
+    """Every plugin root of :func:`_plugin_resource_roots`, unresolved, with
+    where it came from (``CLAUDE_PLUGIN_CLONE_ROOT``, ``marketplace <name>``,
+    ``plugin <id>``) — so a check can name what a refused root holds (#255)."""
+    sources: List[Tuple[str, Path]] = []
 
     clone_root = os.getenv("CLAUDE_PLUGIN_CLONE_ROOT", "").strip()
     if clone_root:
-        _add_root(roots, seen, Path(clone_root))
+        sources.append(("CLAUDE_PLUGIN_CLONE_ROOT", Path(clone_root)))
 
     if claude_home is None:
-        return roots
+        return sources
     plugins_dir = claude_home / "plugins"
 
     # Marketplace clones registered with `claude plugin marketplace add`.
     known = _read_json(plugins_dir / "known_marketplaces.json")
     if isinstance(known, dict):
-        for info in known.values():
+        for name, info in known.items():
             if not isinstance(info, dict):
                 continue
             loc = info.get("installLocation")
             if isinstance(loc, str) and loc:
-                _add_root(roots, seen, Path(loc))
+                sources.append((f"marketplace {name}", Path(loc)))
 
     # Installed plugin cache directories (one entry per scope).
     installed = _read_json(plugins_dir / "installed_plugins.json")
     if isinstance(installed, dict):
         plugins = installed.get("plugins")
         if isinstance(plugins, dict):
-            for entries in plugins.values():
+            for plugin_id, entries in plugins.items():
                 if not isinstance(entries, list):
                     continue
                 for entry in entries:
                     if isinstance(entry, dict) and isinstance(
                         entry.get("installPath"), str
                     ):
-                        _add_root(roots, seen, Path(entry["installPath"]))
+                        sources.append(
+                            (f"plugin {plugin_id}", Path(entry["installPath"]))
+                        )
 
-    return roots
+    return sources
 
 
 def plugin_resource_roots() -> List[Path]:

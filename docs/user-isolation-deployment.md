@@ -101,6 +101,9 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 - **플러그인:**
   - landlock 모드에서는 `~/.claude/plugins/data`가 읽기 전용이다. 훅은 돌지만 그 안에 쓰는 것은 실패한다. uid 모드에서는 사용자별 config dir에 쓸 수 있다.
   - 플러그인의 `bin/`이 Bash `PATH`에 오르지 않는다.
+  - **마켓플레이스·플러그인 소스를 `/app` 아래(예: `/app/data/plugins/...`)에 두면 안 된다(#255).** `/app`은 세션에 절대 열리지 않는다. 그래서 거기서 설치한 플러그인은 설치도 되고 관리자 화면·`/v1/agent-resources`에도 나오지만, 모델은 그 스킬을 쓰지 못한다. 워크스페이스 base·임시 디렉터리 아래도 같다.
+    - 게이트웨이는 기동 때와 관리자 화면에서 설치할 때 이런 경로를 경고로 알린다. 경고 문구는 `the plugin root … is not readable by confined sessions`이고, 설치 응답에는 `warnings` 필드가 붙는다.
+    - `/app` 밖의 볼륨으로 옮기고 마켓플레이스를 다시 추가한다. 예: `CLAUDE_PLUGIN_CLONE_ROOT`가 가리키는 볼륨. uid 모드에서는 `/data/claude/shared` 아래다.
 - **CLI 자체 Bash 샌드박스(bubblewrap)는 강제로 꺼진다.** Landlock 도메인 안에서는 뜰 수 없기 때문이다. `CLAUDE_SANDBOX_ENABLED=true`가 설정돼 있으면 기동 때 경고한다.
 
 ## 4. 방법 2 — 사용자별 UID + Landlock (더 강한 OS 격리)
