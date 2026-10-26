@@ -160,8 +160,8 @@ class TestPreflightAllocatesNothing:
     async def test_a_request_refused_with_400_takes_no_uid(
         self, uid_on, registry, monkeypatch, tmp_path
     ):
-        # The whole slash path: validate_prompt -> catalog preflight (twice:
-        # cached, then a forced refresh) -> SlashCommandError. The fake SDK
+        # The whole slash path: validate_prompt -> catalog preflight (once: the
+        # forced refresh reuses the fresh catalog) -> SlashCommandError. The fake SDK
         # client records which confinement each preflight spawn would get.
         from src.backends.claude import slash_commands as sc
 
@@ -190,7 +190,8 @@ class TestPreflightAllocatesNothing:
         finally:
             sc._cache.reset()
         assert refused.value.code == "unknown_command"
-        assert seen == ["landlock", "landlock"]
+        # One preflight: the forced refresh reuses the catalog the cache miss just read.
+        assert seen == ["landlock"]
         assert not registry.exists()
 
 

@@ -7,6 +7,10 @@ import pytest
 from src.backends.claude import slash_commands as sc
 
 
+def _age_entries(cache, seconds):
+    cache.entries = {k: (v, at - seconds) for k, (v, at) in cache.entries.items()}
+
+
 @pytest.fixture(autouse=True)
 def _reset_cache():
     sc._cache.reset()
@@ -120,8 +124,9 @@ async def test_unknown_command_raises(monkeypatch):
     with pytest.raises(sc.SlashCommandError) as ei:
         await sc.validate_prompt("/help")
     assert ei.value.code == "unknown_command"
-    # First fetch for cache miss, second forced refresh before giving up.
-    assert calls["n"] == 2
+    # The cache-miss fetch just read the catalog, so the forced refresh before
+    # giving up reuses it instead of spawning a second preflight CLI.
+    assert calls["n"] == 1
 
 
 async def test_slash_prefixed_plain_input_is_noop(monkeypatch):
@@ -212,14 +217,15 @@ async def test_ttl_cache_refreshes_after_expiry(monkeypatch):
     assert calls["n"] == 1
 
     # Force expiry by rewinding the cache timestamp past the TTL.
-    sc._cache.fetched_at -= sc.CACHE_TTL_SECONDS + 1
+    sc._cache.expire_all()
 
     await sc.get_available_commands()
     assert calls["n"] == 2
 
 
 async def test_refresh_picks_up_newly_added_skill(monkeypatch):
-    """If the cache is stale and the skill was just added, refresh rescues it."""
+    """If the cached catalog is older than a moment and the skill was added since,
+    the forced refresh rescues it."""
     state = {"commands": {"review"}, "calls": 0}
 
     async def _fake_fetch(cwd, user=None):
@@ -231,5 +237,24 @@ async def test_refresh_picks_up_newly_added_skill(monkeypatch):
 
     monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
 
+    await sc.get_available_commands()  # cached earlier in the TTL window
+    _age_entries(sc._cache, sc.FORCE_REFRESH_MIN_AGE_SECONDS + 1)
     await sc.validate_prompt("/newly-added")
     assert state["calls"] == 2
+
+
+async def test_cold_miss_does_not_fetch_twice(monkeypatch):
+    """A catalog read a moment ago is the current one: a name it lacks does not
+    trigger a second preflight CLI right away (it did on every new session whose
+    Skill policy named a skill the workspace lacks)."""
+    calls = {"n": 0}
+
+    async def _fake_fetch(cwd, user=None):
+        calls["n"] += 1
+        return {"review"}
+
+    monkeypatch.setattr(sc, "_fetch_commands", _fake_fetch)
+
+    with pytest.raises(sc.SlashCommandError):
+        await sc.validate_prompt("/missing")
+    assert calls["n"] == 1
