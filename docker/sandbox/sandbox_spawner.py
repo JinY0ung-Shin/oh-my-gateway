@@ -54,6 +54,9 @@ REC = struct.Struct("=Ii")
 REC_SIGNAL = 1
 EXITED, SIGNALED, REFUSED = 1, 2, 3
 MAX_HEADER = 8 << 20
+# A client has this long to deliver its fds and whole header; a stalled or
+# half-open connection then frees its thread instead of holding it forever.
+HANDSHAKE_TIMEOUT_S = 10.0
 TERM_GRACE_S = 5.0
 _USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@-]{0,126}$")
 
@@ -283,7 +286,10 @@ class Spawner:
 
     def handle(self, conn):
         try:
+            conn.settimeout(HANDSHAKE_TIMEOUT_S)
             header, fds = _recv_header(conn)
+            # The relay loop blocks for as long as the CLI runs.
+            conn.settimeout(None)
         except Exception as exc:  # noqa: BLE001 - refuse and keep serving
             log.warning("refused: bad header: %s", exc)
             _send(conn, REFUSED, 0)
@@ -441,24 +447,37 @@ def _recv_exact(conn, n):
 
 
 def _recv_header(conn):
-    fds = array.array("i")
+    """``(header, [fd0, fd1, fd2])``. The fds belong to the caller only on a
+    normal return: every failure after they arrived (wrong count, bad length,
+    a truncated or invalid header, a timeout) closes them here, since the
+    caller never sees the list."""
+    received = array.array("i")
     msg, anc, _flags, _addr = conn.recvmsg(
-        HDR.size, socket.CMSG_SPACE(3 * fds.itemsize)
+        HDR.size, socket.CMSG_SPACE(3 * received.itemsize)
     )
     for level, kind, data in anc:
         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
-            fds.frombytes(data[: len(data) - (len(data) % fds.itemsize)])
-    fds = list(fds)
-    if len(fds) != 3:
+            received.frombytes(data[: len(data) - (len(data) % received.itemsize)])
+    fds = list(received)
+    try:
+        if len(fds) != 3:
+            raise ValueError("expected 3 fds, got %d" % len(fds))
+        if len(msg) < HDR.size:
+            msg += _recv_exact(conn, HDR.size - len(msg))
+        (length,) = HDR.unpack(msg)
+        if not 0 < length <= MAX_HEADER:
+            raise ValueError("header length %d" % length)
+        body = _recv_exact(conn, length)
+        if len(body) != length:
+            raise ValueError("header truncated (%d of %d bytes)" % (len(body), length))
+        return json.loads(body), fds
+    except BaseException:
         for fd in fds:
-            os.close(fd)
-        raise ValueError("expected 3 fds, got %d" % len(fds))
-    if len(msg) < HDR.size:
-        msg += _recv_exact(conn, HDR.size - len(msg))
-    (length,) = HDR.unpack(msg)
-    if not 0 < length <= MAX_HEADER:
-        raise ValueError("header length %d" % length)
-    return json.loads(_recv_exact(conn, length)), fds
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
 
 
 def _send(conn, kind, value):
