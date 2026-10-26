@@ -406,7 +406,7 @@ uv run pytest --cov=src                            # with coverage
   secret, the gateway warns the pipe was empty, and uid mode refuses to start; a deliberate
   same-uid reader could write it back unnoticed, but the app uid can already rewrite `/app`, so the
   pipe is hygiene, not a boundary). `create_client` re-mints the ticket
-  right before `connect()` (120 s TTL; the skills preflight awaits a global lock in between). The
+  right before `connect()` (120 s TTL; the skills preflight may wait in between — it is cached and locked per workspace, `SLASH_PREFLIGHT_CONCURRENCY` (default 4) caps simultaneous preflight CLIs). The
   resident loop is single-threaded `select.poll` (it forks): `SO_PEERCRED` pinned to
   `GATEWAY_ISOLATION_PEER_UID` before reading a byte, ≤ 32 handshakes in flight, a 10 s total
   deadline each, an 8 MiB header cap, a strict `{ticket: str, argv: [str], env: {str: str}}` schema,

@@ -67,6 +67,28 @@ BLOCKED_COMMANDS: frozenset[str] = _BUILTIN_BLOCKED_COMMANDS | (
     _parse_blocked_commands_env(os.getenv("BLOCKED_SLASH_COMMANDS", ""))
 )
 CACHE_TTL_SECONDS: float = 60.0
+# A forced refresh ("a requested skill may have just been installed") is skipped
+# when the cached catalog is younger than this: a catalog that was read a moment
+# ago already is the current one, and a session whose Skill policy names a skill
+# its workspace lacks otherwise paid for two preflight CLIs on every new session.
+FORCE_REFRESH_MIN_AGE_SECONDS: float = 10.0
+
+
+def _preflight_concurrency() -> int:
+    raw = os.getenv("SLASH_PREFLIGHT_CONCURRENCY", "").strip()
+    try:
+        value = int(raw) if raw else 4
+    except ValueError:
+        value = 4
+    return max(1, value)
+
+
+# Every preflight spawns a whole CLI (several seconds). They used to run behind
+# one process-wide lock with a single cached workspace, so concurrent first turns
+# of different users queued one after another (a fifth user waited ~25 s before
+# their own CLI even started). Now each workspace has its own entry and lock, and
+# this semaphore only caps how many preflight CLIs run at once.
+PREFLIGHT_CONCURRENCY: int = _preflight_concurrency()
 
 # A slash-command name is alphanumeric/kebab-case, optionally namespaced with
 # ``:`` (e.g. ``help``, ``dev-server``, ``superpowers:brainstorming``). Anything
@@ -118,27 +140,99 @@ def _materialize_project_resources(cwd: Optional[Path]) -> None:
     materialize_workspace_resources(Path(cwd))
 
 
-class _Cache:
-    def __init__(self) -> None:
-        self.commands: Optional[set[str]] = None
-        self.fetched_at: float = 0.0
-        self.cwd_key: Optional[str] = None
-        self.lock = asyncio.Lock()
+class _PerCwdCache:
+    """TTL cache of one preflight result per workspace.
 
-    def is_fresh(self, cwd: Optional[Path] = None) -> bool:
-        return (
-            self.commands is not None
-            and self.cwd_key == _cwd_key(cwd)
-            and (time.monotonic() - self.fetched_at) < CACHE_TTL_SECONDS
-        )
+    Each workspace (``_cwd_key``) has its own entry and its own lock, so a
+    preflight for one user's workspace never waits for another user's, and two
+    concurrent first turns in the same workspace share one fetch. Expired
+    entries and idle locks are pruned as new workspaces arrive, so the maps stay
+    bounded by the workspaces active within one TTL.
+    """
+
+    def __init__(self) -> None:
+        self.entries: dict[Optional[str], tuple[object, float]] = {}
+        self.locks: dict[Optional[str], asyncio.Lock] = {}
+
+    def fresh(
+        self, key: Optional[str], ttl: float = CACHE_TTL_SECONDS
+    ) -> Optional[object]:
+        entry = self.entries.get(key)
+        if entry is None or (time.monotonic() - entry[1]) >= ttl:
+            return None
+        return entry[0]
+
+    def lock_for(self, key: Optional[str]) -> asyncio.Lock:
+        lock = self.locks.get(key)
+        if lock is None:
+            self._prune()
+            lock = self.locks[key] = asyncio.Lock()
+        return lock
+
+    def store(self, key: Optional[str], value: object) -> None:
+        self.entries[key] = (value, time.monotonic())
+
+    def _prune(self) -> None:
+        now = time.monotonic()
+        for key in [
+            k for k, (_, at) in self.entries.items() if now - at >= CACHE_TTL_SECONDS
+        ]:
+            del self.entries[key]
+        for key in [
+            k
+            for k, lock in self.locks.items()
+            if not lock.locked() and k not in self.entries
+        ]:
+            del self.locks[key]
 
     def reset(self) -> None:
-        self.commands = None
-        self.fetched_at = 0.0
-        self.cwd_key = None
+        self.entries.clear()
+        self.locks.clear()
+
+    def expire_all(self) -> None:
+        """Age every entry past the TTL (tests)."""
+        self.entries = {
+            k: (v, at - CACHE_TTL_SECONDS - 1) for k, (v, at) in self.entries.items()
+        }
 
 
-_cache = _Cache()
+_preflight_slots: Optional[asyncio.Semaphore] = None
+_preflight_slots_loop: Optional[asyncio.AbstractEventLoop] = None
+
+
+def _slots() -> asyncio.Semaphore:
+    """The preflight cap for the running loop (a semaphore binds to one loop)."""
+    global _preflight_slots, _preflight_slots_loop
+    loop = asyncio.get_running_loop()
+    if _preflight_slots is None or _preflight_slots_loop is not loop:
+        _preflight_slots = asyncio.Semaphore(PREFLIGHT_CONCURRENCY)
+        _preflight_slots_loop = loop
+    return _preflight_slots
+
+
+async def _cached_preflight(
+    cache: _PerCwdCache, cwd: Optional[Path], force: bool, fetch
+):
+    """The cached result for *cwd*, fetching it (under the per-workspace lock and
+    the global preflight cap) when missing, expired or forced."""
+    key = _cwd_key(cwd)
+    hit = cache.fresh(key)
+    if hit is not None and not force:
+        return hit
+    async with cache.lock_for(key):
+        # Someone may have fetched while we waited for the lock.
+        hit = cache.fresh(
+            key, FORCE_REFRESH_MIN_AGE_SECONDS if force else CACHE_TTL_SECONDS
+        )
+        if hit is not None:
+            return hit
+        async with _slots():
+            value = await fetch()
+        cache.store(key, value)
+        return value
+
+
+_cache = _PerCwdCache()
 
 _preflight_dir: Optional[Path] = None
 
@@ -268,32 +362,12 @@ async def get_available_commands(
     (``landlock.preflight_options_env``). The cache stays keyed on the cwd
     alone.
     """
-    async with _cache.lock:
-        if not force and _cache.is_fresh(cwd):
-            assert _cache.commands is not None
-            return _cache.commands
-        _cache.commands = await _fetch_commands(cwd, user)
-        _cache.fetched_at = time.monotonic()
-        _cache.cwd_key = _cwd_key(cwd)
-        return _cache.commands
+    return await _cached_preflight(
+        _cache, cwd, force, lambda: _fetch_commands(cwd, user)
+    )
 
 
-class _DetailsCache:
-    def __init__(self) -> None:
-        self.details: Optional[dict[str, dict[str, str]]] = None
-        self.fetched_at: float = 0.0
-        self.cwd_key: Optional[str] = None
-        self.lock = asyncio.Lock()
-
-    def is_fresh(self, cwd: Optional[Path] = None) -> bool:
-        return (
-            self.details is not None
-            and self.cwd_key == _cwd_key(cwd)
-            and (time.monotonic() - self.fetched_at) < CACHE_TTL_SECONDS
-        )
-
-
-_details_cache = _DetailsCache()
+_details_cache = _PerCwdCache()
 
 
 async def _fetch_command_details(
@@ -323,14 +397,9 @@ async def get_command_details(
     cwd: Optional[Path] = None, force: bool = False, user: Optional[str] = None
 ) -> dict[str, dict[str, str]]:
     """Like :func:`get_available_commands` but with per-command metadata."""
-    async with _details_cache.lock:
-        if not force and _details_cache.is_fresh(cwd):
-            assert _details_cache.details is not None
-            return _details_cache.details
-        _details_cache.details = await _fetch_command_details(cwd, user)
-        _details_cache.fetched_at = time.monotonic()
-        _details_cache.cwd_key = _cwd_key(cwd)
-        return _details_cache.details
+    return await _cached_preflight(
+        _details_cache, cwd, force, lambda: _fetch_command_details(cwd, user)
+    )
 
 
 def extract_command_name(prompt: str) -> Optional[str]:
