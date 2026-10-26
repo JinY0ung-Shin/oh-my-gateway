@@ -9,6 +9,8 @@ chunking, and the gateway wiring (hooks, child env, both outbound paths).
 from __future__ import annotations
 
 import dataclasses
+import json
+import logging
 import os
 import random
 import re
@@ -288,6 +290,125 @@ class TestCollection:
             assert r.redact_text(f"[{value}]") == "[[REDACTED:secret]]", value
         for value in ("tiny", "Jane Example", "/tmp/ssh-xyz/agent.123", "/usr/bin:/bin"):
             assert r.redact_text(value) == value
+
+    def test_all_env_values_are_off_by_default(self, monkeypatch):
+        monkeypatch.delenv("SYSINFO_REDACT_ALL_ENV", raising=False)
+        r = _build(
+            {"GIT_AUTHOR_NAME": "Jane Example", "SERVICE_REGION": "ap-northeast-2"}
+        )
+        assert (
+            r.redact_text("Jane Example ap-northeast-2")
+            == "Jane Example ap-northeast-2"
+        )
+
+    def test_all_env_values_option_redacts_every_value(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        env = {
+            "GIT_AUTHOR_EMAIL": "jane@corp.example",
+            "SERVICE_REGION": "ap-northeast-2",
+            "INTERNAL_BASE_URL": "https://svc.internal:8443/v1",
+            "ANTHROPIC_AUTH_TOKEN": "tok-aaaaaaaaaaaa",  # still labelled secret
+            "SHORT": "tiny",  # under MIN_SECRET_LEN
+            # process basics the agent's shell reports and must reuse verbatim
+            "PATH": "/usr/local/bin:/usr/bin",
+            "HOME": "/home/appuser",
+            "LANG": "en_US.UTF-8",
+            "LC_ALL": "en_US.UTF-8",
+            "TMPDIR": "/tmp/session-1",
+        }
+        r = _build(env)
+        for value in (
+            "jane@corp.example",
+            "ap-northeast-2",
+            "https://svc.internal:8443/v1",
+        ):
+            assert r.redact_text(f"[{value}]") == "[[REDACTED:env]]", value
+        assert r.redact_text("tok-aaaaaaaaaaaa") == "[REDACTED:secret]"
+        for value in (
+            "tiny",
+            "/usr/local/bin:/usr/bin",
+            "/home/appuser",
+            "en_US.UTF-8",
+            "/tmp/session-1",
+        ):
+            assert r.redact_text(value) == value
+
+    def test_all_env_values_leave_paths_intact(self, monkeypatch):
+        """#252 review P2: a path the model must reuse in its next tool call."""
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        env = {
+            "USER_WORKSPACES_DIR": "/data/workspaces",  # the Compose default
+            "CLAUDE_PLUGIN_MANIFEST": "/app/data/gateway-plugins.json",
+            "CLAUDE_PLANS_DIRECTORY": ".claude/plans",
+            "SSH_AUTH_SOCK": "/tmp/ssh-xyz/agent.123",
+            "CACHE_DIR": "~/.cache/gateway",
+            "SERVICE_REGION": "ap-northeast-2",
+        }
+        r = _build(env)
+        for path in (
+            "/data/workspaces/alice/claude/a.py",
+            "/app/data/gateway-plugins.json",
+            ".claude/plans/plan.md",
+            "/tmp/ssh-xyz/agent.123",
+            "~/.cache/gateway/x",
+        ):
+            assert r.redact_text(path) == path
+        assert r.redact_text("ap-northeast-2") == "[REDACTED:env]"
+
+    def test_all_env_values_never_lengthen_the_stream_hold(
+        self, monkeypatch, caplog
+    ):
+        """#252 review P1: a long or multi-word value (a JSON config) would make
+        the stream carry hold ordinary text back for its length."""
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        servers = {f"s{i}": {"url": "x" * 40} for i in range(80)}
+        config = json.dumps({"servers": servers})
+        assert len(config) > 4096 and " " in config
+        env = {
+            "MCP_CONFIG": config,
+            "BANNER": "hello from the gateway",
+            "LONG_OPAQUE": "z" * (sr._ALL_ENV_MAX_LEN + 1),
+            "SERVICE_REGION": "ap-northeast-2",
+        }
+        with caplog.at_level(logging.INFO, logger=sr.logger.name):
+            r = _build(env)
+        assert r.max_ws_literal_len == 0
+        assert r.stream_keep == 256
+        assert r.redact_text("hello from the gateway") == "hello from the gateway"
+        assert "BANNER, LONG_OPAQUE, MCP_CONFIG" in caplog.text
+        # Short unrelated deltas stream out before the block ends.
+        s = StreamRedactor(r)
+        first = []
+        for _ in range(20):
+            out = s.process(_delta("plain words stream out "))
+            if _streamed_text(out):
+                first.append(out)
+                break
+        assert first, "streamed text was held back until the block stop"
+
+    def test_all_env_values_honours_name_exceptions_and_allow(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "1")
+        monkeypatch.setenv(
+            "SYSINFO_REDACT_ALL_ENV_EXCEPT", "workspace_root, CLAUDE_CWD"
+        )
+        monkeypatch.setenv("SYSINFO_REDACT_ALLOW", "keep-this-value")
+        env = {
+            "WORKSPACE_ROOT": "/srv/workspaces",
+            "CLAUDE_CWD": "/srv/workspaces/u1",
+            "SOME_FLAG": "keep-this-value",
+            "OTHER": "mask-this-value",
+        }
+        r = _build(env)
+        assert r.redact_text("/srv/workspaces/u1/a.py") == "/srv/workspaces/u1/a.py"
+        assert (
+            r.redact_text("keep-this-value mask-this-value")
+            == "keep-this-value [REDACTED:env]"
+        )
+
+    def test_host_label_wins_over_env_label(self, monkeypatch):
+        monkeypatch.setenv("SYSINFO_REDACT_ALL_ENV", "true")
+        r = _build({"HOSTNAME": HOST})
+        assert r.redact_text(f"on {HOST}") == "on [REDACTED:hostname]"
 
     def test_real_probes_never_raise_and_skip_loopback(self):
         r = sr.build_redactor({})

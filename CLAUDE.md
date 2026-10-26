@@ -627,6 +627,10 @@ uv run pytest --cov=src                            # with coverage
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values
+  (or, with opt-in `SYSINFO_REDACT_ALL_ENV`, every env value ≥ 8 chars except the process basics
+  in `_ALL_ENV_EXCEPTIONS`, `SYSINFO_REDACT_ALL_ENV_EXCEPT` names, path-like values — the model
+  reuses them in tool calls — and values with whitespace or over `_ALL_ENV_MAX_LEN` (256, the
+  stream carry's floor, so the option never lengthens the hold); left-out names are logged)
   and private IP ranges in **successful** tool results before the model sees them, and
   `_redact_stream` filters every chunk leaving `run_completion_with_client` /
   `receive_response_from_client` (plus the idle outbox) — streamed deltas through a carry that
