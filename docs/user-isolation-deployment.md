@@ -101,9 +101,18 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 - **플러그인:**
   - landlock 모드에서는 `~/.claude/plugins/data`가 읽기 전용이다. 훅은 돌지만 그 안에 쓰는 것은 실패한다. uid 모드에서는 사용자별 config dir에 쓸 수 있다.
   - 플러그인의 `bin/`이 Bash `PATH`에 오르지 않는다.
-  - **마켓플레이스·플러그인 소스를 `/app` 아래(예: `/app/data/plugins/...`)에 두면 안 된다(#255).** `/app`은 세션에 절대 열리지 않는다. 그래서 거기서 설치한 플러그인은 설치도 되고 관리자 화면·`/v1/agent-resources`에도 나오지만, 모델은 그 스킬을 쓰지 못한다. 워크스페이스 base·임시 디렉터리 아래도 같다.
-    - 게이트웨이는 기동 때와 관리자 화면에서 설치할 때 이런 경로를 경고로 알린다. 경고 문구는 `the plugin root … is not readable by confined sessions`이고, 설치 응답에는 `warnings` 필드가 붙는다.
-    - `/app` 밖의 볼륨으로 옮기고 마켓플레이스를 다시 추가한다. 예: `CLAUDE_PLUGIN_CLONE_ROOT`가 가리키는 볼륨. uid 모드에서는 `/data/claude/shared` 아래다.
+  - **로컬 마켓플레이스 소스는 `/data/plugins` 아래에 둔다.** 기본 Compose가 호스트의 `./plugins`(`PLUGIN_SOURCES_HOST_DIR`)를 `/data/plugins`에 읽기 전용으로 마운트한다. 관리자 화면에서 `/data/plugins/<마켓플레이스>`로 추가하면 그 자리가 그대로 등록된다.
+  - **`/app` 아래(예: `/app/data/plugins/...`)에 둔 소스는 사본으로 등록된다(#258).** `/app`은 세션에 절대 열리지 않는다. 워크스페이스 base·임시 디렉터리 아래도 같다. 그래서 게이트웨이는 이런 로컬 경로를 clone 루트(`CLAUDE_PLUGIN_CLONE_ROOT`, uid 모드에서는 `/data/claude/shared/plugin-marketplaces`)로 복사하고, 그 사본을 등록한다.
+    - manifest에는 원래 경로가 남는다. 기동할 때마다, 그리고 관리자 화면의 refresh 때마다 다시 복사한다. 원본을 고친 내용은 그때 반영된다.
+    - 사본은 모든 세션이 읽는 곳에 놓이므로 마켓플레이스 자신의 일반 파일만 옮긴다.
+      - 링크는 따라가지 않는다. 트리 안을 가리키는 상대 링크만 링크로 남기고, `/app/data/x.json`이나 `../..`처럼 트리 밖을 가리키는 링크는 버린다.
+      - 하드 링크와 특수 파일(FIFO·소켓·장치)은 건너뛴다. 건너뛴 항목은 로그에 남는다.
+      - 2만 개, 512 MiB를 넘으면 오류가 나고, 기존 사본은 그대로 남는다.
+      - `/app`·`/app/data` 자체나 `$HOME`·워크스페이스 base를 품은 넓은 경로, `.claude-plugin/marketplace.json`이 없는 디렉터리는 복사하지 않고 오류로 돌려준다.
+    - 컨테이너 안에서 `claude plugin marketplace add <경로>`를 직접 실행한 경우는 게이트웨이를 거치지 않아 복사되지 않는다. 게이트웨이는 기동 때와 관리자 화면에서 설치할 때 이런 경로를 경고로 알린다. 경고 문구는 `the plugin root … is not readable by confined sessions`이고, 설치 응답에는 `warnings` 필드가 붙는다. 관리자 화면에서 다시 추가하면 해결된다.
+- **폰트는 시스템 경로에 설치한다.** `/usr/share/fonts`·`/usr/local/share/fonts`의 폰트와 fontconfig 캐시(`/var/cache/fontconfig`, 읽기 전용)는 세션에 열린다. `~/.local/share/fonts`·`~/.fonts`처럼 `$HOME` 아래 설치한 폰트는 세션에 보이지 않는다.
+  - 이미지 빌드 때(예: `GATEWAY_BUILD_INSTALL_SCRIPT`) `/usr/local/share/fonts`에 복사하고 `fc-cache -f`를 실행한다. 캐시가 없거나 오래되면 fontconfig 클라이언트(LibreOffice·Chromium·matplotlib)가 실행할 때마다 폰트를 전부 다시 훑는다.
+  - 세션의 `XDG_CACHE_HOME`은 `<워크스페이스>/.cli-tmp/cache`다. fontconfig·matplotlib·pip 캐시는 워크스페이스마다 따로 쌓인다.
 - **CLI 자체 Bash 샌드박스(bubblewrap)는 강제로 꺼진다.** Landlock 도메인 안에서는 뜰 수 없기 때문이다. `CLAUDE_SANDBOX_ENABLED=true`가 설정돼 있으면 기동 때 경고한다.
 
 ## 4. 방법 2 — 사용자별 UID + Landlock (더 강한 OS 격리)

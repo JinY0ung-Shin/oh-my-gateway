@@ -79,6 +79,12 @@ services:
       # environment block below). Override the host path with
       # USER_WORKSPACES_HOST_DIR if you want it somewhere other than ./workspaces.
       - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
+      # Local marketplace sources (add them in the admin page as
+      # /data/plugins/<marketplace>). Outside /app on purpose: with Landlock
+      # confinement on, sessions are never granted /app, so a source under
+      # /app/data is only usable as a copy in the clone root (#258), while one
+      # here is registered in place. Override with PLUGIN_SOURCES_HOST_DIR.
+      - ${PLUGIN_SOURCES_HOST_DIR:-./plugins}:/data/plugins:ro
       # Optional: bind a host system-prompt file into the container. Set
       # SYSTEM_PROMPT_HOST_FILE in .env to a host path (e.g. /home/me/prompt.md)
       # and it is mounted read-only here; the SYSTEM_PROMPT_FILE env below then

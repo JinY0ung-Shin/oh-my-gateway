@@ -797,7 +797,7 @@ def _child_ro_rw(real_cli, workspace, ticket_ro, ticket_rw):
     """``(ro, rw)`` of the broker's own, opened following links, and
     ``(gateway_ro, gateway_rw)``: the ticket's workspace and lists, which the
     gateway resolved, opened following none (``ll.build_and_restrict``)."""
-    ro = list(ll.SYSTEM_RO)
+    ro = [*ll.SYSTEM_RO, *ll.system_ro_caches()]
     ro.append(os.path.dirname(os.path.realpath(real_cli)))
     # The session shell wrapper the CLI execs for every Bash call (set in
     # _child_env): the file, never its directory.

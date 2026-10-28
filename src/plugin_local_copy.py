@@ -1,0 +1,265 @@
+"""Copy a local marketplace a confined session cannot read into the clone root.
+
+With Landlock confinement on (``CLAUDE_ISOLATION_MODE=landlock|uid``), every
+spawn refuses grants under the gateway app root (``/app``: code and the
+``/app/data`` credentials), the workspace base, the temp dir and the private
+system roots. A local marketplace registered in place there (``/app/data/
+plugins/<mp>``, a natural persistent spot) installs and lists fine, but the
+CLI never sees its skills (#255). Remote repos already go through a clone
+into the clone root, which sessions may read; this gives a local path the same
+treatment (#258): a copy in the clone root is registered, the manifest keeps
+the original path, and every start and admin refresh copies it again.
+
+The copy lands where every session reads, beside nothing the source sat next
+to, so it must never widen what a session reaches:
+
+* no link is followed: the walk is fd-relative with ``O_NOFOLLOW``, and a link
+  is kept only when it is relative and stays inside the copied tree (a link to
+  ``/app/data/x.json``, or ``../..`` out of the tree, is dropped — beside the
+  clone root a relative link could otherwise name the config dir);
+* hard-linked files and special files (FIFO, socket, device) are skipped;
+* file count and total size are capped (:data:`MAX_FILES`, :data:`MAX_BYTES`);
+* a source that is or contains the app root, its ``data`` dir, the workspace
+  base, the temp dir or ``$HOME`` is refused, and it must be a marketplace
+  (a regular ``.claude-plugin/marketplace.json``).
+
+Standalone on purpose (stdlib only, no ``src`` import): the startup script
+``docker/install_plugins.py`` loads it from beside itself
+(``/usr/local/bin`` in the image) or from ``src/`` in a checkout.
+"""
+
+from __future__ import annotations
+
+import errno
+import os
+import shutil
+import stat
+import tempfile
+from pathlib import Path
+from typing import List, Optional
+
+MODE_ENV = "CLAUDE_ISOLATION_MODE"
+_CONFINED_MODES = ("landlock", "uid")
+# Mirrors landlock._PRIVATE_SYSTEM_ROOTS: never granted to a session.
+_PRIVATE_SYSTEM_ROOTS = ("/run", "/var/run", "/dev", "/sys", "/root", "/var/tmp")
+
+MAX_FILES = 20000
+MAX_BYTES = 512 * 1024 * 1024
+_CHUNK = 1024 * 1024
+
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | getattr(os, "O_NONBLOCK", 0)
+
+
+class LocalCopyError(ValueError):
+    """The local marketplace cannot (or must not) be copied."""
+
+
+def confinement_on(env=None) -> bool:
+    env = os.environ if env is None else env
+    return (env.get(MODE_ENV) or "").strip().lower() in _CONFINED_MODES
+
+
+def _real(path) -> str:
+    return os.path.realpath(os.path.abspath(str(path)))
+
+
+def _beneath(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
+
+
+def workspace_base(env=None) -> str:
+    """``USER_WORKSPACES_DIR``, else the workspace manager's temp default."""
+    env = os.environ if env is None else env
+    configured = (env.get("USER_WORKSPACES_DIR") or "").strip()
+    if configured:
+        return configured
+    return os.path.join(tempfile.gettempdir(), "oh-my-gateway-workspaces")
+
+
+def _unreadable_roots(app_root, env) -> List[str]:
+    roots = [str(app_root), workspace_base(env), tempfile.gettempdir()]
+    return [_real(r) for r in roots + list(_PRIVATE_SYSTEM_ROOTS) if r]
+
+
+def needs_copy(path, *, app_root, env=None) -> bool:
+    """Whether a confined session is refused *path*: confinement is on and it
+    lies in the app root, the workspace base, the temp dir or a private system
+    root. A path sessions can read is registered in place, as before."""
+    if not confinement_on(env):
+        return False
+    real = _real(path)
+    return any(_beneath(real, root) for root in _unreadable_roots(app_root, env))
+
+
+def source_problem(path, *, app_root, env=None) -> Optional[str]:
+    """Why *path* must not be copied, or ``None``: a broad dir that holds the
+    gateway's state, or no marketplace at all."""
+    env = os.environ if env is None else env
+    real = _real(path)
+    app = _real(app_root)
+    if real in (app, os.path.join(app, "data")):
+        return f"{real} is the gateway's {'app root' if real == app else 'data dir'}"
+    home = (env.get("HOME") or "").strip()
+    held = [
+        ("the gateway app root", app),
+        ("the workspace base", _real(workspace_base(env))),
+        ("the temp dir", _real(tempfile.gettempdir())),
+    ]
+    if home:
+        held.append(("$HOME", _real(home)))
+    for label, root in held:
+        if real == "/" or (real != root and _beneath(root, real)):
+            return f"{real} contains {label}"
+    manifest = os.path.join(real, ".claude-plugin", "marketplace.json")
+    try:
+        st = os.lstat(manifest)
+    except OSError:
+        st = None
+    if st is None or not stat.S_ISREG(st.st_mode):
+        return (
+            f"{real} is not a marketplace (no regular .claude-plugin/marketplace.json)"
+        )
+    return None
+
+
+class _Budget:
+    def __init__(self, max_files: int, max_bytes: int):
+        self.files = 0
+        self.bytes = 0
+        self.max_files = max_files
+        self.max_bytes = max_bytes
+        self.skipped: List[str] = []
+
+    def take(self, rel: str, size: int = 0) -> None:
+        self.files += 1
+        self.bytes += size
+        if self.files > self.max_files:
+            raise LocalCopyError(f"more than {self.max_files} entries (at {rel})")
+        if self.bytes > self.max_bytes:
+            raise LocalCopyError(f"more than {self.max_bytes} bytes (at {rel})")
+
+
+def _link_stays_inside(rel_dir: str, target: str) -> bool:
+    if os.path.isabs(target):
+        return False
+    joined = os.path.normpath(os.path.join(rel_dir, target))
+    return joined != ".." and not joined.startswith(".." + os.sep)
+
+
+def _copy_file(src_dir_fd: int, name: str, dest: str, rel: str, budget) -> None:
+    try:
+        fd = os.open(name, _FILE_FLAGS, dir_fd=src_dir_fd)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.ENXIO):
+            budget.skipped.append(rel)  # swapped for a link, or a socket
+            return
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            budget.skipped.append(rel)
+            return
+        budget.take(rel, st.st_size)
+        mode = 0o755 if st.st_mode & stat.S_IXUSR else 0o644
+        out = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+        try:
+            copied = 0
+            while True:
+                chunk = os.read(fd, _CHUNK)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > st.st_size:  # grew while copying: count it
+                    budget.take(rel, len(chunk))
+                os.write(out, chunk)
+            os.fchmod(out, mode)
+        finally:
+            os.close(out)
+    finally:
+        os.close(fd)
+
+
+def _copy_dir(src_fd: int, dest: str, rel: str, budget, depth: int) -> None:
+    if depth > 64:
+        raise LocalCopyError(f"nested deeper than 64 levels (at {rel})")
+    with os.scandir(src_fd) as it:
+        entries = sorted(it, key=lambda e: e.name)
+    for entry in entries:
+        name = entry.name
+        child_rel = os.path.join(rel, name) if rel else name
+        child_dest = os.path.join(dest, name)
+        st = os.lstat(name, dir_fd=src_fd)
+        if stat.S_ISLNK(st.st_mode):
+            target = os.readlink(name, dir_fd=src_fd)
+            if _link_stays_inside(rel, target):
+                budget.take(child_rel)
+                os.symlink(target, child_dest)
+            else:
+                budget.skipped.append(child_rel)
+        elif stat.S_ISDIR(st.st_mode):
+            try:
+                fd = os.open(name, _DIR_FLAGS, dir_fd=src_fd)
+            except OSError as exc:
+                if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                    budget.skipped.append(child_rel)
+                    continue
+                raise
+            try:
+                budget.take(child_rel)
+                os.mkdir(child_dest, 0o755)
+                _copy_dir(fd, child_dest, child_rel, budget, depth + 1)
+                os.chmod(child_dest, 0o755)
+            finally:
+                os.close(fd)
+        elif stat.S_ISREG(st.st_mode):
+            _copy_file(src_fd, name, child_dest, child_rel, budget)
+        else:
+            budget.skipped.append(child_rel)
+
+
+def copy_marketplace(
+    source,
+    dest: Path,
+    *,
+    app_root,
+    env=None,
+    max_files: int = MAX_FILES,
+    max_bytes: int = MAX_BYTES,
+) -> List[str]:
+    """Copy the marketplace at *source* to *dest* (staged in ``<dest>.new``,
+    swapped in only on success; a failure leaves the previous copy). Returns
+    the relative paths skipped (links out of the tree, hard links, special
+    files). Raises :class:`LocalCopyError` for a refused source or a cap."""
+    problem = source_problem(source, app_root=app_root, env=env)
+    if problem:
+        raise LocalCopyError(f"refusing to copy the local marketplace: {problem}")
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    staging = dest.with_name(dest.name + ".new")
+    _remove(staging)
+    budget = _Budget(max_files, max_bytes)
+    src_fd = os.open(_real(source), _DIR_FLAGS)
+    try:
+        os.mkdir(staging, 0o755)
+        _copy_dir(src_fd, str(staging), "", budget, 0)
+        os.chmod(staging, 0o755)
+    except BaseException:
+        _remove(staging)
+        raise
+    finally:
+        os.close(src_fd)
+    _remove(dest)
+    os.replace(staging, dest)
+    return budget.skipped
+
+
+def _remove(path: Path) -> None:
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(st.st_mode):
+        shutil.rmtree(path)
+    else:
+        os.unlink(path)
