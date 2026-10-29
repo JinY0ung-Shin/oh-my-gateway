@@ -36,9 +36,11 @@ import errno
 import fcntl
 import logging
 import os
+import re
 import shutil
 import stat
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -373,12 +375,21 @@ def _publish(staging: Path, dest: Path, committed: List[bool]) -> None:
 
 def _sweep(dest: Path) -> None:
     """Remove replaced trees past their grace and staging dirs a dead copy
-    left. Runs under the lock, so no live copy's staging dir is touched."""
+    left. Runs under the lock, so no live copy's staging dir is touched.
+
+    Replaced trees stay, whatever their age, while another gateway instance
+    is alive (blue/green, ``docs/zero-downtime-deploy.md`` §5.4): the color
+    draining beside this one may still hold fds and cwds inside them."""
     now = time.time()
+    keep_old: Optional[bool] = None
     _remove(dest.with_name(dest.name + ".new"))  # the pre-#262 fixed name
     for entry in dest.parent.iterdir():
         name = entry.name
         if name.startswith(dest.name + _OLD):
+            if keep_old is None:
+                keep_old = other_instances_alive()
+            if keep_old:
+                continue
             limit = OLD_GRACE_SECONDS
         elif name.startswith(dest.name + _NEW):
             limit = STALE_STAGING_SECONDS
@@ -400,3 +411,181 @@ def _remove(path: Path) -> None:
         shutil.rmtree(path)
     else:
         os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Blue/green deploys (docs/zero-downtime-deploy.md §5.4)
+# ---------------------------------------------------------------------------
+
+# Mirrors ``src.instance_registry`` (stdlib only here: the startup script loads
+# this module standalone). Parity-tested in tests/test_plugin_replay.py.
+_INSTANCE_NAME = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+_OLD_TREE = re.compile(r"^(?P<dest>.+)" + re.escape(_OLD) + r"[0-9a-f]{12}$")
+
+
+def _instances_dir(env) -> Path:
+    raw = (env.get("GATEWAY_INSTANCE_DIR") or "").strip()
+    if raw:
+        return Path(raw)
+    here = Path(__file__).resolve().parent
+    if here.name == "src" and (here / "instance_registry.py").is_file():
+        return here.parent / "data" / "instances"
+    return Path("/app/data/instances")  # beside install_plugins.py in the image
+
+
+def _instance_alive(lock_path: Path) -> bool:
+    try:
+        fd = os.open(str(lock_path), os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def other_instances_alive(env=None) -> bool:
+    """Whether a gateway instance other than this one holds its liveness lock
+    (``instance_registry.other_live_instances()`` is non-empty).
+
+    Answers ``True`` when liveness cannot be read (an unreadable instances
+    dir or lock): callers use it to decide whether a shared file may be
+    deleted, so an unknown answer keeps it. No instances dir is ``False``."""
+    env = os.environ if env is None else env
+    me = (env.get("GATEWAY_INSTANCE") or "").strip().lower()
+    directory = _instances_dir(env)
+    try:
+        names = sorted(p.stem for p in directory.glob("*.lock"))
+    except OSError:
+        return True
+    if not names and not os.path.isdir(directory):
+        return False
+    for name in names:
+        if name == me or not _INSTANCE_NAME.fullmatch(name):
+            continue
+        try:
+            if _instance_alive(directory / f"{name}.lock"):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def sweep_parked_trees(root) -> int:
+    """Startup sweep: run :func:`_sweep` for every dest in *root* that has a
+    parked ``<dest>.old-*`` tree, so trees replaced during a deploy (kept while
+    the other color drained) do not linger once it is gone. Nothing is
+    removed while another instance is alive, and the grace still applies.
+    Best effort: returns how many dests were swept, never raises."""
+    try:
+        if other_instances_alive():
+            return 0
+        dests = sorted(
+            {
+                m.group("dest")
+                for m in (_OLD_TREE.match(e.name) for e in Path(root).iterdir())
+                if m
+            }
+        )
+    except OSError:
+        return 0
+    swept = 0
+    for name in dests:
+        dest = Path(root) / name
+        try:
+            with _locked(dest):
+                _sweep(dest)
+            swept += 1
+        except OSError:
+            logger.warning("Could not sweep parked trees of %s", dest, exc_info=True)
+    return swept
+
+
+# The startup replay (``docker/install_plugins.py``) and every admin path that
+# runs ``claude plugin …`` (``plugin_admin_service``, so ``plugin_autorefresh``
+# too) hold this lock: two colors never edit ``installed_plugins.json`` /
+# ``known_marketplaces.json`` at once. It is outside :func:`replace_tree`'s
+# per-dest lock, never inside it.
+REPLAY_LOCK_NAME = ".plugin-replay.lock"
+# Written into the manifest's dir (``data/``) after a replay that changed
+# nothing it could not reproduce; a boot whose inputs match it skips the replay.
+REPLAY_DIGEST_NAME = "plugin-replay.digest"
+
+_replay_guard = threading.RLock()
+_replay_depth = 0
+_replay_fd: Optional[int] = None
+
+
+def claude_config_dir(env=None) -> Path:
+    """``$CLAUDE_CONFIG_DIR`` else ``~/.claude``, as ``claude_config_paths``."""
+    env = os.environ if env is None else env
+    configured = (env.get("CLAUDE_CONFIG_DIR") or "").strip()
+    return Path(configured) if configured else Path.home() / ".claude"
+
+
+@contextlib.contextmanager
+def replay_lock(config_dir=None):
+    """Hold the replay-wide ``flock`` on ``<config dir>/.plugin-replay.lock``.
+
+    Re-entrant within a process (an admin install that first adds its
+    marketplace takes it twice); threads of one process take turns on an
+    ``RLock`` first. Blocking: call it from a worker thread, never the event
+    loop."""
+    global _replay_depth, _replay_fd
+    with _replay_guard:
+        if _replay_depth == 0:
+            directory = Path(config_dir) if config_dir else claude_config_dir()
+            directory.mkdir(parents=True, exist_ok=True)
+            fd = os.open(
+                str(directory / REPLAY_LOCK_NAME),
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            except BaseException:
+                os.close(fd)
+                raise
+            _replay_fd = fd
+        _replay_depth += 1
+        try:
+            yield
+        finally:
+            _replay_depth -= 1
+            if _replay_depth == 0 and _replay_fd is not None:
+                os.close(_replay_fd)
+                _replay_fd = None
+
+
+def replay_digest_path(data_dir) -> Path:
+    return Path(data_dir) / REPLAY_DIGEST_NAME
+
+
+def read_replay_digest(data_dir) -> Optional[str]:
+    try:
+        return replay_digest_path(data_dir).read_text(encoding="ascii").strip() or None
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def write_replay_digest(data_dir, digest: str) -> None:
+    """Atomically (tmp + ``os.replace``) record *digest*."""
+    path = replay_digest_path(data_dir)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", encoding="ascii") as fh:
+            fh.write(digest + "\n")
+        os.replace(tmp, path)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(tmp)
+
+
+def invalidate_replay_digest(data_dir) -> None:
+    """Make the next boot replay (an admin change, or a replay starting).
+    Raises ``OSError`` only when an existing digest cannot be removed."""
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(replay_digest_path(data_dir))

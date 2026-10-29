@@ -33,6 +33,15 @@ Behavior:
       admin uninstall stays applied after a plugin-cache wipe.
     * A failure for one plugin or one repo is logged and skipped; it never
       aborts the run, so the gateway always starts. Exit status is always 0.
+    * The whole replay holds ``<claude config dir>/.plugin-replay.lock``
+      (``flock``; the admin plugin paths take it too), so two gateway colors
+      never run ``claude plugin ...`` at once (blue/green deploy, §5.4).
+    * A replay with no failure records the digest of its inputs (manifest,
+      the commit ``git ls-remote`` reports per remote marketplace, a tree
+      digest per local one, the CLI version, the registry it left) in
+      ``plugin-replay.digest`` beside the manifest. A boot whose inputs match
+      it skips the replay: no clone, no ``claude plugin`` call. Any failure
+      computing it replays, as before.
 
 The git token is fed to ``git`` through a temporary ``GIT_ASKPASS`` helper and
 is never passed to the ``claude`` CLI or embedded in any registered marketplace
@@ -40,6 +49,7 @@ URL.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -287,7 +297,7 @@ def _timeout_seconds() -> int:
 
 
 def run(
-    cmd: List[str], *, token: str = "", check: bool = True
+    cmd: List[str], *, token: str = "", check: bool = True, capture: bool = False
 ) -> subprocess.CompletedProcess:
     """Run *cmd*, streaming its output straight to the container logs.
 
@@ -312,7 +322,14 @@ def run(
     env["GIT_TERMINAL_PROMPT"] = "0"
     askpass_path = _write_askpass(token, env) if token else None
     try:
-        proc = subprocess.run(cmd, env=env, timeout=_timeout_seconds())
+        proc = subprocess.run(
+            cmd,
+            env=env,
+            timeout=_timeout_seconds(),
+            stdout=subprocess.PIPE if capture else None,
+            stdin=subprocess.DEVNULL if capture else None,
+            text=capture,
+        )
     except subprocess.TimeoutExpired as exc:
         raise subprocess.CalledProcessError(124, cmd) from exc
     finally:
@@ -550,6 +567,8 @@ def process_entry(
 
 
 def main() -> int:
+    lc = _load_local_copy()
+    _sweep_parked_trees(lc)
     entries = collect_entries()
     if not entries:
         return 0  # nothing in the manifest — no-op
@@ -566,6 +585,30 @@ def main() -> int:
         )
         return 0  # never block server startup
 
+    with _replay_lock(lc):
+        return _replay(entries, claude_bin, lc)
+
+
+def _replay(entries: List[PluginEntry], claude_bin: str, lc) -> int:
+    """The manifest replay, under the replay lock (see :func:`main`)."""
+    inputs = _input_material(entries, claude_bin) if lc is not None else None
+    data_dir = manifest_path().parent
+    if inputs is not None:
+        digest = _digest(inputs, _registry_material())
+        if digest is not None and digest == lc.read_replay_digest(data_dir):
+            log(
+                f"inputs unchanged since the last replay (digest {digest[:12]}); "
+                f"skipping {sum(len(e.names) for e in entries)} plugin(s) across "
+                f"{len(entries)} repo(s)"
+            )
+            return 0
+    if lc is not None:
+        try:
+            lc.invalidate_replay_digest(data_dir)
+        except OSError as exc:
+            log(f"could not remove the replay digest: {exc}")
+            inputs = None  # a stale digest stays: never write a new one over it
+
     removed_set = {(r["spec"], r["scope"]) for r in load_manifest()["removed"]}
 
     root = clone_root()
@@ -581,7 +624,197 @@ def main() -> int:
     log(
         f"done: {total_ok} plugin(s) ensured, {total_failed} failed, across {len(entries)} repo(s)"
     )
+    if inputs is not None and total_failed == 0:
+        digest = _digest(inputs, _registry_material())
+        if digest is not None:
+            try:
+                lc.write_replay_digest(data_dir, digest)
+            except OSError as exc:
+                log(f"could not write the replay digest: {exc}")
     return 0
+
+
+# ---------------------------------------------------------------------------
+# Blue/green: replay lock, input digest, parked-tree sweep (§5.4)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _replay_lock(lc):
+    """``plugin_local_copy.replay_lock()``; without it (module missing, or the
+    lock cannot be taken) the replay runs unlocked, as before."""
+    if lc is None:
+        yield
+        return
+    lock = lc.replay_lock()
+    try:
+        lock.__enter__()
+    except OSError as exc:
+        log(f"could not take the plugin replay lock, replaying unlocked: {exc}")
+        yield
+        return
+    try:
+        yield
+    finally:
+        lock.__exit__(None, None, None)
+
+
+def _sweep_parked_trees(lc) -> None:
+    """Remove replaced clone-root trees past their grace (best effort; none
+    while another gateway instance is alive)."""
+    if lc is None:
+        return
+    try:
+        root = clone_root()
+        if root.is_dir():
+            lc.sweep_parked_trees(root)
+    except Exception as exc:  # never block startup
+        log(f"parked-tree sweep skipped: {exc!r}")
+
+
+# Bound on the local-source tree digest: a larger tree is not digested (the
+# replay then always runs, as before). ``.git`` internals are not walked.
+_TREE_MAX_ENTRIES = 20000
+_TREE_SKIP_DIRS = frozenset({".git"})
+
+
+def _tree_material(path: str) -> str:
+    """sha256 over (path, mode, size, mtime) of every entry below *path*;
+    links are recorded, never followed. Raises ``OSError`` past the cap."""
+    root = os.path.realpath(path)
+    h = hashlib.sha256(root.encode("utf-8", "surrogateescape"))
+    count = 0
+
+    def fail(exc: OSError) -> None:
+        raise exc
+
+    for dirpath, dirnames, filenames in os.walk(root, onerror=fail):
+        dirnames[:] = sorted(d for d in dirnames if d not in _TREE_SKIP_DIRS)
+        for name in sorted(dirnames + filenames):
+            full = os.path.join(dirpath, name)
+            st = os.lstat(full)
+            count += 1
+            if count > _TREE_MAX_ENTRIES:
+                raise OSError(f"{root} has more than {_TREE_MAX_ENTRIES} entries")
+            target = os.readlink(full) if os.path.islink(full) else ""
+            rel = os.path.relpath(full, root)
+            line = f"{rel}\0{st.st_mode}\0{st.st_size}\0{st.st_mtime_ns}\0{target}\n"
+            h.update(line.encode("utf-8", "surrogateescape"))
+    return h.hexdigest()
+
+
+def _remote_material(entry: PluginEntry) -> str:
+    """What ``git ls-remote`` reports for the entry's branch (or tag)."""
+    proc = run(
+        ["git", "ls-remote", "--", entry.repo, entry.branch],
+        token=entry.git_token,
+        capture=True,
+    )
+    lines = sorted(line.strip() for line in (proc.stdout or "").splitlines())
+    lines = [line for line in lines if line]
+    if not lines:
+        raise OSError(f"git ls-remote reported no ref {entry.branch!r}")
+    return "\n".join(lines)
+
+
+def _input_material(entries: List[PluginEntry], claude_bin: str) -> Optional[dict]:
+    """Everything the replay's outcome depends on, or ``None`` (replay)."""
+    try:
+        version = run([claude_bin, "--version"], capture=True).stdout.strip()
+        if not version:
+            raise OSError("claude --version printed nothing")
+        sources: Dict[str, str] = {}
+        for entry in entries:
+            key = f"{entry.repo}\0{entry.branch}"
+            if key in sources:
+                continue
+            if Path(entry.repo).exists():
+                sources[key] = "local:" + _tree_material(entry.repo)
+            else:
+                sources[key] = "remote:" + _remote_material(entry)
+        manifest = load_manifest()
+        return {
+            "version": 1,
+            "manifest": {"added": manifest["added"], "removed": manifest["removed"]},
+            "token": bool(os.environ.get("CLAUDE_PLUGIN_GIT_TOKEN", "")),
+            "sources": sources,
+            "cli": version,
+            "claude_bin": claude_bin,
+            "clone_root": str(clone_root()),
+            "app_root": str(_app_root()),
+            "env": {
+                k: os.environ.get(k, "")
+                for k in (
+                    "CLAUDE_ISOLATION_MODE",
+                    "CLAUDE_CONFIG_DIR",
+                    "HOME",
+                    "USER_WORKSPACES_DIR",
+                )
+            },
+        }
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        log(f"could not compute the replay inputs, replaying: {exc}")
+        return None
+
+
+def _registry_material() -> Optional[dict]:
+    """What the replay left in the CLI's registry: marketplaces and installed
+    plugins (timestamps dropped) and whether each recorded path still exists.
+    A wiped plugin volume reads differently, so its boot replays."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    config = Path(configured) if configured else Path.home() / ".claude"
+    plugins = config / "plugins"
+    try:
+        loaded = {}
+        for name in ("known_marketplaces.json", "installed_plugins.json"):
+            try:
+                loaded[name] = json.loads((plugins / name).read_text("utf-8"))
+            except FileNotFoundError:
+                loaded[name] = None
+        known = loaded["known_marketplaces.json"] or {}
+        installed = (loaded["installed_plugins.json"] or {}).get("plugins") or {}
+        marketplaces = {
+            str(name): {
+                "source": rec.get("source"),
+                "installLocation": rec.get("installLocation"),
+                "present": os.path.isdir(str(rec.get("installLocation") or "")),
+            }
+            for name, rec in sorted(known.items())
+        }
+        plugin_rows = {
+            str(pid): sorted(
+                json.dumps(
+                    {
+                        "scope": row.get("scope"),
+                        "version": row.get("version"),
+                        "installPath": row.get("installPath"),
+                        "projectPath": row.get("projectPath"),
+                        "present": os.path.isdir(str(row.get("installPath") or "")),
+                    },
+                    sort_keys=True,
+                )
+                for row in rows
+            )
+            for pid, rows in sorted(installed.items())
+        }
+        return {
+            "absent": [k for k, v in sorted(loaded.items()) if v is None],
+            "marketplaces": marketplaces,
+            "plugins": plugin_rows,
+        }
+    except (OSError, ValueError, AttributeError, TypeError) as exc:
+        log(f"could not read the plugin registry, replaying: {exc}")
+        return None
+
+
+def _digest(inputs: dict, registry: Optional[dict]) -> Optional[str]:
+    if registry is None:
+        return None
+    try:
+        blob = json.dumps({"inputs": inputs, "registry": registry}, sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
 def apply_removed(claude_bin: str, removed_set: set) -> None:
