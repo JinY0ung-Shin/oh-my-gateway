@@ -30,11 +30,15 @@ Standalone on purpose (stdlib only, no ``src`` import): the startup script
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import errno
+import fcntl
 import os
 import shutil
 import stat
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -227,31 +231,129 @@ def copy_marketplace(
     max_files: int = MAX_FILES,
     max_bytes: int = MAX_BYTES,
 ) -> List[str]:
-    """Copy the marketplace at *source* to *dest* (staged in ``<dest>.new``,
-    swapped in only on success; a failure leaves the previous copy). Returns
-    the relative paths skipped (links out of the tree, hard links, special
-    files). Raises :class:`LocalCopyError` for a refused source or a cap."""
+    """Copy the marketplace at *source* to *dest* and publish it there.
+
+    One copy per *dest* at a time (an ``flock`` on ``<dest>.lock``, so an admin
+    refresh and the startup replay never interleave), staged in a fresh
+    ``<dest>.new-*`` dir of its own, then swapped in by :func:`_publish`: a
+    failure at any step leaves the copy *dest* holds now, and a reader of
+    *dest* sees the old tree or the new one, never a partial one. Returns the
+    relative paths skipped (links out of the tree, hard links, special files).
+    Raises :class:`LocalCopyError` for a refused source or a cap."""
     problem = source_problem(source, app_root=app_root, env=env)
     if problem:
         raise LocalCopyError(f"refusing to copy the local marketplace: {problem}")
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    staging = dest.with_name(dest.name + ".new")
-    _remove(staging)
-    budget = _Budget(max_files, max_bytes)
-    src_fd = os.open(_real(source), _DIR_FLAGS)
-    try:
-        os.mkdir(staging, 0o755)
-        _copy_dir(src_fd, str(staging), "", budget, 0)
-        os.chmod(staging, 0o755)
-    except BaseException:
-        _remove(staging)
-        raise
-    finally:
-        os.close(src_fd)
-    _remove(dest)
-    os.replace(staging, dest)
+    with _locked(dest):
+        _sweep(dest)
+        staging = Path(tempfile.mkdtemp(prefix=dest.name + _NEW, dir=dest.parent))
+        budget = _Budget(max_files, max_bytes)
+        try:
+            src_fd = os.open(_real(source), _DIR_FLAGS)
+            try:
+                _copy_dir(src_fd, str(staging), "", budget, 0)
+            finally:
+                os.close(src_fd)
+            os.chmod(staging, 0o755)  # mkdtemp made it 0700
+            _publish(staging, dest)
+        except BaseException:
+            _remove(staging)
+            raise
     return budget.skipped
+
+
+# Sibling names beside a copy: its lock, staging dirs and replaced trees.
+_LOCK = ".lock"
+_NEW = ".new-"
+_OLD = ".old-"
+# A replaced tree stays this long: a reader that resolved part of a path into it
+# just before the swap still finds it. Swept by the next copy of the same dest.
+OLD_GRACE_SECONDS = 600
+# A staging dir is this old only when its copy died without cleaning up.
+STALE_STAGING_SECONDS = 3600
+
+_RENAME_EXCHANGE = 2
+_AT_FDCWD = -100
+
+
+@contextlib.contextmanager
+def _locked(dest: Path):
+    fd = os.open(
+        str(dest) + _LOCK, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644
+    )
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _exchange(a: Path, b: Path) -> None:
+    """Atomically swap two paths (``renameat2(RENAME_EXCHANGE)``, Linux)."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise OSError(errno.ENOSYS, "renameat2 is not available")
+    rc = renameat2(
+        _AT_FDCWD, os.fsencode(a), _AT_FDCWD, os.fsencode(b), _RENAME_EXCHANGE
+    )
+    if rc != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, os.strerror(err), str(a))
+
+
+def _publish(staging: Path, dest: Path) -> None:
+    """Make *staging* the tree at *dest*; the tree *dest* held moves aside to
+    ``<dest>.old-*`` (removed after :data:`OLD_GRACE_SECONDS`).
+
+    With an existing copy the two are exchanged in one ``renameat2`` call. A
+    filesystem without ``RENAME_EXCHANGE`` gets two renames: *dest* is missing
+    for that instant, and when the second one fails the first is undone."""
+    try:
+        st = os.lstat(dest)
+    except FileNotFoundError:
+        os.rename(staging, dest)
+        return
+    if not stat.S_ISDIR(st.st_mode):
+        _remove(dest)  # not a copy of ours: a link or file planted there
+        os.rename(staging, dest)
+        return
+    old = dest.with_name(dest.name + _OLD + os.urandom(6).hex())
+    try:
+        _exchange(staging, dest)
+    except OSError as exc:
+        if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+            raise
+        os.rename(dest, old)
+        try:
+            os.rename(staging, dest)
+        except BaseException:
+            os.rename(old, dest)
+            raise
+    else:
+        os.rename(staging, old)
+    # The grace counts from now: the old tree's own mtime is its copy time.
+    os.utime(old)
+
+
+def _sweep(dest: Path) -> None:
+    """Remove replaced trees past their grace and staging dirs a dead copy
+    left. Runs under the lock, so no live copy's staging dir is touched."""
+    now = time.time()
+    for entry in dest.parent.iterdir():
+        name = entry.name
+        if name.startswith(dest.name + _OLD):
+            limit = OLD_GRACE_SECONDS
+        elif name.startswith(dest.name + _NEW):
+            limit = STALE_STAGING_SECONDS
+        else:
+            continue
+        try:
+            if now - os.lstat(entry).st_mtime > limit:
+                _remove(entry)
+        except OSError:
+            pass
 
 
 def _remove(path: Path) -> None:

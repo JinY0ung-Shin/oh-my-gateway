@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -154,7 +155,7 @@ class TestCopy:
             lc.copy_marketplace(source, dest, app_root=app, env={}, max_files=3)
         assert (dest / "tool" / "skills" / "probe" / "SKILL.md").is_file()
         assert not (dest / "big.bin").exists()
-        assert not dest.with_name("copy.new").exists()
+        assert not list(tmp_path.glob("copy.new-*"))
 
     def test_a_refresh_replaces_the_copy(self, app, tmp_path):
         source = app / "data" / "plugins" / "inside-mp"
@@ -170,6 +171,158 @@ class TestCopy:
         with pytest.raises(lc.LocalCopyError, match="gateway's data dir"):
             lc.copy_marketplace(app / "data", tmp_path / "copy", app_root=app, env={})
         assert not (tmp_path / "copy").exists()
+
+
+def _siblings(dest: Path, marker: str) -> list:
+    return sorted(dest.parent.glob(dest.name + marker + "*"))
+
+
+class TestPublish:
+    """The swap keeps the published copy readable, whatever fails (#259 review)."""
+
+    @pytest.fixture
+    def source(self, app):
+        return app / "data" / "plugins" / "inside-mp"
+
+    def _skill(self, root: Path) -> Path:
+        return root / "tool" / "skills" / "probe" / "SKILL.md"
+
+    def test_a_failed_exchange_keeps_the_copy(self, app, source, tmp_path, monkeypatch):
+        dest = tmp_path / "copy"
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        self._skill(source).write_text("v2")
+
+        def boom(a, b):
+            raise OSError(5, "I/O error")
+
+        monkeypatch.setattr(lc, "_exchange", boom)
+        with pytest.raises(OSError, match="I/O error"):
+            lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert self._skill(dest).read_text().startswith("---"), "the old copy"
+        assert not _siblings(dest, lc._NEW) and not _siblings(dest, lc._OLD)
+
+    def test_without_exchange_two_renames_publish(
+        self, app, source, tmp_path, monkeypatch
+    ):
+        dest = tmp_path / "copy"
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+
+        def unsupported(a, b):
+            raise OSError(22, "Invalid argument")
+
+        monkeypatch.setattr(lc, "_exchange", unsupported)
+        self._skill(source).write_text("v2")
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert self._skill(dest).read_text() == "v2"
+        (old,) = _siblings(dest, lc._OLD)
+        assert self._skill(old).read_text().startswith("---")
+
+    def test_without_exchange_a_failed_rename_is_undone(
+        self, app, source, tmp_path, monkeypatch
+    ):
+        dest = tmp_path / "copy"
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        monkeypatch.setattr(
+            lc, "_exchange", lambda a, b: (_ for _ in ()).throw(OSError(22, "x"))
+        )
+        real_rename = os.rename
+
+        def rename(a, b):
+            if lc._NEW in Path(a).name:
+                raise OSError(28, "No space left on device")
+            return real_rename(a, b)
+
+        monkeypatch.setattr(lc.os, "rename", rename)
+        self._skill(source).write_text("v2")
+        with pytest.raises(OSError, match="No space"):
+            lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert self._skill(dest).read_text().startswith("---"), "rolled back"
+        assert not _siblings(dest, lc._NEW) and not _siblings(dest, lc._OLD)
+
+    def test_a_reader_never_sees_a_partial_tree(self, app, source, tmp_path):
+        dest = tmp_path / "copy"
+        for i in range(30):
+            (source / "tool" / f"f{i}.md").write_text("x" * 1000)
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        stop = threading.Event()
+        errors: list = []
+
+        def read():
+            while not stop.is_set():
+                try:
+                    files = len(list((dest / "tool").glob("f*.md")))
+                    text = self._skill(dest).read_text()
+                    json.loads(
+                        (dest / ".claude-plugin" / "marketplace.json").read_text()
+                    )
+                    if files != 30 or not text:
+                        errors.append(f"partial: {files} files, {text!r}")
+                except OSError as exc:
+                    errors.append(repr(exc))
+
+        reader = threading.Thread(target=read)
+        reader.start()
+        try:
+            for n in range(25):
+                self._skill(source).write_text(f"v{n}")
+                lc.copy_marketplace(source, dest, app_root=app, env={})
+        finally:
+            stop.set()
+            reader.join()
+        assert errors == []
+        assert self._skill(dest).read_text() == "v24"
+
+    def test_concurrent_copies_of_one_source_never_collide(self, app, source, tmp_path):
+        dest = tmp_path / "copy"
+        errors: list = []
+
+        def refresh():
+            try:
+                for _ in range(5):
+                    lc.copy_marketplace(source, dest, app_root=app, env={})
+            except Exception as exc:  # noqa: BLE001 - collected for the assert
+                errors.append(repr(exc))
+
+        workers = [threading.Thread(target=refresh) for _ in range(6)]
+        for w in workers:
+            w.start()
+        for w in workers:
+            w.join()
+        assert errors == []
+        assert self._skill(dest).read_text().startswith("---")
+        assert not _siblings(dest, lc._NEW)
+
+    def test_concurrent_processes_serialize_on_the_lock(self, app, source, tmp_path):
+        """The admin path and the startup replay are separate processes."""
+        dest = tmp_path / "copy"
+        code = (
+            "import sys; sys.path.insert(0, sys.argv[1]);"
+            "from src import plugin_local_copy as lc\n"
+            "for _ in range(5):\n"
+            "    lc.copy_marketplace(sys.argv[2], sys.argv[3], app_root=sys.argv[4], env={})"
+        )
+        argv = [sys.executable, "-c", code, str(ROOT), str(source), str(dest), str(app)]
+        env = {**os.environ, "GATEWAY_SKIP_DOTENV": "1"}
+        procs = [
+            subprocess.Popen(argv, env=env, stderr=subprocess.PIPE, text=True)
+            for _ in range(3)
+        ]
+        for proc in procs:
+            _out, err = proc.communicate(timeout=120)
+            assert proc.returncode == 0, err
+        assert self._skill(dest).read_text().startswith("---")
+        assert not _siblings(dest, lc._NEW)
+
+    def test_replaced_trees_are_swept_after_their_grace(
+        self, app, source, tmp_path, monkeypatch
+    ):
+        dest = tmp_path / "copy"
+        for _ in range(3):
+            lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert len(_siblings(dest, lc._OLD)) == 2, "kept for readers mid-path"
+        monkeypatch.setattr(lc, "OLD_GRACE_SECONDS", -1)
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert len(_siblings(dest, lc._OLD)) == 1, "only the one just replaced"
 
 
 # --- the admin path ----------------------------------------------------------
@@ -314,7 +467,7 @@ def _replay(tmp_path: Path, app: Path, source: Path, **env_extra):
 def test_the_startup_replay_registers_a_fresh_copy(app, tmp_path):
     source = app / "data" / "plugins" / "inside-mp"
     proc, log = _replay(tmp_path, app, source, CLAUDE_ISOLATION_MODE="landlock")
-    (copy,) = (tmp_path / "clones").iterdir()
+    (copy,) = [p for p in (tmp_path / "clones").iterdir() if p.is_dir()]
     assert f"plugin marketplace add {copy} --scope user" in log
     assert "copying local" in proc.stdout + proc.stderr
     # An edit to the source arrives on the next start.
