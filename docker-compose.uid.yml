@@ -1,8 +1,18 @@
 # uid-mode override (CLAUDE_ISOLATION_MODE=uid, issue #241): every session CLI
 # runs as a uid of its own, so sessions are kept apart by file ownership as well
-# as by the Landlock ruleset. Layer it over the main file:
+# as by the Landlock ruleset. Layer it over the main file through deploy.sh:
 #
-#   docker compose -f docker-compose.yml -f docker-compose.uid.yml up -d --build
+#   export GATEWAY_COMPOSE="docker compose -f docker-compose.yml -f docker-compose.uid.yml"
+#   scripts/deploy.sh restart     # rebuild + recreate the active color in place
+#   scripts/deploy.sh migrate     # once, from the old single `gateway` service
+#
+# uid mode keeps the RESTART deploy (a short outage), not the blue/green swap:
+# the uid registry admits one gateway process at a time (an flock on
+# data/isolation_uids.json.lock), and the anonymous uid pool and the broker's
+# orphan checks are per process, so a second color refuses to start. deploy.sh
+# refuses `deploy`/`rollback` here (docs/zero-downtime-deploy.md §6). Both
+# colors carry the override so whichever one is active stays in uid mode; only
+# one of them ever runs.
 #
 # Requirements:
 # - A root start: the image default, so do not set `user:`. The entrypoint, still
@@ -47,16 +57,19 @@
 # Before enabling this in production, re-run docs/isolation-uid-verification.md
 # in the deployment container; the image ships the probe it starts with as
 # /usr/local/bin/isolation_probe.py.
+x-uid-gateway: &uid-gateway
+  environment:
+    - CLAUDE_ISOLATION_MODE=uid
+    - CLAUDE_CONFIG_DIR=/data/claude/shared
+    - CLAUDE_PLUGIN_CLONE_ROOT=/data/claude/shared/plugin-marketplaces
+    - CLAUDE_ISOLATION_CONFIG_BASE=/data/claude/users
+    - CLAUDE_ISOLATION_MIGRATE_FROM=/home/app/.claude
+  volumes:
+    - claude_isolation:/data/claude
+
 services:
-  gateway:
-    environment:
-      - CLAUDE_ISOLATION_MODE=uid
-      - CLAUDE_CONFIG_DIR=/data/claude/shared
-      - CLAUDE_PLUGIN_CLONE_ROOT=/data/claude/shared/plugin-marketplaces
-      - CLAUDE_ISOLATION_CONFIG_BASE=/data/claude/users
-      - CLAUDE_ISOLATION_MIGRATE_FROM=/home/app/.claude
-    volumes:
-      - claude_isolation:/data/claude
+  gateway-blue: *uid-gateway
+  gateway-green: *uid-gateway
 
 volumes:
   # The shared config dir and the per-uid config dirs of uid mode.

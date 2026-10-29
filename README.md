@@ -7,7 +7,7 @@
 
 OpenAI-compatible gateway for coding agent backends. It exposes the Claude Agent SDK through `/v1/responses`, plus a stateless Claude SDK event stream at `/v1/agents/messages`, with MCP integration, workspace isolation, and an admin dashboard. OpenCode and Codex backends are still in the tree but **stale** (frozen since July 2026, unmaintained).
 
-> Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose service is now `gateway`; update commands such as `docker compose logs claude-wrapper` to use `gateway`.
+> Previously published as **Claude Code Gateway**. The repository was renamed because the gateway now fronts multiple agent backends, not just Claude. The Docker Compose gateway now runs as `gateway-blue` / `gateway-green` behind `gateway-proxy` (zero-downtime deploys, see below); `scripts/deploy.sh active` names the one serving, e.g. `docker compose logs "$(scripts/deploy.sh active)"`.
 
 ## Quick Start
 
@@ -304,8 +304,23 @@ With Compose:
 
 ```bash
 cp .env.example .env
-docker compose up -d
+scripts/deploy.sh            # build, start gateway-blue, put gateway-proxy on ${PORT:-8000}
 ```
+
+Compose runs the gateway as two colors of one image, `gateway-blue` and
+`gateway-green`, behind an nginx `gateway-proxy` that alone publishes
+`${PORT:-8000}`. The colors sit behind the `blue` / `green` profiles, so a bare
+`docker compose up -d` only starts the proxy. Every later release is a
+zero-downtime swap: `scripts/deploy.sh` builds the idle color, waits until it
+is ready, drains the active one toward it, switches nginx and stops the old
+color once its turns, cards and streams are done (`scripts/deploy.sh status`,
+`scripts/deploy.sh rollback`). Moving an existing single-`gateway` deployment
+is a one-time restart deploy: `scripts/deploy.sh migrate`. uid isolation mode
+keeps the restart deploy (`scripts/deploy.sh restart`). Operations:
+[docs/zero-downtime-deploy.md](docs/zero-downtime-deploy.md) §10.
+
+`docker compose exec` / `logs` take the color's name:
+`docker compose logs --tail=100 "$(scripts/deploy.sh active)"`.
 
 On startup the Compose image repairs gateway-owned bind-mount permissions for
 `./data` and then runs the server as a non-root user. If your host user is not
@@ -320,7 +335,7 @@ APT_MIRROR_URL=http://apt-mirror.example.com/debian \
 APT_SECURITY_MIRROR_URL=http://apt-mirror.example.com/debian-security \
 NPM_CONFIG_REGISTRY=https://npm.example.com/repository/npm/ \
 PIP_INDEX_URL=https://pypi.example.com/simple/ \
-docker compose build
+scripts/deploy.sh
 ```
 
 To run a local corporate install script during the image build without checking
@@ -328,11 +343,11 @@ it into this repository, point Compose at the script path:
 
 ```bash
 GATEWAY_BUILD_INSTALL_SCRIPT=/opt/company/install_gateway_addons.sh \
-docker compose build
+scripts/deploy.sh
 ```
 
 BuildKit does not include secret contents in the cache key. If the script
-changes, rebuild with `docker compose build --no-cache` or set
+changes, rebuild with `docker compose --profile blue --profile green build --no-cache` or set
 `GATEWAY_BUILD_INSTALL_CACHE_BUST` to a new non-secret value.
 
 The Docker image is pinned to Debian trixie. The default `Dockerfile` /
@@ -361,10 +376,14 @@ persists Codex CLI state in a named Docker volume:
 docker compose -f docker-compose.codex.yml up -d --build
 ```
 
-The Compose service is named `gateway`. Optional usage logging is available through the `logging` profile:
+The OpenCode and Codex Compose files keep a single `gateway` service and the
+plain restart deploy (they are stale). Optional usage logging is available
+through the `logging` profile — set it in `.env` so `scripts/deploy.sh` and
+`docker compose up -d` both keep the sidecar running:
 
 ```bash
-docker compose --profile logging up -d
+echo COMPOSE_PROFILES=logging >> .env
+docker compose up -d gateway-log
 ```
 
 ## Development

@@ -515,8 +515,10 @@ init shim·root이거나 hidepid로 아예 안 보이면 그 자식으로 물러
 신원을 못 얻으면 INCONCLUSIVE), 프로브 자신(`docker exec`)의 cap은 참고용으로만 찍는다.
 
 ```bash
-docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.py
+docker compose exec -T -u app "$(scripts/deploy.sh active)" python3 -I -S - < scripts/isolation_probe.py
 ```
+
+(서비스 이름은 blue/green 배치의 지금 색, `gateway-blue` 또는 `gateway-green`이다 — [무중단 배포 §10](zero-downtime-deploy.md#10-운영).)
 
 > 스크립트는 **stdin으로** 넣는다(`-T`는 TTY 없이 파이프하기 위해서다). 컨테이너 `/tmp` 같은 고정 이름에 복사해
 > 돌리면 같은 uid의 세션이 그 이름을 `__main__.py`를 담은 디렉터리로 미리 만들어 둘 수 있다 — 그러면

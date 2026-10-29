@@ -1056,29 +1056,30 @@ def _override():
 def test_the_compose_override_turns_uid_mode_on():
     yaml = pytest.importorskip("yaml")
     override = _override()
-    gateway = override["services"]["gateway"]
-    environment = dict(item.split("=", 1) for item in gateway["environment"])
-    assert environment == {
-        "CLAUDE_ISOLATION_MODE": "uid",
-        "CLAUDE_CONFIG_DIR": "/data/claude/shared",
-        "CLAUDE_PLUGIN_CLONE_ROOT": "/data/claude/shared/plugin-marketplaces",
-        "CLAUDE_ISOLATION_CONFIG_BASE": "/data/claude/users",
-        "CLAUDE_ISOLATION_MIGRATE_FROM": "/home/app/.claude",
-    }
-    assert gateway["volumes"] == ["claude_isolation:/data/claude"]
-    assert "claude_isolation" in override["volumes"]
-    # The old shared dir it migrates from is the main file's claude_home.
     main = yaml.safe_load((ROOT / "docker-compose.yml").read_text())
-    assert "claude_home:/home/app/.claude" in main["services"]["gateway"]["volumes"]
-    assert not any(
-        str(item).startswith("CLAUDE_ISOLATION_MODE")
-        for item in main["services"]["gateway"]["environment"]
-    )
+    # Both blue/green colors carry it, so whichever one is active stays in uid mode
+    # (uid mode keeps the single-color restart deploy: scripts/deploy.sh restart).
+    assert set(override["services"]) == {"gateway-blue", "gateway-green"}
+    for name, gateway in override["services"].items():
+        environment = dict(item.split("=", 1) for item in gateway["environment"])
+        assert environment == {
+            "CLAUDE_ISOLATION_MODE": "uid",
+            "CLAUDE_CONFIG_DIR": "/data/claude/shared",
+            "CLAUDE_PLUGIN_CLONE_ROOT": "/data/claude/shared/plugin-marketplaces",
+            "CLAUDE_ISOLATION_CONFIG_BASE": "/data/claude/users",
+            "CLAUDE_ISOLATION_MIGRATE_FROM": "/home/app/.claude",
+        }, name
+        assert gateway["volumes"] == ["claude_isolation:/data/claude"], name
+        # The old shared dir it migrates from is the main file's claude_home.
+        assert "claude_home:/home/app/.claude" in main["services"][name]["volumes"]
+        assert "CLAUDE_ISOLATION_MODE" not in main["services"][name]["environment"]
+    assert "claude_isolation" in override["volumes"]
 
 
 def test_the_override_layout_passes_the_entrypoint_checks(entrypoint):
     environment = dict(
-        item.split("=", 1) for item in _override()["services"]["gateway"]["environment"]
+        item.split("=", 1)
+        for item in _override()["services"]["gateway-blue"]["environment"]
     )
     shared = environment["CLAUDE_CONFIG_DIR"]
     base = environment["CLAUDE_ISOLATION_CONFIG_BASE"]
