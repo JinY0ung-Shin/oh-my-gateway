@@ -101,6 +101,16 @@ def _error(code: str, message: str, kind: str = "api_error") -> Dict[str, Any]:
     return {"error": {"message": message, "type": kind, "code": code}}
 
 
+class _TooLarge(ValueError):
+    """The body outgrew what routing buffers. Carries every byte already read,
+    so the request can still reach the app intact (:class:`_PrefixReplay`)."""
+
+    def __init__(self, prefix: bytes, more_body: bool) -> None:
+        super().__init__("body too large to route")
+        self.prefix = prefix
+        self.more_body = more_body
+
+
 async def _read_body(receive: Receive) -> Optional[bytes]:
     chunks: List[bytes] = []
     size = 0
@@ -109,12 +119,29 @@ async def _read_body(receive: Receive) -> Optional[bytes]:
         if message["type"] == "http.disconnect":
             return None
         chunk = message.get("body", b"")
-        size += len(chunk)
-        if size > _BODY_LIMIT:
-            raise ValueError("body too large to route")
         chunks.append(chunk)
-        if not message.get("more_body"):
+        size += len(chunk)
+        more = bool(message.get("more_body"))
+        if size > _BODY_LIMIT:
+            raise _TooLarge(b"".join(chunks), more)
+        if not more:
             return b"".join(chunks)
+
+
+class _PrefixReplay:
+    """``receive`` that hands the app the bytes routing already consumed, then
+    the rest of the real channel — the app sees the body byte for byte."""
+
+    def __init__(self, prefix: bytes, more_body: bool, receive: Receive) -> None:
+        self._prefix: Optional[bytes] = prefix
+        self._more = more_body
+        self._receive = receive
+
+    async def __call__(self) -> Dict[str, Any]:
+        if self._prefix is not None:
+            prefix, self._prefix = self._prefix, None
+            return {"type": "http.request", "body": prefix, "more_body": self._more}
+        return await self._receive()
 
 
 class _Replay:
@@ -203,8 +230,19 @@ class HandoffMiddleware:
 
         try:
             body = await _read_body(receive)
-        except ValueError:
-            await self.app(scope, receive, send)  # oversized: let the size limit answer
+        except _TooLarge as big:
+            # Too large to buffer for routing (e.g. an upload): serve it here with
+            # the bytes already read put back in front, so the app — and its own
+            # size limits — see the original body. Nothing is forwarded.
+            if drain_state.draining and kind != "session":
+                logger.warning(
+                    "Draining, but %s %s is too large to forward; serving it locally",
+                    method,
+                    path,
+                )
+            await self.app(
+                scope, _PrefixReplay(big.prefix, big.more_body, receive), send
+            )
             return
         if body is None:
             return  # client went away

@@ -196,3 +196,78 @@ async def test_draining_instance_admits_no_session(blue, monkeypatch):
     with pytest.raises(SessionOwnedElsewhere):
         sm.get_or_create_session("cccccccc-2222-3333-4444-555555555555")
     assert sm.sessions == {}
+
+
+# -------------------------------------------------------- middleware body integrity
+
+
+async def _drive(app, path: str, chunks: list, method: str = "POST") -> list:
+    """Run *app* over a request whose body arrives in *chunks*; return the body
+    messages the inner app received."""
+    messages = [
+        {"type": "http.request", "body": c, "more_body": i < len(chunks) - 1}
+        for i, c in enumerate(chunks)
+    ]
+    sent = []
+
+    async def receive():
+        if messages:
+            return messages.pop(0)
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "method": method,
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "headers": [(b"content-type", b"multipart/form-data; boundary=x")],
+        "client": ("10.0.0.9", 1234),
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+@pytest.mark.parametrize("path", ["/api/upload", "/admin/api/files", "/v1/responses"])
+async def test_oversized_body_reaches_the_app_byte_for_byte(blue, monkeypatch, path):
+    """#266 review P1: a body larger than the routing buffer used to lose the
+    chunks already read before the app saw the request."""
+    from src.handoff import middleware as mw
+
+    monkeypatch.setattr(mw, "_BODY_LIMIT", 16)
+    received = bytearray()
+
+    async def inner(scope, receive, send):
+        while True:
+            message = await receive()
+            received.extend(message.get("body", b""))
+            if not message.get("more_body"):
+                break
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    chunks = [bytes([65 + i]) * 5 for i in range(9)]  # 45 bytes, 9 chunks
+    sent = await _drive(mw.HandoffMiddleware(inner), path, chunks)
+    assert bytes(received) == b"".join(chunks)
+    assert sent[0]["status"] == 200
+
+
+async def test_body_that_overflows_on_its_last_chunk_keeps_more_body_false(
+    blue, monkeypatch
+):
+    from src.handoff import middleware as mw
+
+    monkeypatch.setattr(mw, "_BODY_LIMIT", 8)
+    flags = []
+
+    async def inner(scope, receive, send):
+        message = await receive()
+        flags.append((message["body"], message["more_body"]))
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+        await send({"type": "http.response.body", "body": b""})
+
+    await _drive(mw.HandoffMiddleware(inner), "/api/upload", [b"abcd", b"efghijkl"])
+    assert flags == [(b"abcdefghijkl", False)]
