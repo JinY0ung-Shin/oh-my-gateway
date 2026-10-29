@@ -8,13 +8,25 @@ Only values listed in ``EDITABLE_KEYS`` can be changed at runtime.
 Changes take effect on the **next request** — already-running requests
 and already-created sessions are not retroactively affected.
 
+Overrides are persisted to ``data/runtime_config.json`` (``RUNTIME_CONFIG_FILE``
+overrides the path) after every ``set`` / ``reset`` / ``reset_all`` and loaded
+when the module is imported, so a restarted gateway — or the second color of a
+blue/green deploy (docs/zero-downtime-deploy.md §5.5) — starts with the admin's
+overrides instead of the env defaults. Loading never fails startup: an
+unreadable file, an unknown key or a value ``_coerce`` rejects is logged and
+dropped. The file holds no secrets (see ``EDITABLE_KEYS``) but is written 0600
+anyway: only the gateway itself reads it.
+
 Rate limits and timeout are intentionally excluded because slowapi
 caches limit strings at decorator time and the backend captures
 timeout at init time.  Changing those requires a server restart.
 """
 
+import json
 import logging
 import os
+import tempfile
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
@@ -190,17 +202,152 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
 
 
 # ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_FILE_VERSION = 1
+_MAX_FILE_BYTES = 1 << 20
+
+# The JSON type a persisted value must already have (the file is written from
+# coerced values, so anything else was edited by hand or by another build).
+_JSON_TYPES = {"int": int, "bool": bool, "string": str}
+
+
+def runtime_config_path() -> Path:
+    raw = os.getenv("RUNTIME_CONFIG_FILE", "").strip()
+    return Path(raw) if raw else _DATA_DIR / "runtime_config.json"
+
+
+# ---------------------------------------------------------------------------
 # RuntimeConfig singleton
 # ---------------------------------------------------------------------------
 
 
 class RuntimeConfig:
-    """Thread-safe runtime configuration store."""
+    """Thread-safe runtime configuration store.
 
-    def __init__(self) -> None:
+    With ``persist=True`` (the module singleton) every change is written to
+    :func:`runtime_config_path` and :meth:`load` reads it back. A bare
+    ``RuntimeConfig()`` stays memory-only.
+    """
+
+    def __init__(self, persist: bool = False) -> None:
         self._overrides: Dict[str, Any] = {}
         self._lock = Lock()
         self._listeners: List[Callable[[Optional[str]], None]] = []
+        self._persist = persist
+
+    def _save_locked(self) -> None:
+        """Write the overrides atomically. Caller holds ``self._lock``.
+
+        A failed write is logged, never raised: the override is already live in
+        this process, it just will not survive a restart.
+        """
+        if not self._persist:
+            return
+        path = runtime_config_path()
+        body = json.dumps(
+            {"version": _FILE_VERSION, "overrides": self._overrides},
+            indent=2,
+            sort_keys=True,
+        )
+        tmp = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # mkstemp creates the file 0600.
+            fd, tmp = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            tmp = None
+        except OSError as exc:
+            logger.error(
+                "Runtime config overrides not persisted to %s (%s); they are "
+                "live in this process but will not survive a restart",
+                path,
+                exc,
+            )
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _read_file(path: Path) -> Dict[str, Any]:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(_MAX_FILE_BYTES + 1)
+        if len(raw) > _MAX_FILE_BYTES:
+            raise ValueError(f"larger than {_MAX_FILE_BYTES} bytes")
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("overrides"), dict):
+            raise ValueError("expected an object with an 'overrides' object")
+        if data.get("version") != _FILE_VERSION:
+            raise ValueError(f"unsupported version {data.get('version')!r}")
+        return data["overrides"]
+
+    def load(self) -> None:
+        """Replace the overrides with the persisted ones (startup).
+
+        Keys no longer editable and values that fail validation are logged and
+        dropped; the file is not rewritten here (the next change does that), so
+        another build sharing the file keeps its entries until then. Listeners
+        are notified like a ``reset_all`` so cached values pick the result up.
+        """
+        if not self._persist:
+            return
+        path = runtime_config_path()
+        try:
+            stored = self._read_file(path)
+        except FileNotFoundError:
+            return
+        except (OSError, ValueError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "Runtime config file %s ignored (%s); starting without "
+                "persisted overrides",
+                path,
+                exc,
+            )
+            return
+        loaded: Dict[str, Any] = {}
+        for key, value in stored.items():
+            meta = EDITABLE_KEYS.get(key)
+            if meta is None:
+                logger.warning("Runtime config file: unknown key %r dropped", key)
+                continue
+            expected = _JSON_TYPES[meta["type"]]
+            # bool is an int subclass: an int key must not accept true/false.
+            if not isinstance(value, expected) or (
+                expected is int and isinstance(value, bool)
+            ):
+                logger.warning(
+                    "Runtime config file: %s has a %s, expected %s; dropped",
+                    key,
+                    type(value).__name__,
+                    meta["type"],
+                )
+                continue
+            try:
+                loaded[key] = self._coerce(key, value)
+            except (TypeError, ValueError) as exc:
+                logger.warning("Runtime config file: %s dropped (%s)", key, exc)
+        with self._lock:
+            self._overrides = loaded
+        if loaded:
+            logger.info(
+                "Runtime config: loaded %d persisted override(s) from %s: %s",
+                len(loaded),
+                path,
+                ", ".join(sorted(loaded)),
+            )
+        self._notify(None)
 
     def on_change(self, listener: Callable[[Optional[str]], None]) -> None:
         """Call *listener* with the changed key (``None`` = all) after a change.
@@ -232,6 +379,7 @@ class RuntimeConfig:
         coerced = self._coerce(key, value)
         with self._lock:
             self._overrides[key] = coerced
+            self._save_locked()
         logger.info(f"Runtime config updated: {key} = {coerced!r}")
         self._notify(key)
 
@@ -249,6 +397,7 @@ class RuntimeConfig:
             raise KeyError(f"Key '{key}' is not editable at runtime")
         with self._lock:
             self._overrides.pop(key, None)
+            self._save_locked()
         logger.info(f"Runtime config reset: {key}")
         self._notify(key)
 
@@ -256,6 +405,7 @@ class RuntimeConfig:
         """Remove all runtime overrides."""
         with self._lock:
             self._overrides.clear()
+            self._save_locked()
         logger.info("Runtime config: all overrides cleared")
         self._notify(None)
 
@@ -374,7 +524,8 @@ class RuntimeConfig:
 # Convenience getters — import these instead of raw constants
 # ---------------------------------------------------------------------------
 
-runtime_config = RuntimeConfig()
+runtime_config = RuntimeConfig(persist=True)
+runtime_config.load()
 
 
 def get_default_model() -> str:
