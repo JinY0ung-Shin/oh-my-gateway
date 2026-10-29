@@ -222,8 +222,8 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 - 전달하는 쪽은 전달마다 새 dispatch id를 단다: `x-gateway-dispatch-id: <대상 boot id>.<발급 시각 ms>.<무작위 128비트>`.
   `boot id`는 대상 프로세스가 기동 때 만든 값(`/internal/ping`과 instance 등록에 실린다). 같은 원 요청의 재판정 loop 안에서는
   새로 보낼 때마다 새 id다. 두 색은 같은 호스트라 같은 시계를 쓴다(발급 시각을 대상이 잰다).
-- **받아들이기(admission)**: 소유자는 본문을 다 받은 뒤, 세션 잠금 안에서 턴 시작과 한 번에 ledger에 `id → admitted`를
-  적는다. 다음이면 받아들이지 않고 `refused`를 적은 뒤 거절한다(전달하는 쪽은 "받지 않음"으로 보고 재판정한다):
+- **받아들이기(admission)**: 소유자는 본문을 다 받은 뒤, 세션 잠금과 **ledger 잠금**(settle과 같은 잠금) 안에서 턴 시작과
+  한 번에 ledger에 `id → admitted`를 적는다 — settle과 admission이 같은 id에 대해 동시에 일어나도 한쪽만 이긴다. 다음이면 받아들이지 않고 `refused`를 적은 뒤 거절한다(전달하는 쪽은 "받지 않음"으로 보고 재판정한다):
   - id의 boot id가 자기 것이 아님(다른 프로세스 앞으로 보낸 요청),
   - 발급 시각이 `DISPATCH_ACCEPT_WINDOW`(기본 `HANDOFF_DEADLINE`, 10s)보다 오래됨 — 늦게 도착한 요청은 ledger에 흔적이
     없어도 절대 받아들여지지 않는다,
