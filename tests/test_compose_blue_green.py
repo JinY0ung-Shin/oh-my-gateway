@@ -81,7 +81,7 @@ def test_both_colors_share_state_volumes_and_env():
         assert "${PLUGIN_SOURCES_HOST_DIR:-./plugins}:/data/plugins:ro" in volumes
         assert svc["env_file"] == [".env"]
         assert svc["environment"]["ADMIN_API_KEY"].startswith("${ADMIN_API_KEY:?")
-        assert svc["stop_grace_period"] == "35s"
+        assert svc["stop_grace_period"] == "60s"
         assert svc["hostname"] == "${GATEWAY_CONTAINER_HOSTNAME:-agent-sandbox}"
         assert svc["depends_on"]["gateway-log"]["required"] is False
         assert "gateway_build_install_script" in svc["build"]["secrets"]

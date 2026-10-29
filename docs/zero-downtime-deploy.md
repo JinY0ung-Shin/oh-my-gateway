@@ -115,7 +115,7 @@
    `DRAIN_TIMEOUT_SECONDS`(기본 3600)을 넘기면 남은 것을 보여 주고 멈춘다 — 강제로 내릴지는 운영자가 정한다
    (`--force`).
 7. **정지** — blue에 SIGTERM. 이때는 열린 연결이 없으므로 lifespan 종료(세션 disconnect)가 곧바로 돈다.
-   `stop_grace_period`는 lifespan 종료만 덮으면 된다(지금의 35s 유지). 마지막으로 drain 동안 보존한 옛 플러그인
+   `stop_grace_period`는 lifespan 종료만 덮으면 된다(60s — `docker stop`만 한 경우의 graceful 25s + lifespan 종료도 덮는다). 마지막으로 drain 동안 보존한 옛 플러그인
    트리를 치운다([§5.4](#54-기동-시-공유-파일-플러그인)).
 
 drain(4)을 전환(5)보다 **먼저** 하는 이유: 전환을 먼저 하면 green이 받은 다음 턴이 blue가 아직 쥔 쉬는 세션과 부딪힌다.
@@ -297,17 +297,20 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
    `.old-*`로 옮긴다. 옛 색(drain 중)의 CLI는 그 경로를 이미 연 fd로만 옛 내용을 보고, 경로로 새로 여는 것은 새 트리다 —
    drain 동안 옛 색의 세션이 새 플러그인 내용을 볼 수 있다는 뜻이고, 이것은 받아들인다(세션 시작 때 읽는 정의는 이미
    읽혀 있다). 지워지면 안 되는 것은 `.old-*` 자체다(옛 fd·cwd가 그 안을 가리킨다):
-   - `OLD_GRACE_SECONDS`(600)를 env `PLUGIN_OLD_GRACE_SECONDS`로 열고, deploy 중에는 `DRAIN_TIMEOUT_SECONDS` 이상이
-     되게 한다. 또는 drain 중인 instance가 살아 있는 동안 `_sweep`이 `.old-*`를 지우지 않게 한다(instance 잠금으로 판정) —
-     구현 PR에서 둘 중 하나로 정한다.
-   - deploy 스크립트는 7단계(옛 색 정지) 뒤에 `.old-*`를 치운다.
+   - **정한 방식**: 다른 instance가 살아 있는 동안(그 instance 잠금이 잡혀 있는 동안, 판정이 안 되면 살아 있다고 본다)
+     `_sweep`은 `.old-*`를 나이와 상관없이 지우지 않는다. grace 길이(600초)는 그대로다. `install_plugins.py`가 기동할 때마다,
+     다른 instance가 없을 때만 grace가 지난 `.old-*`를 치운다(best effort).
    - grace의 시작점은 #264가 이미 맞춰 두었다: `_publish`가 옛 트리를 `.old-*`로 옮긴 직후 `os.utime(old)`로 mtime을
-     찍고(`src/plugin_local_copy.py` 363–364), `_sweep`이 그 mtime으로 잰다 — 600초는 게시 시점부터다. 남는 문제는
-     **길이**뿐이다: grace 600초 < drain 최대 3600초.
-   - **확인할 것**: `claude plugin update`가 `plugins/cache/<mp>/<plugin>/<옛 버전>`을 지우는지. 지운다면 옛 색의 CLI가
-     그 경로를 참조하므로, replay 잠금 안에서 update가 지우려는 옛 버전을 drain이 끝날 때까지 남기는 방법이 필요하다.
-4. **`_tmp_` 정리**: 익명 워크스페이스 이름에 instance를 넣거나(`_tmp_<instance>_…`), 기동 정리가 다른 살아 있는 instance의
-   것을 건드리지 않게 한다. 다른 색이 내려간 뒤 남은 것은 다음 기동 정리가 치운다.
+     찍고(`src/plugin_local_copy.py`), `_sweep`이 그 mtime으로 잰다.
+   - **확인함**: `claude plugin update`(번들 CLI 2.1.283)는 옛 버전 디렉터리를 바로 지우지 않는다 — 0.1.0→0.2.0→0.3.0
+     갱신 뒤 세 버전이 모두 `plugins/cache/<mp>/<plugin>/` 아래 남고, 밀려난 버전에는 `.orphaned_at` 표시가 붙는다. CLI는
+     기동마다 표시가 14일 지난 버전만 지우고, 살아 있는 세션이 쓰는 버전은 건너뛴다(코드 확인, 14일·live-session 판정은 직접
+     실행해 보지 않음). drain(최대 3600초) 동안 옛 색이 쓰는 버전이 지워지지 않으므로 따로 지킬 것이 없다.
+   - 구현: replay 잠금·digest·옛 트리 판정은 `src/plugin_local_copy.py`(표준 라이브러리만 쓰는 `install_plugins.py`가 옆에서
+     불러 쓴다), 관리자 경로 잠금은 `src/plugin_admin_service.py`(worker thread에서), 테스트는 `tests/test_plugin_replay.py`.
+4. **`_tmp_` 정리**: `GATEWAY_INSTANCE`가 있으면 익명 워크스페이스 이름이 `_tmp_<instance>_<hex>`다. 다른 instance가 살아
+   있는 동안 기동 정리는 자기 접두어만(나이 조건 그대로) 지우고, 다른 instance가 없을 때만 모든 `_tmp_`를 본다(uid 모드의
+   "나이 무관" 첫 정리도 그때만). 다른 색이 내려간 뒤 남은 것은 다음 기동 정리가 치운다.
 5. **entrypoint의 chown**: 같은 uid로 다시 소유권을 맞추는 것이라 두 색이 함께 돌아도 안전하다(시간만 든다).
 
 ### 5.5 관리자 상태

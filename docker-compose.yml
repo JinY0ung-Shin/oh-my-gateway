@@ -27,8 +27,11 @@ x-gateway: &gateway
   # grandchildren in the cgroup — the reason `docker restart` used to leak
   # workers while only `compose down && up` recovered (issue #147).
   # scripts/deploy.sh stops a color only after its drain finished, so this
-  # grace only has to cover the lifespan shutdown.
-  stop_grace_period: 35s
+  # grace only has to cover the lifespan shutdown. A plain `docker stop` with
+  # streams still open is bounded too: uvicorn waits at most
+  # --timeout-graceful-shutdown (25s, Dockerfile CMD) for them, then runs the
+  # lifespan shutdown (capped CLI disconnects, ~20s) — 60s covers both.
+  stop_grace_period: 60s
   # The agent's tools run inside this container, so whatever `hostname`
   # returns can reach the model. Docker's default is the container id; a fixed
   # neutral name means a leaked value says nothing about the real host. The
