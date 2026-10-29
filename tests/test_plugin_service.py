@@ -923,6 +923,81 @@ class TestLocalMarketplaceSources:
         assert [p["name"] for p in entry["plugins"]] == ["example-plugin"]
 
 
+class TestAnchorSymlinks:
+    """An anchor that is itself a link admits nothing; a link above it is
+    fine (#263). The parent walk used to stop at the anchor before checking
+    it, so ``PLUGIN_SOURCES_DIR``/clone root/``marketplaces``/``cache`` as a
+    link let the catalog read wherever it pointed."""
+
+    @pytest.fixture
+    def env(self, plugins_dir, monkeypatch, tmp_path):
+        monkeypatch.delenv("PLUGIN_SOURCES_DIR", raising=False)
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(tmp_path / "no-clones"))
+        with patch("src.plugin_manifest.list_marketplace_records", return_value={}):
+            yield tmp_path
+
+    def _mkt(self, root: Path) -> Path:
+        loc = root / "mkt"
+        loc.mkdir(parents=True)
+        return loc
+
+    def test_a_linked_sources_root_is_refused(self, env, monkeypatch):
+        self._mkt(env / "elsewhere")
+        (env / "sources").symlink_to(env / "elsewhere")
+        monkeypatch.setenv("PLUGIN_SOURCES_DIR", str(env / "sources"))
+        assert _validate_marketplace_path(env / "sources" / "mkt") is None
+
+    def test_a_linked_clone_root_is_refused(self, env, monkeypatch):
+        self._mkt(env / "elsewhere")
+        (env / "clones").symlink_to(env / "elsewhere")
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(env / "clones"))
+        assert _validate_marketplace_path(env / "clones" / "mkt") is None
+
+    def test_a_linked_marketplaces_dir_is_refused(self, env, tmp_path):
+        plugins = tmp_path / "linked-plugins"
+        plugins.mkdir()
+        self._mkt(tmp_path / "elsewhere")
+        (plugins / "marketplaces").symlink_to(tmp_path / "elsewhere")
+        with patch("src.plugin_service._plugins_root", return_value=plugins):
+            loc = plugins / "marketplaces" / "mkt"
+            assert _validate_marketplace_path(loc) is None
+
+    def test_a_linked_cache_dir_is_refused(self, tmp_path):
+        plugins = tmp_path / "linked-plugins"
+        plugins.mkdir()
+        (tmp_path / "elsewhere" / "p" / "1.0").mkdir(parents=True)
+        (plugins / "cache").symlink_to(tmp_path / "elsewhere")
+        with patch("src.plugin_service._plugins_root", return_value=plugins):
+            assert _validate_install_path(plugins / "cache" / "p" / "1.0") is None
+
+    def test_a_link_below_the_anchor_back_to_it_is_refused(self, env, monkeypatch):
+        sources = env / "sources"
+        self._mkt(sources)
+        (sources / "again").symlink_to(".")
+        monkeypatch.setenv("PLUGIN_SOURCES_DIR", str(sources))
+        loc = sources / "mkt"
+        assert _validate_marketplace_path(loc) == loc.resolve()
+        assert _validate_marketplace_path(sources / "again" / "mkt") is None
+
+    def test_a_link_above_the_anchor_is_fine(self, env, monkeypatch):
+        """e.g. ``/home -> /data/home``: only the anchor and below are checked."""
+        self._mkt(env / "real" / "sources")
+        (env / "up").symlink_to(env / "real")
+        monkeypatch.setenv("PLUGIN_SOURCES_DIR", str(env / "up" / "sources"))
+        loc = env / "up" / "sources" / "mkt"
+        assert _validate_marketplace_path(loc) == loc.resolve()
+
+    def test_an_exact_manifest_source_under_a_linked_ancestor(self, env):
+        loc = self._mkt(env / "real" / "srv")
+        (env / "up").symlink_to(env / "real")
+        linked = env / "up" / "srv" / "mkt"
+        records = {"mkt": {"repo": str(linked), "branch": "main"}}
+        with patch(
+            "src.plugin_manifest.list_marketplace_records", return_value=records
+        ):
+            assert _validate_marketplace_path(linked) == loc.resolve()
+
+
 # ---------------------------------------------------------------------------
 # list_marketplace_plugins
 # ---------------------------------------------------------------------------

@@ -411,37 +411,43 @@ def prepare_repo(entry: PluginEntry, root: Path) -> Path:
     """Return the local marketplace path for *entry*, fresh-cloning if remote.
 
     Local-path repos are used in place (``entry.branch`` is ignored). Remote
-    repos are removed and freshly cloned from ``entry.branch`` every run so the
-    latest marketplace content is always on disk.
+    repos are freshly cloned from ``entry.branch`` every run so the latest
+    marketplace content is always on disk, into a fresh staging dir published
+    by ``plugin_local_copy.replace_tree`` (#262): serialized with an admin
+    refresh of the same clone, swapped in atomically, and a failed re-clone or
+    swap leaves the previous clone (and its registered installLocation) intact.
     """
     if Path(entry.repo).exists():
         return _local_copy(entry, root)
 
+    lc = _load_local_copy()
+    if lc is None:
+        raise OSError("plugin_local_copy.py is missing beside install_plugins.py")
     dest = _clone_dir(root, entry.repo)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    # Clone into a staging dir and swap it in only on success, so a failed
-    # re-clone leaves any previous clone (and its registered marketplace
-    # installLocation) intact rather than dangling at a deleted path.
-    staging = dest.with_name(dest.name + ".new")
-    if staging.exists():
-        shutil.rmtree(staging)
-    log(f"{entry.source_label}: fresh-cloning {entry.repo} (branch {entry.branch}) -> {dest}")
-    run(
-        [
-            "git",
-            "clone",
-            "--depth",
-            "1",
-            "--branch",
-            entry.branch,
-            entry.repo,
-            str(staging),
-        ],
-        token=entry.git_token,
+    log(
+        f"{entry.source_label}: fresh-cloning {entry.repo} "
+        f"(branch {entry.branch}) -> {dest}"
     )
-    if dest.exists():
-        shutil.rmtree(dest)
-    os.replace(staging, dest)
+
+    def clone(staging: Path) -> None:
+        run(
+            [
+                "git",
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                entry.branch,
+                entry.repo,
+                str(staging),
+            ],
+            token=entry.git_token,
+        )
+
+    try:
+        lc.replace_tree(dest, clone)
+    except lc.LocalCopyError as exc:
+        raise OSError(str(exc)) from exc
     return dest
 
 

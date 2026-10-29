@@ -41,7 +41,7 @@ import stat
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -236,36 +236,51 @@ def copy_marketplace(
 ) -> List[str]:
     """Copy the marketplace at *source* to *dest* and publish it there.
 
-    One copy per *dest* at a time (an ``flock`` on ``<dest>.lock``, so an admin
-    refresh and the startup replay never interleave), staged in a fresh
-    ``<dest>.new-*`` dir of its own, then swapped in by :func:`_publish`: a
-    failure at any step leaves the copy *dest* holds now, and a reader of
-    *dest* sees the old tree or the new one, never a partial one. Returns the
+    Published by :func:`replace_tree`: a failure at any step leaves the copy
+    *dest* holds now, and a reader of *dest* never sees a partial one. Returns the
     relative paths skipped (links out of the tree, hard links, special files).
     Raises :class:`LocalCopyError` for a refused source or a cap."""
     problem = source_problem(source, app_root=app_root, env=env)
     if problem:
         raise LocalCopyError(f"refusing to copy the local marketplace: {problem}")
+    budget = _Budget(max_files, max_bytes)
+
+    def fill(staging: Path) -> None:
+        src_fd = os.open(_real(source), _DIR_FLAGS)
+        try:
+            _copy_dir(src_fd, str(staging), "", budget, 0)
+        finally:
+            os.close(src_fd)
+
+    replace_tree(dest, fill)
+    return budget.skipped
+
+
+def replace_tree(dest, fill: Callable[[Path], None]) -> None:
+    """Build a new tree with *fill* and publish it at *dest*.
+
+    The one way a marketplace tree in the clone root is replaced — a local
+    copy (:func:`copy_marketplace`) and a remote ``git clone`` (#262) alike.
+    One build per *dest* at a time (an ``flock`` on ``<dest>.lock``, across
+    processes: an admin refresh, the auto-refresh and the startup replay never
+    interleave). *fill* gets a fresh, empty ``<dest>.new-*`` dir of its own,
+    which is then swapped in by :func:`_publish`: a failure at any step leaves
+    the tree *dest* holds now, and a reader of *dest* sees the old tree or the
+    new one, never a partial one."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     with _locked(dest):
         _sweep(dest)
         staging = Path(tempfile.mkdtemp(prefix=dest.name + _NEW, dir=dest.parent))
-        budget = _Budget(max_files, max_bytes)
         committed: List[bool] = []
         try:
-            src_fd = os.open(_real(source), _DIR_FLAGS)
-            try:
-                _copy_dir(src_fd, str(staging), "", budget, 0)
-            finally:
-                os.close(src_fd)
+            fill(staging)
             os.chmod(staging, 0o755)  # mkdtemp made it 0700
             _publish(staging, dest, committed)
         except BaseException:
             if not committed:  # after the exchange, staging holds the old tree
                 _remove(staging)
             raise
-    return budget.skipped
 
 
 # Sibling names beside a copy: its lock, staging dirs and replaced trees.
@@ -360,6 +375,7 @@ def _sweep(dest: Path) -> None:
     """Remove replaced trees past their grace and staging dirs a dead copy
     left. Runs under the lock, so no live copy's staging dir is touched."""
     now = time.time()
+    _remove(dest.with_name(dest.name + ".new"))  # the pre-#262 fixed name
     for entry in dest.parent.iterdir():
         name = entry.name
         if name.startswith(dest.name + _OLD):
