@@ -820,6 +820,109 @@ class TestValidateMarketplacePath:
         assert _validate_marketplace_path(outside) is None
 
 
+class TestLocalMarketplaceSources:
+    """Marketplaces registered in place from a local source (#258, #260).
+
+    The compose file mounts local sources at ``/data/plugins`` and sets
+    ``PLUGIN_SOURCES_DIR``; the admin page registers such a source in place
+    and records its path in the manifest. The catalog used to accept only
+    ``plugins/marketplaces`` and the clone root, so it showed none of their
+    plugins (every lookup logged "outside allowed roots").
+    """
+
+    @pytest.fixture
+    def sources(self, plugins_dir, monkeypatch):
+        root = plugins_dir.parent / "data-plugins"
+        root.mkdir()
+        monkeypatch.setenv("PLUGIN_SOURCES_DIR", str(root))
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(plugins_dir / "clones"))
+        with patch("src.plugin_manifest.list_marketplace_records", return_value={}):
+            yield root
+
+    def test_a_marketplace_under_the_sources_root_is_accepted(self, sources):
+        loc = sources / "example-marketplace"
+        loc.mkdir()
+        assert _validate_marketplace_path(loc) == loc.resolve()
+
+    def test_a_sibling_of_the_root_is_still_rejected(self, sources):
+        sibling = sources.parent / "data-plugins-evil"
+        sibling.mkdir()
+        assert _validate_marketplace_path(sibling) is None
+
+    def test_links_under_the_new_root_are_rejected(self, sources, tmp_path):
+        real = tmp_path / "elsewhere" / "mkt"
+        real.mkdir(parents=True)
+        (sources / "leaf-link").symlink_to(real)
+        assert _validate_marketplace_path(sources / "leaf-link") is None
+        (sources / "dir-link").symlink_to(real.parent)
+        assert _validate_marketplace_path(sources / "dir-link" / "mkt") is None
+
+    @pytest.mark.parametrize("value", ["/", "relative/plugins", "   "])
+    def test_a_root_or_relative_value_admits_nothing(
+        self, plugins_dir, monkeypatch, value
+    ):
+        from src.claude_config_paths import plugin_sources_dir
+
+        monkeypatch.setenv("PLUGIN_SOURCES_DIR", value)
+        assert plugin_sources_dir() is None
+
+    def test_a_manifest_local_source_is_accepted_exactly(
+        self, plugins_dir, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv("PLUGIN_SOURCES_DIR", raising=False)
+        monkeypatch.setenv("CLAUDE_PLUGIN_CLONE_ROOT", str(plugins_dir / "clones"))
+        source = tmp_path / "srv" / "mkt"
+        (source / "nested").mkdir(parents=True)
+        (tmp_path / "srv" / "other").mkdir()
+        records = {"mkt": {"repo": str(source), "branch": "main", "scope": "user"}}
+        with patch(
+            "src.plugin_manifest.list_marketplace_records", return_value=records
+        ):
+            assert _validate_marketplace_path(source) == source.resolve()
+            assert _validate_marketplace_path(source / "nested") is None
+            assert _validate_marketplace_path(tmp_path / "srv" / "other") is None
+
+    def test_a_remote_manifest_record_admits_nothing(self, plugins_dir, monkeypatch):
+        monkeypatch.delenv("PLUGIN_SOURCES_DIR", raising=False)
+        records = {"r": {"repo": "https://example.com/r.git", "branch": "main"}}
+        with patch(
+            "src.plugin_manifest.list_marketplace_records", return_value=records
+        ):
+            assert _validate_marketplace_path(Path("/tmp")) is None
+
+    def test_the_catalog_lists_a_directory_marketplace(self, plugins_dir, sources):
+        loc = sources / "example-marketplace"
+        (loc / ".claude-plugin").mkdir(parents=True)
+        (loc / ".claude-plugin" / "marketplace.json").write_text(
+            json.dumps(
+                {
+                    "name": "example-marketplace",
+                    "plugins": [
+                        {"name": "example-plugin", "source": "./example-plugin"}
+                    ],
+                }
+            )
+        )
+        (plugins_dir / "known_marketplaces.json").write_text(
+            json.dumps(
+                {
+                    "example-marketplace": {
+                        "source": {"source": "directory", "path": str(loc)},
+                        "installLocation": str(loc),
+                        "lastUpdated": "2026-10-29T00:00:00Z",
+                    }
+                }
+            )
+        )
+        (entry,) = [
+            m
+            for m in get_marketplaces_with_plugins()
+            if m["name"] == "example-marketplace"
+        ]
+        assert entry["plugin_count"] == 1
+        assert [p["name"] for p in entry["plugins"]] == ["example-plugin"]
+
+
 # ---------------------------------------------------------------------------
 # list_marketplace_plugins
 # ---------------------------------------------------------------------------

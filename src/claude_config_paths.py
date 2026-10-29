@@ -43,6 +43,9 @@ from typing import Optional
 
 CONFIG_DIR_ENV = "CLAUDE_CONFIG_DIR"
 PLUGIN_CLONE_ROOT_ENV = "CLAUDE_PLUGIN_CLONE_ROOT"
+# Where operators keep local marketplace sources registered in place (#258,
+# #260): the compose file mounts them at /data/plugins and sets this.
+PLUGIN_SOURCES_DIR_ENV = "PLUGIN_SOURCES_DIR"
 # uid mode only: where the per-uid config dirs live (``<base>/<uid>``).
 CONFIG_BASE_ENV = "CLAUDE_ISOLATION_CONFIG_BASE"
 # uid mode only: the config dir whose ``projects/<name>`` a named user's first
@@ -145,6 +148,18 @@ def plugin_clone_root() -> Path:
     if configured:
         return Path(configured)
     return _home() / _CONFIG_DIR_NAME / _PLUGIN_MARKETPLACES
+
+
+def plugin_sources_dir() -> Optional[Path]:
+    """The local marketplace source root (``$PLUGIN_SOURCES_DIR``), or ``None``
+    when unset, relative, or resolving to ``/`` (which would admit every
+    path)."""
+    configured = os.environ.get(PLUGIN_SOURCES_DIR_ENV, "").strip()
+    if not configured or not os.path.isabs(configured):
+        return None
+    if os.path.realpath(configured) == "/":
+        return None
+    return Path(configured)
 
 
 @dataclass(frozen=True)
