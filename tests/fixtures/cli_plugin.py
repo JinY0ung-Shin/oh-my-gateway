@@ -27,11 +27,13 @@ def install_plugin(
     marketplace: str = "testmkt",
     hooks: Optional[Dict[str, Any]] = None,
     skill: Optional[str] = None,
+    bins: Optional[Dict[str, str]] = None,
 ) -> str:
     """Write a local marketplace with one plugin under *root*, install it.
 
     *hooks* becomes the plugin's ``hooks/hooks.json`` ``hooks`` object; *skill*
-    adds ``skills/<skill>/SKILL.md``. Returns the plugin id.
+    adds ``skills/<skill>/SKILL.md``; *bins* maps names to the bodies of
+    executable ``bin/<name>`` scripts. Returns the plugin id.
     """
     root = Path(root).resolve()
     for var in ("HOME", "CLAUDE_CONFIG_DIR"):
@@ -62,6 +64,11 @@ def install_plugin(
         (plugin / "skills" / skill / "SKILL.md").write_text(
             f"---\nname: {skill}\ndescription: test skill\n---\nbody\n"
         )
+
+    for tool, body in (bins or {}).items():
+        (plugin / "bin").mkdir(exist_ok=True)
+        (plugin / "bin" / tool).write_text(body)
+        (plugin / "bin" / tool).chmod(0o755)
 
     plugin_id = f"{name}@{marketplace}"
     child_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), **env}

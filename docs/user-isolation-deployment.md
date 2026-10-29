@@ -103,7 +103,7 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 - **`~/.gitconfig`·`~/.config/git`은 읽히지 않는다.** git은 워크스페이스별 `<워크스페이스>/.cli-tmp/gitconfig`를 전역 설정으로 쓴다. 운영 전역 git 설정은 `/etc/gitconfig`에 둔다.
 - **플러그인:**
   - landlock 모드에서는 `~/.claude/plugins/data`가 읽기 전용이다. 훅은 돌지만 그 안에 쓰는 것은 실패한다. uid 모드에서는 사용자별 config dir에 쓸 수 있다.
-  - 플러그인의 `bin/`이 Bash `PATH`에 오르지 않는다.
+  - 플러그인의 `bin/`은 Bash `PATH`의 **맨 뒤**에 붙는다(#267). 시스템 명령과 이름이 같은 플러그인 도구는 시스템 쪽이 먼저 실행된다. user 스코프로 설치하고 켠(`enabledPlugins`) 플러그인만 해당하며, project·local 스코프 플러그인은 붙지 않는다. 새로 설치한 플러그인은 다음 세션부터 PATH에 들어간다.
   - **로컬 마켓플레이스 소스는 `/data/plugins` 아래에 둔다.** 기본 Compose가 호스트의 `./plugins`(`PLUGIN_SOURCES_HOST_DIR`)를 `/data/plugins`에 읽기 전용으로 마운트한다. 관리자 화면에서 `/data/plugins/<마켓플레이스>`로 추가하면 그 자리가 그대로 등록된다. Compose가 설정하는 `PLUGIN_SOURCES_DIR=/data/plugins`는 관리자 카탈로그가 이 아래 마켓플레이스의 플러그인 목록을 읽게 한다(#260). 이 디렉터리와 clone 루트는 심볼릭 링크가 아닌 실제 디렉터리여야 한다. 링크이면 카탈로그가 그 아래를 읽지 않는다(#263). 그보다 위의 경로(예: `/home -> /data/home`)는 링크여도 된다.
   - **`/app` 아래(예: `/app/data/plugins/...`)에 둔 소스는 사본으로 등록된다(#258).** `/app`은 세션에 절대 열리지 않는다. 워크스페이스 base·임시 디렉터리 아래도 같다. 그래서 게이트웨이는 이런 로컬 경로를 clone 루트(`CLAUDE_PLUGIN_CLONE_ROOT`, uid 모드에서는 `/data/claude/shared/plugin-marketplaces`)로 복사하고, 그 사본을 등록한다.
     - manifest에는 원래 경로가 남는다. 기동할 때마다, 그리고 관리자 화면의 refresh 때마다 다시 복사한다. 원본을 고친 내용은 그때 반영된다.

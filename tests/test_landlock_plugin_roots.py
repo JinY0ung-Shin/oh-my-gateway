@@ -139,3 +139,79 @@ def test_an_admin_install_carries_the_warning(layout):
 
     _register(cfg)
     assert "warnings" not in pas._with_confinement_warnings({"status": "added"})
+
+
+# --- plugin bin/ on a confined spawn's PATH (#267) ---------------------------
+
+
+def _install(cfg, plugins, enabled):
+    """*plugins*: id -> (scope, installPath); *enabled*: id -> bool."""
+    (cfg / "settings.json").write_text(json.dumps({"enabledPlugins": enabled}))
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    pid: [{"scope": scope, "installPath": str(path)}]
+                    for pid, (scope, path) in plugins.items()
+                },
+            }
+        )
+    )
+
+
+def _plugin(root, name):
+    (root / name / "bin").mkdir(parents=True)
+    return root / name
+
+
+def test_only_enabled_user_scope_bins_are_listed(layout):
+    cfg, _inside, outside = layout
+    on = _plugin(outside, "on")
+    off = _plugin(outside, "off")
+    proj = _plugin(outside, "proj")
+    nobin = outside / "nobin"
+    nobin.mkdir()
+    _install(
+        cfg,
+        {
+            "on@m": ("user", on),
+            "off@m": ("user", off),
+            "proj@m": ("project", proj),
+            "nobin@m": ("user", nobin),
+        },
+        {"on@m": True, "off@m": False, "proj@m": True, "nobin@m": True},
+    )
+    assert landlock.enabled_plugin_bin_dirs() == [str(on / "bin")]
+
+
+def test_bins_are_appended_and_only_when_granted(layout, monkeypatch):
+    cfg, inside, outside = layout
+    granted = _plugin(outside, "granted")
+    (inside / "refused" / "bin").mkdir(parents=True)
+    _install(
+        cfg,
+        {"g@m": ("user", granted), "r@m": ("user", inside / "refused")},
+        {"g@m": True, "r@m": True},
+    )
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    env = landlock._plugin_path_env([str(outside)])
+    # Last, so no plugin shadows the CLI's own shell, git or rg lookups.
+    assert env == {"PATH": f"/usr/bin:/bin:{granted / 'bin'}"}
+    assert landlock._plugin_path_env([]) == {}
+
+
+def test_a_bin_dir_with_a_path_separator_is_dropped(layout, monkeypatch):
+    cfg, _inside, outside = layout
+    odd = _plugin(outside, "a:b")
+    _install(cfg, {"odd@m": ("user", odd)}, {"odd@m": True})
+    assert landlock._plugin_path_env([str(outside)]) == {}
+
+
+def test_options_env_carries_the_path(layout, monkeypatch, tmp_path):
+    cfg, _inside, outside = layout
+    tool = _plugin(outside, "tool")
+    _install(cfg, {"tool@m": ("user", tool)}, {"tool@m": True})
+    monkeypatch.setattr(landlock, "_ro_rw_roots", lambda *a, **k: ([str(outside)], []))
+    env = landlock.options_env(tmp_path / "ws")
+    assert env["PATH"].split(":")[-1] == str(tool / "bin")
