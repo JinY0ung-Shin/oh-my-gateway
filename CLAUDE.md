@@ -624,6 +624,22 @@ uv run pytest --cov=src                            # with coverage
   looks into session-writable trees uses `lstat` and catches `OSError`. Rollback to landlock/off
   keeps U's ordinary (0666/0777) workspace files usable by the app uid through the ACL; its
   0600/0700 files and the transcripts in `P` stay closed (those sessions are not resumed).
+- Blue/green zero-downtime deploy (`docs/zero-downtime-deploy.md`, `scripts/deploy.sh`,
+  `docker-compose.yml` `gateway-blue`/`gateway-green` + `gateway-proxy` nginx) is **off unless
+  `GATEWAY_INSTANCE` is set**; a single container behaves as before. With it: `src/instance_registry.py`
+  (name, `BOOT_ID`, liveness `flock` on `data/instances/<name>.lock`, HMAC key `data/instance_secret`);
+  `src/handoff/` — a session holds `data/session-owners/<sid>.lock` from admission to the end of
+  `_release_session_dirs` (after its CLI stopped); admission refuses with `SessionOwnedElsewhere` (an
+  `HTTPException` 421 + `x-gateway-reroute`, raised before any work) when another process holds the id or
+  this one drains; `Session.lock` is a `SessionLock` a hand-off poisons; `HandoffMiddleware` (outermost)
+  serves / asks the owner to `release_for_handoff` (idle only) / forwards byte-for-byte (busy). Forwarding
+  retries only what provably never ran (no request byte sent, or the owner's ledger settles the dispatch id
+  as refused); otherwise `forward_interrupted`, never resent — `admitted` ledger entries live until the
+  request ends. Drain (`POST/DELETE /internal/drain`, loopback + `ADMIN_API_KEY`) pins a validated drain
+  target; nginx's active color is never consulted by the gateway. Keep `/internal/` and `/health/drain`
+  unreachable from outside (nginx 404s them). uid mode keeps the restart deploy (registry flock = one
+  process). Pinned by `tests/test_handoff_{units,two_process}.py`, `tests/test_deploy_script.py`,
+  `tests/test_compose_blue_green.py`, `tests/test_plugin_replay.py`.
 - Host/secret redaction (`src/backends/claude/sysinfo_redaction.py`, on by default,
   `SYSINFO_REDACTION` / admin key `sysinfo_redaction_enabled`): a `PostToolUse` hook
   (`updatedToolOutput`) replaces this host's name/addresses/container id/MACs, secret env values
