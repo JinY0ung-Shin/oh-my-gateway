@@ -216,10 +216,14 @@ async def list_agent_resources(
 async def health_check(request: Request):
     """Health check endpoint."""
     _ = request  # slowapi requires a request parameter in decorated handlers.
+    from src import instance_registry
+
     return {
         "status": "healthy",
         "service": "oh-my-gateway",
         "backends": list(BackendRegistry.all_backends().keys()),
+        # Blue/green identity (instance, boot_id, capabilities) — empty without it.
+        **instance_registry.describe(),
     }
 
 
@@ -308,6 +312,12 @@ async def readiness_check(request: Request):
     }
     checks["opencode_server"] = results[len(backend_names)]
     checks["usage_log_db"] = results[len(backend_names) + 1]
+
+    # A draining blue/green instance takes no new sessions: not ready, by design.
+    from src.handoff.drain import drain_state
+
+    if drain_state.draining:
+        checks["draining"] = {"ok": False, "errors": ["instance is draining"]}
 
     ready = all(check.get("ok") for check in checks.values())
     return JSONResponse(

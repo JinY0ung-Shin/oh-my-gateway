@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from threading import Lock
 
 from src import metrics
+from src.handoff import SessionLock, SessionOwnedElsewhere, admission_closed, owner_locks
 from src.concurrency import SessionLimitExceeded
 from src.models import Message, SessionInfo
 from src.constants import (
@@ -365,7 +366,10 @@ class Session:
     # Which live prompt the snapshot above came from (``system_prompt.get_live_ref``):
     # lets the admin prompt library say how many sessions still run an old version.
     base_prompt_ref: Optional[Dict[str, Any]] = field(default=None, compare=False)
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False, compare=False)
+    # A SessionLock: plain asyncio.Lock semantics, except that a blue/green
+    # hand-off can poison it so waiters reroute instead of running a turn on a
+    # session this process gave away (src.handoff).
+    lock: asyncio.Lock = field(default_factory=SessionLock, repr=False, compare=False)
     user: Optional[str] = None
     workspace: Optional[str] = None
 
@@ -823,15 +827,20 @@ class SessionManager:
                 deferred = self._defer_release_locked(session, finished)
         if deferred:
             return
-        if session.workspace:
-            self._cleanup_workspace(session.workspace)
-        if session.user and not finished:
-            return
-        if locked:
-            self._remove_session_env_locked(session)
-        else:
-            with self.lock:
+        try:
+            if session.workspace:
+                self._cleanup_workspace(session.workspace)
+            if session.user and not finished:
+                return
+            if locked:
                 self._remove_session_env_locked(session)
+            else:
+                with self.lock:
+                    self._remove_session_env_locked(session)
+        finally:
+            # Every teardown ends here once the session's CLI is stopped (or it
+            # never had one): only now may another instance resume the id.
+            owner_locks.release(session.session_id, session)
 
     @staticmethod
     def _defer_release_locked(session: "Session", finished: bool) -> bool:
@@ -1071,6 +1080,7 @@ class SessionManager:
             else:
                 ttl = self.default_ttl_minutes
             session = Session(session_id=session_id, ttl_minutes=ttl)
+            self._take_ownership_locked(session)
             self.sessions[session_id] = session
             logger.info(f"Created new session: {session_id}")
             return session
@@ -1191,6 +1201,7 @@ class SessionManager:
                     )
                     metrics.record_session_rejected()
                     raise SessionLimitExceeded(_max_live_sessions())
+                self._take_ownership_locked(session)
                 self.sessions[session_id] = session
                 self._rehydrate_hits = getattr(self, "_rehydrate_hits", 0) + 1
                 return session
@@ -1254,6 +1265,53 @@ class SessionManager:
 
         logger.info(f"Deleted session: {session_id}")
         return True
+
+    def _take_ownership_locked(self, session: Session) -> None:
+        """Hold *session*'s cross-instance owner lock before it enters the cache.
+
+        Caller holds ``self.lock``. Raises :class:`SessionOwnedElsewhere` (the
+        request is re-routed, nothing of it has run) while this instance drains,
+        or when another gateway instance holds the id. No-op without blue/green.
+        """
+        if admission_closed():
+            raise SessionOwnedElsewhere(session.session_id, "draining")
+        if not owner_locks.acquire(session.session_id, session):
+            raise SessionOwnedElsewhere(session.session_id, "held by another instance")
+
+    async def release_for_handoff(self, session_id: str) -> str:
+        """Give *session_id* up so another gateway instance can resume it.
+
+        ``"released"`` once its CLI is stopped and the owner lock is dropped;
+        ``"busy"`` when a turn, a pending card, a background run or a client
+        start still uses it (the caller forwards instead); ``"absent"`` when this
+        process does not hold it. The idle check and the removal happen with no
+        await in between, and the session lock is poisoned before anything is
+        awaited, so a request that already holds the session object reroutes
+        instead of running a turn on it.
+        """
+        with self.lock:
+            session = self.sessions.get(session_id)
+            if session is None:
+                return "absent"
+            if (
+                session.lock.locked()
+                or session.active_response_id is not None
+                or session.pending_tool_call is not None
+                or session.input_event is not None
+                or session.client_starting is True
+            ):
+                return "busy"
+            del self.sessions[session_id]
+        poison = getattr(session.lock, "poison", None)
+        if poison is not None:
+            poison()
+        _cancel_idle_reader(session)
+        if session.client is not None:
+            await _stop_client(session.client, f"handed-off session {session_id}")
+            session.client = None
+        self._release_session_dirs(session)
+        logger.info("Released session %s for hand-off", session_id)
+        return "released"
 
     def begin_client_start(self, session: Session) -> None:
         """Mark that the caller is creating *session*'s client (``create_client``).
