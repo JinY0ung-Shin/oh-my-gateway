@@ -115,20 +115,21 @@ def _validate_install_path(install_path: Path) -> Optional[Path]:
         return None
     # Reject a symlinked PARENT component: ``resolve()`` follows all symlinks,
     # so a symlinked intermediate directory could still pass the containment
-    # check above.  Walk each component from the leaf up to (but not including)
-    # ``cache_dir`` and reject if any is a symlink.
+    # check above.  Walk each component from the leaf up to ``cache_dir``
+    # itself and reject if any is a symlink (#263: the anchor too — what lies
+    # above it may be a link, e.g. ``/home -> /data/home``).
     try:
         cache_anchor = cache_dir.resolve()
     except OSError:
         return None
     for parent in install_path.parents:
+        if parent.is_symlink():
+            logger.warning("Plugin install_path has symlinked parent: %s", parent)
+            return None
         try:
             if parent.resolve() == cache_anchor:
                 break
         except OSError:
-            return None
-        if parent.is_symlink():
-            logger.warning("Plugin install_path has symlinked parent: %s", parent)
             return None
     return resolved if resolved.is_dir() else None
 
@@ -190,8 +191,11 @@ def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
 
     Allowed: anything under :func:`_marketplace_anchors`, or exactly a local
     source the admin manifest records (:func:`_manifest_local_sources`).
-    Returns the resolved path, or ``None`` if the path is a symlink (leaf or
-    parent), escapes every allowed root, or does not exist as a directory.
+    Returns the resolved path, or ``None`` if the path is a symlink, has a
+    symlinked component between it and its anchor — the anchor itself
+    included, so an anchor that is a link admits nothing (#263); what lies
+    above the anchor may be a link —, escapes every allowed root, or does not
+    exist as a directory.
     """
     try:
         resolved = install_location.resolve()
@@ -227,21 +231,25 @@ def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
 
     if install_location.is_symlink():
         return None
-    # Reject a symlinked PARENT component (see _validate_install_path).
+    # Reject a symlinked PARENT component, the anchor itself included (see
+    # _validate_install_path; #263).
     try:
         anchor_resolved = anchor.resolve()
     except OSError:
         return None
-    for parent in install_location.parents:
-        try:
-            if parent.resolve() == anchor_resolved:
-                break
-        except OSError:
-            return None
+    # An exact manifest source is its own anchor: only what lies above it,
+    # which may be a link, would be walked.
+    parents = [] if anchor_resolved == resolved else install_location.parents
+    for parent in parents:
         if parent.is_symlink():
             logger.warning(
                 "Marketplace installLocation has symlinked parent: %s", parent
             )
+            return None
+        try:
+            if parent.resolve() == anchor_resolved:
+                break
+        except OSError:
             return None
     return resolved if resolved.is_dir() else None
 
