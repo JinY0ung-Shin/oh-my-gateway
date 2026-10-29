@@ -108,6 +108,7 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
       - 링크는 따라가지 않는다. 트리 안을 가리키는 상대 링크만 링크로 남기고, `/app/data/x.json`이나 `../..`처럼 트리 밖을 가리키는 링크는 버린다.
       - 하드 링크와 특수 파일(FIFO·소켓·장치)은 건너뛴다. 건너뛴 항목은 로그에 남는다.
       - 2만 개, 512 MiB를 넘으면 오류가 나고, 기존 사본은 그대로 남는다.
+      - 사본 갱신은 `renameat2(RENAME_EXCHANGE)` 한 번으로 기존 사본과 맞바꾼다. 등록 경로에는 항상 온전한 트리 하나가 있다. 이 호출을 지원하지 않는 파일시스템이면 갱신을 오류로 거부하고 기존 사본을 유지한다. 같은 대상의 갱신은 `<사본>.lock`으로 한 번에 하나만 돈다.
       - `/app`·`/app/data` 자체나 `$HOME`·워크스페이스 base를 품은 넓은 경로, `.claude-plugin/marketplace.json`이 없는 디렉터리는 복사하지 않고 오류로 돌려준다.
     - 컨테이너 안에서 `claude plugin marketplace add <경로>`를 직접 실행한 경우는 게이트웨이를 거치지 않아 복사되지 않는다. 게이트웨이는 기동 때와 관리자 화면에서 설치할 때 이런 경로를 경고로 알린다. 경고 문구는 `the plugin root … is not readable by confined sessions`이고, 설치 응답에는 `warnings` 필드가 붙는다. 관리자 화면에서 다시 추가하면 해결된다.
 - **폰트는 시스템 경로에 설치한다.** `/usr/share/fonts`·`/usr/local/share/fonts`의 폰트와 fontconfig 캐시(`/var/cache/fontconfig`, 읽기 전용)는 세션에 열린다. `~/.local/share/fonts`·`~/.fonts`처럼 `$HOME` 아래 설치한 폰트는 세션에 보이지 않는다.

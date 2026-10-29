@@ -201,43 +201,64 @@ class TestPublish:
         assert self._skill(dest).read_text().startswith("---"), "the old copy"
         assert not _siblings(dest, lc._NEW) and not _siblings(dest, lc._OLD)
 
-    def test_without_exchange_two_renames_publish(
-        self, app, source, tmp_path, monkeypatch
+    @pytest.mark.parametrize("err", [22, 38, 95])  # EINVAL, ENOSYS, EOPNOTSUPP
+    def test_without_exchange_the_update_fails_closed(
+        self, app, source, tmp_path, monkeypatch, err
     ):
+        """No two-rename fallback: dest would be missing between them."""
         dest = tmp_path / "copy"
         lc.copy_marketplace(source, dest, app_root=app, env={})
 
         def unsupported(a, b):
-            raise OSError(22, "Invalid argument")
+            raise OSError(err, os.strerror(err))
 
         monkeypatch.setattr(lc, "_exchange", unsupported)
         self._skill(source).write_text("v2")
-        lc.copy_marketplace(source, dest, app_root=app, env={})
-        assert self._skill(dest).read_text() == "v2"
-        (old,) = _siblings(dest, lc._OLD)
-        assert self._skill(old).read_text().startswith("---")
+        with pytest.raises(lc.LocalCopyError, match="current copy is kept"):
+            lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert self._skill(dest).read_text().startswith("---"), "the old copy"
+        assert not _siblings(dest, lc._NEW) and not _siblings(dest, lc._OLD)
 
-    def test_without_exchange_a_failed_rename_is_undone(
+    def test_without_exchange_a_first_copy_still_publishes(
         self, app, source, tmp_path, monkeypatch
     ):
-        dest = tmp_path / "copy"
-        lc.copy_marketplace(source, dest, app_root=app, env={})
         monkeypatch.setattr(
             lc, "_exchange", lambda a, b: (_ for _ in ()).throw(OSError(22, "x"))
         )
+        dest = tmp_path / "copy"
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert self._skill(dest).is_file()
+
+    @pytest.mark.parametrize("exc", [OSError(5, "I/O error"), KeyboardInterrupt()])
+    def test_a_failure_after_the_exchange_keeps_both_trees(
+        self, app, source, tmp_path, monkeypatch, exc
+    ):
+        """The exchange is the commit: parking the old tree may fail, but
+        never deletes it or un-publishes the new one."""
+        dest = tmp_path / "copy"
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        self._skill(source).write_text("v2")
         real_rename = os.rename
 
         def rename(a, b):
-            if lc._NEW in Path(a).name:
-                raise OSError(28, "No space left on device")
+            if lc._OLD in Path(b).name:
+                raise exc
             return real_rename(a, b)
 
         monkeypatch.setattr(lc.os, "rename", rename)
-        self._skill(source).write_text("v2")
-        with pytest.raises(OSError, match="No space"):
-            lc.copy_marketplace(source, dest, app_root=app, env={})
-        assert self._skill(dest).read_text().startswith("---"), "rolled back"
-        assert not _siblings(dest, lc._NEW) and not _siblings(dest, lc._OLD)
+        if isinstance(exc, OSError):
+            lc.copy_marketplace(source, dest, app_root=app, env={})  # published
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert self._skill(dest).read_text() == "v2"
+        (left,) = _siblings(dest, lc._NEW)
+        assert self._skill(left).read_text().startswith("---"), "old tree kept"
+
+        monkeypatch.setattr(lc.os, "rename", real_rename)
+        monkeypatch.setattr(lc, "STALE_STAGING_SECONDS", -1)
+        lc.copy_marketplace(source, dest, app_root=app, env={})
+        assert not _siblings(dest, lc._NEW), "swept by a later copy"
 
     def test_a_reader_never_sees_a_partial_tree(self, app, source, tmp_path):
         dest = tmp_path / "copy"

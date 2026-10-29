@@ -34,6 +34,7 @@ import contextlib
 import ctypes
 import errno
 import fcntl
+import logging
 import os
 import shutil
 import stat
@@ -41,6 +42,8 @@ import tempfile
 import time
 from pathlib import Path
 from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 MODE_ENV = "CLAUDE_ISOLATION_MODE"
 _CONFINED_MODES = ("landlock", "uid")
@@ -249,6 +252,7 @@ def copy_marketplace(
         _sweep(dest)
         staging = Path(tempfile.mkdtemp(prefix=dest.name + _NEW, dir=dest.parent))
         budget = _Budget(max_files, max_bytes)
+        committed: List[bool] = []
         try:
             src_fd = os.open(_real(source), _DIR_FLAGS)
             try:
@@ -256,9 +260,10 @@ def copy_marketplace(
             finally:
                 os.close(src_fd)
             os.chmod(staging, 0o755)  # mkdtemp made it 0700
-            _publish(staging, dest)
+            _publish(staging, dest, committed)
         except BaseException:
-            _remove(staging)
+            if not committed:  # after the exchange, staging holds the old tree
+                _remove(staging)
             raise
     return budget.skipped
 
@@ -303,38 +308,52 @@ def _exchange(a: Path, b: Path) -> None:
         raise OSError(err, os.strerror(err), str(a))
 
 
-def _publish(staging: Path, dest: Path) -> None:
+def _publish(staging: Path, dest: Path, committed: List[bool]) -> None:
     """Make *staging* the tree at *dest*; the tree *dest* held moves aside to
     ``<dest>.old-*`` (removed after :data:`OLD_GRACE_SECONDS`).
 
-    With an existing copy the two are exchanged in one ``renameat2`` call. A
-    filesystem without ``RENAME_EXCHANGE`` gets two renames: *dest* is missing
-    for that instant, and when the second one fails the first is undone."""
+    An existing copy is exchanged in one ``renameat2(RENAME_EXCHANGE)`` call:
+    *dest* always names a whole tree. A filesystem without it is refused
+    (:class:`LocalCopyError`) and keeps the current copy, rather than leave
+    *dest* missing between two renames. The exchange is the commit: what
+    follows only parks the old tree, and a failure there is logged, never
+    raised — the new copy is published, and the old tree stays where the
+    exchange left it (``<dest>.new-*``, swept as a stale staging dir). Each
+    commit appends to *committed*, so the caller never removes *staging*
+    after it (by then it is the tree a reader may still be inside)."""
     try:
         st = os.lstat(dest)
     except FileNotFoundError:
-        os.rename(staging, dest)
+        os.rename(staging, dest)  # no copy yet: nothing for a reader to lose
+        committed.append(True)
         return
     if not stat.S_ISDIR(st.st_mode):
         _remove(dest)  # not a copy of ours: a link or file planted there
         os.rename(staging, dest)
+        committed.append(True)
         return
-    old = dest.with_name(dest.name + _OLD + os.urandom(6).hex())
     try:
         _exchange(staging, dest)
     except OSError as exc:
-        if exc.errno not in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
-            raise
-        os.rename(dest, old)
-        try:
-            os.rename(staging, dest)
-        except BaseException:
-            os.rename(old, dest)
-            raise
-    else:
+        if exc.errno in (errno.ENOSYS, errno.EINVAL, errno.EOPNOTSUPP):
+            raise LocalCopyError(
+                f"cannot replace {dest} atomically (renameat2 RENAME_EXCHANGE: "
+                f"{exc.strerror}); the current copy is kept"
+            ) from exc
+        raise
+    committed.append(True)
+    old = dest.with_name(dest.name + _OLD + os.urandom(6).hex())
+    try:
         os.rename(staging, old)
-    # The grace counts from now: the old tree's own mtime is its copy time.
-    os.utime(old)
+        # The grace counts from now: the old tree's own mtime is its copy time.
+        os.utime(old)
+    except OSError:
+        logger.warning(
+            "Published %s; could not park the tree it replaced (left at %s)",
+            dest,
+            staging if staging.exists() else old,
+            exc_info=True,
+        )
 
 
 def _sweep(dest: Path) -> None:
