@@ -48,6 +48,7 @@ curl http://localhost:8000/v1/responses \
 |-------|-----|
 | Claude backend setup, auth, workspaces, sandbox, MCP, subagents | [docs/claude-code/](docs/claude-code/) |
 | **Multi-user isolation: Landlock/UID setup, authentication, verification** | [docs/user-isolation-deployment.md](docs/user-isolation-deployment.md) |
+| Zero-downtime (blue/green) deploy — design draft | [docs/zero-downtime-deploy.md](docs/zero-downtime-deploy.md) |
 | OpenCode backend overview and mode selection (stale) | [docs/opencode/](docs/opencode/) |
 | OpenCode managed mode (stale) | [docs/opencode/managed.md](docs/opencode/managed.md) |
 | OpenCode external mode (stale) | [docs/opencode/external.md](docs/opencode/external.md) |
