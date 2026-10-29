@@ -378,19 +378,17 @@ def prepare_repo(repo: str, *, branch: str, token: str, root: Path) -> Path:
 
     A local-path repo is used in place (*branch* is ignored), unless a confined
     session could not read it there: then it is copied into the clone root
-    (:func:`_local_copy`, #258). A remote repo is cloned into a staging dir and
-    swapped in only on success, so a failed re-clone leaves any previous clone
-    intact.
+    (:func:`_local_copy`, #258). A remote repo is cloned into a fresh staging
+    dir and published by :func:`plugin_local_copy.replace_tree` (#262): one
+    refresh per clone at a time, an atomic exchange with the clone readers see
+    now, and a failed re-clone or swap leaves that clone intact.
     """
     if Path(repo).exists():
         return _local_copy(repo, root)
 
     dest = _clone_dir(root, repo)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    staging = dest.with_name(dest.name + ".new")
-    if staging.exists():
-        shutil.rmtree(staging)
-    try:
+
+    def clone(staging: Path) -> None:
         run(
             [
                 "git",
@@ -405,13 +403,17 @@ def prepare_repo(repo: str, *, branch: str, token: str, root: Path) -> Path:
             ],
             token=token,
         )
+
+    try:
+        plugin_local_copy.replace_tree(dest, clone)
     except subprocess.CalledProcessError as exc:
         raise PluginAdminError(
             f"git clone failed for {repo!r} (branch {branch}): rc={exc.returncode}"
         ) from exc
-    if dest.exists():
-        shutil.rmtree(dest)
-    os.replace(staging, dest)
+    except (plugin_local_copy.LocalCopyError, OSError) as exc:
+        raise PluginAdminError(
+            f"could not publish the clone of {repo!r}: {exc}"
+        ) from exc
     return dest
 
 
