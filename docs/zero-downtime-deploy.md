@@ -1,16 +1,24 @@
 # 무중단 배포 설계 (blue/green)
 
-> 상태: **설계 초안**, 구현 전. 기준 2026-10-29 `main`. 구현은 이 문서가 리뷰된 뒤 아래 [단계](#7-구현-단계)대로
-> 나눠 올린다. 참고: ChatDRAGON UI의 같은 방식(#710, `scripts/deploy.sh`·`/health/drain`·nginx `active.conf`).
+> 상태: **설계 초안 2판**, 구현 전. 기준 2026-10-29 `main` `d2fcd21`(#264 포함). 구현은 이 문서가 리뷰된 뒤
+> [단계](#7-구현-단계)대로 나눠 올린다. 참고: ChatDRAGON UI의 같은 방식(#710, `scripts/deploy.sh`·`/health/drain`·
+> nginx `active.conf`).
+>
+> 2판에서 바뀐 것(#265 1차 리뷰): 전환 직후 쉬는 세션에 409가 구조적으로 나던 순서를 없애고, 세션 소유권을 **서버가
+> 넘겨받는**(handoff) 방식으로 바꿨다 — 클라이언트 재시도·헤더에 기대지 않는다([§5.2](#52-세션-소유권과-넘겨받기)).
+> 플러그인 갱신은 #264의 `replace_tree()`를 바탕으로 남은 일만 적었다([§5.4](#54-기동-시-공유-파일-플러그인)).
 
 ## 1. 목표와 비목표
 
-**목표** — 새 이미지로 바꾸는 동안 사용자가 아무것도 알아채지 못한다.
+**목표** — 새 이미지로 바꾸는 동안 사용자가 아무것도 알아채지 못한다. 구체적으로, 클라이언트(ChatDRAGON이든 헤더를 모르는
+공개 API 사용자든)가 **아무것도 바꾸지 않아도**:
 
 1. 새 요청은 새 컨테이너로 간다.
 2. 옛 컨테이너에서 이미 돌고 있는 턴(스트리밍·백그라운드)은 끝까지 돈다 — 도구를 오래 쓰는 턴은 수십 분이다.
-3. 옛 컨테이너에서 시작한 대화(`previous_response_id`)를 새 컨테이너가 이어 간다.
-4. 옛 컨테이너가 띄운 AskUserQuestion·계획 승인 카드에 사용자가 답하면, 답이 그 카드를 기다리는 프로세스에 닿는다.
+3. 옛 컨테이너에서 시작한 대화(`previous_response_id`)의 다음 턴이 오류 없이 이어진다 — 전환 직후 옛 컨테이너가 그
+   세션을 아직 쥐고 있어도.
+4. 옛 컨테이너가 띄운 AskUserQuestion·계획 승인 카드에 답하면, 답이 그 카드를 기다리는 프로세스에 닿는다.
+5. 같은 턴이 두 번 실행되지 않는다(한 세션에는 언제나 CLI 하나).
 
 **비목표**
 
@@ -29,12 +37,13 @@
 | 진행 중인 턴 | SIGTERM → uvicorn이 소켓을 닫고 열린 연결을 기다리지만, `stop_grace_period: 35s` 뒤 SIGKILL | 35초 넘는 턴은 끊긴다. 백그라운드 턴(`_BACKGROUND_RUNS`, 최대 3600s)은 lifespan 종료에서 죽는다 |
 | drain | 없음. `/health`(정적)·`/health/ready`(인증·DB)만 | 새 턴을 막고 진행 중인 것만 끝내는 단계가 없다 |
 | 카드(AskUserQuestion·ExitPlanMode) | 세션의 `pending_tool_call` + 프로세스 내 `asyncio.Event`에서 기다린다(`ASK_USER_TIMEOUT_SECONDS` 300) | 답이 다른 색으로 가면 400 `no pending tool call` → ChatDRAGON은 "카드 만료" |
-| `GET /v1/sessions/{id}/pending-events` | 세션 outbox, 프로세스 메모리 | 다른 색은 404 → ChatDRAGON은 빈 응답으로 처리하고 다음 턴이 복구(이미 처리). 교체 순간의 이벤트 일부를 놓칠 수 있다 |
+| 세션에 묶인 다른 요청 | `GET/cancel /v1/responses/{id}`, `GET /v1/sessions/{id}/pending-events`, 세션 삭제 — 프로세스 메모리 | 다른 색은 404 |
 | 같은 세션에 CLI 둘 | 옛 색은 쉬는 세션의 CLI를 TTL(`SESSION_MAX_AGE_MINUTES` 60) 동안 쥔다. 프로세스 간 잠금 없음 | 새 색이 같은 세션을 resume하면 transcript 하나에 CLI 둘이 쓴다 |
-| 기동 시 플러그인 설치 | CMD가 매 기동 `install_plugins.py` — 고정된 `<dest>.new`로 받아 `rmtree(dest)` + `os.replace`, `claude plugin …`이 `installed_plugins.json`을 고친다. 파일 잠금 없음 | 새 색 기동이 옛 색의 살아 있는 세션 밑에서 플러그인 폴더를 바꾼다. 둘이 동시에 기동하면 `.new`가 충돌 |
+| 플러그인 트리 게시 | **#264로 해결됨**: `plugin_local_copy.replace_tree()` — 대상별 `flock`(프로세스 간), 요청마다 새 `<dest>.new-*`, `renameat2(RENAME_EXCHANGE)` 한 번, 옛 트리는 `<dest>.old-*`로 `OLD_GRACE_SECONDS`(600) 보존, 실패하면 옛 트리 유지. 관리자 refresh와 기동 replay가 같이 쓴다 | 반쯤 지워진 트리·겹친 staging은 더 없다 |
+| 플러그인 레지스트리·버전 | 기동마다 `install_plugins.py`가 manifest를 replay — `claude plugin marketplace add`·`install`·`update`가 `installed_plugins.json`·`known_marketplaces.json`·`plugins/cache`를 고친다. 이 단계에는 프로세스 간 잠금이 없고, 바뀐 게 없어도 매번 다시 돈다 | 새 색 기동이 옛 색의 살아 있는 세션 밑에서 레지스트리·cache 버전을 바꾸고, 두 색의 CLI가 레지스트리 파일을 동시에 고칠 수 있다 |
 | 기동 시 `_tmp_` 정리 | `SESSION_MAX_AGE_MINUTES*60`보다 mtime이 오랜 익명 워크스페이스를 지운다 | 새 색이 옛 색의 **살아 있는** 익명 워크스페이스를 지울 수 있다 |
 | 관리자 쿠키 | `_COOKIE_SECRET = secrets.token_bytes(32)` (`src/admin_auth.py`) 프로세스마다 새로 | 교체하면 관리자가 로그아웃된다 |
-| runtime-config 오버라이드 | 메모리에만(`src/runtime_config.py`) | 새 색은 env 기본값으로 뜬다. ChatDRAGON이 주기 reconcile로 다시 건다(`gateway_runtime_pin`, `GATEWAY_RUNTIME_RESTORE`) — 그 주기 동안 기본값 |
+| runtime-config 오버라이드 | 메모리에만(`src/runtime_config.py`) | 새 색은 env 기본값으로 뜬다. ChatDRAGON이 주기 reconcile로 다시 건다(`gateway_runtime_pin`) — 그 주기 동안 기본값 |
 | `data/` 파일(프롬프트·MCP·플러그인 manifest 등) | tmp + `os.replace`로 원자적이지만 잠금은 프로세스 내 `RLock` | 두 색이 동시에 고치면 마지막 쓰기가 이긴다. 관리자 쓰기를 활성 색 한 곳으로만 보내면 문제없다 |
 | 포트 | `ports: "${PORT}:${PORT}"` 하나 | 두 번째 컨테이너는 같은 호스트 포트를 못 잡는다 → nginx가 호스트 포트를 잡고 색은 내부 네트워크만 |
 | MCP progress relay | CLI 자식이 **자기 컨테이너의 loopback**으로 다이얼(`note_origin`) | 그대로 된다. `MCP_RELAY_BASE_URL`을 nginx·공용 주소로 두면 깨진다 — 비워 둔다 |
@@ -42,8 +51,9 @@
 ## 3. 구조
 
 ```
-ChatDRAGON BFF ── :8000 ──> gateway-proxy (nginx) ──> gateway-blue | gateway-green (:8000, 내부망)
-                                                      └ 같은 claude_home · ./data · ./workspaces · ./plugins
+클라이언트 ── :8000 ──> gateway-proxy (nginx) ──> gateway-blue | gateway-green (:8000, 내부망)
+                                                  └ 같은 claude_home · ./data · ./workspaces · ./plugins
+                                                  └ 서로를 내부망 이름으로 부를 수 있다 (§5.2 넘겨받기·전달)
 ```
 
 - `docker-compose.yml`의 `gateway` 서비스를 `gateway-blue`·`gateway-green`(같은 이미지, profile로 골라 띄움)과
@@ -55,32 +65,44 @@ ChatDRAGON BFF ── :8000 ──> gateway-proxy (nginx) ──> gateway-blue |
 - nginx 설정은 ChatDRAGON #710과 같은 원칙: `proxy_buffering off`, `proxy_request_buffering off`,
   `proxy_read_timeout`을 턴 길이보다 길게(SSE keepalive가 있으므로 3600s), `resolver 127.0.0.11`로 색 이름을
   요청마다 푼다(그 색이 없어도 nginx가 죽지 않는다), `client_max_body_size 0`(업로드 한도는 앱이 본다).
+  **라우팅은 활성 색 하나로만 한다** — 세션을 어느 색이 쥐고 있는지는 nginx가 아니라 gateway가 안다([§5.2](#52-세션-소유권과-넘겨받기)).
 - 각 색은 `GATEWAY_INSTANCE=<blue|green>`을 받아 응답 헤더 `x-gateway-instance`와 `/health`에 싣는다 — deploy
-  스크립트가 proxy를 거친 응답이 정말 새 색에서 왔는지 확인한다(200만으로는 옛 색일 수 있다).
-- 마이그레이션: 지금의 단일 `gateway` 컨테이너에서 처음 옮길 때는 `scripts/deploy.sh migrate` 한 번 — blue를 먼저
-  healthy로 띄우고 옛 컨테이너를 내린 뒤 proxy가 포트를 잡는다(이 한 번은 포트를 넘기는 몇 초의 끊김이 있다).
+  스크립트가 proxy를 거친 응답이 정말 새 색에서 왔는지 확인한다(200만으로는 옛 색일 수 있다). 클라이언트에게는 정보일
+  뿐이고 라우팅에 쓰지 않는다.
+- 색끼리 부르는 내부 경로(`/internal/sessions/…`)는 내부망의 다른 색에서만 받는다: nginx는 `/internal/`을 밖으로
+  내지 않고(404), 앱은 `ADMIN_API_KEY`가 아니라 기동 때 만든 공유 비밀값(`data/instance_secret`, 0600)의 HMAC로 확인한다.
 
 ## 4. 배포 순서 (`scripts/deploy.sh`)
 
 1. **빌드** — 새 이미지를 만든다. uid 모드(`CLAUDE_ISOLATION_MODE=uid`)면 여기서 거부하고 재시작 배포를 안내한다.
-2. **유휴 색 기동** — 활성 색이 blue면 green을 같은 볼륨으로 띄운다. 플러그인 설치는 [§5.4](#54-기동-시-공유-파일)대로
+   **활성 색이 handoff를 아는 버전인지 확인한다**([§7 배포 gate](#배포-gate)) — 모르는 버전이면 무중단 교체를 거부한다.
+2. **유휴 색 기동** — 활성 색이 blue면 green을 같은 볼륨으로 띄운다. 플러그인 replay는 [§5.4](#54-기동-시-공유-파일-플러그인)대로
    잠금 + "바뀐 게 없으면 건너뜀".
-3. **준비 확인** — green 안에서 `/health/ready`가 200, `/health`의 instance가 `green`.
-4. **전환** — `active.conf`를 green으로 바꾸고 reload. proxy를 거친 `/health`가 `green`을 답할 때까지 확인.
-5. **drain 시작** — blue에 `POST /internal/drain`(컨테이너 안 loopback 전용 + `ADMIN_API_KEY`). blue는:
-   - `/health/ready` → 503, 새 세션을 만드는 요청은 retryable 503(`x-should-retry: true` — 전환 직후 nginx가
-     아직 blue로 보낸 요청이 다시 와서 green으로 간다).
-   - **쉬는 세션을 바로 놓는다**: 진행 중인 턴도 카드도 없는 세션의 CLI를 disconnect하고(transcript는 남는다)
-     세션 잠금을 푼다 — green이 그 세션을 resume해도 CLI가 둘이 되지 않는다([§5.2](#52-한-세션에-cli-하나)).
+3. **준비 확인** — green 안에서 `/health/ready`가 200, `/health`의 instance가 `green`, green이 blue의 내부 주소에
+   닿는다(`/internal/ping`).
+4. **blue를 drain으로 둔다** — `POST /internal/drain`. 이 순간부터 blue는:
+   - **새 세션을 만들지 않는다**: 세션을 새로 여는 요청(`previous_response_id` 없는 `/v1/responses`,
+     `/v1/agents/messages`)은 green으로 내부 전달한다(아직 nginx가 blue로 보내는 동안의 요청 — [§5.2](#52-세션-소유권과-넘겨받기)의 "전달").
+   - **쉬는 세션을 놓는다**: 진행 중인 턴도 카드도 없는 세션의 CLI를 disconnect하고(transcript는 남는다) 소유를
+     푼다. 놓은 세션은 blue에서 다시 열지 않는다(울타리).
    - 진행 중인 턴·카드를 기다리는 세션·백그라운드 턴은 그대로 둔다. 끝나면 그 세션도 놓는다.
+   - `/health/ready` → 503.
+5. **전환** — `active.conf`를 green으로 바꾸고 reload. proxy를 거친 `/health`가 `green`을 답할 때까지 확인.
+   4와 5 사이에 blue로 온 요청은 위대로 전달되거나 blue가 아직 쥔 세션이면 blue가 처리한다 — 어느 쪽도 409가 아니다.
 6. **drain 대기** — `GET /health/drain`(loopback 전용)을 주기적으로 읽어 아래가 모두 0이 될 때까지 기다린다.
    `DRAIN_TIMEOUT_SECONDS`(기본 3600)을 넘기면 남은 것을 보여 주고 멈춘다 — 강제로 내릴지는 운영자가 정한다
    (`--force`).
 7. **정지** — blue에 SIGTERM. 이때는 열린 연결이 없으므로 lifespan 종료(세션 disconnect)가 곧바로 돈다.
-   `stop_grace_period`는 lifespan 종료만 덮으면 된다(지금의 35s 유지).
+   `stop_grace_period`는 lifespan 종료만 덮으면 된다(지금의 35s 유지). 마지막으로 drain 동안 보존한 옛 플러그인
+   트리를 치운다([§5.4](#54-기동-시-공유-파일-플러그인)).
 
-되돌리기: 6단계 전이면 `active.conf`를 blue로 되돌리고 blue의 drain을 풀면(`DELETE /internal/drain`) 끝이다.
-7단계 뒤라면 같은 스크립트로 옛 이미지를 다시 배포한다.
+drain(4)을 전환(5)보다 **먼저** 하는 이유: 전환을 먼저 하면 green이 받은 다음 턴이 blue가 아직 쥔 쉬는 세션과 부딪힌다.
+drain을 먼저 걸면 blue가 쉬는 세션을 놓기 시작한 뒤에 green으로 요청이 가고, 그래도 아직 놓지 못한 세션은 §5.2의
+넘겨받기가 그 자리에서 해결한다.
+
+되돌리기: 6단계 중이면 `DELETE /internal/drain`(blue가 다시 새 세션을 받는다)과 `active.conf`를 blue로 되돌린다.
+green이 그 사이 연 세션은 green이 계속 쥐다가, 같은 절차로 green을 drain하면 blue로 넘어간다. 7단계 뒤라면 같은
+스크립트로 옛 이미지를 다시 배포한다.
 
 ### `/health/drain` 계약
 
@@ -91,8 +113,9 @@ ChatDRAGON BFF ── :8000 ──> gateway-proxy (nginx) ──> gateway-blue |
   "active_turns": 0,
   "background_turns": 0,
   "pending_interactions": 0,
+  "forwarding": 0,
   "open_requests": 0,
-  "live_sessions": 0
+  "owned_sessions": 0
 }
 ```
 
@@ -100,9 +123,11 @@ ChatDRAGON BFF ── :8000 ──> gateway-proxy (nginx) ──> gateway-blue |
 - `background_turns` — `_BACKGROUND_RUNS`에 남은 것.
 - `pending_interactions` — 답을 기다리는 카드(`pending_tool_call`이 있고 `input_event`가 안 풀린 세션). 300s 뒤엔
   저절로 만료되므로 drain이 무한히 걸리지 않는다.
+- `forwarding` — blue가 green으로 내부 전달 중인 요청(스트림 포함). 0이 되기 전에 blue를 내리면 그 스트림이 끊긴다.
 - `open_requests` — 위에 속하지 않는 열린 HTTP 요청(업로드·파일 API·관리자 작업). ChatDRAGON `drain.py`의
   `InflightMiddleware`와 같은 방식(probe 경로는 세지 않는다).
-- `live_sessions` — 아직 CLI를 쥔 세션 수. 정보용(0이 아니어도 위가 0이면 내릴 수 있다 — 놓기만 하면 된다).
+- `owned_sessions` — 아직 소유를 쥔 세션 수. 위가 모두 0이면 이것도 0이어야 한다(놓기는 즉시) — 0이 아니면 스크립트가
+  이름을 보여 주고 멈춘다.
 
 ## 5. 세부 설계
 
@@ -112,48 +137,89 @@ ChatDRAGON BFF ── :8000 ──> gateway-proxy (nginx) ──> gateway-blue |
 deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣어 고정한다. 익명 대화는 지금처럼 새로 시작된다
 (ChatDRAGON은 늘 `user`를 보낸다).
 
-### 5.2 한 세션에 CLI 하나
+### 5.2 세션 소유권과 넘겨받기
 
-drain이 쉬는 세션을 바로 놓는 것으로 대부분 막히지만, **진행 중인** 세션에 같은 대화의 다음 요청이 green으로 가는
-경우(ChatDRAGON은 같은 대화의 턴을 줄 세우지만 API 클라이언트는 그러지 않을 수 있다)를 위해 프로세스 간 잠금을
-더한다:
+한 세션의 CLI는 언제나 한 프로세스만 쥔다. 그 사실을 디스크의 잠금으로 두고, 요청이 소유하지 않은 색에 오면
+**소유한 색과 그 자리에서 정리**한다 — 클라이언트에게 409를 돌려주지 않는다.
 
-- 세션이 CLI를 쥐는 동안 `claude_home/gateway-session-locks/<session_id>.lock`에 `flock(LOCK_EX)`를 잡는다(두
-  컨테이너가 같은 볼륨 = 같은 커널이므로 컨테이너를 넘어 동작한다). 놓을 때 푼다. 프로세스가 죽으면 커널이 푼다.
-- 다른 프로세스가 그 세션을 resume하려다 `LOCK_NB`에 걸리면 409 `session_busy_elsewhere` + `x-should-retry: true`
-  (+ `Retry-After`) — 끝나면 다시 잇는다. ChatDRAGON에는 "앞 턴을 마무리하는 중" 안내로 매핑한다(별도 PR).
-- 같은 프로세스 안의 기존 세션 잠금(`asyncio.Lock`)은 그대로 두고, 이 파일 잠금은 그 바깥 경계로만 쓴다.
+**소유 잠금.** 세션이 CLI를 쥐는 동안 `claude_home/gateway-session-owners/<session_id>.lock`에
+`flock(LOCK_EX)`를 잡고, 파일에 소유 instance 이름을 적는다(두 컨테이너가 같은 볼륨 = 같은 커널이므로 컨테이너를 넘어
+동작한다). 놓을 때 푼다. 프로세스가 죽으면 커널이 푼다 — 그래서 "파일에 이름이 있는데 잠금이 없다"는 "소유자가 죽었다"이고
+누구나 가져갈 수 있다. 같은 프로세스 안의 기존 세션 잠금(`asyncio.Lock`)은 그대로 두고, 이 파일 잠금은 그 바깥 경계로만
+쓴다. instance 생존은 `data/instances/<name>.lock`의 `flock`으로 같은 방식으로 본다.
 
-### 5.3 카드·pending-events가 그 프로세스로 가게
+**요청 처리.** 세션 id로 귀결되는 모든 요청(`previous_response_id`가 있는 `/v1/responses`, `GET`·`cancel`
+`/v1/responses/{id}`, `/v1/sessions/{id}/…`)에서, 그 세션을 이 프로세스가 쥐고 있지 않으면:
 
-카드는 그 카드를 기다리는 프로세스 메모리에만 있다. 두 안이 있다.
+| 소유 상태 | 처리 |
+|---|---|
+| 아무도 안 쥠 | 지금처럼 잠금을 잡고 rehydrate + resume |
+| 다른 instance가 쥠, 그 세션이 **쉬는 중** | **넘겨받기**: 소유자에게 `POST /internal/sessions/<sid>/release`. 소유자는 세션 잠금 안에서 "진행 중인 턴·카드·백그라운드 없음"을 확인하고 CLI를 disconnect한 뒤 소유를 푼다. 받은 쪽은 그 잠금을 잡고 resume. 소유자가 놓은 세션에는 울타리를 친다 — 그 뒤 소유자에게 그 세션 요청이 오면 소유자는 다시 열지 않고 활성 색으로 전달한다 |
+| 다른 instance가 쥠, 그 세션이 **진행 중**(턴·카드·백그라운드) | **전달**: 요청을 소유자에게 그대로 내부 reverse-proxy한다(본문·헤더·스트리밍 응답 그대로). 카드 답(`function_call_output`)은 카드를 기다리는 프로세스에 닿고, 진행 중인 턴의 `GET`/`cancel`/`pending-events`도 그 프로세스가 답한다 |
+| 소유자가 죽음(잠금 없음) | 아무도 안 쥠과 같다 |
 
-| | A. 응답 헤더로 색 고정 (권장) | B. gateway가 서로에게 넘기기 |
-|---|---|---|
-| 방식 | 응답에 `x-gateway-instance: blue`. 클라이언트가 같은 세션의 다음 요청(카드 답, `pending-events`)에 그 값을 다시 보내면 nginx `map $http_x_gateway_instance`가 그 색으로 보낸다. 그 색이 없으면 활성 색으로 | 세션 잠금 파일에 소유 색의 내부 주소를 적고, green이 남의 세션 요청을 받으면 그 색으로 내부 reverse-proxy(스트리밍 포함) |
-| 클라이언트 변경 | ChatDRAGON이 대화별로 마지막 instance를 기억해 다시 보낸다(BFF 한 곳) | 없음 |
-| 복잡도 | nginx `map` 몇 줄 + 헤더 한 개 | 스트리밍 프록시·인증 전달·실패 처리 — 큰 표면 |
-| 헤더 없는 클라이언트 | 지금과 같다(카드 만료 → 다시 묻기) | 모두 된다 |
+- **중복 실행 방지**: release는 소유자의 세션 잠금 안에서 "진행 중 없음"을 확인하고 놓기까지를 한 번에 한다 — 그 사이
+  소유자에게 새 턴이 시작될 수 없다(같은 잠금). 놓은 뒤 소유자는 울타리 때문에 그 세션을 다시 열지 않으므로, 한 턴이 두
+  색에서 동시에 돌 수 없다. release가 "진행 중"을 답하면 넘겨받기 대신 전달로 간다. 전달된 요청은
+  `x-gateway-forwarded`를 달고, 전달받은 쪽은 다시 전달하지 않는다(루프 방지) — 그 상태(양쪽이 서로 소유자가 아니라고 보는
+  짧은 경합)만 retryable 503 + `Retry-After: 1`로 답하며, 이것이 이 설계에서 남는 유일한 재시도 응답이다.
+- **대기 한도**: release가 1초(`HANDOFF_RELEASE_TIMEOUT`) 안에 답하지 않으면 소유자가 살아 있는 한 전달로 간다.
+- **전달의 범위**: drain 중에만 생기는 일이 아니다 — 같은 세션에 대한 요청이 어쩌다 다른 색으로 와도 같은 규칙이다. 다만
+  평상시(한 색만 돌 때)에는 소유자가 언제나 자기 자신이라 이 경로를 타지 않는다.
+- **새 세션 요청**(세션 id가 없는 요청)이 drain 중인 색에 오면 활성 색으로 전달한다(§4의 4단계).
 
-**권장: A.** gateway 쪽은 헤더 한 개, nginx `map`, 그리고 "그 색이 drain 중이어도 자기 세션 요청은 받는다"뿐이다.
-B는 클라이언트를 안 바꿔도 되지만 gateway 안에 두 번째 프록시를 만드는 일이라 이 목적에 비해 크다. 헤더가 없는
-클라이언트(공개 API 직접 사용자)는 교체 순간 300초 안의 카드가 만료될 수 있다 — 지금의 재시작보다 나쁘지 않다.
+**가용성 수준.** 클라이언트가 무엇을 아느냐에 따라 달라지지 않는다 — 판정과 전달이 모두 서버에 있다.
 
-`x-gateway-instance`는 **라우팅 힌트일 뿐 권한이 아니다** — 어느 색으로 가든 세션 소유자 검사(`user`)는 그대로다.
-값은 `blue`/`green`만 받고 나머지는 활성 색으로 보낸다.
+| 클라이언트 | 전환 중 다음 턴 | 전환 중 카드 답 | 진행 중인 턴 |
+|---|---|---|---|
+| ChatDRAGON | 오류 없음(넘겨받기) | 소유자에게 닿음(전달) | 끝까지 |
+| 헤더를 모르는 공개 API | 같음 | 같음 | 같음 |
+| 익명(`user` 없음) | 지금과 같다 — 새 대화(전체 기록 재전송) | 진행 중 세션은 전달로 닿음 | 끝까지 |
 
-### 5.4 기동 시 공유 파일
+1판의 "응답 헤더로 색 고정 + ChatDRAGON 변경"(옛 §5.3 A)은 빼었다: 위 서버 쪽 전달이 같은 일을 클라이언트 변경 없이 하고,
+헤더를 배우기 전의 요청·헤더 없는 클라이언트에서도 같다.
 
-- **플러그인 설치**: `install_plugins.py`를 `claude_home/.install-plugins.lock`의 `flock`으로 감싸고, staging
-  디렉터리를 `<dest>.new-<pid>`처럼 유일하게 한다. 또 manifest·marketplace 원본이 지난 설치와 같으면(`data/`에
-  지난 설치의 digest를 남긴다) **아무것도 하지 않는다** — 그래야 같은 manifest로 green을 띄울 때 blue의 살아 있는
-  세션 밑에서 플러그인 폴더가 바뀌지 않는다. manifest가 **바뀐** 배포는 바뀐 플러그인만 갱신하고, 옛 색의 세션은
-  drain 동안 옛 파일을 볼 수 있어야 하므로 `rmtree(dest)` 대신 새 디렉터리로 바꾼 뒤 옛 것은 drain이 끝난 뒤 지운다
-  (구현 단계에서 `claude plugin update`가 옛 cache 버전을 지우는지 먼저 확인).
-- **`plugin_autorefresh`**: 프로세스 내 `asyncio.Lock`만 있다 — 같은 파일 잠금을 쓰고, drain 중인 색은 돌리지 않는다.
-- **`_tmp_` 정리**: 익명 워크스페이스 이름에 instance를 넣거나(`_tmp_<instance>_…`), 기동 정리가 다른 instance의
-  것을 건드리지 않게 한다. 다른 색이 내려간 뒤 남은 것은 다음 기동 정리가 치운다.
-- **entrypoint의 chown**: 같은 uid로 다시 소유권을 맞추는 것이라 두 색이 함께 돌아도 안전하다(시간만 든다).
+### 5.3 전달(reverse-proxy)의 계약
+
+- 대상은 `data/instances/<name>.json`의 내부 주소(`http://gateway-<색>:8000`), 살아 있음은 instance 잠금으로 본다.
+- 원 요청의 메서드·경로·쿼리·본문·`Authorization` 등 헤더를 그대로 보내고, 응답(상태·헤더·SSE 스트림)을 바이트 그대로
+  돌려준다. 전달하는 쪽은 본문을 해석하지 않는다 — 인증·세션 소유자 검사(`user`)는 받는 쪽이 원래대로 한다.
+- 클라이언트가 끊으면 전달 연결도 끊는다(받는 쪽은 지금처럼 끊김을 취소로 본다).
+- `x-gateway-forwarded: <보낸 instance>`와 instance 비밀값 HMAC를 단다. 받는 쪽은 HMAC가 맞을 때만 그 헤더를 믿고,
+  밖에서 온 `x-gateway-forwarded`는 지운다.
+
+### 5.4 기동 시 공유 파일 (플러그인)
+
+**바탕(#264, 이미 main)**: 트리 게시는 `replace_tree()`가 맡는다 — 대상별 프로세스 간 `flock`, 유일한 staging,
+`RENAME_EXCHANGE` 한 번, 옛 트리는 `<dest>.old-*`. 이 부분은 다시 만들지 않는다.
+
+남은 것은 그 바깥이다.
+
+1. **replay 전체 잠금**: `install_plugins.py`의 manifest replay 전체(`marketplace add`·`install`·`update`·`uninstall`)를
+   `claude_home/.plugin-replay.lock` `flock`으로 감싼다. 관리자 경로(`plugin_admin_service`)와 `plugin_autorefresh`도
+   같은 잠금을 쓴다 — 두 색의 `claude plugin …`이 `installed_plugins.json`·`known_marketplaces.json`을 동시에
+   고치지 않게. (`replace_tree`의 대상별 잠금과는 다른, 더 바깥 잠금이다.)
+2. **바뀐 게 없으면 건너뛰기**: replay가 끝나면 `data/plugin-replay.digest`에 입력(manifest 내용 + 원격 marketplace별
+   clone한 커밋 + 로컬 원본의 트리 digest + CLI 버전)의 digest를 남긴다. 다음 기동의 입력 digest가 같으면 아무것도 하지
+   않는다 — 같은 manifest로 green을 띄울 때 blue의 살아 있는 세션 밑에서 레지스트리·cache가 바뀌지 않는다. 원격의 새 커밋을
+   알려면 `git ls-remote`만 하고 clone은 다르면 한다.
+3. **바뀐 배포에서 옛 트리의 수명**: manifest·원본이 **바뀐** 배포는 replay가 돌고, `replace_tree`가 옛 트리를
+   `.old-*`로 옮긴다. 옛 색(drain 중)의 CLI는 그 경로를 이미 연 fd로만 옛 내용을 보고, 경로로 새로 여는 것은 새 트리다 —
+   drain 동안 옛 색의 세션이 새 플러그인 내용을 볼 수 있다는 뜻이고, 이것은 받아들인다(세션 시작 때 읽는 정의는 이미
+   읽혀 있다). 지워지면 안 되는 것은 `.old-*` 자체다(옛 fd·cwd가 그 안을 가리킨다):
+   - `OLD_GRACE_SECONDS`(600)를 env `PLUGIN_OLD_GRACE_SECONDS`로 열고, deploy 중에는 `DRAIN_TIMEOUT_SECONDS` 이상이
+     되게 한다. 또는 drain 중인 instance가 살아 있는 동안 `_sweep`이 `.old-*`를 지우지 않게 한다(instance 잠금으로 판정) —
+     구현 PR에서 둘 중 하나로 정한다.
+   - deploy 스크립트는 7단계(옛 색 정지) 뒤에 `.old-*`를 치운다.
+   - **확인됨(#264의 틈)**: `_sweep`의 나이는 옛 트리 자신의 `st_mtime`으로 잰다. 같은 부모 안에서의 rename은 옮긴
+     디렉터리의 mtime을 바꾸지 않는다(ctime만 바뀐다 — 로컬에서 `mv a a.old-1` 뒤 `stat`으로 확인). 그래서 오래전에 채운
+     트리는 옮겨진 직후의 **다음** replace에서 grace 없이 바로 지워진다 — 무중단 배포와 무관하게 #264의 "옮긴 뒤 600초"가
+     지켜지지 않는다. 옮길 때 이름에 시각을 넣고(`.old-<unix>-…`) 그 시각으로 재도록 PR 3에서 고친다(별도 이슈로도 연다).
+   - **확인할 것**: `claude plugin update`가 `plugins/cache/<mp>/<plugin>/<옛 버전>`을 지우는지. 지운다면 옛 색의 CLI가
+     그 경로를 참조하므로, replay 잠금 안에서 update가 지우려는 옛 버전을 drain이 끝날 때까지 남기는 방법이 필요하다.
+4. **`_tmp_` 정리**: 익명 워크스페이스 이름에 instance를 넣거나(`_tmp_<instance>_…`), 기동 정리가 다른 살아 있는 instance의
+   것을 건드리지 않게 한다. 다른 색이 내려간 뒤 남은 것은 다음 기동 정리가 치운다.
+5. **entrypoint의 chown**: 같은 uid로 다시 소유권을 맞추는 것이라 두 색이 함께 돌아도 안전하다(시간만 든다).
 
 ### 5.5 관리자 상태
 
@@ -162,8 +228,8 @@ B는 클라이언트를 안 바꿔도 되지만 gateway 안에 두 번째 프록
 - **runtime-config**: 오버라이드를 `data/runtime_config.json`(tmp + `os.replace`)에 남기고 기동 때 읽는다 — green이
   기본값으로 뜨는 틈이 없어진다. ChatDRAGON의 reconcile은 그대로 두어도 된다(gateway가 이미 오버라이드를 들고
   있으면 건드리지 않는다).
-- **관리자 쓰기**: proxy는 활성 색으로만 보내므로 `data/`를 쓰는 곳은 한 곳이다. drain 중인 색은 관리자 쓰기를 503으로
-  거절한다(옛 화면의 늦은 저장이 옛 색에 쓰이지 않게).
+- **관리자 쓰기**: proxy는 활성 색으로만 보내므로 `data/`를 쓰는 곳은 한 곳이다. drain 중인 색은 관리자 쓰기를 활성 색으로
+  전달한다(옛 화면의 늦은 저장이 옛 색에만 쓰이지 않게).
 
 ### 5.6 종료
 
@@ -181,26 +247,46 @@ uid 모드는 레지스트리 잠금 때문에 두 번째 프로세스가 기동
 
 | PR | 내용 | 클라이언트 영향 |
 |---|---|---|
-| 1 | drain(`/internal/drain`, `/health/drain`, 쉬는 세션 즉시 놓기, ready 503), `GATEWAY_INSTANCE` + `x-gateway-instance`, `--timeout-graceful-shutdown`, 쿠키 비밀값·runtime-config 영속화 | 없음 |
-| 2 | 세션 파일 잠금(§5.2) + 409 `session_busy_elsewhere`, 기동 공유 파일 정리(§5.4) | 409가 새로 생김(retryable) |
-| 3 | compose(blue/green/proxy, 고정 볼륨 이름), nginx 설정, `scripts/deploy.sh`(+ `migrate`), 운영 문서 | 운영 절차 바뀜 |
-| 4 (ChatDRAGON) | 대화별 `x-gateway-instance` 기억·전달, 409 `session_busy_elsewhere` 안내 | 카드가 교체 중에도 산다 |
+| 1 | 세션 소유 잠금 + instance 등록·생존, 넘겨받기(`/internal/sessions/<sid>/release`)·울타리, 전달(reverse-proxy, `x-gateway-forwarded`+HMAC), `GATEWAY_INSTANCE`·`x-gateway-instance` | 없음(한 색만 돌면 경로를 안 탄다) |
+| 2 | drain(`/internal/drain`, `/health/drain`, 새 세션 전달, 쉬는 세션 즉시 놓기, ready 503), `--timeout-graceful-shutdown`, 쿠키 비밀값·runtime-config 영속화 | 없음 |
+| 3 | 플러그인 replay 전체 잠금·digest skip·옛 트리 수명(§5.4), `_tmp_` 정리 | 없음 |
+| 4 | compose(blue/green/proxy, 고정 볼륨 이름), nginx 설정, `scripts/deploy.sh`(+ `migrate`), 운영 문서 | 운영 절차 바뀜 |
 
-PR 1·2는 단일 컨테이너 배포에서도 해가 없다(drain을 안 부르면 지금과 같다).
+ChatDRAGON 변경은 필요 없다. PR 1–3은 단일 컨테이너 배포에서도 해가 없다(drain을 안 부르고 색이 하나면 지금과 같다).
+
+### 배포 gate
+
+- **첫 무중단 교체는 PR 1–3을 가진 버전에서 그 다음 버전으로만** 한다. 지금 단일 컨테이너에서 처음 옮기는 배포
+  (`scripts/deploy.sh migrate`)는 재시작 배포다: blue를 먼저 healthy로 띄우고 옛 컨테이너를 내린 뒤 proxy가 포트를 잡는다
+  (이 한 번은 포트를 넘기는 몇 초의 끊김과, 옛 컨테이너의 진행 중 턴·카드를 잃을 수 있다 — 한가한 시간에).
+- deploy 스크립트는 활성 색의 `/health`가 handoff 지원 버전(`capabilities: ["handoff", "drain"]`)을 답하지 않으면 무중단
+  교체를 거부하고 재시작 배포를 안내한다 — handoff를 모르는 옛 색과 새 색이 함께 돌면 §5.2가 성립하지 않는다.
 
 ## 8. 검증 계획
 
-- 단위: drain 상태 전이, `/health/drain` 카운트(턴·카드·백그라운드·열린 요청), 쉬는 세션 즉시 놓기, 파일 잠금
-  409, 플러그인 설치 skip/잠금, `_tmp_` 정리가 다른 instance를 건드리지 않음, 쿠키 비밀값 공유.
-- 통합(`tests/fixtures/fake_anthropic_api.py` + 번들 CLI, 두 프로세스를 같은 HOME으로): blue에서 시작한 대화를 green이
-  resume, 진행 중인 세션을 green이 잡으려 하면 409, drain 중 blue의 긴 턴이 끝까지 스트리밍.
-- deploy 스크립트: ChatDRAGON `tests/test_deploy_script.py`처럼 docker 호출을 가짜로 바꿔 순서·되돌리기·timeout을 고정.
-- 실환경 리허설(배포 컨테이너): 긴 도구 턴 + 카드 대기 + 백그라운드 턴을 걸어 둔 채 `deploy.sh` — 끊김 없음, 카드 답이
+- **단위**: 소유 잠금(같은 프로세스·다른 프로세스·죽은 소유자), release의 원자성(진행 중이면 거부, 놓은 뒤 울타리),
+  전달(본문·헤더·SSE 바이트 그대로, 클라이언트 끊김 전파, 재전달 금지, 밖에서 온 forwarded 헤더 제거), drain 상태 전이와
+  `/health/drain` 카운트, 새 세션 전달, 쿠키 비밀값 공유, replay 잠금·digest skip, `.old-*` 수명(§5.4의 mtime 확인 포함),
+  `_tmp_` 정리가 다른 instance를 건드리지 않음.
+- **두 프로세스 통합**(`tests/fixtures/fake_anthropic_api.py` + 번들 CLI, 같은 HOME·data·workspaces, 두 uvicorn) — 리뷰
+  acceptance 그대로:
+  1. blue에서 턴을 마친 직후 drain + 전환, blue가 아직 쉬는 세션을 쥔 채 다음 턴을 green으로 → 409·실패 없이 완료,
+     transcript에 CLI 하나만 쓴 흔적.
+  2. blue에서 긴 턴이 도는 중에 같은 세션의 요청이 green으로 → blue로 전달, 턴은 끝까지, 중복 실행 없음.
+  3. blue의 카드 대기 중 답이 green으로 → blue로 전달되어 카드가 풀림.
+  4. 헤더를 모르는 클라이언트로 1–3 반복.
+  5. 두 색이 동시에 플러그인 replay(같은 manifest → 둘 다 skip / 다른 manifest → 한쪽씩 잠금, 레지스트리 온전).
+  6. replay 뒤에도 옛 색의 CLI가 연 fd·cwd로 옛 플러그인 트리를 drain 끝까지 읽는다.
+  7. 반복 배포(blue→green→blue)와 되돌리기(6단계 중 rollback).
+- **deploy 스크립트**: ChatDRAGON `tests/test_deploy_script.py`처럼 docker 호출을 가짜로 바꿔 순서(drain → 전환)·gate·
+  되돌리기·timeout을 고정.
+- **실환경 리허설**(배포 컨테이너): 긴 도구 턴 + 카드 대기 + 백그라운드 턴을 걸어 둔 채 `deploy.sh` — 끊김 없음, 카드 답이
   닿음, 교체 뒤 같은 대화가 이어짐.
 
 ## 9. 정할 것
 
-1. §5.3 A(헤더, ChatDRAGON 변경)로 갈지, 헤더 없는 클라이언트까지 위해 B를 할지.
-2. `DRAIN_TIMEOUT_SECONDS` 기본값(제안 3600)과 넘겼을 때의 동작(멈춤 vs 강제).
-3. 배포 호스트에서 nginx를 gateway compose 안에 둘지, 이미 있는 사내 리버스 프록시에 upstream 전환을 맡길지.
+1. `DRAIN_TIMEOUT_SECONDS` 기본값(제안 3600)과 넘겼을 때의 동작(멈춤 vs 강제).
+2. 배포 호스트에서 nginx를 gateway compose 안에 둘지, 이미 있는 사내 리버스 프록시에 upstream 전환을 맡길지(사내 프록시면
+   reload가 graceful한지, `/internal/`을 막을 수 있는지 확인).
+3. §5.4-3 옛 트리 수명: grace를 env로 늘릴지, drain 중인 instance가 있는 동안 sweep을 멈출지.
 4. uid 모드 공유 레지스트리를 이 작업 뒤에 이어서 할지.
