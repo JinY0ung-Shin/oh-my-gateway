@@ -318,8 +318,11 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 - **쿠키 비밀값**: `data/admin_cookie_secret`(0600)에 한 번 만들어 두 색이 같이 읽는다 — 교체해도 로그아웃되지 않는다.
   `ADMIN_COOKIE_SECRET` env가 있으면 그것을 쓴다.
 - **runtime-config**: 오버라이드를 `data/runtime_config.json`(tmp + `os.replace`)에 남기고 기동 때 읽는다 — green이
-  기본값으로 뜨는 틈이 없어진다. ChatDRAGON의 reconcile은 그대로 두어도 된다(gateway가 이미 오버라이드를 들고
-  있으면 건드리지 않는다).
+  기본값으로 뜨는 틈이 없어진다. 파일이 두 색의 공통 원본이다: 읽기는 파일이 바뀌었으면(inode·mtime·size) 다시 읽고
+  (`refresh()`, `/health/ready`도 부른다 — 전환 직전 green이 blue의 마지막 변경을 들고 있게), 쓰기는 `<file>.lock`
+  `flock` 아래에서 최신 파일을 읽어 바뀐 키 하나만 얹어 원자적으로 바꾼다 — 한 색이 다른 키의 낡은 사본을 되써서
+  상대의 변경을 지우지 않는다(#266 리뷰). ChatDRAGON의 reconcile은 그대로 두어도 된다(gateway가 이미 오버라이드를
+  들고 있으면 건드리지 않는다).
 - **관리자 쓰기**: proxy는 활성 색으로만 보내므로 `data/`를 쓰는 곳은 한 곳이다. drain 중인 색은 관리자 쓰기를 drain target으로
   전달한다(옛 화면의 늦은 저장이 옛 색에만 쓰이지 않게).
 

@@ -299,6 +299,11 @@ async def readiness_check(request: Request):
     failing checks otherwise. All checks run concurrently with short timeouts.
     """
     _ = request  # slowapi requires a request parameter in decorated handlers.
+    # Pick up admin overrides another blue/green color saved since this one read
+    # the shared file (and notify the turn limiter) before deploy switches to it.
+    from src.runtime_config import runtime_config
+
+    runtime_config.refresh()
     backend_names = sorted(BackendRegistry.all_backends().keys())
 
     results = await asyncio.gather(

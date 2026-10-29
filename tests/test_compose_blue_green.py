@@ -167,10 +167,13 @@ def test_nginx_streams_and_never_limits_or_times_out_first():
         "proxy_set_header Host $http_host;",
         # Overwritten, never appended: the client cannot choose its own address.
         "proxy_set_header X-Forwarded-For $remote_addr;",
-        "proxy_set_header X-Forwarded-Proto $gateway_forwarded_proto;",
+        "proxy_set_header X-Forwarded-Proto $scheme;",
     ):
         assert directive in proxy, directive
     assert "$proxy_add_x_forwarded_for" not in text
+    # #266 review: a client-sent X-Forwarded-Proto must never reach the colors,
+    # which trust this proxy's forwarding headers.
+    assert "$http_x_forwarded_proto" not in text
     assert "client_max_body_size 0;" in text
 
 

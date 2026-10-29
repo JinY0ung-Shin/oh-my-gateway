@@ -81,7 +81,11 @@ def test_no_temp_files_left_behind(cfg_file):
     rc = RuntimeConfig(persist=True)
     for i in range(5):
         rc.set("default_max_turns", i + 1)
-    assert sorted(p.name for p in cfg_file.parent.iterdir()) == [cfg_file.name]
+    # The cross-process write lock stays (flock needs a stable inode).
+    assert sorted(p.name for p in cfg_file.parent.iterdir()) == [
+        cfg_file.name,
+        cfg_file.name + ".lock",
+    ]
 
 
 def test_memory_only_instance_never_writes(cfg_file):
@@ -216,3 +220,80 @@ def test_a_new_process_starts_with_the_persisted_overrides(cfg_file):
     assert proc.returncode == 0, proc.stderr
     out = json.loads(proc.stdout.strip().splitlines()[-1])
     assert out == {"model": "from-blue", "overridden": True, "limiter_total": 7}
+
+
+# ------------------------------------------------- two colors sharing one file
+
+
+def _other_color(cfg_file: Path, code: str) -> subprocess.Popen:
+    """Run *code* in another gateway process (``rc`` = its persisted config)."""
+    prelude = (
+        "import sys; sys.path.insert(0, '.');"
+        "from src.runtime_config import RuntimeConfig;"
+        "rc = RuntimeConfig(persist=True); rc.load()\n"
+    )
+    env = {
+        **os.environ,
+        "GATEWAY_SKIP_DOTENV": "1",
+        "RUNTIME_CONFIG_FILE": str(cfg_file),
+    }
+    return subprocess.Popen(
+        [sys.executable, "-c", prelude + code],
+        cwd=REPO_ROOT,
+        env=env,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+
+def _run_other(cfg_file: Path, code: str) -> None:
+    proc = _other_color(cfg_file, code)
+    _, err = proc.communicate(timeout=60)
+    assert proc.returncode == 0, err
+
+
+def test_a_value_the_other_color_saves_after_boot_is_served(cfg_file):
+    """#266 review (a): green booted, blue changed a value, green serves it."""
+    green = _fresh()
+    assert not green.is_overridden("default_model")
+    seen = []
+    green.on_change(seen.append)
+    _run_other(cfg_file, "rc.set('default_model', 'from-blue')")
+    assert green.get("default_model") == "from-blue"
+    assert seen == [None]
+    _run_other(cfg_file, "rc.reset('default_model')")
+    assert not green.is_overridden("default_model")
+
+
+def test_writing_another_key_keeps_the_other_colors_value(cfg_file):
+    """#266 review (b): green's stale copy never overwrites blue's new value."""
+    green = _fresh()
+    _run_other(cfg_file, "rc.set('default_model', 'from-blue')")
+    green.set("default_max_turns", 9)  # no read in between
+    assert json.loads(cfg_file.read_text())["overrides"] == {
+        "default_model": "from-blue",
+        "default_max_turns": 9,
+    }
+    green.reset_all()
+    _run_other(cfg_file, "assert not rc.is_overridden('default_model')")
+
+
+def test_concurrent_writes_from_both_colors_lose_nothing(cfg_file):
+    """#266 review (c): interleaved admin writes in two processes."""
+    loop = "for i in range(1, 101):\n    rc.set({k!r}, i); rc.set({k2!r}, i)\n"
+    blue = _other_color(
+        cfg_file, loop.format(k="default_max_turns", k2="max_concurrent_turns")
+    )
+    green = _other_color(
+        cfg_file,
+        loop.format(k="turn_queue_max_waiters", k2="session_max_age_minutes"),
+    )
+    for proc in (blue, green):
+        _, err = proc.communicate(timeout=120)
+        assert proc.returncode == 0, err
+    assert json.loads(cfg_file.read_text())["overrides"] == {
+        "default_max_turns": 100,
+        "max_concurrent_turns": 100,
+        "turn_queue_max_waiters": 100,
+        "session_max_age_minutes": 100,
+    }
