@@ -20,6 +20,7 @@ Key data sources:
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -139,35 +140,67 @@ def _marketplace_anchors() -> List[Path]:
     ``~/.claude/plugins/marketplaces/<name>`` when added by a remote shorthand,
     or the clone-root path when added from a local clone — which is how BOTH this
     gateway's admin ``add_marketplace`` and the startup installer register remote
-    repos (clone to the clone root, then add that local path). So both roots are
-    valid anchors. The clone root mirrors
+    repos (clone to the clone root, then add that local path), and how a local
+    source confined sessions cannot read is registered (a copy, #258). So both
+    roots are valid anchors. The clone root mirrors
     ``plugin_admin_service.clone_root()`` / ``docker/install_plugins.py``.
+    A local source a session can read is registered in place: under
+    ``$PLUGIN_SOURCES_DIR`` (the compose file's ``/data/plugins``) it is a
+    third anchor, and anywhere else only its own exact path is accepted
+    (:func:`_manifest_local_sources`).
     """
+    from src.claude_config_paths import plugin_clone_root, plugin_sources_dir
+
     anchors: List[Path] = []
     root = _plugins_root()
     if root is not None:
         anchors.append(root / "marketplaces")
-    from src.claude_config_paths import plugin_clone_root
-
     anchors.append(plugin_clone_root())
+    sources = plugin_sources_dir()
+    if sources is not None:
+        anchors.append(sources)
     return anchors
+
+
+def _manifest_local_sources() -> List[Path]:
+    """Local marketplace paths the admin manifest records (#260).
+
+    ``add_marketplace`` registers a local source a session can read in place
+    and records that same path in the manifest, so the catalog accepts exactly
+    those paths — never what lies beneath them, and nothing a
+    ``known_marketplaces.json`` entry names on its own. Never raises."""
+    try:
+        from src import plugin_manifest
+
+        records = plugin_manifest.list_marketplace_records()
+    except Exception:  # noqa: BLE001 - a read model, never a failure
+        return []
+    paths: List[Path] = []
+    for record in records.values() if isinstance(records, dict) else ():
+        if not isinstance(record, dict):
+            continue
+        repo = str(record.get("repo") or "").strip()
+        if os.path.isabs(repo):
+            paths.append(Path(repo))
+    return paths
 
 
 def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
     """Validate *install_location* resolves within an allowed marketplace root.
 
-    Allowed roots are ``~/.claude/plugins/marketplaces`` and the clone root
-    (see :func:`_marketplace_anchors`). Returns the resolved path, or ``None`` if
-    the path is a symlink (leaf or parent), escapes every allowed root, or does
-    not exist as a directory.
+    Allowed: anything under :func:`_marketplace_anchors`, or exactly a local
+    source the admin manifest records (:func:`_manifest_local_sources`).
+    Returns the resolved path, or ``None`` if the path is a symlink (leaf or
+    parent), escapes every allowed root, or does not exist as a directory.
     """
     try:
         resolved = install_location.resolve()
     except OSError:
         return None
 
+    anchors = _marketplace_anchors()
     anchor: Optional[Path] = None
-    for candidate in _marketplace_anchors():
+    for candidate in anchors:
         try:
             resolved.relative_to(candidate.resolve())
             anchor = candidate
@@ -175,9 +208,20 @@ def _validate_marketplace_path(install_location: Path) -> Optional[Path]:
         except (ValueError, OSError):
             continue
     if anchor is None:
+        for source in _manifest_local_sources():
+            try:
+                if source.resolve() == resolved:
+                    anchor = source
+                    break
+            except OSError:
+                continue
+    if anchor is None:
         logger.warning(
-            "Marketplace installLocation outside allowed roots: %s",
+            "Marketplace installLocation outside allowed roots: %s (expected "
+            "under %s, or a local source added from the admin page; set "
+            "PLUGIN_SOURCES_DIR for a source root registered in place)",
             install_location,
+            ", ".join(str(a) for a in anchors),
         )
         return None
 

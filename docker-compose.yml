@@ -109,6 +109,9 @@ services:
       # reinstalls manifest.added and reapplies manifest.removed on next boot
       # (self-healing).
       - CLAUDE_PLUGIN_MANIFEST=${CLAUDE_PLUGIN_MANIFEST:-/app/data/gateway-plugins.json}
+      # Container side of the plugin sources mount above. The admin catalog
+      # reads marketplaces registered in place beneath it (#260).
+      - PLUGIN_SOURCES_DIR=${PLUGIN_SOURCES_DIR:-/data/plugins}
       # Auto-wire the custom system prompt to the host file mounted above.
       # Resolves to /app/system_prompt.md only when SYSTEM_PROMPT_HOST_FILE is
       # set; otherwise empty so the claude_code preset is used. This overrides

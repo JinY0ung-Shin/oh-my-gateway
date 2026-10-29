@@ -101,7 +101,7 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 - **플러그인:**
   - landlock 모드에서는 `~/.claude/plugins/data`가 읽기 전용이다. 훅은 돌지만 그 안에 쓰는 것은 실패한다. uid 모드에서는 사용자별 config dir에 쓸 수 있다.
   - 플러그인의 `bin/`이 Bash `PATH`에 오르지 않는다.
-  - **로컬 마켓플레이스 소스는 `/data/plugins` 아래에 둔다.** 기본 Compose가 호스트의 `./plugins`(`PLUGIN_SOURCES_HOST_DIR`)를 `/data/plugins`에 읽기 전용으로 마운트한다. 관리자 화면에서 `/data/plugins/<마켓플레이스>`로 추가하면 그 자리가 그대로 등록된다.
+  - **로컬 마켓플레이스 소스는 `/data/plugins` 아래에 둔다.** 기본 Compose가 호스트의 `./plugins`(`PLUGIN_SOURCES_HOST_DIR`)를 `/data/plugins`에 읽기 전용으로 마운트한다. 관리자 화면에서 `/data/plugins/<마켓플레이스>`로 추가하면 그 자리가 그대로 등록된다. Compose가 설정하는 `PLUGIN_SOURCES_DIR=/data/plugins`는 관리자 카탈로그가 이 아래 마켓플레이스의 플러그인 목록을 읽게 한다(#260).
   - **`/app` 아래(예: `/app/data/plugins/...`)에 둔 소스는 사본으로 등록된다(#258).** `/app`은 세션에 절대 열리지 않는다. 워크스페이스 base·임시 디렉터리 아래도 같다. 그래서 게이트웨이는 이런 로컬 경로를 clone 루트(`CLAUDE_PLUGIN_CLONE_ROOT`, uid 모드에서는 `/data/claude/shared/plugin-marketplaces`)로 복사하고, 그 사본을 등록한다.
     - manifest에는 원래 경로가 남는다. 기동할 때마다, 그리고 관리자 화면의 refresh 때마다 다시 복사한다. 원본을 고친 내용은 그때 반영된다.
     - 사본은 모든 세션이 읽는 곳에 놓이므로 마켓플레이스 자신의 일반 파일만 옮긴다.
