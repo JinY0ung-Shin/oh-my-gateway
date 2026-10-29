@@ -34,6 +34,23 @@ os.environ.setdefault("GATEWAY_NON_DUMPABLE", "false")
 # that enable a mode take the dev opt-out; the ownership tests unset it.
 os.environ.setdefault("CLAUDE_ISOLATION_ALLOW_UNSAFE_LAUNCHER", "true")
 
+# Admin-panel state the gateway persists under the repo's data/ dir
+# (src/runtime_config.py overrides, src/admin_auth.py cookie secret) goes to a
+# throwaway dir instead, so a test's runtime_config.set() never lands in — or
+# is loaded from — the checkout. Subprocess gateways inherit these.
+import atexit as _atexit
+import shutil as _shutil
+import tempfile as _tempfile
+
+_GATEWAY_TEST_DATA = _tempfile.mkdtemp(prefix="gateway-test-data-")
+_atexit.register(_shutil.rmtree, _GATEWAY_TEST_DATA, True)
+os.environ.setdefault(
+    "RUNTIME_CONFIG_FILE", os.path.join(_GATEWAY_TEST_DATA, "runtime_config.json")
+)
+os.environ.setdefault(
+    "ADMIN_COOKIE_SECRET_FILE", os.path.join(_GATEWAY_TEST_DATA, "admin_cookie_secret")
+)
+
 # Throwaway HOME, no inherited CLAUDE_CONFIG_DIR (see the module docstring).
 from tests.fixtures import hermetic_home  # must precede every src import
 

@@ -5,7 +5,9 @@ Run INSIDE the gateway container, as the uid:gid that sessions run as (the
 gateway's -- `docker compose exec` attaches as root here unless given `-u`), fed
 on stdin so no session-writable path in the container is involved:
 
-    docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.py
+    docker compose exec -T -u app "$(scripts/deploy.sh active)" python3 -I -S - < scripts/isolation_probe.py
+
+(`scripts/deploy.sh active` names the serving color, gateway-blue or gateway-green.)
 
 With APP_GID != the app user's group, `-u app` is NOT the sessions' identity;
 the probe then prints the exact `-u <uid>:<gid>` to re-run with.
@@ -561,8 +563,11 @@ def _rerun_ids(ident: dict) -> str:
 
 def _rerun_cmd(ident: dict) -> str:
     """The re-run command, fed on stdin like the module docstring's."""
+    # Blue/green compose (docs/zero-downtime-deploy.md): the service is gateway-<color>.
+    color = os.environ.get("GATEWAY_INSTANCE", "").strip().lower()
+    service = f"gateway-{color}" if color in ("blue", "green") else "gateway"
     return (
-        f"docker compose exec -T -u {_rerun_ids(ident)} gateway"
+        f"docker compose exec -T -u {_rerun_ids(ident)} {service}"
         " python3 -I -S - < scripts/isolation_probe.py"
     )
 

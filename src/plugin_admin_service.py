@@ -30,6 +30,8 @@ All functions here are synchronous; routes wrap them in
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import hashlib
 import json
 import logging
@@ -204,6 +206,51 @@ def run(cmd: List[str], *, token: str = "") -> subprocess.CompletedProcess:
             proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr
         )
     return proc
+
+
+@contextlib.contextmanager
+def _replay_locked():
+    """Hold the plugin replay lock and invalidate the replay digest.
+
+    Every mutation here runs ``claude plugin ...`` against the registry the
+    startup replay (``docker/install_plugins.py``) also edits: during a
+    blue/green deploy the other color may be replaying, so both take
+    ``<config dir>/.plugin-replay.lock`` (``plugin_local_copy.replay_lock``,
+    outside ``replace_tree``'s per-dest lock). The digest goes first, so the
+    next boot replays even when this change dies half-way. Blocking: these
+    functions run in worker threads (routes: ``run_in_threadpool``;
+    ``plugin_autorefresh``: ``asyncio.to_thread``)."""
+    from src.claude_config_paths import config_dir
+    from src.plugin_manifest import manifest_path
+
+    lock = plugin_local_copy.replay_lock(config_dir())
+    try:
+        lock.__enter__()
+    except OSError:
+        logger.warning(
+            "Could not take the plugin replay lock; running unlocked", exc_info=True
+        )
+        lock = None
+    try:
+        try:
+            plugin_local_copy.invalidate_replay_digest(manifest_path().parent)
+        except OSError:
+            logger.warning(
+                "Could not invalidate the plugin replay digest", exc_info=True
+            )
+        yield
+    finally:
+        if lock is not None:
+            lock.__exit__(None, None, None)
+
+
+def _with_replay_lock(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        with _replay_locked():
+            return fn(*args, **kwargs)
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +570,7 @@ def _resolve_marketplace_repo_raw(marketplace: str) -> str:
     return ""
 
 
+@_with_replay_lock
 def add_marketplace(
     repo: str,
     *,
@@ -614,6 +662,7 @@ def _installed_plugins_for_marketplace(*names: str) -> list[dict]:
         return []
 
 
+@_with_replay_lock
 def refresh_marketplace(
     name: str,
     *,
@@ -691,6 +740,7 @@ def refresh_marketplace(
     }
 
 
+@_with_replay_lock
 def remove_marketplace(name: str, *, scope: str = "user") -> dict:
     """Remove a configured marketplace and drop its managed ``added`` entries.
 
@@ -750,6 +800,7 @@ def _with_confinement_warnings(result: dict) -> dict:
     return result
 
 
+@_with_replay_lock
 def install_plugin(
     name: str,
     *,
@@ -827,6 +878,7 @@ def install_plugin(
     return _with_confinement_warnings(result)
 
 
+@_with_replay_lock
 def uninstall_plugin(plugin_id: str, *, scope: str = "user") -> dict:
     """Uninstall *plugin_id* (registry key ``name@marketplace``).
 

@@ -65,14 +65,17 @@ GATEWAY_REQUIRE_SCOPED_IDENTITY=true
 2. **기본 Compose만** 사용한다. `docker-compose.uid.yml`은 uid 모드로 덮어쓰므로 함께 적용하지 않는다.
 
    ```bash
-   docker compose up -d --build gateway
-   docker compose logs --tail=150 gateway
+   scripts/deploy.sh            # 무중단 교체(blue/green) — 첫 이전이면 scripts/deploy.sh migrate
+   docker compose logs --tail=150 "$(scripts/deploy.sh active)"
    ```
+
+   Compose의 gateway 서비스는 `gateway-blue`/`gateway-green`이다(`scripts/deploy.sh active`가 지금 트래픽을 받는
+   색을 알려 준다, [무중단 배포 §10](zero-downtime-deploy.md#10-운영)).
 
 3. 컨테이너 내부 Landlock 지원을 확인한다.
 
    ```bash
-   docker compose exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.py
+   docker compose exec -T -u app "$(scripts/deploy.sh active)" python3 -I -S - < scripts/isolation_probe.py
    ```
 
    출력에서 `Landlock usable (ABI>=3)` 판정과 기동 로그의 격리 모드를 확인한다. **`docker compose exec`로 직접 연 셸은 Claude 세션 격리 런처를 통과하지 않으므로**, 그 셸에서 파일을 읽을 수 있다는 사실만으로 Landlock 실패라고 판단하지 않는다. 실제 보호 검사는 **Gateway API로 시작한 Claude 턴에서** 수행한다.
@@ -131,17 +134,24 @@ CLAUDE_ISOLATION_MIGRATE_FROM=/home/app/.claude
 또한 `claude_isolation:/data/claude` 볼륨을 추가한다. **이 다섯 값만 .env에 적고 기본 Compose로 시작하는 것보다 override를 쓰는 게 안전**하다. 기존 `claude_home`의 transcript/memory 이관 및 공유 자산 배치를 위한 레이아웃이다.
 
 ```bash
-# 시작 전 실제 호스트 권한/볼륨과 인증 설정 검토
-docker compose -f docker-compose.yml -f docker-compose.uid.yml config
+export GATEWAY_COMPOSE="docker compose -f docker-compose.yml -f docker-compose.uid.yml"
 
-# uid 모드 기동
-docker compose -f docker-compose.yml -f docker-compose.uid.yml up -d --build gateway
-docker compose -f docker-compose.yml -f docker-compose.uid.yml logs --tail=200 gateway
+# 시작 전 실제 호스트 권한/볼륨과 인증 설정 검토
+$GATEWAY_COMPOSE --profile blue config
+
+# uid 모드 기동 — 재시작 배포(짧은 끊김). 옛 단일 `gateway` 컨테이너에서 처음 옮길 때는 migrate 한 번,
+# 그 뒤 배포는 restart. uid 모드에서는 무중단 교체(scripts/deploy.sh)를 스크립트가 거부한다.
+scripts/deploy.sh migrate      # 처음 한 번 (새로 설치하면 대신 scripts/deploy.sh — blue 하나만 띄운다)
+scripts/deploy.sh restart      # 그 뒤 매 배포
+$GATEWAY_COMPOSE logs --tail=200 "$(scripts/deploy.sh active)"
 
 # 컨테이너 지원능력 읽기 전용 진단
-docker compose -f docker-compose.yml -f docker-compose.uid.yml \
-  exec -T -u app gateway python3 -I -S - < scripts/isolation_probe.py
+$GATEWAY_COMPOSE exec -T -u app "$(scripts/deploy.sh active)" \
+  python3 -I -S - < scripts/isolation_probe.py
 ```
+
+uid 모드가 무중단 교체를 못 하는 이유: uid 레지스트리가 프로세스 하나만 받는다(아래 "다중 worker/다중 복제본").
+두 색이 함께 뜨면 두 번째 색이 기동을 거부한다([무중단 배포 §6](zero-downtime-deploy.md#6-uid-모드)).
 
 필수 전제:
 - Docker 컨테이너 **root 시작 단계** 유지(`user:`로 비root 시작하지 않음). entrypoint가 전용 broker를 생성한 다음 Gateway 본체 권한을 내린다. 일반 구성에서 추가 `cap_add`는 필요하지 않다.
@@ -171,7 +181,7 @@ docker compose -f docker-compose.yml -f docker-compose.uid.yml \
 
 ```bash
 # CLI 시작 실패/격리 실패 원인 확인
-docker compose logs --tail=250 gateway
+docker compose logs --tail=250 "$(scripts/deploy.sh active)"
 
 # 실제 Docker Compose의 포트·환경변수·볼륨 병합 상태 확인 (비밀 포함 가능: 외부 공유 금지)
 docker compose config

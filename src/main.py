@@ -255,6 +255,13 @@ async def lifespan(app: FastAPI):
 
     run_startup_config_check()
 
+    # Blue/green (docs/zero-downtime-deploy.md): take this instance's liveness
+    # lock before serving, so a peer never routes to a process that is not up.
+    # No-op without GATEWAY_INSTANCE.
+    from src import instance_registry
+
+    instance_registry.register()
+
     # Make the per-user identity enforcement state (#251) visible to operators:
     # a security boundary silently off is worse than one loudly on.
     from src.auth import scoped_identity_required
@@ -446,9 +453,14 @@ async def lifespan(app: FastAPI):
     logger.info("Shutting down session manager...")
     # Under uid isolation this also drains the broker-backed reclaimer the
     # session teardowns handed anonymous workspaces to (bounded).
+    from src.handoff.drain import drain_state
+
+    if drain_state.draining:
+        await drain_state.stop()
     await session_manager.async_shutdown()
     await _shutdown_backends()
     await usage_logger.close()
+    instance_registry.unregister()
 
 
 # First uid-mode retention sweep this long after startup, then every hour: a
@@ -721,6 +733,13 @@ app.add_middleware(DebugLoggingMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 # Records the address this gateway serves on so the CLI child can reach the MCP progress relay.
 app.add_middleware(RelayOriginMiddleware)
+
+# Outermost: routes a request to the blue/green instance that owns its session
+# before anything else here sees it (the owner applies auth, limits and logging
+# itself). Pass-through unless GATEWAY_INSTANCE is set.
+from src.handoff.middleware import HandoffMiddleware  # noqa: E402
+
+app.add_middleware(HandoffMiddleware)
 
 
 # ==================== Exception Handlers ====================

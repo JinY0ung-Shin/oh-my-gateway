@@ -245,6 +245,41 @@ def remove_temp_workspace(workspace: Path) -> None:
     _release_uid_lease(workspace)
 
 
+TEMP_PREFIX = "_tmp_"
+
+
+def _instance() -> str:
+    """This gateway's blue/green color (``GATEWAY_INSTANCE``), or ``""``."""
+    try:
+        from src import instance_registry
+
+        return instance_registry.instance_name()
+    except Exception:
+        logger.debug("Could not resolve the gateway instance", exc_info=True)
+        return ""
+
+
+def temp_workspace_prefix() -> str:
+    """The prefix of this gateway's anonymous workspaces: ``_tmp_<instance>_``
+    with ``GATEWAY_INSTANCE`` set (blue/green), else ``_tmp_``. Every
+    ``_tmp_*`` name stays an anonymous workspace to the rest of the code
+    (``startswith("_tmp_")``); the instance only scopes the startup sweep."""
+    name = _instance()
+    return f"{TEMP_PREFIX}{name}_" if name else TEMP_PREFIX
+
+
+def _other_instances_alive() -> bool:
+    """Whether another gateway instance is alive; ``True`` when unknown, so the
+    sweep then keeps what may be that instance's live workspaces."""
+    try:
+        from src import instance_registry
+
+        return bool(instance_registry.other_live_instances())
+    except Exception:
+        logger.warning("Could not read gateway instance liveness", exc_info=True)
+        return True
+
+
 def _per_uid_layouts() -> bool:
     """Whether uid isolation runs with per-uid config dirs (``uid_layout``)."""
     try:
@@ -279,7 +314,7 @@ class WorkspaceManager:
         ``CLAUDE_WORKSPACE_DIR`` may override only the filesystem directory name
         used for the ``claude`` backend; the backend identifier itself remains
         unchanged. Anonymous workspaces remain session-scoped ``_tmp_{uuid}``
-        directories.
+        directories (``_tmp_<instance>_{uuid}`` with ``GATEWAY_INSTANCE`` set).
 
         On the first creation of a named backend workspace,
         ``WORKSPACE_INITIAL_DIRS`` may seed configurable top-level or nested
@@ -314,7 +349,7 @@ class WorkspaceManager:
             if workspace_dir_name:
                 workspace = workspace / workspace_dir_name
         else:
-            workspace = self.base_path / f"_tmp_{uuid.uuid4().hex}"
+            workspace = self.base_path / f"{temp_workspace_prefix()}{uuid.uuid4().hex}"
 
         # Validate seed configuration before creating anything. Otherwise a bad
         # entry could leave behind an empty workspace that subsequent resolves
@@ -392,7 +427,7 @@ class WorkspaceManager:
         CLI of its uid still runs there: the wipe is retried, and given up with
         the lease kept if that CLI outlives the retries.
         """
-        if not workspace.name.startswith("_tmp_"):
+        if not workspace.name.startswith(TEMP_PREFIX):
             if workspace.exists():
                 logger.debug(
                     "Skipping cleanup of non-temporary workspace: %s", workspace
@@ -422,13 +457,27 @@ class WorkspaceManager:
         wipes a shutdown drain did not finish, whose uid leases died with that
         process. Later sweeps keep the age filter.
 
+        Blue/green (``GATEWAY_INSTANCE``, ``docs/zero-downtime-deploy.md``
+        §5.4): while another gateway instance is alive only this instance's own
+        ``_tmp_<instance>_`` workspaces are swept, with the age filter — the
+        rest may be the other color's live runs. Once no other instance is
+        alive every ``_tmp_`` dir is fair game again (legacy and other colors'
+        prefixes included), and only then does the uid-mode any-age rule apply.
+
         Returns the number of directories handed to
         :meth:`cleanup_temp_workspace` — with per-uid config dirs their removal
         completes in the background (as the session uid their ACL names, since
         the leases died with the previous process).
         """
-        any_age = not self._swept_orphans and _per_uid_layouts()
+        first = not self._swept_orphans
         self._swept_orphans = True
+        others_alive = _other_instances_alive()
+        any_age = first and not others_alive and _per_uid_layouts()
+        prefix = temp_workspace_prefix() if others_alive else TEMP_PREFIX
+        if prefix == TEMP_PREFIX and others_alive:
+            # No color of our own (GATEWAY_INSTANCE unset) beside a live
+            # instance: nothing here is provably ours.
+            return 0
         if not self.base_path.exists():
             return 0
         cutoff = time.time() - max_age_seconds
@@ -438,7 +487,7 @@ class WorkspaceManager:
             return 0
         removed = 0
         for child in children:
-            if not child.name.startswith("_tmp_"):
+            if not child.name.startswith(prefix):
                 continue
             if not any_age:
                 try:

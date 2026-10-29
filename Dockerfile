@@ -113,6 +113,12 @@ EXPOSE 8000
 # Run the app with Uvicorn and honor PORT env var.
 # exec ensures SIGTERM from docker stop reaches uvicorn.
 #
+# --timeout-graceful-shutdown 25: on SIGTERM uvicorn waits at most 25 s for open
+# connections (a long SSE stream) and then runs the lifespan shutdown anyway.
+# Without it an open stream blocks shutdown until docker's SIGKILL and the
+# lifespan teardown never runs. Keep it under the compose stop_grace_period
+# (35 s) so teardown finishes before the kill (docs/zero-downtime-deploy.md §5.6).
+#
 # Optional start-time hook for private/corporate setup that must run on every
 # container start (e.g. writing ~/.claude/settings.json). Point
 # GATEWAY_STARTUP_SCRIPT at a script (bind-mounted, or added via the build-time
@@ -123,4 +129,4 @@ EXPOSE 8000
 # The entrypoint runs as root with HOME=/home/app, so it runs in isolated mode
 # (-I): no user site-packages, PYTHON* variables or script-directory imports.
 ENTRYPOINT ["python", "-I", "/usr/local/bin/docker-entrypoint.py"]
-CMD ["sh", "-c", "if [ -n \"$GATEWAY_STARTUP_SCRIPT\" ]; then python \"$GATEWAY_STARTUP_SCRIPT\" || exit 1; fi; python /usr/local/bin/install_plugins.py && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "if [ -n \"$GATEWAY_STARTUP_SCRIPT\" ]; then python \"$GATEWAY_STARTUP_SCRIPT\" || exit 1; fi; python /usr/local/bin/install_plugins.py && exec python -m uvicorn src.main:app --host 0.0.0.0 --port ${PORT:-8000} --timeout-graceful-shutdown 25"]

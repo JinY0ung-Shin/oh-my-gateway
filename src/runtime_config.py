@@ -8,13 +8,26 @@ Only values listed in ``EDITABLE_KEYS`` can be changed at runtime.
 Changes take effect on the **next request** — already-running requests
 and already-created sessions are not retroactively affected.
 
+Overrides are persisted to ``data/runtime_config.json`` (``RUNTIME_CONFIG_FILE``
+overrides the path) after every ``set`` / ``reset`` / ``reset_all`` and loaded
+when the module is imported, so a restarted gateway — or the second color of a
+blue/green deploy (docs/zero-downtime-deploy.md §5.5) — starts with the admin's
+overrides instead of the env defaults. Loading never fails startup: an
+unreadable file, an unknown key or a value ``_coerce`` rejects is logged and
+dropped. The file holds no secrets (see ``EDITABLE_KEYS``) but is written 0600
+anyway: only the gateway itself reads it.
+
 Rate limits and timeout are intentionally excluded because slowapi
 caches limit strings at decorator time and the backend captures
 timeout at init time.  Changing those requires a server restart.
 """
 
+import fcntl
+import json
 import logging
 import os
+import tempfile
+from pathlib import Path
 from threading import Lock
 from typing import Any, Callable, Dict, List, Optional
 
@@ -190,17 +203,239 @@ EDITABLE_KEYS: Dict[str, Dict[str, Any]] = {
 
 
 # ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+
+_DATA_DIR = Path(__file__).resolve().parent.parent / "data"
+_FILE_VERSION = 1
+_MAX_FILE_BYTES = 1 << 20
+
+# The JSON type a persisted value must already have (the file is written from
+# coerced values, so anything else was edited by hand or by another build).
+_JSON_TYPES = {"int": int, "bool": bool, "string": str}
+
+
+def runtime_config_path() -> Path:
+    raw = os.getenv("RUNTIME_CONFIG_FILE", "").strip()
+    return Path(raw) if raw else _DATA_DIR / "runtime_config.json"
+
+
+# ---------------------------------------------------------------------------
 # RuntimeConfig singleton
 # ---------------------------------------------------------------------------
 
 
 class RuntimeConfig:
-    """Thread-safe runtime configuration store."""
+    """Thread-safe runtime configuration store.
 
-    def __init__(self) -> None:
+    With ``persist=True`` (the module singleton) the file at
+    :func:`runtime_config_path` is the source of truth, shared by every gateway
+    process on the same ``data/`` (blue/green colors during a deploy):
+
+    * reads are read-through — :meth:`refresh` re-reads the file whenever its
+      identity (inode, mtime, size) changed, so a value one color saved is what
+      the other one serves next;
+    * writes are read-modify-write of **one key** under an ``flock`` on
+      ``<file>.lock``: the latest file is read, only the changed key is applied,
+      and the result is replaced atomically — a color never writes back a stale
+      copy of the other keys (#266 review). Keys this build does not know are
+      kept as they are.
+
+    A bare ``RuntimeConfig()`` stays memory-only.
+    """
+
+    def __init__(self, persist: bool = False) -> None:
         self._overrides: Dict[str, Any] = {}
         self._lock = Lock()
         self._listeners: List[Callable[[Optional[str]], None]] = []
+        self._persist = persist
+        # Identity of the file the overrides were last read from / written as.
+        self._stamp: Optional[tuple] = None
+
+    @staticmethod
+    def _file_stamp(path: Path) -> Optional[tuple]:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return None
+        return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+    @staticmethod
+    def _write_file(path: Path, raw_overrides: Dict[str, Any]) -> None:
+        body = json.dumps(
+            {"version": _FILE_VERSION, "overrides": raw_overrides},
+            indent=2,
+            sort_keys=True,
+        )
+        tmp = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # mkstemp creates the file 0600; replace() gives it a new inode, which
+            # is what other processes' refresh() notices.
+            fd, tmp = tempfile.mkstemp(
+                prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+            )
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(body + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+            tmp = None
+        finally:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+
+    def _mutate(self, apply: Callable[[Dict[str, Any]], None]) -> None:
+        """Apply *apply* to the overrides: in memory, and (persisted) to the
+        latest file under the cross-process write lock. Never raises on I/O: a
+        failed write is logged and the change stays live in this process."""
+        if not self._persist:
+            with self._lock:
+                apply(self._overrides)
+            return
+        path = runtime_config_path()
+        lock_fd = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            lock_fd = os.open(
+                str(path) + ".lock",
+                os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+                0o600,
+            )
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            try:
+                raw = self._read_file(path)
+            except FileNotFoundError:
+                raw = {}
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                logger.warning(
+                    "Runtime config file %s unreadable (%s); rewriting it from "
+                    "this change",
+                    path,
+                    exc,
+                )
+                raw = {}
+            apply(raw)
+            self._write_file(path, raw)
+            loaded = self._validated(raw)
+            stamp = self._file_stamp(path)
+            with self._lock:
+                self._overrides = loaded
+                self._stamp = stamp
+        except OSError as exc:
+            logger.error(
+                "Runtime config overrides not persisted to %s (%s); they are "
+                "live in this process but will not survive a restart",
+                path,
+                exc,
+            )
+            with self._lock:
+                apply(self._overrides)
+        finally:
+            if lock_fd is not None:
+                os.close(lock_fd)
+
+    @staticmethod
+    def _read_file(path: Path) -> Dict[str, Any]:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as fh:
+            raw = fh.read(_MAX_FILE_BYTES + 1)
+        if len(raw) > _MAX_FILE_BYTES:
+            raise ValueError(f"larger than {_MAX_FILE_BYTES} bytes")
+        data = json.loads(raw.decode("utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("overrides"), dict):
+            raise ValueError("expected an object with an 'overrides' object")
+        if data.get("version") != _FILE_VERSION:
+            raise ValueError(f"unsupported version {data.get('version')!r}")
+        return data["overrides"]
+
+    def _validated(self, stored: Dict[str, Any]) -> Dict[str, Any]:
+        """The editable, valid subset of a file's overrides (the rest is logged)."""
+        loaded: Dict[str, Any] = {}
+        for key, value in stored.items():
+            meta = EDITABLE_KEYS.get(key)
+            if meta is None:
+                logger.warning(
+                    "Runtime config file: unknown key %s ignored (kept on disk)", key
+                )
+                continue
+            expected = _JSON_TYPES[meta["type"]]
+            # bool is an int subclass: an int key must not accept true/false.
+            if not isinstance(value, expected) or (
+                expected is int and isinstance(value, bool)
+            ):
+                logger.warning(
+                    "Runtime config file: %s has a %s, expected %s; ignored",
+                    key,
+                    type(value).__name__,
+                    meta["type"],
+                )
+                continue
+            try:
+                loaded[key] = self._coerce(key, value)
+            except (TypeError, ValueError) as exc:
+                logger.warning("Runtime config file: %s ignored (%s)", key, exc)
+        return loaded
+
+    def load(self) -> None:
+        """Read the persisted overrides (startup). Same as :meth:`refresh`, but
+        logs what was loaded."""
+        if not self._persist:
+            return
+        if self.refresh(force=True):
+            with self._lock:
+                names = sorted(self._overrides)
+            if names:
+                logger.info(
+                    "Runtime config: loaded %d persisted override(s) from %s: %s",
+                    len(names),
+                    runtime_config_path(),
+                    ", ".join(names),
+                )
+
+    def refresh(self, force: bool = False) -> bool:
+        """Re-read the file when another process (or anyone) replaced it since
+        this one last read or wrote it. ``True`` when the overrides were
+        reloaded; listeners are then notified like a ``reset_all``. Cheap when
+        nothing changed (one ``stat``). Never raises."""
+        if not self._persist:
+            return False
+        path = runtime_config_path()
+        try:
+            stamp = self._file_stamp(path)
+        except OSError as exc:  # e.g. a parent that is not a directory
+            logger.debug("Runtime config file %s not checked (%s)", path, exc)
+            return False
+        with self._lock:
+            if not force and stamp == self._stamp:
+                return False
+        if stamp is None:
+            loaded: Dict[str, Any] = {}
+        else:
+            try:
+                loaded = self._validated(self._read_file(path))
+            except FileNotFoundError:
+                loaded = {}
+            except (OSError, ValueError, UnicodeDecodeError) as exc:
+                logger.warning(
+                    "Runtime config file %s ignored (%s); keeping the current "
+                    "overrides",
+                    path,
+                    exc,
+                )
+                with self._lock:
+                    self._stamp = stamp  # do not re-read a broken file every call
+                return False
+        with self._lock:
+            changed = loaded != self._overrides
+            self._overrides = loaded
+            self._stamp = stamp
+        if changed or force:
+            self._notify(None)
+        return True
 
     def on_change(self, listener: Callable[[Optional[str]], None]) -> None:
         """Call *listener* with the changed key (``None`` = all) after a change.
@@ -220,6 +455,7 @@ class RuntimeConfig:
 
     def get(self, key: str) -> Any:
         """Return the runtime value for *key* (override or original constant)."""
+        self.refresh()
         with self._lock:
             if key in self._overrides:
                 return self._overrides[key]
@@ -230,13 +466,17 @@ class RuntimeConfig:
         if key not in EDITABLE_KEYS:
             raise KeyError(f"Key '{key}' is not editable at runtime")
         coerced = self._coerce(key, value)
-        with self._lock:
-            self._overrides[key] = coerced
+
+        def apply(overrides: Dict[str, Any]) -> None:
+            overrides[key] = coerced
+
+        self._mutate(apply)
         logger.info(f"Runtime config updated: {key} = {coerced!r}")
         self._notify(key)
 
     def is_overridden(self, key: str) -> bool:
         """Return ``True`` if *key* has a runtime override."""
+        self.refresh()
         with self._lock:
             return key in self._overrides
 
@@ -247,15 +487,19 @@ class RuntimeConfig:
         """
         if key not in EDITABLE_KEYS:
             raise KeyError(f"Key '{key}' is not editable at runtime")
-        with self._lock:
-            self._overrides.pop(key, None)
+        self._mutate(lambda overrides: overrides.pop(key, None))
         logger.info(f"Runtime config reset: {key}")
         self._notify(key)
 
     def reset_all(self) -> None:
         """Remove all runtime overrides."""
-        with self._lock:
-            self._overrides.clear()
+        def apply(overrides: Dict[str, Any]) -> None:
+            # Only the keys this build manages: another build's entries stay.
+            for name in list(overrides):
+                if name in EDITABLE_KEYS:
+                    del overrides[name]
+
+        self._mutate(apply)
         logger.info("Runtime config: all overrides cleared")
         self._notify(None)
 
@@ -263,6 +507,7 @@ class RuntimeConfig:
         """Return all editable keys with their current effective values."""
         # Snapshot overrides once under a single lock, then compute everything
         # from the snapshot without re-acquiring the lock per key.
+        self.refresh()
         with self._lock:
             overrides = dict(self._overrides)
         result = {}
@@ -374,7 +619,8 @@ class RuntimeConfig:
 # Convenience getters — import these instead of raw constants
 # ---------------------------------------------------------------------------
 
-runtime_config = RuntimeConfig()
+runtime_config = RuntimeConfig(persist=True)
+runtime_config.load()
 
 
 def get_default_model() -> str:

@@ -1,0 +1,4 @@
+# scripts/deploy.sh writes the deploy state here (active.conf = the color that serves, plus its lock).
+# It differs per server — never commit it.
+*
+!.gitignore

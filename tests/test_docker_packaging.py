@@ -599,7 +599,8 @@ def test_compose_defaults_claude_setting_sources_to_user_scope():
     """Docker should read user-scope Claude config so installed plugins load."""
     compose = (ROOT / "docker-compose.yml").read_text()
 
-    assert "CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}" in compose
+    # A mapping shared by both colors (gateway-blue / gateway-green merge it).
+    assert "CLAUDE_SETTING_SOURCES: ${CLAUDE_SETTING_SOURCES:-user,project,local}" in compose
 
 
 def test_compose_does_not_configure_external_opencode_server():

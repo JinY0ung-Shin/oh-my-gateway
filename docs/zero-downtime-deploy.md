@@ -75,7 +75,8 @@
   `gateway-proxy`(nginx)로 나눈다. 호스트 포트 `${PORT}`는 proxy만 잡는다. 색은 `ports`를 내지 않는다.
 - named volume `claude_home`은 고정 `name:`을 준다 — compose project가 달라도 같은 볼륨을 쓴다(project별
   `<project>_claude_home`이 생기면 rehydrate가 404가 된다).
-- 활성 색은 `docker/nginx/state/active.conf` 한 줄(`set $gateway_upstream gateway-<색>:8000;`). deploy 스크립트가
+- 활성 색은 `docker/nginx/state/active.conf` 한 줄(`set $gateway_upstream gateway-<색>;` — 포트는 nginx 템플릿이
+  compose `PORT`로 붙인다, [§10.1](#101-배치)). deploy 스크립트가
   바꾸고 `nginx -s reload` — reload는 graceful이라 열린 연결(SSE 턴 스트림)은 옛 worker가 끝까지 옛 색에 잇는다.
 - nginx 설정은 ChatDRAGON #710과 같은 원칙: `proxy_buffering off`, `proxy_request_buffering off`,
   `proxy_read_timeout`을 턴 길이보다 길게(SSE keepalive가 있으므로 3600s), `resolver 127.0.0.11`로 색 이름을
@@ -114,7 +115,7 @@
    `DRAIN_TIMEOUT_SECONDS`(기본 3600)을 넘기면 남은 것을 보여 주고 멈춘다 — 강제로 내릴지는 운영자가 정한다
    (`--force`).
 7. **정지** — blue에 SIGTERM. 이때는 열린 연결이 없으므로 lifespan 종료(세션 disconnect)가 곧바로 돈다.
-   `stop_grace_period`는 lifespan 종료만 덮으면 된다(지금의 35s 유지). 마지막으로 drain 동안 보존한 옛 플러그인
+   `stop_grace_period`는 lifespan 종료만 덮으면 된다(60s — `docker stop`만 한 경우의 graceful 25s + lifespan 종료도 덮는다). 마지막으로 drain 동안 보존한 옛 플러그인
    트리를 치운다([§5.4](#54-기동-시-공유-파일-플러그인)).
 
 drain(4)을 전환(5)보다 **먼저** 하는 이유: 전환을 먼저 하면 green이 받은 다음 턴이 blue가 아직 쥔 쉬는 세션과 부딪힌다.
@@ -170,7 +171,7 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 한 세션의 CLI는 언제나 한 프로세스만 쥔다. 그 사실을 디스크의 잠금으로 두고, 요청이 소유하지 않은 색에 오면
 **소유한 색과 그 자리에서 정리**한다 — 클라이언트에게 409를 돌려주지 않는다.
 
-**소유 잠금.** 세션이 CLI를 쥐는 동안 `claude_home/gateway-session-owners/<session_id>.lock`에
+**소유 잠금.** 세션이 CLI를 쥐는 동안 `data/session-owners/<session_id>.lock`(두 색이 같이 쓰는 `./data`)에
 `flock(LOCK_EX)`를 잡고, 파일에 소유 instance 이름을 적는다(두 컨테이너가 같은 볼륨 = 같은 커널이므로 컨테이너를 넘어
 동작한다). 놓을 때 푼다. 프로세스가 죽으면 커널이 푼다 — 그래서 "파일에 이름이 있는데 잠금이 없다"는 "소유자가 죽었다"이고
 누구나 가져갈 수 있다. 같은 프로세스 안의 기존 세션 잠금(`asyncio.Lock`)은 그대로 두고, 이 파일 잠금은 그 바깥 경계로만
@@ -203,7 +204,7 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
   - 이 프로세스가 세션 잠금을 잡고 턴을 시작한 뒤는 지금처럼 그 턴의 일이다(되풀이 없음).
 - **최종 fallback**: 기한 안에 소유자를 확정하지 못하면(예: 두 색의 내부망이 끊김) retryable 503 + `Retry-After`를 돌린다 —
   정상 전환에서는 나오지 않는 응답이고, 나왔다면 운영 장애로 본다(`handoff_deadline_exceeded` 로그·메트릭).
-- **대기 한도**: release가 1초(`HANDOFF_RELEASE_TIMEOUT`) 안에 답하지 않으면 소유자가 살아 있는 한 전달로 간다.
+- **대기 한도**: release는 쉬는 CLI를 멈추는 시간(capped disconnect)만큼 걸릴 수 있어 45초까지 기다리고, 그 안에 답하지 않거나 "busy"면 소유자가 살아 있는 한 전달로 간다. drain 중에는 쉬는 세션을 미리 놓으므로 요청이 이 대기를 만나는 일은 드물다.
 - **전달의 범위**: drain 중에만 생기는 일이 아니다 — 같은 세션에 대한 요청이 어쩌다 다른 색으로 와도 같은 규칙이다. 다만
   평상시(한 색만 돌 때)에는 소유자가 언제나 자기 자신이라 이 경로를 타지 않는다.
 - **새 세션 요청**(세션 id가 없는 요청)이 drain 중인 색에 오면 그 색의 **drain target**으로 전달한다(§4의 4단계). drain
@@ -296,17 +297,20 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
    `.old-*`로 옮긴다. 옛 색(drain 중)의 CLI는 그 경로를 이미 연 fd로만 옛 내용을 보고, 경로로 새로 여는 것은 새 트리다 —
    drain 동안 옛 색의 세션이 새 플러그인 내용을 볼 수 있다는 뜻이고, 이것은 받아들인다(세션 시작 때 읽는 정의는 이미
    읽혀 있다). 지워지면 안 되는 것은 `.old-*` 자체다(옛 fd·cwd가 그 안을 가리킨다):
-   - `OLD_GRACE_SECONDS`(600)를 env `PLUGIN_OLD_GRACE_SECONDS`로 열고, deploy 중에는 `DRAIN_TIMEOUT_SECONDS` 이상이
-     되게 한다. 또는 drain 중인 instance가 살아 있는 동안 `_sweep`이 `.old-*`를 지우지 않게 한다(instance 잠금으로 판정) —
-     구현 PR에서 둘 중 하나로 정한다.
-   - deploy 스크립트는 7단계(옛 색 정지) 뒤에 `.old-*`를 치운다.
+   - **정한 방식**: 다른 instance가 살아 있는 동안(그 instance 잠금이 잡혀 있는 동안, 판정이 안 되면 살아 있다고 본다)
+     `_sweep`은 `.old-*`를 나이와 상관없이 지우지 않는다. grace 길이(600초)는 그대로다. `install_plugins.py`가 기동할 때마다,
+     다른 instance가 없을 때만 grace가 지난 `.old-*`를 치운다(best effort).
    - grace의 시작점은 #264가 이미 맞춰 두었다: `_publish`가 옛 트리를 `.old-*`로 옮긴 직후 `os.utime(old)`로 mtime을
-     찍고(`src/plugin_local_copy.py` 363–364), `_sweep`이 그 mtime으로 잰다 — 600초는 게시 시점부터다. 남는 문제는
-     **길이**뿐이다: grace 600초 < drain 최대 3600초.
-   - **확인할 것**: `claude plugin update`가 `plugins/cache/<mp>/<plugin>/<옛 버전>`을 지우는지. 지운다면 옛 색의 CLI가
-     그 경로를 참조하므로, replay 잠금 안에서 update가 지우려는 옛 버전을 drain이 끝날 때까지 남기는 방법이 필요하다.
-4. **`_tmp_` 정리**: 익명 워크스페이스 이름에 instance를 넣거나(`_tmp_<instance>_…`), 기동 정리가 다른 살아 있는 instance의
-   것을 건드리지 않게 한다. 다른 색이 내려간 뒤 남은 것은 다음 기동 정리가 치운다.
+     찍고(`src/plugin_local_copy.py`), `_sweep`이 그 mtime으로 잰다.
+   - **확인함**: `claude plugin update`(번들 CLI 2.1.283)는 옛 버전 디렉터리를 바로 지우지 않는다 — 0.1.0→0.2.0→0.3.0
+     갱신 뒤 세 버전이 모두 `plugins/cache/<mp>/<plugin>/` 아래 남고, 밀려난 버전에는 `.orphaned_at` 표시가 붙는다. CLI는
+     기동마다 표시가 14일 지난 버전만 지우고, 살아 있는 세션이 쓰는 버전은 건너뛴다(코드 확인, 14일·live-session 판정은 직접
+     실행해 보지 않음). drain(최대 3600초) 동안 옛 색이 쓰는 버전이 지워지지 않으므로 따로 지킬 것이 없다.
+   - 구현: replay 잠금·digest·옛 트리 판정은 `src/plugin_local_copy.py`(표준 라이브러리만 쓰는 `install_plugins.py`가 옆에서
+     불러 쓴다), 관리자 경로 잠금은 `src/plugin_admin_service.py`(worker thread에서), 테스트는 `tests/test_plugin_replay.py`.
+4. **`_tmp_` 정리**: `GATEWAY_INSTANCE`가 있으면 익명 워크스페이스 이름이 `_tmp_<instance>_<hex>`다. 다른 instance가 살아
+   있는 동안 기동 정리는 자기 접두어만(나이 조건 그대로) 지우고, 다른 instance가 없을 때만 모든 `_tmp_`를 본다(uid 모드의
+   "나이 무관" 첫 정리도 그때만). 다른 색이 내려간 뒤 남은 것은 다음 기동 정리가 치운다.
 5. **entrypoint의 chown**: 같은 uid로 다시 소유권을 맞추는 것이라 두 색이 함께 돌아도 안전하다(시간만 든다).
 
 ### 5.5 관리자 상태
@@ -314,8 +318,11 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 - **쿠키 비밀값**: `data/admin_cookie_secret`(0600)에 한 번 만들어 두 색이 같이 읽는다 — 교체해도 로그아웃되지 않는다.
   `ADMIN_COOKIE_SECRET` env가 있으면 그것을 쓴다.
 - **runtime-config**: 오버라이드를 `data/runtime_config.json`(tmp + `os.replace`)에 남기고 기동 때 읽는다 — green이
-  기본값으로 뜨는 틈이 없어진다. ChatDRAGON의 reconcile은 그대로 두어도 된다(gateway가 이미 오버라이드를 들고
-  있으면 건드리지 않는다).
+  기본값으로 뜨는 틈이 없어진다. 파일이 두 색의 공통 원본이다: 읽기는 파일이 바뀌었으면(inode·mtime·size) 다시 읽고
+  (`refresh()`, `/health/ready`도 부른다 — 전환 직전 green이 blue의 마지막 변경을 들고 있게), 쓰기는 `<file>.lock`
+  `flock` 아래에서 최신 파일을 읽어 바뀐 키 하나만 얹어 원자적으로 바꾼다 — 한 색이 다른 키의 낡은 사본을 되써서
+  상대의 변경을 지우지 않는다(#266 리뷰). ChatDRAGON의 reconcile은 그대로 두어도 된다(gateway가 이미 오버라이드를
+  들고 있으면 건드리지 않는다).
 - **관리자 쓰기**: proxy는 활성 색으로만 보내므로 `data/`를 쓰는 곳은 한 곳이다. drain 중인 색은 관리자 쓰기를 drain target으로
   전달한다(옛 화면의 늦은 저장이 옛 색에만 쓰이지 않게).
 
@@ -394,3 +401,144 @@ ChatDRAGON 변경은 필요 없다. PR 1–3은 단일 컨테이너 배포에서
    reload가 graceful한지, `/internal/`을 막을 수 있는지 확인).
 3. §5.4-3 옛 트리 수명: grace를 env로 늘릴지, drain 중인 instance가 있는 동안 sweep을 멈출지.
 4. uid 모드 공유 레지스트리를 이 작업 뒤에 이어서 할지.
+
+## 10. 운영
+
+구현: `docker-compose.yml`(색 둘 + proxy), `docker/nginx/gateway.conf`, `scripts/deploy.sh`. 스크립트의 결정 규칙은
+`tests/test_deploy_script.py`, compose·nginx 불변식은 `tests/test_compose_blue_green.py`가 고정한다.
+
+### 10.1 배치
+
+| 무엇 | 어디 |
+|---|---|
+| 호스트 포트 `${PORT}` | `gateway-proxy`(nginx)만 잡는다. 색은 `ports`가 없고 내부망에서 같은 `PORT`로 받는다 |
+| gateway | `gateway-blue` / `gateway-green` — 같은 빌드·env·볼륨, profile `blue`/`green`, `GATEWAY_INSTANCE`만 다르다. 맨 `docker compose up -d`는 proxy만 띄우고 도는 색을 건드리지 않는다 |
+| 이미지 | 색마다 태그 하나(`${GATEWAY_IMAGE:-oh-my-gateway}:blue`/`:green`). 쉬던 색을 빌드해도 활성 색·직전 색의 이미지는 그대로라 되돌리기가 옛 빌드를 다시 띄울 수 있다 |
+| 활성 색 | `docker/nginx/state/active.conf` 한 줄(서버마다 다른 런타임 상태 — git이 무시한다). 손으로 고치지 않는다 |
+| 포트 | nginx 설정은 이미지의 템플릿 기능으로 `GATEWAY_PORT`(= compose `PORT`)를 기동 때 넣는다. `PORT`를 바꾸면 proxy를 다시 만들어야 한다 |
+| `claude_home` | 고정 `name: ${GATEWAY_CLAUDE_HOME_VOLUME:-${COMPOSE_PROJECT_NAME}_claude_home}`. Compose는 보간 때 `COMPOSE_PROJECT_NAME`을 실제 프로젝트 이름(디렉터리 이름 또는 `-p`)으로 채우므로 기본값은 예전 이름 `<프로젝트>_claude_home` 그대로다 — 기존 배포는 데이터를 그대로 쓴다. 체크아웃을 옮기거나 프로젝트 이름을 바꿀 때는 `.env`에 `GATEWAY_CLAUDE_HOME_VOLUME=<기존 볼륨 이름>`(`docker volume ls`) |
+| 클라이언트 주소 | nginx가 `X-Forwarded-For`를 실제 peer로 **덮어쓰고**(덧붙이지 않는다), 색은 proxy의 고정 주소(`edge` 네트워크, `GATEWAY_EDGE_PROXY_IP`)에서 온 것만 믿는다(`FORWARDED_ALLOW_IPS`). 그래서 rate limit 버킷·요청 로그·loopback 판정이 proxy가 없을 때와 같다. 서브넷이 호스트의 다른 네트워크와 겹치면(`Pool overlaps`) `GATEWAY_EDGE_SUBNET`과 `GATEWAY_EDGE_PROXY_IP`를 함께 바꾼다 |
+| 밖에서 막는 경로 | `/internal/…`, `/health/drain` — nginx가 404(정규화된 경로로 판정하므로 `//internal/`, `/%69nternal/`도). 스크립트는 `docker compose exec`로 색 안의 loopback에서 부른다 |
+| `MCP_RELAY_BASE_URL` | 비워 둔다(compose도 설정하지 않는다). `.env`에 있으면 스크립트가 경고한다 |
+
+`docker compose exec`·`logs`는 색 이름을 받는다: `docker compose logs --tail=100 "$(scripts/deploy.sh active)"`.
+
+### 10.2 처음 한 번: 단일 `gateway`에서 옮기기 (`migrate`)
+
+```bash
+git pull                       # 이 배치가 들어간 버전(PR 1–4)
+scripts/deploy.sh migrate      # 한가한 시간에
+scripts/deploy.sh status
+```
+
+- **재시작 배포다.** 순서: `gateway-blue` 빌드·기동 → `/health/ready` 대기 → 옛 컨테이너 정지(`docker stop -t 35`) →
+  `gateway-proxy`가 포트를 잡음 → proxy 너머 `/health`가 blue의 boot id인지 확인 → 옛 컨테이너 삭제(이미지는 남는다).
+  끊기는 것은 포트가 넘어가는 몇 초와, 옛 컨테이너에서 돌던 턴·답을 기다리던 카드다(옛 버전에는 drain이 없다).
+- 실패하면 스스로 되돌린다: blue가 준비되지 않으면 옛 컨테이너를 건드리지 않고, proxy 확인이 실패하면 proxy를 내리고
+  옛 컨테이너를 다시 띄운다.
+- uid 모드는 순서가 다르다: 레지스트리 잠금 때문에 blue가 옛 컨테이너 옆에서 뜰 수 없어 **옛 컨테이너를 먼저 내린다** —
+  blue가 준비될 때까지 끊긴다([§10.6](#106-uid-모드와-재시작-배포)).
+- 옮기기 전에 확인할 것:
+  - `docker compose config`가 통과하는지. 자동으로 읽히는 `docker-compose.override.yml`이 `services.gateway`를 고치고
+    있었다면 이제 이미지도 build도 없는 서비스가 되어 거부된다 — 같은 내용을 `gateway-blue`와 `gateway-green` 둘 다에
+    옮긴다. 호스트 포트를 바꾸던 override(예: `127.0.0.1:8000:8000`)는 `gateway-proxy`로 옮긴다.
+  - `docker volume ls`의 `<프로젝트>_claude_home`이 `docker compose --profile blue config`의 `volumes.claude_home.name`과
+    같은지(다르면 `GATEWAY_CLAUDE_HOME_VOLUME`) — 다르면 rehydrate가 404가 되고 transcript가 안 보인다.
+  - `GATEWAY_EDGE_SUBNET`이 다른 네트워크(예: 같은 호스트의 ChatDRAGON `edge` 172.31.250.240/28)와 겹치지 않는지.
+- OpenCode·Codex 전용 compose 파일(`-f docker-compose.codex.yml` 등)은 단일 `gateway` 서비스와 재시작 배포를 그대로
+  쓴다(stale, 옮기지 않는다).
+
+### 10.3 매 배포
+
+```bash
+git pull
+scripts/deploy.sh              # 빌드 → 쉬던 색 기동·준비 → 활성 색 drain → nginx 전환·확인 → drain 대기 → 옛 색 정지
+scripts/deploy.sh --no-build   # .env만 바꿨을 때: 활성 빌드를 쉬던 색에 태깅해 같은 순서로 교체
+```
+
+스크립트가 하는 일(§4 그대로):
+
+1. 거부 조건 — uid 모드(`.env`/셸의 `CLAUDE_ISOLATION_MODE`, 렌더된 compose 설정, 활성 색 컨테이너의 env 중 하나라도
+   `uid`), 옛 단일 컨테이너가 아직 돔(→ `migrate`), 활성 색의 `/health`가 `capabilities`에 `handoff`·`drain`을 싣지
+   않음(→ `restart` 한 번), 다른 배포가 진행 중(`docker/nginx/state/.deploy.lock`).
+2. 쉬던 색이 아직 돌고 있으면(앞선 배포가 drain 중에 끊겼다) 그 drain부터 끝내고 내린다 — 일하는 색을 다시 만들지 않는다.
+3. 쉬던 색 빌드·기동(`--no-deps --force-recreate`) → 그 안에서 `/health/ready` 200, `/health`의 `instance`가 그 색이고
+   `boot_id`·capability가 있을 때까지(`HEALTH_TIMEOUT_SECONDS`, 기본 300).
+4. 활성 색에 `POST /internal/drain {"target": <새 색>, "target_boot_id": <3에서 읽은 값>}`. 거절(400)이면 새 색을 내리고
+   멈춘다 — 트래픽은 그대로.
+5. `active.conf` 교체 → `nginx -t` → `nginx -s reload` → proxy 너머 `/health`가 새 색의 boot id를 세 번 연달아 답하는지
+   확인. 확인이 안 되면 거꾸로 돌린다: 옛 색의 drain을 풀고(`DELETE`), nginx를 되돌려 확인하고, 새 색을 옛 색 쪽으로
+   drain해 내린다(그 사이 전달받은 세션이 있을 수 있다).
+6. 옛 색의 `/health/drain`을 5초마다 읽어 **모든 수가 0인 판독이 두 번 연달아** 나오면 `docker compose stop`. 조회 실패는
+   0이 아니라 "모름"이다.
+
+배포 셸의 환경 변수(`.env`가 아니다):
+
+| 변수 | 기본 | 뜻 |
+|---|---|---|
+| `DRAIN_TIMEOUT_SECONDS` | 3600 | 옛 색 drain 대기 한도. 넘기면 남은 수를 보여 주고 **옛 색을 둔 채** non-zero로 멈춘다 |
+| `DRAIN_OWNED_GRACE_SECONDS` | 60 | 진행 중인 것이 없는데 `owned_sessions`만 남아 있는 것을 기다리는 시간. 넘기면 멈추고 알린다 |
+| `HEALTH_TIMEOUT_SECONDS` | 300 | 새 색이 준비될 때까지 |
+| `GATEWAY_COMPOSE` | `docker compose` | 다른 compose 명령(예: `-f` overlay, `-p`) |
+| `DOCKER` | `docker` | docker 바이너리(테스트가 가짜를 넣는다) |
+
+`--force`(또는 `DRAIN_FORCE=true`)는 drain 한도·`owned_sessions` 판정을 넘겨도 옛 색을 내린다 — 남은 턴은 끊긴다.
+
+### 10.4 drain이 끝나지 않을 때
+
+트래픽은 이미 새 색에 있으므로 서두를 일이 아니다.
+
+```bash
+scripts/deploy.sh status              # 두 색의 상태, boot id, drain 수(턴·백그라운드·카드·전달·요청·소유 세션)
+docker compose logs --tail=200 gateway-blue
+scripts/deploy.sh drain blue          # 다시 기다렸다가 0이 되면 내린다
+scripts/deploy.sh drain blue --force  # 지금 내린다(남은 턴은 끊긴다)
+```
+
+- 카드(`pending_interactions`)는 `ASK_USER_TIMEOUT_SECONDS`(300) 뒤 저절로 만료되고, 백그라운드 턴은 최대 3600초다.
+- `owned_sessions`만 남으면(나머지는 0) 놓기가 안 된 세션이 있다는 뜻이다 — 옛 색 로그에서 세션 id를 보고 판단한다.
+- **drain target이 사라지면**(새 색이 죽었거나 다시 떠서 boot id가 바뀜) 옛 색은 새 세션·울타리 세션·관리자 쓰기에
+  503 `drain_target_unavailable`로 답한다. 스크립트는 drain 대기 중 새 색의 boot id를 30초마다 확인하고, 두 번 연달아
+  어긋나면 경보를 내고 멈춘다(옛 색은 내리지 않는다). 할 일은 둘: `scripts/deploy.sh rollback`, 또는 새 색을 살린 뒤
+  `scripts/deploy.sh drain <옛 색>`(활성 색의 지금 boot id로 drain을 다시 건다).
+- 누군가 drain을 풀었으면(`draining: false`) 스크립트는 그 색을 내리지 않고 멈춘다.
+
+### 10.5 되돌리기
+
+```bash
+scripts/deploy.sh rollback
+```
+
+- **drain 중**(옛 색이 아직 돈다): 옛 색의 drain을 풀고(`DELETE /internal/drain`) 준비를 확인한 뒤, 지금 색을 옛 색 쪽으로
+  drain하고 → nginx를 옛 색으로 → 확인 → 지금 색이 비면 내린다. 옛 색은 다시 만들지 않는다. 지금 색이 그 사이 연 세션은
+  지금 색이 끝까지 쥐고, 그 세션 요청이 옛 색으로 오면 소유자 전달로 처리된다(§4 되돌리기).
+- **정지 뒤**: 옛 색의 컨테이너·이미지 태그가 남아 있으므로 그대로 다시 띄워(`--no-build`, 재생성 없음) 같은 순서로
+  교체한다. 되돌릴 수 있는 것은 **직전 한 빌드**뿐이다 — 그 다음 배포가 그 색의 태그를 새로 빌드한다. 더 옛 버전은
+  그 커밋을 받아 `scripts/deploy.sh`.
+- 되돌리기도 활성 색이 handoff·drain을 아는 버전이어야 하고, uid 모드에서는 거부된다.
+
+### 10.6 uid 모드와 재시작 배포
+
+uid 모드(`docker-compose.uid.yml`)는 무중단 교체를 하지 않는다(§6): `deploy`·`rollback`은 거부되고, 배포는 활성 색을
+그 자리에서 다시 만드는 재시작 배포다. overlay는 두 색 모두에 붙어 있어 어느 색이 활성이든 uid 모드로 뜬다.
+
+```bash
+export GATEWAY_COMPOSE="docker compose -f docker-compose.yml -f docker-compose.uid.yml"
+scripts/deploy.sh migrate      # 처음 한 번(단일 gateway에서) — 새로 설치하면 대신 scripts/deploy.sh(blue 하나만 띄운다)
+scripts/deploy.sh restart      # 매 배포: 빌드 → 활성 색 재생성(끊김) → 준비·proxy 확인
+```
+
+`restart`는 활성 색이 handoff를 모르는 옛 버전일 때(§7 배포 gate가 거부할 때) 한 번 쓰는 길이기도 하다. 다른 색이 아직
+돌면 거부한다. `GATEWAY_COMPOSE`를 잊어도 스크립트는 도는 컨테이너(활성 색, `migrate`면 옛 컨테이너)의 env로 uid
+모드를 알아본다: `deploy`·`rollback`은 거부하고, overlay 없이 다시 만들면 uid 모드가 풀리므로 `restart`·`migrate`도
+거부한다.
+
+### 10.7 지켜볼 것·하지 말 것
+
+- 배포 중 `scripts/deploy.sh status`와 두 색의 로그. 전환 뒤 클라이언트 응답의 `x-gateway-instance`가 새 색인지.
+- **`docker compose down`·`restart`로 배포하지 않는다** — proxy까지 내려가 모든 연결이 끊긴다. `down -v`는
+  `claude_home`(고정 이름이어도 이 프로젝트가 만든 볼륨)을 지운다.
+- proxy 자체를 바꾸는 일(`docker/nginx/gateway.conf` 수정, `PORT` 변경, nginx 이미지 갱신)은
+  `docker compose up -d --force-recreate gateway-proxy`이고 **열린 스트림이 끊긴다** — 한가한 시간에. 설정은 기동 때
+  템플릿에서 만들어지므로 `nginx -s reload`만으로는 템플릿 수정이 반영되지 않는다.
+- 두 색이 함께 도는 동안 동시 턴 한도는 색마다 따로 센다(§1 비목표).

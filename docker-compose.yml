@@ -1,126 +1,228 @@
+# oh-my-gateway — http://<host>:${PORT:-8000}
+#
+#   cp .env.example .env          # fill in ADMIN_API_KEY, ANTHROPIC_AUTH_TOKEN, ...
+#   scripts/deploy.sh             # build → start the idle color → drain the active one → switch → stop it
+#   scripts/deploy.sh status      # which color serves, what each one still holds
+#
+# Zero-downtime (blue/green) layout, docs/zero-downtime-deploy.md: the host port
+# ${PORT} belongs to nginx (`gateway-proxy`); the gateway itself runs as
+# `gateway-blue` or `gateway-green` (same build, same env and volumes, only
+# GATEWAY_INSTANCE differs) on the compose network. The two colors sit behind
+# the `blue` / `green` profiles, so a bare `docker compose up -d` only starts
+# the proxy and never touches a running color — replace the gateway with
+# scripts/deploy.sh. Moving an existing single-`gateway` deployment onto this
+# layout is a one-time restart deploy: `scripts/deploy.sh migrate`
+# (docs/zero-downtime-deploy.md §10).
+#
+# uid mode (docker-compose.uid.yml) keeps the restart deploy: its uid registry
+# admits one gateway process at a time, so deploy.sh refuses the blue/green swap
+# there and `scripts/deploy.sh restart` recreates the active color in place.
+
+x-gateway: &gateway
+  restart: unless-stopped
+  # Shutdown must outlive the SDK's SIGTERM→SIGKILL escalation (~20s worst
+  # case per claude subprocess; disconnects run concurrently, see
+  # CLIENT_DISCONNECT_TIMEOUT_SECONDS in src/constants.py). Docker's default
+  # 10s grace would SIGKILL the gateway mid-escalation and strand `claude`
+  # grandchildren in the cgroup — the reason `docker restart` used to leak
+  # workers while only `compose down && up` recovered (issue #147).
+  # scripts/deploy.sh stops a color only after its drain finished, so this
+  # grace only has to cover the lifespan shutdown. A plain `docker stop` with
+  # streams still open is bounded too: uvicorn waits at most
+  # --timeout-graceful-shutdown (25s, Dockerfile CMD) for them, then runs the
+  # lifespan shutdown (capped CLI disconnects, ~20s) — 60s covers both.
+  stop_grace_period: 60s
+  # The agent's tools run inside this container, so whatever `hostname`
+  # returns can reach the model. Docker's default is the container id; a fixed
+  # neutral name means a leaked value says nothing about the real host. The
+  # gateway still redacts its own name/addresses from tool results
+  # (SYSINFO_REDACTION, on by default) — this is the part that holds even for
+  # a failed tool call, which the CLI cannot rewrite. Both colors use the same
+  # name: it is the container's own hostname, not its address on the network
+  # (that is the service name, gateway-<color>).
+  hostname: ${GATEWAY_CONTAINER_HOSTNAME:-agent-sandbox}
+  build:
+    context: .
+    # Inherit proxy settings from the host shell at build time.
+    # Listed without values so Compose reads them from the host environment;
+    # unset ones are simply not forwarded. HTTP_PROXY / HTTPS_PROXY / NO_PROXY
+    # (and lowercase) are predefined build ARGs in Docker — no Dockerfile ARG
+    # declaration needed, and they are not persisted in image history.
+    args:
+      - HTTP_PROXY
+      - HTTPS_PROXY
+      - NO_PROXY
+      - http_proxy
+      - https_proxy
+      - no_proxy
+      # Optional apt/npm/pip overrides for private/corporate mirrors.
+      # Export these in the shell before 'scripts/deploy.sh' on corp networks.
+      - APT_MIRROR_URL
+      - APT_SECURITY_MIRROR_URL
+      - NPM_CONFIG_REGISTRY
+      - PIP_INDEX_URL
+      - PIP_EXTRA_INDEX_URL
+      - PIP_TRUSTED_HOST
+      - GATEWAY_BUILD_INSTALL_CACHE_BUST
+    secrets:
+      - gateway_build_install_script
+  # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
+  # before starting the gateway, so the usage-log engine can connect on first
+  # try.  ``required: false`` (Compose v2.20+) keeps the gateway runnable
+  # when the ``logging`` profile is off and gateway-log isn't created.
+  depends_on:
+    gateway-log:
+      condition: service_healthy
+      required: false
+  # Let the container reach the host's published ports (e.g. UniBridge edge
+  # on host :3000) via host.docker.internal, used by ANTHROPIC_BASE_URL.
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  # No `ports:` — the host port is gateway-proxy's (two colors could not both
+  # bind it). The colors are reachable on the compose networks only: by the
+  # proxy on `edge`, by each other (session handoff / forwarding, §5.2) and by
+  # gateway-log on both.
+  expose:
+    - "${PORT:-8000}"
+  networks:
+    default:
+    edge:
+  volumes:
+    # Container's claude CLI state lives in a named docker volume rather than
+    # a host bind mount: host customizations (skills, CLAUDE.md, conversation
+    # history) do not leak in, but per-container state — conversation logs,
+    # caches, settings written by the SDK — survives container recreates.
+    # Auth comes from ANTHROPIC_AUTH_TOKEN in .env, not from a credentials
+    # file. To opt back into host assets, add a separate read-only mount,
+    # e.g. ~/.claude/skills:/home/app/.claude/skills:ro
+    # Both colors mount the SAME volume (see `volumes:` below): a conversation
+    # started on one color resumes on the other from its transcript.
+    - claude_home:/home/app/.claude
+    # Share the host CA bundle with the container so git/curl/Python trust the
+    # same corporate roots. Override HOST_CA_CERTIFICATES_PATH in .env when
+    # the host bundle lives outside the Debian/Ubuntu default path.
+    - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
+    # Persist admin overrides (system prompt, runtime config) across restarts.
+    # Also the colors' shared state during a swap: instance registry
+    # (data/instances), session owner locks, the instance HMAC secret.
+    - ./data:/app/data
+    # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
+    # to the host so individual users' state survives container recreates.
+    # The container defaults USER_WORKSPACES_DIR to /data/workspaces (see the
+    # environment block below). Override the host path with
+    # USER_WORKSPACES_HOST_DIR if you want it somewhere other than ./workspaces.
+    - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
+    # Local marketplace sources (add them in the admin page as
+    # /data/plugins/<marketplace>). Outside /app on purpose: with Landlock
+    # confinement on, sessions are never granted /app, so a source under
+    # /app/data is only usable as a copy in the clone root (#258), while one
+    # here is registered in place. Override with PLUGIN_SOURCES_HOST_DIR.
+    - ${PLUGIN_SOURCES_HOST_DIR:-./plugins}:/data/plugins:ro
+    # Optional: bind a host system-prompt file into the container. Set
+    # SYSTEM_PROMPT_HOST_FILE in .env to a host path (e.g. /home/me/prompt.md)
+    # and it is mounted read-only here; the SYSTEM_PROMPT_FILE env below then
+    # auto-points at it. When unset, /dev/null is mapped harmlessly and
+    # SYSTEM_PROMPT_FILE stays empty (claude_code preset mode).
+    - ${SYSTEM_PROMPT_HOST_FILE:-/dev/null}:/app/system_prompt.md:ro
+  # All runtime configuration comes from .env (see .env.example for the full list).
+  # ${PORT} is interpolated by Compose at parse-time from the shell env and
+  # the ./.env file next to this compose file; the gateway also reads PORT from
+  # env_file. Keep it in ./.env so the proxy, the colors and scripts/deploy.sh
+  # agree on it.
+  env_file:
+    - .env
+  # A mapping (not a list) so each color can merge it and add GATEWAY_INSTANCE.
+  # MCP_RELAY_BASE_URL is deliberately absent: the CLI child dials the relay on
+  # its own container's loopback; pointing it at the proxy or a shared address
+  # would send one color's MCP calls to the other (docs/zero-downtime-deploy.md §2).
+  environment: &gateway-env
+    # Fail fast if ADMIN_API_KEY is missing — the server refuses to start without it.
+    ADMIN_API_KEY: ${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
+    # Persist per-user workspaces to the host bind mount by default.
+    USER_WORKSPACES_DIR: ${USER_WORKSPACES_DIR:-/data/workspaces}
+    # Docker installs optional plugins into the container user's ~/.claude,
+    # so include user-scope config when the Claude SDK starts.
+    CLAUDE_SETTING_SOURCES: ${CLAUDE_SETTING_SOURCES:-user,project,local}
+    # Admin-managed plugin manifest — the only way plugins are declared (the
+    # CLAUDE_PLUGIN_* env bootstrap was removed 2026-07). Persisted to the
+    # ./data bind mount so it survives image redeploy AND `docker compose
+    # down -v` (which wipes claude_home's plugin cache); install_plugins.py
+    # reinstalls manifest.added and reapplies manifest.removed on next boot
+    # (self-healing).
+    CLAUDE_PLUGIN_MANIFEST: ${CLAUDE_PLUGIN_MANIFEST:-/app/data/gateway-plugins.json}
+    # Container side of the plugin sources mount above. The admin catalog
+    # reads marketplaces registered in place beneath it (#260).
+    PLUGIN_SOURCES_DIR: ${PLUGIN_SOURCES_DIR:-/data/plugins}
+    # Auto-wire the custom system prompt to the host file mounted above.
+    # Resolves to /app/system_prompt.md only when SYSTEM_PROMPT_HOST_FILE is
+    # set; otherwise empty so the claude_code preset is used. This overrides
+    # any SYSTEM_PROMPT_FILE in .env — under Docker, set SYSTEM_PROMPT_HOST_FILE.
+    SYSTEM_PROMPT_FILE: ${SYSTEM_PROMPT_HOST_FILE:+/app/system_prompt.md}
+    # uvicorn reads this as --forwarded-allow-ips: trust X-Forwarded-For only
+    # from the proxy's fixed address on `edge`, never `*` or the subnet. nginx
+    # overwrites the header with the real peer, so the client address the
+    # gateway sees (rate-limit buckets, request log, loopback checks) is the
+    # same as without the proxy. Anything else on the network — the other
+    # color, a session's Bash reaching across — is taken at its own address.
+    FORWARDED_ALLOW_IPS: ${GATEWAY_EDGE_PROXY_IP:-172.31.251.250}
+
 services:
-  gateway:
+  gateway-blue:
+    <<: *gateway
+    profiles: ["blue"]
+    # One image tag per color: building the idle color never replaces the image
+    # the active (or the stopped previous) color runs, so `deploy.sh rollback`
+    # can restart the previous build.
+    image: ${GATEWAY_IMAGE:-oh-my-gateway}:blue
+    environment:
+      <<: *gateway-env
+      GATEWAY_INSTANCE: blue
+
+  gateway-green:
+    <<: *gateway
+    profiles: ["green"]
+    image: ${GATEWAY_IMAGE:-oh-my-gateway}:green
+    environment:
+      <<: *gateway-env
+      GATEWAY_INSTANCE: green
+
+  # Front door: holds the host port and sends every request to the active color
+  # (docker/nginx/state/active.conf, written by scripts/deploy.sh). It routes to
+  # ONE color only — which color owns a session is the gateway's business
+  # (handoff/forwarding), not nginx's.
+  gateway-proxy:
+    image: ${GATEWAY_PROXY_IMAGE:-nginx:1.27-alpine}
     restart: unless-stopped
-    # Shutdown must outlive the SDK's SIGTERM→SIGKILL escalation (~20s worst
-    # case per claude subprocess; disconnects run concurrently, see
-    # CLIENT_DISCONNECT_TIMEOUT_SECONDS in src/constants.py). Docker's default
-    # 10s grace would SIGKILL the gateway mid-escalation and strand `claude`
-    # grandchildren in the cgroup — the reason `docker restart` used to leak
-    # workers while only `compose down && up` recovered (issue #147).
-    stop_grace_period: 35s
-    # The agent's tools run inside this container, so whatever `hostname`
-    # returns can reach the model. Docker's default is the container id; a fixed
-    # neutral name means a leaked value says nothing about the real host. The
-    # gateway still redacts its own name/addresses from tool results
-    # (SYSINFO_REDACTION, on by default) — this is the part that holds even for
-    # a failed tool call, which the CLI cannot rewrite.
-    hostname: ${GATEWAY_CONTAINER_HOSTNAME:-agent-sandbox}
-    build:
-      context: .
-      # Inherit proxy settings from the host shell at build time.
-      # Listed without values so Compose reads them from the host environment;
-      # unset ones are simply not forwarded. HTTP_PROXY / HTTPS_PROXY / NO_PROXY
-      # (and lowercase) are predefined build ARGs in Docker — no Dockerfile ARG
-      # declaration needed, and they are not persisted in image history.
-      args:
-        - HTTP_PROXY
-        - HTTPS_PROXY
-        - NO_PROXY
-        - http_proxy
-        - https_proxy
-        - no_proxy
-        # Optional apt/npm/pip overrides for private/corporate mirrors.
-        # Export these in the shell before 'docker compose build' on corp networks.
-        - APT_MIRROR_URL
-        - APT_SECURITY_MIRROR_URL
-        - NPM_CONFIG_REGISTRY
-        - PIP_INDEX_URL
-        - PIP_EXTRA_INDEX_URL
-        - PIP_TRUSTED_HOST
-        - GATEWAY_BUILD_INSTALL_CACHE_BUST
-      secrets:
-        - gateway_build_install_script
-    # Wait for the optional gateway-log MySQL sidecar to pass its healthcheck
-    # before starting the gateway, so the usage-log engine can connect on first
-    # try.  ``required: false`` (Compose v2.20+) keeps the gateway runnable
-    # when the ``logging`` profile is off and gateway-log isn't created.
-    depends_on:
-      gateway-log:
-        condition: service_healthy
-        required: false
-    # Let the container reach the host's published ports (e.g. UniBridge edge
-    # on host :3000) via host.docker.internal, used by ANTHROPIC_BASE_URL.
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
     # ${PORT} is interpolated by Compose at parse-time from the shell env and
     # the ./.env file next to this compose file. It is NOT read from the service's
     # env_file. If you move PORT into a non-default env file, pin the host side
     # explicitly (e.g. "8000:${PORT}") instead of relying on auto-interpolation.
+    # To keep the gateway local-only, bind the host side: "127.0.0.1:8000:8000".
     ports:
       - "${PORT:-8000}:${PORT:-8000}"
-    volumes:
-      # Container's claude CLI state lives in a named docker volume rather than
-      # a host bind mount: host customizations (skills, CLAUDE.md, conversation
-      # history) do not leak in, but per-container state — conversation logs,
-      # caches, settings written by the SDK — survives container recreates.
-      # Auth comes from ANTHROPIC_AUTH_TOKEN in .env, not from a credentials
-      # file. To opt back into host assets, add a separate read-only mount,
-      # e.g. ~/.claude/skills:/home/app/.claude/skills:ro
-      - claude_home:/home/app/.claude
-      # Share the host CA bundle with the container so git/curl/Python trust the
-      # same corporate roots. Override HOST_CA_CERTIFICATES_PATH in .env when
-      # the host bundle lives outside the Debian/Ubuntu default path.
-      - ${HOST_CA_CERTIFICATES_PATH:-/etc/ssl/certs/ca-certificates.crt}:/etc/ssl/certs/ca-certificates.crt:ro
-      # Persist admin overrides (system prompt, runtime config) across restarts
-      - ./data:/app/data
-      # Per-user workspaces ({USER_WORKSPACES_DIR}/{user}/{backend}). Persisted
-      # to the host so individual users' state survives container recreates.
-      # The container defaults USER_WORKSPACES_DIR to /data/workspaces (see the
-      # environment block below). Override the host path with
-      # USER_WORKSPACES_HOST_DIR if you want it somewhere other than ./workspaces.
-      - ${USER_WORKSPACES_HOST_DIR:-./workspaces}:/data/workspaces
-      # Local marketplace sources (add them in the admin page as
-      # /data/plugins/<marketplace>). Outside /app on purpose: with Landlock
-      # confinement on, sessions are never granted /app, so a source under
-      # /app/data is only usable as a copy in the clone root (#258), while one
-      # here is registered in place. Override with PLUGIN_SOURCES_HOST_DIR.
-      - ${PLUGIN_SOURCES_HOST_DIR:-./plugins}:/data/plugins:ro
-      # Optional: bind a host system-prompt file into the container. Set
-      # SYSTEM_PROMPT_HOST_FILE in .env to a host path (e.g. /home/me/prompt.md)
-      # and it is mounted read-only here; the SYSTEM_PROMPT_FILE env below then
-      # auto-points at it. When unset, /dev/null is mapped harmlessly and
-      # SYSTEM_PROMPT_FILE stays empty (claude_code preset mode).
-      - ${SYSTEM_PROMPT_HOST_FILE:-/dev/null}:/app/system_prompt.md:ro
-    # All runtime configuration comes from .env (see .env.example for the full list).
-    env_file:
-      - .env
     environment:
-      # Fail fast if ADMIN_API_KEY is missing — the server refuses to start without it.
-      - ADMIN_API_KEY=${ADMIN_API_KEY:?Set ADMIN_API_KEY in .env}
-      # Persist per-user workspaces to the host bind mount by default.
-      - USER_WORKSPACES_DIR=${USER_WORKSPACES_DIR:-/data/workspaces}
-      # Docker installs optional plugins into the container user's ~/.claude,
-      # so include user-scope config when the Claude SDK starts.
-      - CLAUDE_SETTING_SOURCES=${CLAUDE_SETTING_SOURCES:-user,project,local}
-      # Admin-managed plugin manifest — the only way plugins are declared (the
-      # CLAUDE_PLUGIN_* env bootstrap was removed 2026-07). Persisted to the
-      # ./data bind mount so it survives image redeploy AND `docker compose
-      # down -v` (which wipes claude_home's plugin cache); install_plugins.py
-      # reinstalls manifest.added and reapplies manifest.removed on next boot
-      # (self-healing).
-      - CLAUDE_PLUGIN_MANIFEST=${CLAUDE_PLUGIN_MANIFEST:-/app/data/gateway-plugins.json}
-      # Container side of the plugin sources mount above. The admin catalog
-      # reads marketplaces registered in place beneath it (#260).
-      - PLUGIN_SOURCES_DIR=${PLUGIN_SOURCES_DIR:-/data/plugins}
-      # Auto-wire the custom system prompt to the host file mounted above.
-      # Resolves to /app/system_prompt.md only when SYSTEM_PROMPT_HOST_FILE is
-      # set; otherwise empty so the claude_code preset is used. This overrides
-      # any SYSTEM_PROMPT_FILE in .env — under Docker, set SYSTEM_PROMPT_HOST_FILE.
-      - SYSTEM_PROMPT_FILE=${SYSTEM_PROMPT_HOST_FILE:+/app/system_prompt.md}
+      # Rendered into the template below by the nginx image's envsubst step
+      # (only GATEWAY_* names, so nginx's own $variables are left alone).
+      GATEWAY_PORT: ${PORT:-8000}
+      NGINX_ENVSUBST_FILTER: ^GATEWAY_
+    networks:
+      edge:
+        ipv4_address: ${GATEWAY_EDGE_PROXY_IP:-172.31.251.250}
+    volumes:
+      - ./docker/nginx/gateway.conf:/etc/nginx/templates/default.conf.template:ro
+      # The active color — scripts/deploy.sh rewrites it and runs `nginx -s
+      # reload`. A directory mount, not a file mount: a bind-mounted file does
+      # not see the replaced file.
+      - ./docker/nginx/state:/etc/nginx/gateway-state:ro
+    healthcheck:
+      test: ["CMD", "nginx", "-t", "-q"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
 
   # Optional MySQL sidecar that persists per-turn usage logs (token counts,
   # tool-call stats).  Activated only when the `logging` compose profile is
-  # enabled (e.g. `docker compose --profile logging up`).  When the profile
+  # enabled (e.g. `COMPOSE_PROFILES=logging` in .env).  When the profile
   # is off the gateway runs standalone and no MySQL image is pulled.
   gateway-log:
     profiles: ["logging"]
@@ -146,11 +248,30 @@ services:
       retries: 10
     restart: unless-stopped
 
+networks:
+  # proxy ↔ colors. The subnet is fixed so the proxy has a fixed address the
+  # colors can trust for X-Forwarded-For (FORWARDED_ALLOW_IPS above). If it
+  # overlaps another network on the host Compose refuses with "Pool overlaps":
+  # change GATEWAY_EDGE_SUBNET and GATEWAY_EDGE_PROXY_IP (inside it, not its
+  # first address) together in .env.
+  edge:
+    ipam:
+      config:
+        - subnet: ${GATEWAY_EDGE_SUBNET:-172.31.251.240/28}
+
 volumes:
-  # Claude CLI per-container state (conversation history, caches, settings).
-  # Inspect with: docker volume inspect claude-code-openai-wrapper_claude_home
+  # Claude CLI state (conversation history, caches, settings), shared by both
+  # colors. The name is pinned so every color, overlay and a later compose
+  # project resolve the same volume; its default is exactly the name Compose
+  # gave it before the pin (`<project>_claude_home` — Compose fills
+  # COMPOSE_PROJECT_NAME with the effective project name, the directory name or
+  # -p), so an existing deployment keeps its data. To move the checkout or run
+  # under another project name, set GATEWAY_CLAUDE_HOME_VOLUME in .env to the
+  # existing volume's name (`docker volume ls`).
+  # Inspect with: docker volume inspect <name>
   # Wipe with:    docker compose down -v   (or: docker volume rm <name>)
   claude_home:
+    name: ${GATEWAY_CLAUDE_HOME_VOLUME:-${COMPOSE_PROJECT_NAME}_claude_home}
 
 secrets:
   gateway_build_install_script:
