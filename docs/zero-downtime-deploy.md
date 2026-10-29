@@ -1,6 +1,6 @@
 # 무중단 배포 설계 (blue/green)
 
-> 상태: **설계 초안 5판**, 구현 전. 기준 2026-10-29 `main` `d2fcd21`(#264 포함). 구현은 이 문서가 리뷰된 뒤
+> 상태: **설계 초안 6판**, 구현 전. 기준 2026-10-29 `main` `d2fcd21`(#264 포함). 구현은 이 문서가 리뷰된 뒤
 > [단계](#7-구현-단계)대로 나눠 올린다. 참고: ChatDRAGON UI의 같은 방식(#710, `scripts/deploy.sh`·`/health/drain`·
 > nginx `active.conf`).
 >
@@ -18,6 +18,10 @@
 > 5판(#265 4차 리뷰): ledger를 TTL로 지우지 않는다 — `admitted`는 턴이 끝날 때까지, 끝난 상태와 `refused`는 그 뒤
 > `DISPATCH_RETENTION` 동안. id에 대상 boot id·발급 시각을 넣어, 늦은 도착은 tombstone 없이도 거절하고, 판정 근거가 없는
 > settle은 언제나 "모름"(재전송 없음)이다.
+>
+> 6판(#265 5차 리뷰): drain 중인 색이 새 세션·울타리 세션·관리자 쓰기를 보낼 곳을 "활성 색"(nginx 상태)이 아니라 drain을
+> 걸 때 검증·고정하는 **drain target**(instance + boot id)으로 정했다. 자기 자신은 target이 될 수 없고, target이 사라지면
+> 추측하지 않고 503으로 멈춘다.
 
 ## 1. 목표와 비목표
 
@@ -91,15 +95,21 @@
    잠금 + "바뀐 게 없으면 건너뜀".
 3. **준비 확인** — green 안에서 `/health/ready`가 200, `/health`의 instance가 `green`, green이 blue의 내부 주소에
    닿는다(`/internal/ping`).
-4. **blue를 drain으로 둔다** — `POST /internal/drain`. 이 순간부터 blue는:
+4. **blue를 drain으로 둔다** — `POST /internal/drain {"target": "green", "target_boot_id": "<3단계에서 읽은 값>"}`.
+   blue는 먼저 target을 **검증**한다: 자기 자신이 아니고, instance 등록과 잠금으로 살아 있고, `/internal/ping`이 같은 boot
+   id를 답해야 한다 — 하나라도 아니면 drain을 거절하고(400) 아무것도 바꾸지 않는다. 검증되면 그 target을 **drain target**으로
+   고정한다. 이 순간부터 blue는:
    - **새 세션을 만들지 않는다**: 세션을 새로 여는 요청(`previous_response_id` 없는 `/v1/responses`,
-     `/v1/agents/messages`)은 green으로 내부 전달한다(아직 nginx가 blue로 보내는 동안의 요청 — [§5.2](#52-세션-소유권과-넘겨받기)의 "전달").
+     `/v1/agents/messages`)은 drain target으로 내부 전달한다(아직 nginx가 blue로 보내는 동안의 요청 — [§5.2](#52-세션-소유권과-넘겨받기)의 "전달").
    - **쉬는 세션을 놓는다**: 진행 중인 턴도 카드도 없는 세션의 CLI를 disconnect하고(transcript는 남는다) 소유를
-     푼다. 놓은 세션은 blue에서 다시 열지 않는다(울타리).
+     푼다. 놓은 세션은 drain 동안 blue에서 다시 열지 않는다(울타리) — 그 세션 요청이 blue에 오면 drain target으로 전달한다.
+   - 관리자 쓰기도 drain target으로 전달한다([§5.5](#55-관리자-상태)).
    - 진행 중인 턴·카드를 기다리는 세션·백그라운드 턴은 그대로 둔다. 끝나면 그 세션도 놓는다.
    - `/health/ready` → 503.
 5. **전환** — `active.conf`를 green으로 바꾸고 reload. proxy를 거친 `/health`가 `green`을 답할 때까지 확인.
-   4와 5 사이에 blue로 온 요청은 위대로 전달되거나 blue가 아직 쥔 세션이면 blue가 처리한다 — 어느 쪽도 409가 아니다.
+   4와 5 사이에 blue로 온 요청은 위대로 drain target에 전달되거나 blue가 아직 쥔 세션이면 blue가 처리한다 — 어느 쪽도
+   409가 아니다. 전환은 drain target을 바꾸지 않는다: blue에게 "어디로 보낼지"는 `active.conf`가 아니라 4단계에서 고정한
+   drain target 하나뿐이다(`active.conf`는 nginx만 읽는다).
 6. **drain 대기** — `GET /health/drain`(loopback 전용)을 주기적으로 읽어 아래가 모두 0이 될 때까지 기다린다.
    `DRAIN_TIMEOUT_SECONDS`(기본 3600)을 넘기면 남은 것을 보여 주고 멈춘다 — 강제로 내릴지는 운영자가 정한다
    (`--force`).
@@ -111,9 +121,16 @@ drain(4)을 전환(5)보다 **먼저** 하는 이유: 전환을 먼저 하면 gr
 drain을 먼저 걸면 blue가 쉬는 세션을 놓기 시작한 뒤에 green으로 요청이 가고, 그래도 아직 놓지 못한 세션은 §5.2의
 넘겨받기가 그 자리에서 해결한다.
 
-되돌리기: 6단계 중이면 `DELETE /internal/drain`(blue가 다시 새 세션을 받는다)과 `active.conf`를 blue로 되돌린다.
-green이 그 사이 연 세션은 green이 계속 쥐다가, 같은 절차로 green을 drain하면 blue로 넘어간다. 7단계 뒤라면 같은
-스크립트로 옛 이미지를 다시 배포한다.
+되돌리기: 6단계 중이면 `active.conf`를 blue로 되돌리고 `DELETE /internal/drain`(blue는 drain target을 지우고 다시 새
+세션을 받으며 울타리도 걷는다). green이 그 사이 연 세션은 green이 계속 쥐고, 그 세션 요청이 blue로 오면 일반 소유자 전달
+([§5.2](#52-세션-소유권과-넘겨받기))로 green이 처리한다. green을 내리려면 같은 절차로 `drain(green, target=blue)`를 건다. 7단계 뒤라면
+같은 스크립트로 옛 이미지를 다시 배포한다.
+
+**drain target이 사라지면**(green이 죽었거나 boot id가 바뀜 — 전달 전에 매번 instance 잠금·boot id로 확인한다): blue는
+새 세션·울타리 세션·관리자 쓰기를 **자기에게 다시 열지도, 다른 곳으로 추측해 보내지도 않는다** — retryable 503
+(`drain_target_unavailable`)로 답하고 deploy 스크립트가 경보를 띄운다. 운영자의 선택은 둘이다: 되돌리기(위), 또는 새
+target으로 drain을 다시 걸기(`POST /internal/drain`은 drain 중에도 target을 검증된 새 값으로 바꿀 수 있다). drain target이
+자기 자신으로 풀리는 경로는 없다 — 자기 앞으로의 전달은 구현에서 assert로 막고(재귀 전달 금지와 별개), 테스트로 고정한다.
 
 ### `/health/drain` 계약
 
@@ -165,7 +182,7 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 | 소유 상태 | 처리 |
 |---|---|
 | 아무도 안 쥠 | 지금처럼 잠금을 잡고 rehydrate + resume |
-| 다른 instance가 쥠, 그 세션이 **쉬는 중** | **넘겨받기**: 소유자에게 `POST /internal/sessions/<sid>/release`. 소유자는 세션 잠금 안에서 "진행 중인 턴·카드·백그라운드 없음"을 확인하고 CLI를 disconnect한 뒤 소유를 푼다. 받은 쪽은 그 잠금을 잡고 resume. 소유자가 놓은 세션에는 울타리를 친다 — 그 뒤 소유자에게 그 세션 요청이 오면 소유자는 다시 열지 않고 활성 색으로 전달한다 |
+| 다른 instance가 쥠, 그 세션이 **쉬는 중** | **넘겨받기**: 소유자에게 `POST /internal/sessions/<sid>/release`. 소유자는 세션 잠금 안에서 "진행 중인 턴·카드·백그라운드 없음"을 확인하고 CLI를 disconnect한 뒤 소유를 푼다. 받은 쪽은 그 잠금을 잡고 resume. 놓은 뒤 그 세션 요청이 옛 소유자에게 오면, 옛 소유자는 잠금의 현재 소유자에게 전달한다(아무도 안 쥐었으면 drain 중일 때는 drain target으로, 아니면 직접 연다 — 잠금이 CLI 하나를 지킨다) |
 | 다른 instance가 쥠, 그 세션이 **진행 중**(턴·카드·백그라운드) | **전달**: 요청을 소유자에게 그대로 내부 reverse-proxy한다(본문·헤더·스트리밍 응답 그대로). 카드 답(`function_call_output`)은 카드를 기다리는 프로세스에 닿고, 진행 중인 턴의 `GET`/`cancel`/`pending-events`도 그 프로세스가 답한다 |
 | 소유자가 죽음(잠금 없음) | 아무도 안 쥠과 같다 |
 
@@ -189,7 +206,8 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 - **대기 한도**: release가 1초(`HANDOFF_RELEASE_TIMEOUT`) 안에 답하지 않으면 소유자가 살아 있는 한 전달로 간다.
 - **전달의 범위**: drain 중에만 생기는 일이 아니다 — 같은 세션에 대한 요청이 어쩌다 다른 색으로 와도 같은 규칙이다. 다만
   평상시(한 색만 돌 때)에는 소유자가 언제나 자기 자신이라 이 경로를 타지 않는다.
-- **새 세션 요청**(세션 id가 없는 요청)이 drain 중인 색에 오면 활성 색으로 전달한다(§4의 4단계).
+- **새 세션 요청**(세션 id가 없는 요청)이 drain 중인 색에 오면 그 색의 **drain target**으로 전달한다(§4의 4단계). drain
+  중이 아닌 색은 새 세션을 직접 연다. "활성 색"(nginx의 `active.conf`)은 gateway의 판단에 쓰지 않는다.
 
 **가용성 수준.** 클라이언트가 무엇을 아느냐에 따라 달라지지 않는다 — 판정·전달·경합 재시도가 모두 서버에 있다. 아래
 "오류 없음"은 두 색이 서로 닿는 정상 전환을 전제로 하며, 그때 클라이언트가 보는 것은 길어야 `HANDOFF_DEADLINE` 안의
@@ -298,7 +316,7 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 - **runtime-config**: 오버라이드를 `data/runtime_config.json`(tmp + `os.replace`)에 남기고 기동 때 읽는다 — green이
   기본값으로 뜨는 틈이 없어진다. ChatDRAGON의 reconcile은 그대로 두어도 된다(gateway가 이미 오버라이드를 들고
   있으면 건드리지 않는다).
-- **관리자 쓰기**: proxy는 활성 색으로만 보내므로 `data/`를 쓰는 곳은 한 곳이다. drain 중인 색은 관리자 쓰기를 활성 색으로
+- **관리자 쓰기**: proxy는 활성 색으로만 보내므로 `data/`를 쓰는 곳은 한 곳이다. drain 중인 색은 관리자 쓰기를 drain target으로
   전달한다(옛 화면의 늦은 저장이 옛 색에만 쓰이지 않게).
 
 ### 5.6 종료
@@ -359,6 +377,11 @@ ChatDRAGON 변경은 필요 없다. PR 1–3은 단일 컨테이너 배포에서
   5. 두 색이 동시에 플러그인 replay(같은 manifest → 둘 다 skip / 다른 manifest → 한쪽씩 잠금, 레지스트리 온전).
   6. replay 뒤에도 옛 색의 CLI가 연 fd·cwd로 옛 플러그인 트리를 drain 끝까지 읽는다.
   7. 반복 배포(blue→green→blue)와 되돌리기(6단계 중 rollback).
+  8. 전환 창(리뷰 acceptance): nginx가 아직 blue인 상태에서 `drain(blue, target=green)` → blue 프록시로 신규 세션 POST,
+     기존 쉬는 세션의 새 턴, 관리자 저장을 보낸다 → 신규 세션은 green에서 정확히 한 번 생기고, 쉬는 세션은 green이 넘겨받아
+     잇고, 관리자 저장은 green의 `data/`에 한 번 쓰이며, blue가 자기 자신에게 보낸 전달은 0건. 그 뒤 nginx 전환·중단·
+     rollback(`DELETE /internal/drain` 후 green 소유 세션은 소유자 전달로 계속)을 반복. `drain(blue, target=blue)`와 boot id가
+     맞지 않는 target은 400, target이 죽으면 503 `drain_target_unavailable`(자기 자신으로 열지 않음).
 - **deploy 스크립트**: ChatDRAGON `tests/test_deploy_script.py`처럼 docker 호출을 가짜로 바꿔 순서(drain → 전환)·gate·
   되돌리기·timeout을 고정.
 - **실환경 리허설**(배포 컨테이너): 긴 도구 턴 + 카드 대기 + 백그라운드 턴을 걸어 둔 채 `deploy.sh` — 끊김 없음, 카드 답이
