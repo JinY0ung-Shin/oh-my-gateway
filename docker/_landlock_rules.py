@@ -97,6 +97,12 @@ SYSTEM_RO = (
     "/opt",
     "/proc",
 )
+# Read-only system caches outside the roots above. fontconfig's prebuilt cache
+# (``fc-cache`` at image build) holds font metadata only: without it every
+# fontconfig client in a session (fc-list, LibreOffice, Chromium, matplotlib)
+# rescans every font file on every start. Only a real directory is granted
+# (:func:`system_ro_caches`): a link there could point anywhere.
+SYSTEM_RO_CACHES = ("/var/cache/fontconfig",)
 RO_FILES = ("/dev/urandom",)
 RW_FILES = ("/dev/null", "/dev/zero", "/dev/tty")
 
@@ -154,6 +160,19 @@ def _add_rule_fd(ruleset_fd, fd, rights, path):
     if rc != 0:
         raise LandlockError("add_rule failed for %r (errno %d)" % (path, err))
     return True
+
+
+def system_ro_caches():
+    """The :data:`SYSTEM_RO_CACHES` entries to grant: each one that is a real
+    directory, never a symlink (``_add_rule`` follows links)."""
+    out = []
+    for path in SYSTEM_RO_CACHES:
+        try:
+            if stat.S_ISDIR(os.lstat(path).st_mode):
+                out.append(path)
+        except OSError:
+            pass
+    return out
 
 
 def _add_rule(ruleset_fd, path, rights):
@@ -607,7 +626,12 @@ def session_tmp_env(tmp):
     leaves the excludes default at ``~/.config/git/ignore``. Not
     ``XDG_CONFIG_HOME``: the CLI reads its own config beneath that too. The
     system config (/etc/gitconfig) stays readable and in effect, except for
-    those two keys, which the session's global config overrides."""
+    those two keys, which the session's global config overrides.
+
+    ``XDG_CACHE_HOME``: the shared ``~/.cache`` is not granted, so fontconfig,
+    matplotlib, pip and the CLI's own cache fell back to rebuilding (or not
+    writing) their caches on every run; beneath the tmp dir they persist per
+    workspace without becoming a cross-session plant channel."""
     npm_cache = os.path.join(tmp, "npm-cache")
     return {
         "TMPDIR": tmp,
@@ -618,6 +642,7 @@ def session_tmp_env(tmp):
         "UV_PYTHON_INSTALL_DIR": os.path.join(tmp, "uv-python"),
         "UV_TOOL_DIR": os.path.join(tmp, "uv-tools"),
         "GIT_CONFIG_GLOBAL": os.path.join(tmp, GIT_CONFIG_NAME),
+        "XDG_CACHE_HOME": os.path.join(tmp, "cache"),
     }
 
 

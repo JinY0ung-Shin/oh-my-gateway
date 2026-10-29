@@ -56,6 +56,8 @@ COPY docs/*system-prompt*.md ./docs/
 # plugin manifest (manifest.added / manifest.removed) and fresh-clones each
 # marketplace repo on every start so the latest plugin version is installed.
 COPY docker/install_plugins.py /usr/local/bin/install_plugins.py
+# Its local-marketplace copy (#258), shared with the admin path.
+COPY src/plugin_local_copy.py /usr/local/bin/plugin_local_copy.py
 
 # Optional build-time install hook for private/corporate additions. Compose
 # supplies a no-op script by default; set GATEWAY_BUILD_INSTALL_SCRIPT to run

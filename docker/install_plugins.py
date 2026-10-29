@@ -24,7 +24,9 @@ Behavior:
     * Manifest repos that point at a clone URL are removed and freshly
       ``git clone --depth 1 --branch <branch>``'d on every run (branch defaults
       to ``main``); values that point at an existing local path are used in
-      place (no clone).
+      place (no clone) — unless Landlock confinement is on and sessions could
+      not read them there (``/app``, the workspace base, the temp dir): then
+      they are copied into the clone root on every run (#258).
     * Each plugin is ``install``'d (first run) and then ``update``'d (later
       runs) so the installed version always tracks the marketplace's latest.
     * Specs in ``manifest.removed`` are skipped and actively uninstalled so an
@@ -346,6 +348,65 @@ def _clone_dir(root: Path, repo: str) -> Path:
     return root / f"{base}-{digest}"
 
 
+def _load_local_copy():
+    """The gateway's ``plugin_local_copy`` module: beside this script in the
+    image (``/usr/local/bin``), ``../src`` in a checkout. ``None`` if absent."""
+    import importlib.util
+
+    here = Path(__file__).resolve().parent
+    candidates = (
+        here / "plugin_local_copy.py",
+        here.parent / "src" / "plugin_local_copy.py",
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            spec = importlib.util.spec_from_file_location(
+                "plugin_local_copy", candidate
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+    return None
+
+
+def _app_root() -> Path:
+    """The gateway app root: the CMD runs from it (``/app``)."""
+    cwd = Path.cwd()
+    return cwd if (cwd / "src" / "main.py").is_file() else Path("/app")
+
+
+def _local_copy(entry: PluginEntry, root: Path) -> Path:
+    """The local repo itself, or a fresh copy in the clone root when a confined
+    session could not read it in place (#258; same check as the admin path)."""
+    lc = _load_local_copy()
+    if lc is None:
+        if os.environ.get("CLAUDE_ISOLATION_MODE", "").strip():
+            log(
+                f"{entry.source_label}: plugin_local_copy.py missing; "
+                f"{entry.repo} registered in place"
+            )
+        return Path(entry.repo)
+    app_root = _app_root()
+    if not lc.needs_copy(entry.repo, app_root=app_root):
+        return Path(entry.repo)
+    dest = _clone_dir(root, entry.repo)
+    log(
+        f"{entry.source_label}: copying local {entry.repo} -> {dest} "
+        "(confined sessions cannot read it in place)"
+    )
+    try:
+        skipped = lc.copy_marketplace(entry.repo, dest, app_root=app_root)
+    except lc.LocalCopyError as exc:
+        raise OSError(str(exc)) from exc
+    if skipped:
+        log(
+            f"{entry.source_label}: copied without {len(skipped)} "
+            "entries (links out of the tree, hard links, special files): "
+            + ", ".join(skipped[:10])
+        )
+    return dest
+
+
 def prepare_repo(entry: PluginEntry, root: Path) -> Path:
     """Return the local marketplace path for *entry*, fresh-cloning if remote.
 
@@ -354,7 +415,7 @@ def prepare_repo(entry: PluginEntry, root: Path) -> Path:
     latest marketplace content is always on disk.
     """
     if Path(entry.repo).exists():
-        return Path(entry.repo)
+        return _local_copy(entry, root)
 
     dest = _clone_dir(root, entry.repo)
     dest.parent.mkdir(parents=True, exist_ok=True)

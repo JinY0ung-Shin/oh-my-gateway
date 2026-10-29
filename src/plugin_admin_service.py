@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import List, Optional
 from urllib.parse import urlsplit, urlunsplit
 
-from . import plugin_manifest
+from . import plugin_local_copy, plugin_manifest
 
 logger = logging.getLogger(__name__)
 
@@ -319,15 +319,71 @@ def _clone_dir(root: Path, repo: str) -> Path:
     return root / f"{base}-{digest}"
 
 
+def _local_needs_copy(path: str) -> bool:
+    """Whether a confined session is refused the local marketplace *path*:
+    the standalone check ``install_plugins.py`` makes too, or the spawn's own
+    grant filter (which also knows ``$HOME`` and the config dir)."""
+    from .backends.claude import landlock
+
+    if plugin_local_copy.needs_copy(path, app_root=landlock._APP_ROOT):
+        return True
+    if not landlock.confine_enabled():
+        return False
+    try:
+        from .backends.claude import workspace_sandbox as ws
+
+        real = landlock._real(path)
+        grants = landlock._GrantFilter(ws._claude_home(), None)
+        refused = grants._read_refusal(real) or landlock._target_refusal(
+            real, file=False
+        )
+    except (OSError, ValueError):
+        return False
+    return refused is not None
+
+
+def _local_copy(repo: str, root: Path) -> Path:
+    """*repo* itself, or its copy in the clone root when sessions cannot read
+    it in place (#258). The manifest keeps *repo*, so every start and refresh
+    copies again and edits to the source arrive then."""
+    if not _local_needs_copy(repo):
+        return Path(repo)
+    from .backends.claude import landlock
+
+    dest = _clone_dir(root, repo)
+    try:
+        skipped = plugin_local_copy.copy_marketplace(
+            repo, dest, app_root=landlock._APP_ROOT
+        )
+    except (plugin_local_copy.LocalCopyError, OSError) as exc:
+        raise PluginAdminError(
+            f"could not copy the local marketplace {repo!r} where confined "
+            f"sessions can read it: {exc}"
+        ) from exc
+    if skipped:
+        logger.warning(
+            "Local marketplace %s copied to %s without %d entr%s (links out of "
+            "the tree, hard links, special files): %s",
+            repo,
+            dest,
+            len(skipped),
+            "y" if len(skipped) == 1 else "ies",
+            ", ".join(skipped[:10]),
+        )
+    return dest
+
+
 def prepare_repo(repo: str, *, branch: str, token: str, root: Path) -> Path:
     """Return the local marketplace path for *repo*, fresh-cloning if remote.
 
-    A local-path repo is used in place (*branch* is ignored). A remote repo is
-    cloned into a staging dir and swapped in only on success, so a failed
-    re-clone leaves any previous clone intact.
+    A local-path repo is used in place (*branch* is ignored), unless a confined
+    session could not read it there: then it is copied into the clone root
+    (:func:`_local_copy`, #258). A remote repo is cloned into a staging dir and
+    swapped in only on success, so a failed re-clone leaves any previous clone
+    intact.
     """
     if Path(repo).exists():
-        return Path(repo)
+        return _local_copy(repo, root)
 
     dest = _clone_dir(root, repo)
     dest.parent.mkdir(parents=True, exist_ok=True)

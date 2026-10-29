@@ -1220,6 +1220,51 @@ async def _bash_turn(ws: Path, home: Path, command: str) -> str:
         return json.dumps([r["body"] for r in api.model_requests()])
 
 
+class TestSystemCaches:
+    def test_a_real_cache_dir_is_granted(self, rules, tmp_path, monkeypatch):
+        cache = tmp_path / "fontconfig"
+        cache.mkdir()
+        monkeypatch.setattr(rules, "SYSTEM_RO_CACHES", (str(cache),))
+        assert rules.system_ro_caches() == [str(cache)]
+
+    def test_a_link_or_a_missing_one_is_not(self, rules, tmp_path, monkeypatch):
+        # _add_rule follows links: a cache dir planted as one could grant /.
+        link = tmp_path / "fontconfig"
+        link.symlink_to("/")
+        monkeypatch.setattr(rules, "SYSTEM_RO_CACHES", (str(link), "/nonexistent"))
+        assert rules.system_ro_caches() == []
+
+    def test_the_cache_home_lies_beneath_the_tmp_dir(self, rules, tmp_path):
+        tmp = str(tmp_path / ".cli-tmp")
+        assert rules.session_tmp_env(tmp)["XDG_CACHE_HOME"] == tmp + "/cache"
+
+
+_FONT_PROBE = (
+    "import json, os\n"
+    "out = {'cache_home': os.environ.get('XDG_CACHE_HOME')}\n"
+    "try:\n"
+    "    out['cache'] = sorted(os.listdir('/var/cache/fontconfig'))\n"
+    "except OSError as e:\n"
+    "    out['cache'] = e.errno\n"
+    "print(json.dumps(out))\n"
+)
+
+
+@_needs_landlock
+@pytest.mark.skipif(
+    not os.path.isdir("/var/cache/fontconfig")
+    or os.path.islink("/var/cache/fontconfig")
+    or not os.access("/var/cache/fontconfig", os.R_OK),
+    reason="no fontconfig cache",
+)
+class TestLauncherFontCache:
+    def test_the_font_cache_is_readable_confined(self, ws, home):
+        # Without it every fontconfig client rescanned every font per start.
+        out = _launch(ws, _FONT_PROBE, _launch_env(ws, home))
+        assert out["cache"] == sorted(os.listdir("/var/cache/fontconfig"))
+        assert out["cache_home"] == str(ws / ".cli-tmp" / "cache")
+
+
 @pytest.mark.integration
 @_needs_landlock
 @pytest.mark.skipif(not landlock.resolve_real_cli(), reason="no bundled CLI")

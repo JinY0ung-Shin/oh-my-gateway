@@ -162,7 +162,7 @@ def _ro_rw(real_cli, cwd):
     problem = ll.cli_dir_problem(cli_dir, cwd)
     if problem:
         _die("refusing to grant the real CLI's directory %r: %s" % (cli_dir, problem))
-    ro = list(ll.SYSTEM_RO)
+    ro = [*ll.SYSTEM_RO, *ll.system_ro_caches()]
     ro.append(cli_dir)
     # The session shell wrapper, which the CLI execs for every Bash call: the
     # file, never its directory (in a checkout that is the gateway's docker/).
