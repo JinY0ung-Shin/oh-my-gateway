@@ -130,6 +130,25 @@ class TestPluginBinOnPath:
         output = _bash_output(api)
         assert "probe-ok hello" in output and "rc=0" in output, output
 
+    async def test_a_stale_shell_snapshot_does_not_drop_it(self, confined_plugin):
+        """A long-lived volume keeps the snapshots unconfined runs wrote, with
+        a hard-coded ``export PATH=...`` (#268 review). A confined CLI neither
+        writes a new one nor sources an old one, so the PATH entry survives."""
+        api, env, ws = confined_plugin
+        snaps = Path(env["CLAUDE_CONFIG_DIR"]) / "shell-snapshots"
+        snaps.mkdir()
+        stale = (
+            "unalias -a 2>/dev/null || true\n"
+            "export PATH=/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n"
+        )
+        for name in ("snapshot-bash-1700000000000-abcdef.sh", "snapshot-bash-x.sh"):
+            (snaps / name).write_text(stale)
+        before = sorted(p.name for p in snaps.iterdir())
+        await _one_turn(env, ws, landlock.options_env(ws))
+        output = _bash_output(api)
+        assert "probe-ok hello" in output and "rc=0" in output, output
+        assert sorted(p.name for p in snaps.iterdir()) == before, "none written"
+
     async def test_control_without_the_path_entry_it_is_127(
         self, confined_plugin, monkeypatch
     ):

@@ -993,3 +993,38 @@ class TestFileApiKeepsOwnerAccess:
             assert posix_acl.get_acl(fd) is None
         finally:
             os.close(fd)
+
+
+class TestPluginBinPath:
+    """uid mode with per-uid config dirs keeps an enabled plugin's ``bin/`` on
+    the CLI's PATH (#267, #268 review): ``P/settings.json`` links to ``S``'s,
+    and the bin dir is granted through ``S``'s registry roots."""
+
+    def test_the_per_uid_spawn_appends_the_bin_dir(self, tree, monkeypatch):
+        shared = tree["shared"]
+        root = shared / "plugins" / "cache" / "m" / "tool" / "1.0.0"
+        (root / "bin").mkdir(parents=True)
+        (shared / "plugins" / "installed_plugins.json").write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "plugins": {
+                        "tool@m": [{"scope": "user", "installPath": str(root)}]
+                    },
+                }
+            )
+        )
+        (shared / "settings.json").write_text(
+            json.dumps({"enabledPlugins": {"tool@m": True}})
+        )
+        monkeypatch.setenv("GATEWAY_ISOLATION_TICKET_SECRET", "s3cret")
+        monkeypatch.setenv(landlock.BROKER_SOCKET_ENV, "/run/x.sock")
+        monkeypatch.setenv(
+            "CLAUDE_ISOLATION_UID_REGISTRY", str(tree["tmp"] / "uids.json")
+        )
+        monkeypatch.setenv("PATH", "/usr/bin:/bin")
+        ws = tree["workspaces"] / "alice"
+        ws.mkdir()
+        env = landlock.options_env(ws, user="alice")
+        assert env[landlock.MODE_ENV] == "uid"
+        assert env["PATH"] == f"/usr/bin:/bin:{root / 'bin'}"
