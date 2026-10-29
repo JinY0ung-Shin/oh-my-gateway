@@ -25,7 +25,7 @@ import json
 import logging
 import re
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 import httpx
 
@@ -73,7 +73,9 @@ def _session_of_response(resp_id: Optional[str]) -> Optional[str]:
 
 
 def _headers(scope: Scope) -> Dict[str, str]:
-    return {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]}
+    return {
+        k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope["headers"]
+    }
 
 
 def _loopback(scope: Scope) -> bool:
@@ -81,9 +83,14 @@ def _loopback(scope: Scope) -> bool:
     return bool(client) and client[0] in ("127.0.0.1", "::1")
 
 
-async def _send_json(send: Send, status: int, body: Any, headers: Optional[Dict[str, str]] = None) -> None:
+async def _send_json(
+    send: Send, status: int, body: Any, headers: Optional[Dict[str, str]] = None
+) -> None:
     raw = json.dumps(body).encode()
-    hdrs = [(b"content-type", b"application/json"), (b"content-length", str(len(raw)).encode())]
+    hdrs = [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(raw)).encode()),
+    ]
     for k, v in (headers or {}).items():
         hdrs.append((k.encode(), v.encode()))
     await send({"type": "http.response.start", "status": status, "headers": hdrs})
@@ -145,7 +152,9 @@ class HandoffMiddleware:
             await self.app(scope, receive, send)
             return
         path = scope["path"]
-        if path.startswith("/internal/") and not path.startswith("/internal/mcp-relay/"):
+        if path.startswith("/internal/") and not path.startswith(
+            "/internal/mcp-relay/"
+        ):
             await self._internal(scope, receive, send)
             return
         if path == "/health/drain":
@@ -214,27 +223,38 @@ class HandoffMiddleware:
         deadline = time.monotonic() + HANDOFF_DEADLINE
         backoff = _BACKOFF_START
         while True:
-            outcome = await self._attempt(scope, receive, send, body, kind, session_id, continuation)
+            outcome = await self._attempt(
+                scope, receive, send, body, kind, session_id, continuation
+            )
             if outcome == "done":
                 return
             if outcome == "again":
                 continue
             if time.monotonic() + backoff > deadline:
                 logger.warning(
-                    "handoff_deadline_exceeded: %s %s (session %s)", method, path, session_id
+                    "handoff_deadline_exceeded: %s %s (session %s)",
+                    method,
+                    path,
+                    session_id,
                 )
                 if outcome == "unavailable":
                     await _send_json(
                         send,
                         503,
-                        _error("drain_target_unavailable", "This gateway is draining and its target is not reachable; retry shortly"),
+                        _error(
+                            "drain_target_unavailable",
+                            "This gateway is draining and its target is not reachable; retry shortly",
+                        ),
                         {"retry-after": "1"},
                     )
                 else:
                     await _send_json(
                         send,
                         503,
-                        _error("handoff_deadline_exceeded", "Could not determine which gateway instance owns this session; retry shortly"),
+                        _error(
+                            "handoff_deadline_exceeded",
+                            "Could not determine which gateway instance owns this session; retry shortly",
+                        ),
                         {"retry-after": "1"},
                     )
                 return
@@ -287,7 +307,9 @@ class HandoffMiddleware:
                 return "again"
         return await self._forward(instance, scope, receive, send, body)
 
-    async def _ask_release(self, instance: instance_registry.Instance, session_id: str) -> bool:
+    async def _ask_release(
+        self, instance: instance_registry.Instance, session_id: str
+    ) -> bool:
         try:
             res = await peer.call(
                 instance,
@@ -295,19 +317,30 @@ class HandoffMiddleware:
                 f"/internal/sessions/{session_id}/release",
                 timeout=_RELEASE_TIMEOUT,
             )
-            return res.status_code == 200 and res.json().get("result") in ("released", "absent")
+            return res.status_code == 200 and res.json().get("result") in (
+                "released",
+                "absent",
+            )
         except Exception:
-            logger.info("release of %s by %s did not answer", session_id, instance.name, exc_info=True)
+            logger.info(
+                "release of %s by %s did not answer",
+                session_id,
+                instance.name,
+                exc_info=True,
+            )
             return False
 
-    async def _local(self, scope: Scope, receive: Receive, send: Send, body: bytes) -> str:
+    async def _local(
+        self, scope: Scope, receive: Receive, send: Send, body: bytes
+    ) -> str:
         rerouted = False
 
         async def guarded_send(message: Dict[str, Any]) -> None:
             nonlocal rerouted
             if message["type"] == "http.response.start":
                 if message.get("status") == 421 and any(
-                    k.lower() == peer.REROUTE.encode() for k, _ in message.get("headers", [])
+                    k.lower() == peer.REROUTE.encode()
+                    for k, _ in message.get("headers", [])
                 ):
                     rerouted = True
                     return
@@ -330,7 +363,9 @@ class HandoffMiddleware:
         send: Send,
         body: bytes,
     ) -> str:
-        assert instance.name != instance_registry.instance_name(), "never forward to self"
+        assert (
+            instance.name != instance_registry.instance_name()
+        ), "never forward to self"
         target = peer.request_target(scope)
         sig = peer.signed_headers(instance.boot_id, scope["method"], target)
         dispatch_id = sig[peer.DISPATCH_ID]
@@ -341,9 +376,15 @@ class HandoffMiddleware:
         ]
         headers.extend(sig.items())
         query = scope.get("query_string") or b""
-        url = instance.url + scope["path"] + (("?" + query.decode("latin-1")) if query else "")
+        url = (
+            instance.url
+            + scope["path"]
+            + (("?" + query.decode("latin-1")) if query else "")
+        )
         client = self._http()
-        request = client.build_request(scope["method"], url, headers=headers, content=body)
+        request = client.build_request(
+            scope["method"], url, headers=headers, content=body
+        )
         self.forwarding += 1
         started = False
         try:
@@ -359,7 +400,9 @@ class HandoffMiddleware:
             watcher = asyncio.create_task(watch())
             try:
                 try:
-                    response = await self._until_disconnect(client.send(request, stream=True), disconnected)
+                    response = await self._until_disconnect(
+                        client.send(request, stream=True), disconnected
+                    )
                 except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
                     return "wait"  # no request byte left this process
                 except asyncio.CancelledError:
@@ -367,7 +410,9 @@ class HandoffMiddleware:
                         return "done"  # the client left; the owner sees our close as its disconnect
                     raise
                 except httpx.HTTPError:
-                    return await self._settle_or_report(instance, dispatch_id, send, started)
+                    return await self._settle_or_report(
+                        instance, dispatch_id, send, started
+                    )
                 try:
                     if response.status_code == 421 and peer.REROUTE in response.headers:
                         return "wait"
@@ -376,25 +421,56 @@ class HandoffMiddleware:
                         for k, v in response.headers.multi_items()
                         if k.lower().encode() not in _HOP_BY_HOP
                     ]
-                    await send({"type": "http.response.start", "status": response.status_code, "headers": out_headers})
+                    await send(
+                        {
+                            "type": "http.response.start",
+                            "status": response.status_code,
+                            "headers": out_headers,
+                        }
+                    )
                     started = True
-                    sse = response.headers.get("content-type", "").startswith("text/event-stream")
+                    sse = response.headers.get("content-type", "").startswith(
+                        "text/event-stream"
+                    )
                     try:
-                        async for chunk in self._until_disconnect_iter(response.aiter_raw(), disconnected):
-                            await send({"type": "http.response.body", "body": chunk, "more_body": True})
+                        async for chunk in self._until_disconnect_iter(
+                            response.aiter_raw(), disconnected
+                        ):
+                            await send(
+                                {
+                                    "type": "http.response.body",
+                                    "body": chunk,
+                                    "more_body": True,
+                                }
+                            )
                     except httpx.HTTPError:
-                        logger.warning("forward_interrupted mid-stream to %s (%s)", instance.name, dispatch_id)
+                        logger.warning(
+                            "forward_interrupted mid-stream to %s (%s)",
+                            instance.name,
+                            dispatch_id,
+                        )
                         if sse:
                             event = {
                                 "type": "response.failed",
                                 "response": {
                                     "status": "failed",
-                                    "error": {"code": "forward_interrupted", "message": "The connection to the gateway instance running this turn was lost; the turn's outcome is unknown. Do not retry automatically."},
+                                    "error": {
+                                        "code": "forward_interrupted",
+                                        "message": "The connection to the gateway instance running this turn was lost; the turn's outcome is unknown. Do not retry automatically.",
+                                    },
                                 },
                             }
                             payload = f"event: response.failed\ndata: {json.dumps(event)}\n\n".encode()
-                            await send({"type": "http.response.body", "body": payload, "more_body": True})
-                    await send({"type": "http.response.body", "body": b"", "more_body": False})
+                            await send(
+                                {
+                                    "type": "http.response.body",
+                                    "body": payload,
+                                    "more_body": True,
+                                }
+                            )
+                    await send(
+                        {"type": "http.response.body", "body": b"", "more_body": False}
+                    )
                     return "done"
                 finally:
                     await response.aclose()
@@ -408,7 +484,9 @@ class HandoffMiddleware:
         task = asyncio.ensure_future(awaitable)
         stop = asyncio.ensure_future(disconnected.wait())
         try:
-            done, _ = await asyncio.wait({task, stop}, return_when=asyncio.FIRST_COMPLETED)
+            done, _ = await asyncio.wait(
+                {task, stop}, return_when=asyncio.FIRST_COMPLETED
+            )
             if task in done:
                 return task.result()
             task.cancel()
@@ -430,25 +508,45 @@ class HandoffMiddleware:
             yield chunk
 
     async def _settle_or_report(
-        self, instance: instance_registry.Instance, dispatch_id: str, send: Send, started: bool
+        self,
+        instance: instance_registry.Instance,
+        dispatch_id: str,
+        send: Send,
+        started: bool,
     ) -> str:
         verdict = "unknown"
         try:
             res = await peer.call(
-                instance, "POST", f"/internal/dispatch/{dispatch_id}/settle", timeout=_SETTLE_TIMEOUT
+                instance,
+                "POST",
+                f"/internal/dispatch/{dispatch_id}/settle",
+                timeout=_SETTLE_TIMEOUT,
             )
             if res.status_code == 200:
                 verdict = res.json().get("verdict", "unknown")
         except Exception:
-            logger.info("settle of %s at %s did not answer", dispatch_id, instance.name, exc_info=True)
+            logger.info(
+                "settle of %s at %s did not answer",
+                dispatch_id,
+                instance.name,
+                exc_info=True,
+            )
         if verdict == "refused":
             return "wait"
-        logger.warning("forward_interrupted to %s (%s): settle=%s", instance.name, dispatch_id, verdict)
+        logger.warning(
+            "forward_interrupted to %s (%s): settle=%s",
+            instance.name,
+            dispatch_id,
+            verdict,
+        )
         if not started:
             await _send_json(
                 send,
                 502,
-                _error("forward_interrupted", "The connection to the gateway instance handling this request was lost; its outcome is unknown. Do not retry automatically."),
+                _error(
+                    "forward_interrupted",
+                    "The connection to the gateway instance handling this request was lost; its outcome is unknown. Do not retry automatically.",
+                ),
                 {"x-should-retry": "false"},
             )
         return "done"
@@ -457,12 +555,17 @@ class HandoffMiddleware:
     # The owner side of a forward
     # ------------------------------------------------------------------
 
-    async def _serve_forwarded(self, scope: Scope, receive: Receive, send: Send, dispatch_id: str) -> None:
+    async def _serve_forwarded(
+        self, scope: Scope, receive: Receive, send: Send, dispatch_id: str
+    ) -> None:
         if not ledger.admit(dispatch_id):
             await _send_json(
                 send,
                 421,
-                _error("dispatch_refused", "Dispatch refused (stale, replayed or for another process)"),
+                _error(
+                    "dispatch_refused",
+                    "Dispatch refused (stale, replayed or for another process)",
+                ),
                 {peer.REROUTE: "1"},
             )
             return
@@ -514,7 +617,9 @@ class HandoffMiddleware:
             return
         await _send_json(send, 404, {"detail": "Not Found"})
 
-    async def _drain_endpoint(self, scope: Scope, receive: Receive, send: Send, headers: Dict[str, str]) -> None:
+    async def _drain_endpoint(
+        self, scope: Scope, receive: Receive, send: Send, headers: Dict[str, str]
+    ) -> None:
         import hmac
         import os
 
@@ -537,11 +642,15 @@ class HandoffMiddleware:
         try:
             raw = await _read_body(receive)
             body = json.loads(raw or b"{}")
-            await drain_state.start(str(body.get("target", "")), str(body.get("target_boot_id", "")))
+            await drain_state.start(
+                str(body.get("target", "")), str(body.get("target_boot_id", ""))
+            )
         except (ValueError, AttributeError, DrainError) as exc:
             await _send_json(send, 400, {"detail": str(exc)})
             return
-        await _send_json(send, 200, {"draining": True, "drain_target": drain_state.describe_target()})
+        await _send_json(
+            send, 200, {"draining": True, "drain_target": drain_state.describe_target()}
+        )
 
     async def aclose(self) -> None:
         if self._client is not None:

@@ -14,7 +14,6 @@ Usage: GATEWAY_INSTANCE=blue PORT=… python handoff_peer_app.py
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import sys
 import uuid
@@ -112,4 +111,6 @@ async def _startup() -> None:
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=int(os.environ["PORT"]), log_level="warning")
+    uvicorn.run(
+        app, host="127.0.0.1", port=int(os.environ["PORT"]), log_level="warning"
+    )

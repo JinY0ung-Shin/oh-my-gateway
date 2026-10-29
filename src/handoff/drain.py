@@ -57,7 +57,9 @@ class DrainState:
             res = await peer.call(instance, "GET", "/internal/ping", timeout=3.0)
             seen = res.json().get("boot_id") if res.status_code == 200 else None
         except Exception as exc:  # unreachable, bad JSON
-            raise DrainError(f"target {name!r} did not answer /internal/ping: {exc}") from exc
+            raise DrainError(
+                f"target {name!r} did not answer /internal/ping: {exc}"
+            ) from exc
         if seen != boot_id:
             raise DrainError(f"target {name!r} answered boot {str(seen)[:8]}")
         self.target = instance
@@ -116,7 +118,9 @@ def snapshot(forwarding: int, open_requests: int) -> Dict[str, Any]:
         "active_turns": sum(1 for s in sessions if s.active_response_id is not None),
         "background_turns": background,
         "pending_interactions": sum(
-            1 for s in sessions if s.pending_tool_call is not None or s.input_event is not None
+            1
+            for s in sessions
+            if s.pending_tool_call is not None or s.input_event is not None
         ),
         "forwarding": forwarding,
         "open_requests": open_requests,

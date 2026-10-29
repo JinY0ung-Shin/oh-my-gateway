@@ -123,11 +123,19 @@ def test_owner_lock_spans_processes(blue):
         "from src.handoff.owners import OwnerLocks;l=OwnerLocks();"
         f"print(l.acquire({sid!r}, object()), l.owner({sid!r}))"
     )
-    env = {**__import__("os").environ, "GATEWAY_INSTANCE": "green", "GATEWAY_SKIP_DOTENV": "1"}
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    env = {
+        **__import__("os").environ,
+        "GATEWAY_INSTANCE": "green",
+        "GATEWAY_SKIP_DOTENV": "1",
+    }
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
     assert out.stdout.split() == ["False", "blue"], out.stderr
     locks.release(sid, token)
-    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True)
+    out = subprocess.run(
+        [sys.executable, "-c", code], env=env, capture_output=True, text=True
+    )
     assert out.stdout.split() == ["True", "green"], out.stderr
 
 
@@ -181,7 +189,9 @@ async def test_draining_instance_admits_no_session(blue, monkeypatch):
     from src.handoff.drain import drain_state
     from src.session_manager import SessionManager
 
-    monkeypatch.setattr(drain_state, "target", instance_registry.Instance("green", "b" * 32, "http://x"))
+    monkeypatch.setattr(
+        drain_state, "target", instance_registry.Instance("green", "b" * 32, "http://x")
+    )
     sm = SessionManager()
     with pytest.raises(SessionOwnedElsewhere):
         sm.get_or_create_session("cccccccc-2222-3333-4444-555555555555")

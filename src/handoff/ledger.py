@@ -28,9 +28,7 @@ from src.env_utils import parse_int_env
 
 HANDOFF_DEADLINE = parse_int_env("HANDOFF_DEADLINE_SECONDS", 10)
 ACCEPT_WINDOW = parse_int_env("DISPATCH_ACCEPT_WINDOW_SECONDS", HANDOFF_DEADLINE)
-RETENTION = max(
-    parse_int_env("DISPATCH_RETENTION_SECONDS", 600), 3 * ACCEPT_WINDOW + 1
-)
+RETENTION = max(parse_int_env("DISPATCH_RETENTION_SECONDS", 600), 3 * ACCEPT_WINDOW + 1)
 # Clocks of two colors on one host agree; this only absorbs rounding.
 _FUTURE_SKEW_MS = 5_000
 

@@ -96,7 +96,9 @@ def register() -> None:
     directory = instances_dir()
     directory.mkdir(parents=True, exist_ok=True)
     fd = os.open(
-        str(_lock_path(name)), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o644
+        str(_lock_path(name)),
+        os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC,
+        0o644,
     )
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -154,7 +156,9 @@ def lookup(name: str) -> Optional[Instance]:
         return None
     try:
         record = json.loads(_record_path(name).read_text(encoding="utf-8"))
-        return Instance(name=name, boot_id=str(record["boot_id"]), url=str(record["url"]))
+        return Instance(
+            name=name, boot_id=str(record["boot_id"]), url=str(record["url"])
+        )
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
@@ -179,7 +183,9 @@ def shared_secret() -> bytes:
     path.parent.mkdir(parents=True, exist_ok=True)
     value = secrets.token_hex(32)
     try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        fd = os.open(
+            str(path), os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600
+        )
     except FileExistsError:  # another instance won the race
         return bytes.fromhex(path.read_text(encoding="ascii").strip())
     with os.fdopen(fd, "w", encoding="ascii") as fh:
@@ -191,4 +197,8 @@ def describe() -> Dict[str, object]:
     """``/health`` fields; empty without blue/green."""
     if not enabled():
         return {}
-    return {"instance": instance_name(), "boot_id": BOOT_ID, "capabilities": list(CAPABILITIES)}
+    return {
+        "instance": instance_name(),
+        "boot_id": BOOT_ID,
+        "capabilities": list(CAPABILITIES),
+    }

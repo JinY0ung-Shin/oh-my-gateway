@@ -146,7 +146,9 @@ def test_drain_routes_new_sessions_and_released_ones_to_the_target(pair):
     nxt = blue.post({"previous_response_id": first["id"], "input": "two"}).json()
     assert nxt["instance"] == "green"
     status = blue.drain_status()
-    assert status["draining"] and status["active_turns"] == 0 and status["forwarding"] == 0
+    assert (
+        status["draining"] and status["active_turns"] == 0 and status["forwarding"] == 0
+    )
     assert [e[0] for e in _effects(effects)] == ["blue", "green", "green"]
 
 

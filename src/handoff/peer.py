@@ -30,7 +30,9 @@ _INTERNAL_MAX_AGE_MS = 60_000
 
 def sign(sender: str, dispatch_id: str, method: str, target: str) -> str:
     message = "\n".join((sender, dispatch_id, method.upper(), target)).encode()
-    return hmac.new(instance_registry.shared_secret(), message, hashlib.sha256).hexdigest()
+    return hmac.new(
+        instance_registry.shared_secret(), message, hashlib.sha256
+    ).hexdigest()
 
 
 def signed_headers(target_boot_id: str, method: str, target: str) -> Dict[str, str]:
@@ -88,4 +90,6 @@ async def call(
     """One signed internal call to *instance* (``/internal/…``)."""
     headers = signed_headers(instance.boot_id, method, path)
     async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-        return await client.request(method, instance.url + path, json=json, headers=headers)
+        return await client.request(
+            method, instance.url + path, json=json, headers=headers
+        )
