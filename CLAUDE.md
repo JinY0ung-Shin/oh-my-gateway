@@ -339,8 +339,12 @@ uv run pytest --cov=src                            # with coverage
   call as `bash -c -l`, whose `/etc/profile` reset PATH and whose denied `~/.profile` put
   `Permission denied` in every result; the wrapper turns exactly that leading `-c -l` into
   `--norc -c` (Debian's bash otherwise reads `~/.bashrc` when the env looks like ssh; a zsh choice
-  is left alone). Plugin `bin/` dirs on PATH and the CLI's pkill self-guard come only through the
-  snapshot, so they stay off under confinement. The slash/skill preflight
+  is left alone). The CLI puts plugin `bin/` dirs on PATH (and its pkill self-guard) only
+  through the snapshot, so `options_env` **appends** each enabled user-scope plugin's granted
+  `<installPath>/bin` to the confined CLI's own PATH (`landlock._plugin_path_env`, #267 —
+  appended, so no plugin shadows the CLI's shell, `git` or `rg`; project/local-scope plugins and
+  the pkill guard stay off; `tests/test_cli_plugin_bin_path.py` pins the bare-name call and its
+  127 control). The slash/skill preflight
   (`slash_commands._build_preflight_options`) is confined exactly like a session in that workspace
   (uid mode: through the broker as the request user's uid once that user has one — `user` is
   threaded from the responses route and `create_client`; a named user with no uid yet stays

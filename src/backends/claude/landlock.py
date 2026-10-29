@@ -1823,6 +1823,71 @@ def _landlock_env(ro: List[str], rw: List[str]) -> Dict[str, str]:
     return env
 
 
+# Characters a PATH entry must not hold: ``:`` splits it, and the CLI drops a
+# plugin bin dir holding shell metacharacters from its own snapshot too.
+_BAD_PATH_CHARS = frozenset(':"\'$`\\\n\r')
+
+
+def enabled_plugin_bin_dirs() -> List[str]:
+    """The ``bin/`` dirs of the user-scope plugins the config dir's
+    ``settings.json`` enables, resolved (#267). Never raises.
+
+    The CLI puts an enabled plugin's ``bin/`` on the Bash tool's PATH only
+    while writing its shell snapshot; a confined CLI cannot write the shared
+    ``shell-snapshots`` dir (that stays so: every session sources its
+    snapshot), so every bare-name plugin command exited 127."""
+    from . import workspace_sandbox as ws
+
+    try:
+        home = ws._claude_home()
+        if home is None:
+            return []
+        settings = ws._read_json(home / "settings.json")
+        enabled = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+        installed = ws._read_json(home / "plugins" / "installed_plugins.json")
+        plugins = installed.get("plugins") if isinstance(installed, dict) else None
+        if not isinstance(enabled, dict) or not isinstance(plugins, dict):
+            return []
+        dirs: List[str] = []
+        for plugin_id, entries in plugins.items():
+            if enabled.get(plugin_id) is not True or not isinstance(entries, list):
+                continue
+            for entry in entries:
+                if not isinstance(entry, dict) or entry.get("scope") != "user":
+                    continue
+                root = entry.get("installPath")
+                if isinstance(root, str) and root:
+                    path = _real(os.path.join(root, "bin"))
+                    if os.path.isdir(path) and path not in dirs:
+                        dirs.append(path)
+        return dirs
+    except (OSError, ValueError, TypeError):
+        logger.debug("plugin bin dirs skipped", exc_info=True)
+        return []
+
+
+def _plugin_path_env(ro: Sequence[str]) -> Dict[str, str]:
+    """``PATH`` with the enabled plugins' ``bin/`` dirs appended, for a confined
+    spawn granted *ro* (#267); empty when there are none.
+
+    Only a dir the spawn's own read-only grants cover (so a refused plugin root
+    adds nothing a session could not run anyway). Appended, never prepended:
+    this is the CLI's own process PATH, which picks its shell and runs ``git``
+    / ``rg``, so a plugin cannot shadow a system command — unlike the
+    snapshot, where the CLI prepends them for the Bash tool only."""
+    bins = [
+        path
+        for path in enabled_plugin_bin_dirs()
+        if not (set(path) & _BAD_PATH_CHARS)
+        and any(_beneath(path, root) for root in ro)
+    ]
+    if not bins:
+        return {}
+    base = os.environ.get("PATH") or os.defpath
+    parts = base.split(":")
+    return {"PATH": ":".join(parts + [b for b in bins if b not in parts])}
+
+
 def options_env(
     effective_cwd: Path,
     user: Optional[str] = None,
@@ -1856,7 +1921,7 @@ def options_env(
     if mode == "uid":
         return _uid_options_env(cwd, user, session_id)
     ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=True)
-    return _landlock_env(ro, rw)
+    return {**_landlock_env(ro, rw), **_plugin_path_env(ro)}
 
 
 def _uid_options_env(
@@ -1877,7 +1942,7 @@ def _uid_options_env(
 
     if not uid_layout.enabled():
         ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=False)
-        return _uid_spawn_env(cwd, ro, rw, user)[0]
+        return {**_uid_spawn_env(cwd, ro, rw, user)[0], **_plugin_path_env(ro)}
     from src.claude_config_paths import CONFIG_DIR_ENV, layout as config_layout
 
     uid = ui.resolve_uid(user or cwd, persist=bool(user))
@@ -1890,6 +1955,7 @@ def _uid_options_env(
     ro, rw = _ro_rw_roots(Path(cwd), session_id, precreate=False, layout=layout)
     env, _ = _uid_spawn_env(cwd, ro, rw, user, uid=uid)
     env[CONFIG_DIR_ENV] = _real(layout.config_dir)
+    env.update(_plugin_path_env(ro))
     return env
 
 
