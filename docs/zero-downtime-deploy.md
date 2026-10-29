@@ -1,6 +1,6 @@
 # 무중단 배포 설계 (blue/green)
 
-> 상태: **설계 초안 4판**, 구현 전. 기준 2026-10-29 `main` `d2fcd21`(#264 포함). 구현은 이 문서가 리뷰된 뒤
+> 상태: **설계 초안 5판**, 구현 전. 기준 2026-10-29 `main` `d2fcd21`(#264 포함). 구현은 이 문서가 리뷰된 뒤
 > [단계](#7-구현-단계)대로 나눠 올린다. 참고: ChatDRAGON UI의 같은 방식(#710, `scripts/deploy.sh`·`/health/drain`·
 > nginx `active.conf`).
 >
@@ -14,6 +14,10 @@
 > 4판(#265 3차 리뷰): "응답 헤더 전 실패면 다시 보낸다"를 지웠다 — 헤더 전에도 소유자는 턴을 시작했을 수 있다. 재판정은
 > 요청 바이트를 보내기 전 단계와, 소유자가 dispatch id로 "받지 않음"을 원자적으로 확정해 준 경우만. 그 밖의 끊김은 불확실한
 > 결과로 클라이언트에 알리고 다시 보내지 않는다([§5.3](#dispatch-id와-admission)).
+>
+> 5판(#265 4차 리뷰): ledger를 TTL로 지우지 않는다 — `admitted`는 턴이 끝날 때까지, 끝난 상태와 `refused`는 그 뒤
+> `DISPATCH_RETENTION` 동안. id에 대상 boot id·발급 시각을 넣어, 늦은 도착은 tombstone 없이도 거절하고, 판정 근거가 없는
+> settle은 언제나 "모름"(재전송 없음)이다.
 
 ## 1. 목표와 비목표
 
@@ -215,24 +219,44 @@ deploy 테스트에 "blue에서 시작한 대화를 green이 잇는다"를 넣�
 전달 연결이 요청 바이트를 보낸 뒤 끊기면 결과는 **모른다**: 소유자가 그 요청을 받아 턴(도구·MCP의 외부 부작용 포함)을
 시작했을 수도, 본문을 다 받기 전에 끊겼을 수도 있다. 그래서 다시 보내기 전에 소유자에게 묻고, 소유자가 원자적으로 답한다.
 
-- 전달하는 쪽은 전달마다 새 `x-gateway-dispatch-id`(무작위 128비트)를 단다. 같은 원 요청의 재판정 loop 안에서는 새로 보낼
-  때마다 새 id다(되풀이를 허락받은 id를 다시 쓰지 않는다).
-- 소유자는 그 요청을 **받아들이는 순간**(세션 잠금을 잡고 턴을 시작하기 직전, 본문을 다 받은 뒤) 프로세스 내 admission
-  ledger에 `id → admitted`를 적는다. ledger 쓰기와 턴 시작은 세션 잠금 안에서 한 번에 한다.
-- 연결이 요청 바이트를 보낸 뒤 끊기면 전달하는 쪽은 `POST /internal/dispatch/<id>/settle`을 부른다. 소유자는 ledger를 보고
-  원자적으로:
-  - **없음** → `id → refused`를 적고 "받지 않음"을 답한다. 늦게 도착한 같은 id의 요청은 이제 거절된다(울타리). 전달하는
-    쪽은 안전하게 재판정 loop로 돌아간다.
-  - **admitted** → "받음"을 답한다. 전달하는 쪽은 **다시 보내지 않는다.**
-- "받음"이거나 settle 자체가 기한 안에 답하지 않으면(소유자가 죽었거나 닿지 않음) 결과는 불확실하다. 전달하는 쪽은
-  클라이언트에게 **불확실한 결과**를 그대로 알린다: 스트림이 이미 열렸으면 지금의 스트림 오류(`response.failed`,
+- 전달하는 쪽은 전달마다 새 dispatch id를 단다: `x-gateway-dispatch-id: <대상 boot id>.<발급 시각 ms>.<무작위 128비트>`.
+  `boot id`는 대상 프로세스가 기동 때 만든 값(`/internal/ping`과 instance 등록에 실린다). 같은 원 요청의 재판정 loop 안에서는
+  새로 보낼 때마다 새 id다. 두 색은 같은 호스트라 같은 시계를 쓴다(발급 시각을 대상이 잰다).
+- **받아들이기(admission)**: 소유자는 본문을 다 받은 뒤, 세션 잠금 안에서 턴 시작과 한 번에 ledger에 `id → admitted`를
+  적는다. 다음이면 받아들이지 않고 `refused`를 적은 뒤 거절한다(전달하는 쪽은 "받지 않음"으로 보고 재판정한다):
+  - id의 boot id가 자기 것이 아님(다른 프로세스 앞으로 보낸 요청),
+  - 발급 시각이 `DISPATCH_ACCEPT_WINDOW`(기본 `HANDOFF_DEADLINE`, 10s)보다 오래됨 — 늦게 도착한 요청은 ledger에 흔적이
+    없어도 절대 받아들여지지 않는다,
+  - ledger에 이미 그 id가 있음(어떤 상태든).
+- **ledger의 수명** — 시간으로 지우는 것은 끝난 항목뿐이다:
+  - `admitted`는 그 요청의 턴이 **끝날 때까지 지우지 않는다**(스트리밍·백그라운드 모두, 몇 시간이 걸려도).
+  - 끝나면 `completed`/`failed`/`cancelled`로 바뀌고, 끝난 시각부터 `DISPATCH_RETENTION`(기본 `max(10 분, 3 ×
+    DISPATCH_ACCEPT_WINDOW)`) 동안 남는다.
+  - `refused`는 적은 시각부터 `DISPATCH_RETENTION` 동안 남는다. 그 뒤에는 발급 시각이 accept window를 한참 넘었으므로 같은
+    id가 늦게 와도 위의 "발급 시각" 규칙이 거절한다 — tombstone이 사라져도 울타리는 남는다(`DISPATCH_RETENTION` >
+    `DISPATCH_ACCEPT_WINDOW`가 그 조건이고, 기동 시 검사한다).
+- **settle** — 요청 바이트를 보낸 뒤 연결이 끊기면 전달하는 쪽은 `POST /internal/dispatch/<id>/settle`을 부른다. 소유자는
+  ledger 잠금 안에서 원자적으로:
+
+  | ledger | 답 | 전달하는 쪽 |
+  |---|---|---|
+  | `admitted` / `completed` / `failed` / `cancelled` | 받음 | 다시 보내지 않음 → 불확실한 결과 |
+  | `refused` | 받지 않음 | 재판정 loop |
+  | 없음, boot id가 자기 것이고 발급 시각이 `DISPATCH_RETENTION` 안 | `refused`를 적고 받지 않음 | 재판정 loop |
+  | 없음, 그 밖(boot id가 다름 = 소유자가 재기동했다, 또는 발급 시각이 retention보다 오래됨) | **모름** | 다시 보내지 않음 → 불확실한 결과 |
+
+  세 번째 줄이 안전한 이유: 받아들였다면 턴이 끝날 때까지 `admitted`로, 끝난 뒤 `DISPATCH_RETENTION` 동안 끝난 상태로
+  남으므로, 발급 시각이 retention 안인데 항목이 없다면 받아들인 적이 없다 — 그리고 `refused`를 적었으니 앞으로도 받지
+  않는다. 판정할 근거가 없는 경우(네 번째 줄)는 언제나 **모름**이고, "받지 않음"으로 보지 않는다.
+- **불확실한 결과**: "받음"·"모름"이거나 settle 자체가 기한 안에 답하지 않으면(소유자가 죽었거나 닿지 않음), 전달하는 쪽은
+  클라이언트에게 그대로 알린다 — 스트림이 이미 열렸으면 지금의 스트림 오류(`response.failed`,
   `error.code = "forward_interrupted"`), 아직 응답을 시작하지 않았으면 502 `forward_interrupted` + `x-should-retry: false`.
   절대 자동으로 다시 보내지 않는다. 소유자 쪽 턴은 지금 직접 연결된 클라이언트가 끊겼을 때와 같은 규칙으로 처리된다(스트리밍
   턴은 취소, 백그라운드 턴은 계속) — 이미 일어난 부작용은 한 번이다.
 - 이어 붙이기(끊긴 스트림을 소유자의 진행 중인 턴에 다시 attach해 남은 이벤트를 받는 것)는 하지 않는다 — 이벤트 journal이
   없는 지금의 `/v1/responses`에서는 새 계약이다. 불확실한 결과의 빈도가 문제가 되면 별도 과제로 한다.
-- ledger는 소유자 프로세스 메모리에 둔다(받아들이는 것도 settle을 답하는 것도 그 프로세스뿐이다). 항목은
-  `DISPATCH_LEDGER_TTL`(기본 `HANDOFF_DEADLINE`의 3배) 뒤 지운다 — settle은 그 안에만 온다.
+- ledger는 소유자 프로세스 메모리에 둔다(받아들이는 것도 settle을 답하는 것도 그 프로세스뿐이고, 프로세스가 바뀌면 boot id가
+  바뀌어 위 표의 "모름"으로 간다). 크기는 진행 중인 전달 + `DISPATCH_RETENTION` 동안의 전달 수로 묶인다.
 - 직접 연결된 요청(전달이 아닌 것)은 이 경로와 무관하다 — 지금과 같다.
 
 ### 5.4 기동 시 공유 파일 (플러그인)
@@ -328,6 +352,10 @@ ChatDRAGON 변경은 필요 없다. PR 1–3은 단일 컨테이너 배포에서
      응답 헤더를 보내기 전에 전달 연결을 끊는다 → settle이 "받음", 클라이언트는 `forward_interrupted`(재시도 금지)를 받고,
      도구 부작용·CLI 실행 횟수는 정확히 한 번. 같은 실험을 "본문 일부만 보낸 뒤 끊김"으로 바꾸면 settle이 "받지 않음",
      늦게 도착한 같은 id는 거절되고, 재판정으로 한 번만 실행된다.
+  4d. ledger 수명(리뷰 acceptance): 소유자가 id K를 받아들인 뒤 가짜 시계를 `DISPATCH_RETENTION`·accept window 너머로
+     진행시키되 턴은 아직 실행 중(실제 비동기 대기) → 전달 연결 단절 → `settle(K)`는 "받음"(절대 "받지 않음" 아님),
+     fake API 부작용 1회. 턴을 끝낸 뒤 retention 안의 settle도 "받음", retention 뒤는 "모름"(재전송 없음). 같은 K의 늦은
+     도착은 tombstone이 있을 때도 없을 때도 거절. 소유자를 재기동한 뒤의 settle은 "모름".
   5. 두 색이 동시에 플러그인 replay(같은 manifest → 둘 다 skip / 다른 manifest → 한쪽씩 잠금, 레지스트리 온전).
   6. replay 뒤에도 옛 색의 CLI가 연 fd·cwd로 옛 플러그인 트리를 drain 끝까지 읽는다.
   7. 반복 배포(blue→green→blue)와 되돌리기(6단계 중 rollback).
