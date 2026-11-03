@@ -3,7 +3,7 @@
 import time
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_validator
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, Tag, model_serializer, model_validator
 
 from src.runtime_config import get_default_model
 
@@ -325,6 +325,16 @@ class FunctionCallOutputItem(BaseModel):
     name: str
     arguments: str
     status: str = "completed"
+    # Gateway extension (#798): present only on an MCP call parked for the user's
+    # approval — ``{"kind": "tool_approval", "version", "server", "tool", "argsDigest"}``.
+    approval: Optional[Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_approval(self, handler):
+        data = handler(self)
+        if isinstance(data, dict) and data.get("approval") is None:
+            data.pop("approval", None)
+        return data
 
 
 class ResponseDeletedObject(BaseModel):

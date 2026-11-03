@@ -22,6 +22,7 @@ from src.auth import verify_api_key, enforce_scoped_identity, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, BackendRegistry, ResolvedModel
 from src.backends.claude.client import UnsupportedContinuationPolicy
+from src.backends.claude import tool_approval
 from src.backends.claude.skill_names import invalid_skill_rule
 from src.backends.claude.slash_commands import (
     SlashCommandError,
@@ -298,6 +299,7 @@ def _build_requires_action_response(
                 call_id=tc["call_id"],
                 name=tc["name"],
                 arguments=json.dumps(tc.get("arguments", {})),
+                approval=tc.get("approval"),
             )
         ],
         metadata=metadata or {},
@@ -2251,6 +2253,11 @@ async def create_response(
     if body.background:
         _validate_background_request(body)
     session_id, session = await _resolve_response_session(body, resolved.backend)
+    # Whether this client renders tool-approval cards (#798). Re-read on every request —
+    # a continuation from an older client must not inherit a newer one's promise.
+    session.tool_approval_capable = tool_approval.client_supports_approval(
+        request.headers.get(tool_approval.CAPABILITY_HEADER)
+    )
     workspace = await _resolve_response_workspace(
         body, session, session_id, is_new_session, resolved.backend
     )
@@ -2451,6 +2458,7 @@ async def create_response(
                         name=tc["name"],
                         arguments=json.dumps(tc.get("arguments", {})),
                         sequence_number=_take_sequence(stream_result),
+                        approval=tc.get("approval"),
                     )
                     # Emit response.completed with requires_action status
                     requires_action_resp = _build_requires_action_response(
@@ -2895,6 +2903,7 @@ async def _handle_function_call_output(
                         name=tc["name"],
                         arguments=json.dumps(tc.get("arguments", {})),
                         sequence_number=_take_sequence(stream_result),
+                        approval=tc.get("approval"),
                     )
                     requires_action_resp = _build_requires_action_response(
                         resp_id, body.model, tc, body.metadata

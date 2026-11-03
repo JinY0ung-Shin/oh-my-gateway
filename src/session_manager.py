@@ -387,6 +387,9 @@ class Session:
     input_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
     input_response: Optional[str] = None
     pending_tool_call: Optional[Dict[str, Any]] = None
+    # The current request's client renders tool-approval cards (#798,
+    # ``X-Gateway-Capabilities: tool-approval``); without it a gated MCP call is denied.
+    tool_approval_capable: bool = field(default=False, repr=False, compare=False)
     stream_break_event: Optional[asyncio.Event] = field(default=None, repr=False, compare=False)
     # MCP progress relay registration of the current client (src.mcp_progress_relay).
     mcp_progress_relay: Optional[Any] = field(default=None, repr=False, compare=False)
