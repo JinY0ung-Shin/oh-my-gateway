@@ -78,6 +78,7 @@ class TestOptions:
         options = _make_cli()._build_sdk_options()
         assert json.loads(options.settings) == {
             "plansDirectory": ".claude/plans",
+            "autoMemoryDirectory": "/tmp/.memory",
             "permissions": {"blockReadsOutsideWorkingDirectories": True},
         }
 

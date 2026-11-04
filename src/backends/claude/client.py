@@ -1118,7 +1118,33 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     raw,
                     DEFAULT_PLANS_DIRECTORY,
                 )
-        options.settings = json.dumps({"plansDirectory": plans_dir})
+        settings = json.loads(options.settings) if options.settings else {}
+        settings["plansDirectory"] = plans_dir
+        options.settings = json.dumps(settings)
+
+    def _configure_auto_memory(
+        self, options: ClaudeAgentOptions, cwd: Optional[Path]
+    ) -> None:
+        """Point the CLI's auto-memory at ``<cwd>/.memory`` (#270).
+
+        The base prompts promise that ``{{MEMORY_PATH}}/MEMORY.md`` (=
+        ``<cwd>/.memory``) is always loaded, but the CLI loads auto-memory from
+        ``autoMemoryDirectory``, default ``<config dir>/projects/<cwd>/memory``,
+        so the file users kept there never reached the model. The setting must
+        be a per-workspace absolute path, so it rides ``--settings`` (flag
+        settings; the CLI ignores it in the agent-writable project settings).
+        The CLI injects ``MEMORY.md`` as a system-reminder in the first user
+        message, not in the system prompt, so a resumed session sees edits made
+        since. Nothing is created here: a missing directory just loads nothing
+        (the Write tool makes it on the first memory), and the prompt's
+        "directory already exists" is kept by ``resolve_request_placeholders``.
+        """
+        if not cwd:
+            return
+        memory_dir = Path(os.path.abspath(cwd)) / ".memory"
+        settings = json.loads(options.settings) if options.settings else {}
+        settings["autoMemoryDirectory"] = str(memory_dir)
+        options.settings = json.dumps(settings)
 
     def _configure_read_boundary(self, options: ClaudeAgentOptions) -> None:
         """Hand the CLI its native read block when the read boundary is on.
@@ -1429,6 +1455,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         self._configure_sandbox(options)
         self._configure_add_dirs(options)
         self._configure_plans_directory(options)
+        self._configure_auto_memory(options, effective_cwd)
         self._configure_read_boundary(options)
         self._configure_tools(options, allowed_tools, disallowed_tools)
 
