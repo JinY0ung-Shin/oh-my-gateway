@@ -69,6 +69,7 @@ from src.backends.claude.skill_names import (
     SKILL_WILDCARD_RULES,
     skill_name_problem,
 )
+from src.backends.claude import tool_approval
 from src.backends.common import TokenEstimateMixin, error_chunk
 from src.backends.mcp_headers import inject_mcp_headers
 from src.constants import ASK_USER_TIMEOUT_SECONDS
@@ -475,6 +476,141 @@ def plan_execution_mode() -> str:
     configured = (os.getenv("PERMISSION_MODE") or "").strip()
     mode = configured if configured in _EXECUTION_MODES else "default"
     return effective_permission_mode(mode) or mode
+
+
+class DecisionAlreadyPending(Exception):
+    """Another call of this session is already parked on a human decision."""
+
+
+async def _park_for_decision(
+    session, tool_name: str, tool_input: dict, call_id: str, approval: Optional[dict] = None
+) -> Optional[str]:
+    """Pause the turn on a human decision; the answer text, or None on timeout.
+
+    Shared by the AskUserQuestion/ExitPlanMode permission callback and the MCP tool
+    approval hook (#798): the route sees ``pending_tool_call`` and emits
+    ``function_call`` + ``requires_action``; ``approval`` (when given) rides on that item.
+
+    A session has ONE decision slot (``pending_tool_call`` + ``input_event``), and the
+    client answers exactly what that slot shows. A second call that wants a decision
+    while the slot is taken — parallel subagents each calling an approval-gated tool,
+    say — raises :class:`DecisionAlreadyPending` instead of overwriting it: overwriting
+    left the first call waiting on an event nobody could answer anymore (it timed out
+    as a denial) and let its timeout clear the second call's live card (#269 review).
+    Callers deny the overlapping call; the first decision is kept. Every exit clears
+    only the slot this call itself set.
+    """
+    if session.pending_tool_call is not None or session.input_event is not None:
+        raise DecisionAlreadyPending(tool_name)
+    pending: Dict[str, Any] = {"call_id": call_id, "name": tool_name, "arguments": tool_input}
+    if approval is not None:
+        pending["approval"] = approval
+    event = asyncio.Event()
+    session.pending_tool_call = pending
+    session.input_event = event
+
+    # Signal the streaming loop to break so the route can emit
+    # function_call + requires_action before this callback blocks
+    # waiting for the user's answer.
+    if session.stream_break_event is not None:
+        session.stream_break_event.set()
+
+    try:
+        await asyncio.wait_for(event.wait(), timeout=ASK_USER_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "%s timed out after %ds for session %s",
+            tool_name,
+            ASK_USER_TIMEOUT_SECONDS,
+            session.session_id,
+        )
+        return None
+    else:
+        # Capture response before clearing state
+        return session.input_response or ""
+    finally:
+        # Timeout, answer or cancellation (the turn was interrupted): release only
+        # what this call set — never a slot another call took in the meantime.
+        if session.pending_tool_call is pending:
+            session.pending_tool_call = None
+        if session.input_event is event:
+            session.input_event = None
+            session.input_response = None
+
+
+def _approval_deny(reason: str) -> Dict[str, Any]:
+    return {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }
+    }
+
+
+def make_tool_approval_hook(session, policy: "tool_approval.ApprovalPolicy"):
+    """PreToolUse hook that parks a gated MCP call until the user approves it (#798).
+
+    Fires in every permission mode and regardless of ``allowed_tools`` (the permission
+    callback does not — see ``tool_approval``). Returns ``{}`` (no opinion) for tools the
+    policy does not gate, so the other hooks and the CLI's own rules decide those.
+    """
+
+    async def hook(input_data, tool_use_id, context):
+        tool_name = str((input_data or {}).get("tool_name") or "")
+        target = policy.target(tool_name)
+        if target is None:
+            return {}
+        server, tool = target
+        if not getattr(session, "tool_approval_capable", False) or not hasattr(
+            session, "pending_tool_call"
+        ):
+            logger.info("tool approval: %s denied (client cannot show approvals)", tool_name)
+            return _approval_deny(tool_approval.CLIENT_CANNOT_APPROVE)
+        arguments = (input_data or {}).get("tool_input")
+        arguments = arguments if isinstance(arguments, dict) else {}
+        digest = tool_approval.args_digest(arguments)
+        call_id = str(tool_use_id or "")
+        try:
+            answer = await _park_for_decision(
+                session,
+                tool_name,
+                arguments,
+                call_id,
+                approval=tool_approval.approval_payload(server, tool, digest),
+            )
+        except DecisionAlreadyPending:
+            logger.info(
+                "tool approval: session=%s call=%s tool=%s digest=%s decision=busy",
+                getattr(session, "session_id", "?"),
+                call_id,
+                tool_name,
+                digest,
+            )
+            return _approval_deny(tool_approval.ANOTHER_DECISION_PENDING)
+        approved = tool_approval.is_approved(answer, digest)
+        # Audit without the arguments themselves (mail bodies, tokens).
+        logger.info(
+            "tool approval: session=%s call=%s tool=%s digest=%s decision=%s",
+            getattr(session, "session_id", "?"),
+            call_id,
+            tool_name,
+            digest,
+            "approve" if approved else ("timeout" if answer is None else "deny"),
+        )
+        if answer is None:
+            return _approval_deny(tool_approval.NOT_ANSWERED)
+        if not approved:
+            return _approval_deny(tool_approval.DENIED_BY_USER)
+        return {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+                "permissionDecisionReason": "Approved by the user.",
+            }
+        }
+
+    return hook
 
 
 def plan_decision_result(output: str):
@@ -1129,6 +1265,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
         mcp_servers, read_only = split_read_only(mcp_servers)
         options._gateway_read_only_tools = read_only  # type: ignore[attr-defined]
+        # ``approvalTools`` is gateway-only too (#798): stripped here, enforced by the
+        # PreToolUse approval hook built from this policy.
+        mcp_servers, approval = tool_approval.split_approval(mcp_servers)
+        options._gateway_approval_policy = tool_approval.ApprovalPolicy(  # type: ignore[attr-defined]
+            approval, read_only
+        )
 
         if allowed_tools is not None:
             allowed_set = set(allowed_tools)
@@ -1887,42 +2029,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         """
 
         async def park(tool_name: str, tool_input: dict, call_id: str) -> Optional[str]:
-            """Pause the turn on a human decision; the answer text, or None on timeout."""
-            session.pending_tool_call = {
-                "call_id": call_id,
-                "name": tool_name,
-                "arguments": tool_input,
-            }
-            session.input_event = asyncio.Event()
-
-            # Signal the streaming loop to break so the route can emit
-            # function_call + requires_action before this callback blocks
-            # waiting for the user's answer.
-            if session.stream_break_event is not None:
-                session.stream_break_event.set()
-
-            try:
-                await asyncio.wait_for(
-                    session.input_event.wait(),
-                    timeout=ASK_USER_TIMEOUT_SECONDS,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "%s timed out after %ds for session %s",
-                    tool_name,
-                    ASK_USER_TIMEOUT_SECONDS,
-                    session.session_id,
-                )
-                session.input_response = None
-                session.input_event = None
-                session.pending_tool_call = None
-                return None
-
-            # Capture response before clearing state
-            user_response = session.input_response or ""
-            session.input_response = None
-            session.input_event = None
-            return user_response
+            return await _park_for_decision(session, tool_name, tool_input, call_id)
 
         async def can_use_tool(tool_name, input_data, context):
             if tool_name not in HUMAN_DECISION_TOOLS:
@@ -1936,7 +2043,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
             tool_input = input_data if isinstance(input_data, dict) else {}
             call_id = getattr(context, "tool_use_id", None) or ""
-            user_response = await park(tool_name, tool_input, call_id)
+            try:
+                user_response = await park(tool_name, tool_input, call_id)
+            except DecisionAlreadyPending:
+                return PermissionResultDeny(message=tool_approval.ANOTHER_DECISION_PENDING)
             if user_response is None:
                 return PermissionResultDeny(
                     message="User did not respond within the timeout period."
@@ -2107,6 +2217,18 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 cwd, allowed_tools, disallowed_tools, user=user
             )
         }
+        approval_policy = getattr(options, "_gateway_approval_policy", None)
+        if approval_policy:
+            # The CLI's hook timeout must outlast the human decision, or the CLI gives up
+            # on the hook and runs the tool's normal permission path instead.
+            options.hooks["PreToolUse"].insert(
+                0,
+                HookMatcher(
+                    matcher="",
+                    hooks=[make_tool_approval_hook(session, approval_policy)],
+                    timeout=ASK_USER_TIMEOUT_SECONDS + 60,
+                ),
+            )
         post_tool_use = self._post_tool_use_hooks()
         if post_tool_use:
             options.hooks["PostToolUse"] = post_tool_use
@@ -2163,6 +2285,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         # ``readOnlyTools`` was stripped when the options were built (#471); its rules ride
         # on the options. A second split is a no-op safety net for any other config source.
         options.mcp_servers, extra = mcp_progress_relay.split_read_only(options.mcp_servers)
+        options.mcp_servers, _ = tool_approval.split_approval(options.mcp_servers)
         read_only = {**getattr(options, "_gateway_read_only_tools", {}), **extra}
         # Progress is a nicety; the MCP call is the work. An unreachable relay keeps every
         # server direct instead of pointing the CLI at a URL it cannot use.

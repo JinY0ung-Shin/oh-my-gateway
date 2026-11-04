@@ -109,6 +109,22 @@ uv run pytest --cov=src                            # with coverage
   reply (also when a resumable server delivers it on a `Last-Event-ID` GET resume) — the relay's one byte rewrite, and only for HTTP servers routed through it (stdio or an
   unreachable relay logs "not applied"). Only list tools that are truly side-effect free.
   `tests/test_cli_mcp_readonly.py` pins sequential / concurrent / one-marked against the bundled CLI.
+- MCP tool approval (ChatDRAGON #798, `docs/mcp-tool-approval.md`): an MCP server entry may carry the
+  gateway-only key `"approvalTools": "*" | [...names]` (`"*"` = every tool except that entry's
+  `readOnlyTools`; a malformed value gates the whole server). `split_approval` strips it on every
+  options build like `readOnlyTools`. The gate is a **PreToolUse hook** (`make_tool_approval_hook`),
+  never `can_use_tool`: the bundled CLI never asks the permission callback for an MCP call under
+  `bypassPermissions` or when `allowed_tools` lists it (`tests/test_cli_tool_approval.py` pins this
+  control). A gated call parks through the same `pending_tool_call` path as AskUserQuestion, and its
+  `function_call` item carries `approval: {kind, version, server, tool, argsDigest}` (absent on every
+  other item); only `function_call_output` `{"decision":"approve","argsDigest":<same>}` runs it,
+  anything else — and the `ASK_USER_TIMEOUT_SECONDS` timeout — denies. A request without
+  `X-Gateway-Capabilities: tool-approval` (re-read per request into `session.tool_approval_capable`)
+  gets the call denied instead of a card it cannot render; stateless `/v1/agents/messages` always denies.
+  One decision slot per session: `_park_for_decision` raises `DecisionAlreadyPending` instead of
+  overwriting a parked call (parallel subagents, an AskUserQuestion over an open card), both callers
+  deny that call with `ANOTHER_DECISION_PENDING`, and every exit clears only the slot it set. Calls in
+  ONE assistant message are serialized by the CLI and each gets its own card (pinned by the bundled-CLI test).
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
   turn fails with `sdk_error` — when one message exceeds `max_buffer_size`. A tool result is one
   message, so an MCP tool returning inline base64 images tripped the SDK's 1 MiB default (#183).

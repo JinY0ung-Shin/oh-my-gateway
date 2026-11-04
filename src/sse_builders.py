@@ -594,6 +594,7 @@ def make_function_call_response_sse(
     name: str,
     arguments: str,
     sequence_number: Optional[int] = None,
+    approval: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build SSE events for a function_call output item (e.g. AskUserQuestion).
 
@@ -612,6 +613,9 @@ def make_function_call_response_sse(
         "arguments": arguments,
         "status": "completed",
     }
+    if approval is not None:
+        # An MCP call parked for the user's approval (#798) — see tool_approval.
+        item["approval"] = approval
     event_data: Dict[str, Any] = {
         "type": "response.output_item.added",
         "response_id": response_id,
