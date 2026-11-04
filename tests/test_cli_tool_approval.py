@@ -308,3 +308,96 @@ async def test_can_use_tool_is_not_asked_for_an_mcp_call(knob, tmp_path, mode):
     assert (
         asked == [] and len(ran) == 1
     ), "the CLI now asks the permission callback for MCP calls"
+
+
+_TWO = [
+    {"to": "alice@example.com", "subject": "first"},
+    {"to": "bob@example.com", "subject": "second"},
+]
+
+
+def _plan_two(body: Dict[str, Any]) -> Dict[str, Any]:
+    for message in body.get("messages", []):
+        content = message.get("content")
+        if isinstance(content, list) and any(
+            isinstance(c, dict) and c.get("type") == "tool_result" for c in content
+        ):
+            return {"text": "finished"}
+    return {
+        "tool_uses": [
+            {"name": "mcp__knob__send_mail", "input": dict(args)} for args in _TWO
+        ]
+    }
+
+
+async def test_two_gated_calls_in_one_turn_each_get_their_own_decision(
+    knob, tmp_path
+):
+    """One assistant message calls two approval-gated tools (#269 review). Measured on the
+    bundled CLI: it runs a non-read-only MCP batch one call at a time, so the second hook
+    fires only after the first call's decision — each call gets its own card, its own
+    digest and its own outcome; approving one never runs or settles the other."""
+    url, ran = knob
+    session = _session()
+    hook = claude_client.make_tool_approval_hook(session, _POLICY)
+    parked: List[Dict[str, Any]] = []
+    overlaps: List[str] = []
+
+    async def client_decides() -> None:
+        handled: set = set()
+        while True:
+            while (
+                session.pending_tool_call is None
+                or session.pending_tool_call["call_id"] in handled
+            ):
+                await asyncio.sleep(0.02)
+            pending = dict(session.pending_tool_call)
+            handled.add(pending["call_id"])
+            parked.append(pending)
+            await asyncio.sleep(0.8)
+            if len(ran) != len(parked) - 1:
+                overlaps.append("a call ran before its decision")
+            # approve the first, deny the second
+            approve = len(parked) == 1
+            session.input_response = (
+                _approve(pending) if approve else json.dumps({"decision": "deny"})
+            )
+            session.pending_tool_call = None
+            session.input_event.set()
+
+    results: List[str] = []
+    with FakeAnthropicAPI(_plan_two) as api:
+        options = ClaudeAgentOptions(
+            env=api.cli_env(tmp_path),
+            mcp_servers={"knob": {"type": "http", "url": url}},
+            permission_mode="bypassPermissions",
+            cwd=str(tmp_path),
+            hooks={"PreToolUse": [HookMatcher(matcher="", hooks=[hook], timeout=600)]},
+        )
+        decider = asyncio.create_task(client_decides())
+
+        async def turn() -> None:
+            async with GatewayClaudeSDKClient(options=options) as client:
+                await client.query("go")
+                async for message in client.receive_response():
+                    if isinstance(message, UserMessage) and isinstance(
+                        message.content, list
+                    ):
+                        results.extend(
+                            str(b.content)
+                            for b in message.content
+                            if isinstance(b, ToolResultBlock)
+                        )
+
+        try:
+            await asyncio.wait_for(turn(), _TURN_TIMEOUT)
+        finally:
+            decider.cancel()
+    assert [p["arguments"] for p in parked] == _TWO
+    assert parked[0]["call_id"] != parked[1]["call_id"]
+    assert [p["approval"]["argsDigest"] for p in parked] == [
+        tool_approval.args_digest(a) for a in _TWO
+    ]
+    assert overlaps == []
+    assert ran == [{"tool": "send_mail", **_TWO[0]}], "only the approved call ran"
+    assert any("declined" in r for r in results), results

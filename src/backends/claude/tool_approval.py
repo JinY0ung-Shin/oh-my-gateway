@@ -47,6 +47,11 @@ DENIED_BY_USER = (
     "user asks again."
 )
 NOT_ANSWERED = "The user did not approve this tool in time. It was not run."
+ANOTHER_DECISION_PENDING = (
+    "Another action is already waiting for the user's decision, so this call was not run "
+    "and the user was not asked about it. Wait for that decision, then call it again if "
+    "it is still needed."
+)
 CLIENT_CANNOT_APPROVE = (
     "This tool needs the user's approval before it runs, and this client cannot ask "
     "for it. It was not run. Tell the user the action needs approval in a client that "

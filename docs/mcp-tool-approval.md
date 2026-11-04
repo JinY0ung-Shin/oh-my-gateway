@@ -89,9 +89,19 @@ AskUserQuestion·ExitPlanMode와 같은 경로다. 스트림은 `response.output
 `"approve"`, 빈 값, 해석할 수 없는 값은 모두 거부다. `ASK_USER_TIMEOUT_SECONDS`(기본 300초) 안에 답이 없으면 거부다.
 한 호출에는 한 번만 답할 수 있다: 이미 처리된 `call_id`나 다른 `call_id`로 보내면 기존과 같이 400이다.
 
+**결정은 세션당 한 번에 하나다.** 화면은 멈춘 호출 하나(`pending_tool_call`)에만 답하므로, 한 호출이 결정을 기다리는
+동안 들어온 다른 결정 요청은 그 자리를 **덮지 않고 거부**한다. 예: 병렬 서브에이전트가 각자 승인 대상 도구를 부르는 경우,
+또는 승인 카드가 떠 있는 동안 AskUserQuestion이 오는 경우. 이때 거부된 호출은 실행되지 않고, 사용자에게도 묻지 않는다.
+모델은 "다른 결정이 기다리는 중이니 그 뒤에 다시 부르라"는 결과를 받는다. 먼저 멈춘 호출의 카드·결정은 그대로다.
+시간 초과·중단이 정리하는 것도 자기가 만든 자리뿐이다(#269 리뷰).
+
+한 assistant 메시지가 승인 대상 도구를 여럿 부르는 경우는 다르다. 번들 CLI는 읽기 전용이 아닌 MCP 묶음을 한 번에
+하나씩 실행하므로 둘째 호출은 첫째의 결정 뒤에 멈추고, 각자 자기 카드와 digest를 받는다
+(`tests/test_cli_tool_approval.py::test_two_gated_calls_in_one_turn_each_get_their_own_decision`).
+
 ### 3.4 감사 로그
 
-게이트웨이는 `tool approval: session=… call=… tool=… digest=… decision=approve|deny|timeout` 한 줄을 남긴다.
+게이트웨이는 `tool approval: session=… call=… tool=… digest=… decision=approve|deny|timeout|busy` 한 줄을 남긴다.
 인자 값(메일 본문·토큰)은 남기지 않는다.
 
 ## 4. 한계

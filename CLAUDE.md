@@ -121,6 +121,10 @@ uv run pytest --cov=src                            # with coverage
   anything else — and the `ASK_USER_TIMEOUT_SECONDS` timeout — denies. A request without
   `X-Gateway-Capabilities: tool-approval` (re-read per request into `session.tool_approval_capable`)
   gets the call denied instead of a card it cannot render; stateless `/v1/agents/messages` always denies.
+  One decision slot per session: `_park_for_decision` raises `DecisionAlreadyPending` instead of
+  overwriting a parked call (parallel subagents, an AskUserQuestion over an open card), both callers
+  deny that call with `ANOTHER_DECISION_PENDING`, and every exit clears only the slot it set. Calls in
+  ONE assistant message are serialized by the CLI and each gets its own card (pinned by the bundled-CLI test).
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
   turn fails with `sdk_error` — when one message exceeds `max_buffer_size`. A tool result is one
   message, so an MCP tool returning inline base64 images tripped the SDK's 1 MiB default (#183).

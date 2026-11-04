@@ -292,3 +292,164 @@ def test_the_route_records_the_capability_on_every_request(monkeypatch):
 
 async def _noop():
     return None
+
+
+# -- one decision slot per session (#269 review) -------------------------------
+
+
+def _gated_session():
+    from src.backends.claude.client import make_tool_approval_hook
+    from src.session_manager import Session
+
+    session = Session(session_id="slot", backend="claude")
+    session.tool_approval_capable = True
+    hook = make_tool_approval_hook(
+        session, ApprovalPolicy({"knob": frozenset({"*"})}, {})
+    )
+    return session, hook
+
+
+def _call(to):
+    return {"tool_name": "mcp__knob__send_mail", "tool_input": {"to": to}}
+
+
+async def _parked(session, call_id):
+    import asyncio
+
+    for _ in range(200):
+        pending = session.pending_tool_call
+        if pending is not None and pending["call_id"] == call_id:
+            return pending
+        await asyncio.sleep(0.005)
+    raise AssertionError(f"{call_id} never parked")
+
+
+def _answer(session, output):
+    """What the route does: record the answer, clear the card, wake the waiter."""
+    event = session.input_event
+    session.input_response = output
+    session.pending_tool_call = None
+    event.set()
+
+
+def _decision(out):
+    return out["hookSpecificOutput"]["permissionDecision"]
+
+
+async def test_a_second_gated_call_does_not_overwrite_the_waiting_one():
+    """Acceptance (1)(2)(4): two hooks enter at once. B is denied immediately without
+    touching A's card or event; A runs only on its own approval; a late answer meant for
+    B cannot approve anything."""
+    import asyncio
+
+    session, hook = _gated_session()
+    a = asyncio.create_task(hook(_call("a@x"), "A", None))
+    pending_a = await _parked(session, "A")
+    event_a = session.input_event
+
+    b = await asyncio.wait_for(hook(_call("b@x"), "B", None), timeout=2)
+    assert _decision(b) == "deny"
+    assert "already waiting" in b["hookSpecificOutput"]["permissionDecisionReason"]
+    assert session.pending_tool_call is pending_a and session.input_event is event_a
+    assert not a.done(), "A is still waiting for its own decision"
+
+    _answer(session, json.dumps({"decision": "approve", "argsDigest": pending_a["approval"]["argsDigest"]}))
+    assert _decision(await a) == "allow"
+    assert session.pending_tool_call is None and session.input_event is None
+
+    # a late/duplicate answer after A settled has no slot to land in
+    assert session.input_event is None
+
+
+async def test_a_denied_first_call_does_not_settle_a_later_one():
+    import asyncio
+
+    session, hook = _gated_session()
+    a = asyncio.create_task(hook(_call("a@x"), "A", None))
+    await _parked(session, "A")
+    _answer(session, json.dumps({"decision": "deny"}))
+    assert _decision(await a) == "deny"
+
+    # the slot is free again: B parks and waits for ITS decision
+    b = asyncio.create_task(hook(_call("b@x"), "B", None))
+    pending_b = await _parked(session, "B")
+    await asyncio.sleep(0.05)
+    assert not b.done()
+    _answer(session, json.dumps({"decision": "approve", "argsDigest": pending_b["approval"]["argsDigest"]}))
+    assert _decision(await b) == "allow"
+
+
+async def test_a_timed_out_call_releases_only_its_own_slot(monkeypatch):
+    """Acceptance (3): A's timeout must not clear a card that is not A's."""
+    import asyncio
+
+    from src.backends.claude import client as claude_client
+
+    monkeypatch.setattr(claude_client, "ASK_USER_TIMEOUT_SECONDS", 0.2)
+    session, hook = _gated_session()
+    a = asyncio.create_task(hook(_call("a@x"), "A", None))
+    await _parked(session, "A")
+    # someone else's slot replaces A's while A waits (e.g. a route reset + a new park)
+    other_pending = {"call_id": "C", "name": "x", "arguments": {}}
+    other_event = asyncio.Event()
+    session.pending_tool_call = other_pending
+    session.input_event = other_event
+    session.input_response = "for C"
+
+    out = await a
+    assert _decision(out) == "deny"
+    assert session.pending_tool_call is other_pending
+    assert session.input_event is other_event
+    assert session.input_response == "for C"
+
+
+async def test_a_timed_out_call_frees_the_slot_for_the_next(monkeypatch):
+    import asyncio
+
+    from src.backends.claude import client as claude_client
+
+    monkeypatch.setattr(claude_client, "ASK_USER_TIMEOUT_SECONDS", 0.2)
+    session, hook = _gated_session()
+    assert _decision(await hook(_call("a@x"), "A", None)) == "deny"
+    assert session.pending_tool_call is None and session.input_event is None
+    b = asyncio.create_task(hook(_call("b@x"), "B", None))
+    await _parked(session, "B")
+    b.cancel()
+
+
+async def test_a_cancelled_wait_releases_its_slot():
+    """An interrupted turn cancels the waiting hook — the slot must not stay taken, or
+    every later decision in the session would be refused as overlapping."""
+    import asyncio
+
+    session, hook = _gated_session()
+    a = asyncio.create_task(hook(_call("a@x"), "A", None))
+    await _parked(session, "A")
+    a.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await a
+    assert session.pending_tool_call is None and session.input_event is None
+
+
+async def test_ask_user_question_overlapping_a_parked_approval_is_denied_not_swapped():
+    """The permission callback shares the slot: an AskUserQuestion that arrives while an
+    approval card waits is refused with the same explicit reason, and the card stays."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from claude_agent_sdk.types import PermissionResultDeny
+
+    from src.backends.claude.client import ClaudeCodeCLI
+
+    session, hook = _gated_session()
+    a = asyncio.create_task(hook(_call("a@x"), "A", None))
+    pending_a = await _parked(session, "A")
+    can_use_tool = ClaudeCodeCLI.__new__(ClaudeCodeCLI)._make_ask_user_can_use_tool(session)
+    result = await asyncio.wait_for(
+        can_use_tool("AskUserQuestion", {"questions": []}, SimpleNamespace(tool_use_id="Q")),
+        timeout=2,
+    )
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == tool_approval.ANOTHER_DECISION_PENDING
+    assert session.pending_tool_call is pending_a
+    a.cancel()

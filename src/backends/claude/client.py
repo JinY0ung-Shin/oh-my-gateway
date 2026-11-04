@@ -478,6 +478,10 @@ def plan_execution_mode() -> str:
     return effective_permission_mode(mode) or mode
 
 
+class DecisionAlreadyPending(Exception):
+    """Another call of this session is already parked on a human decision."""
+
+
 async def _park_for_decision(
     session, tool_name: str, tool_input: dict, call_id: str, approval: Optional[dict] = None
 ) -> Optional[str]:
@@ -486,12 +490,24 @@ async def _park_for_decision(
     Shared by the AskUserQuestion/ExitPlanMode permission callback and the MCP tool
     approval hook (#798): the route sees ``pending_tool_call`` and emits
     ``function_call`` + ``requires_action``; ``approval`` (when given) rides on that item.
+
+    A session has ONE decision slot (``pending_tool_call`` + ``input_event``), and the
+    client answers exactly what that slot shows. A second call that wants a decision
+    while the slot is taken — parallel subagents each calling an approval-gated tool,
+    say — raises :class:`DecisionAlreadyPending` instead of overwriting it: overwriting
+    left the first call waiting on an event nobody could answer anymore (it timed out
+    as a denial) and let its timeout clear the second call's live card (#269 review).
+    Callers deny the overlapping call; the first decision is kept. Every exit clears
+    only the slot this call itself set.
     """
+    if session.pending_tool_call is not None or session.input_event is not None:
+        raise DecisionAlreadyPending(tool_name)
     pending: Dict[str, Any] = {"call_id": call_id, "name": tool_name, "arguments": tool_input}
     if approval is not None:
         pending["approval"] = approval
+    event = asyncio.Event()
     session.pending_tool_call = pending
-    session.input_event = asyncio.Event()
+    session.input_event = event
 
     # Signal the streaming loop to break so the route can emit
     # function_call + requires_action before this callback blocks
@@ -500,10 +516,7 @@ async def _park_for_decision(
         session.stream_break_event.set()
 
     try:
-        await asyncio.wait_for(
-            session.input_event.wait(),
-            timeout=ASK_USER_TIMEOUT_SECONDS,
-        )
+        await asyncio.wait_for(event.wait(), timeout=ASK_USER_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         logger.warning(
             "%s timed out after %ds for session %s",
@@ -511,16 +524,18 @@ async def _park_for_decision(
             ASK_USER_TIMEOUT_SECONDS,
             session.session_id,
         )
-        session.input_response = None
-        session.input_event = None
-        session.pending_tool_call = None
         return None
-
-    # Capture response before clearing state
-    user_response = session.input_response or ""
-    session.input_response = None
-    session.input_event = None
-    return user_response
+    else:
+        # Capture response before clearing state
+        return session.input_response or ""
+    finally:
+        # Timeout, answer or cancellation (the turn was interrupted): release only
+        # what this call set — never a slot another call took in the meantime.
+        if session.pending_tool_call is pending:
+            session.pending_tool_call = None
+        if session.input_event is event:
+            session.input_event = None
+            session.input_response = None
 
 
 def _approval_deny(reason: str) -> Dict[str, Any]:
@@ -556,13 +571,23 @@ def make_tool_approval_hook(session, policy: "tool_approval.ApprovalPolicy"):
         arguments = arguments if isinstance(arguments, dict) else {}
         digest = tool_approval.args_digest(arguments)
         call_id = str(tool_use_id or "")
-        answer = await _park_for_decision(
-            session,
-            tool_name,
-            arguments,
-            call_id,
-            approval=tool_approval.approval_payload(server, tool, digest),
-        )
+        try:
+            answer = await _park_for_decision(
+                session,
+                tool_name,
+                arguments,
+                call_id,
+                approval=tool_approval.approval_payload(server, tool, digest),
+            )
+        except DecisionAlreadyPending:
+            logger.info(
+                "tool approval: session=%s call=%s tool=%s digest=%s decision=busy",
+                getattr(session, "session_id", "?"),
+                call_id,
+                tool_name,
+                digest,
+            )
+            return _approval_deny(tool_approval.ANOTHER_DECISION_PENDING)
         approved = tool_approval.is_approved(answer, digest)
         # Audit without the arguments themselves (mail bodies, tokens).
         logger.info(
@@ -2018,7 +2043,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
 
             tool_input = input_data if isinstance(input_data, dict) else {}
             call_id = getattr(context, "tool_use_id", None) or ""
-            user_response = await park(tool_name, tool_input, call_id)
+            try:
+                user_response = await park(tool_name, tool_input, call_id)
+            except DecisionAlreadyPending:
+                return PermissionResultDeny(message=tool_approval.ANOTHER_DECISION_PENDING)
             if user_response is None:
                 return PermissionResultDeny(
                     message="User did not respond within the timeout period."
