@@ -52,20 +52,20 @@ class TestPlansDirectoryOption:
     def test_default_is_workspace_relative(self, monkeypatch):
         monkeypatch.delenv("CLAUDE_PLANS_DIRECTORY", raising=False)
         options = _make_cli()._build_sdk_options()
-        assert json.loads(options.settings) == {"plansDirectory": ".claude/plans"}
+        assert json.loads(options.settings)["plansDirectory"] == ".claude/plans"
         assert DEFAULT_PLANS_DIRECTORY == ".claude/plans"
 
     def test_env_override(self, monkeypatch):
         monkeypatch.setenv("CLAUDE_PLANS_DIRECTORY", " docs/plans ")
         options = _make_cli()._build_sdk_options()
-        assert json.loads(options.settings) == {"plansDirectory": "docs/plans"}
+        assert json.loads(options.settings)["plansDirectory"] == "docs/plans"
 
     @pytest.mark.parametrize("raw", ["", "  ", "/home/app/.claude/plans", "../x"])
     def test_no_value_reopens_the_shared_default(self, monkeypatch, raw):
         """Empty, absolute or ``..`` never falls back to the shared ~/.claude/plans."""
         monkeypatch.setenv("CLAUDE_PLANS_DIRECTORY", raw)
         options = _make_cli()._build_sdk_options()
-        assert json.loads(options.settings) == {"plansDirectory": ".claude/plans"}
+        assert json.loads(options.settings)["plansDirectory"] == ".claude/plans"
 
 
 @pytest.fixture

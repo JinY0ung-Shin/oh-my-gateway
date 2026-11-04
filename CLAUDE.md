@@ -192,7 +192,15 @@ uv run pytest --cov=src                            # with coverage
   across users today. Don't describe the guard as covering Bash. Plan files are moved into
   the workspace by `--settings {"plansDirectory": ".claude/plans"}` (`CLAUDE_PLANS_DIRECTORY` may
   pick another relative dir; empty/absolute/`..` falls back to the default, never the shared one);
-  `tests/test_cli_plans_directory.py` pins it against the bundled CLI.
+  `tests/test_cli_plans_directory.py` pins it against the bundled CLI. The same `--settings` JSON
+  (merged, never reassigned) carries `autoMemoryDirectory=<cwd>/.memory` (#270): the base prompts'
+  `{{MEMORY_PATH}}` promises `MEMORY.md` is always loaded, and the CLI otherwise loads auto-memory
+  from `<cfg>/projects/<cwd>/memory` only (the key is ignored in project settings). It rides a
+  system-reminder in the first user message, so a resume sees edits; a root `<ws>/MEMORY.md` is
+  never read. Being the workspace path, the key would put the user key on the CLI's command line,
+  so with confinement on `argv_files.externalize` moves the whole `--settings` JSON (with
+  `options.sandbox` merged in as the SDK would) into a per-spawn file too. `tests/test_cli_auto_memory.py`
+  pins load, no-key control, resume and the confined externalized path.
 - Read boundary (#234, opt-in `CLAUDE_BLOCK_READS_OUTSIDE_WORKSPACE`): the CLI's native
   `permissions.blockReadsOutsideWorkingDirectories` goes out through `--settings` (flag settings
   outrank the agent-writable workspace `.claude/settings.json`). The CLI refuses file-tool reads

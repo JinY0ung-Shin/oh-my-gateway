@@ -15,7 +15,12 @@ and leaves only their names on the command line:
   present, since the SDK needs the dict to find its instance;
 * a custom system prompt: ``{"type": "file"}`` → ``--system-prompt-file``;
 * a preset's ``append``: dropped from the preset and passed as
-  ``--append-system-prompt-file`` through ``extra_args``.
+  ``--append-system-prompt-file`` through ``extra_args``;
+* the ``--settings`` JSON, which carries ``autoMemoryDirectory`` — the
+  workspace's absolute path (#270): ``options.settings`` becomes the file name,
+  with ``options.sandbox`` merged in first exactly as the SDK would (with a
+  sandbox set, the SDK reads a settings path itself, against the gateway's
+  cwd, and inlines it again).
 
 The names are relative to the CLI's working directory, which is the workspace
 (the launcher and the broker refuse a spawn whose cwd is anything else), so
@@ -25,7 +30,7 @@ call still runs a shell whose argv carries the command text and a
 ``<workspace>/.cli-tmp/claude-<hex>-cwd`` path (the CLI's ``pwd -P >|`` tail;
 its temp dir lives in the workspace), readable by every session while the
 command runs — a separate exposure of §6.5 this module does not close. The
-CLI resolves all three names against its cwd while parsing its arguments and
+CLI resolves all four names against its cwd while parsing its arguments and
 never reads them again, so the caller removes the files once the CLI has
 started (:meth:`ArgvFiles.cleanup`, also on failure): ``create_client`` after
 ``connect()``, ``verify()`` after its one-shot query.
@@ -135,6 +140,19 @@ def _write(dir_fd: int, kind: str, text: str, mode: int, files: ArgvFiles) -> st
     return name
 
 
+def _settings_object(options: Any) -> Optional[dict]:
+    """``options.settings`` (a JSON object string) with ``options.sandbox``
+    merged in the way the SDK merges it, or ``None`` when there is no JSON
+    settings value to move (unset, or already a file path)."""
+    raw = options.settings
+    if not isinstance(raw, str) or not raw.strip().startswith("{"):
+        return None
+    settings = json.loads(raw)
+    if options.sandbox is not None:
+        settings["sandbox"] = options.sandbox
+    return settings
+
+
 def _has_sdk_server(servers: Any) -> bool:
     return isinstance(servers, dict) and any(
         isinstance(cfg, dict) and cfg.get("type") == "sdk" for cfg in servers.values()
@@ -142,7 +160,7 @@ def _has_sdk_server(servers: Any) -> bool:
 
 
 def externalize(options: Any, *, shared_uid: bool) -> ArgvFiles:
-    """Move *options*' MCP config and system prompt into workspace files.
+    """Move *options*' MCP config, system prompt and settings into workspace files.
 
     *shared_uid* is true in landlock mode (the CLI runs as the gateway's uid,
     files are 0600) and false in uid mode (0644, readable by the session uid).
@@ -186,6 +204,13 @@ def externalize(options: Any, *, shared_uid: bool) -> ArgvFiles:
                 extra = dict(options.extra_args or {})
                 extra["append-system-prompt-file"] = path
                 options.extra_args = extra
+
+        settings = _settings_object(options)
+        if settings is not None:
+            options.settings = _write(
+                dir_fd, "settings", json.dumps(settings), mode, files
+            )
+            options.sandbox = None
     except BaseException:
         files.cleanup()
         raise

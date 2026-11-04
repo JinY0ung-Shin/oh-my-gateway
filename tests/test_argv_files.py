@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import json
 import os
 import secrets
 import time
@@ -80,6 +81,45 @@ def test_externalize_leaves_only_relative_names(tmp_path, prompt):
     finally:
         files.cleanup()
     assert not list(ws.iterdir())
+
+
+def test_externalize_moves_the_settings_with_the_sandbox_merged(tmp_path):
+    """``--settings`` carries ``autoMemoryDirectory`` = the workspace path
+    (#270); with confinement on it must not reach the command line either."""
+    from claude_agent_sdk.types import SandboxSettings
+
+    ws = tmp_path / "alice" / "claude"
+    ws.mkdir(parents=True)
+    settings = {
+        "plansDirectory": ".claude/plans",
+        "autoMemoryDirectory": str(ws / ".memory"),
+    }
+    options = ClaudeAgentOptions(
+        settings=json.dumps(settings),
+        sandbox=SandboxSettings(enabled=False),
+        cwd=str(ws),
+    )
+    files = argv_files.externalize(options, shared_uid=True)
+    try:
+        name = options.settings
+        assert not os.path.isabs(name) and os.sep not in name
+        assert options.sandbox is None
+        # Exactly what the SDK would have inlined.
+        written = json.loads((ws / name).read_text())
+        assert written == {**settings, "sandbox": {"enabled": False}}
+        cmd = _command(options)
+        assert cmd[cmd.index("--settings") + 1] == name
+        assert not any("alice" in arg for arg in cmd), cmd
+    finally:
+        files.cleanup()
+    assert not list(ws.iterdir())
+
+
+def test_externalize_leaves_a_settings_path_alone(tmp_path):
+    options = ClaudeAgentOptions(settings="/etc/claude/settings.json", cwd=str(tmp_path))
+    files = argv_files.externalize(options, shared_uid=True)
+    assert options.settings == "/etc/claude/settings.json"
+    assert files.names == []
 
 
 # ---------------------------------------------------------------------------
@@ -309,7 +349,7 @@ async def test_verify_removes_the_files_when_cancelled(
     with patch("src.backends.claude.client.query", blocked_query):
         task = asyncio.create_task(cli.verify())
         await asyncio.wait_for(streaming.wait(), 10)
-        assert len(list(cwd.glob(f"{argv_files.PREFIX}*"))) == 2  # mcp + prompt
+        assert len(list(cwd.glob(f"{argv_files.PREFIX}*"))) == 3  # mcp, prompt, settings
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
