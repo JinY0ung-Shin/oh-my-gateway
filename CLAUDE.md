@@ -125,6 +125,9 @@ uv run pytest --cov=src                            # with coverage
   overwriting a parked call (parallel subagents, an AskUserQuestion over an open card), both callers
   deny that call with `ANOTHER_DECISION_PENDING`, and every exit clears only the slot it set. Calls in
   ONE assistant message are serialized by the CLI and each gets its own card (pinned by the bundled-CLI test).
+  Editors that own only this key use `PATCH /admin/api/mcp-servers/{name}/approval` (`set_approval`:
+  compare-and-swap on `approvalTools` under the manifest lock, other keys kept as stored, 409 + `current`
+  on mismatch) — never read-then-PUT the whole config (ChatDRAGON #811).
 - The SDK frames CLI stdout one JSON message at a time and **aborts the reader** — the whole
   turn fails with `sdk_error` — when one message exceeds `max_buffer_size`. A tool result is one
   message, so an MCP tool returning inline base64 images tripped the SDK's 1 MiB default (#183).

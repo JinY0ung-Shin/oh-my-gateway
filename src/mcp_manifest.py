@@ -17,6 +17,7 @@ import os
 import tempfile
 from pathlib import Path
 from threading import RLock
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +104,26 @@ def upsert_server(name: str, config: dict) -> None:
         data["servers"][name] = config
         save(data)
     _reload()
+
+
+def update_server(name: str, mutate: Callable[[dict], dict]) -> Optional[dict]:
+    """Read-modify-write ONE existing entry under the lock, then hot-reload.
+
+    ``mutate`` gets a copy of the stored config and returns the new one; if it raises,
+    nothing is written (the caller's compare-and-swap refuses inside the lock, so no
+    other writer can slip between its check and this write). Returns the saved config,
+    or ``None`` when ``name`` has no manifest entry.
+    """
+    with _lock:
+        data = load()
+        current = data["servers"].get(name)
+        if not isinstance(current, dict):
+            return None
+        updated = mutate(dict(current))
+        data["servers"][name] = updated
+        save(data)
+    _reload()
+    return updated
 
 
 def delete_server(name: str) -> bool:
