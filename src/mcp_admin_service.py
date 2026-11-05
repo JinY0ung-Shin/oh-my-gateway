@@ -14,6 +14,7 @@ CRUD.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any, Dict, List, Optional
@@ -186,6 +187,96 @@ def _write(name: str, config: Any, *, updating: bool) -> Dict[str, Any]:
         "server": name,
         "patterns": get_mcp_tool_patterns({name: config}),
     }
+
+
+# Gateway-only key gating MCP tools behind a human decision (ChatDRAGON #798,
+# ``backends/claude/tool_approval.py``). Spelled here so this module stays free of the
+# backend import chain.
+APPROVAL_KEY = "approvalTools"
+
+
+class McpApprovalConflict(McpAdminError):
+    """The entry's ``approvalTools`` is not what the caller last read (route -> 409)."""
+
+    def __init__(self, message: str, current: Dict[str, Any]):
+        super().__init__(message)
+        self.current = current
+
+
+def approval_state(config: Any) -> Dict[str, Any]:
+    """``{"present": False}`` or ``{"present": True, "value": <stored value>}``.
+
+    "absent", ``null`` and ``[]`` are three different stored states (the last two
+    gate every tool, see ``split_approval``), so the caller's expectation names which.
+    """
+    if isinstance(config, dict) and APPROVAL_KEY in config:
+        return {"present": True, "value": config[APPROVAL_KEY]}
+    return {"present": False}
+
+
+def _same_state(a: Dict[str, Any], b: Any) -> bool:
+    if not isinstance(b, dict) or not isinstance(b.get("present"), bool):
+        return False
+    if a["present"] != b["present"]:
+        return False
+    if not a["present"]:
+        return True
+    canon = lambda v: json.dumps(v, sort_keys=True, separators=(",", ":"))  # noqa: E731
+    return "value" in b and canon(a["value"]) == canon(b["value"])
+
+
+def _valid_approval(value: Any) -> bool:
+    if value == "*":
+        return True
+    return (
+        isinstance(value, list)
+        and bool(value)
+        and all(isinstance(v, str) and v and v != "*" for v in value)
+    )
+
+
+def set_approval(name: str, value: Any, expected: Any) -> Dict[str, Any]:
+    """Set (``"*"`` / a list of tool names) or remove (``None``) one manifest server's
+    ``approvalTools`` — and nothing else — iff it is still ``expected``.
+
+    The full-config PUT cannot do this safely for an editor that owns one key: another
+    admin's save between the editor's read and its PUT is silently reverted, and for this
+    key that can quietly undo an approval policy (ChatDRAGON #811 review). Here the
+    compare and the write happen under the manifest lock, so a concurrent change of
+    ``approvalTools`` is a conflict and a concurrent change of any OTHER key survives.
+    Values that ``split_approval`` would read as "gate everything" (``[]``, ``true``,
+    ...) are refused rather than stored — this editor only writes well-formed policy.
+    """
+    name = _validate_name(name)
+    if value is not None and not _valid_approval(value):
+        raise McpAdminError(
+            'approvalTools must be "*", a non-empty list of tool names, or null to remove'
+        )
+    if not isinstance(expected, dict) or not isinstance(expected.get("present"), bool):
+        raise McpAdminError('expected must be {"present": bool, "value"?: any}')
+    if name in _env_names() and name not in mcp_manifest.list_servers():
+        raise McpAdminError(
+            f"'{name}' is defined by MCP_CONFIG (env) and is not editable"
+        )
+
+    def mutate(current: Dict[str, Any]) -> Dict[str, Any]:
+        state = approval_state(current)
+        if not _same_state(state, expected):
+            raise McpApprovalConflict(
+                f"approvalTools of '{name}' changed since it was read", state
+            )
+        updated = {k: v for k, v in current.items() if k != APPROVAL_KEY}
+        if value is not None:
+            updated[APPROVAL_KEY] = value
+        ok, reason = validate_server(name, updated)
+        if not ok:
+            raise McpAdminError(reason)
+        return updated
+
+    saved = mcp_manifest.update_server(name, mutate)
+    if saved is None:
+        raise McpAdminError(f"server '{name}' not found")
+    return {"status": "saved", "server": name, "approval": approval_state(saved)}
 
 
 def delete_server(name: str) -> Dict[str, Any]:

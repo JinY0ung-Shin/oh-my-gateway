@@ -525,3 +525,127 @@ class TestEnvHeadersValidation:
         assert result["valid"] is True
         assert result["env_refs"] == ["MCP_TOKEN"]
         assert result["header_key_count"] == 1
+
+
+# ---------------------------------------------------------------------------
+# set_approval: compare-and-swap of ONE key (ChatDRAGON #811 review)
+# ---------------------------------------------------------------------------
+
+
+KNOB = {
+    "type": "http",
+    "url": "https://knob.internal/mcp",
+    "headers": {"Authorization": "Bearer real-secret"},
+    "readOnlyTools": ["list_mail"],
+}
+ABSENT = {"present": False}
+
+
+class TestSetApproval:
+    def _make(self):
+        with env_servers({}):
+            mcp_admin_service.create_server("knob", dict(KNOB))
+
+    def _stored(self):
+        from src import mcp_manifest
+
+        return mcp_manifest.get_server("knob")
+
+    def test_sets_replaces_and_removes_only_that_key(self, manifest_file):
+        self._make()
+        with env_servers({}):
+            r = mcp_admin_service.set_approval("knob", "*", ABSENT)
+            assert r == {
+                "status": "saved",
+                "server": "knob",
+                "approval": {"present": True, "value": "*"},
+            }
+            assert self._stored() == {**KNOB, "approvalTools": "*"}
+            mcp_admin_service.set_approval(
+                "knob", ["send_mail"], {"present": True, "value": "*"}
+            )
+            assert self._stored()["approvalTools"] == ["send_mail"]
+            mcp_admin_service.set_approval(
+                "knob", None, {"present": True, "value": ["send_mail"]}
+            )
+        # the real secret is kept (this path never sees the redacted view)
+        assert self._stored() == KNOB
+
+    def test_another_writer_of_another_key_survives(self, manifest_file):
+        """A reads (approval absent); B saves a new url/headers; A's CAS still matches
+        on approvalTools, so it applies — on top of B's config, not A's stale copy."""
+        self._make()
+        b_config = {
+            **KNOB,
+            "url": "https://knob-v2.internal/mcp",
+            "headers": {"Authorization": "Bearer rotated"},
+        }
+        with env_servers({}):
+            mcp_admin_service.update_server("knob", b_config)  # B, after A's read
+            mcp_admin_service.set_approval("knob", "*", ABSENT)  # A
+        assert self._stored() == {**b_config, "approvalTools": "*"}
+
+    def test_another_writer_of_this_key_is_a_conflict_and_wins(self, manifest_file):
+        """A reads (absent); B sets approvalTools; A's write is refused, B's whole config stays."""
+        self._make()
+        b_config = {**KNOB, "url": "https://knob-v2.internal/mcp", "approvalTools": ["send_mail"]}
+        with env_servers({}):
+            mcp_admin_service.update_server("knob", b_config)
+            with pytest.raises(mcp_admin_service.McpApprovalConflict) as exc:
+                mcp_admin_service.set_approval("knob", None, ABSENT)
+        assert exc.value.current == {"present": True, "value": ["send_mail"]}
+        assert self._stored() == b_config
+
+    @pytest.mark.parametrize(
+        "stored, expected, match",
+        [
+            # stored: the entry's approvalTools state, as approval_state() reports it
+            ({"present": False}, {"present": True, "value": None}, False),  # absent vs null
+            ({"present": True, "value": None}, {"present": False}, False),  # null vs absent
+            ({"present": True, "value": []}, {"present": True, "value": None}, False),
+            ({"present": True, "value": ["a", "b"]}, {"present": True, "value": ["b", "a"]}, False),
+            ({"present": True, "value": None}, {"present": True}, False),  # no value named
+            ({"present": True, "value": None}, {"present": True, "value": None}, True),
+            ({"present": True, "value": ["a"]}, {"present": True, "value": ["a"]}, True),
+        ],
+    )
+    def test_expectation_names_the_exact_stored_state(
+        self, manifest_file, stored, expected, match
+    ):
+        config = dict(KNOB)
+        if stored["present"]:
+            config["approvalTools"] = stored["value"]
+        with env_servers({}):
+            mcp_admin_service.create_server("knob", config)
+            if match:
+                mcp_admin_service.set_approval("knob", "*", expected)
+                assert self._stored()["approvalTools"] == "*"
+            else:
+                with pytest.raises(mcp_admin_service.McpApprovalConflict):
+                    mcp_admin_service.set_approval("knob", "*", expected)
+                assert self._stored() == config
+
+    @pytest.mark.parametrize(
+        "value", [[], True, 1, "send_mail", ["send_mail", "*"], ["send_mail", ""], [3], {"a": 1}]
+    )
+    def test_refuses_values_the_gate_would_read_as_everything(self, manifest_file, value):
+        self._make()
+        with env_servers({}):
+            with pytest.raises(McpAdminError, match="approvalTools must be"):
+                mcp_admin_service.set_approval("knob", value, ABSENT)
+        assert self._stored() == KNOB
+
+    @pytest.mark.parametrize("expected", [None, {}, {"present": "no"}, "absent"])
+    def test_refuses_a_malformed_expectation(self, manifest_file, expected):
+        self._make()
+        with env_servers({}):
+            with pytest.raises(McpAdminError, match="expected must be"):
+                mcp_admin_service.set_approval("knob", "*", expected)
+        assert self._stored() == KNOB
+
+    def test_env_server_is_not_editable_and_unknown_is_not_found(self, manifest_file):
+        with env_servers({"envsrv": {"type": "stdio", "command": "x"}}):
+            with pytest.raises(McpAdminError, match="not editable"):
+                mcp_admin_service.set_approval("envsrv", "*", ABSENT)
+            with pytest.raises(McpAdminError, match="not found"):
+                mcp_admin_service.set_approval("ghost", "*", ABSENT)

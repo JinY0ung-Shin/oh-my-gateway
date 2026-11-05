@@ -1,5 +1,6 @@
 """Tests for admin panel features: backends, MCP, metrics, tools, sandbox, sessions."""
 
+import json
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -766,3 +767,45 @@ class TestRequestLoggerStats:
         assert stats["total_requests"] == 0
         assert stats["p50_latency_ms"] == 0.0
         assert stats["p99_latency_ms"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# PATCH /admin/api/mcp-servers/{name}/approval (ChatDRAGON #811)
+# ---------------------------------------------------------------------------
+
+
+class TestMcpApprovalRoute:
+    @pytest.fixture
+    def manifest(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("GATEWAY_MCP_MANIFEST", str(tmp_path / "m.json"))
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps({"mcpServers": {}})):
+            from src import mcp_admin_service
+
+            mcp_admin_service.create_server(
+                "knob", {"type": "http", "url": "https://knob.internal/mcp"}
+            )
+            yield
+        import src.mcp_config as mcp_config
+
+        mcp_config.reload_mcp_config()
+
+    def _patch(self, client, name, body):
+        with patch("src.mcp_config.MCP_CONFIG", json.dumps({"mcpServers": {}})):
+            return client.patch(f"/admin/api/mcp-servers/{name}/approval", json=body)
+
+    def test_saves_then_conflicts_with_the_stored_state(self, admin_client, manifest):
+        ok = self._patch(admin_client, "knob", {"value": "*", "expected": {"present": False}})
+        assert ok.status_code == 200
+        assert ok.json()["approval"] == {"present": True, "value": "*"}
+        stale = self._patch(admin_client, "knob", {"value": None, "expected": {"present": False}})
+        assert stale.status_code == 409
+        assert stale.json()["current"] == {"present": True, "value": "*"}
+
+    def test_maps_bad_input_and_unknown_server(self, admin_client, manifest):
+        bad = self._patch(admin_client, "knob", {"value": [], "expected": {"present": False}})
+        assert bad.status_code == 400
+        missing = self._patch(admin_client, "ghost", {"value": "*", "expected": {"present": False}})
+        assert missing.status_code == 404
+        # value is required: an omitted value must not read as "remove"
+        omitted = self._patch(admin_client, "knob", {"expected": {"present": False}})
+        assert omitted.status_code == 422

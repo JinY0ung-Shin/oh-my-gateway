@@ -131,6 +131,15 @@ class McpServerUpsert(BaseModel):
     config: dict[str, Any]
 
 
+class McpApprovalPatch(BaseModel):
+    """``value``: ``"*"`` | ``[tool names]`` | ``null`` (remove). Required — an omitted
+    value must not read as "remove". ``expected``: the state last read,
+    ``{"present": false}`` or ``{"present": true, "value": ...}``."""
+
+    value: Any
+    expected: dict[str, Any]
+
+
 class McpServerValidate(BaseModel):
     name: str = ""
     config: dict[str, Any] = {}
@@ -372,6 +381,37 @@ async def update_mcp_server_endpoint(
     try:
         return await run_in_threadpool(
             mcp_admin_service.update_server, name, body.config
+        )
+    except mcp_admin_service.McpAdminError as e:
+        if "not found" in str(e):
+            code = 404
+        elif "not editable" in str(e):
+            code = 409
+        else:
+            code = 400
+        return JSONResponse(status_code=code, content={"error": str(e)})
+
+
+@router.patch("/api/mcp-servers/{name}/approval")
+async def patch_mcp_server_approval_endpoint(
+    name: str, body: McpApprovalPatch, _=Depends(require_admin)
+):
+    """Compare-and-swap ONE key (``approvalTools``) of a manifest-layer MCP server.
+
+    409 with the stored state (``current``) when it changed since the caller read it;
+    every other key of the entry — including one another admin just saved — is kept.
+    """
+    from fastapi.concurrency import run_in_threadpool
+
+    from src import mcp_admin_service
+
+    try:
+        return await run_in_threadpool(
+            mcp_admin_service.set_approval, name, body.value, body.expected
+        )
+    except mcp_admin_service.McpApprovalConflict as e:
+        return JSONResponse(
+            status_code=409, content={"error": str(e), "current": e.current}
         )
     except mcp_admin_service.McpAdminError as e:
         if "not found" in str(e):

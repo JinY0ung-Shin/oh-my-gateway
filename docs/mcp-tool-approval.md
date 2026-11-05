@@ -26,6 +26,25 @@
 (서버가 자기 쓰기 도구를 읽기라고 선언해 승인을 피할 수 없게). `readOnlyTools`와 `approvalTools`를 둘 다 `"*"`로 두는
 모순된 설정은 전부 승인 대상이다.
 
+### 1.1 관리 API — 이 키만 바꾸기 (ChatDRAGON #811)
+
+`PUT /admin/api/mcp-servers/{name}`은 config **전체**를 바꾼다. 이 키 하나만 고치는 편집기(ChatDRAGON Control Center)가
+읽은 뒤 PUT하면, 그 사이 다른 관리자가 저장한 URL·헤더·`approvalTools`를 조용히 되돌린다. 그래서 키 하나만 원자적으로
+바꾸는 API를 따로 둔다:
+
+```
+PATCH /admin/api/mcp-servers/{name}/approval
+{"value": "*" | ["send_mail", ...] | null, "expected": {"present": false} | {"present": true, "value": <읽은 값>}}
+```
+
+- manifest 잠금 안에서 저장된 `approvalTools`가 `expected`와 같을 때만 그 키를 바꾸거나(`null`이면 지운다) 저장한다.
+  다른 키는 **지금 저장된 값**을 그대로 둔다 — 그 사이 다른 관리자가 바꾼 URL·헤더도 남는다.
+- 다르면 **409** `{"error", "current": {"present", "value"?}}`. 아무것도 쓰지 않는다. 키 없음·`null`·`[]`은 서로 다른 상태다.
+- `value`는 `"*"`, 비지 않은 도구 이름 목록, `null`(지우기)만 받는다(400). `[]`·`true`처럼 게이트가 "모든 도구"로 읽는
+  값은 이 API로 저장하지 않는다. 생략한 `value`는 422 — "지우기"로 읽히지 않는다.
+- env(`MCP_CONFIG`) 서버는 409(편집 불가), 없는 서버는 404. 원자성은 한 gateway 프로세스 안의 manifest 잠금이 보장한다
+  (gateway는 단일 워커로 돈다).
+
 ## 2. 왜 `can_use_tool`이 아니라 PreToolUse 훅인가 (실측)
 
 `tests/test_cli_tool_approval.py`가 번들 CLI 2.1.283으로 고정한다:
