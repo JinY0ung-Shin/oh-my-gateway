@@ -274,3 +274,127 @@ async def test_a_continuation_with_no_further_decision_reads_to_the_end(cli):
         assert session.stream_break_event is None
     finally:
         await client.close()
+
+
+# -- the route's stream: a continuation that parks again never "completes" (#275) --
+
+
+def _sse_events(lines):
+    events = []
+    for line in lines:
+        for part in line.split("\n"):
+            if part.startswith("data:"):
+                try:
+                    events.append(json.loads(part[5:].strip()))
+                except ValueError:
+                    pass
+    return events
+
+
+async def _continuation_sse(chunks, next_pending):
+    """Answer a parked question over the real streaming route; the backend yields
+    ``chunks`` and, like the real reader, ends once ``next_pending`` has parked."""
+    from unittest.mock import MagicMock, patch
+
+    from fastapi.responses import StreamingResponse
+
+    from src.backends import ResolvedModel
+    from src.constants import DEFAULT_MODEL
+    from src.response_models import ResponseCreateRequest
+    from src.routes import responses as responses_module
+
+    session_id = "00000000-0000-0000-0000-000000000000"
+    session = Session(session_id=session_id, backend="claude")
+    session.pending_tool_call = {
+        "call_id": "toolu_q",
+        "name": "AskUserQuestion",
+        "arguments": {"questions": []},
+    }
+    session.input_event = asyncio.Event()
+    session.client = MagicMock(name="sdk_client")
+    session.turn_counter = 1
+    session.workspace = "/tmp/ws/test"
+
+    async def fake_receive(client, sess):
+        for chunk in chunks:
+            yield chunk
+        if next_pending is not None:
+            sess.pending_tool_call = next_pending
+
+    backend = MagicMock()
+    backend.run_completion_with_client = MagicMock()
+    backend.receive_response_from_client = fake_receive
+    body = ResponseCreateRequest(
+        model=DEFAULT_MODEL,
+        input=[{"type": "function_call_output", "call_id": "toolu_q", "output": "Yes"}],
+        previous_response_id=f"resp_{session_id}_1",
+        stream=True,
+    )
+    with patch.object(responses_module, "session_manager") as mock_sm:
+        mock_sm.add_assistant_response = MagicMock()
+        response = await responses_module._handle_function_call_output(
+            body,
+            ResolvedModel(public_model=DEFAULT_MODEL, backend="claude", provider_model=None),
+            backend,
+            session,
+            session_id,
+            "/tmp/ws/test",
+            {"call_id": "toolu_q", "output": "Yes"},
+        )
+        assert isinstance(response, StreamingResponse)
+        lines = [chunk async for chunk in response.body_iterator]
+    return _sse_events(lines), session
+
+
+_CARD = {
+    "call_id": "toolu_mail",
+    "name": MAIL,
+    "arguments": {"to": "a@x"},
+    "approval": tool_approval.approval_payload(
+        "knob", "send_mail", tool_approval.args_digest({"to": "a@x"})
+    ),
+}
+_THINKING = {
+    "type": "assistant",
+    "content": [{"type": "thinking", "thinking": "the user said yes; send it"}],
+}
+_TEXT = {"type": "assistant", "content": [{"type": "text", "text": "Sending now."}]}
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [[], [_THINKING], [_TEXT], [_THINKING, _TEXT]],
+    ids=["no-output", "thinking", "text", "thinking-and-text"],
+)
+async def test_a_continuation_that_parks_again_ends_only_with_requires_action(chunks):
+    """The live failure: the model thinks (or writes) and then calls the gated tool.
+    The stream used to close the turn as ``completed`` first, so the client dropped
+    the card that followed and the call timed out as a denial."""
+    events, session = await _continuation_sse(chunks, dict(_CARD))
+    completed = [e for e in events if e.get("type") == "response.completed"]
+    assert len(completed) == 1, [e["response"]["status"] for e in completed]
+    assert completed[0]["response"]["status"] == "requires_action"
+    assert events[-1] is completed[0], "nothing after the terminal event"
+    calls = [
+        e["item"]
+        for e in events
+        if e.get("type") == "response.output_item.added"
+        and e["item"].get("type") == "function_call"
+    ]
+    assert [c["call_id"] for c in calls] == ["toolu_mail"]
+    assert calls[0]["approval"] == _CARD["approval"]
+    sequence = [e["sequence_number"] for e in events if "sequence_number" in e]
+    assert sequence == sorted(set(sequence)), "sequence numbers must keep rising"
+    # The card is one ``added`` frame; every other item the turn opened is closed.
+    opened = sum(e.get("type") == "response.output_item.added" for e in events)
+    closed = sum(e.get("type") == "response.output_item.done" for e in events)
+    assert opened - len(calls) == closed
+    assert session.turn_counter == 2
+
+
+async def test_a_continuation_with_no_new_decision_still_completes():
+    """Control: no parked call, so the turn ends as an ordinary completed response."""
+    result = {"type": "result", "subtype": "success", "result": "Sending now."}
+    events, _session = await _continuation_sse([_THINKING, _TEXT, result], None)
+    completed = [e for e in events if e.get("type") == "response.completed"]
+    assert [e["response"]["status"] for e in completed] == ["completed"]

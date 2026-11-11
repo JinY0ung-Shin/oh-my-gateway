@@ -248,3 +248,126 @@ async def test_an_interrupt_while_the_card_waits_runs_nothing_and_frees_the_slot
 
     await _question_then_card(url, tmp_path, run)
     assert ran == []
+
+
+# -- the same chain through the real streaming route (#275) ---------------------
+
+
+def _plan_with_text(body: Dict[str, Any]) -> Dict[str, Any]:
+    """As ``_plan``, but the model writes before calling the gated tool — the live
+    shape: once the continuation has output, a stream that cannot see the parked
+    call closes the turn as ``completed`` and the card after it is dropped."""
+    reply = _plan(body)
+    if reply.get("tool_use", {}).get("name") == "mcp__knob__send_mail":
+        reply["text"] = "Sending it now."
+    return reply
+
+
+async def _route_answer(cli, session, call_id: str, output: str) -> List[Dict[str, Any]]:
+    """POST a ``function_call_output`` through the route; its SSE events."""
+    from unittest.mock import MagicMock, patch
+
+    from src.backends import ResolvedModel
+    from src.constants import DEFAULT_MODEL
+    from src.response_models import ResponseCreateRequest
+    from src.routes import responses as responses_module
+
+    body = ResponseCreateRequest(
+        model=DEFAULT_MODEL,
+        input=[{"type": "function_call_output", "call_id": call_id, "output": output}],
+        previous_response_id=f"resp_{session.session_id}_{session.turn_counter}",
+        stream=True,
+    )
+
+    async def post():
+        with patch.object(responses_module, "session_manager") as manager:
+            manager.add_assistant_response = MagicMock()
+            response = await responses_module._handle_function_call_output(
+                body,
+                ResolvedModel(
+                    public_model=DEFAULT_MODEL, backend="claude", provider_model=None
+                ),
+                cli,
+                session,
+                session.session_id,
+                session.workspace,
+                {"call_id": call_id, "output": output},
+            )
+            return [chunk async for chunk in response.body_iterator]
+
+    events = []
+    for line in await asyncio.wait_for(post(), _READ_TIMEOUT):
+        for part in line.split("\n"):
+            if part.startswith("data:"):
+                try:
+                    events.append(json.loads(part[5:].strip()))
+                except ValueError:
+                    pass
+    return events
+
+
+def _terminal_statuses(events: List[Dict[str, Any]]) -> List[str]:
+    return [
+        e["response"]["status"]
+        for e in events
+        if e.get("type") in ("response.completed", "response.failed", "response.incomplete")
+    ]
+
+
+@pytest.mark.parametrize("approve", [True, False], ids=["approve", "deny"])
+async def test_the_route_ends_the_answered_question_with_the_card_not_completed(
+    knob, tmp_path, approve
+):
+    url, ran = knob
+    cli = claude_client.ClaudeCodeCLI.__new__(claude_client.ClaudeCodeCLI)
+    session = Session(session_id="00000000-0000-0000-0000-000000000275", backend="claude")
+    session.tool_approval_capable = True
+    session.workspace = str(tmp_path)
+    session.turn_counter = 1
+    hook = claude_client.make_tool_approval_hook(session, _POLICY)
+    with FakeAnthropicAPI(_plan_with_text) as api:
+        options = ClaudeAgentOptions(
+            env=api.cli_env(tmp_path),
+            mcp_servers={"knob": {"type": "http", "url": url}},
+            permission_mode="bypassPermissions",
+            can_use_tool=cli._make_ask_user_can_use_tool(session),
+            cwd=str(tmp_path),
+            hooks={"PreToolUse": [HookMatcher(matcher="", hooks=[hook], timeout=600)]},
+        )
+        async with GatewayClaudeSDKClient(options=options) as client:
+            session.client = client
+            turn = _Turn(cli, client, session)
+            assert not _ended(await turn.start())
+            question = session.pending_tool_call
+            assert question["name"] == "AskUserQuestion"
+
+            events = await _route_answer(cli, session, question["call_id"], "Yes")
+            assert _terminal_statuses(events) == ["requires_action"], (
+                "the answered question must end with the approval card only"
+            )
+            assert any(
+                e.get("type") == "response.output_text.delta" for e in events
+            ), "control: the model wrote before the gated call"
+            cards = [
+                e["item"]
+                for e in events
+                if e.get("type") == "response.output_item.added"
+                and e["item"].get("type") == "function_call"
+            ]
+            assert [c["name"] for c in cards] == ["mcp__knob__send_mail"]
+            digest = cards[0]["approval"]["argsDigest"]
+            assert digest == tool_approval.args_digest(_ARGS)
+            await asyncio.sleep(1.0)
+            assert ran == [], "the tool must not run before the decision"
+
+            decision = (
+                {"decision": "approve", "argsDigest": digest}
+                if approve
+                else {"decision": "deny"}
+            )
+            events = await _route_answer(
+                cli, session, cards[0]["call_id"], json.dumps(decision)
+            )
+            assert _terminal_statuses(events) == ["completed"]
+            assert session.pending_tool_call is None
+    assert ran == ([_ARGS] if approve else [])

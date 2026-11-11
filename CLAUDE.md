@@ -130,6 +130,10 @@ uv run pytest --cov=src                            # with coverage
   `_read_turn_messages` — never iterate `client.receive_response()` without `stream_break_event`, or
   the next card is never sent and the call is denied at the timeout (`tests/test_decision_continuation.py`;
   `tests/test_cli_decision_continuation.py` pins question → card → approve/deny/interrupt on the bundled CLI).
+  The streaming route must also pass `"session"` in `stream_response_chunks`' `request_context` on
+  **every** path that can park (first turn and continuation): without it a turn that produced thinking
+  or text before parking is closed as `completed` ahead of the `requires_action`, and the client drops
+  the card (#275, issue #13).
   Editors that own only this key use `PATCH /admin/api/mcp-servers/{name}/approval` (`set_approval`:
   compare-and-swap on `approvalTools` under the manifest lock, other keys kept as stored, 409 + `current`
   on mismatch) — never read-then-PUT the whole config (ChatDRAGON #811).
