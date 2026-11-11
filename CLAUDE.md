@@ -128,7 +128,8 @@ uv run pytest --cov=src                            # with coverage
   A turn can park more than once (question answered → gated call, #273): the `function_call_output`
   continuation (`receive_response_from_client`) and a new turn share ONE break-aware reader,
   `_read_turn_messages` — never iterate `client.receive_response()` without `stream_break_event`, or
-  the next card is never sent and the call is denied at the timeout (`tests/test_decision_continuation.py`).
+  the next card is never sent and the call is denied at the timeout (`tests/test_decision_continuation.py`;
+  `tests/test_cli_decision_continuation.py` pins question → card → approve/deny/interrupt on the bundled CLI).
   Editors that own only this key use `PATCH /admin/api/mcp-servers/{name}/approval` (`set_approval`:
   compare-and-swap on `approvalTools` under the manifest lock, other keys kept as stored, 409 + `current`
   on mismatch) — never read-then-PUT the whole config (ChatDRAGON #811).
