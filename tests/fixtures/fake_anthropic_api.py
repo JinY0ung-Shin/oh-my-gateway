@@ -8,7 +8,8 @@ Everything else returns 404, which the CLI tolerates for its side requests.
 A ``plan`` callable picks each reply from the request body:
 
 * ``{"text": "..."}`` — one text block, ``end_turn``;
-* ``{"tool_use": {"name": "...", "input": {...}}}`` — one tool call;
+* ``{"tool_use": {"name": "...", "input": {...}}}`` — one tool call (add
+  ``"text"`` to put a text block before the call(s) in the same message);
 * ``{"tool_uses": [{"name": ...}, ...]}`` — several tool calls in ONE assistant
   message (a parallel batch), in that order;
 * ``{"text_chunks": ["...", ...]}`` — one text block streamed as one
@@ -149,6 +150,9 @@ class FakeAnthropicAPI:
                         }
                         for call in calls
                     ]
+                    if reply.get("text"):
+                        lead = reply["text"]
+                        blocks.insert(0, {"type": "text", "text": lead, "_chunks": [lead]})
                     stop = "tool_use"
                 else:
                     chunks = reply.get("text_chunks") or [reply.get("text", "ok")]

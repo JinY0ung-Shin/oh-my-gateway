@@ -2889,6 +2889,13 @@ async def _handle_function_call_output(
                         "turn": next_turn,
                         "continuation": True,
                         "function_call_output_call_id": fc_output["call_id"],
+                        # A continuation can park again (question answered →
+                        # approval-gated call). Without the session the stream
+                        # cannot tell, and once the model has produced thinking
+                        # or text it closes the turn as ``completed`` before the
+                        # ``requires_action`` below — the client never shows the
+                        # card (#275; same rule as the first turn, issue #13).
+                        "session": session,
                     },
                 )
                 async for line in streaming_utils.bridge_sse_stream(sse_source, chunk_source):
