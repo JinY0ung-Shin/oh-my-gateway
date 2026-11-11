@@ -15,7 +15,18 @@ import atexit
 import shutil
 import contextlib
 import warnings
-from typing import AsyncGenerator, Dict, Any, Literal, Optional, List, Union, cast
+from typing import (
+    AsyncGenerator,
+    Awaitable,
+    Callable,
+    Dict,
+    Any,
+    Literal,
+    Optional,
+    List,
+    Union,
+    cast,
+)
 from pathlib import Path
 import logging
 
@@ -2424,7 +2435,6 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             drain_backlog_to_outbox,
             idle_reader_running,
             pause_idle_reader,
-            reset_active_tasks,
         )
 
         if not idle_reader_running(session):
@@ -2439,19 +2449,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             await drain_backlog_to_outbox(session, client)
         await pause_idle_reader(session)
 
-        # Provide an event the hook can signal to break streaming
-        break_event = asyncio.Event()
-        session.stream_break_event = break_event
-        get_next = None
-        wait_break = None
-        get_progress = None
-        # MCP progress read off the wire by the relay (src.mcp_progress_relay) — the CLI
-        # itself never writes it to the SDK stream. A new turn starts with an empty queue.
-        relay = getattr(session, "mcp_progress_relay", None)
-        progress_queue = relay.queue if relay is not None else None
-        if relay is not None:
-            relay.drain()
-        try:
+        async def send_prompt() -> None:
             # Caller text is delivered verbatim: otherwise the CLI expands
             # ``@<path>`` mentions and inlines the file upstream — outside the
             # workspace too, and past the workspace sandbox hook (no tool call
@@ -2467,6 +2465,63 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 await client.query(
                     self._stream_user_content_blocks(prompt, verbatim=False)
                 )
+
+        stream = self._read_turn_messages(
+            client, session, send=send_prompt, error_label="ClaudeSDKClient error"
+        )
+        try:
+            async for chunk in stream:
+                yield chunk
+        finally:
+            # ``async for`` never closes what it iterates (see above).
+            await stream.aclose()
+
+    async def _read_turn_messages(
+        self,
+        client: ClaudeSDKClient,
+        session,
+        *,
+        send: Optional[Callable[[], Awaitable[None]]],
+        error_label: str,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """Read one stretch of a turn, stopping when a human decision parks it.
+
+        The single reader behind both a new turn (*send* writes the prompt)
+        and the continuation after a ``function_call_output`` (*send* is
+        ``None``: the original request is still active, nothing is written).
+        Both install ``session.stream_break_event`` and race it against the
+        SDK stream, so a decision that parks the turn — AskUserQuestion,
+        ExitPlanMode, an MCP tool approval — ends the read and lets the route
+        emit ``function_call`` + ``requires_action``. The continuation used
+        to iterate ``receive_response()`` with no break event: a second
+        decision in the same turn (question answered → approval-gated MCP
+        call) parked with nobody to stop the stream, no card was ever sent
+        and the hook denied the call at ``ASK_USER_TIMEOUT_SECONDS`` (#273).
+        """
+        from src.session_outbox import reset_active_tasks
+
+        # Provide an event the hook can signal to break streaming
+        break_event = asyncio.Event()
+        session.stream_break_event = break_event
+        if send is None and getattr(session, "pending_tool_call", None) is not None:
+            # The answer woke the SDK before this reader started (the route
+            # commits first), so the next decision may already have parked —
+            # with no break event to signal. The route cleared the answered
+            # slot at commit: one that is set now is that next decision.
+            break_event.set()
+        get_next = None
+        wait_break = None
+        get_progress = None
+        # MCP progress read off the wire by the relay (src.mcp_progress_relay) — the CLI
+        # itself never writes it to the SDK stream. A new turn starts with an empty queue;
+        # a continuation keeps it (the approved tool may already be reporting).
+        relay = getattr(session, "mcp_progress_relay", None)
+        progress_queue = relay.queue if relay is not None else None
+        if relay is not None and send is not None:
+            relay.drain()
+        try:
+            if send is not None:
+                await send()
             response_iter = client.receive_response().__aiter__()
             while True:
                 # Race: next message vs hook-fired break signal vs relayed MCP progress.
@@ -2527,7 +2582,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                     # so genuine execution errors retain failure semantics.
                     yield self._mark_gateway_interrupt(converted, session)
         except Exception as exc:
-            logger.error("ClaudeSDKClient error: %s", exc, exc_info=True)
+            logger.error("%s: %s", error_label, exc, exc_info=True)
             session.client = None
             reset_active_tasks(session, "SDK stream error")
             yield error_chunk(describe_sdk_stream_error(exc))
@@ -2540,7 +2595,9 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             for leftover in (get_next, wait_break, get_progress):
                 if leftover is not None and not leftover.done():
                     leftover.cancel()
-            session.stream_break_event = None
+            # Only our own event: never one a later reader installed.
+            if session.stream_break_event is break_event:
+                session.stream_break_event = None
 
     async def interrupt_client(self, client: ClaudeSDKClient) -> None:
         """Interrupt the active turn without disconnecting the conversation."""
@@ -2604,19 +2661,20 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         Used after the PreToolUse hook returns (deny + reason) — the SDK
         continues processing from where it left off.  A new ``query()``
         call is unnecessary because the original request is still active.
+        The turn can park on another human decision, so it is read through
+        the same break-aware loop as a new turn (#273).
         """
-        from src.session_outbox import pause_idle_reader, reset_active_tasks
+        from src.session_outbox import pause_idle_reader
 
         await pause_idle_reader(session)
+        stream = self._read_turn_messages(
+            client, session, send=None, error_label="ClaudeSDKClient receive error"
+        )
         try:
-            async for message in client.receive_response():
-                converted = self._convert_message(message)
-                yield self._mark_gateway_interrupt(converted, session)
-        except Exception as exc:
-            logger.error("ClaudeSDKClient receive error: %s", exc, exc_info=True)
-            session.client = None
-            reset_active_tasks(session, "SDK stream error")
-            yield error_chunk(describe_sdk_stream_error(exc))
+            async for chunk in stream:
+                yield chunk
+        finally:
+            await stream.aclose()
 
     # ------------------------------------------------------------------
     # Response parsing helpers
