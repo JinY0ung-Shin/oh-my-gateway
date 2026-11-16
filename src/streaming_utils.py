@@ -1060,6 +1060,32 @@ def _backend_may_emit_collab_json(request_context: Optional[Dict[str, Any]]) -> 
     return request_context.get("backend") != "claude"
 
 
+# The opening frames of every /v1/responses stream: created, in_progress.
+PREAMBLE_FRAMES = 2
+
+
+def make_stream_preamble(
+    response_id: str, model: str, metadata: Optional[Dict[str, str]] = None
+) -> list[str]:
+    """``response.created`` + ``response.in_progress`` (sequence 0 and 1).
+
+    One builder for both callers: ``stream_response_chunks`` and the route that sends
+    them *before* it spawns a backend client (#277), then streams with
+    ``preamble_sent=True``.
+    """
+    resp_in_progress = ResponseObject(
+        id=response_id, model=model, status="in_progress", metadata=metadata or {}
+    )
+    return [
+        make_response_sse(
+            "response.created", response_obj=resp_in_progress, sequence_number=0
+        ),
+        make_response_sse(
+            "response.in_progress", response_obj=resp_in_progress, sequence_number=1
+        ),
+    ]
+
+
 async def stream_response_chunks(
     chunk_source,
     model: str,
@@ -1071,6 +1097,7 @@ async def stream_response_chunks(
     metadata: Optional[Dict[str, str]] = None,
     stream_result: Optional[Dict[str, Any]] = None,
     request_context: Optional[Dict[str, Any]] = None,
+    preamble_sent: bool = False,
 ) -> AsyncGenerator[str, None]:
     """SSE streaming logic for /v1/responses (OpenAI Responses API).
 
@@ -1082,6 +1109,9 @@ async def stream_response_chunks(
 
     On SDK error or failure: emits response.failed instead of response.completed.
     Sets stream_result["success"] to indicate outcome to caller.
+
+    ``preamble_sent``: the caller already sent ``make_stream_preamble`` (sequence 0
+    and 1), so the stream starts at the next event and numbers on from 2.
     """
     content_sent = False
     token_streaming = False
@@ -1095,7 +1125,7 @@ async def stream_response_chunks(
     # is reset at each segment boundary (think→text→think), so this is the
     # source of truth for the complete assistant text handed back to the route.
     all_visible_text: list[str] = []
-    seq = 0
+    seq = PREAMBLE_FRAMES if preamble_sent else 0
     # Index of the next text annotation (citation) within the open message
     # item's content part.  Reset whenever a message item closes.
     annotation_index = 0
@@ -1198,18 +1228,11 @@ async def stream_response_chunks(
 
     # --- Preamble: emit opening events ---
 
-    # 1. response.created
-    resp_in_progress = ResponseObject(
-        id=response_id, model=model, status="in_progress", metadata=_metadata
-    )
-    yield make_response_sse(
-        "response.created", response_obj=resp_in_progress, sequence_number=_next_seq()
-    )
-
-    # 2. response.in_progress
-    yield make_response_sse(
-        "response.in_progress", response_obj=resp_in_progress, sequence_number=_next_seq()
-    )
+    # 1. response.created  2. response.in_progress — unless the route already sent them
+    if not preamble_sent:
+        for frame in make_stream_preamble(response_id, model, _metadata):
+            _next_seq()
+            yield frame
 
     # NOTE: response.output_item.added + response.content_part.added for the
     # message item are DEFERRED until the first text delta arrives (or the

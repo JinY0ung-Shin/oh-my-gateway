@@ -70,6 +70,14 @@ uv run pytest --cov=src                            # with coverage
   Permission *rules* pass through that rename map, but **PreToolUse hook matchers fire on
   the tool's real name** — bind hooks to every spelling (`SUBAGENT_TOOL_NAMES`) or they
   become silent no-ops on a new CLI.
+- A streamed `/v1/responses` turn that must start a CLI (`session.client is None`) sends
+  `response.created` + `response.in_progress` **before** the spawn (#277, `_spawn_then_stream`;
+  `RESPONSES_CREATED_BEFORE_SPAWN=false` restores the old order). So a spawn failure (503, 409
+  `session_ended`, 500 `workspace_refused`/`uid_band_exhausted`) arrives as `response.failed` with
+  the same `code`/`message` (`_stream_setup_failure`), not as an HTTP status; every check before the
+  spawn still answers with its status. Both paths share `streaming_utils.make_stream_preamble`, and
+  `stream_response_chunks(preamble_sent=True)` numbers on from 2. A cancel by response id during the
+  spawn is a 404 (the active response is published only once the client is up).
 - A turn cut off by the agentic limit is reported as `response.incomplete` with
   `incomplete_details.reason = "max_turns"`, not `response.failed`: the partial text is
   real work. `DEFAULT_MAX_TURNS` (40) has to accommodate subagent orchestration.
