@@ -76,8 +76,12 @@ uv run pytest --cov=src                            # with coverage
   `session_ended`, 500 `workspace_refused`/`uid_band_exhausted`) arrives as `response.failed` with
   the same `code`/`message` (`_stream_setup_failure`), not as an HTTP status; every check before the
   spawn still answers with its status. Both paths share `streaming_utils.make_stream_preamble`, and
-  `stream_response_chunks(preamble_sent=True)` numbers on from 2. A cancel by response id during the
-  spawn is a 404 (the active response is published only once the client is up).
+  `stream_response_chunks(preamble_sent=True)` numbers on from 2. A stream that ends before its turn
+  is handed over (the client left during or right after the spawn) gives a **new** session back at
+  once (`delete_session_async`: its id was sent but no turn committed, so it can never be continued
+  and would only hold a slot); a continuation keeps its session and loses only the CLI it started. A
+  cancel by response id during the spawn is a 404 (the active response is published only once the
+  client is up).
 - A turn cut off by the agentic limit is reported as `response.incomplete` with
   `incomplete_details.reason = "max_turns"`, not `response.failed`: the partial text is
   real work. `DEFAULT_MAX_TURNS` (40) has to accommodate subagent orchestration.

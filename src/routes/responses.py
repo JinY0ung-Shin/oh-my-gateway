@@ -2648,8 +2648,7 @@ async def create_response(
 
         async def _spawn_then_stream():
             handed_off = False
-            started = False  # this stream spawned the session's client
-            begun = False  # and published the active response
+            begun = False  # this stream published the active response
             try:
                 for frame in streaming_utils.make_stream_preamble(
                     resp_id, body.model, body.metadata
@@ -2667,7 +2666,6 @@ async def create_response(
                         workspace_str,
                         forward_headers=forward_headers,
                     )
-                    started = session.client is not None
                     await _begin_active_response(
                         session, resp_id, next_turn, session.client
                     )
@@ -2706,18 +2704,31 @@ async def create_response(
                 if not handed_off:
 
                     async def _abandon():
-                        # The stream ended (the client left) after the CLI started
-                        # but before the turn ran: stop that CLI and close the
-                        # response, as a failed stream does — nothing will use either.
+                        # The stream ended before the turn ran — the client left
+                        # while (or just after) the CLI started, or it never
+                        # started. Nothing will use what this stream set up.
                         try:
-                            if started:
-                                await _disconnect_session_client(
-                                    session,
-                                    "responses stream closed before the turn began",
-                                )
                             if begun:
                                 await _finish_active_response(
                                     session, resp_id, "failed"
+                                )
+                            if is_new_session:
+                                # No turn was committed, so the response id already
+                                # sent cannot be continued: give the session back
+                                # now — its slot, workspace and CLI — instead of
+                                # holding them until it expires or is evicted
+                                # (#278 review; the slot table is full in
+                                # production). Idempotent: a failed spawn deleted
+                                # it already.
+                                await session_manager.delete_session_async(
+                                    session_id
+                                )
+                            elif session.client is not None:
+                                # A continuation keeps its session; only the CLI
+                                # this stream started goes (it had none before).
+                                await _disconnect_session_client(
+                                    session,
+                                    "responses stream closed before the turn began",
                                 )
                         finally:
                             if preflight["lock_acquired"]:

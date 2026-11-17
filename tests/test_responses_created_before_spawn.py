@@ -323,3 +323,148 @@ def test_a_client_that_leaves_while_the_cli_starts_does_not_strand_the_session()
     assert not session.lock.locked()
     assert session.client is None
     assert session.active_response_id is None
+    # a new session whose first turn never ran is given back, not left holding a slot
+    assert session_manager.get_session(session.session_id) is None
+
+
+def _scope(port: int) -> dict:
+    return {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/v1/responses",
+        "raw_path": b"/v1/responses",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [(b"content-type", b"application/json"), (b"host", b"testserver")],
+        "client": ("127.0.0.1", port),
+        "server": ("testserver", 80),
+    }
+
+
+async def _post_then_leave(body: dict, port: int, left: asyncio.Event) -> None:
+    """POST, and disconnect as soon as response.created has been sent (the user's Stop)."""
+    created = asyncio.Event()
+    payload = json.dumps(body).encode()
+    calls = 0
+
+    async def receive():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"type": "http.request", "body": payload, "more_body": False}
+        await created.wait()
+        left.set()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        if message[
+            "type"
+        ] == "http.response.body" and b"response.created" in message.get("body", b""):
+            created.set()
+
+    await asyncio.wait_for(main.app(_scope(port), receive, send), timeout=5.0)
+
+
+async def _settle(session) -> None:
+    for _ in range(50):  # the teardown may finish detached
+        if not session.lock.locked():
+            return
+        await asyncio.sleep(0.02)
+
+
+class _Cli:
+    def __init__(self):
+        self.disconnected = 0
+
+    async def disconnect(self):
+        self.disconnected += 1
+
+
+def test_a_new_session_whose_cli_started_but_whose_turn_never_ran_is_given_back(
+    monkeypatch,
+):
+    """#278 review: the client leaves after the CLI started, before the turn is handed to
+    the stream. The new session never committed a turn — its response id cannot be
+    continued — so it leaves the session table at once, CLI stopped, lock released."""
+    from src.routes import responses as responses_module
+
+    state: dict = {"cli": _Cli()}
+    real_begin = responses_module._begin_active_response
+
+    with client_context() as (client, mock_cli):
+
+        async def started(**kwargs):
+            state["session"] = kwargs["session"]
+            return state["cli"]
+
+        async def held_until_the_user_left(session, *args):
+            await state["left"].wait()
+            await asyncio.sleep(1)  # the disconnect's cancellation lands here
+            return await real_begin(session, *args)
+
+        mock_cli.create_client = started
+        monkeypatch.setattr(
+            responses_module, "_begin_active_response", held_until_the_user_left
+        )
+
+        async def run():
+            state["left"] = asyncio.Event()
+            await _post_then_leave(
+                {"model": DEFAULT_MODEL, "input": "hello", "stream": True},
+                50002,
+                state["left"],
+            )
+            await _settle(state["session"])
+
+        client.portal.call(run)
+
+    session = state["session"]
+    assert session.client is state["cli"] or session.client is None
+    assert state["cli"].disconnected >= 1, "the CLI this stream started is stopped"
+    assert not session.lock.locked()
+    assert session.active_response_id is None
+    assert session_manager.get_session(session.session_id) is None
+
+
+def test_a_continuation_that_respawns_keeps_its_session_when_the_client_leaves():
+    """Only a new session is given back. A continuation whose CLI had to be started again
+    keeps its session (and its committed turns); just the CLI this stream started goes.
+    """
+
+    with client_context() as (client, mock_cli):
+        first = client.post(
+            "/v1/responses",
+            json={"model": DEFAULT_MODEL, "input": "hi", "stream": True},
+        )
+        resp_id = _events(first.text)[-1]["response"]["id"]
+        session_id = resp_id[len("resp_") :].rsplit("_", 1)[0]
+        session = session_manager.get_session(session_id)
+        session.client = None  # its CLI went away (evicted client, restart, …)
+
+        async def never_ready(**kwargs):
+            await asyncio.Event().wait()
+            return object()
+
+        mock_cli.create_client = never_ready
+
+        async def run():
+            await _post_then_leave(
+                {
+                    "model": DEFAULT_MODEL,
+                    "input": "again",
+                    "stream": True,
+                    "previous_response_id": resp_id,
+                },
+                50003,
+                asyncio.Event(),
+            )
+            await _settle(session)
+
+        client.portal.call(run)
+
+    assert not session.lock.locked()
+    assert session_manager.get_session(session_id) is session
+    assert session.turn_counter == 1
