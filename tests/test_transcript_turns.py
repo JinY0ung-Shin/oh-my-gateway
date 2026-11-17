@@ -19,6 +19,7 @@ import inspect
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -129,6 +130,62 @@ CASES = [
     ("a cwd with a double slash", _text(_user("x", cwd="/" + _CWD)), -2),
     ("a cwd with a dotdot", _text(_user("x", cwd=_CWD + "/../claude")), -2),
     ("another workspace", _text(PROMPT, ELSEWHERE), -2),
+    # #279: a tool that ran in a subdirectory of the workspace records it. 90 of 92
+    # cwd refusals in production were this — the session is still this workspace's.
+    (
+        "a tool result from a subdirectory",
+        _text(
+            PROMPT,
+            TOOL_USE,
+            {**TOOL_RESULT, "cwd": _CWD + "/.cli-tmp/merge"},
+            ANSWER,
+            PROMPT,
+        ),
+        2,
+    ),
+    ("a subdirectory cwd", _text(_user("x", cwd=_CWD + "/outputs")), 1),
+    (
+        "a deep subdirectory cwd",
+        _text(_user("x", cwd=_CWD + "/.cli-tmp/claude-1000/x/0b9f/images")),
+        1,
+    ),
+    ("a subdirectory cwd with a dot", _text(_user("x", cwd=_CWD + "/./uploads")), 1),
+    (
+        "a subdirectory cwd with a trailing slash",
+        _text(_user("x", cwd=_CWD + "/a/")),
+        1,
+    ),
+    (
+        "a very deep subdirectory cwd",
+        _text(_user("x", cwd=_CWD + "/d" * 10_000)),
+        1,
+    ),
+    # …and nothing that only looks like one
+    ("a sibling sharing the prefix", _text(_user("x", cwd=_CWD + "-other")), -2),
+    ("a sibling sharing the prefix, below", _text(_user("x", cwd=_CWD + "x/sub")), -2),
+    ("the parent directory", _text(_user("x", cwd="/data/workspaces/alice")), -2),
+    ("the root", _text(_user("x", cwd="/")), -2),
+    (
+        "a subdirectory escaping with dotdot",
+        _text(_user("x", cwd=_CWD + "/a/../../bob")),
+        -2,
+    ),
+    (
+        "a subdirectory with a dotdot inside",
+        _text(_user("x", cwd=_CWD + "/a/../b")),
+        -2,
+    ),
+    ("a relative cwd", _text(_user("x", cwd="outputs")), -2),
+    (
+        "a subdirectory of a double-slash root",
+        _text(_user("x", cwd="/" + _CWD + "/a")),
+        -2,
+    ),
+    (
+        "a subdirectory, then another workspace",
+        _text(_user("x", cwd=_CWD + "/a"), ELSEWHERE),
+        -2,
+    ),
     ("a mismatch before corruption", _text(PROMPT, ELSEWHERE) + b"{\n", -2),
     ("corruption before a mismatch", _text(PROMPT) + b"{\n" + _text(ELSEWHERE), -3),
     ("a blank line", _text(PROMPT) + b"\n" + _text(PROMPT), -3),
@@ -232,6 +289,28 @@ def test_both_copies_agree(broker, tmp_path, data, expected):
     assert _evaluate(broker, path) == expected
     # And the broker's whole read: the nofollow walk, the open, the checks.
     assert broker._read_transcript(os.path.realpath(path), _CWD) == expected
+
+
+@pytest.mark.parametrize(
+    "cwd, expected",
+    [
+        (_CWD + "/d" * 200_000, 1),
+        (_CWD + "-other" + "/d" * 200_000, -2),
+        (_CWD + "/d" * 200_000 + "/..", -2),
+    ],
+    ids=["under", "sibling", "dotdot-at-the-end"],
+)
+def test_a_deep_cwd_costs_time_linear_in_its_length(broker, tmp_path, cwd, expected):
+    """#280 review: the cwd is a transcript string, so no filesystem bound limits its
+    depth, and the line/value bounds do not count path components. Walking
+    ``PurePosixPath.parents`` builds every ancestor — quadratic: 200k components
+    took minutes. The prefix comparison reads each component once."""
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(_text(_user("x", cwd=cwd)))
+    started = time.perf_counter()
+    assert _evaluate(gateway, path) == expected
+    assert _evaluate(broker, path) == expected
+    assert time.perf_counter() - started < 5.0
 
 
 def test_deep_nesting_reads_as_corrupt_in_both(broker, tmp_path):

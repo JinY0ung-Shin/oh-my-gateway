@@ -1029,9 +1029,15 @@ def count_transcript_turns(
       line included: the CLI writes none), one that may hold more than
       *max_values* JSON values (:func:`too_many_values`, not parsed), or a user
       line whose ``message`` is not an object. Refuse to guess.
-    * :data:`TRANSCRIPT_MISMATCH` — a line records a ``cwd`` other than
-      *expected_cwd*: the transcript belongs to another workspace that maps to
-      the same ``projects/`` name.
+    * :data:`TRANSCRIPT_MISMATCH` — a line records a ``cwd`` that is neither
+      *expected_cwd* nor a directory under it: the transcript belongs to
+      another workspace that maps to the same ``projects/`` name. A tool that
+      ran in a subdirectory of the workspace (``outputs/``, ``.cli-tmp/…``)
+      records that subdirectory (#279), and the session is still this one: the
+      CLI names the transcript's directory after the session's own cwd, and a
+      directory under the workspace maps to a longer name. A recorded path
+      with a ``..`` component is never "under" it (``PurePosixPath`` does not
+      resolve ``..``, so ``<ws>/../other`` starts with ``<ws>``'s parts).
     * otherwise the number of ``type == "user"`` lines that are neither
       ``isMeta`` system reminders nor tool results (a non-empty ``content``
       list of only ``tool_result`` blocks): the prompts the gateway sent, one
@@ -1039,7 +1045,7 @@ def count_transcript_turns(
 
     *lines* are text lines as a file yields them (trailing newline allowed).
     """
-    expected = PurePosixPath(expected_cwd)
+    base = PurePosixPath(expected_cwd).parts
     turns = 0
     for raw in lines:
         if too_many_values(raw, max_values):
@@ -1053,12 +1059,15 @@ def count_transcript_turns(
         if not isinstance(line, dict):
             return TRANSCRIPT_CORRUPT
         recorded = line.get("cwd")
-        if (
-            isinstance(recorded, str)
-            and recorded
-            and PurePosixPath(recorded) != expected
-        ):
-            return TRANSCRIPT_MISMATCH
+        if isinstance(recorded, str) and recorded:
+            # Under *expected_cwd*: its parts lead, at least one more follows, and no
+            # ``..``. Compared once, linear in the path (``path.parents`` builds
+            # every ancestor: quadratic in a depth no filesystem limit bounds).
+            parts = PurePosixPath(recorded).parts
+            if parts != base and (
+                len(parts) <= len(base) or parts[: len(base)] != base or ".." in parts
+            ):
+                return TRANSCRIPT_MISMATCH
         if line.get("type") != "user" or line.get("isMeta"):
             continue
         message = line.get("message", {})
