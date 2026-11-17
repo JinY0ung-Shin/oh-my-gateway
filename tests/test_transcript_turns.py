@@ -129,6 +129,57 @@ CASES = [
     ("a cwd with a double slash", _text(_user("x", cwd="/" + _CWD)), -2),
     ("a cwd with a dotdot", _text(_user("x", cwd=_CWD + "/../claude")), -2),
     ("another workspace", _text(PROMPT, ELSEWHERE), -2),
+    # #279: a tool that ran in a subdirectory of the workspace records it. 90 of 92
+    # cwd refusals in production were this — the session is still this workspace's.
+    (
+        "a tool result from a subdirectory",
+        _text(
+            PROMPT,
+            TOOL_USE,
+            {**TOOL_RESULT, "cwd": _CWD + "/.cli-tmp/merge"},
+            ANSWER,
+            PROMPT,
+        ),
+        2,
+    ),
+    ("a subdirectory cwd", _text(_user("x", cwd=_CWD + "/outputs")), 1),
+    (
+        "a deep subdirectory cwd",
+        _text(_user("x", cwd=_CWD + "/.cli-tmp/claude-1000/x/0b9f/images")),
+        1,
+    ),
+    ("a subdirectory cwd with a dot", _text(_user("x", cwd=_CWD + "/./uploads")), 1),
+    (
+        "a subdirectory cwd with a trailing slash",
+        _text(_user("x", cwd=_CWD + "/a/")),
+        1,
+    ),
+    # …and nothing that only looks like one
+    ("a sibling sharing the prefix", _text(_user("x", cwd=_CWD + "-other")), -2),
+    ("a sibling sharing the prefix, below", _text(_user("x", cwd=_CWD + "x/sub")), -2),
+    ("the parent directory", _text(_user("x", cwd="/data/workspaces/alice")), -2),
+    ("the root", _text(_user("x", cwd="/")), -2),
+    (
+        "a subdirectory escaping with dotdot",
+        _text(_user("x", cwd=_CWD + "/a/../../bob")),
+        -2,
+    ),
+    (
+        "a subdirectory with a dotdot inside",
+        _text(_user("x", cwd=_CWD + "/a/../b")),
+        -2,
+    ),
+    ("a relative cwd", _text(_user("x", cwd="outputs")), -2),
+    (
+        "a subdirectory of a double-slash root",
+        _text(_user("x", cwd="/" + _CWD + "/a")),
+        -2,
+    ),
+    (
+        "a subdirectory, then another workspace",
+        _text(_user("x", cwd=_CWD + "/a"), ELSEWHERE),
+        -2,
+    ),
     ("a mismatch before corruption", _text(PROMPT, ELSEWHERE) + b"{\n", -2),
     ("corruption before a mismatch", _text(PROMPT) + b"{\n" + _text(ELSEWHERE), -3),
     ("a blank line", _text(PROMPT) + b"\n" + _text(PROMPT), -3),

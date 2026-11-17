@@ -1029,9 +1029,16 @@ def count_transcript_turns(
       line included: the CLI writes none), one that may hold more than
       *max_values* JSON values (:func:`too_many_values`, not parsed), or a user
       line whose ``message`` is not an object. Refuse to guess.
-    * :data:`TRANSCRIPT_MISMATCH` — a line records a ``cwd`` other than
-      *expected_cwd*: the transcript belongs to another workspace that maps to
-      the same ``projects/`` name.
+    * :data:`TRANSCRIPT_MISMATCH` — a line records a ``cwd`` that is neither
+      *expected_cwd* nor a directory under it: the transcript belongs to
+      another workspace that maps to the same ``projects/`` name. A tool that
+      ran in a subdirectory of the workspace (``outputs/``, ``.cli-tmp/…``)
+      records that subdirectory (#279), and the session is still this one: the
+      CLI names the transcript's directory after the session's own cwd, and a
+      directory under the workspace maps to a longer name. A recorded path
+      with a ``..`` component is never "under" it (``PurePosixPath`` does not
+      resolve ``..``, so ``<ws>/../other`` would list ``<ws>`` among its
+      parents).
     * otherwise the number of ``type == "user"`` lines that are neither
       ``isMeta`` system reminders nor tool results (a non-empty ``content``
       list of only ``tool_result`` blocks): the prompts the gateway sent, one
@@ -1053,12 +1060,12 @@ def count_transcript_turns(
         if not isinstance(line, dict):
             return TRANSCRIPT_CORRUPT
         recorded = line.get("cwd")
-        if (
-            isinstance(recorded, str)
-            and recorded
-            and PurePosixPath(recorded) != expected
-        ):
-            return TRANSCRIPT_MISMATCH
+        if isinstance(recorded, str) and recorded:
+            path = PurePosixPath(recorded)
+            if path != expected and (
+                ".." in path.parts or expected not in path.parents
+            ):
+                return TRANSCRIPT_MISMATCH
         if line.get("type") != "user" or line.get("isMeta"):
             continue
         message = line.get("message", {})

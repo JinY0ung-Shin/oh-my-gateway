@@ -74,7 +74,7 @@ def _encode_cwd(cwd) -> str:
     The rule is **lossy** — distinct workspaces such as ``a_b``, ``a.b`` and
     ``a-b`` collapse to the same directory — so ``_try_rehydrate_from_jsonl``
     additionally verifies the transcript's recorded ``cwd`` against the
-    requester's workspace before trusting it.
+    requester's workspace (that directory or one under it) before trusting it.
     """
     from src.backends.claude.workspace_sandbox import _project_dir_name
 
@@ -211,13 +211,14 @@ def _try_rehydrate_from_jsonl(session_id: str, *, user: Optional[str], cwd) -> O
         # Ownership guard. ``_encode_cwd`` is lossy (every non-alphanumeric
         # collapses to '-'), so distinct workspaces — e.g. users "a_b", "a.b"
         # and "a-b" — share one on-disk transcript directory. The SDK records
-        # the REAL cwd on each turn line, so a transcript whose recorded cwd
-        # does not match the requester's resolved workspace is refused;
-        # otherwise a colliding user could rebuild another user's session and
-        # history. (The other workspace is not logged: it names another user.)
+        # the REAL cwd on each turn line, so a transcript recording a cwd
+        # outside the requester's resolved workspace is refused; otherwise a
+        # colliding user could rebuild another user's session and history. A
+        # subdirectory of the workspace (a tool's cwd) is this workspace
+        # (#279). (The other path is not logged: it may name another user.)
         logger.warning(
             "Refusing to rehydrate session %s: its transcript records a cwd "
-            "other than requester workspace %r",
+            "outside requester workspace %r",
             session_id,
             str(cwd),
         )

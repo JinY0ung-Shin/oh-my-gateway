@@ -265,6 +265,67 @@ def test_try_rehydrate_allows_matching_recorded_cwd(tmp_path, monkeypatch):
     assert sess.turn_counter == 1
 
 
+def test_try_rehydrate_allows_a_tool_cwd_under_the_workspace(tmp_path, monkeypatch):
+    """#279: a tool that ran in a subdirectory of the workspace records that
+    subdirectory on its result line. The session is still this workspace's: it
+    rehydrates instead of answering 404 "not found or expired" (90 of 92 cwd
+    refusals in production were this)."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/base/alice/claude"
+    sid = "subdir-1"
+    jsonl = tmp_path / session_manager._encode_cwd(cwd) / f"{sid}.jsonl"
+    tool_result = [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]
+    _write_jsonl(
+        jsonl,
+        [
+            {"type": "user", "cwd": cwd, "message": {"role": "user", "content": "hi"}},
+            {
+                "type": "assistant",
+                "cwd": cwd,
+                "message": {"role": "assistant", "content": [{"type": "tool_use"}]},
+            },
+            {
+                "type": "user",
+                "cwd": cwd + "/.cli-tmp/merge",
+                "message": {"role": "user", "content": tool_result},
+            },
+            {
+                "type": "user",
+                "cwd": cwd + "/outputs",
+                "message": {"role": "user", "content": "again"},
+            },
+        ],
+    )
+
+    sess = session_manager._try_rehydrate_from_jsonl(sid, user="alice", cwd=cwd)
+    assert sess is not None
+    assert sess.turn_counter == 2
+
+
+def test_try_rehydrate_still_refuses_a_look_alike_sibling(tmp_path, monkeypatch):
+    """A path that only shares the workspace's string prefix is another workspace."""
+    from src import session_manager
+
+    monkeypatch.setattr(session_manager, "_PROJECTS_ROOT", tmp_path)
+    cwd = "/base/alice/claude"
+    sid = "sibling-1"
+    jsonl = tmp_path / session_manager._encode_cwd(cwd) / f"{sid}.jsonl"
+    _write_jsonl(
+        jsonl,
+        [
+            {
+                "type": "user",
+                "cwd": cwd + "-x/sub",
+                "message": {"role": "user", "content": "hi"},
+            }
+        ],
+    )
+
+    assert session_manager._try_rehydrate_from_jsonl(sid, user="alice", cwd=cwd) is None
+
+
 def test_try_rehydrate_refuses_on_recorded_cwd_mismatch(tmp_path, monkeypatch):
     """Refuse to rehydrate when the transcript's recorded cwd differs from
     the requester's workspace (cross-workspace transcript)."""
