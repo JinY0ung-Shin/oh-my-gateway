@@ -19,6 +19,7 @@ import inspect
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,11 @@ CASES = [
         _text(_user("x", cwd=_CWD + "/a/")),
         1,
     ),
+    (
+        "a very deep subdirectory cwd",
+        _text(_user("x", cwd=_CWD + "/d" * 10_000)),
+        1,
+    ),
     # …and nothing that only looks like one
     ("a sibling sharing the prefix", _text(_user("x", cwd=_CWD + "-other")), -2),
     ("a sibling sharing the prefix, below", _text(_user("x", cwd=_CWD + "x/sub")), -2),
@@ -283,6 +289,28 @@ def test_both_copies_agree(broker, tmp_path, data, expected):
     assert _evaluate(broker, path) == expected
     # And the broker's whole read: the nofollow walk, the open, the checks.
     assert broker._read_transcript(os.path.realpath(path), _CWD) == expected
+
+
+@pytest.mark.parametrize(
+    "cwd, expected",
+    [
+        (_CWD + "/d" * 200_000, 1),
+        (_CWD + "-other" + "/d" * 200_000, -2),
+        (_CWD + "/d" * 200_000 + "/..", -2),
+    ],
+    ids=["under", "sibling", "dotdot-at-the-end"],
+)
+def test_a_deep_cwd_costs_time_linear_in_its_length(broker, tmp_path, cwd, expected):
+    """#280 review: the cwd is a transcript string, so no filesystem bound limits its
+    depth, and the line/value bounds do not count path components. Walking
+    ``PurePosixPath.parents`` builds every ancestor — quadratic: 200k components
+    took minutes. The prefix comparison reads each component once."""
+    path = tmp_path / "s.jsonl"
+    path.write_bytes(_text(_user("x", cwd=cwd)))
+    started = time.perf_counter()
+    assert _evaluate(gateway, path) == expected
+    assert _evaluate(broker, path) == expected
+    assert time.perf_counter() - started < 5.0
 
 
 def test_deep_nesting_reads_as_corrupt_in_both(broker, tmp_path):

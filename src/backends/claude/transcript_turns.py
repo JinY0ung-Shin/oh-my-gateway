@@ -68,8 +68,7 @@ def count_transcript_turns(
       CLI names the transcript's directory after the session's own cwd, and a
       directory under the workspace maps to a longer name. A recorded path
       with a ``..`` component is never "under" it (``PurePosixPath`` does not
-      resolve ``..``, so ``<ws>/../other`` would list ``<ws>`` among its
-      parents).
+      resolve ``..``, so ``<ws>/../other`` starts with ``<ws>``'s parts).
     * otherwise the number of ``type == "user"`` lines that are neither
       ``isMeta`` system reminders nor tool results (a non-empty ``content``
       list of only ``tool_result`` blocks): the prompts the gateway sent, one
@@ -77,7 +76,7 @@ def count_transcript_turns(
 
     *lines* are text lines as a file yields them (trailing newline allowed).
     """
-    expected = PurePosixPath(expected_cwd)
+    base = PurePosixPath(expected_cwd).parts
     turns = 0
     for raw in lines:
         if too_many_values(raw, max_values):
@@ -92,9 +91,12 @@ def count_transcript_turns(
             return TRANSCRIPT_CORRUPT
         recorded = line.get("cwd")
         if isinstance(recorded, str) and recorded:
-            path = PurePosixPath(recorded)
-            if path != expected and (
-                ".." in path.parts or expected not in path.parents
+            # Under *expected_cwd*: its parts lead, at least one more follows, and no
+            # ``..``. Compared once, linear in the path (``path.parents`` builds
+            # every ancestor: quadratic in a depth no filesystem limit bounds).
+            parts = PurePosixPath(recorded).parts
+            if parts != base and (
+                len(parts) <= len(base) or parts[: len(base)] != base or ".." in parts
             ):
                 return TRANSCRIPT_MISMATCH
         if line.get("type") != "user" or line.get("isMeta"):
