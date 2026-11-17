@@ -50,6 +50,7 @@ from src.rate_limiter import rate_limit_endpoint
 from src import session_outbox
 from src.chunk_processing import classify_error_chunk
 from src.constants import CLIENT_DISCONNECT_TIMEOUT_SECONDS, DEFAULT_TIMEOUT_MS
+from src.env_utils import parse_bool_env
 from src.mcp_config import get_mcp_servers
 from src import streaming_utils
 from src.usage_logger import usage_logger
@@ -1197,6 +1198,39 @@ def _backend_unavailable_error(backend: str, exc: BaseException) -> HTTPExceptio
     return HTTPException(
         status_code=503, detail=f"{backend} backend unavailable; retry shortly"
     )
+
+
+def _created_before_spawn() -> bool:
+    """Whether a streamed turn that must start a client opens its stream first (#277).
+
+    On by default. ``RESPONSES_CREATED_BEFORE_SPAWN=false`` restores the old order,
+    where the spawn ran before the response and its failure answered with an HTTP
+    status.
+    """
+    return parse_bool_env("RESPONSES_CREATED_BEFORE_SPAWN", "true")
+
+
+def _stream_setup_failure(exc: BaseException) -> tuple[str, str]:
+    """``(code, message)`` for a stream whose backend client could not start.
+
+    Reads the HTTP error the route would have answered with before the stream opened,
+    so a client sees the same code and words, only as ``response.failed`` instead of a
+    status.
+    """
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        if isinstance(detail, dict):
+            error = detail.get("error")
+            if not isinstance(error, dict):
+                error = detail
+            code = error.get("code")
+            message = error.get("message")
+            if isinstance(code, str) and code and isinstance(message, str) and message:
+                return code, message
+        if isinstance(detail, str) and detail:
+            code = "backend_unavailable" if exc.status_code == 503 else "server_error"
+            return code, detail
+    return "server_error", "The backend client could not start."
 
 
 async def _validate_backend_prompt(
@@ -2375,36 +2409,47 @@ async def create_response(
             is_new_session,
             workspace_str=workspace_str,
         )
-        try:
-            await _ensure_response_session_client(
-                body,
-                resolved,
-                backend,
-                session,
-                session_id,
-                is_new_session,
-                system_prompt,
-                workspace_str,
-                forward_headers=forward_headers,
-            )
-        except Exception:
-            if preflight["lock_acquired"]:
-                session.lock.release()
-            raise
-
         next_turn = preflight["next_turn"]
         resp_id = _make_response_id(session_id, next_turn)
         output_item_id = _generate_msg_id()
-        try:
-            await _begin_active_response(session, resp_id, next_turn, session.client)
-        except Exception:
-            if preflight["lock_acquired"]:
-                session.lock.release()
-            raise
+        # A fresh backend client (a CLI process tree) takes seconds to start — p50
+        # 4.2 s in production (#277) — and until now the stream's first byte waited for
+        # it, so the user saw nothing at all. With a client to spawn, the stream opens
+        # first and the spawn runs inside it; a client that is already up starts in
+        # milliseconds and keeps the old order. Every check above (input, slash
+        # command, session preflight) still answers with its HTTP status.
+        spawn_in_stream = session.client is None and _created_before_spawn()
+        if not spawn_in_stream:
+            try:
+                await _ensure_response_session_client(
+                    body,
+                    resolved,
+                    backend,
+                    session,
+                    session_id,
+                    is_new_session,
+                    system_prompt,
+                    workspace_str,
+                    forward_headers=forward_headers,
+                )
+            except Exception:
+                if preflight["lock_acquired"]:
+                    session.lock.release()
+                raise
+            try:
+                await _begin_active_response(
+                    session, resp_id, next_turn, session.client
+                )
+            except Exception:
+                if preflight["lock_acquired"]:
+                    session.lock.release()
+                raise
 
-        async def _run_stream():
+        async def _run_stream(preamble_sent: bool = False):
             lock_acquired = preflight["lock_acquired"]
             stream_result: dict = {"success": False}
+            if preamble_sent:
+                stream_result["next_sequence"] = streaming_utils.PREAMBLE_FRAMES
             active_client = session.client
             try:
                 chunks_buffer = []
@@ -2425,6 +2470,7 @@ async def create_response(
                     prompt_text=prompt,
                     metadata=body.metadata or {},
                     stream_result=stream_result,
+                    preamble_sent=preamble_sent,
                     request_context={
                         "session_id": session_id,
                         "user": body.user,
@@ -2597,7 +2643,102 @@ async def create_response(
                     _teardown(), f"stream-teardown:{resp_id}"
                 )
 
-        return StreamingResponse(_run_stream(), media_type="text/event-stream")
+        if not spawn_in_stream:
+            return StreamingResponse(_run_stream(), media_type="text/event-stream")
+
+        async def _spawn_then_stream():
+            handed_off = False
+            begun = False  # this stream published the active response
+            try:
+                for frame in streaming_utils.make_stream_preamble(
+                    resp_id, body.model, body.metadata
+                ):
+                    yield frame
+                try:
+                    await _ensure_response_session_client(
+                        body,
+                        resolved,
+                        backend,
+                        session,
+                        session_id,
+                        is_new_session,
+                        system_prompt,
+                        workspace_str,
+                        forward_headers=forward_headers,
+                    )
+                    await _begin_active_response(
+                        session, resp_id, next_turn, session.client
+                    )
+                    begun = True
+                except Exception as exc:
+                    # The same failure the HTTP status used to carry (code + message),
+                    # now as the stream's terminal event: the 200 is already sent.
+                    code, message = _stream_setup_failure(exc)
+                    logger.warning(
+                        "Responses stream: backend client did not start (%s): %s",
+                        code,
+                        message,
+                    )
+                    yield streaming_utils.make_response_sse(
+                        "response.failed",
+                        response_obj=_build_failed_response(
+                            resp_id,
+                            body.model,
+                            body.metadata,
+                            code=code,
+                            message=message,
+                        ),
+                        sequence_number=streaming_utils.PREAMBLE_FRAMES,
+                    )
+                    return
+                handed_off = True
+                inner = _run_stream(preamble_sent=True)
+                try:
+                    async for line in inner:
+                        yield line
+                finally:
+                    # Closed now, not by the garbage collector: its teardown releases
+                    # the session lock and finishes the active response.
+                    await inner.aclose()
+            finally:
+                if not handed_off:
+
+                    async def _abandon():
+                        # The stream ended before the turn ran — the client left
+                        # while (or just after) the CLI started, or it never
+                        # started. Nothing will use what this stream set up.
+                        try:
+                            if begun:
+                                await _finish_active_response(
+                                    session, resp_id, "failed"
+                                )
+                            if is_new_session:
+                                # No turn was committed, so the response id already
+                                # sent cannot be continued: give the session back
+                                # now — its slot, workspace and CLI — instead of
+                                # holding them until it expires or is evicted
+                                # (#278 review; the slot table is full in
+                                # production). Idempotent: a failed spawn deleted
+                                # it already.
+                                await session_manager.delete_session_async(
+                                    session_id
+                                )
+                            elif session.client is not None:
+                                # A continuation keeps its session; only the CLI
+                                # this stream started goes (it had none before).
+                                await _disconnect_session_client(
+                                    session,
+                                    "responses stream closed before the turn began",
+                                )
+                        finally:
+                            if preflight["lock_acquired"]:
+                                session.lock.release()
+
+                    await _shielded_stream_teardown(
+                        _abandon(), f"stream-abandon:{resp_id}"
+                    )
+
+        return StreamingResponse(_spawn_then_stream(), media_type="text/event-stream")
 
     # --- Non-streaming path ---
     import time as _time

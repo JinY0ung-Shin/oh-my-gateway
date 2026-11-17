@@ -2083,8 +2083,11 @@ class TestStreamingPreflight:
 
         assert resp.status_code == 404
 
-    def test_streaming_ensure_client_failure_releases_lock(self, isolated_session_manager):
-        """Lines 1167-1170 — if _ensure_response_session_client raises, lock is released."""
+    def test_streaming_ensure_client_failure_releases_lock(
+        self, isolated_session_manager, monkeypatch
+    ):
+        """With the old order (spawn before the stream), a client that cannot start is a 503."""
+        monkeypatch.setenv("RESPONSES_CREATED_BEFORE_SPAWN", "false")
 
         async def boom_create(**kwargs):
             raise RuntimeError("boom")
@@ -2102,6 +2105,44 @@ class TestStreamingPreflight:
 
         # The RuntimeError should be turned into a 503 by ensure_session_client
         assert resp.status_code == 503
+
+    def test_streaming_client_failure_after_created_is_a_failed_event(
+        self, isolated_session_manager
+    ):
+        """#277: the stream opens before the spawn, so a client that cannot start ends it with
+        ``response.failed`` carrying the code the 503 used to — after ``response.created``."""
+
+        async def boom_create(**kwargs):
+            raise RuntimeError("boom")
+
+        with client_context() as (client, mock_cli, mock_wm):
+            mock_cli.create_client = boom_create
+            resp = client.post(
+                "/v1/responses",
+                json={
+                    "model": DEFAULT_MODEL,
+                    "input": "hello",
+                    "stream": True,
+                },
+            )
+
+        assert resp.status_code == 200
+        events = [
+            json.loads(line[len("data: "):])
+            for line in resp.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        assert [e["type"] for e in events] == [
+            "response.created",
+            "response.in_progress",
+            "response.failed",
+        ]
+        assert [e["sequence_number"] for e in events] == [0, 1, 2]
+        error = events[-1]["response"]["error"]
+        assert error["code"] == "backend_unavailable"
+        assert "retry shortly" in error["message"]
+        # The new session was never handed out: it is gone, as with the 503.
+        assert events[0]["response"]["id"] == events[-1]["response"]["id"]
 
 
 class _TrackableAsyncGen:

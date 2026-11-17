@@ -554,8 +554,17 @@ class TestResponsesStreamingValidationViaEndpoint:
         assert response.status_code == 400
         mock_cli.create_client.assert_not_called()
 
-    def test_streaming_create_client_failure_returns_503_and_releases_lock(self):
-        """Streaming client creation failure cleans up before returning a response."""
+    @pytest.mark.parametrize("created_first", [False, True], ids=["spawn-first", "created-first"])
+    def test_streaming_create_client_failure_returns_503_and_releases_lock(
+        self, monkeypatch, created_first
+    ):
+        """Streaming client creation failure cleans up the same way in both orders (#277).
+
+        Spawn first (``RESPONSES_CREATED_BEFORE_SPAWN=false``): a 503 before the stream.
+        Created first (default): ``response.created`` and then ``response.failed`` with the
+        503's code — the lock is released and the never-handed-out session is gone either way.
+        """
+        monkeypatch.setenv("RESPONSES_CREATED_BEFORE_SPAWN", "true" if created_first else "false")
         captured = {}
 
         async def failing_create_client(**kwargs):
@@ -575,7 +584,17 @@ class TestResponsesStreamingValidationViaEndpoint:
             )
 
         session = captured["session"]
-        assert response.status_code == 503
+        if created_first:
+            assert response.status_code == 200
+            types = [
+                json.loads(line[len("data: "):])["type"]
+                for line in response.text.splitlines()
+                if line.startswith("data: ")
+            ]
+            assert types == ["response.created", "response.in_progress", "response.failed"]
+            assert '"code":"backend_unavailable"' in response.text.replace(" ", "")
+        else:
+            assert response.status_code == 503
         assert not session.lock.locked()
         assert session.client is None
         assert session_manager.get_session(session.session_id) is None
