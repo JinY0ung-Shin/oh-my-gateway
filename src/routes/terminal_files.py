@@ -22,6 +22,15 @@ Contract (what FileNav calls):
 - ``POST /files/copy``  {source,destination} -> ``{source,destination,type}``
 - ``POST /files/archive`` {paths}     -> zip stream
 
+Paths: a leading slash historically means a host path when it is the root, under it,
+or an ancestor of it — the FileNav explorer echoes the real cwd and its breadcrumbs —
+and the workspace's own ``/`` otherwise. A caller that only speaks workspace-relative
+paths (ChatDRAGON's file panel) sends ``X-Workspace-Paths: relative`` and every
+leading slash is then the workspace's ``/``, so a folder named like an ancestor of
+the root (``data`` under ``/data/workspaces/...``) opens instead of reading as
+navigation above the workspace (#281). Either way the target must resolve inside
+the root.
+
 Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
 default ``X-User-Email``) and used WHOLE — the same value ``/v1/responses`` keys its
 workspace on — so the explorer resolves the very files the agent wrote. The caller
@@ -231,6 +240,21 @@ def _user_header() -> str:
     return os.getenv("WORKSPACE_USER_HEADER", _DEFAULT_USER_HEADER)
 
 
+# A caller that speaks workspace-relative paths says so (#281). Without it a
+# leading-slash path keeps its historical meaning: a host path when it is the
+# root, under it, or an ancestor of it (the FileNav explorer echoes the real cwd
+# and its breadcrumbs). With it, every leading slash is the workspace's own "/",
+# so a workspace folder named like an ancestor of the root (``/data`` under
+# ``/data/workspaces/...``) opens instead of reading as navigation above the
+# workspace. It only ever narrows: the target must still resolve inside the root.
+WORKSPACE_PATHS_HEADER = "X-Workspace-Paths"
+
+
+def _relative_paths(request: Request) -> bool:
+    value = request.headers.get(WORKSPACE_PATHS_HEADER, "")
+    return value.strip().lower() == "relative"
+
+
 def _hide_dotfiles() -> bool:
     """When true, dot-prefixed entries are neither listed nor accessible.
 
@@ -433,7 +457,9 @@ def _is_under(path: Path, base: Path) -> bool:
         return False
 
 
-def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
+def _resolve_in_root(
+    root: Path, rel: str, *, relative: bool = False
+) -> Optional[Path]:
     """Resolve *rel* and confine it to *root*; ``None`` if it escapes the root.
 
     ``Path.resolve()`` collapses ``..`` and follows symlinks, so an escape via
@@ -445,6 +471,9 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
     the root. An absolute path that is an *ancestor* of the root (breadcrumb
     navigation above the workspace) is rejected outright; any other stray
     leading-slash path is reinterpreted as workspace-relative.
+
+    With *relative* (the caller sent ``X-Workspace-Paths: relative``) a leading
+    slash always means the workspace root — no host-path reading at all (#281).
     """
     try:
         root_resolved = root.resolve()
@@ -455,7 +484,9 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
         return root_resolved  # workspace root (virtual "/")
     try:
         candidate = Path(p)
-        if candidate.is_absolute():
+        if relative:
+            resolved = (root_resolved / p.lstrip("/")).resolve()
+        elif candidate.is_absolute():
             resolved = candidate.resolve()
             if not _is_under(resolved, root_resolved):
                 if _is_under(root_resolved, resolved):
@@ -468,7 +499,9 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
     return resolved if _is_under(resolved, root_resolved) else None
 
 
-def _lexical_relative_path(root: Path, rel: str) -> Path:
+def _lexical_relative_path(
+    root: Path, rel: str, *, relative: bool = False
+) -> Path:
     """Return the requested workspace-relative path without resolving symlinks.
 
     Hidden-path policy is lexical as well as target-based.  A request such as
@@ -484,6 +517,8 @@ def _lexical_relative_path(root: Path, rel: str) -> Path:
     if p in ("/", ""):
         return Path(".")
     candidate = Path(p)
+    if relative:
+        return Path(p.lstrip("/"))
     if not candidate.is_absolute():
         return candidate
     try:
@@ -492,7 +527,7 @@ def _lexical_relative_path(root: Path, rel: str) -> Path:
         return Path(p.lstrip("/"))
 
 
-def _resolve_or_403(root: Path, rel: str) -> Path:
+def _resolve_or_403(root: Path, rel: str, *, relative: bool = False) -> Path:
     """Resolve within the workspace root or raise.
 
     - Outside the root -> **403** ("outside your workspace"), so the explorer can
@@ -501,9 +536,10 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
       invisible rather than advertising that something is blocked.
 
     The returned path may not exist yet (callers that create paths check as
-    needed); callers reading/listing must still verify existence.
+    needed); callers reading/listing must still verify existence. Routes pass
+    ``relative=_relative_paths(request)`` (see ``_resolve_in_root``).
     """
-    target = _resolve_in_root(root, rel)
+    target = _resolve_in_root(root, rel, relative=relative)
     if target is None:
         raise HTTPException(
             status_code=403,
@@ -512,7 +548,7 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
     hide_dot = _hide_dotfiles()
     hide_claude = _hide_claude_prefix()
     # Checked even with both switches off: argv files are always hidden.
-    requested_relative = _lexical_relative_path(root, rel)
+    requested_relative = _lexical_relative_path(root, rel, relative=relative)
     try:
         resolved_relative = target.relative_to(root.resolve())
     except (ValueError, OSError, RuntimeError):
@@ -816,7 +852,7 @@ async def list_files(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, directory)
+    target = _resolve_or_403(root, directory, relative=_relative_paths(request))
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
 
@@ -988,7 +1024,7 @@ async def file_digest(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, path)
+    target = _resolve_or_403(root, path, relative=_relative_paths(request))
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
@@ -1016,7 +1052,7 @@ async def read_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, path)
+    target = _resolve_or_403(root, path, relative=_relative_paths(request))
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
@@ -1058,7 +1094,7 @@ async def view_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, path)
+    target = _resolve_or_403(root, path, relative=_relative_paths(request))
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
@@ -1087,7 +1123,11 @@ async def serve_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, path if path.startswith("/") else f"/{path}")
+    target = _resolve_or_403(
+        root,
+        path if path.startswith("/") else f"/{path}",
+        relative=_relative_paths(request),
+    )
     if not target.is_file():
         raise HTTPException(status_code=404, detail="file not found")
 
@@ -1112,7 +1152,7 @@ async def set_cwd(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, body.path)
+    target = _resolve_or_403(root, body.path, relative=_relative_paths(request))
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
     return {"cwd": body.path}
@@ -1168,7 +1208,7 @@ async def upload_file(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    dest_dir = _resolve_or_403(root, directory)
+    dest_dir = _resolve_or_403(root, directory, relative=_relative_paths(request))
     if not dest_dir.is_dir():
         raise HTTPException(status_code=404, detail="directory not found")
 
@@ -1176,7 +1216,9 @@ async def upload_file(
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = _resolve_or_403(root, f"{directory}/{name}")
+    target = _resolve_or_403(
+        root, f"{directory}/{name}", relative=_relative_paths(request)
+    )
 
     data = await file.read()
     # Defence in depth against the request boundary: middleware bounds the raw
@@ -1495,7 +1537,7 @@ async def write_if_unchanged(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    dest_dir = _resolve_or_403(root, directory)
+    dest_dir = _resolve_or_403(root, directory, relative=_relative_paths(request))
     if not dest_dir.is_dir():
         # The file's folder is gone, so the file the draft started from is gone:
         # that is a conflict, not a 404 -- callers read 404/405 from this route
@@ -1507,7 +1549,9 @@ async def write_if_unchanged(
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = _resolve_or_403(root, f"{directory}/{name}")
+    target = _resolve_or_403(
+        root, f"{directory}/{name}", relative=_relative_paths(request)
+    )
     expected = expected_sha256.lower()
     if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
         raise HTTPException(status_code=400, detail="invalid expected_sha256")
@@ -1576,7 +1620,7 @@ async def make_dir(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, body.path)
+    target = _resolve_or_403(root, body.path, relative=_relative_paths(request))
     if target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
 
@@ -1613,7 +1657,7 @@ async def delete_entry(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, path)
+    target = _resolve_or_403(root, path, relative=_relative_paths(request))
     if target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not target.exists():
@@ -1651,8 +1695,8 @@ async def move_entry(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    src = _resolve_or_403(root, body.source)
-    dst = _resolve_or_403(root, body.destination)
+    src = _resolve_or_403(root, body.source, relative=_relative_paths(request))
+    dst = _resolve_or_403(root, body.destination, relative=_relative_paths(request))
     if src == root.resolve() or dst == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not src.exists():
@@ -2007,8 +2051,8 @@ async def copy_entry(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    src = _resolve_or_403(root, body.source)
-    dst = _resolve_or_403(root, body.destination)
+    src = _resolve_or_403(root, body.source, relative=_relative_paths(request))
+    dst = _resolve_or_403(root, body.destination, relative=_relative_paths(request))
     if src == root.resolve() or dst == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not src.exists():
@@ -2427,7 +2471,7 @@ async def archive_entries(
 
     targets = []
     for p in body.paths:
-        t = _resolve_or_403(root, p)
+        t = _resolve_or_403(root, p, relative=_relative_paths(request))
         if not t.exists():
             raise HTTPException(status_code=404, detail=f"not found: {p}")
         targets.append(t)
