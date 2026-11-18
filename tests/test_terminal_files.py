@@ -2795,3 +2795,142 @@ def test_argv_files_are_never_served(client, workspace, argv_file):
     )
     assert up.status_code == 404
     assert not (workspace / ".gateway-argv-system-prompt-x").exists()
+
+
+# --- a workspace folder that shares a name with an ancestor of the root (#281) ---
+#
+# In production the root is ``/data/workspaces/<user>/<ws>``. A user folder named
+# ``data`` arrives from the file panel as ``/data`` — the host path ``/data`` is an
+# ancestor of the root, so the resolver read it as navigation above the workspace
+# and answered 403 for every operation under it, while the root listing showed the
+# folder. Here the root's own first segment (``/tmp`` on most hosts) plays ``data``.
+
+
+def _ancestor_names(workspace: Path) -> tuple[str, str]:
+    """The root's first host segment, and the first two joined (both ancestors)."""
+    parts = workspace.resolve().parts
+    return parts[1], f"{parts[1]}/{parts[2]}"
+
+
+@pytest.fixture
+def shadowing(workspace) -> str:
+    top, _ = _ancestor_names(workspace)
+    (workspace / top).mkdir()
+    (workspace / top / "a.txt").write_text("in the workspace\n")
+    (workspace / top / "deep").mkdir()
+    return top
+
+
+def test_a_folder_named_like_an_ancestor_lists(client, workspace, shadowing):
+    root = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
+    assert root.status_code == 200
+    listed = {e["name"]: e["type"] for e in root.json()["entries"]}
+    assert listed[shadowing] == "directory"
+
+    for directory in (
+        f"/{shadowing}",
+        f"/{shadowing}/",
+        f"/./{shadowing}",
+        shadowing,
+    ):
+        r = client.get(
+            f"/files/list?directory={directory}", headers={**_AUTH, **_USER}
+        )
+        assert r.status_code == 200, (directory, r.text)
+        assert {e["name"] for e in r.json()["entries"]} == {"a.txt", "deep"}
+
+
+def test_a_folder_named_like_an_ancestor_reads_and_writes(
+    client, workspace, shadowing
+):
+    h = {**_AUTH, **_USER}
+    inside = workspace / shadowing
+    read = client.get(f"/files/read?path=/{shadowing}/a.txt", headers=h)
+    assert read.status_code == 200 and "in the workspace" in read.text
+    digest = client.get(f"/files/digest?path=/{shadowing}/a.txt", headers=h)
+    assert digest.status_code == 200
+
+    up = client.post(
+        f"/files/upload?directory=/{shadowing}",
+        headers=h,
+        files={"file": ("up.txt", b"uploaded", "text/plain")},
+    )
+    assert up.status_code == 200
+    assert (inside / "up.txt").read_bytes() == b"uploaded"
+    mk = client.post("/files/mkdir", headers=h, json={"path": f"/{shadowing}/made"})
+    assert mk.status_code == 200 and (inside / "made").is_dir()
+    mv = client.post(
+        "/files/move",
+        headers=h,
+        json={"source": f"/{shadowing}/up.txt", "destination": "/sub/up.txt"},
+    )
+    assert mv.status_code == 200 and (workspace / "sub" / "up.txt").exists()
+    rm = client.delete(f"/files/delete?path=/{shadowing}/a.txt", headers=h)
+    assert rm.status_code == 200 and not (inside / "a.txt").exists()
+    rmdir = client.delete(f"/files/delete?path=/{shadowing}", headers=h)
+    assert rmdir.status_code == 200 and not inside.exists()
+
+
+def test_a_folder_named_like_an_ancestor_can_be_created(client, workspace):
+    """Creating the folder is the same request shape — it must land in the workspace."""
+    h = {**_AUTH, **_USER}
+    top, _ = _ancestor_names(workspace)
+
+    mk = client.post("/files/mkdir", headers=h, json={"path": f"/{top}"})
+    assert mk.status_code == 200, mk.text
+    assert (workspace / top).is_dir()
+    client.delete(f"/files/delete?path=/{top}", headers=h)
+
+    mv = client.post(
+        "/files/move", headers=h, json={"source": "/sub", "destination": f"/{top}"}
+    )
+    assert mv.status_code == 200, mv.text
+    assert (workspace / top / "inner.md").exists()
+    # "/<top>/<second>" is itself an ancestor of the root — a copy onto it lands
+    # in the workspace folder, now that "/<top>" exists there
+    _, two = _ancestor_names(workspace)
+    cp = client.post(
+        "/files/copy",
+        headers=h,
+        json={"source": "/notes.txt", "destination": f"/{two}"},
+    )
+    assert cp.status_code == 200, cp.text
+    assert (workspace / two).read_text() == "hello\nworld\n"
+
+
+def test_navigation_above_the_root_is_still_403(client, workspace, shadowing):
+    """The real ancestors stay out of reach — with or without a same-named folder."""
+    h = {**_AUTH, **_USER}
+    _, two = _ancestor_names(workspace)
+    for directory in (str(workspace.resolve().parent), f"/{two}"):
+        r = client.get(f"/files/list?directory={directory}", headers=h)
+        assert r.status_code == 403, (directory, r.text)
+        assert "outside your workspace" in r.json()["detail"]
+    # without a workspace folder of that name, "/<ancestor>" is above-root navigation
+    client.delete(f"/files/delete?path=/{shadowing}", headers=h)
+    r = client.get(f"/files/list?directory=/{shadowing}", headers=h)
+    assert r.status_code == 403
+    # creating deep under a missing folder is not a reason to read it as virtual
+    mk = client.post("/files/mkdir", headers=h, json={"path": f"/{two}"})
+    assert mk.status_code == 403
+
+
+def test_a_same_named_folder_does_not_open_an_escape(client, workspace, shadowing):
+    h = {**_AUTH, **_USER}
+    for path in (
+        f"/{shadowing}/../../secret.txt",
+        f"/{shadowing}/../../../secret.txt",
+    ):
+        r = client.get(f"/files/read?path={path}", headers=h)
+        assert r.status_code in (403, 404), (path, r.status_code)
+        assert "TOP SECRET" not in r.text
+    # the same-named folder is a symlink out of the workspace -> still refused
+    inside = workspace / shadowing
+    for child in sorted(inside.rglob("*"), reverse=True):
+        child.unlink() if child.is_file() else child.rmdir()
+    inside.rmdir()
+    inside.symlink_to(workspace.parent.parent)
+    r = client.get(f"/files/list?directory=/{shadowing}", headers=h)
+    assert r.status_code == 403
+    r = client.get(f"/files/read?path=/{shadowing}/secret.txt", headers=h)
+    assert r.status_code == 403

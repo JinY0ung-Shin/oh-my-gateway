@@ -433,7 +433,9 @@ def _is_under(path: Path, base: Path) -> bool:
         return False
 
 
-def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
+def _resolve_in_root(
+    root: Path, rel: str, *, creating: bool = False
+) -> Optional[Path]:
     """Resolve *rel* and confine it to *root*; ``None`` if it escapes the root.
 
     ``Path.resolve()`` collapses ``..`` and follows symlinks, so an escape via
@@ -442,9 +444,15 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
     your workspace" (403) from "hidden/not found" (404).
 
     The explorer echoes the real cwd, so most paths arrive absolute and under
-    the root. An absolute path that is an *ancestor* of the root (breadcrumb
-    navigation above the workspace) is rejected outright; any other stray
-    leading-slash path is reinterpreted as workspace-relative.
+    the root. Any other leading-slash path is workspace-relative (the file
+    panel's virtual ``/``), with one ambiguous case: an absolute path that is
+    an *ancestor* of the root. That is breadcrumb navigation above the
+    workspace — or a workspace folder that merely shares an ancestor's name
+    (``/data`` when the root is ``/data/workspaces/<user>/<ws>``, #281). It is
+    read as that workspace folder when the folder exists (or, with
+    *creating*, when its parent does, so ``mkdir /data`` and a move or copy
+    onto it work); otherwise it is still above-workspace navigation and
+    rejected.
     """
     try:
         root_resolved = root.resolve()
@@ -458,14 +466,36 @@ def _resolve_in_root(root: Path, rel: str) -> Optional[Path]:
         if candidate.is_absolute():
             resolved = candidate.resolve()
             if not _is_under(resolved, root_resolved):
-                if _is_under(root_resolved, resolved):
+                virtual = (root_resolved / p.lstrip("/")).resolve()
+                if _is_under(root_resolved, resolved) and not (
+                    _is_under(virtual, root_resolved)
+                    and _names_workspace_entry(virtual, root_resolved, creating)
+                ):
                     return None  # ancestor of the root -> above-workspace nav
-                resolved = (root_resolved / p.lstrip("/")).resolve()
+                resolved = virtual
         else:
             resolved = (root_resolved / p).resolve()
     except (OSError, RuntimeError):
         return None
     return resolved if _is_under(resolved, root_resolved) else None
+
+
+def _names_workspace_entry(virtual: Path, root: Path, creating: bool) -> bool:
+    """Whether *virtual* (resolved, inside *root*) names a workspace entry.
+
+    True when it exists, or — for a path about to be created — when its parent
+    is a directory inside the root. Tells a workspace folder that shares an
+    ancestor's name apart from navigation above the workspace (#281).
+    """
+    if virtual == root:
+        return False  # "/<ancestor>" never means the root itself
+    try:
+        if virtual.exists():
+            return True
+        parent = virtual.parent
+        return creating and _is_under(parent, root) and parent.is_dir()
+    except OSError:
+        return False
 
 
 def _lexical_relative_path(root: Path, rel: str) -> Path:
@@ -492,7 +522,7 @@ def _lexical_relative_path(root: Path, rel: str) -> Path:
         return Path(p.lstrip("/"))
 
 
-def _resolve_or_403(root: Path, rel: str) -> Path:
+def _resolve_or_403(root: Path, rel: str, *, creating: bool = False) -> Path:
     """Resolve within the workspace root or raise.
 
     - Outside the root -> **403** ("outside your workspace"), so the explorer can
@@ -501,9 +531,10 @@ def _resolve_or_403(root: Path, rel: str) -> Path:
       invisible rather than advertising that something is blocked.
 
     The returned path may not exist yet (callers that create paths check as
-    needed); callers reading/listing must still verify existence.
+    needed); callers reading/listing must still verify existence. Callers that
+    create *rel* pass ``creating=True`` (see ``_resolve_in_root``).
     """
-    target = _resolve_in_root(root, rel)
+    target = _resolve_in_root(root, rel, creating=creating)
     if target is None:
         raise HTTPException(
             status_code=403,
@@ -1176,7 +1207,7 @@ async def upload_file(
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = _resolve_or_403(root, f"{directory}/{name}")
+    target = _resolve_or_403(root, f"{directory}/{name}", creating=True)
 
     data = await file.read()
     # Defence in depth against the request boundary: middleware bounds the raw
@@ -1507,7 +1538,7 @@ async def write_if_unchanged(
     name = os.path.basename(file.filename or "")
     if not name or name in (".", ".."):
         raise HTTPException(status_code=400, detail="invalid filename")
-    target = _resolve_or_403(root, f"{directory}/{name}")
+    target = _resolve_or_403(root, f"{directory}/{name}", creating=True)
     expected = expected_sha256.lower()
     if len(expected) != 64 or any(c not in "0123456789abcdef" for c in expected):
         raise HTTPException(status_code=400, detail="invalid expected_sha256")
@@ -1576,7 +1607,7 @@ async def make_dir(
     await verify_api_key(request, credentials)
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
-    target = _resolve_or_403(root, body.path)
+    target = _resolve_or_403(root, body.path, creating=True)
     if target == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
 
@@ -1652,7 +1683,7 @@ async def move_entry(
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
     src = _resolve_or_403(root, body.source)
-    dst = _resolve_or_403(root, body.destination)
+    dst = _resolve_or_403(root, body.destination, creating=True)
     if src == root.resolve() or dst == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not src.exists():
@@ -2008,7 +2039,7 @@ async def copy_entry(
     _ensure_api_key()
     root = _workspace_root(_require_user(request))
     src = _resolve_or_403(root, body.source)
-    dst = _resolve_or_403(root, body.destination)
+    dst = _resolve_or_403(root, body.destination, creating=True)
     if src == root.resolve() or dst == root.resolve():
         raise HTTPException(status_code=400, detail="invalid path")
     if not src.exists():
