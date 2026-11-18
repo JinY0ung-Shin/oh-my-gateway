@@ -2941,12 +2941,11 @@ def test_relative_paths_never_leave_the_root(client, workspace, shadowing):
         r = client.get(f"/files/read?path={path}", headers=h)
         assert r.status_code in (403, 404), (path, r.status_code)
         assert "TOP SECRET" not in r.text
-    # a host path at or under the root still names that file for a relative caller
-    # (it may hold one from an earlier response) — the header changes no path an older
-    # gateway would serve (#884 review)
+    # a host path is not special to a relative caller: it names a workspace entry.
+    # A relative caller never holds host paths (ChatDRAGON refuses to hand the screen a
+    # response it cannot strip, #884), so this reading has no ambiguity to resolve.
     r = client.get(f"/files/list?directory={workspace.resolve()}/sub", headers=h)
-    assert r.status_code == 200
-    assert [e["name"] for e in r.json()["entries"]] == ["inner.md"]
+    assert r.status_code == 404
     # a same-named folder that is a symlink out of the workspace is still refused
     inside = workspace / shadowing
     for child in sorted(inside.rglob("*"), reverse=True):
@@ -2970,35 +2969,47 @@ def test_only_the_relative_value_switches_the_reading(
     assert client.get(url, headers=h).status_code == 200
 
 
-def test_the_header_changes_no_path_a_gateway_without_it_would_serve(
-    client, workspace, shadowing
-):
-    """#884 review: a caller sends the header to every gateway version (an older
-    one ignores it), so for every path an older gateway served, the answer must be
-    the same with and without it. Pinned on the real resolver: the host paths
-    ``<root>/<top>`` and ``<root>/<top>/a.txt`` (the reviewer's ``<root>/data`` and
-    ``<root>/data/a.txt``) are those very entries either way; only the
-    ancestor-shaped ``/<top>`` differs — refused without the header, the workspace
-    folder with it."""
-    root = workspace.resolve()
-    inside = root / shadowing
-    cases = {
-        f"{root}/{shadowing}": (inside, inside),
-        f"{root}/{shadowing}/a.txt": (inside / "a.txt", inside / "a.txt"),
-        f"{root}/sub": (root / "sub", root / "sub"),
-        f"/{shadowing}/a.txt": (inside / "a.txt", inside / "a.txt"),
-        "/sub/inner.md": (root / "sub" / "inner.md", root / "sub" / "inner.md"),
-        f"/{shadowing}": (None, inside),
-        str(root.parent): (None, root / str(root.parent).lstrip("/")),
-    }
-    for path, (without, with_header) in cases.items():
-        assert tf._resolve_in_root(workspace, path) == without, path
-        assert tf._resolve_in_root(workspace, path, relative=True) == with_header, path
 
-    h = {**_AUTH, **_USER}
-    for path in (f"{root}/{shadowing}", f"{root}/{shadowing}/a.txt"):
-        op = "list?directory" if path.endswith(shadowing) else "read?path"
-        plain = client.get(f"/files/{op}={path}", headers=h)
-        relative = client.get(f"/files/{op}={path}", headers={**h, **_RELATIVE})
-        assert plain.status_code == relative.status_code == 200, path
-        assert plain.json() == relative.json(), path
+def test_a_relative_path_spelled_like_a_host_path_names_the_workspace_entry(
+    client, workspace
+):
+    """#283 review: the workspace holds ``doc.txt`` (A) and, nested, a folder chain that
+    spells the root's own host path with its own ``doc.txt`` (B). For a relative caller
+    the string ``<root>/doc.txt`` is the path of B inside the workspace — reads, lists,
+    deletes and moves reach B only, and A is untouched. (A host-path preference here
+    sent that request to A.) Without the header the same string is still the host
+    path, A, as it always was."""
+    root = workspace.resolve()
+    spelled = str(root).lstrip("/")
+    (workspace / "doc.txt").write_text("A")
+    (workspace / spelled).mkdir(parents=True)
+    (workspace / spelled / "doc.txt").write_text("B")
+    (workspace / spelled / "keep.txt").write_text("keep")
+    a, b = workspace / "doc.txt", workspace / spelled / "doc.txt"
+    rel = {**_AUTH, **_USER, **_RELATIVE}
+    plain = {**_AUTH, **_USER}
+    host_b = f"{root}/doc.txt"  # the relative path of B == the host path of A
+
+    assert tf._resolve_in_root(workspace, host_b, relative=True) == b
+    assert tf._resolve_in_root(workspace, host_b) == a
+
+    read_rel = client.get(f"/files/read?path={host_b}", headers=rel)
+    read_plain = client.get(f"/files/read?path={host_b}", headers=plain)
+    assert read_rel.json()["content"] == "B"
+    assert read_plain.json()["content"] == "A"
+    listed = client.get(f"/files/list?directory={root}", headers=rel)
+    assert {e["name"] for e in listed.json()["entries"]} == {"doc.txt", "keep.txt"}
+
+    mv = client.post(
+        "/files/move",
+        headers=rel,
+        json={"source": host_b, "destination": f"{root}/moved.txt"},
+    )
+    assert mv.status_code == 200, mv.text
+    assert (workspace / spelled / "moved.txt").read_text() == "B"
+    assert a.read_text() == "A" and not b.exists()
+    rm = client.delete(f"/files/delete?path={root}/moved.txt", headers=rel)
+    assert rm.status_code == 200
+    assert not (workspace / spelled / "moved.txt").exists()
+    assert a.read_text() == "A"
+    assert (workspace / spelled / "keep.txt").read_text() == "keep"
