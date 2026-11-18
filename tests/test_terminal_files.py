@@ -2797,66 +2797,76 @@ def test_argv_files_are_never_served(client, workspace, argv_file):
     assert not (workspace / ".gateway-argv-system-prompt-x").exists()
 
 
+
 # --- a workspace folder that shares a name with an ancestor of the root (#281) ---
 #
-# In production the root is ``/data/workspaces/<user>/<ws>``. A user folder named
-# ``data`` arrives from the file panel as ``/data`` — the host path ``/data`` is an
-# ancestor of the root, so the resolver read it as navigation above the workspace
-# and answered 403 for every operation under it, while the root listing showed the
-# folder. Here the root's own first segment (``/tmp`` on most hosts) plays ``data``.
+# In production the root is ``/data/workspaces/<user>/<ws>``. The file panel sends a
+# user folder ``data`` as ``/data`` — the host path ``/data`` is an ancestor of the
+# root, so the resolver read it as navigation above the workspace and answered 403
+# for every operation under it, while the root listing showed the folder. A caller
+# that speaks workspace-relative paths now says so (``X-Workspace-Paths: relative``,
+# ChatDRAGON's BFF); without the header every path keeps its old meaning, whatever
+# the workspace happens to contain (#282 review). The root's own first host segment
+# (``/tmp`` on most hosts) plays ``data`` here.
+
+_RELATIVE = {"X-Workspace-Paths": "relative"}
 
 
-def _ancestor_names(workspace: Path) -> tuple[str, str]:
-    """The root's first host segment, and the first two joined (both ancestors)."""
-    parts = workspace.resolve().parts
-    return parts[1], f"{parts[1]}/{parts[2]}"
+def _ancestors(workspace: Path) -> tuple[str, str]:
+    """The root's first host segment, and its full parent path without the slash."""
+    resolved = workspace.resolve()
+    return resolved.parts[1], str(resolved.parent).lstrip("/")
 
 
 @pytest.fixture
 def shadowing(workspace) -> str:
-    top, _ = _ancestor_names(workspace)
+    """A workspace folder named like the root's first ancestor, plus a full mirror
+    of the root's parent path inside the workspace (the reviewer's case)."""
+    top, parent = _ancestors(workspace)
     (workspace / top).mkdir()
     (workspace / top / "a.txt").write_text("in the workspace\n")
-    (workspace / top / "deep").mkdir()
+    (workspace / parent).mkdir(parents=True, exist_ok=True)
+    (workspace / parent / "mirror.txt").write_text("mirror\n")
     return top
 
 
-def test_a_folder_named_like_an_ancestor_lists(client, workspace, shadowing):
-    root = client.get("/files/list?directory=/", headers={**_AUTH, **_USER})
-    assert root.status_code == 200
-    listed = {e["name"]: e["type"] for e in root.json()["entries"]}
-    assert listed[shadowing] == "directory"
-
+def test_relative_caller_opens_a_folder_named_like_an_ancestor(
+    client, workspace, shadowing
+):
+    h = {**_AUTH, **_USER, **_RELATIVE}
+    root = client.get("/files/list?directory=/", headers=h)
+    assert {e["name"]: e["type"] for e in root.json()["entries"]}[shadowing] == (
+        "directory"
+    )
     for directory in (
         f"/{shadowing}",
         f"/{shadowing}/",
         f"/./{shadowing}",
         shadowing,
     ):
-        r = client.get(
-            f"/files/list?directory={directory}", headers={**_AUTH, **_USER}
-        )
+        r = client.get(f"/files/list?directory={directory}", headers=h)
         assert r.status_code == 200, (directory, r.text)
-        assert {e["name"] for e in r.json()["entries"]} == {"a.txt", "deep"}
+        assert "a.txt" in {e["name"] for e in r.json()["entries"]}
+    # even the full host path of the root's parent is the workspace's own folder
+    _, parent = _ancestors(workspace)
+    r = client.get(f"/files/list?directory=/{parent}", headers=h)
+    assert r.status_code == 200, r.text
+    assert {e["name"] for e in r.json()["entries"]} == {"mirror.txt"}
 
 
-def test_a_folder_named_like_an_ancestor_reads_and_writes(
-    client, workspace, shadowing
-):
-    h = {**_AUTH, **_USER}
+def test_relative_caller_reads_and_writes_there(client, workspace, shadowing):
+    h = {**_AUTH, **_USER, **_RELATIVE}
     inside = workspace / shadowing
     read = client.get(f"/files/read?path=/{shadowing}/a.txt", headers=h)
     assert read.status_code == 200 and "in the workspace" in read.text
     digest = client.get(f"/files/digest?path=/{shadowing}/a.txt", headers=h)
     assert digest.status_code == 200
-
     up = client.post(
         f"/files/upload?directory=/{shadowing}",
         headers=h,
         files={"file": ("up.txt", b"uploaded", "text/plain")},
     )
-    assert up.status_code == 200
-    assert (inside / "up.txt").read_bytes() == b"uploaded"
+    assert up.status_code == 200 and (inside / "up.txt").read_bytes() == b"uploaded"
     mk = client.post("/files/mkdir", headers=h, json={"path": f"/{shadowing}/made"})
     assert mk.status_code == 200 and (inside / "made").is_dir()
     mv = client.post(
@@ -2865,66 +2875,76 @@ def test_a_folder_named_like_an_ancestor_reads_and_writes(
         json={"source": f"/{shadowing}/up.txt", "destination": "/sub/up.txt"},
     )
     assert mv.status_code == 200 and (workspace / "sub" / "up.txt").exists()
-    rm = client.delete(f"/files/delete?path=/{shadowing}/a.txt", headers=h)
-    assert rm.status_code == 200 and not (inside / "a.txt").exists()
-    rmdir = client.delete(f"/files/delete?path=/{shadowing}", headers=h)
-    assert rmdir.status_code == 200 and not inside.exists()
-
-
-def test_a_folder_named_like_an_ancestor_can_be_created(client, workspace):
-    """Creating the folder is the same request shape — it must land in the workspace."""
-    h = {**_AUTH, **_USER}
-    top, _ = _ancestor_names(workspace)
-
-    mk = client.post("/files/mkdir", headers=h, json={"path": f"/{top}"})
-    assert mk.status_code == 200, mk.text
-    assert (workspace / top).is_dir()
-    client.delete(f"/files/delete?path=/{top}", headers=h)
-
-    mv = client.post(
-        "/files/move", headers=h, json={"source": "/sub", "destination": f"/{top}"}
-    )
-    assert mv.status_code == 200, mv.text
-    assert (workspace / top / "inner.md").exists()
-    # "/<top>/<second>" is itself an ancestor of the root — a copy onto it lands
-    # in the workspace folder, now that "/<top>" exists there
-    _, two = _ancestor_names(workspace)
     cp = client.post(
         "/files/copy",
         headers=h,
-        json={"source": "/notes.txt", "destination": f"/{two}"},
+        json={"source": "/notes.txt", "destination": f"/{shadowing}/n.txt"},
     )
-    assert cp.status_code == 200, cp.text
-    assert (workspace / two).read_text() == "hello\nworld\n"
+    assert cp.status_code == 200 and (inside / "n.txt").exists()
+    rm = client.delete(f"/files/delete?path=/{shadowing}", headers=h)
+    assert rm.status_code == 200 and not inside.exists()
+    # and creating it from scratch lands in the workspace too
+    mk = client.post("/files/mkdir", headers=h, json={"path": f"/{shadowing}"})
+    assert mk.status_code == 200 and inside.is_dir()
 
 
-def test_navigation_above_the_root_is_still_403(client, workspace, shadowing):
-    """The real ancestors stay out of reach — with or without a same-named folder."""
+def test_without_the_header_host_paths_keep_their_meaning(
+    client, workspace, shadowing
+):
+    """The reviewer's case: the workspace holds a folder at exactly the relative path
+    of the root's real parent (and one named like its first ancestor). A caller that
+    did not ask for relative paths still gets 403 for those host paths — as a listing,
+    a create, a delete, a move source and a copy target — and the workspace folders
+    are untouched. (A path *below* an ancestor that is not itself one was already read
+    as workspace-relative before #281; that rule is unchanged.)"""
     h = {**_AUTH, **_USER}
-    _, two = _ancestor_names(workspace)
-    for directory in (str(workspace.resolve().parent), f"/{two}"):
-        r = client.get(f"/files/list?directory={directory}", headers=h)
-        assert r.status_code == 403, (directory, r.text)
+    _, parent = _ancestors(workspace)
+    host_parent = f"/{parent}"
+    mirror = workspace / parent
+    calls = [
+        client.get(f"/files/list?directory={host_parent}", headers=h),
+        client.get(f"/files/list?directory=/{shadowing}", headers=h),
+        client.post("/files/mkdir", headers=h, json={"path": host_parent}),
+        client.delete(f"/files/delete?path={host_parent}", headers=h),
+        client.delete(f"/files/delete?path=/{shadowing}", headers=h),
+        client.post(
+            "/files/move",
+            headers=h,
+            json={"source": host_parent, "destination": "/moved"},
+        ),
+        client.post(
+            "/files/copy",
+            headers=h,
+            json={"source": "/notes.txt", "destination": host_parent},
+        ),
+    ]
+    for r in calls:
+        assert r.status_code == 403, (r.request.url, r.text)
         assert "outside your workspace" in r.json()["detail"]
-    # without a workspace folder of that name, "/<ancestor>" is above-root navigation
-    client.delete(f"/files/delete?path=/{shadowing}", headers=h)
-    r = client.get(f"/files/list?directory=/{shadowing}", headers=h)
-    assert r.status_code == 403
-    # creating deep under a missing folder is not a reason to read it as virtual
-    mk = client.post("/files/mkdir", headers=h, json={"path": f"/{two}"})
-    assert mk.status_code == 403
+    assert (mirror / "mirror.txt").read_text() == "mirror\n"
+    assert (workspace / shadowing / "a.txt").exists()
+    assert not (workspace / "moved").exists()
+    # the existing explorer contract: a real path under the root is that path
+    real = client.get(f"/files/list?directory={workspace.resolve()}/sub", headers=h)
+    assert real.status_code == 200
+    assert [e["name"] for e in real.json()["entries"]] == ["inner.md"]
 
 
-def test_a_same_named_folder_does_not_open_an_escape(client, workspace, shadowing):
-    h = {**_AUTH, **_USER}
+def test_relative_paths_never_leave_the_root(client, workspace, shadowing):
+    h = {**_AUTH, **_USER, **_RELATIVE}
     for path in (
         f"/{shadowing}/../../secret.txt",
-        f"/{shadowing}/../../../secret.txt",
+        "/../secret.txt",
+        "/../../secret.txt",
+        "/../../../secret.txt",
     ):
         r = client.get(f"/files/read?path={path}", headers=h)
         assert r.status_code in (403, 404), (path, r.status_code)
         assert "TOP SECRET" not in r.text
-    # the same-named folder is a symlink out of the workspace -> still refused
+    # a host path is not special to a relative caller: it names a workspace entry
+    r = client.get(f"/files/list?directory={workspace.resolve()}/sub", headers=h)
+    assert r.status_code == 404
+    # a same-named folder that is a symlink out of the workspace is still refused
     inside = workspace / shadowing
     for child in sorted(inside.rglob("*"), reverse=True):
         child.unlink() if child.is_file() else child.rmdir()
@@ -2934,3 +2954,14 @@ def test_a_same_named_folder_does_not_open_an_escape(client, workspace, shadowin
     assert r.status_code == 403
     r = client.get(f"/files/read?path=/{shadowing}/secret.txt", headers=h)
     assert r.status_code == 403
+
+
+@pytest.mark.parametrize("value", ["", "absolute", "yes", "relative-ish"])
+def test_only_the_relative_value_switches_the_reading(
+    client, workspace, shadowing, value
+):
+    url = f"/files/list?directory=/{shadowing}"
+    h = {**_AUTH, **_USER, "X-Workspace-Paths": value}
+    assert client.get(url, headers=h).status_code == 403
+    h["X-Workspace-Paths"] = " Relative "
+    assert client.get(url, headers=h).status_code == 200
