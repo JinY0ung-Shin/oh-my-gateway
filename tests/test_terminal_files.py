@@ -2941,9 +2941,12 @@ def test_relative_paths_never_leave_the_root(client, workspace, shadowing):
         r = client.get(f"/files/read?path={path}", headers=h)
         assert r.status_code in (403, 404), (path, r.status_code)
         assert "TOP SECRET" not in r.text
-    # a host path is not special to a relative caller: it names a workspace entry
+    # a host path at or under the root still names that file for a relative caller
+    # (it may hold one from an earlier response) — the header changes no path an older
+    # gateway would serve (#884 review)
     r = client.get(f"/files/list?directory={workspace.resolve()}/sub", headers=h)
-    assert r.status_code == 404
+    assert r.status_code == 200
+    assert [e["name"] for e in r.json()["entries"]] == ["inner.md"]
     # a same-named folder that is a symlink out of the workspace is still refused
     inside = workspace / shadowing
     for child in sorted(inside.rglob("*"), reverse=True):
@@ -2965,3 +2968,37 @@ def test_only_the_relative_value_switches_the_reading(
     assert client.get(url, headers=h).status_code == 403
     h["X-Workspace-Paths"] = " Relative "
     assert client.get(url, headers=h).status_code == 200
+
+
+def test_the_header_changes_no_path_a_gateway_without_it_would_serve(
+    client, workspace, shadowing
+):
+    """#884 review: a caller sends the header to every gateway version (an older
+    one ignores it), so for every path an older gateway served, the answer must be
+    the same with and without it. Pinned on the real resolver: the host paths
+    ``<root>/<top>`` and ``<root>/<top>/a.txt`` (the reviewer's ``<root>/data`` and
+    ``<root>/data/a.txt``) are those very entries either way; only the
+    ancestor-shaped ``/<top>`` differs — refused without the header, the workspace
+    folder with it."""
+    root = workspace.resolve()
+    inside = root / shadowing
+    cases = {
+        f"{root}/{shadowing}": (inside, inside),
+        f"{root}/{shadowing}/a.txt": (inside / "a.txt", inside / "a.txt"),
+        f"{root}/sub": (root / "sub", root / "sub"),
+        f"/{shadowing}/a.txt": (inside / "a.txt", inside / "a.txt"),
+        "/sub/inner.md": (root / "sub" / "inner.md", root / "sub" / "inner.md"),
+        f"/{shadowing}": (None, inside),
+        str(root.parent): (None, root / str(root.parent).lstrip("/")),
+    }
+    for path, (without, with_header) in cases.items():
+        assert tf._resolve_in_root(workspace, path) == without, path
+        assert tf._resolve_in_root(workspace, path, relative=True) == with_header, path
+
+    h = {**_AUTH, **_USER}
+    for path in (f"{root}/{shadowing}", f"{root}/{shadowing}/a.txt"):
+        op = "list?directory" if path.endswith(shadowing) else "read?path"
+        plain = client.get(f"/files/{op}={path}", headers=h)
+        relative = client.get(f"/files/{op}={path}", headers={**h, **_RELATIVE})
+        assert plain.status_code == relative.status_code == 200, path
+        assert plain.json() == relative.json(), path

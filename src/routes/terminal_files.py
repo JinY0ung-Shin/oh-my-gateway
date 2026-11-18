@@ -24,12 +24,15 @@ Contract (what FileNav calls):
 
 Paths: a leading slash historically means a host path when it is the root, under it,
 or an ancestor of it — the FileNav explorer echoes the real cwd and its breadcrumbs —
-and the workspace's own ``/`` otherwise. A caller that only speaks workspace-relative
-paths (ChatDRAGON's file panel) sends ``X-Workspace-Paths: relative`` and every
-leading slash is then the workspace's ``/``, so a folder named like an ancestor of
-the root (``data`` under ``/data/workspaces/...``) opens instead of reading as
-navigation above the workspace (#281). Either way the target must resolve inside
-the root.
+and the workspace's own ``/`` otherwise. A caller that speaks workspace-relative
+paths (ChatDRAGON's file panel) sends ``X-Workspace-Paths: relative``: a host path at
+or under the root still names that file (the caller may hold one from an earlier
+response), and every other leading slash is the workspace's ``/`` — never a host
+ancestor — so a folder named like an ancestor of the root (``data`` under
+``/data/workspaces/...``) opens instead of reading as navigation above the workspace
+(#281). The header changes the meaning of no path a gateway without it would serve,
+so callers can send it to any gateway version. Either way the target must resolve
+inside the root.
 
 Identity: read from a configurable, vendor-neutral header (``WORKSPACE_USER_HEADER``,
 default ``X-User-Email``) and used WHOLE — the same value ``/v1/responses`` keys its
@@ -243,10 +246,13 @@ def _user_header() -> str:
 # A caller that speaks workspace-relative paths says so (#281). Without it a
 # leading-slash path keeps its historical meaning: a host path when it is the
 # root, under it, or an ancestor of it (the FileNav explorer echoes the real cwd
-# and its breadcrumbs). With it, every leading slash is the workspace's own "/",
-# so a workspace folder named like an ancestor of the root (``/data`` under
-# ``/data/workspaces/...``) opens instead of reading as navigation above the
-# workspace. It only ever narrows: the target must still resolve inside the root.
+# and its breadcrumbs). With it, a host path at or under the root still names that
+# file, and every other leading slash is the workspace's own "/" — so a workspace
+# folder named like an ancestor of the root (``/data`` under ``/data/workspaces/...``)
+# opens instead of reading as navigation above the workspace, while no path an older
+# gateway would serve changes meaning (#884 review: a caller can send the header to
+# any gateway version). It only ever narrows: the target must still resolve inside
+# the root.
 WORKSPACE_PATHS_HEADER = "X-Workspace-Paths"
 
 
@@ -472,8 +478,11 @@ def _resolve_in_root(
     navigation above the workspace) is rejected outright; any other stray
     leading-slash path is reinterpreted as workspace-relative.
 
-    With *relative* (the caller sent ``X-Workspace-Paths: relative``) a leading
-    slash always means the workspace root — no host-path reading at all (#281).
+    With *relative* (the caller sent ``X-Workspace-Paths: relative``) a path that
+    resolves to the root or under it is still that host path — a caller may hold one
+    it got from an earlier response — and every other leading slash is the
+    workspace's own ``/``, never a host ancestor (#281). So the header changes the
+    meaning of no path a gateway without it would have served.
     """
     try:
         root_resolved = root.resolve()
@@ -485,7 +494,11 @@ def _resolve_in_root(
     try:
         candidate = Path(p)
         if relative:
-            resolved = (root_resolved / p.lstrip("/")).resolve()
+            # a host path the gateway itself handed out (the root or under it) keeps
+            # naming that file; only the rest is the workspace's own "/" (#884 review)
+            resolved = candidate.resolve() if candidate.is_absolute() else None
+            if resolved is None or not _is_under(resolved, root_resolved):
+                resolved = (root_resolved / p.lstrip("/")).resolve()
         elif candidate.is_absolute():
             resolved = candidate.resolve()
             if not _is_under(resolved, root_resolved):
@@ -518,7 +531,10 @@ def _lexical_relative_path(
         return Path(".")
     candidate = Path(p)
     if relative:
-        return Path(p.lstrip("/"))
+        try:
+            return candidate.relative_to(root.resolve())
+        except ValueError:
+            return Path(p.lstrip("/"))
     if not candidate.is_absolute():
         return candidate
     try:
