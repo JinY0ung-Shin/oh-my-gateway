@@ -27,6 +27,19 @@ from typing import Any, AsyncIterator, Dict, Optional
 
 from claude_agent_sdk import ClaudeSDKClient
 
+STEERING_HEADER = "X-Gateway-Steering-Run"
+
+
+@dataclass
+class SteeringInput:
+    # Track one physical CLI across response segments, including an approval pause.
+
+    run_id: str = ""
+    accepting: bool = False
+    submitted: dict[str, str] = field(default_factory=dict)
+    pending: dict[str, str] = field(default_factory=dict)
+
+
 
 @dataclass
 class ToolProgressMessage:
@@ -78,6 +91,10 @@ def parse_tool_progress(data: Dict[str, Any]) -> Optional[ToolProgressMessage]:
 class GatewayClaudeSDKClient(ClaudeSDKClient):
     """``ClaudeSDKClient`` whose message stream includes ``tool_progress``."""
 
+    def __init__(self, *args: Any, **kwargs: Any):
+        super().__init__(*args, **kwargs)
+        self.steering = SteeringInput()
+
     async def receive_messages(self) -> AsyncIterator[Any]:
         query = getattr(self, "_query", None)
         if not query:
@@ -89,6 +106,11 @@ class GatewayClaudeSDKClient(ClaudeSDKClient):
         from claude_agent_sdk._internal.message_parser import parse_message
 
         async for data in query.receive_messages():
+            if isinstance(data, dict) and data.get("type") == "user" and data.get("isReplay") is True:
+                steer_id = data.get("uuid")
+                if steer_id in self.steering.pending:
+                    yield {"type": "steering_echo", "steer_id": steer_id}
+                continue
             if isinstance(data, dict) and data.get("type") == "tool_progress":
                 progress = parse_tool_progress(data)
                 if progress is not None:

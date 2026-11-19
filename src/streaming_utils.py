@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from typing import Any, AsyncGenerator, Callable, Dict, Optional
@@ -1114,6 +1115,7 @@ async def stream_response_chunks(
     and 1), so the stream starts at the next event and numbers on from 2.
     """
     content_sent = False
+    steering_usage: list[dict[str, Any]] = []
     token_streaming = False
     in_thinking = False
     tool_acc = ToolUseAccumulator()
@@ -1428,6 +1430,33 @@ async def stream_response_chunks(
                 for event in _tool_heartbeat_events(tool_stats, _next_seq):
                     yield event
                 continue
+
+            if isinstance(chunk, dict) and chunk.get("type") in ("steering_ready", "steering_applied"):
+                event = {"type": f"response.{chunk['type']}"}
+                event.update({key: value for key, value in chunk.items() if key != "type"})
+                if chunk["type"] == "steering_applied":
+                    stream_result.setdefault("steering_inputs", []).append(chunk["input"])
+                    _close_thinking_capture()
+                    if reasoning_open:
+                        for line in _close_reasoning():
+                            yield line
+                    if message_item_opened:
+                        for line in _close_message_item():
+                            yield line
+                event["sequence_number"] = _next_seq()
+                yield f"event: {event['type']}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+                continue
+            if isinstance(chunk, dict) and chunk.get("steering_intermediate"):
+                steering_usage.append(chunk["usage"])
+                continue
+            if steering_usage and isinstance(chunk, dict) and chunk.get("type") == "result":
+                usage = dict(chunk.get("usage") or {})
+                for key in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                            "cache_creation_input_tokens"):
+                    usage[key] = int(usage.get(key) or 0) + sum(
+                        int(previous.get(key) or 0) for previous in steering_usage
+                    )
+                chunk = {**chunk, "usage": usage}
 
             # The CLI's own tool_progress frame (mcp_progress, bash_progress …),
             # surfaced by the gateway SDK client — the pinned SDK drops it.

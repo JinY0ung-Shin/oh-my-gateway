@@ -6,6 +6,7 @@ import inspect
 import json
 import logging
 import os
+import re
 import secrets
 import time
 import uuid
@@ -15,14 +16,16 @@ from typing import Optional, Dict, Any, List, cast
 from fastapi import APIRouter, HTTPException, Request, Depends
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 
 from src.models import Message
 from src.message_adapter import MessageAdapter
-from src.auth import verify_api_key, enforce_scoped_identity, security
+from src.auth import verify_api_key, enforce_scoped_identity, get_authenticated_user, security
 from src.session_manager import session_manager
 from src.backends import BackendClient, BackendRegistry, ResolvedModel
 from src.backends.claude.client import UnsupportedContinuationPolicy
 from src.backends.claude import tool_approval
+from src.backends.claude.sdk_client import STEERING_HEADER, SteeringInput
 from src.backends.claude.skill_names import invalid_skill_rule
 from src.backends.claude.slash_commands import (
     SlashCommandError,
@@ -576,7 +579,9 @@ async def _disconnect_session_client(session, reason: str, client=None) -> None:
         logger.debug("SDK client disconnect failed after %s", reason, exc_info=True)
 
 
-async def _begin_active_response(session, response_id: str, turn: int, client: Any) -> None:
+async def _begin_active_response(
+    session, response_id: str, turn: int, client: Any, *, steering_run_id: str = ""
+) -> None:
     """Publish an in-flight response for concurrent cancel requests."""
     async with session.response_control_lock:
         if session.active_response_id is not None:
@@ -590,6 +595,11 @@ async def _begin_active_response(session, response_id: str, turn: int, client: A
         session.active_response_started_at = time.monotonic()
         session.active_response_last_progress_at = session.active_response_started_at
         session.active_response_client = client
+        steering = getattr(client, "steering", None)
+        if isinstance(steering, SteeringInput):
+            steering.run_id = steering_run_id
+            steering.accepting = False
+            steering.submitted = dict(steering.pending)
         session.active_response_done.clear()
 
 
@@ -2257,6 +2267,10 @@ async def create_response(
     await verify_api_key(request, credentials)
     enforce_scoped_identity(request)
 
+    steering_run_id = request.headers.get(STEERING_HEADER, "")
+    if not re.fullmatch(r"[0-9a-f]{32}", steering_run_id):
+        steering_run_id = ""
+
     # Resolve model -> backend and validate auth
     resolved, backend = resolve_and_get_backend(body.model)
     logger.info(
@@ -2314,7 +2328,8 @@ async def create_response(
                     ),
                 )
             return await _handle_function_call_output(
-                body, resolved, backend, session, session_id, workspace_str, fc_output
+                body, resolved, backend, session, session_id, workspace_str, fc_output,
+                steering_run_id=steering_run_id,
             )
 
         # A paused human decision (AskUserQuestion, ExitPlanMode) accepts exactly one
@@ -2438,7 +2453,7 @@ async def create_response(
                 raise
             try:
                 await _begin_active_response(
-                    session, resp_id, next_turn, session.client
+                    session, resp_id, next_turn, session.client, steering_run_id=steering_run_id
                 )
             except Exception:
                 if preflight["lock_acquired"]:
@@ -2520,7 +2535,7 @@ async def create_response(
                     # Record the user prompt too — a paused turn still
                     # consumed the user's input, so history must reflect it.
                     session.turn_counter = next_turn
-                    session.add_messages([Message(role="user", content=prompt)])
+                    session.add_messages([Message(role="user", content=prompt), *_steering_messages(stream_result)])
                     _record_turn_response(
                         session, next_turn, requires_action_resp, store=body.store
                     )
@@ -2536,7 +2551,7 @@ async def create_response(
                         stream_result.get("thinking_texts"),
                     ) or Message(role="assistant", content="")
                     session.turn_counter = next_turn
-                    session.add_messages([Message(role="user", content=prompt)])
+                    session.add_messages([Message(role="user", content=prompt), *_steering_messages(stream_result)])
                     session_manager.add_assistant_response(session_id, assistant_message)
                     response_obj = stream_result.get("response_obj")
                     if response_obj is not None:
@@ -2587,7 +2602,7 @@ async def create_response(
                         stream_result.get("thinking_texts"),
                     ) or Message(role="assistant", content="")
                     session.turn_counter = next_turn
-                    session.add_messages([Message(role="user", content=prompt)])
+                    session.add_messages([Message(role="user", content=prompt), *_steering_messages(stream_result)])
                     session_manager.add_assistant_response(session_id, assistant_message)
                     _record_stream_turn_response(
                         session,
@@ -2621,8 +2636,8 @@ async def create_response(
 
                 async def _teardown():
                     try:
-                        if not stream_result.get("success") and not stream_result.get(
-                            "interrupted"
+                        if not stream_result.get("success") and (
+                            not stream_result.get("interrupted") or _has_pending_steering(active_client)
                         ):
                             await _disconnect_session_client(
                                 session, "responses stream failure", client=active_client
@@ -2667,7 +2682,7 @@ async def create_response(
                         forward_headers=forward_headers,
                     )
                     await _begin_active_response(
-                        session, resp_id, next_turn, session.client
+                        session, resp_id, next_turn, session.client, steering_run_id=steering_run_id
                     )
                     begun = True
                 except Exception as exc:
@@ -2915,6 +2930,8 @@ async def _handle_function_call_output(
     session_id: str,
     workspace_str: str,
     fc_output: Dict[str, str],
+    *,
+    steering_run_id: str = "",
 ):
     """Handle a function_call_output continuation request.
 
@@ -2988,7 +3005,9 @@ async def _handle_function_call_output(
 
     if body.stream:
         try:
-            await _begin_active_response(session, resp_id, next_turn, active_client)
+            await _begin_active_response(
+                session, resp_id, next_turn, active_client, steering_run_id=steering_run_id
+            )
         except Exception:
             session.lock.release()
             raise
@@ -3062,6 +3081,7 @@ async def _handle_function_call_output(
                         sequence_number=_take_sequence(stream_result),
                     )
                     session.turn_counter = next_turn
+                    session.add_messages(_steering_messages(stream_result))
                     _record_turn_response(
                         session, next_turn, requires_action_resp, store=body.store
                     )
@@ -3073,6 +3093,7 @@ async def _handle_function_call_output(
                         stream_result.get("thinking_texts"),
                     ) or Message(role="assistant", content="")
                     session.turn_counter = next_turn
+                    session.add_messages(_steering_messages(stream_result))
                     session_manager.add_assistant_response(session_id, assistant_message)
                     response_obj = stream_result.get("response_obj")
                     if response_obj is not None:
@@ -3101,6 +3122,7 @@ async def _handle_function_call_output(
                         stream_result.get("thinking_texts"),
                     ) or Message(role="assistant", content="")
                     session.turn_counter = next_turn
+                    session.add_messages(_steering_messages(stream_result))
                     session_manager.add_assistant_response(session_id, assistant_message)
                     _record_stream_turn_response(
                         session,
@@ -3134,8 +3156,8 @@ async def _handle_function_call_output(
 
                 async def _teardown():
                     try:
-                        if not stream_result.get("success") and not stream_result.get(
-                            "interrupted"
+                        if not stream_result.get("success") and (
+                            not stream_result.get("interrupted") or _has_pending_steering(active_client)
                         ):
                             await _disconnect_session_client(
                                 session,
@@ -3271,6 +3293,76 @@ async def _handle_function_call_output(
         logger.warning("usage-log emit failed (non-stream continuation)", exc_info=True)
 
     return response_obj.model_dump()
+
+
+def _steering_messages(stream_result: dict) -> list[Message]:
+    return [Message(role="user", content=text) for text in stream_result.get("steering_inputs", ())]
+
+
+def _has_pending_steering(client: Any) -> bool:
+    steering = getattr(client, "steering", None)
+    return isinstance(steering, SteeringInput) and bool(steering.pending)
+
+
+class SteeringRequest(BaseModel):
+    run_id: str = Field(pattern=r"^[0-9a-f]{32}$")
+    steer_id: uuid.UUID
+    input: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/v1/responses/{response_id}/steer", status_code=202)
+@rate_limit_endpoint("responses")
+async def steer_response(
+    request: Request,
+    response_id: str,
+    body: SteeringRequest,
+    user: str,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    await verify_api_key(request, credentials)
+    enforce_scoped_identity(request)
+    parsed = _parse_response_id(response_id)
+    session = session_manager.get_session(parsed[0]) if parsed is not None else None
+    principal = get_authenticated_user(request)
+    if session is None or session.user != user or (principal is not None and principal != user):
+        raise _response_not_found(response_id)
+
+    text = body.input.strip()
+    if not text or text.startswith("/"):
+        raise HTTPException(status_code=422, detail="Steering accepts plain text only")
+    steer_id = str(body.steer_id)
+    async with session.response_control_lock:
+        client = session.active_response_client
+        steering = getattr(client, "steering", None)
+        if (
+            session.active_response_id != response_id
+            or not isinstance(steering, SteeringInput)
+            or steering.run_id != body.run_id
+        ):
+            raise _response_not_found(response_id)
+        if steer_id in steering.submitted:
+            if steering.submitted[steer_id] != text:
+                raise HTTPException(status_code=409, detail="Steering ID already used")
+            return {"steer_id": steer_id}
+        if (
+            not steering.accepting
+            or session.active_response_state != "running"
+            or session.pending_tool_call is not None
+        ):
+            raise HTTPException(status_code=409, detail="Response is not accepting steering")
+        if steering.pending or len(steering.submitted) >= 16:
+            raise HTTPException(status_code=429, detail="Steering is already pending or at its limit")
+        backend = BackendRegistry.get(session.backend)
+        steering.pending[steer_id] = text
+        steering.submitted[steer_id] = text
+        try:
+            await asyncio.wait_for(backend.steer_client(client, text, steer_id), timeout=2.0)
+        except Exception as exc:
+            steering.accepting = False
+            steering.pending.pop(steer_id, None)
+            steering.submitted.pop(steer_id, None)
+            raise HTTPException(status_code=502, detail="Could not send steering to Claude") from exc
+    return {"steer_id": steer_id}
 
 
 @router.post("/v1/responses/{response_id}/cancel")

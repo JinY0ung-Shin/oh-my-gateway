@@ -74,7 +74,7 @@ from src.backends.claude.constants import (
 # ``ClaudeSDKClient``, and ``src.backends.claude.client.ClaudeSDKClient`` is the
 # seam tests patch to stub the SDK — keep that seam stable.
 from src.backends.claude.sdk_client import GatewayClaudeSDKClient as ClaudeSDKClient
-from src.backends.claude.sdk_client import ToolProgressMessage
+from src.backends.claude.sdk_client import SteeringInput, ToolProgressMessage
 from src.backends.claude.skill_names import (
     GRANULAR_SKILL_RULE_RE,
     SKILL_WILDCARD_RULES,
@@ -2245,6 +2245,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             options.env["CLAUDE_CODE_ALWAYS_ENABLE_EFFORT"] = "1"
         await self._apply_skills_allowlist(options, user)
         await self._attach_mcp_progress_relay(options, session)
+        # See the CLI receive/send ordering in tests/test_cli_steering.py.
+        options.extra_args["replay-user-messages"] = None
         # AskUserQuestion is intercepted via a can_use_tool callback (below),
         # not a PreToolUse hook: the CLI only surfaces AskUserQuestion to the
         # model as a callable tool when a permission callback is present.
@@ -2346,6 +2348,7 @@ class ClaudeCodeCLI(TokenEstimateMixin):
     async def _stream_user_content_blocks(
         content_blocks: Union[str, List[Dict[str, Any]]],
         verbatim: bool = True,
+        steer_id: str | None = None,
     ) -> AsyncGenerator[Dict[str, Any], None]:
         """Wrap a user turn as a single SDK streaming-input message.
 
@@ -2364,6 +2367,8 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         }
         if verbatim:
             message["client_composed"] = True
+        if steer_id:
+            message.update(uuid=steer_id, priority="next")
         yield message
 
     @staticmethod
@@ -2519,10 +2524,30 @@ class ClaudeCodeCLI(TokenEstimateMixin):
         progress_queue = relay.queue if relay is not None else None
         if relay is not None and send is not None:
             relay.drain()
+        steering = getattr(client, "steering", None)
+        # Only opt-in HTTP streams offer steering. A continuation must also
+        # drain receipts owed to its approval-paused predecessor.
+        steerable = isinstance(steering, SteeringInput) and bool(
+            steering.run_id or steering.pending
+        )
+        def steering_echo(converted: dict) -> dict | None:
+            if not steerable or converted.get("type") != "steering_echo":
+                return None
+            steer_id = converted["steer_id"]
+            text = steering.pending.pop(steer_id, None)
+            if text is None:
+                return None
+            return {"type": "steering_applied", "steer_id": steer_id, "input": text}
+
         try:
             if send is not None:
                 await send()
-            response_iter = client.receive_response().__aiter__()
+            if steerable and steering.run_id and not break_event.is_set():
+                steering.accepting = True
+                yield {"type": "steering_ready", "run_id": steering.run_id}
+            response_iter = (
+                client.receive_messages() if steerable else client.receive_response()
+            ).__aiter__()
             while True:
                 # Race: next message vs hook-fired break signal vs relayed MCP progress.
                 # A pending SDK read survives a progress wake-up: cancelling __anext__
@@ -2554,9 +2579,12 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                 if wait_break in done:
                     # Hook fired — yield any message that arrived concurrently,
                     # then break so the route can emit function_call.
+                    if steerable:
+                        steering.accepting = False
                     if get_next in done:
                         try:
-                            yield self._convert_message(get_next.result())
+                            converted = self._convert_message(get_next.result())
+                            yield steering_echo(converted) or converted
                         except StopAsyncIteration:
                             pass
                     else:
@@ -2577,16 +2605,37 @@ class ClaudeCodeCLI(TokenEstimateMixin):
                         break  # Stream ended normally (ResultMessage received)
                     get_next = None
                     converted = self._convert_message(message)
+                    if echo := steering_echo(converted):
+                        yield echo
+                        continue
+                    if steerable and converted.get("type") == "result":
+                        async with session.response_control_lock:
+                            more = bool(steering.pending) and not converted.get("is_error") and (
+                                session.active_response_state != "cancelling"
+                            )
+                            if not more:
+                                steering.accepting = False
+                        if more:
+                            # Text-only inference can finish its SDK cycle before
+                            # Claude dequeues the new input. Keep one HTTP stream
+                            # and let the next SDK result settle it.
+                            if converted.get("usage"):
+                                yield {**converted, "steering_intermediate": True}
+                            continue
                     # The SDK reports user interrupts as an error result. Mark
                     # only one paired with an explicit gateway cancel request
                     # so genuine execution errors retain failure semantics.
                     yield self._mark_gateway_interrupt(converted, session)
+                    if steerable and converted.get("type") == "result":
+                        break
         except Exception as exc:
             logger.error("%s: %s", error_label, exc, exc_info=True)
             session.client = None
             reset_active_tasks(session, "SDK stream error")
             yield error_chunk(describe_sdk_stream_error(exc))
         finally:
+            if steerable:
+                steering.accepting = False
             # A cancellation (consumer disconnected mid-turn) exits the loop
             # between the asyncio.wait race and the pending-task cleanup.
             # Cancel the leftovers: an orphaned __anext__ would log "Task
@@ -2598,6 +2647,10 @@ class ClaudeCodeCLI(TokenEstimateMixin):
             # Only our own event: never one a later reader installed.
             if session.stream_break_event is break_event:
                 session.stream_break_event = None
+
+    async def steer_client(self, client: ClaudeSDKClient, text: str, steer_id: str) -> None:
+        """Send a user message before the next tool/model boundary."""
+        await client.query(self._stream_user_content_blocks(text, steer_id=steer_id))
 
     async def interrupt_client(self, client: ClaudeSDKClient) -> None:
         """Interrupt the active turn without disconnecting the conversation."""
